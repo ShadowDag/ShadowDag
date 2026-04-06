@@ -217,8 +217,11 @@ impl RpcState {
     }
 
     pub fn new_with_peers_path(peers_path: &str, db: Arc<DB>) -> Result<Self, NetworkError> {
-        let peer_manager = PeerManager::new(peers_path)
-            .unwrap_or_else(|| PeerManager::new_default().expect("PeerManager init failed"));
+        let peer_manager = match PeerManager::new(peers_path) {
+            Some(pm) => pm,
+            None => PeerManager::new_default()
+                .map_err(|e| NetworkError::Other(format!("PeerManager init failed: {}", e)))?,
+        };
         let admin_password = Self::load_or_create_admin_password(&db);
         let block_store = BlockStore::new(db.clone())
             .map_err(|e| NetworkError::Storage(e))?;
