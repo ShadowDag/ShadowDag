@@ -64,8 +64,10 @@ const MAX_ORPHAN_BLOCKS: usize = 500;
 /// Maximum orphan blocks per peer (prevents single-peer flood)
 const MAX_ORPHAN_PER_PEER: usize = 25;
 
-/// Maximum age (seconds) before an orphan is evicted
-const ORPHAN_EXPIRY_SECS: u64 = 600;
+/// Maximum age (seconds) before an orphan is evicted.
+/// Tightened from 600s to 120s to reduce the selfish mining withholding
+/// window. At 10 BPS, 120s = 1200 blocks (vs previous 6000 blocks).
+const ORPHAN_EXPIRY_SECS: u64 = 120;
 
 /// Maximum reorg depth: reject reorgs deeper than this to prevent
 /// deep-reorg attacks. Blocks older than this are considered final.
