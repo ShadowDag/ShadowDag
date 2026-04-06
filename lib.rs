@@ -236,10 +236,9 @@ pub mod engine {
     pub mod tx_validation;
     pub mod pruning;
     pub mod state_snapshot;
-    // NOTE: swap and dex are protocol primitives NOT wired into consensus.
-    // They are exposed via RPC info endpoints only. Integration requires:
-    // 1. New TxType variants  2. Block validation rules  3. Mempool rules
-    // Consider extracting to separate crate when activating.
+    // Swap and DEX modules — wired into consensus via TxType::SwapTx
+    // and TxType::DexOrder. Validation rules in block_validator.rs and
+    // mempool.rs enforce payload, fee, and structural requirements.
     pub mod swap {
         pub mod atomic_swap;
     }
