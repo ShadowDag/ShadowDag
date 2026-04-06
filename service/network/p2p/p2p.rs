@@ -383,11 +383,10 @@ pub struct P2P {
     pub dandelion:         crate::service::network::propagation::dandelion::DandelionRelay,
 }
 
-impl Default for P2P {
-    fn default() -> Self {
-        Self::new().expect("P2P initialization failed")
-    }
-}
+// NOTE: Default impl removed — P2P::new() returns Result<Self, NetworkError>
+// and there is no safe fallback. Callers must use P2P::new() explicitly
+// and handle the error. The previous Default used expect() which would
+// panic on initialization failure (remote DoS via resource exhaustion).
 
 impl P2P {
     pub fn new() -> Result<Self, crate::errors::NetworkError> {
