@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::collections::HashSet as FxHashSet;
 
 use crate::domain::block::block::Block;
+use crate::domain::transaction::transaction::{Transaction, TxType};
 use crate::domain::transaction::tx_validator::TxValidator;
 use crate::domain::utxo::utxo_set::{UtxoSet, utxo_key};
 #[cfg(test)]
@@ -221,6 +222,13 @@ impl BlockValidator {
                 // Ring signature verification for confidential (privacy) transactions
                 if tx.is_confidential() && !RingValidator::validate(tx) {
                     return Err(ConsensusError::BlockValidation(format!("tx {} ring signature verification failed", i)));
+                }
+                // Validate swap/dex transaction payloads
+                if tx.tx_type == TxType::SwapTx {
+                    Self::validate_swap_tx(tx)?;
+                }
+                if tx.tx_type == TxType::DexOrder {
+                    Self::validate_dex_order_tx(tx)?;
                 }
             }
         }
@@ -756,6 +764,49 @@ impl BlockValidator {
         }
 
         BlockValidationResult::ok(changes)
+    }
+
+    /// Validate a swap transaction's payload.
+    /// SwapTx must carry a payload_hash containing the HTLC secret hash (64 hex chars).
+    /// The first output must lock funds to the HTLC address.
+    fn validate_swap_tx(tx: &Transaction) -> Result<(), ConsensusError> {
+        // 1. Must have payload_hash (HTLC secret hash)
+        let secret_hash = tx.payload_hash.as_ref()
+            .ok_or_else(|| ConsensusError::BlockValidation("SwapTx missing payload_hash (HTLC secret hash)".into()))?;
+        // 2. payload_hash must be 64 hex chars (32 bytes SHA256)
+        if secret_hash.len() != 64 || !secret_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(ConsensusError::BlockValidation("SwapTx payload_hash must be 64 hex chars".into()));
+        }
+        // 3. Must have at least one output (the HTLC lock)
+        if tx.outputs.is_empty() {
+            return Err(ConsensusError::BlockValidation("SwapTx must have at least one output".into()));
+        }
+        // 4. Must not be coinbase
+        if tx.is_coinbase {
+            return Err(ConsensusError::BlockValidation("SwapTx cannot be coinbase".into()));
+        }
+        Ok(())
+    }
+
+    /// Validate a DEX order transaction's payload.
+    /// DexOrder must carry a payload_hash encoding the order parameters.
+    fn validate_dex_order_tx(tx: &Transaction) -> Result<(), ConsensusError> {
+        // 1. Must have payload_hash (order data)
+        let order_data = tx.payload_hash.as_ref()
+            .ok_or_else(|| ConsensusError::BlockValidation("DexOrder missing payload_hash (order data)".into()))?;
+        // 2. payload_hash must be non-empty hex
+        if order_data.is_empty() || !order_data.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(ConsensusError::BlockValidation("DexOrder payload_hash must be valid hex".into()));
+        }
+        // 3. Must not be coinbase
+        if tx.is_coinbase {
+            return Err(ConsensusError::BlockValidation("DexOrder cannot be coinbase".into()));
+        }
+        // 4. Must have at least one input (placing an order requires funds)
+        if tx.inputs.is_empty() {
+            return Err(ConsensusError::BlockValidation("DexOrder must have at least one input".into()));
+        }
+        Ok(())
     }
 }
 

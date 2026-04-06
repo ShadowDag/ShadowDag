@@ -241,6 +241,66 @@ pub fn parse_amount(sdag_str: &str) -> Result<u64, VmError> {
 
 use rand::RngCore;
 
+// ── Smart Contract Helpers ─────────────────────────────────────────
+
+/// Encode a contract method call using ABI-like encoding.
+/// The selector is the first 4 bytes of SHA256(method_signature).
+/// Arguments are 32-byte zero-padded, big-endian encoded.
+///
+/// Example: encode_contract_call("transfer(address,uint256)", &[addr_bytes, amount_bytes])
+pub fn encode_contract_call(method_signature: &str, args: &[&[u8]]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(method_signature.as_bytes());
+    let selector = &hasher.finalize()[..4];
+
+    let mut encoded = Vec::with_capacity(4 + args.len() * 32);
+    encoded.extend_from_slice(selector);
+
+    for arg in args {
+        // Zero-pad to 32 bytes (right-aligned, big-endian)
+        let mut padded = [0u8; 32];
+        let start = 32usize.saturating_sub(arg.len());
+        let copy_len = arg.len().min(32);
+        padded[start..start + copy_len].copy_from_slice(&arg[..copy_len]);
+        encoded.extend_from_slice(&padded);
+    }
+
+    encoded
+}
+
+/// Decode a contract call result into 32-byte chunks.
+pub fn decode_contract_result(output: &[u8]) -> Vec<Vec<u8>> {
+    output.chunks(32).map(|chunk| chunk.to_vec()).collect()
+}
+
+/// Compute deterministic contract address from deployer, bytecode, and timestamp.
+/// address = SHA256(deployer || bytecode || timestamp)[0..20], hex-encoded with "SD1c" prefix.
+pub fn compute_contract_address(deployer: &str, bytecode: &[u8], timestamp: u64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ShadowDAG_Contract_v1");
+    hasher.update(deployer.as_bytes());
+    hasher.update(bytecode);
+    hasher.update(&timestamp.to_le_bytes());
+    let hash = hasher.finalize();
+    format!("SD1c{}", hex::encode(&hash[..20]))
+}
+
+/// Encode a contract deployment payload.
+/// Format: [bytecode_len (4 bytes LE)] [bytecode] [constructor_args...]
+pub fn encode_deploy_tx(bytecode: &[u8], constructor_args: &[&[u8]]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(4 + bytecode.len() + constructor_args.len() * 32);
+    payload.extend_from_slice(&(bytecode.len() as u32).to_le_bytes());
+    payload.extend_from_slice(bytecode);
+    for arg in constructor_args {
+        let mut padded = [0u8; 32];
+        let start = 32usize.saturating_sub(arg.len());
+        let copy_len = arg.len().min(32);
+        padded[start..start + copy_len].copy_from_slice(&arg[..copy_len]);
+        payload.extend_from_slice(&padded);
+    }
+    payload
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //                            TESTS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -366,5 +426,40 @@ mod tests {
         let formatted = format_amount(original);
         let parsed = parse_amount(&formatted).unwrap();
         assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn contract_call_encoding() {
+        let encoded = encode_contract_call("transfer(address,uint256)", &[&[0x01; 20], &42u64.to_be_bytes()]);
+        assert_eq!(encoded.len(), 4 + 32 + 32); // 4-byte selector + 2 args
+        // Selector is first 4 bytes of SHA256("transfer(address,uint256)")
+        assert_eq!(encoded.len(), 68);
+    }
+
+    #[test]
+    fn contract_address_deterministic() {
+        let addr1 = compute_contract_address("SD1abc", b"code", 1000);
+        let addr2 = compute_contract_address("SD1abc", b"code", 1000);
+        assert_eq!(addr1, addr2);
+        assert!(addr1.starts_with("SD1c"));
+        assert_eq!(addr1.len(), 4 + 40); // "SD1c" + 40 hex chars
+    }
+
+    #[test]
+    fn deploy_tx_encoding() {
+        let bytecode = vec![0x60, 0x80, 0x60, 0x40]; // sample bytecode
+        let payload = encode_deploy_tx(&bytecode, &[&[0x01]]);
+        // 4 bytes length + 4 bytes bytecode + 32 bytes arg
+        assert_eq!(payload.len(), 4 + 4 + 32);
+        let len = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+        assert_eq!(len, 4);
+    }
+
+    #[test]
+    fn decode_result_chunks() {
+        let data = vec![0u8; 96]; // 3 chunks of 32 bytes
+        let chunks = decode_contract_result(&data);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), 32);
     }
 }

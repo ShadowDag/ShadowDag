@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::errors::MempoolError;
-use crate::domain::transaction::transaction::Transaction;
+use crate::domain::transaction::transaction::{Transaction, TxType};
 use crate::domain::transaction::tx_validator::TxValidator;
 use crate::domain::utxo::utxo_set::UtxoSet;
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
@@ -311,6 +311,29 @@ impl Mempool {
         // payload_hash format check (existence checked at block validation)
         if TxValidator::validate_payload_hash_format(tx).is_err() {
             return false;
+        }
+
+        // ── L1.6  Swap/DEX-specific validation ─────────────────────────
+        if tx.tx_type == TxType::SwapTx {
+            // SwapTx requires 2x minimum fee due to HTLC overhead
+            if tx.fee < MIN_RELAY_FEE * 2 {
+                return false;
+            }
+            // Must have HTLC secret hash in payload
+            if tx.payload_hash.is_none() {
+                return false;
+            }
+        }
+        if tx.tx_type == TxType::DexOrder {
+            // DexOrder requires 1.5x minimum fee
+            let dex_min_fee = MIN_RELAY_FEE + MIN_RELAY_FEE / 2;
+            if tx.fee < dex_min_fee {
+                return false;
+            }
+            // Must have order data in payload
+            if tx.payload_hash.is_none() {
+                return false;
+            }
         }
 
         // ── L2 Structural: signature verification (prevents flood) ───
@@ -1027,6 +1050,25 @@ impl Mempool {
 
         if tx.fee < MIN_RELAY_FEE {
             return Err(MempoolError::FeeTooLow { fee: tx.fee, minimum: MIN_RELAY_FEE });
+        }
+
+        // Swap/DEX-specific validation
+        if tx.tx_type == TxType::SwapTx {
+            if tx.fee < MIN_RELAY_FEE * 2 {
+                return Err(MempoolError::FeeTooLow { fee: tx.fee, minimum: MIN_RELAY_FEE * 2 });
+            }
+            if tx.payload_hash.is_none() {
+                return Err(MempoolError::ValidationFailed("SwapTx missing HTLC secret hash".into()));
+            }
+        }
+        if tx.tx_type == TxType::DexOrder {
+            let dex_min_fee = MIN_RELAY_FEE + MIN_RELAY_FEE / 2;
+            if tx.fee < dex_min_fee {
+                return Err(MempoolError::FeeTooLow { fee: tx.fee, minimum: dex_min_fee });
+            }
+            if tx.payload_hash.is_none() {
+                return Err(MempoolError::ValidationFailed("DexOrder missing order payload".into()));
+            }
         }
 
         // Fee-rate check with surge pricing: floor rises under pool pressure
