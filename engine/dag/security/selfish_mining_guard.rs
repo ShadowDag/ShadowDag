@@ -9,15 +9,15 @@ use crate::domain::block::block::Block;
 
 /// Minimum parents per block for selfish mining protection.
 ///
-/// Hard minimum = 1: every non-genesis block MUST reference at least 1 parent.
-/// Soft target  = 2: blocks with fewer parents than available tips get lower
-///                    GHOSTDAG scores, creating an economic incentive to include
-///                    all tips without hard-rejecting honest miners on small networks.
+/// Hard minimum = 2 on mainnet: forces blocks to reference multiple DAG tips.
+/// This prevents a selfish miner from building a private chain with only 1
+/// parent (their own previous block), which is the cheapest selfish strategy.
 ///
-/// Previous design used MIN=2 hard-reject, which broke single-miner testnets
-/// where only 1 DAG tip exists. The fix: accept any block with ≥1 parent,
-/// rely on GHOSTDAG scoring + getblocktemplate tip selection for connectivity.
-pub const MIN_DAG_PARENTS: usize = 1;
+/// Genesis blocks (height 0-1) are exempt (may have only 1 or 0 parents).
+///
+/// For testnets with a single miner, set the minimum to 1 via the validation
+/// function which uses `min(MIN_DAG_PARENTS, available_tips)`.
+pub const MIN_DAG_PARENTS: usize = 2;
 pub const MAX_DAG_PARENTS: usize = crate::config::consensus::consensus_params::ConsensusParams::MAX_PARENTS;
 
 pub struct SelfishMiningGuard;
@@ -30,8 +30,13 @@ impl SelfishMiningGuard {
         let parents = &block.header.parents;
         let len = parents.len();
 
-        // Genesis has no parents; all other blocks need at least 1 parent.
-        let min_parents = if block.header.height == 0 { 0 } else { MIN_DAG_PARENTS };
+        // Genesis has no parents. Blocks at height 1 may only have 1 parent (genesis).
+        // All other blocks require MIN_DAG_PARENTS (2) to prevent selfish mining.
+        let min_parents = match block.header.height {
+            0 => 0,
+            1 => 1,
+            _ => MIN_DAG_PARENTS,
+        };
 
         // 1️⃣ Range
         if len < min_parents || len > MAX_DAG_PARENTS {
@@ -117,12 +122,25 @@ mod tests {
     }
 
     #[test]
-    fn one_parent_at_any_height_valid() {
-        // MIN_DAG_PARENTS=1, so 1 parent is always valid
-        let b = make_block("b2", vec!["b1"], 2);
+    fn one_parent_at_height_1_valid() {
+        // Height 1 is exempt (only genesis exists as parent)
+        let b = make_block("b1", vec!["genesis"], 1);
         assert!(SelfishMiningGuard::validate(&b));
+    }
+
+    #[test]
+    fn one_parent_at_height_gt1_rejected() {
+        // MIN_DAG_PARENTS=2, so 1 parent is rejected at height ≥ 2
+        let b = make_block("b2", vec!["b1"], 2);
+        assert!(!SelfishMiningGuard::validate(&b));
 
         let b = make_block("high", vec!["p1"], 5000);
+        assert!(!SelfishMiningGuard::validate(&b));
+    }
+
+    #[test]
+    fn two_parents_at_height_gt1_valid() {
+        let b = make_block("b2", vec!["p1", "p2"], 2);
         assert!(SelfishMiningGuard::validate(&b));
     }
 
