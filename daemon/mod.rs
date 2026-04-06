@@ -42,6 +42,7 @@ use crate::service::network::p2p::p2p::{P2P, P2PMessage, push_outbound, drain_pe
 use crate::engine::dag::security::dag_shield::DagShield;
 use crate::service::network::dos_guard::BanCategory;
 use crate::service::network::rpc::rpc_server::RpcServer;
+use crate::engine::consensus::finality::FinalityManager;
 
 use crate::indexes::utxo_index::UtxoIndex;
 use crate::indexes::tx_index::TxIndex;
@@ -72,6 +73,8 @@ pub struct DaemonNode {
     utxo_index:  Arc<Mutex<UtxoIndex>>,
     /// TX index (in-memory cache backed by RocksDB)
     tx_index:    Arc<Mutex<TxIndex>>,
+    /// Dynamic finality manager — adjusts finality depth based on DAG health
+    finality_manager: Mutex<FinalityManager>,
 }
 
 impl DaemonNode {
@@ -121,6 +124,11 @@ impl DaemonNode {
         let utxo_index = Arc::new(Mutex::new(UtxoIndex::new_with_db(db.clone())));
         let tx_index = Arc::new(Mutex::new(TxIndex::new_with_db(db.clone())));
 
+        // Initialize dynamic finality manager (10 BPS default)
+        let mut finality_mgr = FinalityManager::new(10);
+        finality_mgr = finality_mgr.with_db(db.clone());
+        finality_mgr.load_checkpoints();
+
         Ok(Self {
             cfg,
             db,
@@ -132,6 +140,7 @@ impl DaemonNode {
             mempool,
             utxo_index,
             tx_index,
+            finality_manager: Mutex::new(finality_mgr),
         })
     }
 
@@ -271,6 +280,15 @@ impl DaemonNode {
                         Ok(()) => {
                             total_blocks_processed += 1;
                             slog_info!("daemon", "block_processed", hash => hash_prefix, height => block.header.height, txs => block.body.transactions.len());
+
+                            // Notify finality manager of new accepted block
+                            // Simplified: assume accepted block is blue, dag_width=1
+                            self.finality_manager.lock().on_block(
+                                block.header.height,
+                                &block.header.hash,
+                                true,
+                                1,
+                            );
 
                             // Broadcast accepted block to peers (gossip propagation)
                             if let Ok(block_bytes) = bincode::serialize(&block) {

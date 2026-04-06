@@ -2501,12 +2501,19 @@ impl RpcServer {
     fn cmd_getfinalityinfo(id: Value, state: &SharedState) -> RpcResponse {
         match state.lock() {
             Ok(s) => {
-                use crate::engine::consensus::reorg::FINALITY_DEPTH;
+                use crate::engine::consensus::reorg::{FINALITY_DEPTH, MAX_REORG_DEPTH, ECONOMIC_FINALITY_WORK};
+                use crate::engine::consensus::finality::{BASE_FINALITY_DEPTH, MAX_FINALITY_DEPTH, CHECKPOINT_INTERVAL};
                 RpcResponse::ok(id, json!({
-                    "best_height":      s.best_height,
-                    "finality_depth":   FINALITY_DEPTH,
-                    "finalized_height": s.best_height.saturating_sub(FINALITY_DEPTH),
-                    "reorg_max_depth":  FINALITY_DEPTH,
+                    "best_height":            s.best_height,
+                    "finality_depth":         FINALITY_DEPTH,
+                    "finalized_height":       s.best_height.saturating_sub(FINALITY_DEPTH),
+                    "reorg_max_depth":        MAX_REORG_DEPTH,
+                    "economic_finality_work": ECONOMIC_FINALITY_WORK,
+                    "dynamic_finality": {
+                        "base_depth":           BASE_FINALITY_DEPTH,
+                        "max_depth":            MAX_FINALITY_DEPTH,
+                        "checkpoint_interval":  CHECKPOINT_INTERVAL,
+                    },
                 }))
             },
             Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
