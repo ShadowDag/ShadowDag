@@ -381,13 +381,16 @@ impl BlockValidator {
                 )));
             }
 
-            // R4: Causality — must be ≥ max parent timestamp
-            // In a DAG, parents are independent witnesses. The block
-            // cannot claim to be older than any of its parents.
+            // R4: Monotonic DAG time — must be STRICTLY GREATER than max
+            // ancestor timestamp. In a DAG, parents are independent witnesses.
+            // The block cannot claim to be at or before any ancestor's time.
+            // Strict inequality (>) prevents timestamp stalling where an
+            // attacker creates blocks at the same timestamp as parents,
+            // which would freeze the MTP and difficulty window.
             let max_parent_ts = ancestors.iter().copied().max().unwrap_or(0);
-            if ts < max_parent_ts {
+            if ts <= max_parent_ts {
                 return Err(ConsensusError::Timestamp(format!(
-                    "timestamp {} < max parent timestamp {} (causality violation)",
+                    "timestamp {} ≤ max ancestor timestamp {} (monotonic DAG time violation)",
                     ts, max_parent_ts
                 )));
             }
@@ -424,13 +427,33 @@ impl BlockValidator {
         Ok(())
     }
 
+    /// Compute the Median Time Past from ancestor timestamps.
+    ///
+    /// Uses a **weighted median** where duplicate timestamps (from parallel
+    /// DAG blocks at the same time) naturally increase that timestamp's
+    /// influence. This prevents a single attacker block from skewing the
+    /// MTP by injecting an outlier timestamp — the honest majority of
+    /// blocks at the real time will dominate the median.
+    ///
+    /// In a simple median with deduplication, an attacker controlling 1/N
+    /// of blocks can shift the median by 1/N of the range. With duplicates
+    /// kept, honest blocks at the true time form the majority and anchor
+    /// the median. This is equivalent to a difficulty-weighted median when
+    /// all blocks have similar difficulty.
     fn median_time_past(timestamps: &[u64]) -> u64 {
+        if timestamps.is_empty() {
+            return 0;
+        }
+
         let span = MEDIAN_TIME_SPAN.min(timestamps.len());
         let recent = &timestamps[timestamps.len() - span..];
 
         let mut sorted = recent.to_vec();
         sorted.sort_unstable();
 
+        // Use the median (middle element). With duplicate timestamps from
+        // parallel blocks, the median is weighted toward the most common
+        // timestamp value — which in an honest network is the true time.
         sorted[sorted.len() / 2]
     }
 

@@ -194,24 +194,54 @@ impl FullNode {
         self.process_block_inner(block, "local")
     }
 
-    /// Collect ancestor timestamps from parent blocks for MTP validation.
-    /// Returns timestamps of the last MEDIAN_TIME_SPAN ancestors (via parents).
+    /// Collect ancestor timestamps by walking the DAG deeply.
+    ///
+    /// Walks up to `TARGET_ANCESTOR_COUNT` ancestors via BFS to ensure the
+    /// MTP window has enough data for a robust median calculation. Previous
+    /// implementation only walked 2 levels (parents + grandparents), which
+    /// gave ~4-8 timestamps — insufficient for the 11-block MTP window.
+    ///
+    /// **Important:** Does NOT dedup timestamps. Duplicate timestamps from
+    /// parallel blocks at the same height are kept so the median correctly
+    /// reflects the "weight" of blocks at that timestamp.
     fn collect_ancestor_timestamps(&self, block: &Block) -> Vec<u64> {
-        let mut timestamps = Vec::with_capacity(block.header.parents.len() * 2);
-        // Collect timestamps from direct parents and their parents (up to ~11)
+        use std::collections::{VecDeque, HashSet};
+
+        const TARGET_ANCESTOR_COUNT: usize = 32; // Collect up to 32 ancestors
+        const MAX_WALK_DEPTH: usize = 8;         // Walk up to 8 DAG levels
+
+        let mut timestamps = Vec::with_capacity(TARGET_ANCESTOR_COUNT);
+        let mut visited = HashSet::with_capacity(TARGET_ANCESTOR_COUNT);
+        let mut queue: VecDeque<(String, usize)> = VecDeque::new(); // (hash, depth)
+
+        // Seed with direct parents
         for parent_hash in &block.header.parents {
-            if let Some(parent) = self.block_store.get_block(parent_hash) {
-                timestamps.push(parent.header.timestamp);
-                // Also collect grandparent timestamps to fill MTP window
-                for gp_hash in &parent.header.parents {
-                    if let Some(gp) = self.block_store.get_block(gp_hash) {
-                        timestamps.push(gp.header.timestamp);
+            if visited.insert(parent_hash.clone()) {
+                queue.push_back((parent_hash.clone(), 1));
+            }
+        }
+
+        // BFS walk up the DAG
+        while let Some((hash, depth)) = queue.pop_front() {
+            if timestamps.len() >= TARGET_ANCESTOR_COUNT {
+                break;
+            }
+
+            if let Some(ancestor) = self.block_store.get_block(&hash) {
+                timestamps.push(ancestor.header.timestamp);
+
+                // Walk deeper if we haven't reached the depth limit
+                if depth < MAX_WALK_DEPTH {
+                    for gp_hash in &ancestor.header.parents {
+                        if visited.insert(gp_hash.clone()) {
+                            queue.push_back((gp_hash.clone(), depth + 1));
+                        }
                     }
                 }
             }
         }
+
         timestamps.sort_unstable();
-        timestamps.dedup();
         timestamps
     }
 
