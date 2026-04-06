@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use ed25519_dalek::{VerifyingKey, Signature, Verifier};
 use sha2::{Sha256, Digest};
 
-use crate::domain::transaction::transaction::{Transaction, TxInput};
+use crate::domain::transaction::transaction::{Transaction, TxInput, TxType};
 use crate::domain::transaction::tx_hash::TxHash;
 use crate::domain::utxo::utxo::Utxo;
 use crate::domain::utxo::utxo_key::UtxoKey;
@@ -661,5 +661,44 @@ impl TxValidator {
         }
 
         Some(total)
+    }
+
+    /// Validate swap transaction payload fields.
+    /// Returns Ok(()) if the HTLC secret hash is well-formed.
+    pub fn validate_swap_payload(tx: &Transaction) -> Result<(), ConsensusError> {
+        if tx.tx_type != TxType::SwapTx {
+            return Ok(()); // Not a swap tx, skip
+        }
+        let hash = match &tx.payload_hash {
+            Some(h) => h,
+            None => return Err(ConsensusError::BlockValidation("SwapTx requires payload_hash".into())),
+        };
+        if hash.len() != 64 {
+            return Err(ConsensusError::BlockValidation(
+                format!("SwapTx payload_hash length {} != 64", hash.len())
+            ));
+        }
+        if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(ConsensusError::BlockValidation("SwapTx payload_hash contains non-hex chars".into()));
+        }
+        Ok(())
+    }
+
+    /// Validate DEX order transaction payload fields.
+    pub fn validate_dex_order_payload(tx: &Transaction) -> Result<(), ConsensusError> {
+        if tx.tx_type != TxType::DexOrder {
+            return Ok(()); // Not a dex order, skip
+        }
+        let data = match &tx.payload_hash {
+            Some(d) => d,
+            None => return Err(ConsensusError::BlockValidation("DexOrder requires payload_hash".into())),
+        };
+        if data.is_empty() {
+            return Err(ConsensusError::BlockValidation("DexOrder payload_hash is empty".into()));
+        }
+        if !data.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(ConsensusError::BlockValidation("DexOrder payload_hash contains non-hex chars".into()));
+        }
+        Ok(())
     }
 }

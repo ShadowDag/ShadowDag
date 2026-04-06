@@ -23,6 +23,10 @@ pub enum TxType {
     MultiSig,
     /// Token transfer (SRC-20 standard)
     TokenTransfer,
+    /// Swap transaction — wraps an HTLC operation (initiate/redeem/refund)
+    SwapTx,
+    /// DEX order placement/cancellation transaction
+    DexOrder,
 }
 
 
@@ -148,6 +152,8 @@ impl Transaction {
             TxType::AtomicSwap     => 0x04,
             TxType::MultiSig       => 0x05,
             TxType::TokenTransfer  => 0x06,
+            TxType::SwapTx         => 0x07,
+            TxType::DexOrder       => 0x08,
         };
         buf.push(tx_type_byte);
 
