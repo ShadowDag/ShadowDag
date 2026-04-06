@@ -1,0 +1,1282 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//                           S H A D O W D A G
+//                     © ShadowDAG Project — All Rights Reserved
+// ═══════════════════════════════════════════════════════════════════════════
+
+use std::collections::{HashSet, HashMap};
+use std::net::{TcpListener, TcpStream, SocketAddr};
+use std::io::{Read, Write, BufReader, BufWriter};
+use std::sync::Arc;
+use std::time::{Instant, Duration, SystemTime, UNIX_EPOCH};
+use std::thread;
+
+use serde::{Serialize, Deserialize};
+
+use crate::errors::NetworkError;
+use crate::service::network::p2p::peer_manager::PeerManager;
+use crate::service::network::dos_guard::{DosGuard, DosVerdict, MsgType, BanCategory};
+use crate::config::network::network_params::NetworkParams;
+use crate::config::node::node_config::{NodeConfig, NetworkMode};
+use crate::domain::block::block::Block;
+use crate::domain::transaction::transaction::Transaction;
+use crate::engine::dag::security::dag_shield::DagShield;
+use crate::service::network::p2p::connection_puzzle::{ConnectionPuzzle, ChallengeSolution};
+use crate::service::network::p2p::peer_diversity::PeerIdentity;
+use crate::service::network::p2p::protocol::{
+    self, WireHeader, CommandId, ProtocolSession, VersionPayload,
+    WIRE_HEADER_SIZE, CHAIN_ID, DEFAULT_BPS, MAX_MESSAGE_SIZE,
+    validate_header, validate_payload_checksum, validate_payload_size,
+    validate_inv_items, validate_addr_list, validate_headers_list, validate_hash_hex,
+    validate_reject, build_version_payload,
+};
+
+/// Global DoS guard — shared across all peer threads.
+static DOS_GUARD: Lazy<DosGuard> = Lazy::new(DosGuard::new);
+
+/// Inbound connection throttle: max new connections per second.
+const MAX_INBOUND_PER_SEC: u32 = 10;
+/// Max pending (not-yet-handshaked) connections.
+const MAX_PENDING_CONNECTIONS: usize = 64;
+
+pub const MAX_PEERS:             usize    = NetworkParams::MAX_PEERS;
+pub const MIN_PEERS:             usize    = NetworkParams::MIN_PEERS;
+pub const HANDSHAKE_TIMEOUT_MS:  u64      = 5_000;
+pub const MSG_MAX_BYTES:         usize    = 4 * 1024 * 1024;
+pub const RATE_LIMIT_MS:         u64      = 50;
+
+pub const DEFAULT_PORT:          u16      = NetworkParams::DEFAULT_PORT;
+pub const PROTOCOL_VERSION:      u32      = 1;
+
+// Cross-thread pending queues: P2P handler threads push here, node main loop drains.
+// Uses Arc<Mutex<>> so ANY thread can push and ANY thread can drain.
+// Each item is tagged with the peer_id that sent it, so the event loop
+// can ban_score on rejection (closing the feedback gap).
+use parking_lot::Mutex as PlMutex;
+use once_cell::sync::Lazy;
+
+/// (peer_id, transaction) — peer attribution for ban feedback on rejection.
+static PENDING_TXS: Lazy<Arc<PlMutex<Vec<(String, Transaction)>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(1024))));
+/// (peer_id, block) — peer attribution for ban feedback on rejection.
+static PENDING_BLOCKS: Lazy<Arc<PlMutex<Vec<(String, Block)>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(128))));
+
+/// Per-peer pending counts: prevents one peer from monopolizing the queue.
+/// Key: peer_id, Value: (pending_tx_count, pending_block_count)
+static PEER_PENDING: Lazy<Arc<PlMutex<HashMap<String, (u32, u32)>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(HashMap::new())));
+
+/// Max pending TXs allowed from a single peer before dropping.
+const MAX_PENDING_TXS_PER_PEER: u32 = 500;
+/// Max pending blocks allowed from a single peer before dropping.
+const MAX_PENDING_BLOCKS_PER_PEER: u32 = 50;
+/// Bytes per peer per minute — disconnect abusive peers (100MB/min).
+const MAX_BYTES_PER_PEER_PER_MIN: u64 = 100 * 1024 * 1024;
+/// Interval for bandwidth check (seconds)
+const BANDWIDTH_CHECK_INTERVAL_SECS: u64 = 60;
+/// Keepalive ping interval (seconds) — detect dead connections.
+const KEEPALIVE_INTERVAL_SECS: u64 = 60;
+/// Max time without pong before disconnecting (seconds).
+const PONG_TIMEOUT_SECS: u64 = 120;
+
+/// Broadcast outbound queue: (sequence_number, message).
+/// Each peer tracks `last_outbound_seq` so every peer gets every message.
+static OUTBOUND_MSGS: Lazy<Arc<PlMutex<(u64, Vec<(u64, P2PMessage)>)>>> =
+    Lazy::new(|| Arc::new(PlMutex::new((0, Vec::with_capacity(256)))));
+
+/// Targeted outbound messages: (target_peer_id, message).
+/// Used by Dandelion++ stem phase to send to exactly one peer.
+#[allow(clippy::type_complexity)]
+static TARGETED_MSGS: Lazy<Arc<PlMutex<Vec<(String, P2PMessage)>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(64))));
+
+/// Drain all pending transactions received by P2P (call from node main loop).
+/// Returns (peer_id, transaction) tuples for ban attribution.
+/// Thread-safe: works from ANY thread, not just the one that pushed.
+pub fn drain_pending_txs() -> Vec<(String, Transaction)> {
+    let items = std::mem::take(&mut *PENDING_TXS.lock());
+    // Decrement per-peer pending counts
+    if !items.is_empty() {
+        let mut counts = PEER_PENDING.lock();
+        for (peer, _) in &items {
+            if let Some(entry) = counts.get_mut(peer) {
+                entry.0 = entry.0.saturating_sub(1);
+            }
+        }
+    }
+    items
+}
+
+/// Drain all pending blocks received by P2P (call from node main loop).
+/// Returns (peer_id, block) tuples for ban attribution.
+/// Thread-safe: works from ANY thread, not just the one that pushed.
+pub fn drain_pending_blocks() -> Vec<(String, Block)> {
+    let items = std::mem::take(&mut *PENDING_BLOCKS.lock());
+    // Decrement per-peer pending counts
+    if !items.is_empty() {
+        let mut counts = PEER_PENDING.lock();
+        for (peer, _) in &items {
+            if let Some(entry) = counts.get_mut(peer) {
+                entry.1 = entry.1.saturating_sub(1);
+            }
+        }
+    }
+    items
+}
+
+/// Push a block into the pending queue for consensus validation.
+/// Thread-safe: can be called from RPC or any thread.
+/// The daemon event loop drains this queue and processes each block
+/// through FullNode::process_block() (full validation pipeline).
+pub fn push_pending_block(peer_id: &str, block: Block) -> bool {
+    let mut q = PENDING_BLOCKS.lock();
+    if q.len() < 1_000 {
+        q.push((peer_id.to_string(), block));
+        true
+    } else {
+        eprintln!("[P2P] WARN: pending block queue full, dropping");
+        false
+    }
+}
+
+/// Push a transaction into the pending queue for mempool validation.
+/// Thread-safe: can be called from RPC or any thread.
+pub fn push_pending_tx(peer_id: &str, tx: Transaction) -> bool {
+    let mut q = PENDING_TXS.lock();
+    if q.len() < 10_000 {
+        q.push((peer_id.to_string(), tx));
+        true
+    } else {
+        eprintln!("[P2P] WARN: pending tx queue full, dropping");
+        false
+    }
+}
+
+/// Report a bad TX/block to the DoS guard (called by event loop on rejection).
+/// Closes the feedback loop: event_loop → ban_score → P2P disconnects peer.
+pub fn report_bad_peer(peer_id: &str, score: u64, reason: &str) {
+    DOS_GUARD.add_ban_score(peer_id, score, reason);
+}
+
+/// Categorized version of report_bad_peer for callers that know the offense type.
+pub fn report_bad_peer_cat(peer_id: &str, score: u64, reason: &str, category: BanCategory) {
+    DOS_GUARD.add_ban_score_cat(peer_id, score, reason, category);
+}
+
+/// Push a message to be broadcast to all connected peers.
+/// Thread-safe: can be called from any thread (e.g. TxRelay, mempool).
+pub fn push_outbound(msg: P2PMessage) {
+    let mut q = OUTBOUND_MSGS.lock();
+    if q.1.len() < 10_000 {
+        let seq = q.0 + 1;
+        q.0 = seq;
+        q.1.push((seq, msg));
+    } else {
+        eprintln!("[P2P] WARN: outbound queue full, dropping message");
+    }
+}
+
+/// Push a message targeted at a specific peer (Dandelion++ stem phase).
+/// Thread-safe: can be called from any thread.
+pub fn push_outbound_to_peer(peer_id: &str, msg: P2PMessage) {
+    let mut q = TARGETED_MSGS.lock();
+    if q.len() < 10_000 {
+        q.push((peer_id.to_string(), msg));
+    } else {
+        eprintln!("[P2P] WARN: targeted queue full, dropping message");
+    }
+}
+
+/// Drain targeted messages for a specific peer_id.
+/// Each peer connection thread calls this with its own ID.
+fn drain_targeted_for(peer_id: &str) -> Vec<P2PMessage> {
+    let mut q = TARGETED_MSGS.lock();
+    let mut mine = Vec::new();
+    q.retain(|(target, msg)| {
+        if target == peer_id {
+            mine.push(msg.clone());
+            false // remove from queue
+        } else {
+            true // keep for other peers
+        }
+    });
+    mine
+}
+
+/// Get outbound messages that this peer hasn't sent yet.
+/// Each peer tracks its own `last_outbound_seq` to ensure ALL peers
+/// receive ALL broadcast messages (not just the first to drain).
+/// Also prunes old messages that all peers have had time to read.
+fn drain_outbound_since(since: u64) -> (Vec<P2PMessage>, u64) {
+    let mut q = OUTBOUND_MSGS.lock();
+    let new_msgs: Vec<P2PMessage> = q.1.iter()
+        .filter(|(seq, _)| *seq > since)
+        .map(|(_, msg)| msg.clone())
+        .collect();
+    let max_seq = q.0;
+    // Prune: keep only the last 2000 messages to bound memory
+    if q.1.len() > 2000 {
+        let drain_to = q.1.len() - 1000;
+        q.1.drain(..drain_to);
+    }
+    (new_msgs, max_seq)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum P2PMessage {
+    /// Connection puzzle challenge (anti-Sybil, sent by inbound acceptor).
+    PuzzleChallenge { challenge: String },
+    /// Connection puzzle solution (sent by connector in response).
+    PuzzleSolution  { challenge: String, nonce: u64, hash: String },
+
+    Version {
+        version:    u32,
+        height:     u64,
+        timestamp:  u64,
+        user_agent: String,
+        /// Blocks per second — must match for same-chain peers.
+        #[serde(default)]
+        bps:        u32,
+        /// Chain identifier — prevents cross-chain connections.
+        #[serde(default)]
+        chain_id:   u32,
+        /// Service flags (capabilities bitmap).
+        #[serde(default)]
+        services:   u64,
+        /// Random nonce for self-connection detection.
+        #[serde(default)]
+        nonce:      u64,
+    },
+    VerAck,
+
+    GetAddr,
+    Addr { peers: Vec<String> },
+
+    GetHeaders { from_hash: String, count: u32 },
+    Headers    { hashes: Vec<String> },
+    GetBlock   { hash: String },
+    Block      { data: Vec<u8> },
+
+    Tx         { data: Vec<u8> },
+    Inv        { items: Vec<InvItem> },
+    GetData    { items: Vec<InvItem> },
+
+    Ping { nonce: u64 },
+    Pong { nonce: u64 },
+    Reject { reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvItem {
+    pub kind: String,
+    pub hash: String,
+}
+
+/// Per-connection session state wrapping ProtocolSession with connection-level fields.
+///
+/// ProtocolSession handles: state machine, version negotiation, nonce tracking.
+/// ConnectionSession adds: addr, keepalive timers, bandwidth tracking.
+struct ConnectionSession {
+    /// Protocol state machine (handshake, lifecycle, version, nonces).
+    protocol: ProtocolSession,
+    /// Peer's socket address.
+    addr: SocketAddr,
+    /// Last time we received a Pong (keepalive monitoring).
+    last_pong: Instant,
+    /// Last time we sent a Ping (keepalive interval).
+    last_ping_sent: Instant,
+    /// Bandwidth tracking: bytes received since last reset.
+    bytes_this_window: u64,
+    /// When the current bandwidth window started.
+    bandwidth_window_start: Instant,
+    /// Last time we received any message (for stale detection).
+    last_message_at: u64,
+    /// Count of lifecycle violations (restricted peer sending forbidden commands).
+    /// Escalates ban score and disconnects after threshold.
+    lifecycle_violations: u32,
+    /// Whether this peer connected without solving the connection puzzle.
+    /// Legacy peers are monitored more aggressively.
+    legacy_peer: bool,
+    /// Last outbound broadcast sequence number sent to this peer.
+    /// Used to ensure every peer gets every broadcast message.
+    last_outbound_seq: u64,
+}
+
+// dos_type_name removed — CommandId::name() used directly now
+
+impl ConnectionSession {
+    fn new(addr: SocketAddr, outbound: bool) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self {
+            protocol:               ProtocolSession::new(outbound, DEFAULT_BPS),
+            addr,
+            last_pong:              Instant::now(),
+            last_ping_sent:         Instant::now(),
+            bytes_this_window:      0,
+            bandwidth_window_start: Instant::now(),
+            last_message_at:        now,
+            lifecycle_violations:   0,
+            legacy_peer:            false,
+            last_outbound_seq:      0,
+        }
+    }
+
+    fn touch(&mut self) {
+        self.last_message_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+    }
+
+    /// Track bandwidth and check if the peer exceeds MAX_BYTES_PER_PEER_PER_MIN.
+    /// Returns true if the peer should be disconnected for bandwidth abuse.
+    fn check_bandwidth(&mut self, bytes_read: u64) -> bool {
+        self.bytes_this_window += bytes_read;
+
+        // Reset window every BANDWIDTH_CHECK_INTERVAL_SECS
+        if self.bandwidth_window_start.elapsed() >= Duration::from_secs(BANDWIDTH_CHECK_INTERVAL_SECS) {
+            if self.bytes_this_window > MAX_BYTES_PER_PEER_PER_MIN {
+                return true; // disconnect
+            }
+            self.bytes_this_window = 0;
+            self.bandwidth_window_start = Instant::now();
+        }
+        false
+    }
+
+    /// Shorthand: handshake complete?
+    #[inline]
+    fn is_established(&self) -> bool {
+        self.protocol.is_established()
+    }
+
+    /// Record bytes received and update protocol stats.
+    fn record_bytes_received(&mut self, n: u64) {
+        self.protocol.bytes_received += n;
+    }
+
+    /// Record bytes sent and update protocol stats.
+    fn record_bytes_sent(&mut self, n: u64) {
+        self.protocol.bytes_sent += n;
+    }
+}
+
+pub struct P2P {
+    pub peers:             PeerManager,
+    pub message_pool:      Vec<String>,
+    /// Seen TX hashes (capped at 50K to prevent memory leak)
+    pub tx_seen:           HashSet<String>,
+    /// Peer activity tracking (pruned periodically)
+    peer_last_message:     HashMap<String, Instant>,
+    pub best_height:       u64,
+    pub listen_addr:       String,
+    pub network:           NetworkMode,
+    /// Network magic bytes from config (separates mainnet/testnet/regtest)
+    pub network_magic:     [u8; 4],
+    /// Anti-Eclipse: enforces subnet diversity + crypto identity
+    pub diversity:         crate::service::network::p2p::peer_diversity::PeerDiversity,
+    /// Dandelion++: privacy-preserving TX relay
+    pub dandelion:         crate::service::network::propagation::dandelion::DandelionRelay,
+}
+
+impl Default for P2P {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl P2P {
+    pub fn new() -> Result<Self, crate::errors::NetworkError> {
+        Self::new_with_config(&NodeConfig::for_network(NetworkMode::Mainnet))
+    }
+
+    pub fn new_with_config(cfg: &NodeConfig) -> Result<Self, crate::errors::NetworkError> {
+        let magic = cfg.network.magic();
+        eprintln!("[P2P] Initializing ShadowDAG network — {} on port {} (magic: {:02x}{:02x}{:02x}{:02x})",
+            cfg.network.name(), cfg.p2p_port, magic[0], magic[1], magic[2], magic[3]);
+        Ok(Self {
+            peers:             PeerManager::new_default_path(&cfg.peers_path_str())?,
+            message_pool:      Vec::new(),
+            tx_seen:           HashSet::new(),
+            peer_last_message: HashMap::new(),
+            best_height:       0,
+            listen_addr:       format!("0.0.0.0:{}", cfg.p2p_port),
+            network:           cfg.network.clone(),
+            network_magic:     magic,
+            diversity:         crate::service::network::p2p::peer_diversity::PeerDiversity::new(),
+            dandelion:         crate::service::network::propagation::dandelion::DandelionRelay::new(),
+        })
+    }
+
+    pub fn start(&mut self) {
+        eprintln!("[P2P] Starting network — listening on {}", self.listen_addr);
+
+        let listen_addr = self.listen_addr.clone();
+        let magic = self.network_magic;
+        let known_peers = self.peers.get_addr_list_limited(100);
+        thread::spawn(move || {
+            if let Err(e) = Self::accept_loop(&listen_addr, magic, &known_peers) {
+                eprintln!("[P2P] Accept loop error: {}", e);
+            }
+        });
+
+        self.peers.bootstrap_for_network(&self.network);
+        let _ = self.peers.discover_peers();
+        self.connect_to_peers();
+
+        eprintln!("[P2P] Connected to {} peers", self.peers.count());
+
+        self.request_headers_sync();
+    }
+
+    fn accept_loop(addr: &str, magic: [u8; 4], known_peers: &[String]) -> std::io::Result<()> {
+        let listener = TcpListener::bind(addr)?;
+        eprintln!("[P2P] Listening on {}", addr);
+
+        // Connection throttle state
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut accept_count: u32 = 0;
+        let mut last_accept_sec = std::time::Instant::now();
+
+        for stream in listener.incoming() {
+            match stream {
+                Ok(s) => {
+                    // ── Rate limit: max N new connections per second ──
+                    if last_accept_sec.elapsed() >= Duration::from_secs(1) {
+                        accept_count = 0;
+                        last_accept_sec = std::time::Instant::now();
+                    }
+                    accept_count += 1;
+                    if accept_count > MAX_INBOUND_PER_SEC {
+                        eprintln!("[P2P] Inbound throttle: dropping connection (>{}/sec)", MAX_INBOUND_PER_SEC);
+                        drop(s);
+                        continue;
+                    }
+
+                    // ── Pending connection limit ──
+                    let current_pending = pending.load(std::sync::atomic::Ordering::Relaxed);
+                    if current_pending >= MAX_PENDING_CONNECTIONS {
+                        eprintln!("[P2P] Too many pending connections ({}), dropping", current_pending);
+                        drop(s);
+                        continue;
+                    }
+
+                    let peer_addr = s.peer_addr()
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|_| "unknown".to_string());
+
+                    // ── Check if peer is banned ──
+                    if DOS_GUARD.is_banned(&peer_addr) {
+                        eprintln!("[P2P] Rejected banned peer {}", peer_addr);
+                        drop(s);
+                        continue;
+                    }
+
+                    eprintln!("[P2P] Inbound connection from {}", peer_addr);
+                    let peers_snapshot = known_peers.to_vec();
+                    let pending_clone = Arc::clone(&pending);
+                    pending_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    thread::spawn(move || {
+                        let result = Self::handle_peer_connection(s, false, magic, peers_snapshot);
+                        pending_clone.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Err(e) = result {
+                            eprintln!("[P2P] Peer {} error: {}", peer_addr, e);
+                        }
+                    });
+                }
+                Err(e) => eprintln!("[P2P] Accept error: {}", e),
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_peer_connection(
+        stream: TcpStream,
+        outbound: bool,
+        magic: [u8; 4],
+        known_peers: Vec<String>,
+    ) -> Result<(), NetworkError> {
+        stream.set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+        stream.set_write_timeout(Some(Duration::from_secs(10)))
+            .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+
+        let peer_addr = stream.peer_addr()
+            .map_err(|e| NetworkError::ConnectionFailed(format!("No peer addr: {}", e)))?;
+        let peer_str = peer_addr.to_string();
+
+        let mut reader = BufReader::new(&stream);
+        let mut writer = BufWriter::new(&stream);
+
+        // Session state: ProtocolSession + connection-level fields
+        let mut session = ConnectionSession::new(peer_addr, outbound);
+
+        // ── Connection puzzle (anti-Sybil) ─────────────────────────────────
+        if !outbound {
+            // Inbound: send puzzle challenge, wait for solution
+            let challenge = ConnectionPuzzle::generate_challenge();
+            if let Err(e) = session.protocol.sent_puzzle_challenge(&challenge.challenge) {
+                return Err(NetworkError::ConnectionFailed(format!("State error: {}", e)));
+            }
+            let bytes = Self::write_message(&mut writer, &P2PMessage::PuzzleChallenge {
+                challenge: challenge.challenge.clone(),
+            }, magic)?;
+            session.record_bytes_sent(bytes);
+
+            match Self::read_message(&mut reader, magic) {
+                Ok((P2PMessage::PuzzleSolution { challenge: c, nonce, hash }, _, sz)) => {
+                    session.record_bytes_received(sz as u64);
+                    let sol = ChallengeSolution { challenge: c, nonce, hash };
+                    if !ConnectionPuzzle::verify(&challenge, &sol) {
+                        DOS_GUARD.add_ban_score_cat(&peer_str, 100, "invalid puzzle solution", BanCategory::Malicious);
+                        return Err(NetworkError::ConnectionFailed(
+                            format!("Invalid puzzle solution from {}", peer_str)));
+                    }
+                    session.protocol.puzzle_verified().map_err(|e|
+                        NetworkError::ConnectionFailed(format!("State error: {}", e)))?;
+                    eprintln!("[P2P] Puzzle verified for inbound peer {}", peer_str);
+                }
+                Ok((_, cmd, _)) => {
+                    DOS_GUARD.add_ban_score_cat(&peer_str, 50, "expected puzzle solution", BanCategory::Malicious);
+                    return Err(NetworkError::ConnectionFailed(
+                        format!("Expected PuzzleSolution from {}, got {}", peer_str, cmd)));
+                }
+                Err(e) => {
+                    return Err(NetworkError::ConnectionFailed(
+                        format!("Puzzle exchange failed with {}: {}", peer_str, e)));
+                }
+            }
+        } else {
+            // Outbound: wait for puzzle challenge, solve it, send solution
+            match Self::read_message(&mut reader, magic) {
+                Ok((P2PMessage::PuzzleChallenge { challenge }, _, sz)) => {
+                    session.record_bytes_received(sz as u64);
+                    session.protocol.received_puzzle_challenge(&challenge).map_err(|e|
+                        NetworkError::ConnectionFailed(format!("State error: {}", e)))?;
+                    let sol = ConnectionPuzzle::solve(&challenge);
+                    let sol_msg = P2PMessage::PuzzleSolution {
+                        challenge: sol.challenge,
+                        nonce: sol.nonce,
+                        hash: sol.hash,
+                    };
+                    let bytes = Self::write_message(&mut writer, &sol_msg, magic)?;
+                    session.record_bytes_sent(bytes);
+                    session.protocol.puzzle_verified().map_err(|e|
+                        NetworkError::ConnectionFailed(format!("State error: {}", e)))?;
+                }
+                Ok((msg, cmd, sz)) => {
+                    // Legacy peer sent a non-puzzle message first.
+                    // Accept it but mark this peer as legacy (no puzzle support).
+                    // Only allow Version as the first non-puzzle message — anything
+                    // else is suspicious and gets a ban score.
+                    session.record_bytes_received(sz as u64);
+                    session.touch();
+                    session.protocol.puzzle_verified().ok();
+                    session.legacy_peer = true;
+                    if cmd != CommandId::Version {
+                        DOS_GUARD.add_ban_score_cat(&peer_str, 20,
+                            &format!("non-Version first message ({}), expected puzzle or Version", cmd),
+                            BanCategory::Malformed);
+                    }
+                    if let Err(e) = Self::dispatch_message(
+                        &mut writer, msg, &peer_str, magic, &mut session, &known_peers,
+                    ) {
+                        eprintln!("[P2P] Dispatch error from {}: {}", peer_str, e);
+                    }
+                }
+                Err(e) => {
+                    let emsg = e.to_string().to_lowercase();
+                    if !emsg.contains("timed out") && !emsg.contains("would block") && !emsg.contains("wouldblock")
+                        && !emsg.contains("temporarily unavailable") && !emsg.contains("os error 11") && !emsg.contains("os error 10035") {
+                        return Err(e);
+                    }
+                    // Timeout waiting for puzzle challenge — peer might be slow or legacy.
+                    // Allow connection but flag as legacy. The handshake timeout in the
+                    // main loop will catch peers that never complete Version/VerAck.
+                    session.protocol.puzzle_verified().ok();
+                    session.legacy_peer = true;
+                }
+            }
+        }
+
+        // ── Send our Version (after puzzle phase) ──────────────────────────
+        let bytes = Self::send_version(&mut writer, 0, magic)?;
+        session.record_bytes_sent(bytes);
+        session.protocol.sent_version().ok(); // best-effort state transition
+
+        // ── Main message loop ──────────────────────────────────────────────
+        loop {
+            match Self::read_message(&mut reader, magic) {
+                Ok((msg, cmd, bytes_read)) => {
+                    session.record_bytes_received(bytes_read as u64);
+                    session.protocol.msgs_received += 1;
+                    session.touch();
+
+                    // Bandwidth enforcement
+                    if session.check_bandwidth(bytes_read as u64) {
+                        DOS_GUARD.add_ban_score_cat(&peer_str, 50, "bandwidth abuse (>100MB/min)", BanCategory::Resource);
+                        eprintln!("[P2P] Disconnecting {} — bandwidth abuse ({} bytes/min)",
+                            peer_str, session.bytes_this_window);
+                        break;
+                    }
+
+                    // Protocol state machine: is this command allowed right now?
+                    if let Err(pe) = session.protocol.check_command_allowed(cmd) {
+                        DOS_GUARD.add_ban_score_cat(&peer_str, pe.ban_score as u64, &pe.message,
+                            if pe.ban_score >= 50 { BanCategory::Malicious } else { BanCategory::Malformed });
+                        eprintln!("[P2P] {} sent {} in state {} �� rejected (ban_score={})",
+                            peer_str, cmd, session.protocol.state, pe.ban_score);
+                        if pe.ban_score >= 50 { break; }
+                        continue;
+                    }
+
+                    // Lifecycle filter: restricted peers limited to Ping/Pong/Reject
+                    if let Err(pe) = session.protocol.check_lifecycle_allowed(cmd) {
+                        session.lifecycle_violations += 1;
+                        let (score, cat) = if session.lifecycle_violations > 5 {
+                            (20u64, BanCategory::Malformed)  // persistent = likely intentional
+                        } else {
+                            (5u64, BanCategory::Resource)    // few violations = possibly buggy client
+                        };
+                        DOS_GUARD.add_ban_score_cat(&peer_str, score,
+                            &format!("lifecycle violation #{}: {}", session.lifecycle_violations, pe), cat);
+                        eprintln!("[P2P] {} lifecycle blocked {} (violation #{})",
+                            peer_str, cmd, session.lifecycle_violations);
+                        if session.lifecycle_violations > 10 {
+                            eprintln!("[P2P] {} excessive lifecycle violations — disconnecting", peer_str);
+                            break;
+                        }
+                        continue;
+                    }
+
+                    if let Err(e) = Self::dispatch_message(
+                        &mut writer, msg, &peer_str, magic,
+                        &mut session, &known_peers,
+                    ) {
+                        eprintln!("[P2P] Dispatch error from {}: {}", peer_str, e);
+                        break;
+                    }
+
+                    // Flush broadcast + targeted outbound messages
+                    Self::flush_outbound(&mut writer, &peer_str, &mut session, magic);
+                }
+                Err(e) => {
+                    let msg = e.to_string().to_lowercase();
+                    let is_timeout = msg.contains("timed out")
+                        || msg.contains("would block")
+                        || msg.contains("wouldblock")
+                        || msg.contains("temporarily unavailable")
+                        || msg.contains("os error 11")
+                        || msg.contains("os error 10035");
+
+                    if is_timeout {
+                        // Keepalive ping
+                        if session.is_established()
+                            && session.last_ping_sent.elapsed() >= Duration::from_secs(KEEPALIVE_INTERVAL_SECS)
+                        {
+                            let nonce = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_nanos() as u64)
+                                .unwrap_or(0);
+                            match Self::write_message(&mut writer, &P2PMessage::Ping { nonce }, magic) {
+                                Ok(bytes) => {
+                                    session.record_bytes_sent(bytes);
+                                    session.last_ping_sent = Instant::now();
+                                }
+                                Err(we) => {
+                                    eprintln!("[P2P] Keepalive write error to {}: {}", peer_str, we);
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Pong timeout
+                        if session.is_established()
+                            && session.last_pong.elapsed() >= Duration::from_secs(PONG_TIMEOUT_SECS)
+                        {
+                            eprintln!("[P2P] Disconnecting {} — no pong in {}s", peer_str, PONG_TIMEOUT_SECS);
+                            let _ = Self::write_message(
+                                &mut writer,
+                                &P2PMessage::Reject { reason: "pong timeout".to_string() },
+                                magic,
+                            );
+                            session.protocol.begin_disconnect();
+                            break;
+                        }
+
+                        // Handshake timeout (protocol state machine)
+                        if let Err(pe) = session.protocol.check_handshake_timeout() {
+                            eprintln!("[P2P] {} handshake timed out: {}", peer_str, pe);
+                            let _ = Self::write_message(
+                                &mut writer,
+                                &P2PMessage::Reject { reason: format!("timeout: {}", pe) },
+                                magic,
+                            );
+                            session.protocol.begin_disconnect();
+                            break;
+                        }
+
+                        Self::flush_outbound(&mut writer, &peer_str, &mut session, magic);
+                        continue;
+                    }
+
+                    // Graceful disconnect
+                    let _ = Self::write_message(
+                        &mut writer,
+                        &P2PMessage::Reject { reason: format!("disconnect: {}", e) },
+                        magic,
+                    );
+                    session.protocol.begin_disconnect();
+                    eprintln!("[P2P] Peer {} disconnected: {}", peer_str, e);
+                    break;
+                }
+            }
+        }
+
+        log::debug!("[P2P] Connection to {} closed (state={}, lifecycle={}, rx={}, tx={})",
+            peer_str, session.protocol.state, session.protocol.lifecycle,
+            session.protocol.bytes_received, session.protocol.bytes_sent);
+        Ok(())
+    }
+
+    /// Flush broadcast + targeted outbound messages to a peer.
+    fn flush_outbound(
+        writer: &mut BufWriter<&TcpStream>,
+        peer_str: &str,
+        session: &mut ConnectionSession,
+        magic: [u8; 4],
+    ) {
+        let (outbound, new_seq) = drain_outbound_since(session.last_outbound_seq);
+        session.last_outbound_seq = new_seq;
+        for out_msg in &outbound {
+            match Self::write_message(writer, out_msg, magic) {
+                Ok(bytes) => session.record_bytes_sent(bytes),
+                Err(we) => {
+                    eprintln!("[P2P] Write error to {}: {}", peer_str, we);
+                    return;
+                }
+            }
+        }
+        let targeted = drain_targeted_for(peer_str);
+        for t_msg in &targeted {
+            match Self::write_message(writer, t_msg, magic) {
+                Ok(bytes) => session.record_bytes_sent(bytes),
+                Err(we) => {
+                    eprintln!("[P2P] Write error (targeted) to {}: {}", peer_str, we);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Write a framed message with 13-byte wire header (magic + cmd + len + checksum).
+    ///
+    /// The checksum (first 4 bytes of SHA-256(payload)) is computed and verified
+    /// on both ends — protects against bit flips, truncation, and tampering.
+    fn write_message(
+        writer: &mut BufWriter<&TcpStream>,
+        msg: &P2PMessage,
+        magic: [u8; 4],
+    ) -> Result<u64, NetworkError> {
+        let payload = bincode::serialize(msg)
+            .map_err(|e| NetworkError::Serialization(e.to_string()))?;
+
+        if payload.len() > MAX_MESSAGE_SIZE {
+            return Err(NetworkError::Serialization(
+                format!("Message too large: {} bytes > {}", payload.len(), MAX_MESSAGE_SIZE)));
+        }
+
+        // Map P2PMessage variant → CommandId for the wire header
+        let cmd = Self::msg_to_command_id(msg);
+
+        // Build 13-byte header: magic(4) + cmd(1) + len(4) + checksum(4)
+        let header = WireHeader::for_payload(magic, cmd as u8, &payload);
+        let hdr_bytes = header.encode();
+
+        let mut buf = Vec::with_capacity(WIRE_HEADER_SIZE + payload.len());
+        buf.extend_from_slice(&hdr_bytes);
+        buf.extend_from_slice(&payload);
+
+        let total = buf.len() as u64;
+        writer.write_all(&buf).map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+        writer.flush().map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+        Ok(total)
+    }
+
+    /// Map a P2PMessage variant to its CommandId for wire framing.
+    fn msg_to_command_id(msg: &P2PMessage) -> CommandId {
+        match msg {
+            P2PMessage::Version { .. }         => CommandId::Version,
+            P2PMessage::VerAck                 => CommandId::VerAck,
+            P2PMessage::Ping { .. }            => CommandId::Ping,
+            P2PMessage::Pong { .. }            => CommandId::Pong,
+            P2PMessage::GetAddr                => CommandId::GetAddr,
+            P2PMessage::Addr { .. }            => CommandId::Addr,
+            P2PMessage::Inv { .. }             => CommandId::Inv,
+            P2PMessage::GetData { .. }         => CommandId::GetData,
+            P2PMessage::Block { .. }           => CommandId::Block,
+            P2PMessage::Tx { .. }              => CommandId::Tx,
+            P2PMessage::GetHeaders { .. }      => CommandId::GetHeaders,
+            P2PMessage::Headers { .. }         => CommandId::Headers,
+            P2PMessage::GetBlock { .. }        => CommandId::GetBlocks,
+            P2PMessage::Reject { .. }          => CommandId::Reject,
+            P2PMessage::PuzzleChallenge { .. } => CommandId::PuzzleChallenge,
+            P2PMessage::PuzzleSolution { .. }  => CommandId::PuzzleSolution,
+        }
+    }
+
+    /// Read a framed message with full wire header validation.
+    ///
+    /// Validation order (defense-in-depth):
+    ///   1. Read 13-byte header
+    ///   2. Validate magic (wrong network → reject immediately)
+    ///   3. Validate command_id (unknown → reject before reading payload)
+    ///   4. Validate payload_len (oversize → reject before allocating)
+    ///   5. Read payload bytes
+    ///   6. Validate checksum (corrupted/tampered → reject before deserializing)
+    ///   7. Validate per-command payload size bounds
+    ///   8. Deserialize payload (only after all structural checks pass)
+    fn read_message(
+        reader: &mut BufReader<&TcpStream>,
+        magic: [u8; 4],
+    ) -> Result<(P2PMessage, CommandId, usize), NetworkError> {
+        // 1. Read wire header (13 bytes)
+        let mut hdr_buf = [0u8; WIRE_HEADER_SIZE];
+        reader.read_exact(&mut hdr_buf)
+            .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+        let header = WireHeader::decode(&hdr_buf);
+
+        // 2-4. Validate header: magic, command_id, payload_len
+        let cmd = validate_header(&header, magic).map_err(|pe| {
+            NetworkError::Serialization(format!("[Protocol] {}", pe))
+        })?;
+
+        // 5. Read payload
+        let payload_len = header.payload_len as usize;
+        let mut payload = vec![0u8; payload_len];
+        if payload_len > 0 {
+            reader.read_exact(&mut payload)
+                .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+        }
+
+        // 6. Validate checksum (BEFORE deserialization — blocks tampered data)
+        validate_payload_checksum(&payload, header.checksum).map_err(|pe| {
+            NetworkError::Serialization(format!("[Protocol] {}", pe))
+        })?;
+
+        // 7. Validate per-command payload size bounds
+        validate_payload_size(cmd, payload_len).map_err(|pe| {
+            NetworkError::Serialization(format!("[Protocol] {}", pe))
+        })?;
+
+        // 8. Deserialize payload (bincode)
+        let msg: P2PMessage = bincode::deserialize(&payload)
+            .map_err(|e| NetworkError::Serialization(
+                format!("[Protocol] {} deserialize failed: {}", cmd, e)))?;
+
+        Ok((msg, cmd, WIRE_HEADER_SIZE + payload_len))
+    }
+
+    /// Map CommandId to DoS guard MsgType for rate limiting.
+    fn cmd_to_dos_type(cmd: CommandId) -> MsgType {
+        match cmd {
+            CommandId::Version         => MsgType::Version,
+            CommandId::VerAck          => MsgType::VerAck,
+            CommandId::Ping            => MsgType::Ping,
+            CommandId::Pong            => MsgType::Pong,
+            CommandId::Tx              => MsgType::Tx,
+            CommandId::Block           => MsgType::Block,
+            CommandId::Inv             => MsgType::Inv,
+            CommandId::GetData         => MsgType::GetData,
+            CommandId::GetAddr         => MsgType::GetAddr,
+            CommandId::Addr            => MsgType::Addr,
+            CommandId::GetHeaders      => MsgType::GetHeaders,
+            CommandId::Headers         => MsgType::Headers,
+            CommandId::GetBlocks       => MsgType::GetBlocks,
+            CommandId::GetMempool      => MsgType::Mempool,
+            CommandId::Reject          => MsgType::Reject,
+            _                          => MsgType::Unknown,
+        }
+    }
+
+    fn dispatch_message(
+        writer: &mut BufWriter<&TcpStream>,
+        msg: P2PMessage,
+        peer: &str,
+        magic: [u8; 4],
+        session: &mut ConnectionSession,
+        known_peers: &[String],
+    ) -> Result<(), NetworkError> {
+        // ── DoS Guard: rate limit + ban check ──
+        let cmd = Self::msg_to_command_id(&msg);
+        let dos_type = Self::cmd_to_dos_type(cmd);
+        let msg_size = std::mem::size_of_val(&msg);
+        match DOS_GUARD.check(peer, &dos_type, msg_size) {
+            DosVerdict::Allow => {}
+            DosVerdict::BanActive => {
+                return Err(NetworkError::PeerBanned(peer.to_string()));
+            }
+            DosVerdict::RateLimited { .. } => {
+                eprintln!("[P2P] Rate limited peer {}", peer);
+                return Ok(());
+            }
+            DosVerdict::GlobalRateLimited => {
+                return Ok(());
+            }
+            DosVerdict::OversizedMessage { allowed, got } => {
+                eprintln!("[P2P] Oversized msg from {}: {} > {}", peer, got, allowed);
+                return Err(NetworkError::DosGuard(format!("oversized message from {}", peer)));
+            }
+        }
+
+        // NOTE: Handshake enforcement + lifecycle filtering are done in the
+        // main loop BEFORE dispatch_message is called, using:
+        //   session.protocol.check_command_allowed(cmd)
+        //   session.protocol.check_lifecycle_allowed(cmd)
+
+        match msg {
+            // ── Puzzle messages (edge case: received in main loop) ──────
+            P2PMessage::PuzzleChallenge { challenge } => {
+                let sol = ConnectionPuzzle::solve(&challenge);
+                let sol_msg = P2PMessage::PuzzleSolution {
+                    challenge: sol.challenge,
+                    nonce: sol.nonce,
+                    hash: sol.hash,
+                };
+                let bytes = Self::write_message(writer, &sol_msg, magic)?;
+                session.record_bytes_sent(bytes);
+                session.protocol.puzzle_verified().ok();
+            }
+
+            P2PMessage::PuzzleSolution { .. } => {
+                DOS_GUARD.add_ban_score_cat(peer, 10, "unexpected puzzle solution", BanCategory::Malformed);
+            }
+
+            // ── Version: full validation via ProtocolSession ────────���──
+            P2PMessage::Version { version, height, timestamp, user_agent,
+                                  bps, chain_id, services, nonce } => {
+                // Build VersionPayload and validate through protocol state machine
+                let payload = VersionPayload {
+                    version,
+                    height,
+                    timestamp,
+                    user_agent: user_agent.clone(),
+                    bps:      if bps == 0 { DEFAULT_BPS } else { bps },  // backward compat
+                    chain_id: if chain_id == 0 { CHAIN_ID } else { chain_id },
+                    services: if services == 0 { protocol::SERVICE_NODE_NETWORK } else { services },
+                    nonce,
+                };
+
+                // ProtocolSession::received_version validates:
+                //   - version range [1, PROTOCOL_VERSION]
+                //   - BPS match
+                //   - chain_id match
+                //   - timestamp drift (±5 min)
+                //   - user_agent bounds + control chars
+                //   - service flags
+                //   - duplicate version (100 ban_score)
+                if let Err(pe) = session.protocol.received_version(payload) {
+                    DOS_GUARD.add_ban_score_cat(peer, pe.ban_score as u64, &pe.message,
+                        if pe.ban_score >= 100 { BanCategory::Malicious } else { BanCategory::Malformed });
+                    if pe.ban_score >= 50 {
+                        return Err(NetworkError::ConnectionFailed(
+                            format!("Version rejected from {}: {}", peer, pe)));
+                    }
+                    return Ok(());
+                }
+
+                // Log peer identity
+                if let Some(id) = session.protocol.peer_identity() {
+                    eprintln!("[P2P] Peer {} identity: {}...", peer, &id[..id.len().min(16)]);
+                }
+
+                let bytes = Self::write_message(writer, &P2PMessage::VerAck, magic)?;
+                session.record_bytes_sent(bytes);
+            }
+
+            // ── VerAck: complete handshake via state machine ───────────
+            P2PMessage::VerAck => {
+                if let Err(pe) = session.protocol.received_verack() {
+                    DOS_GUARD.add_ban_score_cat(peer, pe.ban_score as u64, &pe.message, BanCategory::Malformed);
+                    return Ok(());
+                }
+                eprintln!("[P2P] Handshake complete with {} (height={}, lifecycle={})",
+                    peer, session.protocol.peer_height(), session.protocol.lifecycle);
+
+                // Initiate sync if peer is ahead
+                let peer_height = session.protocol.peer_height();
+                if peer_height > 0 {
+                    session.protocol.begin_header_sync(peer_height);
+                } else {
+                    session.protocol.sync_complete();
+                }
+
+                // Request peer addresses
+                let bytes = Self::write_message(writer, &P2PMessage::GetAddr, magic)?;
+                session.record_bytes_sent(bytes);
+            }
+
+            // ── GetAddr: validated address list ─���──────────────────────
+            P2PMessage::GetAddr => {
+                let addrs: Vec<String> = known_peers.iter().take(100).cloned().collect();
+                let response = P2PMessage::Addr { peers: addrs };
+                let bytes = Self::write_message(writer, &response, magic)?;
+                session.record_bytes_sent(bytes);
+            }
+
+            // ── Addr: validate list size ──���────────────────────────────
+            P2PMessage::Addr { ref peers } => {
+                if let Err(pe) = validate_addr_list(peers) {
+                    DOS_GUARD.add_ban_score_cat(peer, pe.ban_score as u64, &pe.message, BanCategory::Malformed);
+                    return Ok(());
+                }
+                // Addresses are processed by the peer manager
+                log::debug!("[P2P] Received {} addresses from {}", peers.len(), peer);
+            }
+
+            // ── Ping: anti-replay via ProtocolSession nonce tracking ───
+            P2PMessage::Ping { nonce } => {
+                if !session.protocol.record_nonce(nonce) {
+                    DOS_GUARD.add_ban_score_cat(peer, 20, "duplicate ping nonce (replay)", BanCategory::Malicious);
+                    eprintln!("[P2P] Replay detected from {}: duplicate ping nonce {}", peer, nonce);
+                    return Ok(());
+                }
+                let bytes = Self::write_message(writer, &P2PMessage::Pong { nonce }, magic)?;
+                session.record_bytes_sent(bytes);
+            }
+
+            // ── Pong: anti-replay + keepalive tracking ─────────────────
+            P2PMessage::Pong { nonce } => {
+                if !session.protocol.record_nonce(nonce) {
+                    DOS_GUARD.add_ban_score_cat(peer, 20, "duplicate pong nonce (replay)", BanCategory::Malicious);
+                    return Ok(());
+                }
+                session.last_pong = Instant::now();
+            }
+
+            // ── Tx: DagShield pre-validation + queue management ────��───
+            P2PMessage::Tx { data } => {
+                match bincode::deserialize::<Transaction>(&data) {
+                    Ok(tx) => {
+                        match DagShield::pre_validate_tx(&tx) {
+                            Ok(()) => {
+                                // Atomicize quota check + queue push under a single lock scope
+                                // to prevent TOCTOU race where multiple threads pass the check.
+                                let pushed = {
+                                    let mut q = PENDING_TXS.lock();
+                                    if q.len() >= 10_000 {
+                                        false
+                                    } else {
+                                        // Check per-peer quota inside the same critical section
+                                        let mut m = PEER_PENDING.lock();
+                                        let entry = m.entry(peer.to_string()).or_insert((0, 0));
+                                        if entry.0 >= MAX_PENDING_TXS_PER_PEER {
+                                            false
+                                        } else {
+                                            entry.0 += 1;
+                                            q.push((peer.to_string(), tx));
+                                            true
+                                        }
+                                    }
+                                };
+
+                                if !pushed {
+                                    DOS_GUARD.add_ban_score_cat(peer, 5, "TX queue quota exceeded or full", BanCategory::Resource);
+                                }
+                            }
+                            Err(rej) => {
+                                DOS_GUARD.add_ban_score_cat(peer, rej.ban_score as u64, rej.reason, BanCategory::Malformed);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Malformed bincode = either attack or deeply broken client.
+                        // Score 25 so 4 malformed TXs = auto-ban (100).
+                        DOS_GUARD.add_ban_score_cat(peer, 25, "invalid tx deserialization", BanCategory::Malformed);
+                        eprintln!("[P2P] Invalid TX from {}: {}", peer, e);
+                    }
+                }
+            }
+
+            // ── Block: DagShield pre-validation + queue management ──────
+            P2PMessage::Block { data } => {
+                match bincode::deserialize::<Block>(&data) {
+                    Ok(block) => {
+                        match DagShield::pre_validate_block(&block) {
+                            Ok(()) => {
+                                // Atomicize quota check + queue push (same pattern as Tx)
+                                let pushed = {
+                                    let mut q = PENDING_BLOCKS.lock();
+                                    if q.len() >= 1_000 {
+                                        false
+                                    } else {
+                                        let mut m = PEER_PENDING.lock();
+                                        let entry = m.entry(peer.to_string()).or_insert((0, 0));
+                                        if entry.1 >= MAX_PENDING_BLOCKS_PER_PEER {
+                                            false
+                                        } else {
+                                            entry.1 += 1;
+                                            q.push((peer.to_string(), block));
+                                            true
+                                        }
+                                    }
+                                };
+
+                                if !pushed {
+                                    DOS_GUARD.add_ban_score_cat(peer, 10, "block queue quota exceeded or full", BanCategory::Resource);
+                                }
+                            }
+                            Err(rej) => {
+                                DOS_GUARD.add_ban_score_cat(peer, rej.ban_score as u64, rej.reason, BanCategory::Malformed);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Malformed block bincode = immediate high penalty.
+                        // Score 50 so 2 malformed blocks = auto-ban.
+                        DOS_GUARD.add_ban_score_cat(peer, 50, "invalid block deserialization", BanCategory::Malformed);
+                        eprintln!("[P2P] Invalid Block from {}: {}", peer, e);
+                    }
+                }
+            }
+
+            // ── Inv: validate item list via protocol validators ─────────
+            P2PMessage::Inv { ref items } => {
+                let pairs: Vec<(String, String)> = items.iter()
+                    .map(|i| (i.kind.clone(), i.hash.clone()))
+                    .collect();
+                if let Err(pe) = validate_inv_items(&pairs) {
+                    DOS_GUARD.add_ban_score_cat(peer, pe.ban_score as u64, &pe.message, BanCategory::Malformed);
+                    return Ok(());
+                }
+                let get_data = P2PMessage::GetData { items: items.clone() };
+                let bytes = Self::write_message(writer, &get_data, magic)?;
+                session.record_bytes_sent(bytes);
+            }
+
+            // ── GetData: validate item list ─────────────────────────────
+            P2PMessage::GetData { ref items } => {
+                let pairs: Vec<(String, String)> = items.iter()
+                    .map(|i| (i.kind.clone(), i.hash.clone()))
+                    .collect();
+                if let Err(pe) = validate_inv_items(&pairs) {
+                    DOS_GUARD.add_ban_score_cat(peer, pe.ban_score as u64, &pe.message, BanCategory::Malformed);
+                    return Ok(());
+                }
+                // Data serving handled by upper layer
+            }
+
+            // ── GetHeaders: validate hash ───────────────────────────────
+            P2PMessage::GetHeaders { ref from_hash, .. } => {
+                if !from_hash.is_empty() {
+                    if let Err(pe) = validate_hash_hex(from_hash) {
+                        DOS_GUARD.add_ban_score_cat(peer, pe.ban_score as u64, &pe.message, BanCategory::Malformed);
+                        return Ok(());
+                    }
+                }
+            }
+
+            // ── Headers: validate hash list ─────────────────────────────
+            P2PMessage::Headers { ref hashes } => {
+                if let Err(pe) = validate_headers_list(hashes) {
+                    DOS_GUARD.add_ban_score_cat(peer, pe.ban_score as u64, &pe.message, BanCategory::Malformed);
+                    return Ok(());
+                }
+            }
+
+            // ── GetBlock: validate hash ─────────────────────────────────
+            P2PMessage::GetBlock { ref hash } => {
+                if let Err(pe) = validate_hash_hex(hash) {
+                    DOS_GUARD.add_ban_score_cat(peer, pe.ban_score as u64, &pe.message, BanCategory::Malformed);
+                    return Ok(());
+                }
+            }
+
+            // ── Reject: validate reason length ──────────────────────────
+            P2PMessage::Reject { ref reason } => {
+                if let Err(pe) = validate_reject(reason) {
+                    DOS_GUARD.add_ban_score_cat(peer, pe.ban_score as u64, &pe.message, BanCategory::Malformed);
+                    return Ok(());
+                }
+                eprintln!("[P2P] Rejected by {}: {}", peer, reason);
+            }
+        }
+        Ok(())
+    }
+
+    fn send_version(
+        writer: &mut BufWriter<&TcpStream>,
+        height: u64,
+        magic: [u8; 4],
+    ) -> Result<u64, NetworkError> {
+        let identity = PeerIdentity::generate();
+        let user_agent = format!("ShadowDAG/{} id:{}", env!("CARGO_PKG_VERSION"), identity.public_key);
+        let vp = build_version_payload(&user_agent, height, DEFAULT_BPS);
+
+        let msg = P2PMessage::Version {
+            version:    vp.version,
+            height:     vp.height,
+            timestamp:  vp.timestamp,
+            user_agent: vp.user_agent,
+            bps:        vp.bps,
+            chain_id:   vp.chain_id,
+            services:   vp.services,
+            nonce:      vp.nonce,
+        };
+        Self::write_message(writer, &msg, magic)
+    }
+
+    fn connect_to_peers(&mut self) {
+        let peer_list = self.peers.get_peers();
+        let count = peer_list.len().min(MAX_PEERS);
+        let magic = self.network_magic;
+        let known_peers = self.peers.get_addr_list_limited(100);
+        eprintln!("[P2P] Connecting to {} peers", count);
+
+        for addr in peer_list.into_iter().take(count) {
+            let addr_clone = addr.clone();
+            let peers_snapshot = known_peers.clone();
+            thread::spawn(move || {
+                match TcpStream::connect(&addr_clone) {
+                    Ok(stream) => {
+                        eprintln!("[P2P] Connected to {}", addr_clone);
+                        if let Err(e) = Self::handle_peer_connection(stream, true, magic, peers_snapshot) {
+                            eprintln!("[P2P] Peer {} error: {}", addr_clone, e);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[P2P] Cannot connect to {}: {}", addr_clone, e);
+                    }
+                }
+            });
+        }
+    }
+
+    fn request_headers_sync(&self) {
+        eprintln!("[P2P] Requesting headers sync from height {}", self.best_height);
+        // NOTE: actual sync is performed inside each peer connection via dispatch_message.
+        // A full implementation would iterate connected peers and send GetHeaders.
+    }
+
+    pub fn allow_peer(&mut self, peer_id: &str) -> bool {
+        let now = Instant::now();
+        if let Some(last) = self.peer_last_message.get(peer_id) {
+            if now.duration_since(*last) < Duration::from_millis(RATE_LIMIT_MS) {
+                return false;
+            }
+        }
+        self.peer_last_message.insert(peer_id.to_string(), now);
+        true
+    }
+
+    pub fn fast_sync_headers(&self) {
+        eprintln!("[P2P] fast_sync_headers → use request_headers_sync()");
+    }
+    pub fn fast_sync_blocks(&self) {
+        eprintln!("[P2P] fast_sync_blocks → requesting full block sync");
+    }
+}

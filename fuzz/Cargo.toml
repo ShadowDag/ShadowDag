@@ -1,0 +1,40 @@
+[package]
+name = "shadowdag-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bincode = "1"
+serde_json = "1"
+
+[dependencies.shadowdag]
+path = ".."
+
+# ─── Fuzz Targets ─────────────────────────────────────────────────────────
+
+[[bin]]
+name = "fuzz_vm_execute"
+path = "fuzz_targets/fuzz_vm_execute.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_transaction_deserialize"
+path = "fuzz_targets/fuzz_transaction_deserialize.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_block_deserialize"
+path = "fuzz_targets/fuzz_block_deserialize.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_canonical_bytes"
+path = "fuzz_targets/fuzz_canonical_bytes.rs"
+doc = false
+
+[workspace]

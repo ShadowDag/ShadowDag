@@ -1,0 +1,477 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//                           S H A D O W D A G
+//                     © ShadowDAG Project — All Rights Reserved
+// ═══════════════════════════════════════════════════════════════════════════
+
+use rocksdb::{DB, Options};
+use std::sync::Arc;
+
+use crate::domain::block::block::Block;
+use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
+
+const BLK_PREFIX: &str = "blk:";
+const BLK_BEST_HASH: &[u8] = b"blk:best_hash";
+
+pub struct BlockStore {
+    db: Arc<DB>,
+}
+
+impl BlockStore {
+    pub fn new<S: Into<SharedDbSource>>(source: S) -> Result<Self, crate::errors::StorageError> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.set_write_buffer_size(64 * 1024 * 1024);
+        let db = open_shared_db(source, &opts)
+            .map_err(|e| {
+                eprintln!("[BlockStore] ERROR: Block storage unavailable: {}", e);
+                e
+            })?;
+        Ok(Self { db })
+    }
+
+    /// Save a block to the store.
+    /// Height index uses `blk:height:{h}:{hash}` to support multiple blocks at the same
+    /// height (DAG-compatible). This is NOT a linear chain — many blocks can share a height.
+    pub fn save_block(&self, block: &Block) -> bool {
+        let hash = &block.header.hash;
+        let block_key = format!("{}{}", BLK_PREFIX, hash);
+        match bincode::serialize(block) {
+            Ok(data) => {
+                let mut batch = rocksdb::WriteBatch::default();
+                batch.put(block_key.as_bytes(), &data);
+                // DAG-compatible height index: blk:height:{h}:{hash}
+                // Multiple blocks can exist at the same height
+                let height_key = format!("{}height:{}:{}", BLK_PREFIX, block.header.height, hash);
+                batch.put(height_key.as_bytes(), hash.as_bytes());
+                match self.db.write(batch) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        eprintln!("[BlockStore] write failed: {}", e);
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[BlockStore] Serialize error: {}", e);
+                false
+            }
+        }
+    }
+
+    /// Store the UTXO commitment hash for a block.
+    /// Called after UTXO state is applied, so recovery can verify integrity.
+    pub fn set_utxo_commitment(&self, block_hash: &str, commitment: &str) {
+        let key = format!("{}utxo_commit:{}", BLK_PREFIX, block_hash);
+        if let Err(e) = self.db.put(key.as_bytes(), commitment.as_bytes()) {
+            eprintln!("[BlockStore] set_utxo_commitment failed: {}", e);
+        }
+    }
+
+    /// Get the UTXO commitment hash for a block.
+    pub fn get_utxo_commitment(&self, block_hash: &str) -> Option<String> {
+        let key = format!("{}utxo_commit:{}", BLK_PREFIX, block_hash);
+        match self.db.get(key.as_bytes()) {
+            Ok(Some(data)) => String::from_utf8(data.to_vec()).ok(),
+            _ => None,
+        }
+    }
+
+    /// Explicitly set the best (tip) block hash.
+    /// The consensus layer / DAG manager should call this after determining
+    /// which block is the true DAG tip (e.g., by blue score), not on every save.
+    pub fn update_best_hash(&self, hash: &str) -> bool {
+        match self.db.put(BLK_BEST_HASH, hash.as_bytes()) {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("[BlockStore] update_best_hash failed: {}", e);
+                false
+            }
+        }
+    }
+
+    pub fn get_block(&self, hash: &str) -> Option<Block> {
+        let key = format!("{}{}", BLK_PREFIX, hash);
+        match self.db.get(key.as_bytes()) {
+            Ok(Some(data)) => match bincode::deserialize(&data) {
+                Ok(block) => Some(block),
+                Err(e) => {
+                    eprintln!("[BlockStore] deserialization error for block '{}': {}", hash, e);
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("[BlockStore] DB read error for block '{}': {}", hash, e);
+                None
+            }
+        }
+    }
+
+    pub fn block_exists(&self, hash: &str) -> bool {
+        let key = format!("{}{}", BLK_PREFIX, hash);
+        matches!(self.db.get(key.as_bytes()), Ok(Some(_)))
+    }
+
+    pub fn get_best_hash(&self) -> Option<String> {
+        match self.db.get(BLK_BEST_HASH) {
+            Ok(Some(data)) => String::from_utf8(data.to_vec()).ok(),
+            _ => None,
+        }
+    }
+
+    pub fn get_recent_blocks(&self, limit: usize) -> Vec<Block> {
+        let mut blocks: Vec<Block> = Vec::new();
+        let prefix = BLK_PREFIX.as_bytes();
+        let iter = self.db.prefix_iterator(prefix);
+        for item in iter {
+            if blocks.len() >= limit { break; }
+            if let Ok((k, v)) = item {
+                let key_str = String::from_utf8(k.to_vec()).unwrap_or_default();
+                // Skip metadata keys (best_hash, height index)
+                if !key_str.starts_with(BLK_PREFIX) { break; }
+                if key_str == "blk:best_hash" { continue; }
+                if key_str.contains(":height:") { continue; }
+                if let Ok(block) = bincode::deserialize::<Block>(&v) {
+                    blocks.push(block);
+                }
+            }
+        }
+        blocks
+    }
+
+    pub fn count(&self) -> usize {
+        let prefix = BLK_PREFIX.as_bytes();
+        self.db.prefix_iterator(prefix)
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!("[BlockStore] iterator error: {}", e);
+                    None
+                }
+            })
+            .filter(|(k, _)| {
+                let key_str = String::from_utf8(k.to_vec()).unwrap_or_default();
+                key_str.starts_with(BLK_PREFIX)
+                    && key_str != "blk:best_hash"
+                    && !key_str.contains(":height:")
+            })
+            .count()
+    }
+
+    /// Return all blocks sorted by height (ascending).
+    /// Used by crash recovery to rebuild DAG and UTXO state from the source of truth.
+    pub fn get_all_blocks_sorted_by_height(&self) -> Vec<Block> {
+        let mut blocks = Vec::new();
+        let prefix = BLK_PREFIX.as_bytes();
+        let iter = self.db.prefix_iterator(prefix);
+
+        for item in iter {
+            let (k, v) = match item {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("[BlockStore] iterator error: {}", e);
+                    continue;
+                }
+            };
+            let key_str = String::from_utf8_lossy(&k);
+            if !key_str.starts_with(BLK_PREFIX) {
+                break;
+            }
+            // Skip metadata keys (best_hash, height index)
+            if key_str == "blk:best_hash" {
+                continue;
+            }
+            if key_str.starts_with("blk:height:") {
+                continue;
+            }
+            if let Ok(block) = bincode::deserialize::<Block>(&v) {
+                blocks.push(block);
+            }
+        }
+
+        blocks.sort_by_key(|b| b.header.height);
+        blocks
+    }
+
+    pub fn save_block_height(&self, hash: &str, height: u64) {
+        // DAG: multiple blocks per height → blk:height:{h}:{hash}
+        let key = format!("{}height:{}:{}", BLK_PREFIX, height, hash);
+        if let Err(e) = self.db.put(key.as_bytes(), hash.as_bytes()) {
+            eprintln!("[BlockStore] save_block_height failed: {}", e);
+        }
+    }
+
+    /// Get ALL block hashes at a given height (DAG: multiple blocks per height).
+    pub fn get_block_hashes_at_height(&self, height: u64) -> Vec<String> {
+        let prefix = format!("{}height:{}:", BLK_PREFIX, height);
+        let mut hashes = Vec::new();
+        let iter = self.db.prefix_iterator(prefix.as_bytes());
+        for item in iter {
+            let (k, v) = match item {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("[BlockStore] iterator error: {}", e);
+                    continue;
+                }
+            };
+            let key_str = String::from_utf8_lossy(&k);
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+            if let Ok(hash) = String::from_utf8(v.to_vec()) {
+                hashes.push(hash);
+            }
+        }
+        hashes
+    }
+
+    /// Get ONE block hash at height (returns first found — use get_block_hashes_at_height
+    /// for all blocks). Kept for backward compatibility.
+    pub fn get_block_hash_at_height(&self, height: u64) -> Option<String> {
+        self.get_block_hashes_at_height(height).into_iter().next()
+    }
+
+    /// Get the number of blocks at a specific height (DAG parallelism metric).
+    pub fn blocks_at_height(&self, height: u64) -> usize {
+        self.get_block_hashes_at_height(height).len()
+    }
+
+    // ── Pruning ────────────────────────────────────────────────────────────
+
+    /// Prune a block's body data while keeping its height index and UTXO commitment.
+    /// After pruning, `get_block()` returns None but the height index still works.
+    /// Returns true if the block existed and was pruned.
+    pub fn prune_block_body(&self, hash: &str) -> bool {
+        let block_key = format!("{}{}", BLK_PREFIX, hash);
+        match self.db.get(block_key.as_bytes()) {
+            Ok(Some(_)) => {
+                if let Err(e) = self.db.delete(block_key.as_bytes()) {
+                    eprintln!("[BlockStore] prune_block_body failed: {}", e);
+                    return false;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Prune all block bodies below a given height.
+    /// Height index entries and UTXO commitments are preserved.
+    /// Returns the number of blocks pruned.
+    pub fn prune_blocks_below_height(&self, below_height: u64) -> u64 {
+        let mut pruned = 0u64;
+        let mut batch = rocksdb::WriteBatch::default();
+
+        // Iterate actual blocks instead of every possible height (O(blocks) not O(height))
+        let prefix = BLK_PREFIX.as_bytes();
+        let iter = self.db.prefix_iterator(prefix);
+
+        for item in iter {
+            let (k, v) = match item {
+                Ok(pair) => pair,
+                Err(_) => continue,
+            };
+
+            let key_str = String::from_utf8_lossy(&k);
+            if !key_str.starts_with(BLK_PREFIX) {
+                break;
+            }
+            // Skip metadata and height index keys
+            if key_str == "blk:best_hash" || key_str.contains(":height:") || key_str.contains(":utxo_commit:") {
+                continue;
+            }
+
+            // Deserialize to check height
+            let block: Block = match bincode::deserialize(&v) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+
+            if block.header.height < below_height {
+                batch.delete(&*k);
+                pruned += 1;
+
+                // Write in batches of 1000 to limit memory
+                if pruned % 1000 == 0 {
+                    if let Err(e) = self.db.write(batch) {
+                        eprintln!("[BlockStore] pruning batch write failed: {}", e);
+                        return pruned;
+                    }
+                    batch = rocksdb::WriteBatch::default();
+                }
+            }
+        }
+
+        // Write remaining batch
+        if pruned % 1000 != 0 {
+            if let Err(e) = self.db.write(batch) {
+                eprintln!("[BlockStore] final pruning batch failed: {}", e);
+            }
+        }
+        pruned
+    }
+
+    /// Check if a block body exists (not pruned).
+    pub fn has_block_body(&self, hash: &str) -> bool {
+        self.block_exists(hash)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::block::block_header::BlockHeader;
+    use crate::domain::block::block_body::BlockBody;
+    use crate::infrastructure::storage::rocksdb::core::db::NodeDB;
+
+    fn tmp_path() -> String {
+        format!(
+            "/tmp/test_block_store_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        )
+    }
+
+    fn make_block(hash: &str, height: u64) -> Block {
+        Block {
+            header: BlockHeader {
+                version: 1,
+                hash: hash.to_string(),
+                parents: vec![],
+                merkle_root: "mr".into(),
+                timestamp: 1000,
+                nonce: 0,
+                difficulty: 1,
+                height,
+                blue_score: 0,
+                selected_parent: None,
+                utxo_commitment: None,
+                extra_nonce: 0,
+            },
+            body: BlockBody { transactions: vec![] },
+        }
+    }
+
+    fn open_store() -> BlockStore {
+        let path = tmp_path();
+        let node_db = NodeDB::new(&path).expect("open NodeDB");
+        BlockStore::new(node_db.shared()).expect("open BlockStore")
+    }
+
+    #[test]
+    fn save_and_get_block_roundtrip() {
+        let store = open_store();
+        let block = make_block("abc123", 0);
+
+        assert!(store.save_block(&block));
+
+        let loaded = store.get_block("abc123").expect("block should exist");
+        assert_eq!(loaded.header.hash, "abc123");
+        assert_eq!(loaded.header.height, 0);
+    }
+
+    #[test]
+    fn block_exists_true_for_saved_false_for_unknown() {
+        let store = open_store();
+        let block = make_block("exists_test", 1);
+
+        assert!(!store.block_exists("exists_test"));
+        store.save_block(&block);
+        assert!(store.block_exists("exists_test"));
+        assert!(!store.block_exists("no_such_block"));
+    }
+
+    #[test]
+    fn get_best_hash_and_update_best_hash() {
+        let store = open_store();
+
+        assert!(store.get_best_hash().is_none());
+
+        assert!(store.update_best_hash("tip_hash_1"));
+        assert_eq!(store.get_best_hash().unwrap(), "tip_hash_1");
+
+        assert!(store.update_best_hash("tip_hash_2"));
+        assert_eq!(store.get_best_hash().unwrap(), "tip_hash_2");
+    }
+
+    #[test]
+    fn get_block_hashes_at_height_returns_correct_hashes() {
+        let store = open_store();
+
+        let b1 = make_block("h5_block_a", 5);
+        let b2 = make_block("h5_block_b", 5);
+        let b3 = make_block("h7_block_c", 7);
+
+        store.save_block(&b1);
+        store.save_block(&b2);
+        store.save_block(&b3);
+
+        let mut hashes_at_5 = store.get_block_hashes_at_height(5);
+        hashes_at_5.sort();
+        assert_eq!(hashes_at_5, vec!["h5_block_a", "h5_block_b"]);
+
+        let hashes_at_7 = store.get_block_hashes_at_height(7);
+        assert_eq!(hashes_at_7, vec!["h7_block_c"]);
+
+        let hashes_at_99 = store.get_block_hashes_at_height(99);
+        assert!(hashes_at_99.is_empty());
+    }
+
+    #[test]
+    fn prune_block_body_removes_body_but_keeps_height_index() {
+        let store = open_store();
+        let block = make_block("prune_me", 3);
+
+        store.save_block(&block);
+        assert!(store.block_exists("prune_me"));
+
+        assert!(store.prune_block_body("prune_me"));
+        assert!(!store.block_exists("prune_me"));
+        assert!(store.get_block("prune_me").is_none());
+
+        // Height index should still list the hash
+        let hashes = store.get_block_hashes_at_height(3);
+        assert!(hashes.contains(&"prune_me".to_string()));
+    }
+
+    #[test]
+    fn prune_blocks_below_height_batch_pruning() {
+        let store = open_store();
+
+        store.save_block(&make_block("h0", 0));
+        store.save_block(&make_block("h1", 1));
+        store.save_block(&make_block("h2", 2));
+        store.save_block(&make_block("h3", 3));
+
+        let pruned = store.prune_blocks_below_height(2);
+        assert_eq!(pruned, 2);
+
+        // Blocks at height 0 and 1 should be pruned
+        assert!(!store.block_exists("h0"));
+        assert!(!store.block_exists("h1"));
+
+        // Blocks at height 2 and 3 should remain
+        assert!(store.block_exists("h2"));
+        assert!(store.block_exists("h3"));
+
+        // Height indices preserved for pruned blocks
+        assert!(store.get_block_hashes_at_height(0).contains(&"h0".to_string()));
+        assert!(store.get_block_hashes_at_height(1).contains(&"h1".to_string()));
+    }
+
+    #[test]
+    fn count_returns_correct_number() {
+        let store = open_store();
+
+        assert_eq!(store.count(), 0);
+
+        store.save_block(&make_block("c1", 0));
+        assert_eq!(store.count(), 1);
+
+        store.save_block(&make_block("c2", 1));
+        store.save_block(&make_block("c3", 2));
+        assert_eq!(store.count(), 3);
+    }
+}
