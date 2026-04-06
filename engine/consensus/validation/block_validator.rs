@@ -153,7 +153,16 @@ impl BlockValidator {
     //  L1 Network:    size, format, DoS protection     (no crypto)
     //  L2 Structural: merkle root, TX hash, signatures (crypto)
     //  L3 Consensus:  PoW, difficulty, checkpoints     (chain state)
-    //  L4 Execution:  UTXO balance, fees               (separate call)
+    //  L4 Execution:  UTXO balance, fees               (SEPARATE — in FullNode)
+    //
+    //  SAFETY INVARIANT: L1–L3 are 100% STATELESS. They MUST NOT read
+    //  from block_store, utxo_set, dag_manager, or any persistent state.
+    //  The `_utxo_set` parameter is intentionally unused (underscore prefix).
+    //  This separation ensures all nodes agree on L1–L3 validity regardless
+    //  of local state, preventing consensus forks from state-dependent checks.
+    //
+    //  Only parallel operation: Merkle tree (rayon par_iter) — deterministic
+    //  because same TX order always produces same root hash.
     // ═══════════════════════════════════════════════════════════════
     /// **L1 Network** — cheapest checks first. Reject malformed data
     /// before spending CPU on crypto or DB lookups.

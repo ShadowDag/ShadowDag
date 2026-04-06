@@ -249,10 +249,26 @@ impl FullNode {
 
     fn process_block_inner(&self, block: &Block, peer_id: &str) -> Result<(), NodeError> {
         // ═══════════════════════════════════════════════════════════════
-        // PHASE 1: STRUCTURAL VALIDATION (lock-free, fully parallel)
+        // CONSENSUS-CRITICAL VALIDATION PIPELINE
         //
-        // Stateless checks — no UTXO dependency.
-        // Invalid blocks rejected. Valid blocks accepted into DAG.
+        // Three strictly-separated phases. Ordering is a SAFETY INVARIANT:
+        //
+        //   Phase 1 (STATELESS): L1→PoW→L2→L3 — NO DB/UTXO reads.
+        //     Inputs:  block header + body only (+ pre-collected ancestor timestamps)
+        //     Checks:  format, size, signatures, merkle root, PoW, difficulty
+        //     Merkle tree uses rayon par_iter — SAFE because deterministic
+        //     (same TX order → same hash, regardless of thread scheduling)
+        //
+        //   Phase 2 (DAG): Parent existence + DAG insertion — reads block_store
+        //     Only reached if Phase 1 passes. No UTXO changes.
+        //
+        //   Phase 3 (UTXO EXECUTION): Apply transactions in GHOSTDAG order
+        //     Only reached after Phase 2. Reads/writes UTXO set.
+        //     Sequential, single-threaded, atomic rollback on failure.
+        //
+        // INVARIANT: Phase 1 MUST NOT read from block_store, utxo_set,
+        //            dag_manager, or any mutable state. Violation = consensus
+        //            bug where nodes disagree on block validity.
         // ═══════════════════════════════════════════════════════════════
 
         let expected_diff = {
@@ -273,6 +289,9 @@ impl FullNode {
             )));
         }
 
+        // ─── PHASE 1 END ─── (above: stateless only, no DB reads) ───
+
+        // ─── PHASE 2 START ─── (stateful: reads block_store, dag_manager) ───
         if self.dag_manager.block_exists(&block.header.hash) {
             return Err(NodeError::BlockRejected(format!("Block {} already exists in DAG", &block.header.hash)));
         }
