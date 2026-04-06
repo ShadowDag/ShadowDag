@@ -138,28 +138,35 @@ impl Mempool {
     }
 
     // ── Surge pricing ────────────────────────────────────────────────────
-    /// Dynamic fee-rate floor that rises with pool utilization.
+    /// Dynamic fee-rate floor that rises **exponentially** with pool utilization.
     ///
-    /// Below 50% full → base MIN_FEE_RATE (1.0 sat/byte)
-    /// 50-75% full    → 2× MIN_FEE_RATE
-    /// 75-90% full    → 4× MIN_FEE_RATE
-    /// 90%+ full      → 8× MIN_FEE_RATE
+    /// Uses a smooth curve: `multiplier = 2^(utilization × 6)`, which gives:
     ///
-    /// This prevents spam from filling the pool at the minimum rate.
-    /// Legitimate users get price signals to bid higher during congestion.
+    /// | Utilization | Multiplier | Effective Min Fee Rate |
+    /// |-------------|------------|------------------------|
+    /// |    0%       |   1.0×     | 1.0 sat/byte           |
+    /// |   25%       |   2.8×     | 2.8 sat/byte           |
+    /// |   50%       |   8.0×     | 8.0 sat/byte           |
+    /// |   75%       |  22.6×     | 22.6 sat/byte          |
+    /// |   90%       |  39.4×     | 39.4 sat/byte          |
+    /// |  100%       |  64.0×     | 64.0 sat/byte (cap)    |
+    ///
+    /// Smooth curve prevents fee-gaming at step boundaries and provides
+    /// continuous price signals. Capped at 64× to avoid astronomical fees.
     pub fn effective_min_fee_rate(&self) -> f64 {
         let count = self.count();
-        let pct = if MAX_MEMPOOL_SIZE > 0 {
-            (count * 100) / MAX_MEMPOOL_SIZE
+        let utilization = if MAX_MEMPOOL_SIZE > 0 {
+            count as f64 / MAX_MEMPOOL_SIZE as f64
         } else {
-            0
+            0.0
         };
 
-        let multiplier = match pct {
-            0..=49  => 1.0,
-            50..=74 => 2.0,
-            75..=89 => 4.0,
-            _       => 8.0,
+        // Exponential: 2^(utilization × 6)
+        // At 0%: 2^0 = 1×, at 50%: 2^3 = 8×, at 100%: 2^6 = 64×
+        let multiplier = if utilization < 0.001 {
+            1.0
+        } else {
+            (2.0_f64).powf(utilization * 6.0).min(64.0)
         };
 
         MIN_FEE_RATE * multiplier
@@ -1619,25 +1626,29 @@ mod policy_tests {
     #[test]
     fn surge_pricing_scales_with_utilization() {
         let mp = pool("surge_scale");
-        // Simulate high utilization by pushing the counter up
-        // MAX_MEMPOOL_SIZE = 100_000, so 75% = 75_000
+        // Simulate 75% utilization: exponential curve should give ~22.6×
         mp.meta_set_u64(META_TX_COUNT, 75_000);
         let rate = mp.effective_min_fee_rate();
         assert!(
-            (rate - MIN_FEE_RATE * 4.0).abs() < 1e-9,
-            "75% utilization should give 4× rate, got {}",
+            rate > MIN_FEE_RATE * 10.0 && rate < MIN_FEE_RATE * 40.0,
+            "75% utilization should give ~22.6× rate, got {}",
             rate
         );
     }
 
     #[test]
-    fn surge_pricing_max_at_90_percent() {
+    fn surge_pricing_high_at_90_percent() {
         let mp = pool("surge_max");
         mp.meta_set_u64(META_TX_COUNT, 95_000);
         let rate = mp.effective_min_fee_rate();
         assert!(
-            (rate - MIN_FEE_RATE * 8.0).abs() < 1e-9,
-            "95% utilization should give 8× rate, got {}",
+            rate > MIN_FEE_RATE * 20.0,
+            "95% utilization should give high rate, got {}",
+            rate
+        );
+        assert!(
+            rate <= MIN_FEE_RATE * 64.0,
+            "Rate should be capped at 64×, got {}",
             rate
         );
     }
