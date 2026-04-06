@@ -109,6 +109,7 @@ pub mod engine {
         }
         pub mod state;
         pub mod reorg;
+        pub mod finality;
         pub mod chain_manager;
         pub mod block_processor;
     }

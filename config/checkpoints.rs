@@ -12,7 +12,7 @@ pub struct CheckpointEntry {
 }
 
 impl CheckpointEntry {
-    fn new(height: u64, hash: String) -> Self {
+    pub fn new(height: u64, hash: String) -> Self {
         Self { height, hash }
     }
 }
@@ -52,6 +52,41 @@ impl Checkpoints {
 
     pub fn get(height: u64) -> Option<CheckpointEntry> {
         Self::all().into_iter().find(|cp| cp.height == height)
+    }
+
+    /// Load dynamic (auto-generated) checkpoints from a RocksDB instance
+    /// and merge them with the hardcoded checkpoints.
+    pub fn all_with_dynamic(db: &rocksdb::DB) -> Vec<CheckpointEntry> {
+        // Auto-checkpoints use the same key format as FinalityManager
+        // (see engine::consensus::finality::AutoCheckpoint)
+        let mut all = Self::all(); // hardcoded first
+
+        // Load auto-checkpoints from DB
+        let prefix = b"chkpt:";
+        let iter = db.prefix_iterator(prefix);
+        for item in iter {
+            let (key, value) = match item {
+                Ok(kv) => kv,
+                Err(_) => continue,
+            };
+            if key.len() < prefix.len() + 8 || !key.starts_with(prefix) {
+                break;
+            }
+            let height_bytes: [u8; 8] = match key[prefix.len()..prefix.len() + 8].try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let height = u64::from_be_bytes(height_bytes);
+            let hash = String::from_utf8_lossy(&value).to_string();
+
+            // Don't duplicate heights
+            if !all.iter().any(|cp| cp.height == height) {
+                all.push(CheckpointEntry { height, hash });
+            }
+        }
+
+        all.sort_by_key(|cp| cp.height);
+        all
     }
 }
 

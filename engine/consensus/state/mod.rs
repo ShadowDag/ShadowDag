@@ -309,6 +309,8 @@ impl ConsensusState {
     }
 
     /// Update the finality point to the block at `depth` positions below the tip.
+    /// Callers should use `FinalityManager::current_depth()` for the dynamic depth
+    /// instead of the static `FINALITY_DEPTH` constant.
     /// Blocks at or below the finality point are considered irreversible.
     /// Returns the new finality point hash if updated.
     pub fn update_finality(&mut self, depth: u64) -> Option<String> {
