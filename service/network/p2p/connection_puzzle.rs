@@ -17,10 +17,13 @@ use sha2::{Sha256, Digest};
 use rand::rngs::OsRng;
 use rand::RngCore;
 
-/// Puzzle difficulty (leading hex zeros required)
-/// 2 = ~256 hashes average (~0.01ms on modern CPU)
-/// But 10,000 fake nodes = ~2.56 million hashes = noticeable cost
-pub const PUZZLE_DIFFICULTY: usize = 2;
+/// Puzzle difficulty (leading hex zeros required).
+/// 3 = ~4096 hashes average (~0.1ms on modern CPU) — trivial for
+/// legitimate nodes but forces an attacker with 10,000 fake nodes to
+/// compute ~41 million hashes = significant cost and latency.
+///
+/// Previous value was 2 (~256 hashes), which was too cheap for mainnet.
+pub const PUZZLE_DIFFICULTY: usize = 3;
 
 /// Puzzle expiry (5 minutes)
 pub const PUZZLE_EXPIRY_SECS: u64 = 300;
