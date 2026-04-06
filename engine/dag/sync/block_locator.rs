@@ -29,7 +29,7 @@ const LOCATOR_PREFIX: &[u8] = b"l:";
 
 pub struct StorageEngine {
     pub db: Arc<DB>,
-    write_opts_no_wal: WriteOptions,
+    write_opts: WriteOptions,
     read_opts: ReadOptions,
 }
 
@@ -59,15 +59,15 @@ impl StorageEngine {
                 .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?
         );
 
-        let mut write_opts_no_wal = WriteOptions::default();
-        write_opts_no_wal.disable_wal(false);
+        let mut write_opts = WriteOptions::default();
+        write_opts.disable_wal(false); // WAL enabled for crash safety
 
         let mut read_opts = ReadOptions::default();
         read_opts.fill_cache(false);
 
         Ok(Self {
             db,
-            write_opts_no_wal,
+            write_opts,
             read_opts,
         })
     }
@@ -108,7 +108,7 @@ impl<'a> BlockLocator<'a> {
             cf,
             &key,
             b"1",
-            &self.engine.write_opts_no_wal,
+            &self.engine.write_opts,
         ) {
             slog_error!("dag", "locator_put_failed", error => e);
         }
@@ -197,7 +197,7 @@ impl StorageEngine {
         batch.put_cf(cf_locators, b"l:hash1", b"1");
         batch.put_cf(cf_blocks, b"block1", b"...");
 
-        if let Err(e) = self.db.write_opt(batch, &self.write_opts_no_wal) {
+        if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
             slog_error!("dag", "storage_engine_batch_failed", error => e);
         }
     }
