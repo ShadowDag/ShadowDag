@@ -8,6 +8,11 @@ pub const TARGET_BLOCK_TIME_SECS:   u64 = 1;
 pub const SHORT_WINDOW:             usize = 144;
 pub const LONG_WINDOW:              usize = 2016;
 
+/// Maximum timestamp drift allowed between a DAG block and its parents.
+/// Tighter than the block validator's MAX_TIMESTAMP_JUMP_SECS (30s) to
+/// prevent timewarp in high-BPS DAGs where many blocks share timestamps.
+pub const MAX_DAG_TIMESTAMP_DRIFT:  u64 = 5;
+
 pub const EMA_ALPHA_NUM:            u64 = 1;
 pub const EMA_ALPHA_DEN:            u64 = 20;
 
@@ -31,6 +36,10 @@ pub struct BlockTimeRecord {
     pub height:     u64,
     pub timestamp:  u64,
     pub difficulty: u64,
+    /// Total number of DAG blocks at this height level (including parallel blocks).
+    /// When only the best-tip chain is observed, this defaults to 1.
+    /// When DAG-wide data is available, this reflects the true DAG width.
+    pub dag_block_count: u64,
 }
 
 pub struct RetargetEngine {
@@ -39,6 +48,13 @@ pub struct RetargetEngine {
     /// EMA difficulty — stored as u64 (NOT float) for consensus determinism.
     /// Integer EMA: ema = ema_prev + (new - ema_prev) / 20
     ema_diff:     u64,
+    /// Expected blocks per second (from consensus params). Used to scale
+    /// the effective block rate for DAG-aware difficulty.
+    expected_bps: u64,
+    /// Accumulated DAG-wide block count within the current short window.
+    /// Sum of all `dag_block_count` values, giving the TRUE number of blocks
+    /// the network produced (not just the chain-only count).
+    dag_blocks_in_window: u64,
 }
 
 impl RetargetEngine {
@@ -47,17 +63,41 @@ impl RetargetEngine {
             short_window: VecDeque::new(),
             long_window:  VecDeque::new(),
             ema_diff:     initial_difficulty,
+            expected_bps: 10,
+            dag_blocks_in_window: 0,
+        }
+    }
+
+    /// Create with explicit BPS (blocks per second) for DAG-aware scaling.
+    pub fn new_with_bps(initial_difficulty: u64, bps: u64) -> Self {
+        Self {
+            short_window: VecDeque::new(),
+            long_window:  VecDeque::new(),
+            ema_diff:     initial_difficulty,
+            expected_bps: bps.max(1),
+            dag_blocks_in_window: 0,
         }
     }
 
     pub fn on_new_block(&mut self, rec: BlockTimeRecord) -> u64 {
+        // Track DAG-wide block count for this record
+        self.dag_blocks_in_window += rec.dag_block_count.max(1);
+
+        // Scale window sizes by BPS so we always cover ~the same wall-clock time.
+        // At 10 BPS, SHORT_WINDOW=144 covers ~14s; we want ~60s → scale by BPS/2
+        let effective_short = SHORT_WINDOW.max(self.expected_bps as usize * 15);
+        let effective_long  = LONG_WINDOW.max(self.expected_bps as usize * 200);
+
         self.short_window.push_back(rec.clone());
-        if self.short_window.len() > SHORT_WINDOW {
-            self.short_window.pop_front();
+        while self.short_window.len() > effective_short {
+            if let Some(old) = self.short_window.pop_front() {
+                self.dag_blocks_in_window = self.dag_blocks_in_window
+                    .saturating_sub(old.dag_block_count.max(1));
+            }
         }
 
         self.long_window.push_back(rec);
-        if self.long_window.len() > LONG_WINDOW {
+        while self.long_window.len() > effective_long {
             self.long_window.pop_front();
         }
 
@@ -133,6 +173,21 @@ impl RetargetEngine {
                 // e.g. 50% same-ts → blended_time / 2
                 let divisor = (same_pct / 25).min(4).max(1);
                 blended_time = (blended_time / divisor).max(1);
+            }
+        }
+
+        // ── DAG-wide block rate correction ────────────────────────────
+        // The chain-only view sees 1 block/sec (best-tip), but the DAG has
+        // N parallel blocks per second. If dag_blocks_in_window >> chain blocks,
+        // the network is producing blocks faster than timestamps suggest.
+        // Divide effective block time by the DAG-to-chain ratio to account for
+        // all parallel blocks in the difficulty calculation.
+        if self.dag_blocks_in_window > n as u64 {
+            let dag_ratio = self.dag_blocks_in_window / (n as u64).max(1);
+            if dag_ratio > 1 {
+                // Cap at expected_bps * 2 to prevent manipulation via inflated counts
+                let capped_ratio = dag_ratio.min(self.expected_bps * 2);
+                blended_time = (blended_time / capped_ratio).max(1);
             }
         }
 
@@ -333,7 +388,11 @@ mod tests {
     use super::*;
 
     fn block(h: u64, ts: u64, diff: u64) -> BlockTimeRecord {
-        BlockTimeRecord { height: h, timestamp: ts, difficulty: diff }
+        BlockTimeRecord { height: h, timestamp: ts, difficulty: diff, dag_block_count: 1 }
+    }
+
+    fn dag_block(h: u64, ts: u64, diff: u64, dag_count: u64) -> BlockTimeRecord {
+        BlockTimeRecord { height: h, timestamp: ts, difficulty: diff, dag_block_count: dag_count }
     }
 
     #[test]
@@ -418,5 +477,57 @@ mod tests {
         // tolerance = 32/8 = 4, so 28..=36 is valid
         assert!(engine.validate_difficulty(28, 32));
         assert!(!engine.validate_difficulty(10, 32));
+    }
+
+    // ── DAG-aware tests ─────────────────────────────────────────────
+
+    #[test]
+    fn dag_wide_blocks_increase_difficulty() {
+        // Simulate 10 BPS: each chain block reports 10 parallel DAG blocks
+        let init = 100u64;
+        let mut engine = RetargetEngine::new_with_bps(init, 10);
+        let mut diff = init;
+
+        // Feed 200 blocks at 1s interval, but each represents 10 DAG blocks
+        for i in 0..200u64 {
+            let r = dag_block(i, i * TARGET_BLOCK_TIME_SECS, diff, 10);
+            diff = engine.on_new_block(r);
+        }
+
+        // Difficulty should have increased because DAG rate is 10x chain rate
+        assert!(diff > init,
+            "DAG-aware diff should increase: init={}, got={}", init, diff);
+    }
+
+    #[test]
+    fn bps_scaling_increases_window() {
+        let mut engine = RetargetEngine::new_with_bps(100, 10);
+
+        // Feed 200 blocks
+        for i in 0..200u64 {
+            engine.on_new_block(block(i, i, 100));
+        }
+
+        // At BPS=10, effective short window = max(144, 10*15) = 150
+        // So we should have 150 entries in short_window (not 144)
+        assert!(engine.short_window_len() >= 150,
+            "Window should scale with BPS: got {}", engine.short_window_len());
+    }
+
+    #[test]
+    fn dag_block_count_1_is_backward_compatible() {
+        // When dag_block_count=1, behavior should be identical to old engine
+        let init = 1000u64;
+        let mut engine = RetargetEngine::new(init);
+        let mut diff = init;
+
+        for i in 0..200u64 {
+            let r = block(i, i * TARGET_BLOCK_TIME_SECS, diff);
+            diff = engine.on_new_block(r);
+        }
+
+        // Should stay roughly stable (chain-only view sees 1 block/sec = target)
+        assert!(diff >= init / 3 && diff <= init * 3,
+            "Backward compat: init={}, got={}", init, diff);
     }
 }

@@ -46,6 +46,12 @@ pub const MAX_PAST_BLOCK_SECS: u64 = 600;
 /// tight enough to prevent timewarp manipulation while allowing recovery.
 pub const MAX_TIMESTAMP_JUMP_SECS: u64 = 30;
 
+/// Stricter timestamp drift for DAG-dense heights. When multiple parallel
+/// blocks exist at the same height, a tighter cap prevents timewarp attacks
+/// that exploit DAG parallelism. Used as a secondary check when the block
+/// has ≥3 parents (indicating high DAG density at that height).
+pub const MAX_DAG_DENSE_TIMESTAMP_JUMP_SECS: u64 = 10;
+
 // ─────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -395,6 +401,22 @@ impl BlockValidator {
                 return Err(ConsensusError::Timestamp(format!(
                     "timestamp jump {}s from parent (max {}s)",
                     ts.saturating_sub(max_parent_ts), MAX_TIMESTAMP_JUMP_SECS
+                )));
+            }
+
+            // R6: Stricter DAG-dense timestamp check.
+            // When a block has ≥3 parents, the DAG is "dense" at this height,
+            // meaning many parallel blocks exist. In this case, tighten the
+            // allowed timestamp jump to prevent timewarp exploits that abuse
+            // DAG parallelism to inflate the difficulty window.
+            if block.header.parents.len() >= 3
+                && ts > max_parent_ts + MAX_DAG_DENSE_TIMESTAMP_JUMP_SECS
+            {
+                return Err(ConsensusError::Timestamp(format!(
+                    "DAG-dense timestamp jump {}s from parent (max {}s with {} parents)",
+                    ts.saturating_sub(max_parent_ts),
+                    MAX_DAG_DENSE_TIMESTAMP_JUMP_SECS,
+                    block.header.parents.len()
                 )));
             }
         }

@@ -120,9 +120,10 @@ impl FullNode {
             let start_idx = blocks.len().saturating_sub(SHORT_WINDOW);
             for block in &blocks[start_idx..] {
                 retarget.on_new_block(BlockTimeRecord {
-                    height:     block.header.height,
-                    timestamp:  block.header.timestamp,
-                    difficulty: block.header.difficulty,
+                    height:          block.header.height,
+                    timestamp:       block.header.timestamp,
+                    difficulty:      block.header.difficulty,
+                    dag_block_count: 1, // historical seed — no DAG width data
                 });
             }
             let seeded_diff = retarget.ema_difficulty();
@@ -477,10 +478,15 @@ impl FullNode {
         // Update retarget from selected chain and publish next difficulty
         if let Some(best_block) = self.block_store.get_block(&best_tip) {
             if let Ok(mut retarget) = self.retarget.lock() {
+                // Count total DAG blocks at this height for DAG-aware difficulty.
+                // This gives the retarget engine visibility into parallel blocks.
+                let dag_width = (self.block_store.blocks_at_height(best_block.header.height) as u64).max(1);
+
                 let next_diff = retarget.on_new_block(BlockTimeRecord {
-                    height:     best_block.header.height,
-                    timestamp:  best_block.header.timestamp,
-                    difficulty: best_block.header.difficulty,
+                    height:          best_block.header.height,
+                    timestamp:       best_block.header.timestamp,
+                    difficulty:      best_block.header.difficulty,
+                    dag_block_count: dag_width,
                 });
                 // Publish for RPC getblocktemplate
                 set_next_difficulty(next_diff);
