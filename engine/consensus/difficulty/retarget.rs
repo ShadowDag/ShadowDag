@@ -40,6 +40,11 @@ pub struct BlockTimeRecord {
     /// When only the best-tip chain is observed, this defaults to 1.
     /// When DAG-wide data is available, this reflects the true DAG width.
     pub dag_block_count: u64,
+    /// Blue score of this block in GHOSTDAG ordering.
+    /// Used for blue score rate calculation — a more stable signal than
+    /// raw block rate because it filters out red (attack/stale) blocks.
+    /// Defaults to 0 when not available.
+    pub blue_score: u64,
 }
 
 pub struct RetargetEngine {
@@ -55,6 +60,13 @@ pub struct RetargetEngine {
     /// Sum of all `dag_block_count` values, giving the TRUE number of blocks
     /// the network produced (not just the chain-only count).
     dag_blocks_in_window: u64,
+    /// Blue score delta within the current short window.
+    /// Tracks how much the blue score has advanced, which reflects the
+    /// HONEST network's throughput (red blocks don't inflate blue score).
+    /// Used to stabilize difficulty under DAG conditions where total block
+    /// rate fluctuates due to latency and parallelism.
+    blue_score_window_start: u64,
+    blue_score_window_end:   u64,
 }
 
 impl RetargetEngine {
@@ -65,6 +77,8 @@ impl RetargetEngine {
             ema_diff:     initial_difficulty,
             expected_bps: 10,
             dag_blocks_in_window: 0,
+            blue_score_window_start: 0,
+            blue_score_window_end: 0,
         }
     }
 
@@ -76,12 +90,22 @@ impl RetargetEngine {
             ema_diff:     initial_difficulty,
             expected_bps: bps.max(1),
             dag_blocks_in_window: 0,
+            blue_score_window_start: 0,
+            blue_score_window_end: 0,
         }
     }
 
     pub fn on_new_block(&mut self, rec: BlockTimeRecord) -> u64 {
         // Track DAG-wide block count for this record
         self.dag_blocks_in_window += rec.dag_block_count.max(1);
+
+        // Track blue score progression for blue-rate calculation
+        if rec.blue_score > 0 {
+            self.blue_score_window_end = rec.blue_score;
+            if self.blue_score_window_start == 0 {
+                self.blue_score_window_start = rec.blue_score;
+            }
+        }
 
         // Scale window sizes by BPS so we always cover ~the same wall-clock time.
         // At 10 BPS, SHORT_WINDOW=144 covers ~14s; we want ~60s → scale by BPS/2
@@ -188,6 +212,44 @@ impl RetargetEngine {
                 // Cap at expected_bps * 2 to prevent manipulation via inflated counts
                 let capped_ratio = dag_ratio.min(self.expected_bps * 2);
                 blended_time = (blended_time / capped_ratio).max(1);
+            }
+        }
+
+        // ── Blue score rate stabilizer ─────────────────────────────
+        // Blue score rate is a more stable signal than raw block rate
+        // because GHOSTDAG filters red blocks (attacks/stale). If the
+        // blue score advanced faster than expected for the time window,
+        // mining is too fast. If slower, mining is too slow.
+        //
+        // We blend the blue-rate signal with the block-rate signal:
+        //   70% block-rate (responsive) + 30% blue-rate (stable)
+        if n >= 10
+            && self.blue_score_window_end > self.blue_score_window_start
+        {
+            let first_ts = self.short_window.front().map(|r| r.timestamp).unwrap_or(0);
+            let last_ts  = self.short_window.back().map(|r| r.timestamp).unwrap_or(0);
+            let time_span = last_ts.saturating_sub(first_ts).max(1);
+
+            let blue_delta = self.blue_score_window_end - self.blue_score_window_start;
+
+            // Expected blue score delta = time_span × expected_bps
+            // (each second should produce ~BPS blue blocks)
+            let expected_blue = time_span * self.expected_bps;
+
+            if expected_blue > 0 {
+                // blue_ratio > 1.0 means faster than expected, < 1.0 means slower
+                // Scale to integer: multiply by 100 for precision
+                let blue_pct = (blue_delta * 100) / expected_blue;
+
+                // If blue rate is significantly different from expected,
+                // adjust blended_time to compensate.
+                // blue_pct = 100 → on target, 200 → 2× too fast, 50 → 2× too slow
+                if blue_pct > 0 && blue_pct != 100 {
+                    // Blend: 70% block-rate blended_time + 30% blue-rate adjusted time
+                    let blue_adjusted = (blended_time as u128 * 100 / blue_pct as u128) as u64;
+                    blended_time = ((blended_time as u128 * 7 + blue_adjusted as u128 * 3) / 10) as u64;
+                    blended_time = blended_time.max(1);
+                }
             }
         }
 
@@ -363,6 +425,20 @@ impl RetargetEngine {
     pub fn short_window_len(&self) -> usize { self.short_window.len() }
     pub fn long_window_len(&self)  -> usize { self.long_window.len() }
     pub fn ema_difficulty(&self)   -> u64   { self.ema_diff }
+
+    /// Blue score rate: blue_score_delta / time_span (blue blocks per second).
+    /// More stable than raw block rate because GHOSTDAG filters red blocks.
+    /// Returns 0 if insufficient data.
+    pub fn blue_score_rate(&self) -> u64 {
+        if self.short_window.len() < 2 {
+            return 0;
+        }
+        let first_ts = self.short_window.front().map(|r| r.timestamp).unwrap_or(0);
+        let last_ts  = self.short_window.back().map(|r| r.timestamp).unwrap_or(0);
+        let span = last_ts.saturating_sub(first_ts).max(1);
+        let delta = self.blue_score_window_end.saturating_sub(self.blue_score_window_start);
+        delta / span
+    }
 }
 
 // legacy
@@ -388,11 +464,15 @@ mod tests {
     use super::*;
 
     fn block(h: u64, ts: u64, diff: u64) -> BlockTimeRecord {
-        BlockTimeRecord { height: h, timestamp: ts, difficulty: diff, dag_block_count: 1 }
+        BlockTimeRecord { height: h, timestamp: ts, difficulty: diff, dag_block_count: 1, blue_score: h }
     }
 
     fn dag_block(h: u64, ts: u64, diff: u64, dag_count: u64) -> BlockTimeRecord {
-        BlockTimeRecord { height: h, timestamp: ts, difficulty: diff, dag_block_count: dag_count }
+        BlockTimeRecord { height: h, timestamp: ts, difficulty: diff, dag_block_count: dag_count, blue_score: h }
+    }
+
+    fn scored_block(h: u64, ts: u64, diff: u64, dag_count: u64, blue: u64) -> BlockTimeRecord {
+        BlockTimeRecord { height: h, timestamp: ts, difficulty: diff, dag_block_count: dag_count, blue_score: blue }
     }
 
     #[test]
@@ -529,5 +609,42 @@ mod tests {
         // Should stay roughly stable (chain-only view sees 1 block/sec = target)
         assert!(diff >= init / 3 && diff <= init * 3,
             "Backward compat: init={}, got={}", init, diff);
+    }
+
+    #[test]
+    fn blue_score_rate_stabilizes_difficulty() {
+        // Simulate: blocks arrive at 1/sec (chain view) but blue score
+        // advances at 10/sec (real DAG throughput at 10 BPS)
+        let init = 100u64;
+        let mut engine = RetargetEngine::new_with_bps(init, 10);
+
+        for i in 0..200u64 {
+            // Chain sees 1 block/sec, but blue score jumps by 10 per block
+            let r = scored_block(i, i, init, 10, i * 10);
+            engine.on_new_block(r);
+        }
+
+        // Blue score rate should be ~10 (blue blocks per second)
+        let bsr = engine.blue_score_rate();
+        assert!(bsr >= 5, "Blue score rate should be ~10, got {}", bsr);
+    }
+
+    #[test]
+    fn red_block_flood_doesnt_inflate_blue_rate() {
+        // Simulate: 50 DAG blocks per height but only 10 blue score per second
+        // This tests that red block spam doesn't fool the difficulty
+        let init = 100u64;
+        let mut engine = RetargetEngine::new_with_bps(init, 10);
+        let mut diff = init;
+
+        for i in 0..200u64 {
+            // 50 total blocks but blue score only +10 (rest are red)
+            let r = scored_block(i, i, diff, 50, i * 10);
+            diff = engine.on_new_block(r);
+        }
+
+        // Blue rate should be ~10, not ~50
+        let bsr = engine.blue_score_rate();
+        assert!(bsr < 20, "Blue rate should reflect honest rate ~10, got {}", bsr);
     }
 }

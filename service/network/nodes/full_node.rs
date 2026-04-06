@@ -126,6 +126,7 @@ impl FullNode {
                     timestamp:       block.header.timestamp,
                     difficulty:      block.header.difficulty,
                     dag_block_count: 1, // historical seed — no DAG width data
+                    blue_score:      block.header.blue_score,
                 });
             }
             let seeded_diff = retarget.ema_difficulty();
@@ -538,6 +539,7 @@ impl FullNode {
                     timestamp:       best_block.header.timestamp,
                     difficulty:      best_block.header.difficulty,
                     dag_block_count: dag_width,
+                    blue_score:      best_block.header.blue_score,
                 });
                 // Publish for RPC getblocktemplate
                 set_next_difficulty(next_diff);
