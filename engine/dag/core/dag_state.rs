@@ -77,7 +77,7 @@ impl DagState {
 
         let db = DB::open(&opts, path).ok()?;
 
-        // 🔥 WAL OFF (FAST DAG)
+        // WAL enabled for crash safety (disable_wal=false).
         let mut write_opts = WriteOptions::default();
         write_opts.disable_wal(false);
 
