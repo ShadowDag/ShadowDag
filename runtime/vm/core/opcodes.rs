@@ -248,8 +248,10 @@ impl OpCode {
     /// Gas cost for executing this opcode
     pub fn gas_cost(&self) -> u64 {
         match self {
-            // Free
-            Self::STOP | Self::NOP | Self::JUMPDEST | Self::RETURN | Self::REVERT => 0,
+            // Minimal cost (1 gas) — prevents infinite-loop DoS via free opcodes.
+            // Previously 0, but a contract like `LOOP: NOP JUMP(LOOP)` would run
+            // forever without consuming gas. Minimum 1 gas ensures termination.
+            Self::STOP | Self::NOP | Self::JUMPDEST | Self::RETURN | Self::REVERT => 1,
 
             // Very cheap (2 gas) — stack & context reads
             Self::PC | Self::GAS | Self::GASLIMIT | Self::POP |
@@ -327,8 +329,8 @@ impl OpCode {
             Self::DAGBPS       => 10,
             Self::ATOMICSWAP   => 50_000,
 
-            // Debug (free in testnet, blocked in mainnet)
-            Self::DEBUG => 0,
+            // Debug (1 gas in testnet, blocked in mainnet via validator)
+            Self::DEBUG => 1,
 
             // Invalid — costs all remaining gas
             Self::INVALID => u64::MAX,

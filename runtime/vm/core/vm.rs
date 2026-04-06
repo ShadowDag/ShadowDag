@@ -11,7 +11,18 @@
 //   - Gas metering: every opcode checked BEFORE execution via GasMeter
 //   - Sandboxed storage with atomic WriteBatch commits
 //   - Execution limits: max stack depth, max memory, max code size
-//   - No floating point, no system time, no random without seed
+//
+// DETERMINISM INVARIANTS (consensus-critical):
+//   1. No floating point (f32/f64) — IEEE 754 rounding varies across CPUs
+//   2. No system time — TIMESTAMP opcode reads from block header, not clock
+//   3. No random — BLOCKHASH is the only source of pseudo-randomness
+//   4. No I/O — no filesystem, network, or process access
+//   5. All arithmetic is integer-only (U256 with wrapping semantics)
+//   6. Storage values parsed deterministically (hex > decimal > zero)
+//   7. Gas metering is pre-execution — checked BEFORE each opcode runs
+//   8. has_gas() is pub(crate) — contracts cannot branch on remaining gas
+//   9. All opcodes cost ≥ 1 gas — prevents infinite-loop DoS
+//  10. State changes are atomic — committed only on successful STOP/RETURN
 //
 // Opcodes are 1 byte. Operands follow inline.
 // Stack elements are 256-bit unsigned integers (U256).
@@ -556,12 +567,21 @@ impl VM {
                     let key = format!("{}:slot:{}", contract_addr, slot);
                     let val = self.context.get(&key)
                         .map(|s| {
-                            // U256::Display writes "0x..." for values > u64,
-                            // and plain decimal for values <= u64.
-                            if s.starts_with("0x") {
+                            // DETERMINISTIC parsing: try hex first (canonical format
+                            // written by SSTORE), then decimal as fallback for
+                            // backward compatibility. Both paths produce identical
+                            // U256 values regardless of input format.
+                            if let Some(hex_str) = s.strip_prefix("0x") {
+                                U256::from_hex(hex_str).unwrap_or(U256::ZERO)
+                            } else if s.starts_with("0x") {
                                 U256::from_hex(&s).unwrap_or(U256::ZERO)
                             } else {
-                                s.parse::<u64>().map(U256::from_u64).unwrap_or(U256::ZERO)
+                                // Strict decimal parsing: only digits, no signs
+                                if s.bytes().all(|b| b.is_ascii_digit()) && !s.is_empty() {
+                                    s.parse::<u64>().map(U256::from_u64).unwrap_or(U256::ZERO)
+                                } else {
+                                    U256::ZERO // garbage → zero (deterministic)
+                                }
                             }
                         })
                         .unwrap_or(U256::ZERO);

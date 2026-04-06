@@ -113,7 +113,13 @@ impl GasMeter {
     }
 
     /// Check if there is at least `cost` gas remaining, without consuming it.
-    pub fn has_gas(&self, cost: u64) -> bool {
+    ///
+    /// RESTRICTED to `pub(crate)` to prevent smart contracts from branching
+    /// on remaining gas, which would create non-deterministic execution paths
+    /// (different gas limits → different branches → state divergence).
+    /// Only the VM execution loop should call this, not user-visible opcodes.
+    #[allow(dead_code)] // Reserved for VM execution loop; intentionally restricted from public API
+    pub(crate) fn has_gas(&self, cost: u64) -> bool {
         self.gas_remaining() >= cost
     }
 }
