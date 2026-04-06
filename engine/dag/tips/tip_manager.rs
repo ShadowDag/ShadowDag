@@ -202,9 +202,27 @@ impl TipManager {
         tips.insert(block_hash.to_string(), info);
     }
 
-    /// Select best parents for a new block (sorted by blue score, highest first)
+    /// Select parents for a new block using **mandatory + weighted random** strategy.
+    ///
+    /// Pure greedy (always pick top-N by blue score) causes all miners to
+    /// reference the same tips, narrowing the DAG into a chain and enabling
+    /// centralization. Instead, we use a two-tier strategy:
+    ///
+    ///   Tier 1 (mandatory): The top 50% of slots go to the highest-scoring tips.
+    ///          This ensures chain progress and fast finality.
+    ///
+    ///   Tier 2 (diversity): The remaining 50% are filled by weighted random
+    ///          sampling from ALL remaining tips. Weight = blue_score + 1.
+    ///          This ensures the DAG stays wide, reducing centralization risk.
+    ///
+    /// Result: different miners include different lower-tier tips, creating
+    /// a healthy wide DAG while still converging on the best chain.
     pub fn select_parents(&self, max_parents: usize) -> Vec<String> {
         let tips = self.tips.read().unwrap_or_else(|e| e.into_inner());
+
+        if tips.is_empty() {
+            return Vec::new();
+        }
 
         let mut sorted: Vec<&TipInfo> = tips.values().collect();
         sorted.sort_by(|a, b| {
@@ -212,10 +230,81 @@ impl TipManager {
                 .then_with(|| a.hash.cmp(&b.hash))
         });
 
-        sorted.iter()
-            .take(max_parents)
+        if sorted.len() <= max_parents {
+            // Fewer tips than slots: include all (no selection needed)
+            return sorted.iter().map(|t| t.hash.clone()).collect();
+        }
+
+        // Tier 1: mandatory top tips (50% of slots, minimum 2)
+        let mandatory_count = (max_parents / 2).max(2).min(sorted.len());
+        let mut selected: Vec<String> = sorted[..mandatory_count]
+            .iter()
             .map(|t| t.hash.clone())
-            .collect()
+            .collect();
+
+        // Tier 2: weighted random from remaining tips
+        let remaining_slots = max_parents.saturating_sub(mandatory_count);
+        if remaining_slots > 0 && sorted.len() > mandatory_count {
+            let candidates = &sorted[mandatory_count..];
+
+            // Deterministic seed from the best tip's hash — ensures all nodes
+            // with the same tip set produce compatible (though not identical)
+            // parent selections. Different nodes may have slightly different
+            // tip sets due to propagation delay, which is acceptable.
+            let seed = Self::hash_seed(&sorted[0].hash);
+
+            let mut rng_state = seed;
+            let total_weight: u64 = candidates.iter()
+                .map(|t| t.blue_score.saturating_add(1))
+                .sum();
+
+            if total_weight > 0 {
+                let mut available: Vec<(usize, u64)> = candidates.iter()
+                    .enumerate()
+                    .map(|(i, t)| (i, t.blue_score.saturating_add(1)))
+                    .collect();
+
+                for _ in 0..remaining_slots {
+                    if available.is_empty() {
+                        break;
+                    }
+
+                    // Simple deterministic PRNG (xorshift64)
+                    rng_state ^= rng_state << 13;
+                    rng_state ^= rng_state >> 7;
+                    rng_state ^= rng_state << 17;
+
+                    let current_total: u64 = available.iter().map(|(_, w)| *w).sum();
+                    let threshold = rng_state % current_total.max(1);
+
+                    let mut cumulative = 0u64;
+                    let mut pick_idx = 0;
+                    for (j, (_, weight)) in available.iter().enumerate() {
+                        cumulative += weight;
+                        if cumulative > threshold {
+                            pick_idx = j;
+                            break;
+                        }
+                    }
+
+                    let (orig_idx, _) = available.remove(pick_idx);
+                    selected.push(candidates[orig_idx].hash.clone());
+                }
+            }
+        }
+
+        selected
+    }
+
+    /// Deterministic seed derived from a tip hash (for weighted random sampling).
+    fn hash_seed(hash: &str) -> u64 {
+        let bytes = hash.as_bytes();
+        let mut seed: u64 = 0x517cc1b727220a95; // FNV offset basis
+        for &b in bytes {
+            seed ^= b as u64;
+            seed = seed.wrapping_mul(0x100000001b3); // FNV prime
+        }
+        seed
     }
 
     /// Get the tip with the highest blue score (selected parent candidate)
