@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::errors::{DagError, StorageError};
+use crate::{slog_warn, slog_error};
 pub use crate::engine::dag::ghostdag::ghostdag::GHOSTDAG_K;
 
 const CF_BLUE: &str = "blue_cf";
@@ -98,7 +99,7 @@ impl BlueSetStore {
     #[inline(always)]
     fn blue_cf(&self) -> Option<&rocksdb::ColumnFamily> {
         self.db.cf_handle(CF_BLUE).or_else(|| {
-            eprintln!("[BlueSetStore] CF_BLUE missing — falling back to default CF");
+            slog_warn!("ghostdag", "cf_blue_missing", fallback => "default CF");
             self.db.cf_handle("default")
         })
     }
@@ -106,7 +107,7 @@ impl BlueSetStore {
     #[inline(always)]
     fn bset_cf(&self) -> Option<&rocksdb::ColumnFamily> {
         self.db.cf_handle(CF_BSET).or_else(|| {
-            eprintln!("[BlueSetStore] CF_BSET missing — falling back to default CF");
+            slog_warn!("ghostdag", "cf_bset_missing", fallback => "default CF");
             self.db.cf_handle("default")
         })
     }
@@ -141,10 +142,10 @@ impl BlueSetStore {
     pub fn store_blue(&self, hash: &str) {
         let cf = match self.blue_cf() {
             Some(cf) => cf,
-            None => { eprintln!("[BlueSetStore] store_blue: no CF available"); return; }
+            None => { slog_error!("ghostdag", "store_blue_no_cf"); return; }
         };
         if let Err(e) = self.db.put_cf_opt(cf, Self::key_blue(hash), [1], &self.write_opts) {
-            eprintln!("store_blue error: {}", e);
+            slog_error!("ghostdag", "store_blue_failed", error => e);
         }
     }
 
@@ -159,20 +160,20 @@ impl BlueSetStore {
     pub fn remove_blue(&self, hash: &str) {
         let cf = match self.blue_cf() {
             Some(cf) => cf,
-            None => { eprintln!("[BlueSetStore] remove_blue: no CF available"); return; }
+            None => { slog_error!("ghostdag", "remove_blue_no_cf"); return; }
         };
         if let Err(e) = self.db.delete_cf(cf, Self::key_blue(hash)) {
-            eprintln!("remove_blue error: {}", e);
+            slog_error!("ghostdag", "remove_blue_failed", error => e);
         }
     }
 
     pub fn add_to_blue_set(&self, block: &str, member: &str) {
         let cf = match self.bset_cf() {
             Some(cf) => cf,
-            None => { eprintln!("[BlueSetStore] add_to_blue_set: no CF available"); return; }
+            None => { slog_error!("ghostdag", "add_to_blue_set_no_cf"); return; }
         };
         if let Err(e) = self.db.put_cf_opt(cf, Self::key_bset(block, member), [1], &self.write_opts) {
-            eprintln!("add_to_blue_set error: {}", e);
+            slog_error!("ghostdag", "add_to_blue_set_failed", error => e);
         }
     }
 
@@ -183,7 +184,7 @@ impl BlueSetStore {
     pub fn store_blue_set(&self, block: &str, members: &HashSet<String>) {
         let cf = match self.bset_cf() {
             Some(cf) => cf,
-            None => { eprintln!("[BlueSetStore] store_blue_set: no CF available"); return; }
+            None => { slog_error!("ghostdag", "store_blue_set_no_cf"); return; }
         };
         let mut batch = WriteBatch::default();
 
@@ -192,7 +193,7 @@ impl BlueSetStore {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("store_blue_set error: {}", e);
+            slog_error!("ghostdag", "store_blue_set_failed", error => e);
         }
     }
 
@@ -227,10 +228,10 @@ impl BlueSetStore {
             }
 
             if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-                eprintln!("build_blue_set error: {}", e);
+                slog_error!("ghostdag", "build_blue_set_failed", error => e);
             }
         } else {
-            eprintln!("[BlueSetStore] build_blue_set: CF unavailable, skipping persist");
+            slog_warn!("ghostdag", "build_blue_set_cf_unavailable");
         }
 
         blue_set
@@ -241,7 +242,7 @@ impl BlueSetStore {
 
         let cf = match self.bset_cf() {
             Some(cf) => cf,
-            None => { eprintln!("[BlueSetStore] scan_set: no CF available"); return set; }
+            None => { slog_error!("ghostdag", "scan_set_no_cf"); return set; }
         };
 
         let mut ro = ReadOptions::default();

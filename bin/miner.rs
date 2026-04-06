@@ -29,8 +29,11 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use std::io::{Read, Write, BufRead};
 use std::net::TcpStream;
+use shadowdag::errors::NodeError;
+use shadowdag::{slog_info, slog_warn, slog_error, slog_fatal};
 
 fn main() {
+    shadowdag::telemetry::logging::structured::init();
     let args: Vec<String> = std::env::args().collect();
 
     if has_flag(&args, "--help") || has_flag(&args, "-h") {
@@ -41,20 +44,19 @@ fn main() {
     }
 
     if let Err(e) = run_miner(&args) {
-        eprintln!();
-        eprintln!("[miner] FATAL: {}", e);
+        slog_fatal!("miner", "startup_failed", error => &e);
         eprintln!("[miner] Run 'shadowdag-miner --help' for usage information.");
         std::process::exit(1);
     }
 }
 
-fn run_miner(args: &[String]) -> Result<(), String> {
+fn run_miner(args: &[String]) -> Result<(), NodeError> {
     // Parse flags
     let miner_address = parse_flag(args, "--address",
         "SD1ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00");
     let network_str = parse_flag(args, "--network", "mainnet");
     let network: NetworkMode = network_str.parse().map_err(|_| {
-        format!("invalid --network '{}'. Use: mainnet, testnet, or regtest", network_str)
+        NodeError::Init(format!("invalid --network '{}'. Use: mainnet, testnet, or regtest", network_str))
     })?;
     let threads: usize = parse_flag(args, "--threads",
         &num_cpus().to_string()).parse().unwrap_or(4).min(256).max(1);
@@ -79,22 +81,20 @@ fn run_miner(args: &[String]) -> Result<(), String> {
     println!("║     S H A D O W D A G  —  Miner v1.1         ║");
     println!("║     Multi-Threaded ShadowHash Mining           ║");
     println!("╚══════════════════════════════════════════════╝");
-    println!("[miner] Network     : {}", network_str);
-    println!("[miner] Address     : {}...{}", &miner_address[..8.min(miner_address.len())], &miner_address[miner_address.len().saturating_sub(6)..]);
-    println!("[miner] Dev Address : {}...{}", &owner_address[..8.min(owner_address.len())], &owner_address[owner_address.len().saturating_sub(6)..]);
-    println!("[miner] Threads     : {}", threads);
-    println!("[miner] RPC         : {}", rpc_addr);
-    println!("[miner] Genesis     : {}...", &genesis.header.hash[..16.min(genesis.header.hash.len())]);
-    println!("[miner] Reward      : {} (Era 0)", EmissionSchedule::info(0));
-    println!();
+    slog_info!("miner", "config",
+        network => &network_str,
+        address => format!("{}...{}", &miner_address[..8.min(miner_address.len())], &miner_address[miner_address.len().saturating_sub(6)..]),
+        dev_address => format!("{}...{}", &owner_address[..8.min(owner_address.len())], &owner_address[owner_address.len().saturating_sub(6)..]),
+        threads => threads,
+        rpc => &rpc_addr,
+        genesis => &genesis.header.hash[..16.min(genesis.header.hash.len())],
+        reward => EmissionSchedule::info(0));
 
     let mut total_mined: u64 = 0;
     let mut total_accepted: u64 = 0;
     let session_start = Instant::now();
 
-    println!("[miner] Starting mining loop...");
-    println!("[miner] Press Ctrl+C to stop.");
-    println!();
+    slog_info!("miner", "mining_loop_started");
 
     loop {
         // ═══ STEP 1: Get fresh template from node EVERY block ═══
@@ -103,8 +103,7 @@ fn run_miner(args: &[String]) -> Result<(), String> {
             Some(t) => t,
             None => {
                 if total_mined == 0 {
-                    println!("[miner] WARNING: Cannot connect to node RPC at {}", rpc_addr);
-                    println!("[miner] Retrying in 5 seconds...");
+                    slog_warn!("miner", "rpc_connect_failed", addr => &rpc_addr, retry_sec => 5);
                 }
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 continue;
@@ -116,7 +115,7 @@ fn run_miner(args: &[String]) -> Result<(), String> {
         let difficulty = template.difficulty;
 
         if total_mined == 0 {
-            println!("[miner] Connected to node: height={}, difficulty={}", height - 1, difficulty);
+            slog_info!("miner", "connected_to_node", height => height - 1, difficulty => difficulty);
         }
 
         let timestamp = SystemTime::now()
@@ -249,7 +248,7 @@ fn run_miner(args: &[String]) -> Result<(), String> {
         let (nonce, hash) = match result {
             Some(r) => r,
             None => {
-                eprintln!("\n[miner] No valid nonce found — retrying with new template...");
+                slog_warn!("miner", "no_valid_nonce_found");
                 continue;
             }
         };
@@ -257,9 +256,10 @@ fn run_miner(args: &[String]) -> Result<(), String> {
         // Clear progress line
         print!("\r{}\r", " ".repeat(80));
 
+        let fees_sdag = template.total_fees as f64 / 100_000_000.0;
         println!(
-            "⛏  Block #{} mined! hash={}... nonce={} time={:.1}s rate={:.0} H/s",
-            height, &hash[..16], nonce, elapsed, hashrate
+            "⛏  Block #{} mined! hash={}... nonce={} time={:.1}s rate={:.0} H/s fees={:.8} SDAG",
+            height, &hash[..16], nonce, elapsed, hashrate, fees_sdag
         );
 
         // ═══ STEP 4: Build full block and submit ═══
@@ -291,10 +291,10 @@ fn run_miner(args: &[String]) -> Result<(), String> {
                 println!("    ✅ Accepted by node (queued for consensus)");
             }
             SubmitResult::Rejected(reason) => {
-                eprintln!("    ❌ Rejected: {}", reason);
+                slog_error!("miner", "block_rejected", reason => &reason);
             }
             SubmitResult::ConnError => {
-                println!("    ⚠️  Could not connect to node");
+                slog_warn!("miner", "block_submit_conn_error");
             }
         }
 
@@ -320,7 +320,6 @@ struct BlockTemplate {
     prev_hash:     String,
     parent_hashes: Vec<String>,
     difficulty:    u64,
-    #[allow(dead_code)]
     total_fees:    u64,
 }
 
@@ -379,14 +378,14 @@ fn rpc_call(addr: &str, method: &str, params: &str) -> Option<String> {
     // Read exactly content_length bytes for the body
     if content_length > 0 {
         if content_length > MAX_RESPONSE {
-            eprintln!("RPC response too large: {} bytes (max {})", content_length, MAX_RESPONSE);
+            slog_error!("miner", "rpc_response_too_large", bytes => content_length, max => MAX_RESPONSE);
             return None;
         }
         let mut body_buf = vec![0u8; content_length];
         match reader.read_exact(&mut body_buf) {
             Ok(()) => {}
             Err(e) => {
-                eprintln!("RPC read_exact failed ({} bytes): {}", content_length, e);
+                slog_error!("miner", "rpc_read_failed", bytes => content_length, error => e);
                 return None;
             }
         }

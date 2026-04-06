@@ -21,6 +21,7 @@ use crate::domain::block::block_body::BlockBody;
 use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
 use crate::config::node::node_config::NetworkMode;
 use crate::errors::ConsensusError;
+use crate::{slog_warn, slog_error};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //                         CHAIN IDENTITY
@@ -226,10 +227,7 @@ pub fn compute_merkle_root(tx_hashes: &[String]) -> String {
             match crate::domain::types::hash::parse_hash256(h) {
                 Ok(bytes) => bytes.to_vec(),
                 Err(e) => {
-                    eprintln!(
-                        "[genesis] STRICT: rejecting malformed hash '{}…' ({}).",
-                        &h[..h.len().min(16)], e
-                    );
+                    slog_error!("genesis", "malformed_merkle_hash", hash_prefix => &h[..h.len().min(16)], error => &e.to_string());
                     vec![0xFF; 32]
                 }
             }
@@ -286,7 +284,7 @@ fn mine_genesis(p: &GenesisParams, merkle_root: &str) -> (u64, String) {
 
         // Safety: prevent infinite loop in case of misconfiguration
         if nonce > 100_000_000 {
-            eprintln!("[genesis] FATAL: could not find valid nonce within 100M attempts");
+            slog_error!("genesis", "nonce_search_exhausted", attempts => "100000000");
             return (0, "0".repeat(64));
         }
     }
@@ -314,7 +312,7 @@ fn build_block(p: GenesisParams) -> Block {
             if hash == MAINNET_GENESIS_HASH {
                 (MAINNET_GENESIS_NONCE, hash)
             } else {
-                eprintln!("[genesis] Mainnet hash mismatch — re-mining genesis...");
+                slog_warn!("genesis", "mainnet_hash_mismatch_remining");
                 mine_genesis(&p, &merkle_root)
             }
         }
@@ -326,7 +324,7 @@ fn build_block(p: GenesisParams) -> Block {
             if hash == TESTNET_GENESIS_HASH {
                 (TESTNET_GENESIS_NONCE, hash)
             } else {
-                eprintln!("[genesis] Testnet hash mismatch — re-mining genesis...");
+                slog_warn!("genesis", "testnet_hash_mismatch_remining");
                 mine_genesis(&p, &merkle_root)
             }
         }
@@ -338,7 +336,7 @@ fn build_block(p: GenesisParams) -> Block {
             if hash == REGTEST_GENESIS_HASH {
                 (REGTEST_GENESIS_NONCE, hash)
             } else {
-                eprintln!("[genesis] Regtest hash mismatch — re-mining genesis...");
+                slog_warn!("genesis", "regtest_hash_mismatch_remining");
                 mine_genesis(&p, &merkle_root)
             }
         }

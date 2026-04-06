@@ -10,6 +10,7 @@ use crate::domain::transaction::transaction::Transaction;
 use crate::domain::utxo::utxo::Utxo;
 use crate::domain::utxo::utxo_key::UtxoKey;
 use crate::domain::utxo::utxo_set::{BlockUndoData, UtxoSet, utxo_key};
+use crate::slog_warn;
 
 pub struct UtxoSpend;
 
@@ -124,10 +125,7 @@ impl UtxoSpend {
                         } else {
                             // Undo data missing for this input — log and skip.
                             // This should not happen if undo data was recorded correctly.
-                            eprintln!(
-                                "[UtxoSpend] rollback: no undo data for spent input {}",
-                                key_str
-                            );
+                            slog_warn!("utxo", "rollback_missing_undo_data", input => &key_str);
                         }
                     }
                 }

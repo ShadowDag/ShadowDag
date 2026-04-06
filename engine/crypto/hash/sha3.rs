@@ -11,6 +11,7 @@ use rocksdb::{
 };
 use std::path::Path;
 use crate::errors::CryptoError;
+use crate::slog_error;
 
 // prefix
 const HASH_PREFIX: &[u8] = b"h:";
@@ -21,7 +22,7 @@ pub struct Sha3Store {
     db: DB,
     write_opts: WriteOptions,
     read_opts: ReadOptions,
-    iter_read_opts: ReadOptions,
+    _iter_read_opts: ReadOptions,
 }
 
 impl Sha3Store {
@@ -61,15 +62,15 @@ impl Sha3Store {
         let mut read_opts = ReadOptions::default();
         read_opts.set_verify_checksums(false);
 
-        let mut iter_read_opts = ReadOptions::default();
-        iter_read_opts.set_verify_checksums(false);
-        iter_read_opts.fill_cache(false);
+        let mut _iter_read_opts = ReadOptions::default();
+        _iter_read_opts.set_verify_checksums(false);
+        _iter_read_opts.fill_cache(false);
 
         Ok(Self {
             db,
             write_opts,
             read_opts,
-            iter_read_opts,
+            _iter_read_opts,
         })
     }
 
@@ -94,7 +95,7 @@ impl Sha3Store {
     pub fn store_hash(&self, key: &str, hash: &str) {
         Self::with_key(key, |k| {
             if let Err(e) = self.db.put_opt(k, hash.as_bytes(), &self.write_opts) {
-                eprintln!("[Sha3Store] CRITICAL: DB write failed: {}", e);
+                slog_error!("crypto", "sha3_store_write_failed", error => e);
             }
         });
     }
@@ -114,7 +115,7 @@ impl Sha3Store {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("[Sha3Store] CRITICAL: DB batch write failed: {}", e);
+            slog_error!("crypto", "sha3_store_batch_write_failed", error => e);
         }
     }
 
@@ -133,7 +134,7 @@ impl Sha3Store {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("[Sha3Store] CRITICAL: DB delete batch failed: {}", e);
+            slog_error!("crypto", "sha3_store_delete_batch_failed", error => e);
         }
     }
 
@@ -147,7 +148,7 @@ impl Sha3Store {
                 Ok(Some(v)) => Some(v.to_vec()),
                 Ok(None) => None,
                 Err(e) => {
-                    eprintln!("[Sha3Store] CRITICAL: DB read failed: {}", e);
+                    slog_error!("crypto", "sha3_store_read_failed", error => e);
                     None
                 }
             }
@@ -175,7 +176,7 @@ impl Sha3Store {
                 Ok(Some(v)) => Some(v.to_vec()),
                 Ok(None) => None,
                 Err(e) => {
-                    eprintln!("[Sha3Store] CRITICAL: DB multi_get failed: {}", e);
+                    slog_error!("crypto", "sha3_store_multi_get_failed", error => e);
                     None
                 }
             })
@@ -199,7 +200,7 @@ impl Sha3Store {
                 Ok(Some(v)) => Some(v),
                 Ok(None) => None,
                 Err(e) => {
-                    eprintln!("[Sha3Store] CRITICAL: DB read pinned failed: {}", e);
+                    slog_error!("crypto", "sha3_store_read_pinned_failed", error => e);
                     None
                 }
             }
@@ -220,7 +221,7 @@ impl Sha3Store {
                 Ok(Some(_)) => true,
                 Ok(None) => false,
                 Err(e) => {
-                    eprintln!("[Sha3Store] CRITICAL: DB exists check failed: {}", e);
+                    slog_error!("crypto", "sha3_store_exists_check_failed", error => e);
                     false
                 }
             }
@@ -299,7 +300,7 @@ impl Sha3Store {
 
             if count >= CLEAR_BATCH_SIZE {
                 if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-                    eprintln!("[Sha3Store] CRITICAL: DB clear failed: {}", e);
+                    slog_error!("crypto", "sha3_store_clear_failed", error => e);
                     return;
                 }
                 batch = WriteBatch::default();
@@ -309,7 +310,7 @@ impl Sha3Store {
 
         if count > 0 {
             if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-                eprintln!("[Sha3Store] CRITICAL: DB clear failed: {}", e);
+                slog_error!("crypto", "sha3_store_clear_failed", error => e);
             }
         }
     }
@@ -319,7 +320,7 @@ impl Sha3Store {
     // ─────────────────────────────────────────
     pub fn flush(&self) {
         if let Err(e) = self.db.flush() {
-            eprintln!("[Sha3Store] CRITICAL: DB flush failed: {}", e);
+            slog_error!("crypto", "sha3_store_flush_failed", error => e);
         }
     }
 }

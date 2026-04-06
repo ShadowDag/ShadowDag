@@ -28,6 +28,7 @@
 use crate::domain::block::block::Block;
 use crate::errors::{DagError, StorageError};
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
+use crate::slog_info;
 use rocksdb::{DB, Options, IteratorMode, WriteBatch};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -260,13 +261,7 @@ impl BlockGraph {
         }
 
         if !visited.is_empty() || orphan_count > 0 {
-            eprintln!(
-                "[BlockGraph] Recovered {} blocks, {} tips, {} orphans from RocksDB (total_added={})",
-                visited.len(),
-                self.cache_tips.len(),
-                orphan_count,
-                self.total_added
-            );
+            slog_info!("dag", "block_graph_recovered", blocks => visited.len(), tips => self.cache_tips.len(), orphans => orphan_count, total_added => self.total_added);
         }
 
         // Try to connect recovered orphans whose parents may now exist

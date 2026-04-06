@@ -26,6 +26,7 @@
 
 use crate::errors::{DagError, StorageError};
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
+use crate::slog_info;
 use rocksdb::{DB, Options, IteratorMode, WriteBatch};
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
@@ -139,7 +140,7 @@ impl TipManager {
         }
 
         if !tips.is_empty() {
-            eprintln!("[TipManager] Recovered {} tips from RocksDB", tips.len());
+            slog_info!("dag", "tip_manager_recovered", tips => tips.len());
         }
     }
 

@@ -21,8 +21,6 @@ const SIG_PREFIX: &[u8] = b"fsig:";
 const PK_PREFIX:  &[u8] = b"fpk:";
 const PREFIX_LEN: usize = 5;
 
-const SIG_UPPER: &[u8] = b"fsig:\xFF";
-const PK_UPPER:  &[u8] = b"fpk:\xFF";
 
 // ─────────────────────────────────────────
 // DATA STRUCTS

@@ -8,8 +8,9 @@ use std::collections::HashSet as FxHashSet;
 
 use crate::domain::block::block::Block;
 use crate::domain::transaction::tx_validator::TxValidator;
-use crate::domain::utxo::utxo_key::UtxoKey;
 use crate::domain::utxo::utxo_set::{UtxoSet, utxo_key};
+#[cfg(test)]
+use crate::domain::utxo::utxo_key::UtxoKey;
 use crate::engine::mining::pow::pow_validator::PowValidator;
 use crate::engine::dag::security::dos_protection::MAX_DAG_PARENTS;
 use crate::engine::dag::security::dag_shield::DagShield;
@@ -428,14 +429,7 @@ impl BlockValidator {
 
     // ─────────────────────────────────────────
 
-    /// Validate all transactions in topological order with staged UTXO state.
-    ///
-    /// Why sequential instead of par_iter:
-    /// Blocks can contain intra-block dependencies (tx1 creates an output,
-    /// tx2 spends it). Parallel validation against a static UTXO snapshot
-    /// would reject these valid chains because tx2's input doesn't exist
-    /// in the base UTXO set yet. We build a staged view that accumulates
-    /// outputs created by earlier transactions within the same block.
+    #[cfg(test)]
     fn validate_transactions_atomic(
         block:    &Block,
         utxo_set: &UtxoSet,

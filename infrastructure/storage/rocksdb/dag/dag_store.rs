@@ -8,6 +8,7 @@ use serde::{Serialize, Deserialize};
 use std::path::Path;
 
 use crate::errors::StorageError;
+use crate::slog_error;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct DagNode {
@@ -34,12 +35,12 @@ impl DagStore {
 
     pub fn save_node(&self, node: &DagNode) -> Result<(), StorageError> {
         let data = bincode::serialize(node).map_err(|e| {
-            eprintln!("[DagStore] serialize error for node '{}': {}", node.hash, e);
+            slog_error!("storage", "dag_node_serialize_error", hash => node.hash, error => e);
             StorageError::Serialization(e.to_string())
         })?;
 
         self.db.put(&node.hash, data).map_err(|e| {
-            eprintln!("[DagStore] put error for node '{}': {}", node.hash, e);
+            slog_error!("storage", "dag_node_put_error", hash => node.hash, error => e);
             StorageError::WriteFailed(e.to_string())
         })
     }
@@ -49,7 +50,7 @@ impl DagStore {
             Ok(Some(data)) => bincode::deserialize(&data).ok(),
             Ok(None) => None,
             Err(e) => {
-                eprintln!("[DagStore] DB read error for node '{}': {}", hash, e);
+                slog_error!("storage", "dag_node_read_error", hash => hash, error => e);
                 None
             }
         }

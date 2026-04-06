@@ -19,6 +19,7 @@ use shadowdag::daemon::DaemonNode;
 use shadowdag::config::node::node_config::{NodeConfig, NetworkMode};
 use shadowdag::config::genesis::genesis::{genesis_info, verify_genesis_detailed, create_genesis_block_for};
 use shadowdag::config::consensus::emission_schedule::EmissionSchedule;
+use shadowdag::{slog_info, slog_error};
 
 // ── Boot error type ─────────────────────────────────────────────────────
 // Lightweight enum for CLI-level errors that don't belong in the library.
@@ -48,6 +49,7 @@ impl std::fmt::Display for BootError {
 }
 
 fn main() {
+    shadowdag::telemetry::logging::structured::init();
     let args: Vec<String> = std::env::args().collect();
 
     // Handle subcommands (these never fail — no Result needed)
@@ -127,13 +129,13 @@ fn run(args: &[String]) -> Result<(), BootError> {
     println!("║     S H A D O W D A G  —  Full Node          ║");
     println!("║     Privacy • Speed • Decentralization        ║");
     println!("╚══════════════════════════════════════════════╝");
-    println!("[node] Version  : 1.0.0");
-    println!("[node] Network  : {}", cfg.network.name());
-    println!("[node] P2P Port : {}", cfg.p2p_port);
-    println!("[node] RPC Port : {}", cfg.rpc_port);
-    println!("[node] Data Dir : {}", cfg.data_dir.display());
-    println!("[node] Genesis  : {}...", &genesis.header.hash[..16]);
-    println!("[node] Emission : {}", EmissionSchedule::info(0));
+    slog_info!("node", "config", version => "1.0.0",
+        network => cfg.network.name(),
+        p2p_port => cfg.p2p_port,
+        rpc_port => cfg.rpc_port,
+        data_dir => cfg.data_dir.display(),
+        genesis => &genesis.header.hash[..16],
+        emission => EmissionSchedule::info(0));
     println!();
 
     // ── Initialize data directories ──────────────────────────────────
@@ -151,7 +153,7 @@ fn run(args: &[String]) -> Result<(), BootError> {
     daemon.start()
         .map_err(|e| BootError::StartFailed(e.to_string()))?;
 
-    println!("[node] All services started. Press Ctrl+C to stop.");
+    slog_info!("node", "all_services_started");
 
     // Main event loop — drains P2P pending queues (blocks + transactions)
     // and processes them through the full consensus pipeline.
@@ -187,7 +189,7 @@ fn print_genesis(args: &[String]) {
     let mode: NetworkMode = match network.parse() {
         Ok(m)  => m,
         Err(_) => {
-            eprintln!("[ERROR] Invalid --network '{}'. Use: mainnet, testnet, or regtest", network);
+            slog_error!("node", "invalid_network", value => &network);
             return;
         }
     };

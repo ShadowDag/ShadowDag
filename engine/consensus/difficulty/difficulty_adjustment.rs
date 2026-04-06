@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::engine::consensus::difficulty::difficulty::Difficulty;
 use crate::engine::consensus::difficulty::difficulty_window::DifficultyWindow;
 use crate::errors::{ConsensusError, StorageError};
+use crate::slog_error;
 
 /// Retarget every 120 seconds worth of blocks to maintain ~2-minute windows.
 /// At ConsensusParams::BLOCKS_PER_SECOND the actual block count per retarget
@@ -209,7 +210,7 @@ impl DifficultyAdjustment {
         let new_difficulty = Difficulty::clamp(smoothed as u64);
 
         if let Err(e) = self.set_difficulty(new_difficulty) {
-            eprintln!("{}", e);
+            slog_error!("consensus", "set_difficulty_failed", error => e);
         }
 
         new_difficulty
@@ -238,7 +239,7 @@ impl DifficultyAdjustment {
 
         let difficulty = Difficulty::clamp(difficulty);
         if let Err(e) = self.set_difficulty(difficulty) {
-            eprintln!("{}", e);
+            slog_error!("consensus", "set_difficulty_failed", error => e);
         }
 
         difficulty

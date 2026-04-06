@@ -82,8 +82,8 @@ static GAMMA_CDF: [u64; GAMMA_TABLE_SIZE] = {
         // Fixed-point: val = x * 2^56 / 256 = x * 2^48
         // This represents x/256 in Q56 fixed point.
         // Range: [1/256, 1] -> [2^48, 2^56]
-        let shift = 48u32;
-        let frac: u128 = x << shift; // x/256 in Q56
+        let shift = 56u32;
+        let frac: u128 = x << 48; // x/256 in Q56 (x * 2^48 = x/256 * 2^56)
 
         // Compute frac^19 keeping precision via staged multiplication.
         // After each multiply of two Q56 values, result is Q112, shift right 56.

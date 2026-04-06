@@ -14,6 +14,7 @@ use dashmap::DashSet;
 use std::collections::HashSet;
 
 use crate::errors::{DagError, StorageError};
+use crate::slog_error;
 
 const HEADER_PREFIX: &[u8] = b"header:";
 const CACHE_LIMIT: usize = 50_000;
@@ -96,7 +97,7 @@ impl HeaderSync {
         Self::make_key(hash, &mut key);
 
         if let Err(e) = self.db.put_opt(&key, b"1", &self.write_opts) {
-            eprintln!("[DB] put error: {}", e);
+            slog_error!("dag", "header_sync_put_failed", error => e);
 
             // rollback
             self.cache.remove(&hash_string);
@@ -140,7 +141,7 @@ impl HeaderSync {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("[DB] batch write error: {}", e);
+            slog_error!("dag", "header_sync_batch_write_failed", error => e);
 
             // rollback
             for hash in to_cache {
@@ -171,7 +172,7 @@ impl HeaderSync {
             }
             Ok(None) => false,
             Err(e) => {
-                eprintln!("[DB] get error: {}", e);
+                slog_error!("dag", "header_sync_get_failed", error => e);
                 false
             }
         }

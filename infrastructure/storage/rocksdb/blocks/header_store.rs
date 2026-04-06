@@ -9,6 +9,7 @@ use bincode;
 
 use crate::domain::block::block_header::BlockHeader;
 use crate::errors::StorageError;
+use crate::slog_error;
 
 pub struct HeaderStore {
     db: DB,
@@ -27,7 +28,7 @@ impl HeaderStore {
     pub fn save_header(&self, header: &BlockHeader) {
         let data = bincode::serialize(header).unwrap_or_default();
 
-        if let Err(_e) = self.db.put(&header.hash, data) { eprintln!("[DB] put error: {}", _e); }
+        if let Err(e) = self.db.put(&header.hash, data) { slog_error!("storage", "header_put_error", error => e); }
 
     }
 

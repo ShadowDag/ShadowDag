@@ -4,6 +4,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use crate::{slog_error, slog_warn};
 
 static ACTIVE_TASKS: AtomicUsize = AtomicUsize::new(0);
 
@@ -31,7 +32,7 @@ impl AsyncRuntime {
             }) {
             Ok(_) => {},
             Err(e) => {
-                eprintln!("[AsyncRuntime] Failed to spawn named thread: {}", e);
+                slog_error!("runtime", "spawn_named_thread_failed", error => &e.to_string());
                 ACTIVE_TASKS.fetch_sub(1, Ordering::Relaxed);
             }
         }
@@ -44,8 +45,7 @@ impl AsyncRuntime {
 
         while ACTIVE_TASKS.load(Ordering::Relaxed) > 0 {
             if start.elapsed() > timeout {
-                eprintln!("[AsyncRuntime] Timeout: {} tasks still active after {:?}",
-                    ACTIVE_TASKS.load(Ordering::Relaxed), timeout);
+                slog_warn!("runtime", "async_runtime_timeout", active_tasks => &ACTIVE_TASKS.load(Ordering::Relaxed).to_string());
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));

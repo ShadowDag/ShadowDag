@@ -7,6 +7,7 @@ use rocksdb::{DB, Options};
 use std::path::Path;
 
 use crate::errors::StorageError;
+use crate::slog_error;
 
 pub struct BlockIndex {
     db: DB,
@@ -24,7 +25,7 @@ impl BlockIndex {
     }
 
     pub fn set_height(&self, hash: &str, height: u64) {
-        if let Err(_e) = self.db.put(hash, height.to_be_bytes()) { eprintln!("[DB] put error: {}", _e); }
+        if let Err(e) = self.db.put(hash, height.to_be_bytes()) { slog_error!("storage", "block_index_put_error", error => e); }
 
     }
 

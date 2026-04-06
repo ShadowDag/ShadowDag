@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::errors::{DagError, StorageError};
+use crate::slog_error;
 
 // Column Families
 pub const CF_DEFAULT: &str = "default";
@@ -100,7 +101,7 @@ impl<'a> BlockLocator<'a> {
         let key = StorageEngine::make_key(hash);
         let cf = match self.engine.db.cf_handle(CF_LOCATORS) {
             Some(cf) => cf,
-            None => { eprintln!("[Locator] CF_LOCATORS missing"); return; }
+            None => { slog_error!("dag", "locator_cf_missing"); return; }
         };
 
         if let Err(e) = self.engine.db.put_cf_opt(
@@ -109,7 +110,7 @@ impl<'a> BlockLocator<'a> {
             b"1",
             &self.engine.write_opts_no_wal,
         ) {
-            eprintln!("[Locator] put error: {}", e);
+            slog_error!("dag", "locator_put_failed", error => e);
         }
     }
 
@@ -119,7 +120,7 @@ impl<'a> BlockLocator<'a> {
         let key = StorageEngine::make_key(hash);
         let cf = match self.engine.db.cf_handle(CF_LOCATORS) {
             Some(cf) => cf,
-            None => { eprintln!("[Locator] CF_LOCATORS missing"); return false; }
+            None => { slog_error!("dag", "locator_cf_missing_exists"); return false; }
         };
 
         matches!(
@@ -137,7 +138,7 @@ impl<'a> BlockLocator<'a> {
         let mut result = Vec::with_capacity(limit.min(1024));
         let cf = match self.engine.db.cf_handle(CF_LOCATORS) {
             Some(cf) => cf,
-            None => { eprintln!("[Locator] CF_LOCATORS missing"); return result; }
+            None => { slog_error!("dag", "locator_cf_missing_list"); return result; }
         };
 
         let mut iter_opts = ReadOptions::default();
@@ -185,11 +186,11 @@ impl StorageEngine {
 
         let cf_locators = match self.db.cf_handle(CF_LOCATORS) {
             Some(cf) => cf,
-            None => { eprintln!("[StorageEngine] CF_LOCATORS missing"); return; }
+            None => { slog_error!("dag", "storage_engine_cf_locators_missing"); return; }
         };
         let cf_blocks = match self.db.cf_handle(CF_BLOCKS) {
             Some(cf) => cf,
-            None => { eprintln!("[StorageEngine] CF_BLOCKS missing"); return; }
+            None => { slog_error!("dag", "storage_engine_cf_blocks_missing"); return; }
         };
 
         let mut batch = WriteBatch::default();
@@ -197,7 +198,7 @@ impl StorageEngine {
         batch.put_cf(cf_blocks, b"block1", b"...");
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts_no_wal) {
-            eprintln!("[DB] batch error: {}", e);
+            slog_error!("dag", "storage_engine_batch_failed", error => e);
         }
     }
 }

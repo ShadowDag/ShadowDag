@@ -6,6 +6,7 @@
 use rocksdb::{DB, Options};
 use std::path::Path;
 use crate::errors::NetworkError;
+use crate::slog_error;
 
 pub struct DnsSeeds {
     db: DB,
@@ -27,7 +28,7 @@ impl DnsSeeds {
     }
 
     pub fn add_seed(&self, address: &str) {
-        if let Err(_e) = self.db.put(address, b"seed") { eprintln!("[DB] put error: {}", _e); }
+        if let Err(_e) = self.db.put(address, b"seed") { slog_error!("p2p", "db_put_error", error => &_e.to_string()); }
 
     }
 

@@ -36,7 +36,6 @@ pub enum ConflictType {
 /// Monitors for 0-conf and 1-conf double-spend attempts
 /// Maximum entries per map to prevent DoS memory exhaustion
 const MAX_MEMPOOL_INPUTS: usize = 500_000;
-const MAX_BLOCK_INPUTS: usize = 1_000_000;
 const MAX_ALERTS: usize = 10_000;
 
 pub struct ZeroConfGuard {

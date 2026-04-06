@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::errors::NetworkError;
 use crate::domain::block::block::Block;
+use crate::slog_error;
 use crate::service::network::p2p::p2p::{P2PMessage, push_outbound};
 use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
@@ -23,8 +24,6 @@ pub const ORPHAN_TTL_SECS: u64 = 3_600;
 /// memory exhaustion from maliciously large or corrupted DB values.
 pub const MAX_ORPHAN_ENTRY_SIZE: usize = 4 * 1024 * 1024;
 
-#[allow(dead_code)]
-const PFX_RELAY:  &[u8] = b"relay:block:";
 const PFX_ORPHAN: &[u8] = b"orphan:block:";
 
 use serde::{Serialize, Deserialize};
@@ -37,7 +36,7 @@ struct OrphanEntry {
 
 pub struct BlockRelay {
     db:           DB,
-    peer_manager: Arc<PeerManager>,
+    _peer_manager: Arc<PeerManager>,
     block_store:  Option<Arc<BlockStore>>,
 }
 
@@ -50,7 +49,7 @@ impl BlockRelay {
                 path: path.to_string(),
                 reason: e.to_string(),
             }))?;
-        Ok(Self { db, peer_manager, block_store: None })
+        Ok(Self { db, _peer_manager: peer_manager, block_store: None })
     }
 
     pub fn with_block_store(mut self, store: Arc<BlockStore>) -> Self {
@@ -82,14 +81,14 @@ impl BlockRelay {
 
         // Mark as relayed
         if let Err(e) = self.db.put(key.as_bytes(), b"1") {
-            eprintln!("[BlockRelay] DB put error: {}", e);
+            slog_error!("relay", "block_relay_db_put_error", error => e);
         }
 
         // Serialize block as bincode for the P2PMessage::Block payload
         let block_bytes = match bincode::serialize(block) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[BlockRelay] Serialize error: {}", e);
+                slog_error!("relay", "block_serialize_error", error => e);
                 return;
             }
         };

@@ -12,6 +12,7 @@ use crate::domain::utxo::utxo_key::UtxoKey;
 use crate::domain::utxo::utxo_set::utxo_key;
 use crate::errors::StorageError;
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
+use crate::{slog_info, slog_error};
 
 #[derive(Clone)]
 pub struct UtxoStore {
@@ -190,7 +191,7 @@ impl UtxoStore {
                     }
                     Ok(_) => {} // spent — skip normally
                     Err(e) => {
-                        eprintln!("[UtxoStore] export_all: corrupted entry {}: {}", utxo_key, e);
+                        slog_error!("storage", "utxo_export_corrupted_entry", key => utxo_key, error => e);
                     }
                 }
             }
@@ -261,9 +262,9 @@ impl UtxoStore {
 
         if count > 0 {
             if let Err(e) = self.db.write(batch) {
-                eprintln!("[UtxoStore] clear_all failed after {} keys: {}", count, e);
+                slog_error!("storage", "utxo_clear_all_failed", keys => count, error => e);
             } else {
-                eprintln!("[UtxoStore] cleared {} UTXO-related keys", count);
+                slog_info!("storage", "utxo_clear_all_complete", keys => count);
             }
         }
     }

@@ -26,6 +26,7 @@ use shadowdag::service::wallet::storage::wallet_db::WalletDB;
 use shadowdag::infrastructure::storage::rocksdb::utxo::utxo_store::UtxoStore;
 use shadowdag::domain::address::invisible_wallet::InvisibleWallet;
 use shadowdag::errors::WalletError;
+use shadowdag::{slog_warn, slog_error};
 
 const MAX_SDAG_AMOUNT: f64 = 21_000_000.0;
 const SATS_PER_SDAG: f64 = 100_000_000.0;
@@ -92,12 +93,11 @@ fn prompt_password(prompt_msg: &str) -> String {
     let mut password = String::new();
     match io::stdin().read_line(&mut password) {
         Ok(0) => {
-            eprintln!("\n[wallet] ERROR: stdin closed (EOF) — cannot read password.");
-            eprintln!("[wallet] If running non-interactively, pipe the password via stdin.");
+            slog_error!("wallet", "stdin_closed_eof", hint => "pipe password via stdin for non-interactive use");
             std::process::exit(1);
         }
         Err(e) => {
-            eprintln!("\n[wallet] ERROR: failed to read password from stdin: {}", e);
+            slog_error!("wallet", "password_read_failed", error => &e.to_string());
             std::process::exit(1);
         }
         Ok(_) => {}
@@ -108,11 +108,11 @@ fn prompt_password(prompt_msg: &str) -> String {
     password.clear();
 
     if trimmed.is_empty() {
-        eprintln!("[wallet] ERROR: empty password is not allowed.");
+        slog_error!("wallet", "empty_password_rejected");
         std::process::exit(1);
     }
     if trimmed.len() < 8 {
-        eprintln!("[wallet] ERROR: password must be at least 8 characters.");
+        slog_error!("wallet", "password_too_short", min_length => "8");
         std::process::exit(1);
     }
     trimmed
@@ -246,17 +246,15 @@ fn cmd_new(args: &[String]) {
 
     // Persist the encrypted seed to disk
     if let Err(e) = save_encrypted_seed(&enc_seed) {
-        eprintln!("Warning: could not save encrypted seed: {}", e);
+        slog_warn!("wallet", "seed_save_failed", error => &e.to_string());
     }
 
     // Persist wallet state via WalletDB
     let db = match WalletDB::new(&wallet_db_path()) {
         Ok(db) => db,
         Err(e) => {
-            eprintln!("[wallet] ERROR: cannot open wallet DB: {}", e);
-            eprintln!("[wallet] Wallet was created but could NOT be saved to disk.");
-            eprintln!("[wallet] Your mnemonic below is the ONLY way to recover it.");
-            eprintln!("[wallet] Fix the DB path and run 'shadowdag-wallet import' to restore.");
+            slog_error!("wallet", "wallet_db_open_failed", error => &e.to_string());
+            slog_error!("wallet", "wallet_not_persisted", recovery => "mnemonic below is the ONLY way to recover");
             // Print mnemonic BEFORE returning so user can still recover
             println!();
             println!("  Mnemonic (WRITE THIS DOWN — wallet NOT saved):");
@@ -326,7 +324,7 @@ fn cmd_balance(args: &[String]) {
             }
         }
         Err(e) => {
-            eprintln!("Cannot open UTXO database at '{}': {}", db_path, e);
+            slog_error!("wallet", "utxo_db_open_failed", path => &db_path, error => &e.to_string());
             eprintln!("Make sure a ShadowDAG node has been run at least once,");
             eprintln!("or set SHADOWDAG_DB to the correct path.");
         }
@@ -434,7 +432,13 @@ fn cmd_stealth(args: &[String]) {
 
 fn cmd_invisible(args: &[String]) {
     let network = args.get(2).map(|s| s.as_str()).unwrap_or("mainnet");
-    let mut wallet = InvisibleWallet::new(network);
+    let mut wallet = match InvisibleWallet::new(network) {
+        Ok(w) => w,
+        Err(e) => {
+            slog_error!("wallet", "invisible_wallet_creation_failed", error => &e.to_string());
+            return;
+        }
+    };
 
     println!("======================================================");
     println!("     Invisible Wallet -- Ghost Mode");

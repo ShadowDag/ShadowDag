@@ -19,7 +19,6 @@ use std::path::Path;
 // PREFIXES
 // ─────────────────────────────────────────
 const SIG_PREFIX: &[u8] = b"sig:";
-const PK_PREFIX:  &[u8] = b"pk:";
 const PREFIX_LEN: usize = 3;
 
 const SIG_UPPER: &[u8] = b"sig:\xFF";

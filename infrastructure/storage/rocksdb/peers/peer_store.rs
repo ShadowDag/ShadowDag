@@ -8,6 +8,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::domain::types::peer_address::PeerAddress;
+use crate::slog_error;
 
 pub const MAX_STORED_PEERS: usize = 2_048;
 
@@ -55,7 +56,7 @@ impl PeerStore {
         let path = crate::config::node::node_config::NetworkMode::base_data_dir()
             .join("peers_store");
         Self::new(&path.to_string_lossy()).ok_or_else(|| {
-            eprintln!("[PeerStore] ERROR: cannot open default peer DB");
+            slog_error!("storage", "peer_store_open_failed");
             crate::errors::StorageError::OpenFailed {
                 path: path.to_string_lossy().to_string(),
                 reason: "PeerStore::new returned None".to_string(),

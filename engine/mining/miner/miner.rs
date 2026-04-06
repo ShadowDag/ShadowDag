@@ -11,6 +11,7 @@ use crate::engine::mining::pow::pow_validator::PowValidator;
 use crate::engine::dag::core::dag_manager::DagManager;
 use crate::engine::dag::security::dos_protection::MAX_DAG_PARENTS;
 use crate::errors::ConsensusError;
+use crate::{slog_info, slog_debug, slog_warn};
 
 pub struct Miner {
     pub difficulty:           u64,
@@ -140,12 +141,7 @@ impl Miner {
         let base_timestamp = block.header.timestamp;
         let mut ts_bumps = 0u32;
 
-        eprintln!(
-            "Miner → start mining height={} parents={} difficulty={}",
-            block.header.height,
-            block.header.parents.len(),
-            self.difficulty
-        );
+        slog_info!("mining", "mining_started", height => block.header.height, parents => block.header.parents.len(), difficulty => self.difficulty);
 
         loop {
             block.header.nonce = nonce;
@@ -153,13 +149,7 @@ impl Miner {
 
             if PowValidator::hash_meets_target(&hash, self.difficulty) {
                 block.header.hash = hash.clone();
-                eprintln!(
-                    "Miner → block FOUND nonce={} hash={} height={} parents={}",
-                    nonce,
-                    &hash[..8],
-                    block.header.height,
-                    block.header.parents.len()
-                );
+                slog_info!("mining", "block_found", nonce => nonce, hash_prefix => &hash[..8], height => block.header.height, parents => block.header.parents.len());
                 return block;
             }
 
@@ -180,10 +170,7 @@ impl Miner {
             }
 
             if nonce.is_multiple_of(1_000_000) {
-                eprintln!(
-                    "Miner → nonce={} (mining height={})",
-                    nonce, block.header.height
-                );
+                slog_debug!("mining", "mining_progress", nonce => nonce, height => block.header.height);
             }
         }
     }
@@ -191,11 +178,7 @@ impl Miner {
     pub fn verify_pow(block: &Block) -> bool {
         let computed = shadow_hash(block);
         if computed != block.header.hash {
-            eprintln!(
-                "[Miner] PoW mismatch: computed={} stored={}",
-                &computed[..8],
-                &block.header.hash.get(..8).unwrap_or("?")
-            );
+            slog_warn!("mining", "pow_mismatch", computed => &computed[..8], stored => block.header.hash.get(..8).unwrap_or("?"));
             return false;
         }
         PowValidator::hash_meets_target(&computed, block.header.difficulty)

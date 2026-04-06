@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
+use crate::slog_error;
 
 /// Event payload for the broadcast channel
 #[derive(Debug, Clone)]
@@ -28,7 +29,7 @@ impl EventBus {
         opts.create_if_missing(true);
         let db = open_shared_db(source, &opts)
             .map_err(|e| {
-                eprintln!("[EventBus] ERROR: cannot init event bus DB: {}", e);
+                slog_error!("runtime", "event_bus_db_init_failed", error => &e.to_string());
                 e
             })?;
         let (broadcast_tx, _) = broadcast::channel(4096);
@@ -39,7 +40,7 @@ impl EventBus {
     pub fn publish(&self, event_id: &str, payload: &str) {
         let key = format!("event:{}", event_id);
         if let Err(_e) = self.db.put(key.as_bytes(), payload.as_bytes()) {
-            eprintln!("[DB] put error: {}", _e);
+            slog_error!("runtime", "event_bus_db_put_error", error => &_e.to_string());
         }
         // Broadcast to real-time subscribers (ignore send errors — no subscribers is OK)
         let _ = self.broadcast_tx.send(BusEvent {

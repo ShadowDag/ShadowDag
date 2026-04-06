@@ -25,7 +25,7 @@ pub struct EntropyStore {
     db: DB,
     write_opts: WriteOptions,
     read_opts: ReadOptions,
-    iter_read_opts: ReadOptions,
+    _iter_read_opts: ReadOptions,
 }
 
 impl EntropyStore {
@@ -60,16 +60,16 @@ impl EntropyStore {
         read_opts.set_verify_checksums(false);
 
         // 🔥 iterator tuning
-        let mut iter_read_opts = ReadOptions::default();
-        iter_read_opts.set_iterate_lower_bound(PREFIX.to_vec());
-        iter_read_opts.set_iterate_upper_bound(PREFIX_UPPER_BOUND.to_vec());
-        iter_read_opts.set_prefix_same_as_start(true); // 🔥 مهم
+        let mut _iter_read_opts = ReadOptions::default();
+        _iter_read_opts.set_iterate_lower_bound(PREFIX.to_vec());
+        _iter_read_opts.set_iterate_upper_bound(PREFIX_UPPER_BOUND.to_vec());
+        _iter_read_opts.set_prefix_same_as_start(true); // 🔥 مهم
 
         Ok(Self {
             db,
             write_opts,
             read_opts,
-            iter_read_opts,
+            _iter_read_opts,
         })
     }
 

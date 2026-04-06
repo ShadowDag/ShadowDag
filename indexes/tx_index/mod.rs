@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use rocksdb::DB;
+use crate::{slog_info, slog_warn, slog_error};
 
 const PREFIX: &str = "tidx:";
 const BLOCK_PREFIX: &str = "tidx:blk:";
@@ -80,7 +81,7 @@ impl TxIndex {
     /// Legacy constructor — calls try_new and logs on failure.
     pub fn new() -> Self {
         Self::try_new().unwrap_or_else(|e| {
-            eprintln!("[TxIndex] WARNING: DB open failed ({}), using fallback", e);
+            slog_warn!("index", "tx_index_db_open_failed", error => &e.to_string());
             let fallback = std::env::temp_dir().join(format!(
                 "shadowdag_tidx_fb_{}", std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
@@ -88,20 +89,17 @@ impl TxIndex {
             let mut opts = rocksdb::Options::default();
             opts.create_if_missing(true);
             let db = DB::open(&opts, &fallback).unwrap_or_else(|e2| {
-                eprintln!("[TxIndex] ERROR: Fallback also failed: {}", e2);
+                slog_error!("index", "tx_index_fallback_failed", error => &e2.to_string());
                 let last = std::env::temp_dir().join(format!("shadowdag_tidx_lr_{}", std::process::id()));
                 DB::open(&opts, &last).unwrap_or_else(|e3| {
-                    eprintln!("[TxIndex] CRITICAL: All attempts failed: {}", e3);
+                    slog_error!("index", "tx_index_all_attempts_failed", error => &e3.to_string());
                     // Create with destroy_on_drop semantics — node runs degraded
                     let noop = std::env::temp_dir().join("shadowdag_tidx_noop");
                     let _ = std::fs::create_dir_all(&noop);
                     match DB::open(&opts, &noop) {
                         Ok(db) => db,
                         Err(e4) => {
-                            eprintln!(
-                                "[TxIndex] FATAL: /tmp not writable after all attempts ({}). Aborting.",
-                                e4
-                            );
+                            slog_error!("index", "tx_index_fatal_abort", error => &e4.to_string());
                             std::process::abort();
                         }
                     }
@@ -121,10 +119,7 @@ impl TxIndex {
             db,
         };
         s.recover_from_db();
-        eprintln!(
-            "[TxIndex] Auto-recovered {} tx records from DB",
-            s.total_indexed
-        );
+        slog_info!("index", "tx_index_recovered", records => &s.total_indexed.to_string());
         s
     }
 
@@ -142,14 +137,14 @@ impl TxIndex {
         let key = Self::db_key(&record.hash);
         let val = serde_json::to_vec(record).unwrap_or_default();
         if let Err(e) = self.db.put(&key, &val) {
-            eprintln!("[TxIndex] DB put error: {}", e);
+            slog_error!("index", "tx_index_db_put_error", error => &e.to_string());
         }
     }
 
     fn delete_record_from_db(&self, hash: &str) {
         let key = Self::db_key(hash);
         if let Err(e) = self.db.delete(&key) {
-            eprintln!("[TxIndex] DB delete error: {}", e);
+            slog_error!("index", "tx_index_db_delete_error", error => &e.to_string());
         }
     }
 

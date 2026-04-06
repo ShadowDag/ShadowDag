@@ -26,6 +26,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use crate::{slog_info, slog_error};
 use crate::errors::NetworkError;
 
 /// Default Stratum port
@@ -272,7 +273,7 @@ pub struct StratumServer {
     /// Total blocks found by pool
     blocks_found:    AtomicU64,
     /// Pool hashrate (estimated)
-    pool_hashrate:   AtomicU64,
+    _pool_hashrate:   AtomicU64,
     /// Pending subscribe→authorize mapping: stores the worker_id assigned
     /// during Subscribe so the subsequent Authorize for the same connection
     /// retrieves the correct ID (fixes race condition with concurrent miners).
@@ -288,7 +289,7 @@ impl StratumServer {
             port,
             running:          AtomicBool::new(false),
             blocks_found:     AtomicU64::new(0),
-            pool_hashrate:    AtomicU64::new(0),
+            _pool_hashrate:    AtomicU64::new(0),
             pending_subs:     RwLock::new(HashMap::new()),
         }
     }
@@ -411,14 +412,13 @@ impl StratumServer {
     /// requests, dispatches them via `handle_request`, and writes responses.
     pub fn start(self: &Arc<Self>) {
         self.running.store(true, Ordering::Relaxed);
-        eprintln!("[Stratum] Server listening on port {}", self.port);
-        eprintln!("[Stratum] Vardiff target: {} shares/min", TARGET_SHARES_PER_MIN);
+        slog_info!("stratum", "server_listening", port => self.port, vardiff_target => TARGET_SHARES_PER_MIN);
 
         let addr = format!("0.0.0.0:{}", self.port);
         let listener = match std::net::TcpListener::bind(&addr) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("[Stratum] Failed to bind: {}", e);
+                slog_error!("stratum", "bind_failed", error => e);
                 return;
             }
         };
@@ -433,11 +433,11 @@ impl StratumServer {
                     let server = Arc::clone(self);
                     std::thread::spawn(move || {
                         if let Err(e) = server.handle_connection(tcp_stream) {
-                            eprintln!("[Stratum] Connection error: {}", e);
+                            slog_error!("stratum", "connection_error", error => e);
                         }
                     });
                 }
-                Err(e) => eprintln!("[Stratum] Accept error: {}", e),
+                Err(e) => slog_error!("stratum", "accept_error", error => e),
             }
         }
     }
@@ -449,7 +449,7 @@ impl StratumServer {
             .map_err(|e| NetworkError::ConnectionFailed(format!("set_read_timeout: {}", e)))?;
 
         let peer_addr = stream.peer_addr().map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
-        eprintln!("[Stratum] Miner connected from {}", peer_addr);
+        slog_info!("stratum", "miner_connected", peer => peer_addr);
 
         let reader = BufReader::new(stream.try_clone().map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?);
         let mut writer = stream;
@@ -460,7 +460,7 @@ impl StratumServer {
             let line = match line_result {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("[Stratum] Read error from {}: {}", peer_addr, e);
+                    slog_error!("stratum", "read_error", peer => peer_addr, error => e);
                     break;
                 }
             };
@@ -505,7 +505,7 @@ impl StratumServer {
         self.pending_subs.write().unwrap_or_else(|e| e.into_inner())
             .remove(&peer_addr);
 
-        eprintln!("[Stratum] Miner disconnected: {}", peer_addr);
+        slog_info!("stratum", "miner_disconnected", peer => peer_addr);
         Ok(())
     }
 
@@ -679,7 +679,7 @@ impl PayoutCalculator {
         {
             Some(s) => s,
             None => {
-                eprintln!("[Stratum] ERROR: share count overflow in payout calculation, aborting payouts");
+                slog_error!("stratum", "share_count_overflow", detail => "payout calculation aborted");
                 return HashMap::new();
             }
         };

@@ -53,11 +53,11 @@ pub struct SyncHeader {
 #[derive(Debug, Clone)]
 struct DownloadJob {
     hash:        String,
-    height:      u64,
+    _height:     u64,
     assigned_to: String,
     started_at:  u64,
     retries:     u32,
-    is_snapshot: bool,
+    _is_snapshot: bool,
 }
 
 impl DownloadJob {
@@ -68,8 +68,8 @@ impl DownloadJob {
 
 #[derive(Debug, Clone)]
 struct PeerSyncState {
-    addr:          String,
-    best_height:   u64,
+    _addr:          String,
+    _best_height:   u64,
     score:         i64,
     in_flight:     usize,
     last_response: u64,
@@ -79,8 +79,8 @@ struct PeerSyncState {
 impl PeerSyncState {
     fn new(addr: &str, height: u64) -> Self {
         Self {
-            addr: addr.to_string(),
-            best_height: height,
+            _addr: addr.to_string(),
+            _best_height: height,
             score: 100,
             in_flight: 0,
             last_response: unix_now(),
@@ -88,15 +88,6 @@ impl PeerSyncState {
         }
     }
 
-    fn is_available(&self) -> bool {
-        self.score > -100
-            && self.in_flight < MAX_CONCURRENT_DOWNLOADS / 4
-            && unix_now() - self.last_response < SYNC_STALL_TIMEOUT_SECS
-    }
-
-    fn best_peer_key(&self) -> i64 {
-        self.best_height as i64 * 10 - self.failed as i64 * 5
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,7 +111,7 @@ pub struct UtxoSnapshot {
 ///
 /// Never acquire a lower-numbered lock while holding a higher-numbered one.
 pub struct BlockSyncManager {
-    peers:          Arc<PeerManager>,
+    _peers:          Arc<PeerManager>,
     phase:          Arc<RwLock<SyncPhase>>,           // Lock order: 1
     local_height:   Arc<AtomicU64>,
     best_height:    Arc<AtomicU64>,
@@ -142,7 +133,7 @@ pub struct BlockSyncManager {
 impl BlockSyncManager {
     pub fn new(peers: Arc<PeerManager>) -> Self {
         Self {
-            peers,
+            _peers: peers,
             phase:         Arc::new(RwLock::new(SyncPhase::Idle)),
             local_height:  Arc::new(AtomicU64::new(0)),
             best_height:   Arc::new(AtomicU64::new(0)),
@@ -282,11 +273,11 @@ impl BlockSyncManager {
             if completed.contains(&hdr.hash) { continue; }
             pending.push_back(DownloadJob {
                 hash:        hdr.hash.clone(),
-                height:      *height,
+                _height:     *height,
                 assigned_to: String::new(),
                 started_at:  0,
                 retries:     0,
-                is_snapshot: false,
+                _is_snapshot: false,
             });
         }
     }

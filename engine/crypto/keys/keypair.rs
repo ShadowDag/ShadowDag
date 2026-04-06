@@ -12,6 +12,7 @@ use rocksdb::{
 use std::path::Path;
 use std::sync::Arc;
 use crate::errors::StorageError;
+use crate::slog_error;
 
 // prefix
 const KEY_PREFIX: &[u8] = b"kp:";
@@ -25,7 +26,7 @@ pub struct KeyPairStore {
     db: Arc<DB>,
     write_opts: WriteOptions,
     read_opts: ReadOptions,
-    iter_read_opts: ReadOptions,
+    _iter_read_opts: ReadOptions,
 }
 
 impl KeyPairStore {
@@ -57,15 +58,15 @@ impl KeyPairStore {
         let write_opts = WriteOptions::default();
         let read_opts  = ReadOptions::default();
 
-        let mut iter_read_opts = ReadOptions::default();
-        iter_read_opts.set_prefix_same_as_start(true);
-        iter_read_opts.set_iterate_upper_bound(PREFIX_UPPER_BOUND_RAW.to_vec());
+        let mut _iter_read_opts = ReadOptions::default();
+        _iter_read_opts.set_prefix_same_as_start(true);
+        _iter_read_opts.set_iterate_upper_bound(PREFIX_UPPER_BOUND_RAW.to_vec());
 
         Ok(Self {
             db: Arc::new(db),
             write_opts,
             read_opts,
-            iter_read_opts,
+            _iter_read_opts,
         })
     }
 
@@ -110,7 +111,7 @@ impl KeyPairStore {
         Self::with_key(id, |key| {
             Self::with_value(public_key, private_key, |value| {
                 if let Err(e) = self.db.put_opt(key, value, &self.write_opts) {
-                    eprintln!("[KeyPairStore] CRITICAL: store_pair failed: {}", e);
+                    slog_error!("crypto", "keypair_store_pair_failed", error => e);
                 }
             });
         });
@@ -124,7 +125,7 @@ impl KeyPairStore {
             let data = match self.db.get_opt(key, &self.read_opts) {
                 Ok(v) => v?,
                 Err(e) => {
-                    eprintln!("[KeyPairStore] CRITICAL: get_pair failed: {}", e);
+                    slog_error!("crypto", "keypair_get_pair_failed", error => e);
                     return None;
                 }
             };
@@ -151,7 +152,7 @@ impl KeyPairStore {
             let data = match self.db.get_pinned_opt(key, &self.read_opts) {
                 Ok(v) => v?,
                 Err(e) => {
-                    eprintln!("[KeyPairStore] CRITICAL: get_pair_pinned failed: {}", e);
+                    slog_error!("crypto", "keypair_get_pair_pinned_failed", error => e);
                     return None;
                 }
             };
@@ -176,7 +177,7 @@ impl KeyPairStore {
         pub_len: usize,
     ) -> Option<(&'a [u8], &'a [u8])> {
         if data.len() < 4 + pub_len {
-            eprintln!("[KeyPairStore] CRITICAL: keypair data too short: expected at least {} bytes, got {}", 4 + pub_len, data.len());
+            slog_error!("crypto", "keypair_data_too_short", expected => 4 + pub_len, got => data.len());
             return None;
         }
         Some((&data[4..4 + pub_len], &data[4 + pub_len..]))
@@ -211,7 +212,7 @@ impl KeyPairStore {
             match self.db.get_pinned_opt(key, &self.read_opts) {
                 Ok(v) => v.is_some(),
                 Err(e) => {
-                    eprintln!("[KeyPairStore] CRITICAL: exists check failed: {}", e);
+                    slog_error!("crypto", "keypair_exists_check_failed", error => e);
                     false
                 }
             }
@@ -249,7 +250,7 @@ impl KeyPairStore {
     pub fn delete_pair(&self, id: &[u8]) {
         Self::with_key(id, |key| {
             if let Err(e) = self.db.delete_opt(key, &self.write_opts) {
-                eprintln!("[KeyPairStore] CRITICAL: delete_pair failed: {}", e);
+                slog_error!("crypto", "keypair_delete_pair_failed", error => e);
             }
         })
     }
@@ -279,7 +280,7 @@ impl KeyPairStore {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("[KeyPairStore] CRITICAL: batch_store failed: {}", e);
+            slog_error!("crypto", "keypair_batch_store_failed", error => e);
         }
     }
 
@@ -300,7 +301,7 @@ impl KeyPairStore {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("[KeyPairStore] CRITICAL: batch_delete failed: {}", e);
+            slog_error!("crypto", "keypair_batch_delete_failed", error => e);
         }
     }
 
@@ -334,7 +335,7 @@ impl KeyPairStore {
 
             if count >= DELETE_BATCH_SIZE {
                 if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-                    eprintln!("[KeyPairStore] CRITICAL: clear batch failed: {}", e);
+                    slog_error!("crypto", "keypair_clear_batch_failed", error => e);
                     return;
                 }
                 batch = WriteBatch::default();
@@ -344,7 +345,7 @@ impl KeyPairStore {
 
         if count > 0 {
             if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-                eprintln!("[KeyPairStore] CRITICAL: clear final batch failed: {}", e);
+                slog_error!("crypto", "keypair_clear_final_batch_failed", error => e);
             }
         }
     }

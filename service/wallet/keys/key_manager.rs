@@ -13,6 +13,7 @@ use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
 use zeroize::Zeroize;
 use crate::errors::WalletError;
+use crate::{slog_error, slog_warn};
 
 const PBKDF2_ITER: u32 = 600_000;
 const SALT_LEN: usize = 16;
@@ -93,7 +94,7 @@ impl KeyManager {
 
         let plaintext = cipher
             .decrypt(nonce, ciphertext)
-            .map_err(|_| WalletError::WrongPassword)?;
+            .map_err(|_| WalletError::AuthFailed)?;
 
         dec_key.zeroize();
 
@@ -126,9 +127,9 @@ impl KeyManager {
         // Prefix with warning marker so plaintext keys are identifiable
         let marked = format!("INSECURE_PLAINTEXT:{}", key_data);
         if let Err(e) = self.db.put(key_id.as_bytes(), marked.as_bytes()) {
-            eprintln!("[KeyManager] CRITICAL: store_key error: {}", e);
+            slog_error!("wallet", "store_key_error", error => &e.to_string());
         }
-        eprintln!("[KeyManager] WARNING: store_key() stores plaintext! Use store_key_encrypted()");
+        slog_warn!("wallet", "plaintext_key_stored", detail => "Use store_key_encrypted()");
     }
 
     #[deprecated(note = "Use get_key_decrypted() — plaintext retrieval is insecure")]

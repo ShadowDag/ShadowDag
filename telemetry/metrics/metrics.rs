@@ -5,6 +5,7 @@
 
 use rocksdb::{DB, Options};
 use std::path::Path;
+use crate::slog_error;
 
 pub struct Metrics {
     db: DB,
@@ -27,7 +28,7 @@ impl Metrics {
     }
 
     pub fn set_metric(&self, name: &str, value: u64) {
-        if let Err(_e) = self.db.put(name, value.to_be_bytes()) { eprintln!("[DB] put error: {}", _e); }
+        if let Err(_e) = self.db.put(name, value.to_be_bytes()) { slog_error!("metrics", "db_put_error", error => &_e.to_string()); }
 
     }
 

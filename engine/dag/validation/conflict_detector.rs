@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::errors::{DagError, StorageError};
+use crate::slog_error;
 
 const CONFLICT_PREFIX: &[u8] = b"conflict:";
 
@@ -73,7 +74,7 @@ impl ConflictStore {
         Self::make_key_into(&mut k, key);
 
         if let Err(e) = self.db.put_opt(k, value, &self.write_opts) {
-            eprintln!("[ConflictStore::store] {}", e);
+            slog_error!("dag", "conflict_store_write_failed", error => e);
         }
     }
 
@@ -89,14 +90,14 @@ impl ConflictStore {
             Ok(Some(_)) => return false,
             Ok(None) => {}
             Err(e) => {
-                eprintln!("[ConflictStore::store_if_absent:get] {}", e);
+                slog_error!("dag", "conflict_store_if_absent_get_failed", error => e);
                 return false;
             }
         }
 
         // كتابة
         if let Err(e) = self.db.put_opt(&k, value.as_bytes(), &self.write_opts) {
-            eprintln!("[ConflictStore::store_if_absent:put] {}", e);
+            slog_error!("dag", "conflict_store_if_absent_put_failed", error => e);
             return false;
         }
 
@@ -116,7 +117,7 @@ impl ConflictStore {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("[ConflictStore::batch_store] {}", e);
+            slog_error!("dag", "conflict_batch_store_failed", error => e);
         }
     }
 
@@ -191,7 +192,7 @@ impl ConflictStore {
         Self::make_key_into(&mut k, key);
 
         if let Err(e) = self.db.delete_opt(k, &self.write_opts) {
-            eprintln!("[ConflictStore::delete] {}", e);
+            slog_error!("dag", "conflict_delete_failed", error => e);
         }
     }
 
@@ -220,7 +221,7 @@ impl ConflictStore {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("[ConflictStore::batch_delete] {}", e);
+            slog_error!("dag", "conflict_batch_delete_failed", error => e);
         }
     }
 
@@ -229,7 +230,7 @@ impl ConflictStore {
     // ─────────────────────────────────────────
     pub fn flush(&self) {
         if let Err(e) = self.db.flush() {
-            eprintln!("[ConflictStore::flush] {}", e);
+            slog_error!("dag", "conflict_flush_failed", error => e);
         }
     }
 

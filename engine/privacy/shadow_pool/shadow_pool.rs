@@ -23,11 +23,11 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use sha2::{Sha256, Digest};
 use rand::RngCore;
 
 use crate::domain::transaction::transaction::Transaction;
 use crate::engine::privacy::shadow_pool::shadow_transaction::{ShadowTransaction, MixDelay};
+use crate::slog_info;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //                         PROTOCOL CONSTANTS
@@ -486,7 +486,7 @@ impl ShadowPool {
         }
 
         if count > 0 {
-            eprintln!("[ShadowPool] Recovered {} pending transactions from DB", count);
+            slog_info!("privacy", "shadow_pool_recovered", pending_txs => count);
         }
     }
 }

@@ -27,6 +27,7 @@ use crate::indexes::tx_index::TxIndex;
 
 use std::sync::{Arc, Mutex};
 use crate::errors::NodeError;
+use crate::{slog_info, slog_warn, slog_error};
 
 /// DEPRECATED: Use DaemonNode::mainnet().start() instead.
 /// DaemonNode includes crash recovery, unified FullNode pipeline, and
@@ -47,17 +48,12 @@ pub fn boot_regtest_node() -> Result<(), NodeError> {
 }
 
 pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
-    eprintln!("╔══════════════════════════════════════════╗");
-    eprintln!("║   ShadowDAG Node — {} ║", cfg.network.name());
-    eprintln!("╚══════════════════════════════════════════╝");
-    eprintln!("[boot] data dir  : {}", cfg.data_dir.display());
-    eprintln!("[boot] P2P port  : {}", cfg.p2p_port);
-    eprintln!("[boot] RPC port  : {}", cfg.rpc_port);
+    slog_info!("boot", "node_starting", network => cfg.network.name(), data_dir => cfg.data_dir.display(), p2p_port => cfg.p2p_port, rpc_port => cfg.rpc_port);
 
     let db_path = cfg.data_dir.join("db");
     let db_path_str = db_path.to_string_lossy().to_string();
     let node_db = NodeDB::new(&db_path_str).map_err(|e| {
-        eprintln!("[boot] FATAL: {}", e);
+        slog_error!("boot", "db_open_failed", error => e);
         NodeError::Storage(e)
     })?;
     let db = node_db.shared();
@@ -85,7 +81,7 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
     let utxo_store = match UtxoStore::new(db.clone()) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[boot] FATAL: cannot create UTXO store: {}", e);
+            slog_error!("boot", "utxo_store_failed", error => e);
             return Err(NodeError::Storage(e));
         }
     };
@@ -96,7 +92,7 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
     let existing_best = blocks.get_best_hash();
     if existing_best.is_none() || existing_best.as_deref() == Some("") {
         let genesis = create_genesis_block_for(&cfg.network);
-        eprintln!("[boot] genesis hash: {}", genesis.header.hash);
+        slog_info!("boot", "genesis_hash", hash => genesis.header.hash);
 
         let _ = dag.add_block(&genesis);
         blocks.save_block(&genesis);
@@ -104,27 +100,25 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
 
         // Apply genesis UTXO state (coinbase outputs become spendable)
         if let Err(e) = utxo_set.apply_block_full(&genesis, 0) {
-            eprintln!("[boot] FATAL: genesis UTXO application failed: {}", e);
+            slog_error!("boot", "genesis_utxo_failed", error => e);
             return Err(NodeError::Init(e.to_string()));
         }
-        eprintln!("[boot] genesis created and inserted into DAG + UTXO");
+        slog_info!("boot", "genesis_created");
     } else {
         // WARNING: boot.rs is DEPRECATED. It does NOT include crash recovery.
         // Use DaemonNode::new(cfg).start() for production — it includes:
         //   - 3-level crash recovery (empty/partial/full UTXO rebuild)
         //   - DAG consistency verification
         //   - Unified FullNode pipeline for genesis
-        eprintln!("[boot] WARNING: boot_with_config() is deprecated and lacks crash recovery.");
-        eprintln!("[boot] Use DaemonNode::new(cfg).start() for production nodes.");
-        eprintln!("[boot] existing chain found (best: {}), skipping genesis",
-            existing_best.unwrap_or_default());
+        slog_warn!("boot", "deprecated_boot_path", message => "boot_with_config() lacks crash recovery, use DaemonNode");
+        slog_info!("boot", "existing_chain_found", best => existing_best.unwrap_or_default());
     }
 
     let mut p2p = P2P::new_with_config(&cfg)?;
 
     p2p.peers.bootstrap_for_network(&cfg.network);
     let _ = p2p.peers.discover_peers();
-    eprintln!("[boot] P2P bootstrapped — {} known peers", p2p.peers.count());
+    slog_info!("boot", "p2p_bootstrapped", peer_count => p2p.peers.count());
 
     relay_sync_mempool(&p2p.peers);
 
@@ -136,10 +130,10 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
         .map_err(|e| NodeError::Init(format!("Failed to init RPC server: {}", e)))?;
     rpc.set_network_name(&format!("shadowdag-{}", cfg.network.name()));
     rpc.start();
-    eprintln!("[boot] RPC server started on port {}", cfg.rpc_port);
+    slog_info!("boot", "rpc_server_started", port => cfg.rpc_port);
 
     p2p.start();
-    eprintln!("[boot] P2P listener started on {}", p2p.listen_addr);
+    slog_info!("boot", "p2p_listener_started", address => p2p.listen_addr);
 
     // Initialize persistent indexes with shared DB (auto-recovers from disk)
     let _utxo_index = Arc::new(Mutex::new(UtxoIndex::new_with_db(db.clone())));
@@ -150,6 +144,6 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
     let _utxo = Arc::new(utxo_set);
     let _mempool = Arc::new(Mutex::new(mempool));
 
-    eprintln!("[boot] ShadowDAG node running — network: {}", cfg.network.name());
+    slog_info!("boot", "node_running", network => cfg.network.name());
     Ok(())
 }

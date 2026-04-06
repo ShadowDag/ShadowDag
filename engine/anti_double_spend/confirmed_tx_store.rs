@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::errors::StorageError;
+use crate::slog_warn;
 
 /// How many blocks' worth of TX hashes to keep.
 /// At 10 BPS this is ~28 hours of history. Deep reorgs beyond this
@@ -172,7 +173,7 @@ impl ConfirmedTxStore {
                 Err(_) => {
                     // Corrupted key — skip rather than misinterpret as height 0
                     // (height 0 = genesis, pruning genesis would corrupt the store)
-                    eprintln!("[confirmed_tx_store] WARNING: skipping malformed height key ({} bytes)", height_slice.len());
+                    slog_warn!("consensus", "malformed_height_key", bytes => &height_slice.len().to_string());
                     continue;
                 }
             };

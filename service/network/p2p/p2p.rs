@@ -13,6 +13,7 @@ use std::thread;
 use serde::{Serialize, Deserialize};
 
 use crate::errors::NetworkError;
+use crate::{slog_info, slog_warn, slog_error, slog_debug};
 use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::service::network::dos_guard::{DosGuard, DosVerdict, MsgType, BanCategory};
 use crate::config::network::network_params::NetworkParams;
@@ -134,7 +135,7 @@ pub fn push_pending_block(peer_id: &str, block: Block) -> bool {
         q.push((peer_id.to_string(), block));
         true
     } else {
-        eprintln!("[P2P] WARN: pending block queue full, dropping");
+        slog_warn!("p2p", "pending_block_queue_full");
         false
     }
 }
@@ -147,7 +148,7 @@ pub fn push_pending_tx(peer_id: &str, tx: Transaction) -> bool {
         q.push((peer_id.to_string(), tx));
         true
     } else {
-        eprintln!("[P2P] WARN: pending tx queue full, dropping");
+        slog_warn!("p2p", "pending_tx_queue_full");
         false
     }
 }
@@ -172,7 +173,7 @@ pub fn push_outbound(msg: P2PMessage) {
         q.0 = seq;
         q.1.push((seq, msg));
     } else {
-        eprintln!("[P2P] WARN: outbound queue full, dropping message");
+        slog_warn!("p2p", "outbound_queue_full");
     }
 }
 
@@ -183,7 +184,7 @@ pub fn push_outbound_to_peer(peer_id: &str, msg: P2PMessage) {
     if q.len() < 10_000 {
         q.push((peer_id.to_string(), msg));
     } else {
-        eprintln!("[P2P] WARN: targeted queue full, dropping message");
+        slog_warn!("p2p", "targeted_queue_full");
     }
 }
 
@@ -280,7 +281,7 @@ struct ConnectionSession {
     /// Protocol state machine (handshake, lifecycle, version, nonces).
     protocol: ProtocolSession,
     /// Peer's socket address.
-    addr: SocketAddr,
+    _addr: SocketAddr,
     /// Last time we received a Pong (keepalive monitoring).
     last_pong: Instant,
     /// Last time we sent a Ping (keepalive interval).
@@ -312,7 +313,7 @@ impl ConnectionSession {
             .unwrap_or(0);
         Self {
             protocol:               ProtocolSession::new(outbound, DEFAULT_BPS),
-            addr,
+            _addr: addr,
             last_pong:              Instant::now(),
             last_ping_sent:         Instant::now(),
             bytes_this_window:      0,
@@ -384,7 +385,7 @@ pub struct P2P {
 
 impl Default for P2P {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("P2P initialization failed")
     }
 }
 
@@ -395,8 +396,7 @@ impl P2P {
 
     pub fn new_with_config(cfg: &NodeConfig) -> Result<Self, crate::errors::NetworkError> {
         let magic = cfg.network.magic();
-        eprintln!("[P2P] Initializing ShadowDAG network — {} on port {} (magic: {:02x}{:02x}{:02x}{:02x})",
-            cfg.network.name(), cfg.p2p_port, magic[0], magic[1], magic[2], magic[3]);
+        slog_info!("p2p", "network_init", network => cfg.network.name(), port => cfg.p2p_port, magic => &format!("{:02x}{:02x}{:02x}{:02x}", magic[0], magic[1], magic[2], magic[3]));
         Ok(Self {
             peers:             PeerManager::new_default_path(&cfg.peers_path_str())?,
             message_pool:      Vec::new(),
@@ -412,14 +412,14 @@ impl P2P {
     }
 
     pub fn start(&mut self) {
-        eprintln!("[P2P] Starting network — listening on {}", self.listen_addr);
+        slog_info!("p2p", "network_start", listen_addr => &self.listen_addr);
 
         let listen_addr = self.listen_addr.clone();
         let magic = self.network_magic;
         let known_peers = self.peers.get_addr_list_limited(100);
         thread::spawn(move || {
             if let Err(e) = Self::accept_loop(&listen_addr, magic, &known_peers) {
-                eprintln!("[P2P] Accept loop error: {}", e);
+                slog_error!("p2p", "accept_loop_error", error => &e.to_string());
             }
         });
 
@@ -427,14 +427,14 @@ impl P2P {
         let _ = self.peers.discover_peers();
         self.connect_to_peers();
 
-        eprintln!("[P2P] Connected to {} peers", self.peers.count());
+        slog_info!("p2p", "peers_connected", count => self.peers.count());
 
         self.request_headers_sync();
     }
 
     fn accept_loop(addr: &str, magic: [u8; 4], known_peers: &[String]) -> std::io::Result<()> {
         let listener = TcpListener::bind(addr)?;
-        eprintln!("[P2P] Listening on {}", addr);
+        slog_info!("p2p", "listener_bound", addr => addr);
 
         // Connection throttle state
         let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -451,7 +451,7 @@ impl P2P {
                     }
                     accept_count += 1;
                     if accept_count > MAX_INBOUND_PER_SEC {
-                        eprintln!("[P2P] Inbound throttle: dropping connection (>{}/sec)", MAX_INBOUND_PER_SEC);
+                        slog_warn!("p2p", "inbound_throttle", max_per_sec => MAX_INBOUND_PER_SEC);
                         drop(s);
                         continue;
                     }
@@ -459,7 +459,7 @@ impl P2P {
                     // ── Pending connection limit ──
                     let current_pending = pending.load(std::sync::atomic::Ordering::Relaxed);
                     if current_pending >= MAX_PENDING_CONNECTIONS {
-                        eprintln!("[P2P] Too many pending connections ({}), dropping", current_pending);
+                        slog_warn!("p2p", "too_many_pending_connections", pending => current_pending);
                         drop(s);
                         continue;
                     }
@@ -470,12 +470,12 @@ impl P2P {
 
                     // ── Check if peer is banned ──
                     if DOS_GUARD.is_banned(&peer_addr) {
-                        eprintln!("[P2P] Rejected banned peer {}", peer_addr);
+                        slog_warn!("p2p", "rejected_banned_peer", addr => &peer_addr);
                         drop(s);
                         continue;
                     }
 
-                    eprintln!("[P2P] Inbound connection from {}", peer_addr);
+                    slog_info!("p2p", "inbound_connection", addr => &peer_addr);
                     let peers_snapshot = known_peers.to_vec();
                     let pending_clone = Arc::clone(&pending);
                     pending_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -484,11 +484,11 @@ impl P2P {
                         let result = Self::handle_peer_connection(s, false, magic, peers_snapshot);
                         pending_clone.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         if let Err(e) = result {
-                            eprintln!("[P2P] Peer {} error: {}", peer_addr, e);
+                            slog_error!("p2p", "peer_connection_error", addr => &peer_addr, error => &e.to_string());
                         }
                     });
                 }
-                Err(e) => eprintln!("[P2P] Accept error: {}", e),
+                Err(e) => slog_error!("p2p", "accept_error", error => &e.to_string()),
             }
         }
         Ok(())
@@ -538,7 +538,7 @@ impl P2P {
                     }
                     session.protocol.puzzle_verified().map_err(|e|
                         NetworkError::ConnectionFailed(format!("State error: {}", e)))?;
-                    eprintln!("[P2P] Puzzle verified for inbound peer {}", peer_str);
+                    slog_info!("p2p", "puzzle_verified", addr => &peer_str);
                 }
                 Ok((_, cmd, _)) => {
                     DOS_GUARD.add_ban_score_cat(&peer_str, 50, "expected puzzle solution", BanCategory::Malicious);
@@ -585,7 +585,7 @@ impl P2P {
                     if let Err(e) = Self::dispatch_message(
                         &mut writer, msg, &peer_str, magic, &mut session, &known_peers,
                     ) {
-                        eprintln!("[P2P] Dispatch error from {}: {}", peer_str, e);
+                        slog_debug!("p2p", "dispatch_error", addr => &peer_str, error => &e.to_string());
                     }
                 }
                 Err(e) => {
@@ -619,8 +619,7 @@ impl P2P {
                     // Bandwidth enforcement
                     if session.check_bandwidth(bytes_read as u64) {
                         DOS_GUARD.add_ban_score_cat(&peer_str, 50, "bandwidth abuse (>100MB/min)", BanCategory::Resource);
-                        eprintln!("[P2P] Disconnecting {} — bandwidth abuse ({} bytes/min)",
-                            peer_str, session.bytes_this_window);
+                        slog_warn!("p2p", "bandwidth_abuse_disconnect", addr => &peer_str, bytes_per_min => session.bytes_this_window);
                         break;
                     }
 
@@ -628,8 +627,7 @@ impl P2P {
                     if let Err(pe) = session.protocol.check_command_allowed(cmd) {
                         DOS_GUARD.add_ban_score_cat(&peer_str, pe.ban_score as u64, &pe.message,
                             if pe.ban_score >= 50 { BanCategory::Malicious } else { BanCategory::Malformed });
-                        eprintln!("[P2P] {} sent {} in state {} �� rejected (ban_score={})",
-                            peer_str, cmd, session.protocol.state, pe.ban_score);
+                        slog_warn!("p2p", "command_rejected", addr => &peer_str, command => &cmd.to_string(), state => &session.protocol.state.to_string(), ban_score => pe.ban_score);
                         if pe.ban_score >= 50 { break; }
                         continue;
                     }
@@ -644,10 +642,9 @@ impl P2P {
                         };
                         DOS_GUARD.add_ban_score_cat(&peer_str, score,
                             &format!("lifecycle violation #{}: {}", session.lifecycle_violations, pe), cat);
-                        eprintln!("[P2P] {} lifecycle blocked {} (violation #{})",
-                            peer_str, cmd, session.lifecycle_violations);
+                        slog_warn!("p2p", "lifecycle_blocked", addr => &peer_str, command => &cmd.to_string(), violation_count => session.lifecycle_violations);
                         if session.lifecycle_violations > 10 {
-                            eprintln!("[P2P] {} excessive lifecycle violations — disconnecting", peer_str);
+                            slog_warn!("p2p", "excessive_lifecycle_violations_disconnect", addr => &peer_str);
                             break;
                         }
                         continue;
@@ -657,7 +654,7 @@ impl P2P {
                         &mut writer, msg, &peer_str, magic,
                         &mut session, &known_peers,
                     ) {
-                        eprintln!("[P2P] Dispatch error from {}: {}", peer_str, e);
+                        slog_error!("p2p", "dispatch_error", addr => &peer_str, error => &e.to_string());
                         break;
                     }
 
@@ -688,7 +685,7 @@ impl P2P {
                                     session.last_ping_sent = Instant::now();
                                 }
                                 Err(we) => {
-                                    eprintln!("[P2P] Keepalive write error to {}: {}", peer_str, we);
+                                    slog_error!("p2p", "keepalive_write_error", addr => &peer_str, error => &we.to_string());
                                     break;
                                 }
                             }
@@ -698,7 +695,7 @@ impl P2P {
                         if session.is_established()
                             && session.last_pong.elapsed() >= Duration::from_secs(PONG_TIMEOUT_SECS)
                         {
-                            eprintln!("[P2P] Disconnecting {} — no pong in {}s", peer_str, PONG_TIMEOUT_SECS);
+                            slog_warn!("p2p", "pong_timeout_disconnect", addr => &peer_str, timeout_secs => PONG_TIMEOUT_SECS);
                             let _ = Self::write_message(
                                 &mut writer,
                                 &P2PMessage::Reject { reason: "pong timeout".to_string() },
@@ -710,7 +707,7 @@ impl P2P {
 
                         // Handshake timeout (protocol state machine)
                         if let Err(pe) = session.protocol.check_handshake_timeout() {
-                            eprintln!("[P2P] {} handshake timed out: {}", peer_str, pe);
+                            slog_warn!("p2p", "handshake_timeout", addr => &peer_str, error => &pe.to_string());
                             let _ = Self::write_message(
                                 &mut writer,
                                 &P2PMessage::Reject { reason: format!("timeout: {}", pe) },
@@ -731,15 +728,13 @@ impl P2P {
                         magic,
                     );
                     session.protocol.begin_disconnect();
-                    eprintln!("[P2P] Peer {} disconnected: {}", peer_str, e);
+                    slog_info!("p2p", "peer_disconnected", addr => &peer_str, reason => &e.to_string());
                     break;
                 }
             }
         }
 
-        log::debug!("[P2P] Connection to {} closed (state={}, lifecycle={}, rx={}, tx={})",
-            peer_str, session.protocol.state, session.protocol.lifecycle,
-            session.protocol.bytes_received, session.protocol.bytes_sent);
+        slog_debug!("p2p", "connection_closed", addr => &peer_str, state => &session.protocol.state.to_string(), lifecycle => &session.protocol.lifecycle.to_string(), bytes_rx => session.protocol.bytes_received, bytes_tx => session.protocol.bytes_sent);
         Ok(())
     }
 
@@ -756,7 +751,7 @@ impl P2P {
             match Self::write_message(writer, out_msg, magic) {
                 Ok(bytes) => session.record_bytes_sent(bytes),
                 Err(we) => {
-                    eprintln!("[P2P] Write error to {}: {}", peer_str, we);
+                    slog_error!("p2p", "write_error", addr => peer_str, error => &we.to_string());
                     return;
                 }
             }
@@ -766,7 +761,7 @@ impl P2P {
             match Self::write_message(writer, t_msg, magic) {
                 Ok(bytes) => session.record_bytes_sent(bytes),
                 Err(we) => {
-                    eprintln!("[P2P] Write error (targeted) to {}: {}", peer_str, we);
+                    slog_error!("p2p", "write_error_targeted", addr => peer_str, error => &we.to_string());
                     return;
                 }
             }
@@ -921,14 +916,14 @@ impl P2P {
                 return Err(NetworkError::PeerBanned(peer.to_string()));
             }
             DosVerdict::RateLimited { .. } => {
-                eprintln!("[P2P] Rate limited peer {}", peer);
+                slog_warn!("p2p", "rate_limited", addr => peer);
                 return Ok(());
             }
             DosVerdict::GlobalRateLimited => {
                 return Ok(());
             }
             DosVerdict::OversizedMessage { allowed, got } => {
-                eprintln!("[P2P] Oversized msg from {}: {} > {}", peer, got, allowed);
+                slog_warn!("p2p", "oversized_message", addr => peer, size => got, max_allowed => allowed);
                 return Err(NetworkError::DosGuard(format!("oversized message from {}", peer)));
             }
         }
@@ -991,7 +986,7 @@ impl P2P {
 
                 // Log peer identity
                 if let Some(id) = session.protocol.peer_identity() {
-                    eprintln!("[P2P] Peer {} identity: {}...", peer, &id[..id.len().min(16)]);
+                    slog_debug!("p2p", "peer_identity", addr => peer, identity => &id[..id.len().min(16)]);
                 }
 
                 let bytes = Self::write_message(writer, &P2PMessage::VerAck, magic)?;
@@ -1004,8 +999,7 @@ impl P2P {
                     DOS_GUARD.add_ban_score_cat(peer, pe.ban_score as u64, &pe.message, BanCategory::Malformed);
                     return Ok(());
                 }
-                eprintln!("[P2P] Handshake complete with {} (height={}, lifecycle={})",
-                    peer, session.protocol.peer_height(), session.protocol.lifecycle);
+                slog_info!("p2p", "handshake_complete", addr => peer, height => session.protocol.peer_height(), lifecycle => &session.protocol.lifecycle.to_string());
 
                 // Initiate sync if peer is ahead
                 let peer_height = session.protocol.peer_height();
@@ -1035,14 +1029,14 @@ impl P2P {
                     return Ok(());
                 }
                 // Addresses are processed by the peer manager
-                log::debug!("[P2P] Received {} addresses from {}", peers.len(), peer);
+                slog_debug!("p2p", "received_addresses", count => peers.len(), addr => peer);
             }
 
             // ── Ping: anti-replay via ProtocolSession nonce tracking ───
             P2PMessage::Ping { nonce } => {
                 if !session.protocol.record_nonce(nonce) {
                     DOS_GUARD.add_ban_score_cat(peer, 20, "duplicate ping nonce (replay)", BanCategory::Malicious);
-                    eprintln!("[P2P] Replay detected from {}: duplicate ping nonce {}", peer, nonce);
+                    slog_warn!("p2p", "replay_detected", addr => peer, nonce => nonce);
                     return Ok(());
                 }
                 let bytes = Self::write_message(writer, &P2PMessage::Pong { nonce }, magic)?;
@@ -1097,7 +1091,7 @@ impl P2P {
                         // Malformed bincode = either attack or deeply broken client.
                         // Score 25 so 4 malformed TXs = auto-ban (100).
                         DOS_GUARD.add_ban_score_cat(peer, 25, "invalid tx deserialization", BanCategory::Malformed);
-                        eprintln!("[P2P] Invalid TX from {}: {}", peer, e);
+                        slog_error!("p2p", "invalid_tx_deserialize", addr => peer, error => &e.to_string());
                     }
                 }
             }
@@ -1139,7 +1133,7 @@ impl P2P {
                         // Malformed block bincode = immediate high penalty.
                         // Score 50 so 2 malformed blocks = auto-ban.
                         DOS_GUARD.add_ban_score_cat(peer, 50, "invalid block deserialization", BanCategory::Malformed);
-                        eprintln!("[P2P] Invalid Block from {}: {}", peer, e);
+                        slog_error!("p2p", "invalid_block_deserialize", addr => peer, error => &e.to_string());
                     }
                 }
             }
@@ -1202,7 +1196,7 @@ impl P2P {
                     DOS_GUARD.add_ban_score_cat(peer, pe.ban_score as u64, &pe.message, BanCategory::Malformed);
                     return Ok(());
                 }
-                eprintln!("[P2P] Rejected by {}: {}", peer, reason);
+                slog_warn!("p2p", "rejected_by_peer", addr => peer, reason => reason.as_str());
             }
         }
         Ok(())
@@ -1235,7 +1229,7 @@ impl P2P {
         let count = peer_list.len().min(MAX_PEERS);
         let magic = self.network_magic;
         let known_peers = self.peers.get_addr_list_limited(100);
-        eprintln!("[P2P] Connecting to {} peers", count);
+        slog_info!("p2p", "connecting_to_peers", count => count);
 
         for addr in peer_list.into_iter().take(count) {
             let addr_clone = addr.clone();
@@ -1243,13 +1237,13 @@ impl P2P {
             thread::spawn(move || {
                 match TcpStream::connect(&addr_clone) {
                     Ok(stream) => {
-                        eprintln!("[P2P] Connected to {}", addr_clone);
+                        slog_info!("p2p", "outbound_connected", addr => &addr_clone);
                         if let Err(e) = Self::handle_peer_connection(stream, true, magic, peers_snapshot) {
-                            eprintln!("[P2P] Peer {} error: {}", addr_clone, e);
+                            slog_error!("p2p", "peer_connection_error", addr => &addr_clone, error => &e.to_string());
                         }
                     }
                     Err(e) => {
-                        eprintln!("[P2P] Cannot connect to {}: {}", addr_clone, e);
+                        slog_error!("p2p", "outbound_connect_failed", addr => &addr_clone, error => &e.to_string());
                     }
                 }
             });
@@ -1257,7 +1251,7 @@ impl P2P {
     }
 
     fn request_headers_sync(&self) {
-        eprintln!("[P2P] Requesting headers sync from height {}", self.best_height);
+        slog_info!("p2p", "requesting_headers_sync", height => self.best_height);
         // NOTE: actual sync is performed inside each peer connection via dispatch_message.
         // A full implementation would iterate connected peers and send GetHeaders.
     }
@@ -1274,9 +1268,9 @@ impl P2P {
     }
 
     pub fn fast_sync_headers(&self) {
-        eprintln!("[P2P] fast_sync_headers → use request_headers_sync()");
+        slog_debug!("p2p", "fast_sync_headers_deprecated");
     }
     pub fn fast_sync_blocks(&self) {
-        eprintln!("[P2P] fast_sync_blocks → requesting full block sync");
+        slog_debug!("p2p", "fast_sync_blocks_deprecated");
     }
 }

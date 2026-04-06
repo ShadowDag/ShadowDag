@@ -145,8 +145,8 @@ impl SnapshotManager {
 
         let db = self.lock_db();
         let meta_key = format!("snap:meta:{}", block_height);
-        let meta_data = bincode::serialize(&meta).map_err(|e| StorageError::Other(e.to_string()))?;
-        db.put(meta_key.as_bytes(), &meta_data).map_err(|e| StorageError::Other(e.to_string()))?;
+        let meta_data = bincode::serialize(&meta).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        db.put(meta_key.as_bytes(), &meta_data).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
 
         let entries_per_chunk = (CHUNK_SIZE_BYTES / 128).max(1);
         let mut batch = WriteBatch::default();
@@ -159,10 +159,10 @@ impl SnapshotManager {
                 chunk_hash:   self.hash_chunk(chunk_entries),
             };
             let chunk_key  = format!("snap:chunk:{}:{}", block_height, chunk_idx);
-            let chunk_data = bincode::serialize(&chunk).map_err(|e| StorageError::Other(e.to_string()))?;
+            let chunk_data = bincode::serialize(&chunk).map_err(|e| StorageError::Serialization(e.to_string()))?;
             batch.put(chunk_key.as_bytes(), &chunk_data);
         }
-        db.write(batch).map_err(|e| StorageError::Other(e.to_string()))?;
+        db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
 
         self.prune_old_snapshots(&db);
 
@@ -207,8 +207,8 @@ impl SnapshotManager {
         {
             let db = self.lock_db();
             let key = format!("snap:dl:chunk:{}", chunk.chunk_index);
-            let data = bincode::serialize(&chunk).map_err(|e| StorageError::Other(e.to_string()))?;
-            db.put(key.as_bytes(), &data).map_err(|e| StorageError::Other(e.to_string()))?;
+            let data = bincode::serialize(&chunk).map_err(|e| StorageError::Serialization(e.to_string()))?;
+            db.put(key.as_bytes(), &data).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         }
 
         let mut prog = self.progress.lock().unwrap_or_else(|e| e.into_inner());
@@ -245,9 +245,9 @@ impl SnapshotManager {
         for chunk_idx in 0..meta.chunk_count {
             let key  = format!("snap:dl:chunk:{}", chunk_idx);
             let data = db.get(key.as_bytes())
-                .map_err(|e| StorageError::Other(e.to_string()))?
+                .map_err(|e| StorageError::ReadFailed(e.to_string()))?
                 .ok_or_else(|| StorageError::KeyNotFound(format!("Missing chunk {}", chunk_idx)))?;
-            let chunk: SnapshotChunk = bincode::deserialize(&data).map_err(|e| StorageError::Other(e.to_string()))?;
+            let chunk: SnapshotChunk = bincode::deserialize(&data).map_err(|e| StorageError::Serialization(e.to_string()))?;
             all_entries.extend(chunk.entries);
         }
 
@@ -262,10 +262,10 @@ impl SnapshotManager {
             // apply_block_dag_ordered and all other UTXO operations. Previously used
             // "utxo:txid:index" string which would be invisible to the UTXO layer.
             let key = crate::domain::utxo::utxo_set::utxo_key(&entry.txid, entry.index)?;
-            let data = bincode::serialize(entry).map_err(|e| StorageError::Other(e.to_string()))?;
+            let data = bincode::serialize(entry).map_err(|e| StorageError::Serialization(e.to_string()))?;
             batch.put(key.as_ref(), &data);
         }
-        db.write(batch).map_err(|e| StorageError::Other(e.to_string()))?;
+        db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
 
         Ok(meta)
     }

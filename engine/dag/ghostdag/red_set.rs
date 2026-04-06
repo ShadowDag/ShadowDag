@@ -11,6 +11,7 @@ use std::collections::{HashSet, HashMap};
 use std::path::Path;
 
 use crate::errors::{DagError, StorageError};
+use crate::slog_error;
 pub use crate::engine::dag::ghostdag::ghostdag::GHOSTDAG_K;
 
 const PFX_RED:  &[u8] = b"red:";
@@ -51,7 +52,7 @@ impl RedSetStore {
                 })
             }
             Err(e) => {
-                eprintln!("[RedSetStore] DB open error: {}", e);
+                slog_error!("ghostdag", "red_set_store_open_failed", error => e);
                 None
             }
         }
@@ -59,7 +60,7 @@ impl RedSetStore {
 
     pub fn new_required(path: &str) -> Result<Self, DagError> {
         Self::new(path).ok_or_else(|| {
-            eprintln!("[RedSetStore] FATAL: cannot open DB at {}", path);
+            slog_error!("ghostdag", "red_set_store_fatal_open", path => path);
             StorageError::OpenFailed { path: path.to_string(), reason: "cannot open DB".to_string() }.into()
         })
     }

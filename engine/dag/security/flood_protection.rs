@@ -48,42 +48,30 @@ impl FloodProtection {
     }
 }
 
-// 🔥 parsing سريع بدون allocation
-#[inline(always)]
-fn fast_hex_to_u64(s: &str) -> Option<u64> {
+#[cfg(test)]
+fn fast_hex_to_u64(hex: &str) -> Option<u64> {
+    if hex.is_empty() { return None; }
     let mut result: u64 = 0;
-    let mut count = 0;
-
-    for c in s.chars().take(16) {
-
-        let value = match c {
-            '0'..='9' => c as u64 - '0' as u64,
-            'a'..='f' => c as u64 - 'a' as u64 + 10,
-            'A'..='F' => c as u64 - 'A' as u64 + 10,
+    for byte in hex.bytes() {
+        let digit = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
             _ => return None,
         };
-
-        result = (result << 4) | value;
-        count += 1;
+        result = result.checked_mul(16)?.checked_add(digit as u64)?;
     }
-
-    if count == 0 {
-        None
-    } else {
-        Some(result)
-    }
+    Some(result)
 }
 
-// 🔥 fallback سريع وآمن
-#[inline(always)]
-fn fallback_mix(bytes: &[u8]) -> u64 {
-    let mut m: u64 = 0;
-
-    for (i, b) in bytes.iter().take(8).enumerate() {
-        m ^= (*b as u64).rotate_left((i * 8) as u32);
+#[cfg(test)]
+fn fallback_mix(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
     }
-
-    m
+    h
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::domain::block::block::Block;
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
+use crate::{slog_error};
 
 const BLK_PREFIX: &str = "blk:";
 const BLK_BEST_HASH: &[u8] = b"blk:best_hash";
@@ -23,7 +24,7 @@ impl BlockStore {
         opts.set_write_buffer_size(64 * 1024 * 1024);
         let db = open_shared_db(source, &opts)
             .map_err(|e| {
-                eprintln!("[BlockStore] ERROR: Block storage unavailable: {}", e);
+                slog_error!("storage", "block_store_unavailable", error => e);
                 e
             })?;
         Ok(Self { db })
@@ -46,13 +47,13 @@ impl BlockStore {
                 match self.db.write(batch) {
                     Ok(_) => true,
                     Err(e) => {
-                        eprintln!("[BlockStore] write failed: {}", e);
+                        slog_error!("storage", "block_write_failed", error => e);
                         false
                     }
                 }
             }
             Err(e) => {
-                eprintln!("[BlockStore] Serialize error: {}", e);
+                slog_error!("storage", "block_serialize_error", error => e);
                 false
             }
         }
@@ -63,7 +64,7 @@ impl BlockStore {
     pub fn set_utxo_commitment(&self, block_hash: &str, commitment: &str) {
         let key = format!("{}utxo_commit:{}", BLK_PREFIX, block_hash);
         if let Err(e) = self.db.put(key.as_bytes(), commitment.as_bytes()) {
-            eprintln!("[BlockStore] set_utxo_commitment failed: {}", e);
+            slog_error!("storage", "set_utxo_commitment_failed", error => e);
         }
     }
 
@@ -83,7 +84,7 @@ impl BlockStore {
         match self.db.put(BLK_BEST_HASH, hash.as_bytes()) {
             Ok(_) => true,
             Err(e) => {
-                eprintln!("[BlockStore] update_best_hash failed: {}", e);
+                slog_error!("storage", "update_best_hash_failed", error => e);
                 false
             }
         }
@@ -95,13 +96,13 @@ impl BlockStore {
             Ok(Some(data)) => match bincode::deserialize(&data) {
                 Ok(block) => Some(block),
                 Err(e) => {
-                    eprintln!("[BlockStore] deserialization error for block '{}': {}", hash, e);
+                    slog_error!("storage", "block_deserialization_error", hash => hash, error => e);
                     None
                 }
             },
             Ok(None) => None,
             Err(e) => {
-                eprintln!("[BlockStore] DB read error for block '{}': {}", hash, e);
+                slog_error!("storage", "block_read_error", hash => hash, error => e);
                 None
             }
         }
@@ -145,7 +146,7 @@ impl BlockStore {
             .filter_map(|r| match r {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    eprintln!("[BlockStore] iterator error: {}", e);
+                    slog_error!("storage", "block_iterator_error", error => e);
                     None
                 }
             })
@@ -169,7 +170,7 @@ impl BlockStore {
             let (k, v) = match item {
                 Ok(pair) => pair,
                 Err(e) => {
-                    eprintln!("[BlockStore] iterator error: {}", e);
+                    slog_error!("storage", "block_iterator_error", error => e);
                     continue;
                 }
             };
@@ -197,7 +198,7 @@ impl BlockStore {
         // DAG: multiple blocks per height → blk:height:{h}:{hash}
         let key = format!("{}height:{}:{}", BLK_PREFIX, height, hash);
         if let Err(e) = self.db.put(key.as_bytes(), hash.as_bytes()) {
-            eprintln!("[BlockStore] save_block_height failed: {}", e);
+            slog_error!("storage", "save_block_height_failed", error => e);
         }
     }
 
@@ -210,7 +211,7 @@ impl BlockStore {
             let (k, v) = match item {
                 Ok(pair) => pair,
                 Err(e) => {
-                    eprintln!("[BlockStore] iterator error: {}", e);
+                    slog_error!("storage", "block_iterator_error", error => e);
                     continue;
                 }
             };
@@ -246,7 +247,7 @@ impl BlockStore {
         match self.db.get(block_key.as_bytes()) {
             Ok(Some(_)) => {
                 if let Err(e) = self.db.delete(block_key.as_bytes()) {
-                    eprintln!("[BlockStore] prune_block_body failed: {}", e);
+                    slog_error!("storage", "prune_block_body_failed", error => e);
                     return false;
                 }
                 true
@@ -294,7 +295,7 @@ impl BlockStore {
                 // Write in batches of 1000 to limit memory
                 if pruned % 1000 == 0 {
                     if let Err(e) = self.db.write(batch) {
-                        eprintln!("[BlockStore] pruning batch write failed: {}", e);
+                        slog_error!("storage", "pruning_batch_write_failed", error => e);
                         return pruned;
                     }
                     batch = rocksdb::WriteBatch::default();
@@ -305,7 +306,7 @@ impl BlockStore {
         // Write remaining batch
         if pruned % 1000 != 0 {
             if let Err(e) = self.db.write(batch) {
-                eprintln!("[BlockStore] final pruning batch failed: {}", e);
+                slog_error!("storage", "final_pruning_batch_failed", error => e);
             }
         }
         pruned

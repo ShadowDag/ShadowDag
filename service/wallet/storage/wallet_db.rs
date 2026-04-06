@@ -8,6 +8,7 @@ use std::path::Path;
 use bincode;
 
 use crate::service::wallet::core::wallet::Wallet;
+use crate::slog_error;
 
 pub struct WalletDB {
     db: DB,
@@ -32,7 +33,7 @@ impl WalletDB {
     pub fn save_wallet(&self, wallet: &Wallet) {
         let data = bincode::serialize(wallet).unwrap_or_default();
 
-        if let Err(_e) = self.db.put(wallet.address(), data) { eprintln!("[DB] put error: {}", _e); }
+        if let Err(_e) = self.db.put(wallet.address(), data) { slog_error!("wallet", "db_put_error", error => &_e.to_string()); }
 
     }
 

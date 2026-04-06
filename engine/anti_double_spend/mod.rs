@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
 use crate::errors::StorageError;
+use crate::{slog_warn, slog_error};
 
 pub const LOCK_TTL_SECS:    u64 = 10_800;
 pub const MAX_LOCKS_PER_TX: usize = 50;
@@ -101,10 +102,10 @@ impl DoubleSpendProtector {
         match Self::new(&dsp_path.to_string_lossy()) {
             Ok(dsp) => Ok(dsp),
             Err(e) => {
-                eprintln!("[DSP] WARNING: cannot open default DSP store: {}", e);
+                slog_warn!("consensus", "dsp_store_open_failed", error => &e.to_string());
                 let fallback = std::env::temp_dir().join(format!("shadowdag_dsp_{}", std::process::id()));
                 Self::new(&fallback.to_string_lossy()).map_err(|e2| {
-                    eprintln!("[DSP] ERROR: fallback DSP also failed: {}", e2);
+                    slog_error!("consensus", "dsp_fallback_failed", error => &e2.to_string());
                     e2
                 })
             }

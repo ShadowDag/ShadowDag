@@ -87,7 +87,7 @@ impl PedersenCommitment {
     /// Check for canonical scalar (r < L) to prevent inflation attacks.
     /// Scalar is canonical if from_canonical_bytes succeeds.
     fn check_canonical_scalar(bytes: &[u8; 32]) -> bool {
-        Scalar::from_canonical_bytes(*bytes).is_some()
+        bool::from(Scalar::from_canonical_bytes(*bytes).is_some())
     }
 
     /// Derive a deterministic blinding factor from master secret and output context.
@@ -105,7 +105,7 @@ impl PedersenCommitment {
         h.update(&amount.to_le_bytes());
         h.update(&output_index.to_le_bytes());
         let hash: [u8; 32] = h.finalize().into();
-        Scalar::from_canonical_bytes(hash)
+        Option::from(Scalar::from_canonical_bytes(hash))
             .ok_or(CryptoError::NonCanonicalScalar)
     }
 

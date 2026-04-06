@@ -13,6 +13,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use std::fmt;
+use crate::slog_warn;
 
 /// 256-bit unsigned integer
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -308,7 +309,7 @@ impl U256 {
     pub fn from_hex(s: &str) -> Option<Self> {
         let s = s.strip_prefix("0x").unwrap_or(s);
         if s.len() > 64 {
-            eprintln!("[U256] from_hex: input too long ({} hex chars, max 64)", s.len());
+            slog_warn!("runtime", "u256_hex_too_long", length => &s.len().to_string());
             return None;
         }
         let padded = format!("{:0>64}", s);

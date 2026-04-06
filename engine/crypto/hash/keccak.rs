@@ -9,6 +9,7 @@ use rocksdb::{
     IteratorMode, Direction,
 };
 use std::path::Path;
+use crate::slog_error;
 
 pub struct KeccakStore {
     db: DB,
@@ -63,7 +64,7 @@ impl KeccakStore {
     #[inline(always)]
     pub fn store_hash_bytes(&self, key: &[u8], hash: &[u8]) {
         if let Err(e) = self.db.put_opt(key, hash, &self.write_opts) {
-            eprintln!("ERROR: store_hash_bytes failed: {}", e);
+            slog_error!("crypto", "keccak_store_hash_bytes_failed", error => e);
         }
     }
 
@@ -78,7 +79,7 @@ impl KeccakStore {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("ERROR: store_batch failed: {}", e);
+            slog_error!("crypto", "keccak_store_batch_failed", error => e);
         }
     }
 
@@ -96,7 +97,7 @@ impl KeccakStore {
             Ok(Some(value)) => Some(value.to_vec()),
             Ok(None) => None,
             Err(e) => {
-                eprintln!("ERROR: get_hash_bytes failed: {}", e);
+                slog_error!("crypto", "keccak_get_hash_bytes_failed", error => e);
                 None
             }
         }
@@ -136,7 +137,7 @@ impl KeccakStore {
     #[inline(always)]
     pub fn delete_hash_bytes(&self, key: &[u8]) {
         if let Err(e) = self.db.delete_opt(key, &self.write_opts) {
-            eprintln!("ERROR: delete_hash_bytes failed: {}", e);
+            slog_error!("crypto", "keccak_delete_hash_bytes_failed", error => e);
         }
     }
 
@@ -151,7 +152,7 @@ impl KeccakStore {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("ERROR: delete_batch failed: {}", e);
+            slog_error!("crypto", "keccak_delete_batch_failed", error => e);
         }
     }
 
@@ -216,7 +217,7 @@ impl KeccakStore {
     // ─────────────────────────────────────────
     pub fn flush(&self) {
         if let Err(e) = self.db.flush() {
-            eprintln!("ERROR: flush failed: {}", e);
+            slog_error!("crypto", "keccak_flush_failed", error => e);
         }
     }
 }

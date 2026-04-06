@@ -7,6 +7,7 @@ use serde::{Serialize, Deserialize};
 
 use crate::domain::utxo::utxo_set::{UtxoSet, utxo_key};
 use crate::errors::StorageError;
+use crate::slog_warn;
 
 pub const SNAPSHOT_INTERVAL: u64 = 1_000;
 
@@ -80,26 +81,23 @@ impl UtxoSnapshot {
         let mut validation_errors = Vec::new();
 
         for (i, entry) in entries.iter().enumerate() {
-            let result = (|| -> Result<_, String> {
+            let result = (|| -> Result<_, StorageError> {
                 if entry.amount == 0 {
-                    return Err(format!("zero amount for key '{}'", entry.key));
+                    return Err(StorageError::Other(format!("zero amount for key '{}'", entry.key)));
                 }
                 let (hash, idx_s) = entry.key.rsplit_once(':')
-                    .ok_or_else(|| format!("missing ':' separator in key '{}'", entry.key))?;
+                    .ok_or_else(|| StorageError::Other(format!("missing ':' separator in key '{}'", entry.key)))?;
                 let idx: u32 = idx_s.parse()
-                    .map_err(|e| format!("invalid index '{}' in key '{}': {}", idx_s, entry.key, e))?;
+                    .map_err(|e| StorageError::Other(format!("invalid index '{}' in key '{}': {}", idx_s, entry.key, e)))?;
                 let k = utxo_key(hash, idx)
-                    .map_err(|e| format!("utxo_key failed for '{}': {}", entry.key, e))?;
+                    .map_err(|e| StorageError::Other(format!("utxo_key failed for '{}': {}", entry.key, e)))?;
                 Ok((k, entry))
             })();
 
             match result {
                 Ok(pair) => parsed.push(pair),
                 Err(reason) => {
-                    eprintln!(
-                        "[Snapshot] WARNING: malformed entry {}/{}: {}",
-                        i, entries.len(), reason
-                    );
+                    slog_warn!("utxo", "malformed_snapshot_entry", index => &i.to_string(), total => &entries.len().to_string(), reason => &reason);
                     validation_errors.push(reason);
                 }
             }

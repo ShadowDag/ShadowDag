@@ -18,6 +18,7 @@ use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::domain::block::block_header::BlockHeader;
 use crate::domain::block::merkle_proof::MerkleProof;
 use crate::domain::block::merkle_verifier::MerkleVerifier;
+use crate::slog_info;
 
 /// Maximum headers to store in memory
 pub const MAX_HEADERS_CACHE: usize = 10_000;
@@ -50,18 +51,18 @@ impl LightNode {
     /// Start the light node and begin header sync
     pub fn start(&mut self, peers: &PeerManager) {
         self.syncing = true;
-        eprintln!("[LightNode] Starting SPV node on {}", self.network);
-        eprintln!("[LightNode] Requesting headers from peers...");
+        slog_info!("node", "light_node_starting", network => &self.network);
+        slog_info!("node", "requesting_headers");
 
         // Request headers from connected peers
         let peer_count = peers.count();
-        eprintln!("[LightNode] Connected to {} peers", peer_count);
+        slog_info!("node", "light_node_peers", count => &peer_count.to_string());
     }
 
     /// Stop the light node
     pub fn stop(&mut self) {
         self.syncing = false;
-        eprintln!("[LightNode] Stopped.");
+        slog_info!("node", "light_node_stopped");
     }
 
     /// Add a block header to our chain

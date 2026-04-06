@@ -22,6 +22,7 @@
 //   Testnet: 17778
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::{slog_info, slog_error};
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::{Arc, RwLock};
@@ -272,14 +273,12 @@ impl GrpcServer {
         self.running.store(true, Ordering::Relaxed);
         let addr = format!("0.0.0.0:{}", self.port);
 
-        eprintln!("[gRPC] Server listening on {}", addr);
-        eprintln!("[gRPC] Protocol: binary length-prefixed");
-        eprintln!("[gRPC] Max message size: {} bytes", MAX_MESSAGE_SIZE);
+        slog_info!("rpc", "grpc_server_listening", addr => &addr, protocol => "binary length-prefixed", max_message_size => MAX_MESSAGE_SIZE);
 
         let listener = match TcpListener::bind(&addr) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("[gRPC] Failed to bind: {}", e);
+                slog_error!("rpc", "grpc_bind_failed", error => e);
                 return;
             }
         };
@@ -297,14 +296,14 @@ impl GrpcServer {
                     // In production: spawn thread to handle connection
                     self.stats.active_conns.fetch_sub(1, Ordering::Relaxed);
                 }
-                Err(e) => eprintln!("[gRPC] Accept error: {}", e),
+                Err(e) => slog_error!("rpc", "grpc_accept_error", error => e),
             }
         }
     }
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
-        eprintln!("[gRPC] Server stopped. {}", self.stats.summary());
+        slog_info!("rpc", "grpc_server_stopped", stats => &self.stats.summary());
     }
 
     pub fn is_running(&self) -> bool { self.running.load(Ordering::Relaxed) }

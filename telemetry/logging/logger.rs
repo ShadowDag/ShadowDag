@@ -5,6 +5,7 @@
 
 use rocksdb::{DB, Options};
 use std::path::Path;
+use crate::slog_error;
 
 pub struct Logger {
     db: DB,
@@ -27,7 +28,7 @@ impl Logger {
     }
 
     pub fn log(&self, id: &str, message: &str) {
-        if let Err(_e) = self.db.put(id, message) { eprintln!("[DB] put error: {}", _e); }
+        if let Err(_e) = self.db.put(id, message) { slog_error!("metrics", "logger_db_put_error", error => &_e.to_string()); }
 
     }
 

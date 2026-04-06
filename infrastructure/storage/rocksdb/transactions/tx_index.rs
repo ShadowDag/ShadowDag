@@ -7,6 +7,7 @@ use rocksdb::{DB, Options};
 use std::path::Path;
 
 use crate::errors::StorageError;
+use crate::slog_error;
 
 pub struct TxIndex {
     db: DB,
@@ -24,7 +25,7 @@ impl TxIndex {
     }
 
     pub fn index_tx(&self, txid: &str, block_hash: &str) {
-        if let Err(_e) = self.db.put(txid, block_hash) { eprintln!("[DB] put error: {}", _e); }
+        if let Err(e) = self.db.put(txid, block_hash) { slog_error!("storage", "tx_index_put_error", error => e); }
 
     }
 

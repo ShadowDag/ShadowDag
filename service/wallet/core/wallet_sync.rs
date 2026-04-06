@@ -8,6 +8,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::service::wallet::storage::wallet_db::WalletDB;
+use crate::{slog_info, slog_warn};
 
 pub struct WalletSync {
     db:               WalletDB,
@@ -28,10 +29,10 @@ impl WalletSync {
 
         match wallet_data {
             Some(wallet) => {
-                eprintln!("[WalletSync] Synced wallet for address: {}", wallet.address());
+                slog_info!("wallet", "wallet_synced", address => wallet.address());
             }
             None => {
-                eprintln!("[WalletSync] No wallet found for {}", address);
+                slog_warn!("wallet", "wallet_not_found", address => address);
             }
         }
     }

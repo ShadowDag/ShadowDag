@@ -7,6 +7,7 @@ use rocksdb::{DB, Options};
 use std::path::Path;
 
 use crate::errors::StorageError;
+use crate::slog_error;
 
 pub struct UtxoIndex {
     db: DB,
@@ -25,7 +26,7 @@ impl UtxoIndex {
 
     pub fn index(&self, key: &str, owner: &str) -> Result<(), StorageError> {
         self.db.put(key, owner).map_err(|e| {
-            eprintln!("[UtxoIndex] put error for key '{}': {}", key, e);
+            slog_error!("storage", "utxo_index_put_error", key => key, error => e);
             StorageError::WriteFailed(e.to_string())
         })
     }
@@ -35,7 +36,7 @@ impl UtxoIndex {
             Ok(Some(data)) => String::from_utf8(data.to_vec()).ok(),
             Ok(None) => None,
             Err(e) => {
-                eprintln!("[UtxoIndex] DB read error for key '{}': {}", key, e);
+                slog_error!("storage", "utxo_index_read_error", key => key, error => e);
                 None
             }
         }

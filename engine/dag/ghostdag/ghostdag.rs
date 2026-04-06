@@ -12,6 +12,8 @@ use std::collections::{HashSet, VecDeque};
 use serde::{Serialize, Deserialize};
 use dashmap::DashMap;
 
+use crate::slog_info;
+
 /// GHOSTDAG K parameter — consensus-critical constant.
 /// This value MUST be identical on all nodes to ensure consistent
 /// BLUE/RED classification. Changing K causes a hard fork.
@@ -92,7 +94,7 @@ impl GhostDag {
             .unwrap_or(0);
 
         if saved_counter > 0 {
-            eprintln!("[GhostDag] Recovered order_counter={} from shared DB", saved_counter);
+            slog_info!("ghostdag", "recovered_order_counter", counter => saved_counter);
         }
 
         Self {
@@ -368,22 +370,6 @@ impl GhostDag {
             .ok().flatten()
             .and_then(|d| bincode::deserialize::<Vec<String>>(&d).ok())
             .unwrap_or_default()
-    }
-
-    fn update_tips(&self, new_hash: &str, parents: &[String]) {
-        let mut tips = self.get_tips_inner();
-
-        for p in parents {
-            tips.remove(p);
-        }
-
-        tips.insert(new_hash.to_string());
-
-        if let Ok(data) = bincode::serialize(&tips.into_iter().collect::<Vec<_>>()) {
-            let _ = self.db.put(PFX_TIPS, data);
-        } else {
-            eprintln!("[GhostDag] CRITICAL: failed to serialize tips in update_tips");
-        }
     }
 
     fn get_tips_inner(&self) -> HashSet<String> {

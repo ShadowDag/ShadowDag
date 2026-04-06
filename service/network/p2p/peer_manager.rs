@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use crate::errors::NetworkError;
+use crate::slog_warn;
 use crate::service::network::dos_guard::BanCategory;
 
 pub const BAN_DURATION_SECS:        u64   = 86_400;
@@ -23,14 +24,12 @@ pub const PEER_HEALTH_TIMEOUT_SECS: u64   = 300;
 
 const PFX_BAN:        &str = "ban:";
 const PFX_PENALTY:    &str = "penalty:";
-const PFX_SCORE:      &str = "score:";
 const PFX_ADDR:       &str = "addr:";
 const PFX_PEER:       &str = "peer:";
 const PFX_LAST_SEEN:  &str = "seen:";
 const PFX_CONN_COUNT: &str = "conn:";
 const PFX_LATENCY:    &str = "latency:";
 const PFX_HEIGHT:     &str = "height:";
-const PFX_FEAT:       &str = "feat:";
 const PFX_BAN_COUNT:  &str = "bancnt:";
 const PFX_BAN_CAT:    &str = "bancat:";
 
@@ -88,7 +87,7 @@ static PEER_MANAGER_INSTANCE: OnceLock<Arc<PeerManager>> = OnceLock::new();
 pub struct PeerManager {
     db:           Arc<Mutex<DB>>,
     addr_cache:   Arc<Mutex<Vec<String>>>,
-    network_path: String,
+    _network_path: String,
 }
 
 impl PeerManager {
@@ -100,11 +99,11 @@ impl PeerManager {
 
         // Try primary path, then fallback, then temp.
         let pm = Self::open(path).or_else(|e| {
-            eprintln!("[PeerManager] cannot open {}: {}", path, e);
+            slog_warn!("p2p", "peer_db_open_failed", path => path, error => &e.to_string());
             let fallback = format!("{}_fallback", path);
             Self::open(&fallback)
         }).or_else(|e| {
-            eprintln!("[PeerManager] fallback also failed: {}", e);
+            slog_warn!("p2p", "peer_db_fallback_failed", error => &e.to_string());
             let temp = std::env::temp_dir().join(format!("shadowdag_peer_emergency_{}", std::process::id()));
             Self::open(temp.to_str().unwrap_or("/tmp/shadowdag_peer_emergency"))
         })?;
@@ -128,7 +127,7 @@ impl PeerManager {
         Ok(Self {
             db:           Arc::new(Mutex::new(db)),
             addr_cache:   Arc::new(Mutex::new(Vec::new())),
-            network_path: path.to_string(),
+            _network_path: path.to_string(),
         })
     }
 
@@ -154,7 +153,7 @@ impl PeerManager {
             match Self::open(p) {
                 Ok(pm) => return Ok(pm),
                 Err(e) => {
-                    eprintln!("[PeerManager] cannot open {}: {}", p, e);
+                    slog_warn!("p2p", "peer_db_open_failed", path => p.as_str(), error => &e.to_string());
                     last_err = Some(e);
                 }
             }
@@ -178,11 +177,11 @@ impl PeerManager {
 
     pub fn new_default_path(path: &str) -> Result<Self, NetworkError> {
         Self::open(path).or_else(|e| {
-            eprintln!("[PeerManager] cannot open {}: {}", path, e);
+            slog_warn!("p2p", "peer_db_open_failed", path => path, error => &e.to_string());
             let fallback = format!("{}_fallback", path);
             Self::open(&fallback)
         }).or_else(|e| {
-            eprintln!("[PeerManager] fallback also failed: {}", e);
+            slog_warn!("p2p", "peer_db_fallback_failed", error => &e.to_string());
             let temp = std::env::temp_dir().join(format!("shadowdag_peer_emergency_{}", std::process::id()));
             Self::open(temp.to_str().unwrap_or("/tmp/shadowdag_peer_emergency"))
         })
@@ -329,8 +328,7 @@ impl PeerManager {
         batch.put(format!("{}{}", PFX_BAN_COUNT, addr).as_bytes(), new_count.to_le_bytes());
         batch.put(format!("{}{}", PFX_BAN_CAT, addr).as_bytes(), &[category as u8]);
         let _ = db.write(batch);
-        eprintln!("[peers] Banned {} for {}s (count={}, category={:?}): {}",
-            addr, duration, new_count, category, reason);
+        slog_warn!("p2p", "peer_banned", addr => addr, duration_secs => duration, ban_count => new_count, category => &format!("{:?}", category), reason => reason);
     }
 
     /// Read persistent ban count (must hold db lock already).
@@ -371,7 +369,7 @@ impl PeerManager {
                 _ => {
                     // Corrupted ban record — fail closed: treat as banned.
                     // Operator can fix by unbanning explicitly.
-                    eprintln!("[peers] WARNING: corrupted ban record for {} ({} bytes), treating as banned", addr, data.len());
+                    slog_warn!("p2p", "corrupted_ban_record", addr => addr, bytes => data.len());
                     return true;
                 }
             }

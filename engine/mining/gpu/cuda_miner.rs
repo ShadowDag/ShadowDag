@@ -8,6 +8,7 @@ use std::time::Instant;
 use crate::engine::mining::algorithms::shadowhash::shadow_hash;
 use crate::engine::mining::pow::pow_validator::PowValidator;
 use crate::domain::block::block::Block;
+use crate::{slog_info, slog_error};
 
 pub struct CudaDeviceInfo {
     pub device_id:    u32,
@@ -24,7 +25,7 @@ pub struct CudaMiner {
 
 impl CudaMiner {
     pub fn new(device_id: u32) -> Self {
-        eprintln!("CudaMiner → initializing device {}", device_id);
+        slog_info!("gpu", "cuda_miner_initializing", device => device_id);
         Self {
             device_id,
             block_size: 256,
@@ -42,24 +43,18 @@ impl CudaMiner {
     }
 
     pub fn load_kernel(&self) {
-        eprintln!(
-            "CudaMiner → ShadowHash kernel loaded on device {} (block={} grid={})",
-            self.device_id, self.block_size, self.grid_size
-        );
+        slog_info!("gpu", "cuda_kernel_loaded", device => self.device_id, block_size => self.block_size, grid_size => self.grid_size);
 
     }
 
     pub fn compute_pow(&self, block: &Block, difficulty: u64) -> Option<u64> {
-        eprintln!(
-            "CudaMiner → compute_pow difficulty={} device={} blocks={}×{}",
-            difficulty, self.device_id, self.grid_size, self.block_size
-        );
+        slog_info!("gpu", "cuda_compute_pow", difficulty => difficulty, device => self.device_id, grid_size => self.grid_size, block_size => self.block_size);
 
         let _difficulty = difficulty;
         let total = match (self.grid_size as u64).checked_mul(self.block_size as u64) {
             Some(n) => n,
             None => {
-                eprintln!("[CUDA] grid*block overflow");
+                slog_error!("gpu", "cuda_grid_block_overflow");
                 return None;
             }
         };
@@ -74,10 +69,7 @@ impl CudaMiner {
             });
 
         let elapsed = start.elapsed().as_millis();
-        eprintln!(
-            "CudaMiner → kernel done in {}ms result={:?}",
-            elapsed, result
-        );
+        slog_info!("gpu", "cuda_kernel_done", time_ms => elapsed, found => result.is_some());
         result
     }
 
@@ -112,10 +104,7 @@ impl CudaMiner {
                     b.header.nonce = nonce;
                     shadow_hash(&b)
                 };
-                eprintln!(
-                    "CudaMiner → ✅ block found nonce={} hash={}",
-                    nonce, &block.header.hash[..16]
-                );
+                slog_info!("gpu", "cuda_block_found", nonce => nonce, hash_prefix => &block.header.hash[..16]);
                 return Some(block);
             }
         }

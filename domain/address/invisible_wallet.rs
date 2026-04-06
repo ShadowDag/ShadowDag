@@ -55,9 +55,9 @@ impl InvisibleWallet {
         let view_bytes  = KeyDerivation::derive_view_key(&master_key);
         let spend_bytes = KeyDerivation::derive_spend_key(&master_key);
 
-        let view_scalar  = Scalar::from_canonical_bytes(view_bytes)
+        let view_scalar  = Option::from(Scalar::from_canonical_bytes(view_bytes))
             .ok_or(CryptoError::NonCanonicalScalar)?;
-        let spend_scalar = Scalar::from_canonical_bytes(spend_bytes)
+        let spend_scalar = Option::from(Scalar::from_canonical_bytes(spend_bytes))
             .ok_or(CryptoError::NonCanonicalScalar)?;
 
         Ok(Self {

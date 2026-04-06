@@ -13,9 +13,6 @@ use crate::domain::traits::pow_checker::PowChecker;
 /// Canonical value defined in block_validator::MAX_FUTURE_SECS.
 const MAX_FUTURE_TIME_SECS: u64 = 120;
 
-/// Maximum block size in bytes
-const MAX_BLOCK_SIZE: usize = 2 * 1024 * 1024;
-
 pub struct BlockRules;
 
 impl BlockRules {

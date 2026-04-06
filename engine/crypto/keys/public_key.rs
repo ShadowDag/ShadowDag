@@ -10,6 +10,7 @@ use rocksdb::{
 };
 use std::path::Path;
 use crate::errors::StorageError;
+use crate::slog_error;
 
 // prefix
 const KEY_PREFIX: &[u8] = b"pk:";
@@ -96,7 +97,7 @@ impl PublicKeyStore {
     pub fn store_raw(&self, key_id: &str, value: &[u8]) {
         Self::build_key(key_id, |k| {
             if let Err(e) = self.db.put_opt(k, value, &self.write_opts) {
-                eprintln!("[PublicKeyStore] DB write error: {}", e);
+                slog_error!("crypto", "public_key_store_write_failed", error => e);
             }
         });
     }
@@ -115,7 +116,7 @@ impl PublicKeyStore {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("[PublicKeyStore] DB batch write error: {}", e);
+            slog_error!("crypto", "public_key_store_batch_write_failed", error => e);
         }
     }
 
@@ -130,7 +131,7 @@ impl PublicKeyStore {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("[PublicKeyStore] DB batch write error: {}", e);
+            slog_error!("crypto", "public_key_store_batch_write_failed", error => e);
         }
     }
 
@@ -191,7 +192,7 @@ impl PublicKeyStore {
     pub fn delete(&self, key_id: &str) {
         Self::build_key(key_id, |k| {
             if let Err(e) = self.db.delete_opt(k, &self.write_opts) {
-                eprintln!("[PublicKeyStore] DB delete error: {}", e);
+                slog_error!("crypto", "public_key_store_delete_failed", error => e);
             }
         });
     }
@@ -210,7 +211,7 @@ impl PublicKeyStore {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("[PublicKeyStore] DB batch delete error: {}", e);
+            slog_error!("crypto", "public_key_store_batch_delete_failed", error => e);
         }
     }
 

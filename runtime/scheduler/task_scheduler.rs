@@ -5,6 +5,7 @@
 
 use rocksdb::DB;
 use std::sync::Arc;
+use crate::slog_error;
 
 pub struct TaskScheduler {
     db: Arc<DB>,
@@ -19,7 +20,7 @@ impl TaskScheduler {
 
     pub fn schedule(&self, task_id: &str, payload: &str) {
         let key = format!("task:{}", task_id);
-        if let Err(_e) = self.db.put(key.as_bytes(), payload.as_bytes()) { eprintln!("[DB] put error: {}", _e); }
+        if let Err(_e) = self.db.put(key.as_bytes(), payload.as_bytes()) { slog_error!("runtime", "task_scheduler_db_put_error", error => &_e.to_string()); }
 
     }
 

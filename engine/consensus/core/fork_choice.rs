@@ -24,7 +24,7 @@ pub struct ForkChoiceStore {
     db: Arc<DB>,
     write_opts: WriteOptions,
     read_opts: ReadOptions,
-    iter_read_opts: ReadOptions,
+    _iter_read_opts: ReadOptions,
 }
 
 impl ForkChoiceStore {
@@ -66,9 +66,9 @@ impl ForkChoiceStore {
         let mut read_opts = ReadOptions::default();
         read_opts.set_total_order_seek(false);
 
-        let mut iter_read_opts = ReadOptions::default();
-        iter_read_opts.set_prefix_same_as_start(true);
-        iter_read_opts.set_total_order_seek(false);
+        let mut _iter_read_opts = ReadOptions::default();
+        _iter_read_opts.set_prefix_same_as_start(true);
+        _iter_read_opts.set_total_order_seek(false);
 
         // 🔥 safe upper bound
         let mut upper = CHOICE_PREFIX.to_vec();
@@ -79,13 +79,13 @@ impl ForkChoiceStore {
                 upper.push(0x00);
             }
         }
-        iter_read_opts.set_iterate_upper_bound(upper);
+        _iter_read_opts.set_iterate_upper_bound(upper);
 
         Ok(Self {
             db: Arc::new(db),
             write_opts,
             read_opts,
-            iter_read_opts,
+            _iter_read_opts,
         })
     }
 

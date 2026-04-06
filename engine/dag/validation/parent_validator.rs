@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::errors::{DagError, StorageError};
+use crate::slog_error;
 
 // prefix
 const PARENT_PREFIX: &[u8] = b"parent:";
@@ -23,8 +24,8 @@ pub struct ParentValidatorStore {
     db: Arc<DB>,
     write_opts: WriteOptions,
     read_opts: ReadOptions,
-    iter_read_opts: ReadOptions,
-    range_end: Vec<u8>, // 🔥 ثابت
+    _iter_read_opts: ReadOptions,
+    _range_end: Vec<u8>, // 🔥 ثابت
 }
 
 impl ParentValidatorStore {
@@ -76,18 +77,18 @@ impl ParentValidatorStore {
         range_end.push(RANGE_END_SUFFIX);
 
         // iterator opts
-        let mut iter_read_opts = ReadOptions::default();
-        iter_read_opts.set_prefix_same_as_start(true);
-        iter_read_opts.set_total_order_seek(false);
-        iter_read_opts.fill_cache(false);
-        iter_read_opts.set_iterate_upper_bound(range_end.clone());
+        let mut _iter_read_opts = ReadOptions::default();
+        _iter_read_opts.set_prefix_same_as_start(true);
+        _iter_read_opts.set_total_order_seek(false);
+        _iter_read_opts.fill_cache(false);
+        _iter_read_opts.set_iterate_upper_bound(range_end.clone());
 
         Ok(Self {
             db: Arc::new(db),
             write_opts,
             read_opts,
-            iter_read_opts,
-            range_end,
+            _iter_read_opts,
+            _range_end: range_end,
         })
     }
 
@@ -111,7 +112,7 @@ impl ParentValidatorStore {
             value.as_bytes(),
             &self.write_opts,
         ) {
-            eprintln!("[ParentValidatorStore] put error: {}", e);
+            slog_error!("dag", "parent_validator_put_failed", error => e);
         }
     }
 
@@ -126,7 +127,7 @@ impl ParentValidatorStore {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("[ParentValidatorStore] batch write error: {}", e);
+            slog_error!("dag", "parent_validator_batch_write_failed", error => e);
         }
     }
 
@@ -186,7 +187,7 @@ impl ParentValidatorStore {
     // ─────────────────────────────────────────
     pub fn delete_parent_check(&self, key: &str) {
         if let Err(e) = self.db.delete_opt(Self::make_key(key), &self.write_opts) {
-            eprintln!("[ParentValidatorStore] delete error: {}", e);
+            slog_error!("dag", "parent_validator_delete_failed", error => e);
         }
     }
 
@@ -226,7 +227,7 @@ impl ParentValidatorStore {
     // ─────────────────────────────────────────
     pub fn flush(&self) {
         if let Err(e) = self.db.flush() {
-            eprintln!("[ParentValidatorStore] flush error: {}", e);
+            slog_error!("dag", "parent_validator_flush_failed", error => e);
         }
     }
 }

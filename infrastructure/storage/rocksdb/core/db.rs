@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::errors::StorageError;
+use crate::{slog_warn, slog_error};
 
 pub enum SharedDbSource {
     Path(String),
@@ -50,7 +51,7 @@ pub fn open_shared_db<S: Into<SharedDbSource>>(source: S, opts: &Options) -> Res
 
             let wal_dir = format!("{}/wal", path);
             if let Err(e) = std::fs::create_dir_all(&wal_dir) {
-                eprintln!("[DB] WARNING: failed to create WAL dir {}: {}", wal_dir, e);
+                slog_warn!("storage", "wal_dir_create_failed", path => wal_dir, error => e);
             }
             safe_opts.set_wal_dir(Path::new(&wal_dir));
 
@@ -132,7 +133,7 @@ impl NodeDB {
 
         let wal_dir = format!("{}/wal", path);
         if let Err(e) = std::fs::create_dir_all(&wal_dir) {
-            eprintln!("[DB] WARNING: failed to create WAL dir {}: {}", wal_dir, e);
+            slog_warn!("storage", "wal_dir_create_failed", path => wal_dir, error => e);
         }
         opts.set_wal_dir(Path::new(&wal_dir));
 
@@ -147,7 +148,7 @@ impl NodeDB {
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
         self.db.put(key, value).map_err(|e| {
-            eprintln!("[NodeDB] WRITE ERROR: {}", e);
+            slog_error!("storage", "write_error", error => e);
             StorageError::WriteFailed(e.to_string())
         })
     }
@@ -155,7 +156,7 @@ impl NodeDB {
     pub fn put_sync(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
         let wo = Self::write_opts(true);
         self.db.put_opt(key, value, &wo).map_err(|e| {
-            eprintln!("[NodeDB] SYNC WRITE ERROR: {}", e);
+            slog_error!("storage", "sync_write_error", error => e);
             StorageError::WriteFailed(e.to_string())
         })
     }
@@ -165,7 +166,7 @@ impl NodeDB {
             Ok(Some(value)) => Some(value.to_vec()),
             Ok(None) => None,
             Err(e) => {
-                eprintln!("[NodeDB] READ ERROR: {}", e);
+                slog_error!("storage", "read_error", error => e);
                 None
             }
         }
@@ -173,7 +174,7 @@ impl NodeDB {
 
     pub fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
         self.db.delete(key).map_err(|e| {
-            eprintln!("[NodeDB] DELETE ERROR: {}", e);
+            slog_error!("storage", "delete_error", error => e);
             StorageError::WriteFailed(e.to_string())
         })
     }
@@ -181,7 +182,7 @@ impl NodeDB {
     pub fn delete_sync(&self, key: &[u8]) -> Result<(), StorageError> {
         let wo = Self::write_opts(true);
         self.db.delete_opt(key, &wo).map_err(|e| {
-            eprintln!("[NodeDB] SYNC DELETE ERROR: {}", e);
+            slog_error!("storage", "sync_delete_error", error => e);
             StorageError::WriteFailed(e.to_string())
         })
     }

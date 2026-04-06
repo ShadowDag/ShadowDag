@@ -9,6 +9,7 @@ use rocksdb::{
 };
 use std::path::Path;
 use crate::errors::CryptoError;
+use crate::slog_error;
 
 const CLEAR_BATCH_SIZE: usize = 1000;
 
@@ -79,7 +80,7 @@ impl Blake3Store {
     #[inline(always)]
     pub fn store_bytes(&self, key: &[u8], value: &[u8]) {
         if let Err(e) = self.put(key, value) {
-            eprintln!("[Blake3Store] CRITICAL: DB write failed: {}", e);
+            slog_error!("crypto", "blake3_store_write_failed", error => e);
         }
     }
 
@@ -159,7 +160,7 @@ impl Blake3Store {
     #[inline(always)]
     pub fn delete_bytes(&self, key: &[u8]) {
         if let Err(e) = self.delete(key) {
-            eprintln!("[Blake3Store] CRITICAL: DB delete failed: {}", e);
+            slog_error!("crypto", "blake3_store_delete_failed", error => e);
         }
     }
 
@@ -181,7 +182,7 @@ impl Blake3Store {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("[Blake3Store] CRITICAL: DB batch write failed: {}", e);
+            slog_error!("crypto", "blake3_store_batch_write_failed", error => e);
         }
     }
 
@@ -193,7 +194,7 @@ impl Blake3Store {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("[Blake3Store] CRITICAL: DB batch write failed: {}", e);
+            slog_error!("crypto", "blake3_store_batch_write_failed", error => e);
         }
     }
 
@@ -205,7 +206,7 @@ impl Blake3Store {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("[Blake3Store] CRITICAL: DB batch delete failed: {}", e);
+            slog_error!("crypto", "blake3_store_batch_delete_failed", error => e);
         }
     }
 
@@ -214,7 +215,7 @@ impl Blake3Store {
     // ─────────────────────────────────────────
     pub fn flush(&self) {
         if let Err(e) = self.db.flush() {
-            eprintln!("[Blake3Store] CRITICAL: DB flush failed: {}", e);
+            slog_error!("crypto", "blake3_store_flush_failed", error => e);
         }
     }
 
@@ -232,7 +233,7 @@ impl Blake3Store {
 
             if count >= CLEAR_BATCH_SIZE {
                 if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-                    eprintln!("[Blake3Store] CRITICAL: DB clear failed: {}", e);
+                    slog_error!("crypto", "blake3_store_clear_failed", error => e);
                     return;
                 }
 
@@ -243,7 +244,7 @@ impl Blake3Store {
 
         if count > 0 {
             if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-                eprintln!("[Blake3Store] CRITICAL: DB clear failed: {}", e);
+                slog_error!("crypto", "blake3_store_clear_failed", error => e);
             }
         }
     }

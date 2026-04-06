@@ -5,6 +5,7 @@
 
 use rocksdb::{DB, Options};
 use std::path::Path;
+use crate::slog_error;
 
 pub struct Tracing {
     db: DB,
@@ -27,7 +28,7 @@ impl Tracing {
     }
 
     pub fn trace(&self, event_id: &str, payload: &str) {
-        if let Err(_e) = self.db.put(event_id, payload) { eprintln!("[DB] put error: {}", _e); }
+        if let Err(_e) = self.db.put(event_id, payload) { slog_error!("tracing", "db_put_error", error => &_e.to_string()); }
 
     }
 

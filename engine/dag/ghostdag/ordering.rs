@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use crate::errors::{DagError, StorageError};
+use crate::{slog_error, slog_warn};
 
 const ORDER_PREFIX: &str = "order:";
 
@@ -26,7 +27,7 @@ impl OrderingStore {
         match DB::open(&opts, Path::new(path)) {
             Ok(db) => Some(Self { db }),
             Err(e) => {
-                eprintln!("[OrderingStore] DB open error: {}", e);
+                slog_error!("ghostdag", "ordering_store_open_failed", error => e);
                 None
             }
         }
@@ -50,7 +51,7 @@ impl OrderingStore {
         let key = Self::make_key(hash);
 
         if let Err(e) = self.db.put(&key, order.to_be_bytes()) {
-            eprintln!("[OrderingStore] DB write failed: {}", e);
+            slog_error!("ghostdag", "ordering_store_write_failed", error => e);
         }
     }
 
@@ -65,7 +66,7 @@ impl OrderingStore {
             }
             Ok(_) => None,
             Err(e) => {
-                eprintln!("[OrderingStore] DB read error: {}", e);
+                slog_error!("ghostdag", "ordering_store_read_failed", error => e);
                 None
             }
         }
@@ -152,11 +153,7 @@ impl OrderingStore {
         }
 
         if ordered.len() != blocks.len() {
-            eprintln!(
-                "[OrderingStore] WARNING: Cycle detected! ordered={} expected={}",
-                ordered.len(),
-                blocks.len()
-            );
+            slog_warn!("ghostdag", "cycle_detected", ordered => ordered.len(), expected => blocks.len());
         }
 
         ordered
@@ -197,7 +194,7 @@ impl OrderingStore {
         }
 
         if let Err(e) = self.db.write(batch) {
-            eprintln!("[OrderingStore] batch write failed: {}", e);
+            slog_error!("ghostdag", "ordering_batch_write_failed", error => e);
         }
 
         sorted
@@ -219,7 +216,7 @@ impl OrderingStore {
         }
 
         if let Err(e) = self.db.write(batch) {
-            eprintln!("[OrderingStore] batch write failed: {}", e);
+            slog_error!("ghostdag", "ordering_batch_write_failed", error => e);
         }
 
         ordered

@@ -6,8 +6,7 @@
 // Structured error types for ShadowDAG.
 //
 // Every module returns typed errors instead of `Result<T, String>`.
-// Each error enum implements `Display` via thiserror and `From<XError> for String`
-// so callers still using `Result<T, String>` keep working during migration.
+// Each error enum implements `Display` via thiserror.
 // ═══════════════════════════════════════════════════════════════════════════
 
 use thiserror::Error;
@@ -42,12 +41,11 @@ pub enum StorageError {
     #[error("[Storage] write failed: {0}")]
     WriteFailed(String),
 
+    #[error("[Storage] read failed: {0}")]
+    ReadFailed(String),
+
     #[error("[Storage] {0}")]
     Other(String),
-}
-
-impl From<StorageError> for String {
-    fn from(e: StorageError) -> Self { e.to_string() }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -90,10 +88,6 @@ pub enum DagError {
     Other(String),
 }
 
-impl From<DagError> for String {
-    fn from(e: DagError) -> Self { e.to_string() }
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 //  Consensus
 // ─────────────────────────────────────────────────────────────────────────
@@ -124,12 +118,11 @@ pub enum ConsensusError {
     #[error("[Consensus] genesis error: {0}")]
     Genesis(String),
 
+    #[error("[Consensus] invalid transaction at index {index}: {reason}")]
+    InvalidTransaction { index: usize, reason: String },
+
     #[error("[Consensus] {0}")]
     Other(String),
-}
-
-impl From<ConsensusError> for String {
-    fn from(e: ConsensusError) -> Self { e.to_string() }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -140,6 +133,9 @@ impl From<ConsensusError> for String {
 pub enum NetworkError {
     #[error("[Network] connection failed: {0}")]
     ConnectionFailed(String),
+
+    #[error("[Network] invalid message: {0}")]
+    InvalidMessage(String),
 
     #[error("[Network] peer '{0}' banned")]
     PeerBanned(String),
@@ -161,10 +157,6 @@ pub enum NetworkError {
 
     #[error("[Network] {0}")]
     Other(String),
-}
-
-impl From<NetworkError> for String {
-    fn from(e: NetworkError) -> Self { e.to_string() }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -204,10 +196,6 @@ pub enum VmError {
     Other(String),
 }
 
-impl From<VmError> for String {
-    fn from(e: VmError) -> Self { e.to_string() }
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 //  Mempool
 // ─────────────────────────────────────────────────────────────────────────
@@ -242,10 +230,6 @@ pub enum MempoolError {
     Other(String),
 }
 
-impl From<MempoolError> for String {
-    fn from(e: MempoolError) -> Self { e.to_string() }
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 //  Wallet
 // ─────────────────────────────────────────────────────────────────────────
@@ -255,8 +239,8 @@ pub enum WalletError {
     #[error("[Wallet] locked")]
     Locked,
 
-    #[error("[Wallet] wrong password")]
-    WrongPassword,
+    #[error("[Wallet] authentication failed")]
+    AuthFailed,
 
     #[error("[Wallet] key derivation failed: {0}")]
     KeyDerivation(String),
@@ -275,10 +259,6 @@ pub enum WalletError {
 
     #[error("[Wallet] {0}")]
     Other(String),
-}
-
-impl From<WalletError> for String {
-    fn from(e: WalletError) -> Self { e.to_string() }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -307,10 +287,6 @@ pub enum CryptoError {
 
     #[error("[Crypto] {0}")]
     Other(String),
-}
-
-impl From<CryptoError> for String {
-    fn from(e: CryptoError) -> Self { e.to_string() }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -346,12 +322,14 @@ pub enum NodeError {
     #[error("[Node] initialization failed: {0}")]
     Init(String),
 
+    #[error("[Node] block rejected: {0}")]
+    BlockRejected(String),
+
+    #[error("[Node] peer banned: {peer} — {reason}")]
+    PeerBanned { peer: String, reason: String },
+
     #[error("[Node] {0}")]
     Other(String),
-}
-
-impl From<NodeError> for String {
-    fn from(e: NodeError) -> Self { e.to_string() }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -382,10 +360,6 @@ pub enum DexError {
     Other(String),
 }
 
-impl From<DexError> for String {
-    fn from(e: DexError) -> Self { e.to_string() }
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 //  Atomic Swap
 // ─────────────────────────────────────────────────────────────────────────
@@ -414,10 +388,6 @@ pub enum SwapError {
     Other(String),
 }
 
-impl From<SwapError> for String {
-    fn from(e: SwapError) -> Self { e.to_string() }
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 //  Privacy
 // ─────────────────────────────────────────────────────────────────────────
@@ -443,6 +413,3 @@ pub enum PrivacyError {
     Other(String),
 }
 
-impl From<PrivacyError> for String {
-    fn from(e: PrivacyError) -> Self { e.to_string() }
-}

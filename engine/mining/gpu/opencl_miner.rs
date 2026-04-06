@@ -8,6 +8,7 @@ use std::time::Instant;
 use crate::engine::mining::algorithms::shadowhash::shadow_hash;
 use crate::engine::mining::pow::pow_validator::PowValidator;
 use crate::domain::block::block::Block;
+use crate::{slog_info, slog_warn};
 
 pub struct OpenClPlatformInfo {
     pub platform_id:  u32,
@@ -25,10 +26,7 @@ pub struct OpenClMiner {
 
 impl OpenClMiner {
     pub fn new(platform_id: u32, device_id: u32) -> Self {
-        eprintln!(
-            "OpenClMiner → initializing platform={} device={}",
-            platform_id, device_id
-        );
+        slog_info!("gpu", "opencl_miner_initializing", platform => platform_id, device => device_id);
         Self {
             platform_id,
             device_id,
@@ -54,19 +52,13 @@ impl OpenClMiner {
 
     pub fn initialize(&self) {
         let info = self.platform_info();
-        eprintln!(
-            "OpenClMiner → platform={} vendor='{}' device={} work_size={}",
-            self.platform_id, info.vendor, self.device_id, self.work_size
-        );
+        slog_info!("gpu", "opencl_platform_info", platform => self.platform_id, vendor => info.vendor, device => self.device_id, work_size => self.work_size);
 
-        eprintln!("OpenClMiner → context and command queue ready");
+        slog_info!("gpu", "opencl_context_ready");
     }
 
     pub fn compute_pow(&self, block: &Block, difficulty: u64) -> Option<u64> {
-        eprintln!(
-            "OpenClMiner → compute_pow difficulty={} platform={} device={} work_size={}",
-            difficulty, self.platform_id, self.device_id, self.work_size
-        );
+        slog_info!("gpu", "opencl_compute_pow", difficulty => difficulty, platform => self.platform_id, device => self.device_id, work_size => self.work_size);
 
         let _difficulty = difficulty;
         let start   = Instant::now();
@@ -80,16 +72,13 @@ impl OpenClMiner {
             });
 
         let elapsed = start.elapsed().as_millis();
-        eprintln!(
-            "OpenClMiner → kernel done in {}ms result={:?}",
-            elapsed, result
-        );
+        slog_info!("gpu", "opencl_kernel_done", time_ms => elapsed, found => result.is_some());
         result
     }
 
     pub fn mine_block(&self, mut block: Block, difficulty: u64) -> Option<Block> {
         if self.work_size == 0 {
-            eprintln!("OpenClMiner → work_size is 0, cannot mine (would divide by zero)");
+            slog_warn!("gpu", "opencl_work_size_zero");
             return None;
         }
         self.initialize();
@@ -118,10 +107,7 @@ impl OpenClMiner {
                 let mut final_block = block.clone();
                 final_block.header.nonce = nonce;
                 final_block.header.hash  = shadow_hash(&final_block);
-                eprintln!(
-                    "OpenClMiner → ✅ block found nonce={} hash={}",
-                    nonce, &final_block.header.hash[..16]
-                );
+                slog_info!("gpu", "opencl_block_found", nonce => nonce, hash_prefix => &final_block.header.hash[..16]);
                 return Some(final_block);
             }
         }
@@ -142,10 +128,7 @@ impl OpenClMiner {
 
         let elapsed_ms = start.elapsed().as_millis().max(1);
         let mhs = (iters as f64 / elapsed_ms as f64) / 1000.0;
-        eprintln!(
-            "OpenClMiner → benchmark platform={} device={}: {:.2} MH/s",
-            self.platform_id, self.device_id, mhs
-        );
+        slog_info!("gpu", "opencl_benchmark_result", platform => self.platform_id, device => self.device_id, hashrate_mhs => format!("{:.2}", mhs));
         mhs
     }
 }

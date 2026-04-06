@@ -35,6 +35,7 @@ use blake2b_simd::Params;
 use rayon::prelude::*;
 
 use crate::domain::transaction::transaction::Transaction;
+use crate::slog_error;
 
 /// BLAKE2b with 32-byte (256-bit) output (used for empty-block root)
 type Blake2b256 = Blake2b<U32>;
@@ -155,11 +156,7 @@ impl MerkleTree {
         match crate::domain::types::hash::parse_hash256(hex_str) {
             Ok(bytes) => bytes.to_vec(),
             Err(e) => {
-                eprintln!(
-                    "[MerkleTree] STRICT: rejecting malformed hash '{}…' ({}). \
-                     Using poison value — block will fail validation.",
-                    &hex_str[..hex_str.len().min(16)], e
-                );
+                slog_error!("block", "malformed_merkle_hash", hash_prefix => &hex_str[..hex_str.len().min(16)], error => &e.to_string());
                 vec![0xFF; 32] // deterministic poison — never matches real hashes
             }
         }

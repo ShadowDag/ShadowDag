@@ -21,6 +21,7 @@ use crate::engine::privacy::stealth::view_key::ViewKey;
 use crate::domain::transaction::transaction::Transaction;
 use crate::domain::block::block::Block;
 use crate::errors::CryptoError;
+use crate::{slog_warn, slog_error};
 
 /// Result of scanning a transaction
 #[derive(Debug, Clone)]
@@ -113,10 +114,7 @@ impl StealthScanner {
             let eph_hex = match &output.ephemeral_pubkey {
                 Some(e) => e,
                 None => {
-                    eprintln!(
-                        "[StealthScanner] tx {} output {} has stealth prefix but no ephemeral_pubkey — skipped",
-                        tx.hash, idx
-                    );
+                    slog_warn!("privacy", "stealth_no_ephemeral_pubkey", tx_hash => tx.hash, output_idx => idx);
                     continue;
                 }
             };
@@ -143,10 +141,7 @@ impl StealthScanner {
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    eprintln!(
-                        "[StealthScanner] tx {} output {} scan error: {} — skipped",
-                        tx.hash, idx, e
-                    );
+                    slog_error!("privacy", "stealth_scan_error", tx_hash => tx.hash, output_idx => idx, error => e);
                     continue;
                 }
             }

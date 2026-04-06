@@ -63,7 +63,7 @@ impl InvEntry {
 struct QueueEntry {
     priority:  MsgPriority,
     entry:     InvEntry,
-    retries:   u32,
+    _retries:   u32,
 }
 
 impl PartialEq for QueueEntry {
@@ -220,7 +220,7 @@ impl GossipManager {
             ps.queue.push(QueueEntry {
                 priority: priority.clone(),
                 entry:    entry.clone(),
-                retries:  0,
+                _retries:  0,
             });
             sent += 1;
         }
@@ -240,7 +240,7 @@ impl GossipManager {
             ps.queue.push(QueueEntry {
                 priority: MsgPriority::Normal,
                 entry:    entry.clone(),
-                retries:  0,
+                _retries:  0,
             });
             ps.last_trickle = now;
         }

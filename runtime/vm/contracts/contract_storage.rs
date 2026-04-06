@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use crate::errors::VmError;
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
+use crate::slog_error;
 
 /// Buffered state changes awaiting atomic commit
 pub struct PendingBatch {
@@ -91,7 +92,7 @@ impl ContractStorage {
     pub fn set_state(&self, key: &str, value: &str) {
         let db_key = format!("contract:{}", key);
         if let Err(e) = self.db.put(db_key.as_bytes(), value.as_bytes()) {
-            eprintln!("[ContractStorage] put error: {}", e);
+            slog_error!("runtime", "contract_storage_put_error", error => &e.to_string());
         }
     }
 
@@ -102,7 +103,7 @@ impl ContractStorage {
             Ok(Some(data)) => String::from_utf8(data.to_vec()).ok(),
             Ok(None) => None,
             Err(e) => {
-                eprintln!("[ContractStorage] get_state error for '{}': {}", key, e);
+                slog_error!("runtime", "contract_storage_get_error", key => key, error => &e.to_string());
                 None
             }
         }

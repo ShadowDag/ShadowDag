@@ -19,6 +19,7 @@ use crate::engine::dag::tips::tip_manager::TipManager;
 use crate::engine::dag::core::dag_manager::DagManager;
 use crate::engine::dag::security::dos_protection::{MAX_DAG_PARENTS, MAX_BLOCK_TX_COUNT};
 use crate::errors::ConsensusError;
+use crate::slog_warn;
 
 pub struct BlockTemplateBuilder;
 
@@ -49,10 +50,7 @@ impl BlockTemplateBuilder {
         let mut validated_parents: Vec<String> = Vec::with_capacity(candidates.len());
         for parent_hash in &candidates {
             if !dag_manager.block_exists(parent_hash) {
-                eprintln!(
-                    "[BlockTemplate] WARNING: tip {} not found in DAG, skipping",
-                    &parent_hash[..parent_hash.len().min(16)]
-                );
+                slog_warn!("mining", "tip_not_found_in_dag", hash_prefix => &parent_hash[..parent_hash.len().min(16)]);
                 continue;
             }
             validated_parents.push(parent_hash.clone());

@@ -14,6 +14,7 @@ use rocksdb::DB;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::errors::StorageError;
+use crate::slog_info;
 
 /// Current database schema version
 pub const CURRENT_DB_VERSION: u32 = 6;
@@ -87,8 +88,7 @@ impl MigrationManager {
                 Ok(_) => {
                     Self::log_migration(db, version);
                     applied += 1;
-                    eprintln!("[migrations] Applied migration v{}: {}",
-                        version, Self::migration_description(version));
+                    slog_info!("storage", "migration_applied", version => version, description => Self::migration_description(version));
                 }
                 Err(e) => {
                     return MigrationResult::Error(format!(

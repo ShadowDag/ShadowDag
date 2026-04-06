@@ -21,8 +21,8 @@ const DELETE_BATCH_SIZE: usize = 1000;
 pub struct ConsensusStore {
     db: Arc<DB>,
     write_opts: WriteOptions,
-    read_opts: ReadOptions,
-    iter_read_opts: ReadOptions,
+    _read_opts: ReadOptions,
+    _iter_read_opts: ReadOptions,
     upper_bound: Vec<u8>,
     /// Guards read-modify-write sequences (e.g. atomic_update) against races.
     /// Readers acquire a shared lock; writers acquire an exclusive lock.
@@ -61,9 +61,9 @@ impl ConsensusStore {
         let mut read_opts = ReadOptions::default();
         read_opts.fill_cache(true);
 
-        let mut iter_read_opts = ReadOptions::default();
-        iter_read_opts.set_prefix_same_as_start(true);
-        iter_read_opts.fill_cache(false);
+        let mut _iter_read_opts = ReadOptions::default();
+        _iter_read_opts.set_prefix_same_as_start(true);
+        _iter_read_opts.fill_cache(false);
 
         let mut upper = PFX_STATE.to_vec();
         upper.push(0xFF);
@@ -71,8 +71,8 @@ impl ConsensusStore {
         Ok(Self {
             db: Arc::new(db),
             write_opts,
-            read_opts,
-            iter_read_opts,
+            _read_opts: read_opts,
+            _iter_read_opts,
             upper_bound: upper,
             write_lock: RwLock::new(()),
         })

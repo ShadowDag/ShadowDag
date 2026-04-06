@@ -11,6 +11,7 @@ use rocksdb::{
 };
 use std::path::Path;
 use crate::errors::CryptoError;
+use crate::slog_error;
 
 // ─────────────────────────────────────────
 // PREFIX
@@ -24,7 +25,7 @@ pub struct CSPRNG {
     db: DB,
     write_opts: WriteOptions,
     read_opts: ReadOptions,
-    iter_read_opts: ReadOptions,
+    _iter_read_opts: ReadOptions,
 }
 
 impl CSPRNG {
@@ -60,16 +61,16 @@ impl CSPRNG {
         let mut read_opts = ReadOptions::default();
         read_opts.set_prefix_same_as_start(true);
 
-        let mut iter_read_opts = ReadOptions::default();
-        iter_read_opts.set_iterate_upper_bound(PREFIX_UPPER_BOUND);
-        iter_read_opts.set_prefix_same_as_start(true);
-        iter_read_opts.fill_cache(false);
+        let mut _iter_read_opts = ReadOptions::default();
+        _iter_read_opts.set_iterate_upper_bound(PREFIX_UPPER_BOUND);
+        _iter_read_opts.set_prefix_same_as_start(true);
+        _iter_read_opts.fill_cache(false);
 
         Ok(Self {
             db,
             write_opts,
             read_opts,
-            iter_read_opts,
+            _iter_read_opts,
         })
     }
 
@@ -94,7 +95,7 @@ impl CSPRNG {
     pub fn store_state(&self, key: &[u8], value: &[u8]) {
         Self::with_key(key, |k| {
             if let Err(e) = self.db.put_opt(k, value, &self.write_opts) {
-                eprintln!("[CSPRNG] CRITICAL: store_state failed: {}", e);
+                slog_error!("crypto", "csprng_store_state_failed", error => e);
             }
         });
     }
@@ -114,7 +115,7 @@ impl CSPRNG {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("[CSPRNG] CRITICAL: store_batch failed: {}", e);
+            slog_error!("crypto", "csprng_store_batch_failed", error => e);
         }
     }
 
@@ -128,7 +129,7 @@ impl CSPRNG {
                 Ok(Some(data)) => Some(data.to_vec()),
                 Ok(None) => None,
                 Err(e) => {
-                    eprintln!("[CSPRNG] CRITICAL: load_state failed: {}", e);
+                    slog_error!("crypto", "csprng_load_state_failed", error => e);
                     None
                 }
             }
@@ -145,7 +146,7 @@ impl CSPRNG {
                 Ok(Some(data)) => Some(data),
                 Ok(None) => None,
                 Err(e) => {
-                    eprintln!("[CSPRNG] CRITICAL: load_state_pinned failed: {}", e);
+                    slog_error!("crypto", "csprng_load_state_pinned_failed", error => e);
                     None
                 }
             }
@@ -168,7 +169,7 @@ impl CSPRNG {
     pub fn delete_state(&self, key: &[u8]) {
         Self::with_key(key, |k| {
             if let Err(e) = self.db.delete_opt(k, &self.write_opts) {
-                eprintln!("[CSPRNG] CRITICAL: delete_state failed: {}", e);
+                slog_error!("crypto", "csprng_delete_state_failed", error => e);
             }
         });
     }
@@ -188,7 +189,7 @@ impl CSPRNG {
         }
 
         if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-            eprintln!("[CSPRNG] CRITICAL: delete_batch failed: {}", e);
+            slog_error!("crypto", "csprng_delete_batch_failed", error => e);
         }
     }
 
@@ -206,7 +207,7 @@ impl CSPRNG {
                 Ok(Some(_)) => true,
                 Ok(None) => false,
                 Err(e) => {
-                    eprintln!("[CSPRNG] CRITICAL: exists check failed: {}", e);
+                    slog_error!("crypto", "csprng_exists_check_failed", error => e);
                     false
                 }
             }
@@ -218,7 +219,7 @@ impl CSPRNG {
     // ─────────────────────────────────────────
     pub fn flush(&self) {
         if let Err(e) = self.db.flush() {
-            eprintln!("[CSPRNG] CRITICAL: flush failed: {}", e);
+            slog_error!("crypto", "csprng_flush_failed", error => e);
         }
     }
 
@@ -245,7 +246,7 @@ impl CSPRNG {
 
             if count >= DELETE_BATCH_SIZE {
                 if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-                    eprintln!("[CSPRNG] CRITICAL: clear_all batch failed: {}", e);
+                    slog_error!("crypto", "csprng_clear_all_batch_failed", error => e);
                     return;
                 }
                 batch = WriteBatch::default();
@@ -255,7 +256,7 @@ impl CSPRNG {
 
         if count > 0 {
             if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-                eprintln!("[CSPRNG] CRITICAL: clear_all final batch failed: {}", e);
+                slog_error!("crypto", "csprng_clear_final_batch_failed", error => e);
             }
         }
     }

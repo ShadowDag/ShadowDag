@@ -4,8 +4,6 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use std::collections::VecDeque;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 pub const TARGET_BLOCK_TIME_SECS:   u64 = 1;
 pub const SHORT_WINDOW:             usize = 144;
 pub const LONG_WINDOW:              usize = 2016;
@@ -329,12 +327,6 @@ pub fn adjust_difficulty(current: u64, actual_secs: u64) -> u64 {
         .clamp(MIN_DIFFICULTY, MAX_DIFFICULTY)
 }
 
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 
 #[cfg(test)]
 mod tests {

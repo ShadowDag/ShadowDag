@@ -21,12 +21,12 @@ use crate::domain::block::block::Block;
 use crate::domain::traits::sync_peers::SyncPeers;
 use crate::domain::traits::block_processor::BlockProcessor;
 use crate::errors::{DagError, StorageError};
+use crate::{slog_warn, slog_error, slog_debug};
 
 // Column Families
 const CF_DEFAULT: &str = "default";
 const CF_SYNC: &str = "dag_sync";
 
-const MAX_BATCH_REQUEST: usize = 128;
 const CACHE_LIMIT: usize = 50_000;
 const CACHE_TRIM: usize = 2_000;
 const MAX_INFLIGHT_TASKS: usize = 1024;
@@ -42,23 +42,10 @@ pub struct DagSync {
     fast_write_opts: WriteOptions,
     safe_write_opts: WriteOptions,
 
-    pool: Arc<ThreadPool>,
+    _pool: Arc<ThreadPool>,
 
     inflight: AtomicUsize,
     counter: AtomicUsize,
-}
-
-//////////////////////////////////////////////////////////////
-/// RAII Guard
-//////////////////////////////////////////////////////////////
-struct InflightGuard<'a> {
-    counter: &'a AtomicUsize,
-}
-
-impl<'a> Drop for InflightGuard<'a> {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Release);
-    }
 }
 
 impl DagSync {
@@ -111,7 +98,7 @@ impl DagSync {
             read_opts,
             fast_write_opts,
             safe_write_opts,
-            pool: Arc::new(pool),
+            _pool: Arc::new(pool),
             inflight: AtomicUsize::new(0),
             counter: AtomicUsize::new(0),
         })
@@ -121,7 +108,7 @@ impl DagSync {
         match self.db.cf_handle(CF_SYNC) {
             Some(cf) => Some(cf),
             None => {
-                eprintln!("[DagSync] CF_SYNC missing — using default CF");
+                slog_warn!("dag", "cf_sync_missing", fallback => "default CF");
                 self.db.cf_handle("default")
             }
         }
@@ -152,7 +139,7 @@ impl DagSync {
         //////////////////////////////////////////////////////////////
         let cf = match self.cf_sync() {
             Some(cf) => cf,
-            None => { eprintln!("[DagSync] CRITICAL: no CF available"); return; }
+            None => { slog_error!("dag", "dag_sync_no_cf_read"); return; }
         };
         match self.db.get_cf_opt(cf, hash, &self.read_opts) {
             Ok(Some(_)) => return,
@@ -184,7 +171,7 @@ impl DagSync {
         let mut batch = WriteBatch::default();
         let cf = match self.cf_sync() {
             Some(cf) => cf,
-            None => { eprintln!("[DagSync] CRITICAL: no CF available for write"); return; }
+            None => { slog_error!("dag", "dag_sync_no_cf_write"); return; }
         };
         batch.put_cf(cf, hash, b"1");
 
@@ -192,7 +179,7 @@ impl DagSync {
             let mut batch2 = WriteBatch::default();
             let cf = match self.cf_sync() {
                 Some(cf) => cf,
-                None => { eprintln!("[DagSync] CRITICAL: no CF available for retry write"); return; }
+                None => { slog_error!("dag", "dag_sync_no_cf_retry_write"); return; }
             };
             batch2.put_cf(cf, hash, b"1");
 
@@ -227,7 +214,7 @@ impl DagSync {
         // Note: inflight counter decrement is handled inline since
         // we can't send a reference to self across thread boundaries.
         if let Err(e) = node.process_block(&block_clone) {
-            eprintln!("[DagSync] block rejected: {}", e);
+            slog_warn!("dag", "dag_sync_block_rejected", error => e);
         }
         self.inflight.fetch_sub(1, Ordering::Release);
     }
@@ -258,12 +245,12 @@ impl DagSync {
     pub fn debug_iterate(&self) {
         let cf = match self.cf_sync() {
             Some(cf) => cf,
-            None => { eprintln!("[DagSync] CRITICAL: no CF available for debug_iterate"); return; }
+            None => { slog_error!("dag", "dag_sync_no_cf_debug_iterate"); return; }
         };
         let iter = self.db.iterator_cf(cf, IteratorMode::Start);
 
         for (key, _) in iter.flatten() {
-            eprintln!("[SYNC] seen block: {}", String::from_utf8_lossy(&key));
+            slog_debug!("dag", "sync_seen_block", hash => String::from_utf8_lossy(&key));
         }
     }
 }

@@ -23,6 +23,7 @@ use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::domain::transaction::transaction::Transaction;
 use crate::engine::privacy::shadow_pool::shadow_pool::ShadowPool;
 use crate::engine::privacy::shadow_pool::shadow_transaction::MixDelay;
+use crate::slog_info;
 
 /// Maximum transactions queued in the shadow relay
 pub const MAX_RELAY_QUEUE: usize = 5_000;
@@ -79,18 +80,18 @@ impl ShadowNode {
     pub fn start(&mut self, peers: &PeerManager) {
         self.active = true;
 
-        eprintln!("[ShadowNode] Starting in {:?} mode on {}", self.mode, self.network);
-        eprintln!("[ShadowNode] Node ID: {}...", &self.node_id[..8]);
+        slog_info!("node", "shadow_node_starting", mode => &format!("{:?}", self.mode), network => &self.network);
+        slog_info!("node", "shadow_node_id", id => &self.node_id[..8]);
 
         let peer_count = peers.count();
-        eprintln!("[ShadowNode] Connected to {} peers", peer_count);
-        eprintln!("[ShadowNode] Shadow relay active. Transactions will be anonymized.");
+        slog_info!("node", "shadow_node_peers", count => &peer_count.to_string());
+        slog_info!("node", "shadow_relay_active");
     }
 
     /// Stop the shadow node
     pub fn stop(&mut self) {
         self.active = false;
-        eprintln!("[ShadowNode] Stopped. Relayed {} transactions total.", self.total_relayed);
+        slog_info!("node", "shadow_node_stopped", total_relayed => &self.total_relayed.to_string());
     }
 
     /// Receive a transaction for relay through the shadow network

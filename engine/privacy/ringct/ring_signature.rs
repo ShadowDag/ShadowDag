@@ -350,15 +350,6 @@ impl RingSignature {
         out
     }
 
-    /// Compute the next challenge from alpha directly (used during signing at
-    /// the signer position). The hash input uses alpha as the "effective_r".
-    fn compute_link_from_alpha(
-        message: &[u8; 32], alpha: &[u8; 32],
-        key_image: &[u8; 32], index: usize,
-    ) -> [u8; 32] {
-        Self::compute_link_core(message, alpha, key_image, index)
-    }
-
     /// Compute the next challenge in the ring.
     ///
     /// Uses a simulated Schnorr-like group operation:
@@ -420,18 +411,6 @@ impl RingSignature {
         Ok(product.to_bytes())
     }
 
-    /// 32-byte scalar subtraction (a - b mod 2^256, wrapping)
-    fn scalar_sub(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-        let mut result = [0u8; 32];
-        let mut borrow: u8 = 0;
-        for i in 0..32 {
-            let (r1, b1) = a[i].overflowing_sub(b[i]);
-            let (r2, b2) = r1.overflowing_sub(borrow);
-            result[i] = r2;
-            borrow = if b1 || b2 { 1 } else { 0 };
-        }
-        result
-    }
 }
 
 #[cfg(test)]

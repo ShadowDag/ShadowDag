@@ -12,6 +12,7 @@ use crate::engine::dag::security::dos_protection::MAX_DAG_PARENTS;
 use crate::engine::mining::pow::pow_validator::PowValidator;
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
 use crate::errors::{DagError, StorageError};
+use crate::{slog_error, slog_warn};
 
 // Block data is stored in BlockStore (blk: prefix). DAG only stores topology:
 //   - exists:{hash}   — lightweight marker for block existence checks
@@ -75,7 +76,7 @@ impl DagManager {
         match open_shared_db(source, &opts) {
             Ok(db) => Some(Self { db }),
             Err(e) => {
-                eprintln!("[DagManager] DB open error: {}", e);
+                slog_error!("dag", "dag_manager_open_failed", error => e);
                 None
             }
         }
@@ -320,10 +321,7 @@ impl DagManager {
                     Err(_) => {
                         // Corrupted metadata — fall back to scan rather than
                         // returning 0, which would cause the DAG to think it's empty.
-                        eprintln!(
-                            "[dag] WARNING: block_count metadata corrupted ({} bytes, expected 8). Falling back to scan.",
-                            v.len()
-                        );
+                        slog_warn!("dag", "block_count_metadata_corrupted", bytes => v.len(), expected => 8);
                         self.scan_block_count_fallback() as u64
                     }
                 }

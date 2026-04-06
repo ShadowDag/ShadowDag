@@ -15,6 +15,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use serde::{Serialize, Deserialize};
+use crate::errors::WalletError;
 
 /// Supported hardware wallet types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,13 +57,13 @@ impl HardwareWalletManager {
     }
 
     /// Request a public key from the hardware wallet
-    pub fn get_public_key(&self, device_id: &str, _derivation_path: &str) -> Result<Vec<u8>, String> {
+    pub fn get_public_key(&self, device_id: &str, _derivation_path: &str) -> Result<Vec<u8>, WalletError> {
         match self.get_device(device_id) {
             Some(_d) if _d.connected => {
-                Err(format!("Device {} requires user confirmation on screen", device_id))
+                Err(WalletError::Other(format!("Device {} requires user confirmation on screen", device_id)))
             }
-            Some(_) => Err("Device not connected".to_string()),
-            None => Err("Device not found".to_string()),
+            Some(_) => Err(WalletError::Other("Device not connected".to_string())),
+            None => Err(WalletError::Other("Device not found".to_string())),
         }
     }
 
@@ -72,13 +73,13 @@ impl HardwareWalletManager {
         device_id: &str,
         _tx_hash: &[u8],
         _derivation_path: &str,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, WalletError> {
         match self.get_device(device_id) {
             Some(d) if d.connected => {
-                Err(format!("Confirm transaction on {} screen", d.device_id))
+                Err(WalletError::Other(format!("Confirm transaction on {} screen", d.device_id)))
             }
-            Some(_) => Err("Device not connected".to_string()),
-            None => Err("Device not found".to_string()),
+            Some(_) => Err(WalletError::Other("Device not connected".to_string())),
+            None => Err(WalletError::Other("Device not found".to_string())),
         }
     }
 

@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::errors::{DagError, StorageError};
+use crate::slog_error;
 // prefixes
 const PFX_SCORE: &[u8] = b"score:";
 const PFX_SP:    &[u8] = b"sp___:";
@@ -88,7 +89,7 @@ impl DagState {
 
     pub fn new_required(path: &str) -> Result<Self, DagError> {
         Self::new(path).ok_or_else(|| {
-            eprintln!("[DagState] FATAL: cannot open DB at {}", path);
+            slog_error!("dag", "dag_state_fatal_open", path => path);
             StorageError::OpenFailed { path: path.to_string(), reason: "cannot open DB".to_string() }.into()
         })
     }

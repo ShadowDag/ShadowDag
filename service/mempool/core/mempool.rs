@@ -14,6 +14,7 @@ use crate::domain::transaction::tx_validator::TxValidator;
 use crate::domain::utxo::utxo_set::UtxoSet;
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
 use crate::service::mempool::core::rbf::{RbfEngine, RbfResult, MempoolTxInfo};
+use crate::{slog_error, slog_warn};
 
 // ── All pool limits imported from the single source of truth ─────────
 use crate::config::consensus::mempool_config::MempoolConfig;
@@ -35,14 +36,7 @@ const MAX_TXS_PER_SENDER: usize = 25;
 
 const PFX_TX:     &[u8] = b"tx:";
 const PFX_FEE:    &[u8] = b"fee:";
-#[allow(dead_code)]
-const PFX_INPUT:  &[u8] = b"inp:";
-#[allow(dead_code)]
-const PFX_DEP:    &[u8] = b"dep:";
 const PFX_RDEP:   &[u8] = b"rdep:";
-/// Per-sender TX count index: "sender:{addr}:{hash}" → "1"
-/// Used for anti-spam: limit unconfirmed TXs per originating address.
-const PFX_SENDER: &[u8] = b"sender:";
 /// Metadata key for tracking total serialized bytes in the pool.
 const META_TOTAL_BYTES: &[u8] = b"_meta:total_bytes";
 /// Metadata key for tracking TX count without full scan.
@@ -244,7 +238,7 @@ impl Mempool {
 impl Mempool {
     pub fn new<S: Into<SharedDbSource>>(source: S) -> Result<Self, MempoolError> {
         Self::try_new(source).map_err(|e| {
-            eprintln!("[Mempool] CRITICAL: Mempool storage unavailable: {}", e);
+            slog_error!("mempool", "storage_unavailable", error => &e.to_string());
             e
         })
     }
@@ -1671,7 +1665,7 @@ impl Mempool {
             if self.add_transaction(&orphan) {
                 let key = format!("orphan:{}", orphan.hash);
                 if let Err(e) = self.db.delete(key.as_bytes()) {
-                    eprintln!("[Mempool] orphan DB deletion failed for '{}': {}", key, e);
+                    slog_warn!("mempool", "orphan_db_delete_failed", key => &key, error => &e.to_string());
                 }
                 promoted.push(orphan.hash.clone());
             }
@@ -1694,7 +1688,7 @@ impl Mempool {
     pub fn remove_orphan(&self, tx_hash: &str) {
         let key = format!("orphan:{}", tx_hash);
         if let Err(e) = self.db.delete(key.as_bytes()) {
-            eprintln!("[Mempool] orphan DB deletion failed for '{}': {}", key, e);
+            slog_warn!("mempool", "orphan_db_delete_failed", key => &key, error => &e.to_string());
         }
     }
 
@@ -1721,7 +1715,7 @@ impl Mempool {
         for k in &stale_keys {
             let label = String::from_utf8_lossy(k);
             if let Err(e) = self.db.delete(k) {
-                eprintln!("[Mempool] orphan DB deletion failed for '{}': {}", label, e);
+                slog_warn!("mempool", "orphan_db_delete_failed", key => &label.to_string(), error => &e.to_string());
             }
         }
 

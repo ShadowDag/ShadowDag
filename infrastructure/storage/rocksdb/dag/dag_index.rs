@@ -7,6 +7,7 @@ use rocksdb::{DB, Options};
 use std::path::Path;
 
 use crate::errors::StorageError;
+use crate::slog_error;
 
 pub struct DagIndex {
     db: DB,
@@ -22,7 +23,7 @@ impl DagIndex {
 
     pub fn index_block(&self, hash: &str, height: u64) {
         let key = format!("height:{}", height);
-        if let Err(_e) = self.db.put(key.as_bytes(), hash.as_bytes()) { eprintln!("[DB] put error: {}", _e); }
+        if let Err(e) = self.db.put(key.as_bytes(), hash.as_bytes()) { slog_error!("storage", "dag_index_put_error", error => e); }
     }
 
     pub fn get_hash_at_height(&self, height: u64) -> Option<String> {

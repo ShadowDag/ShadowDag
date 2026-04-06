@@ -14,7 +14,7 @@ use crate::domain::utxo::utxo_key::UtxoKey;
 use crate::domain::utxo::utxo_set::{UtxoSet, utxo_key};
 use crate::config::node::node_config::NetworkMode;
 use crate::engine::privacy::ringct::ring_validator::RingValidator;
-use crate::errors::StorageError;
+use crate::errors::{StorageError, ConsensusError};
 
 pub const MIN_TX_FEE:        u64   = 1;
 pub const MAX_TX_INPUTS:     usize = 50;
@@ -586,7 +586,7 @@ impl TxValidator {
     /// Rejects TXs older than MAX_TX_AGE_SECS or more than MAX_TX_FUTURE_SECS
     /// in the future. Coinbase TXs are exempt (their timestamp comes from
     /// the block header which has its own validation).
-    pub fn validate_tx_timestamp(tx: &Transaction) -> Result<(), String> {
+    pub fn validate_tx_timestamp(tx: &Transaction) -> Result<(), ConsensusError> {
         if tx.is_coinbase() {
             return Ok(());
         }
@@ -597,17 +597,17 @@ impl TxValidator {
             .as_secs();
 
         if tx.timestamp > now + MAX_TX_FUTURE_SECS {
-            return Err(format!(
+            return Err(ConsensusError::Timestamp(format!(
                 "tx timestamp {} is {}s in the future (max {}s)",
                 tx.timestamp, tx.timestamp - now, MAX_TX_FUTURE_SECS
-            ));
+            )));
         }
 
         if now > tx.timestamp && (now - tx.timestamp) > MAX_TX_AGE_SECS {
-            return Err(format!(
+            return Err(ConsensusError::Timestamp(format!(
                 "tx timestamp {} is {}s old (max {}s)",
                 tx.timestamp, now - tx.timestamp, MAX_TX_AGE_SECS
-            ));
+            )));
         }
 
         Ok(())
@@ -616,16 +616,18 @@ impl TxValidator {
     /// Validate the payload_hash field if present.
     /// The payload_hash must be a valid 64-char hex string (32-byte block hash).
     /// The caller is responsible for checking block existence (requires chain state).
-    pub fn validate_payload_hash_format(tx: &Transaction) -> Result<(), String> {
+    pub fn validate_payload_hash_format(tx: &Transaction) -> Result<(), ConsensusError> {
         if let Some(ref ph) = tx.payload_hash {
             if ph.len() != PAYLOAD_HASH_HEX_LEN {
-                return Err(format!(
+                return Err(ConsensusError::BlockValidation(format!(
                     "payload_hash length {} != expected {}",
                     ph.len(), PAYLOAD_HASH_HEX_LEN
-                ));
+                )));
             }
             if !ph.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err("payload_hash contains non-hex characters".into());
+                return Err(ConsensusError::BlockValidation(
+                    "payload_hash contains non-hex characters".into(),
+                ));
             }
         }
         Ok(())

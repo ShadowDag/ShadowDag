@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use rocksdb::DB;
 use crate::domain::utxo::utxo_set::utxo_key;
+use crate::{slog_info, slog_warn, slog_error};
 
 const PREFIX: &str = "uidx:";
 const ADDR_PREFIX: &str = "uidx:addr:";
@@ -73,7 +74,7 @@ impl UtxoIndex {
     /// prefer `new_with_db` or `try_new`.
     pub fn new() -> Self {
         Self::try_new().unwrap_or_else(|e| {
-            eprintln!("[UtxoIndex] WARNING: DB open failed ({}), using fallback", e);
+            slog_warn!("index", "utxo_index_db_open_failed", error => &e.to_string());
             let fallback = std::env::temp_dir().join(format!(
                 "shadowdag_uidx_fb_{}", std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
@@ -81,16 +82,13 @@ impl UtxoIndex {
             let mut opts = rocksdb::Options::default();
             opts.create_if_missing(true);
             let db = DB::open(&opts, &fallback).unwrap_or_else(|e2| {
-                eprintln!("[UtxoIndex] CRITICAL: Fallback also failed: {}", e2);
+                slog_error!("index", "utxo_index_fallback_failed", error => &e2.to_string());
                 let noop = std::env::temp_dir().join("shadowdag_uidx_noop");
                 let _ = std::fs::create_dir_all(&noop);
                 match DB::open(&opts, &noop) {
                     Ok(db) => db,
                     Err(e3) => {
-                        eprintln!(
-                            "[UtxoIndex] FATAL: /tmp not writable after all attempts ({}). Aborting.",
-                            e3
-                        );
+                        slog_error!("index", "utxo_index_fatal_abort", error => &e3.to_string());
                         std::process::abort();
                     }
                 }
@@ -116,10 +114,7 @@ impl UtxoIndex {
             db,
         };
         s.recover_from_db();
-        eprintln!(
-            "[UtxoIndex] Auto-recovered {} UTXOs from DB",
-            s.total_utxos
-        );
+        slog_info!("index", "utxo_index_recovered", utxos => &s.total_utxos.to_string());
         s
     }
 
@@ -136,19 +131,19 @@ impl UtxoIndex {
     fn write_record_to_db(&self, utxo: &UtxoRecord) {
         let utxo_key = match utxo.key() {
             Ok(k) => k,
-            Err(e) => { eprintln!("[UtxoIndex] bad utxo key: {}", e); return; }
+            Err(e) => { slog_error!("index", "bad_utxo_key", error => &e.to_string()); return; }
         };
         let key = Self::db_key(&utxo_key);
         let val = serde_json::to_vec(utxo).unwrap_or_default();
         if let Err(e) = self.db.put(&key, &val) {
-            eprintln!("[UtxoIndex] DB put error: {}", e);
+            slog_error!("index", "utxo_index_db_put_error", error => &e.to_string());
         }
     }
 
     fn delete_record_from_db(&self, utxo_key: &str) {
         let key = Self::db_key(utxo_key);
         if let Err(e) = self.db.delete(&key) {
-            eprintln!("[UtxoIndex] DB delete error: {}", e);
+            slog_error!("index", "utxo_index_db_delete_error", error => &e.to_string());
         }
     }
 
@@ -176,7 +171,7 @@ impl UtxoIndex {
     pub fn insert(&mut self, utxo: UtxoRecord) {
         let key = match utxo.key() {
             Ok(k) => k,
-            Err(e) => { eprintln!("[UtxoIndex] insert: bad utxo key: {}", e); return; }
+            Err(e) => { slog_error!("index", "insert_bad_utxo_key", error => &e.to_string()); return; }
         };
         let addr = utxo.address.clone();
 
@@ -311,7 +306,7 @@ impl UtxoIndex {
             .filter(|u| !u.is_spent)
             .try_fold(0u64, |acc, u| acc.checked_add(u.amount))
             .unwrap_or_else(|| {
-                eprintln!("[UTXO] WARNING: total_supply overflow detected, returning u64::MAX");
+                slog_warn!("index", "total_supply_overflow");
                 u64::MAX
             })
     }

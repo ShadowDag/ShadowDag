@@ -16,6 +16,7 @@ use crate::domain::utxo::utxo_key::UtxoKey;
 use crate::domain::utxo::utxo_validator::UtxoValidator;
 use crate::domain::traits::utxo_backend::{UtxoBackend, BatchWrite};
 use crate::errors::StorageError;
+use crate::slog_warn;
 
 /// Coinbase maturity — MUST match ConsensusParams::COINBASE_MATURITY.
 /// At 10 BPS, 1000 blocks = 100 seconds = safe against DAG reorgs.
@@ -122,7 +123,7 @@ impl UtxoSet {
             }
             cache.insert(*key, utxo);
         } else {
-            eprintln!("[UtxoSet] WARN: store write failed for key {}, cache not updated", key);
+            slog_warn!("utxo", "store_write_failed", key => &key.to_string());
         }
     }
 
@@ -161,7 +162,7 @@ impl UtxoSet {
             }
             cache.insert(*key, utxo);
         } else {
-            eprintln!("[UtxoSet] WARN: coinbase store write failed for key {}", key);
+            slog_warn!("utxo", "coinbase_store_write_failed", key => &key.to_string());
         }
     }
 
@@ -871,12 +872,12 @@ impl UtxoSet {
         for (key_str, original_utxo) in &undo.spent_utxos {
             // #27 — reject zero-amount UTXO restorations during rollback
             if original_utxo.amount == 0 {
-                eprintln!("[UtxoSet] rejecting zero-amount UTXO restoration for key {}", key_str);
+                slog_warn!("utxo", "rejecting_zero_amount_restoration", key => key_str);
                 continue;
             }
             // #28 — reject empty-address UTXO restorations during rollback
             if original_utxo.address.is_empty() {
-                eprintln!("[UtxoSet] rejecting empty-address UTXO restoration for key {}", key_str);
+                slog_warn!("utxo", "rejecting_empty_address_restoration", key => key_str);
                 continue;
             }
             let data = bincode::serialize(original_utxo)
@@ -972,7 +973,7 @@ impl UtxoSet {
 
         if !ops.is_empty() {
             if let Err(e) = self.store.write_batch(ops) {
-                eprintln!("[UtxoSet] WARN: prune_finalized_undo_data failed: {}", e);
+                slog_warn!("utxo", "prune_undo_data_failed", error => &e.to_string());
                 return 0;
             }
         }
@@ -1047,12 +1048,12 @@ impl UtxoSet {
                     if let Some(mut utxo) = self.get_utxo(&key) {
                         // #27 — reject zero-amount UTXO restorations during rollback
                         if utxo.amount == 0 {
-                            eprintln!("[UtxoSet] rejecting zero-amount UTXO restoration for {}:{}", input.txid, input.index);
+                            slog_warn!("utxo", "rejecting_zero_amount_restoration", key => &format!("{}:{}", input.txid, input.index));
                             continue;
                         }
                         // #28 — reject empty-address UTXO restorations during rollback
                         if utxo.address.is_empty() {
-                            eprintln!("[UtxoSet] rejecting empty-address UTXO restoration for {}:{}", input.txid, input.index);
+                            slog_warn!("utxo", "rejecting_empty_address_restoration", key => &format!("{}:{}", input.txid, input.index));
                             continue;
                         }
                         utxo.spent = false;

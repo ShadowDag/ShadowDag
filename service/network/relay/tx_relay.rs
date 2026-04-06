@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use crate::errors::NetworkError;
 use crate::domain::transaction::transaction::Transaction;
+use crate::slog_error;
 use crate::service::mempool::core::mempool::Mempool;
 use crate::service::network::p2p::p2p::{P2PMessage, push_outbound};
 use crate::service::network::p2p::peer_manager::PeerManager;
@@ -20,7 +21,7 @@ use crate::service::network::p2p::peer_manager::PeerManager;
 pub struct TxRelay {
     db:           DB,
     mempool:      Arc<Mempool>,
-    peer_manager: Arc<PeerManager>,
+    _peer_manager: Arc<PeerManager>,
 }
 
 impl TxRelay {
@@ -32,7 +33,7 @@ impl TxRelay {
                 path: path.to_string(),
                 reason: e.to_string(),
             }))?;
-        Ok(Self { db, mempool, peer_manager })
+        Ok(Self { db, mempool, _peer_manager: peer_manager })
     }
 
     /// Broadcast a transaction to all connected peers (with dedup)
@@ -46,14 +47,14 @@ impl TxRelay {
 
         // Mark as relayed
         if let Err(e) = self.db.put(key.as_bytes(), b"1") {
-            eprintln!("[TxRelay] DB put error: {}", e);
+            slog_error!("relay", "tx_relay_db_put_error", error => e);
         }
 
         // Serialize transaction as bincode for the P2PMessage::Tx payload
         let tx_bytes = match bincode::serialize(tx) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[TxRelay] Serialize error: {}", e);
+                slog_error!("relay", "tx_serialize_error", error => e);
                 return;
             }
         };
@@ -82,7 +83,7 @@ impl TxRelay {
         // Only mark as seen AND relay if the transaction was accepted
         if accepted {
             if let Err(e) = self.db.put(key.as_bytes(), b"1") {
-                eprintln!("[TxRelay] DB put error: {}", e);
+                slog_error!("relay", "tx_relay_db_put_error", error => e);
             }
 
             let tx_bytes = match bincode::serialize(&tx) {

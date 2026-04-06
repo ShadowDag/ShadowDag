@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::errors::ConsensusError;
+use crate::{slog_info, slog_warn, slog_error};
 
 #[derive(Debug, Clone)]
 pub struct BlockConsensusData {
@@ -85,19 +86,10 @@ impl ConsensusState {
             db: Some(db),
         };
         s.recover_from_db();
-        eprintln!(
-            "[ConsensusState] Recovered {} blocks from DB, tip='{}', blue_score={}",
-            s.block_data.len(),
-            s.chain.selected_tip,
-            s.chain.best_blue_score
-        );
+        slog_info!("consensus", "state_recovered", blocks => s.block_data.len(), tip => s.chain.selected_tip, blue_score => s.chain.best_blue_score);
         let issues = s.verify_consistency();
         if !issues.is_empty() {
-            eprintln!(
-                "[ConsensusState] WARNING: {} consistency issues detected after recovery. \
-                 The node may need a resync.",
-                issues.len()
-            );
+            slog_warn!("consensus", "consistency_issues_after_recovery", count => issues.len());
         }
         s
     }
@@ -195,22 +187,14 @@ impl ConsensusState {
                     self.chain.best_blue_score = match parts[1].parse() {
                         Ok(v) => v,
                         Err(e) => {
-                            eprintln!(
-                                "[ConsensusState] CRITICAL: corrupted best_blue_score '{}' in DB: {}. \
-                                 Defaulting to 0 — node state may be inconsistent, consider --reindex",
-                                parts[1], e
-                            );
+                            slog_error!("consensus", "corrupted_best_blue_score", value => parts[1], error => e);
                             0
                         }
                     };
                     self.chain.best_height = match parts[2].parse() {
                         Ok(v) => v,
                         Err(e) => {
-                            eprintln!(
-                                "[ConsensusState] CRITICAL: corrupted best_height '{}' in DB: {}. \
-                                 Defaulting to 0 — node state may be inconsistent, consider --reindex",
-                                parts[2], e
-                            );
+                            slog_error!("consensus", "corrupted_best_height", value => parts[2], error => e);
                             0
                         }
                     };
@@ -432,11 +416,11 @@ impl ConsensusState {
         }
 
         if issues.is_empty() {
-            eprintln!("[ConsensusState] Consistency check PASSED ({} blocks)", self.block_data.len());
+            slog_info!("consensus", "consistency_check_passed", blocks => self.block_data.len());
         } else {
-            eprintln!("[ConsensusState] Consistency check FAILED: {} issues", issues.len());
+            slog_error!("consensus", "consistency_check_failed", count => issues.len());
             for issue in &issues {
-                eprintln!("[ConsensusState]   - {}", issue);
+                slog_warn!("consensus", "consistency_issue", detail => issue);
             }
         }
 

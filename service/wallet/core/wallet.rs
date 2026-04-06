@@ -19,10 +19,8 @@ use crate::errors::WalletError;
 const PBKDF2_ITER:      u32   = 600_000;
 const SALT_LEN:         usize = 32;
 const NONCE_LEN:        usize = 12;
-const ADDRESS_PREFIX:   &str  = "SD";
 const CHECKSUM_BYTES:   usize = 4;
 const DUST_LIMIT:       u64   = 546;
-const COIN:             u64   = 100_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct WalletAddress {
@@ -536,7 +534,7 @@ fn decrypt_bytes(ct: &[u8], salt: &[u8], nonce: &[u8], password: &str) -> Result
     pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, PBKDF2_ITER, &mut key);
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| WalletError::Encryption(e.to_string()))?;
     let n      = aes_gcm::Nonce::from_slice(nonce);
-    let plain  = cipher.decrypt(n, ct).map_err(|_| WalletError::WrongPassword)?;
+    let plain  = cipher.decrypt(n, ct).map_err(|_| WalletError::AuthFailed)?;
     key.zeroize();
     Ok(plain)
 }

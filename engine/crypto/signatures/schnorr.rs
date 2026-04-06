@@ -17,8 +17,6 @@ use std::path::Path;
 const SIG_PREFIX: &[u8] = b"ssig:";
 const PREFIX_LEN: usize = 5;
 
-const SIG_UPPER: &[u8] = b"ssig:\xFF";
-
 // ─────────────────────────────────────────
 // STORE
 // ─────────────────────────────────────────

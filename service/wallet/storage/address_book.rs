@@ -5,6 +5,7 @@
 
 use rocksdb::{DB, Options};
 use std::path::Path;
+use crate::slog_error;
 
 pub struct AddressBook {
     db: DB,
@@ -27,7 +28,7 @@ impl AddressBook {
     }
 
     pub fn add_address(&self, name: &str, address: &str) {
-        if let Err(_e) = self.db.put(name, address) { eprintln!("[DB] put error: {}", _e); }
+        if let Err(_e) = self.db.put(name, address) { slog_error!("wallet", "db_put_error", error => &_e.to_string()); }
 
     }
 

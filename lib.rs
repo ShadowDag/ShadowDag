@@ -3,16 +3,6 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-// TECH DEBT [v1.0-blocker]: Remove per-module #[allow(dead_code)] before mainnet launch.
-// Tracked: Me106#9, Me107#10, Q#8. Per-module allows applied to domain/, engine/,
-// service/, runtime/, infrastructure/ — bin/ and config/ now surface dead-code warnings.
-// Next step: wire remaining public API to CLI, then remove the per-module allows.
-//
-// NOTE: Known technical debt — logging inconsistency.
-// Many modules use println!/eprintln! directly instead of the structured logging
-// system in telemetry::logging. Server-side code (stratum, p2p, rpc) should use
-// eprintln! at minimum (stdout reserved for structured output), but ideally all
-// logging should migrate to the telemetry::logging::logger module.
 #![warn(dead_code)]
 #![allow(clippy::module_inception)]
 #![warn(unused_variables, unused_imports, unused_mut)]
@@ -41,7 +31,6 @@ pub mod config {
     }
 }
 
-#[allow(dead_code)] // Public API — not all functions wired to CLI yet
 pub mod domain {
     pub mod address {
         pub mod address;
@@ -94,7 +83,6 @@ pub mod domain {
     }
 }
 
-#[allow(dead_code)] // Public API — not all functions wired to CLI yet
 pub mod engine {
     pub mod consensus {
         pub mod core {
@@ -260,7 +248,6 @@ pub mod engine {
     }
 }
 
-#[allow(dead_code)] // Public API — not all functions wired to CLI yet
 pub mod infrastructure {
     pub mod storage {
         pub mod rocksdb {
@@ -297,7 +284,6 @@ pub mod infrastructure {
     }
 }
 
-#[allow(dead_code)] // Public API — not all functions wired to CLI yet
 pub mod runtime {
     pub mod event_bus {
         pub mod event_bus;
@@ -351,7 +337,6 @@ pub mod runtime {
     }
 }
 
-#[allow(dead_code)] // Public API — not all functions wired to CLI yet
 pub mod service {
     pub mod mempool {
         pub mod core {

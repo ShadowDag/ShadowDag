@@ -120,7 +120,7 @@ impl ViewKey {
     }
 
     fn from_raw(raw: [u8; 32]) -> Result<Self, CryptoError> {
-        let scalar = Scalar::from_canonical_bytes(raw)
+        let scalar = Option::from(Scalar::from_canonical_bytes(raw))
             .ok_or(CryptoError::NonCanonicalScalar)?;
         let public = scalar * RISTRETTO_BASEPOINT_POINT;
         Ok(Self {

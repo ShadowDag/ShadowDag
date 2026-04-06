@@ -174,9 +174,6 @@ impl TokenBucket {
         }
     }
 
-    fn tokens_available(&self) -> f64 {
-        self.tokens
-    }
 }
 
 #[derive(Debug, Clone)]

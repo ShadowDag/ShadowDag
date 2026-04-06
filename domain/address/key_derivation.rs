@@ -15,7 +15,6 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Domain separation tags for different derivation contexts
 const TAG_VIEW_KEY:    &[u8] = b"ShadowDAG_DeriveView_v1";
-const TAG_SPEND_KEY:   &[u8] = b"ShadowDAG_DeriveSpend_v1";
 const TAG_CHILD_KEY:   &[u8] = b"ShadowDAG_DeriveChild_v1";
 const TAG_ADDRESS:     &[u8] = b"ShadowDAG_DeriveAddr_v1";
 
@@ -46,7 +45,7 @@ impl KeyDerivation {
 
             let mut candidate = [0u8; 32];
             candidate.copy_from_slice(&result);
-            if Scalar::from_canonical_bytes(candidate).is_some() {
+            if bool::from(Scalar::from_canonical_bytes(candidate).is_some()) {
                 return candidate;
             }
             attempt_index = attempt_index.wrapping_add(1);
@@ -76,7 +75,7 @@ impl KeyDerivation {
             let result = mac.finalize().into_bytes();
             let mut out = [0u8; 32];
             out.copy_from_slice(&result);
-            if Scalar::from_canonical_bytes(out).is_some() {
+            if bool::from(Scalar::from_canonical_bytes(out).is_some()) {
                 return out;
             }
             counter += 1;
@@ -96,7 +95,7 @@ impl KeyDerivation {
             let result = mac.finalize().into_bytes();
             let mut out = [0u8; 32];
             out.copy_from_slice(&result);
-            if Scalar::from_canonical_bytes(out).is_some() {
+            if bool::from(Scalar::from_canonical_bytes(out).is_some()) {
                 return out;
             }
             counter += 1;

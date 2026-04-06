@@ -17,12 +17,15 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::time::{Instant, Duration, SystemTime, UNIX_EPOCH};
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use shadowdag::domain::transaction::transaction::{Transaction, TxInput, TxOutput};
 use shadowdag::domain::transaction::tx_builder::generate_keypair;
+use shadowdag::errors::NetworkError;
+use shadowdag::{slog_info, slog_warn, slog_error, slog_fatal};
 use sha2::{Sha256, Digest};
 
 fn main() {
+    shadowdag::telemetry::logging::structured::init();
     let args: Vec<String> = std::env::args().collect();
 
     if has_flag(&args, "--help") || has_flag(&args, "-h") {
@@ -40,34 +43,32 @@ fn main() {
     println!("║  Transaction Stress Testing Tool               ║");
     println!("╚══════════════════════════════════════════════╝");
     println!();
-    println!("[loadtest] Target TPS    : {}", target_tps);
-    println!("[loadtest] Duration      : {} seconds", duration_sec);
-    println!("[loadtest] Wallets       : {}", num_wallets);
-    println!("[loadtest] RPC Endpoint  : {}", rpc_addr);
-    println!();
+    slog_info!("loadtest", "config",
+        target_tps => target_tps,
+        duration_sec => duration_sec,
+        wallets => num_wallets,
+        rpc => &rpc_addr);
 
     // Generate test wallets
-    println!("[loadtest] Generating {} test wallets...", num_wallets);
+    slog_info!("loadtest", "generating_wallets", count => num_wallets);
     let wallets: Vec<_> = (0..num_wallets).map(|_| generate_keypair()).collect();
-    println!("[loadtest] Wallets ready.");
+    slog_info!("loadtest", "wallets_ready");
 
     // Run load test
-    println!("[loadtest] Starting load test...");
-    println!();
+    slog_info!("loadtest", "starting_load_test");
 
     let total_sent = AtomicU64::new(0);
     let total_errors = AtomicU64::new(0);
 
     // Connect to the node's RPC endpoint
-    println!("[loadtest] Connecting to RPC at {}...", rpc_addr);
+    slog_info!("loadtest", "connecting_to_rpc", addr => &rpc_addr);
     let mut stream = match TcpStream::connect(&rpc_addr) {
         Ok(s) => {
-            println!("[loadtest] Connected to RPC.");
+            slog_info!("loadtest", "rpc_connected");
             s
         }
         Err(e) => {
-            eprintln!("[loadtest] FATAL: cannot connect to RPC at {}: {}", rpc_addr, e);
-            eprintln!("[loadtest] Is the node running? Check --rpc flag.");
+            slog_fatal!("loadtest", "rpc_connect_failed", addr => &rpc_addr, error => e);
             std::process::exit(1);
         }
     };
@@ -111,8 +112,7 @@ fn main() {
 
         // Backpressure: wait if too many requests are pending
         if pending >= MAX_PENDING {
-            eprintln!("[loadtest] Backpressure: {} pending requests (sent={}, ack={}), waiting...",
-                      pending, sent_count, ack_count);
+            slog_warn!("loadtest", "backpressure", pending => pending, sent => sent_count, ack => ack_count);
             std::thread::sleep(Duration::from_millis(50));
             continue;
         }
@@ -135,20 +135,21 @@ fn main() {
             Err(e) => {
                 total_errors.fetch_add(1, Ordering::Relaxed);
                 // Reconnect on connection errors
-                if e.contains("Broken pipe") || e.contains("connection") {
-                    eprintln!("[loadtest] Connection lost, reconnecting...");
+                let e_msg = e.to_string();
+                if e_msg.contains("Broken pipe") || e_msg.contains("connection") {
+                    slog_warn!("loadtest", "connection_lost_reconnecting");
                     match TcpStream::connect(&rpc_addr) {
                         Ok(s) => {
                             if s.set_read_timeout(Some(Duration::from_secs(10))).is_err()
                                 || s.set_write_timeout(Some(Duration::from_secs(10))).is_err()
                             {
-                                eprintln!("[loadtest] Failed to set timeouts on reconnected socket");
+                                slog_error!("loadtest", "reconnect_timeout_failed");
                                 break;
                             }
                             stream = s;
                         }
                         Err(re) => {
-                            eprintln!("[loadtest] Reconnect failed: {}", re);
+                            slog_error!("loadtest", "reconnect_failed", error => re);
                             break;
                         }
                     }
@@ -163,10 +164,10 @@ fn main() {
             let sent = total_sent.load(Ordering::Relaxed);
             let errors = total_errors.load(Ordering::Relaxed);
             let actual_tps = sent as f64 / elapsed;
-            println!(
-                "[loadtest] {} tx sent | {} errors | {:.1} TPS | {:.0}s elapsed",
-                sent, errors, actual_tps, elapsed
-            );
+            slog_info!("loadtest", "progress",
+                tx_sent => sent, errors => errors,
+                tps => format!("{:.1}", actual_tps),
+                elapsed_sec => format!("{:.0}", elapsed));
             last_report = Instant::now();
         }
 
@@ -194,8 +195,8 @@ fn main() {
 }
 
 /// Submit a transaction to the node via JSON-RPC over TCP.
-fn rpc_submit_tx(stream: &mut TcpStream, tx: &Transaction, id: u64) -> Result<String, String> {
-    let tx_json = serde_json::to_string(tx).map_err(|e| format!("serialize: {}", e))?;
+fn rpc_submit_tx(stream: &mut TcpStream, tx: &Transaction, id: u64) -> Result<String, NetworkError> {
+    let tx_json = serde_json::to_string(tx).map_err(|e| NetworkError::Other(format!("serialize: {}", e)))?;
 
     let request = serde_json::json!({
         "jsonrpc": "2.0",
@@ -204,18 +205,18 @@ fn rpc_submit_tx(stream: &mut TcpStream, tx: &Transaction, id: u64) -> Result<St
         "params": [tx_json]
     });
 
-    let mut payload = serde_json::to_string(&request).map_err(|e| format!("serialize: {}", e))?;
+    let mut payload = serde_json::to_string(&request).map_err(|e| NetworkError::Other(format!("serialize: {}", e)))?;
     payload.push('\n');
 
-    stream.write_all(payload.as_bytes()).map_err(|e| format!("write: {}", e))?;
-    stream.flush().map_err(|e| format!("flush: {}", e))?;
+    stream.write_all(payload.as_bytes()).map_err(|e| NetworkError::Other(format!("write: {}", e)))?;
+    stream.flush().map_err(|e| NetworkError::Other(format!("flush: {}", e)))?;
 
-    let mut reader = BufReader::new(stream.try_clone().map_err(|e| format!("clone: {}", e))?);
+    let mut reader = BufReader::new(stream.try_clone().map_err(|e| NetworkError::Other(format!("clone: {}", e)))?);
     let mut response = String::new();
-    reader.read_line(&mut response).map_err(|e| format!("read: {}", e))?;
+    reader.read_line(&mut response).map_err(|e| NetworkError::Other(format!("read: {}", e)))?;
 
     if response.contains("\"error\"") && !response.contains("\"error\":null") {
-        return Err(format!("rpc error: {}", response.trim()));
+        return Err(NetworkError::Other(format!("rpc error: {}", response.trim())));
     }
 
     Ok(response)

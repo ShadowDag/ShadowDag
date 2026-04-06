@@ -16,14 +16,14 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::{slog_info, slog_warn, slog_error};
+
 /// Global running flag — checked by all subsystems to coordinate shutdown.
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Shutdown state: 0=running, 1=shutting_down, 2=stopped
 static SHUTDOWN_STATE: AtomicU8 = AtomicU8::new(0);
 
-/// Registered DB handles for flush-on-shutdown (max 8)
-static DB_COUNT: AtomicU8 = AtomicU8::new(0);
 
 use std::sync::Mutex;
 static SHUTDOWN_HOOKS: Mutex<Vec<Box<dyn FnOnce() + Send>>> = Mutex::new(Vec::new());
@@ -41,11 +41,7 @@ impl Lifecycle {
             .unwrap_or_default()
             .as_secs();
 
-        eprintln!("╔══════════════════════════════════════════╗");
-        eprintln!("║     ShadowDAG Node — Lifecycle Start     ║");
-        eprintln!("╚══════════════════════════════════════════╝");
-        eprintln!("[lifecycle] Started at UNIX timestamp {}", ts);
-        eprintln!("[lifecycle] PID: {}", std::process::id());
+        slog_info!("lifecycle", "node_start", timestamp => ts, pid => std::process::id());
 
         // Install panic hook for emergency shutdown
         install_panic_hook();
@@ -66,28 +62,27 @@ impl Lifecycle {
 
         RUNNING.store(false, Ordering::SeqCst);
 
-        eprintln!("[lifecycle] ──────────────────────────────────");
-        eprintln!("[lifecycle] Graceful shutdown initiated...");
+        slog_info!("lifecycle", "shutdown_initiated");
 
         // Run registered shutdown hooks
         if let Ok(mut hooks) = SHUTDOWN_HOOKS.lock() {
             let count = hooks.len();
             if count > 0 {
-                eprintln!("[lifecycle] Running {} shutdown hooks...", count);
+                slog_info!("lifecycle", "running_shutdown_hooks", count => count);
             }
             for hook in hooks.drain(..) {
                 hook();
             }
         }
 
-        eprintln!("[lifecycle] Flushing databases...");
+        slog_info!("lifecycle", "flushing_databases");
         // RocksDB handles are dropped when Arc refcount reaches 0.
         // The DB::flush() is called automatically by rocksdb::DB::drop().
         // We add a small delay to ensure all background compactions complete.
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        eprintln!("[lifecycle] Closing network connections...");
-        eprintln!("[lifecycle] Shutdown complete.");
+        slog_info!("lifecycle", "closing_network_connections");
+        slog_info!("lifecycle", "shutdown_complete");
         SHUTDOWN_STATE.store(2, Ordering::SeqCst);
     }
 
@@ -113,7 +108,7 @@ impl Lifecycle {
 
     /// Restart = stop + start
     pub fn on_restart() {
-        eprintln!("[lifecycle] Restarting node...");
+        slog_info!("lifecycle", "node_restart");
         Self::on_stop();
         std::thread::sleep(std::time::Duration::from_millis(500));
         SHUTDOWN_STATE.store(0, Ordering::SeqCst);
@@ -122,11 +117,8 @@ impl Lifecycle {
 
     /// Called on unrecoverable panic. Logs the error and attempts clean shutdown.
     pub fn on_panic(reason: &str) {
-        eprintln!("╔══════════════════════════════════════════╗");
-        eprintln!("║         ShadowDAG — FATAL ERROR          ║");
-        eprintln!("╚══════════════════════════════════════════╝");
-        eprintln!("[lifecycle] PANIC: {}", reason);
-        eprintln!("[lifecycle] Attempting emergency shutdown...");
+        slog_error!("lifecycle", "fatal_error", reason => reason);
+        slog_error!("lifecycle", "emergency_shutdown_attempt");
 
         Self::on_stop();
     }
@@ -193,7 +185,7 @@ fn install_ctrlc_handler() {
                     let r2 = signal(SIGTERM, signal_handler);
                     // SIG_ERR = usize::MAX on most platforms
                     if r1 == usize::MAX || r2 == usize::MAX {
-                        eprintln!("[lifecycle] WARNING: failed to register signal handler");
+                        slog_warn!("lifecycle", "signal_handler_registration_failed");
                     }
                 }
             }
@@ -205,6 +197,7 @@ fn install_ctrlc_handler() {
 
                 extern "system" fn handler(_: u32) -> i32 {
                     RUNNING.store(false, Ordering::SeqCst);
+                    // Cannot use slog macros in OS signal handler; keep raw eprintln
                     eprintln!("\n[lifecycle] Ctrl+C received — shutting down...");
                     1 // TRUE — we handled it
                 }
@@ -219,7 +212,7 @@ fn install_ctrlc_handler() {
                 unsafe {
                     let ok = SetConsoleCtrlHandler(handler, 1);
                     if ok == 0 {
-                        eprintln!("[lifecycle] WARNING: SetConsoleCtrlHandler failed");
+                        slog_warn!("lifecycle", "console_ctrl_handler_failed");
                     }
                 }
             }
@@ -246,9 +239,9 @@ fn install_panic_hook() {
             "unknown panic".to_string()
         };
 
-        eprintln!("[lifecycle] PANIC intercepted: {}", msg);
+        slog_error!("lifecycle", "panic_intercepted", message => msg);
         if let Some(loc) = info.location() {
-            eprintln!("[lifecycle]   at {}:{}:{}", loc.file(), loc.line(), loc.column());
+            slog_error!("lifecycle", "panic_location", file => loc.file(), line => loc.line(), column => loc.column());
         }
 
         // Attempt graceful shutdown

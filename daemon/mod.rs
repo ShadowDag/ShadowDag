@@ -24,6 +24,8 @@ use parking_lot::Mutex;
 
 use rocksdb::DB;
 
+use crate::{slog_info, slog_warn, slog_error};
+
 use crate::config::genesis::genesis::create_genesis_block_for;
 use crate::config::node::node_config::{NodeConfig, NetworkMode};
 use crate::engine::dag::core::dag_manager::DagManager;
@@ -145,17 +147,16 @@ impl DaemonNode {
         let existing_best = self.block_store.get_best_hash();
         if existing_best.is_none() || existing_best.as_deref() == Some("") {
             let genesis = create_genesis_block_for(&self.cfg.network);
-            eprintln!("[daemon] genesis   : {}", genesis.header.hash);
+            slog_info!("daemon", "genesis_hash", hash => genesis.header.hash);
 
             // Genesis goes through FullNode::process_genesis() — SAME pipeline
             // as all other blocks (validate, save, DAG, GHOSTDAG, UTXO, best_hash).
             // Only difference: parent validation skipped (genesis has no parents).
             self.full_node.process_genesis(&genesis)
                 .map_err(|e| NodeError::Init(format!("[daemon] FATAL: genesis processing failed: {}", e)))?;
-            eprintln!("[daemon] genesis created and inserted via FullNode pipeline");
+            slog_info!("daemon", "genesis_created");
         } else {
-            eprintln!("[daemon] existing chain found (best: {})",
-                existing_best.unwrap_or_default());
+            slog_info!("daemon", "existing_chain_found", best => existing_best.as_deref().unwrap_or_default());
 
             // === CRASH RECOVERY (3-level verification) ===
             // Level 1: BlockStore integrity (best hash + block exist)
@@ -169,7 +170,7 @@ impl DaemonNode {
             // Recompute GHOSTDAG ordering to ensure consistent state.
             // FATAL if this fails — continuing with stale virtual chain means
             // the UTXO set, DAG tip, and block template are all inconsistent.
-            eprintln!("[daemon] Recomputing virtual chain after recovery...");
+            slog_info!("daemon", "recomputing_virtual_chain");
             self.full_node.recompute_virtual_chain().map_err(|e| {
                 NodeError::Init(format!(
                     "[daemon] FATAL: virtual chain recompute failed: {}. \
@@ -184,7 +185,7 @@ impl DaemonNode {
         let mut p2p = P2P::new_with_config(&self.cfg)?;
         p2p.peers.bootstrap_for_network(&self.cfg.network);
         let _ = p2p.peers.discover_peers();
-        eprintln!("[daemon] P2P bootstrapped — {} peers", p2p.peers.count());
+        slog_info!("daemon", "p2p_bootstrapped", peers => p2p.peers.count());
 
         // ── RPC ──────────────────────────────────────────────────
         let rpc = RpcServer::new_for_network(
@@ -195,16 +196,13 @@ impl DaemonNode {
         rpc.set_network_name(&format!("shadowdag-{}", self.cfg.network.name()));
         rpc.set_network_ports(self.cfg.p2p_port, self.cfg.rpc_port);
         rpc.start();
-        eprintln!("[daemon] RPC started on port {}", self.cfg.rpc_port);
+        slog_info!("daemon", "rpc_started", port => self.cfg.rpc_port);
 
         // ── Start network ────────────────────────────────────────
         p2p.start();
-        eprintln!("[daemon] P2P listener on {}", p2p.listen_addr);
+        slog_info!("daemon", "p2p_listening", addr => p2p.listen_addr);
 
-        eprintln!(
-            "[daemon] ShadowDAG node running — network: {}",
-            self.cfg.network.name()
-        );
+        slog_info!("daemon", "node_running", network => self.cfg.network.name());
 
         Ok(())
     }
@@ -229,10 +227,10 @@ impl DaemonNode {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_flag = shutdown.clone();
         if let Err(e) = ctrlc::set_handler(move || {
-            eprintln!("\n[daemon] Received shutdown signal — flushing and stopping...");
+            slog_info!("daemon", "shutdown_signal_received");
             shutdown_flag.store(true, Ordering::SeqCst);
         }) {
-            eprintln!("[event-loop] WARNING: failed to register Ctrl+C handler: {}", e);
+            slog_warn!("daemon", "ctrlc_handler_failed", error => e);
         }
 
         let mut last_stats = Instant::now();
@@ -241,7 +239,7 @@ impl DaemonNode {
         let mut total_blocks_rejected: u64 = 0;
         let mut total_txs_rejected: u64 = 0;
 
-        eprintln!("[event-loop] Started — polling P2P queues every {:?}", POLL_INTERVAL);
+        slog_info!("daemon", "event_loop_started", poll_interval_ms => POLL_INTERVAL.as_millis());
 
         while !shutdown.load(Ordering::SeqCst) {
             let mut did_work = false;
@@ -265,21 +263,14 @@ impl DaemonNode {
                     if let Err(rej) = DagShield::pre_validate_block(&block) {
                         total_blocks_rejected += 1;
                         report_bad_peer(&peer_id, rej.ban_score as u64, rej.reason);
-                        eprintln!(
-                            "[event-loop] Block {}.. REJECTED by DagShield: {}",
-                            hash_prefix, rej.reason
-                        );
+                        slog_warn!("daemon", "block_rejected_dagshield", hash => hash_prefix, reason => rej.reason);
                         continue;
                     }
 
                     match self.full_node.process_block(&block) {
                         Ok(()) => {
                             total_blocks_processed += 1;
-                            eprintln!(
-                                "[event-loop] Block {}.. height={} processed ({} txs)",
-                                hash_prefix, block.header.height,
-                                block.body.transactions.len()
-                            );
+                            slog_info!("daemon", "block_processed", hash => hash_prefix, height => block.header.height, txs => block.body.transactions.len());
 
                             // Broadcast accepted block to peers (gossip propagation)
                             if let Ok(block_bytes) = bincode::serialize(&block) {
@@ -293,10 +284,7 @@ impl DaemonNode {
                             if !err_msg.contains(ERR_ALREADY_EXISTS) && !err_msg.contains(ERR_ORPHAN) {
                                 // Ban feedback: penalize peer that sent the bad block
                                 report_bad_peer_cat(&peer_id, BAN_SCORE_INVALID_BLOCK, "invalid block rejected by consensus", BanCategory::Malformed);
-                                eprintln!(
-                                    "[event-loop] Block {}.. REJECTED from {}: {}",
-                                    hash_prefix, peer_id, err_msg
-                                );
+                                slog_error!("daemon", "block_rejected_consensus", hash => hash_prefix, peer => peer_id, error => err_msg);
                             }
                         }
                     }
@@ -337,11 +325,12 @@ impl DaemonNode {
 
             // ── Periodic stats ──────────────────────────────────────
             if last_stats.elapsed() >= STATS_INTERVAL {
-                eprintln!(
-                    "[event-loop] Stats: blocks +{}/−{}, txs +{}/−{}, mempool={}",
-                    total_blocks_processed, total_blocks_rejected,
-                    total_txs_processed, total_txs_rejected,
-                    self.mempool.lock().tx_pool.mempool.count(),
+                slog_info!("daemon", "event_loop_stats",
+                    blocks_accepted => total_blocks_processed,
+                    blocks_rejected => total_blocks_rejected,
+                    txs_accepted => total_txs_processed,
+                    txs_rejected => total_txs_rejected,
+                    mempool_size => self.mempool.lock().tx_pool.mempool.count()
                 );
                 last_stats = Instant::now();
             }
@@ -355,18 +344,19 @@ impl DaemonNode {
         }
 
         // ── Graceful shutdown ──────────────────────────────────────
-        eprintln!("[daemon] Shutting down gracefully...");
-        eprintln!(
-            "[daemon] Final stats: blocks +{}/−{}, txs +{}/−{}",
-            total_blocks_processed, total_blocks_rejected,
-            total_txs_processed, total_txs_rejected,
+        slog_info!("daemon", "shutting_down");
+        slog_info!("daemon", "final_stats",
+            blocks_accepted => total_blocks_processed,
+            blocks_rejected => total_blocks_rejected,
+            txs_accepted => total_txs_processed,
+            txs_rejected => total_txs_rejected
         );
 
         // Flush RocksDB WAL to prevent corruption
         if let Err(e) = self.db.flush() {
-            eprintln!("[daemon] WARNING: RocksDB flush failed: {}", e);
+            slog_warn!("daemon", "rocksdb_flush_failed", error => e);
         }
-        eprintln!("[daemon] RocksDB flushed — shutdown complete.");
+        slog_info!("daemon", "shutdown_complete");
     }
 
     // ── Public API ───────────────────────────────────────────────
@@ -422,9 +412,9 @@ impl DaemonNode {
             .ok_or(NodeError::Init("No best hash found".to_string()))?;
         let best_block = self.block_store.get_block(&best_hash)
             .ok_or(NodeError::Init("Best block not found in store".to_string()))?;
-        eprintln!("[recovery] BlockStore OK: best={} height={}",
-            &best_hash[..std::cmp::min(16, best_hash.len())],
-            best_block.header.height);
+        slog_info!("daemon", "recovery_blockstore_ok",
+            best => &best_hash[..std::cmp::min(16, best_hash.len())],
+            height => best_block.header.height);
 
         // Step B: Check DAG + GHOSTDAG consistency
         let dag_ok = self.dag.block_exists(&best_hash);
@@ -433,30 +423,30 @@ impl DaemonNode {
 
         if !dag_ok || !ghostdag_ok {
             if !dag_ok {
-                eprintln!("[recovery] DAG missing best block — rebuilding from BlockStore...");
+                slog_warn!("daemon", "recovery_dag_missing_best_block");
             }
             if !ghostdag_ok {
-                eprintln!("[recovery] GHOSTDAG missing best block scores — rebuilding...");
+                slog_warn!("daemon", "recovery_ghostdag_missing_scores");
             }
             self.rebuild_dag()?;
             self.rebuild_ghostdag()?;
         } else {
-            eprintln!("[recovery] DAG OK");
-            eprintln!("[recovery] GHOSTDAG OK (blue_score={})", self.ghostdag.get_blue_score(&best_hash));
+            slog_info!("daemon", "recovery_dag_ok");
+            slog_info!("daemon", "recovery_ghostdag_ok", blue_score => self.ghostdag.get_blue_score(&best_hash));
         }
 
         // Step C: UTXO integrity — full content verification, not just count
         let utxo_count = self.utxo_set.count_utxos();
         if best_block.header.height > 0 && utxo_count == 0 {
             // Level 1: completely empty → full replay
-            eprintln!("[recovery] UTXO set empty — replaying all blocks...");
+            slog_warn!("daemon", "utxo_empty_replaying");
             self.replay_blocks()?;
         } else if best_block.header.height > 0 {
             // Level 2: full UTXO commitment verification
             // Instead of just comparing counts, compute a commitment hash over
             // ALL UTXO data (txid, index, amount, owner, maturity) and compare
             // with the commitment stored in the best block header.
-            eprintln!("[recovery] Verifying UTXO integrity (full commitment check)...");
+            slog_info!("daemon", "utxo_commitment_check");
 
             // Try UTXO store commitment first (atomic with UTXO apply),
             // then BlockStore (legacy), then header field (oldest legacy).
@@ -469,30 +459,26 @@ impl DaemonNode {
             if stored_commitment.is_empty() {
                 // No commitment anywhere — fall back to count-based check
                 // (for blocks processed before commitment was added)
-                eprintln!("[recovery] No UTXO commitment found, falling back to count check...");
+                slog_info!("daemon", "utxo_no_commitment_fallback_count_check");
                 let expected = self.compute_expected_utxo_count();
                 let actual = utxo_count;
                 let tolerance = std::cmp::max(expected / 100, 10);
                 let diff = expected.abs_diff(actual);
 
                 if expected > 0 && diff > tolerance {
-                    eprintln!(
-                        "[recovery] UTXO MISMATCH: expected ~{}, found {}. Rebuilding...",
-                        expected, actual
-                    );
+                    slog_warn!("daemon", "utxo_count_mismatch_rebuilding", expected => expected, actual => actual);
                     self.utxo_set.clear_all();
                     self.replay_blocks()?;
-                    eprintln!("[recovery] UTXO rebuilt: {} entries", self.utxo_set.count_utxos());
+                    slog_info!("daemon", "utxo_rebuilt", entries => self.utxo_set.count_utxos());
                 } else {
-                    eprintln!("[recovery] UTXO OK (count-based): {} unspent (expected ~{})", actual, expected);
+                    slog_info!("daemon", "utxo_ok_count_based", actual => actual, expected => expected);
                 }
             } else if computed_commitment != stored_commitment {
                 // Commitment mismatch — UTXO state is corrupted (amounts, owners,
                 // spent flags, or maturity could be wrong even if count matches)
-                eprintln!(
-                    "[recovery] UTXO COMMITMENT MISMATCH: stored={}, computed={}. Rebuilding...",
-                    &stored_commitment[..std::cmp::min(16, stored_commitment.len())],
-                    &computed_commitment[..std::cmp::min(16, computed_commitment.len())]
+                slog_error!("daemon", "utxo_commitment_mismatch_rebuilding",
+                    stored => &stored_commitment[..std::cmp::min(16, stored_commitment.len())],
+                    computed => &computed_commitment[..std::cmp::min(16, computed_commitment.len())]
                 );
                 self.utxo_set.clear_all();
                 self.replay_blocks()?;
@@ -507,23 +493,23 @@ impl DaemonNode {
                         &rebuilt_commitment[..std::cmp::min(16, rebuilt_commitment.len())]
                     )));
                 }
-                eprintln!("[recovery] UTXO rebuilt and verified: {} entries", self.utxo_set.count_utxos());
+                slog_info!("daemon", "utxo_rebuilt_and_verified", entries => self.utxo_set.count_utxos());
             } else {
-                eprintln!("[recovery] UTXO OK (commitment verified): {} entries, hash={}",
-                    utxo_count,
-                    &computed_commitment[..std::cmp::min(16, computed_commitment.len())]);
+                slog_info!("daemon", "utxo_ok_commitment_verified",
+                    entries => utxo_count,
+                    hash => &computed_commitment[..std::cmp::min(16, computed_commitment.len())]);
             }
         } else {
-            eprintln!("[recovery] UTXO OK ({} entries)", utxo_count);
+            slog_info!("daemon", "utxo_ok", entries => utxo_count);
         }
 
-        eprintln!("[recovery] All subsystems verified");
+        slog_info!("daemon", "recovery_all_subsystems_verified");
         Ok(())
     }
 
     /// Rebuild DAG topology from all blocks in BlockStore.
     fn rebuild_dag(&self) -> Result<(), NodeError> {
-        eprintln!("[recovery] Rebuilding DAG from BlockStore...");
+        slog_info!("daemon", "dag_rebuild_start");
         let blocks = self.block_store.get_all_blocks_sorted_by_height();
         let total = blocks.len() as u64;
         let mut failed = 0u64;
@@ -532,11 +518,10 @@ impl DaemonNode {
             // Use validated=true since these blocks were already accepted
             if let Err(e) = self.dag.add_block_validated(block, true) {
                 failed += 1;
-                eprintln!(
-                    "[recovery] WARNING: failed to re-add block {} at height {}: {}",
-                    block.hash(),
-                    block.header.height,
-                    e
+                slog_warn!("daemon", "dag_rebuild_block_failed",
+                    hash => block.header.hash,
+                    height => block.header.height,
+                    error => e
                 );
                 if failed > max_failures {
                     return Err(NodeError::Init(format!(
@@ -547,16 +532,16 @@ impl DaemonNode {
             }
         }
         if failed > 0 {
-            eprintln!("[recovery] WARNING: {} blocks could not be re-added (corrupted?)", failed);
+            slog_warn!("daemon", "dag_rebuild_partial_failure", failed => failed);
         }
-        eprintln!("[recovery] DAG rebuilt: {} blocks ({} failed)", total, failed);
+        slog_info!("daemon", "dag_rebuilt", total => total, failed => failed);
         Ok(())
     }
 
     /// Rebuild GHOSTDAG ordering from all blocks in BlockStore.
     /// Must be called after rebuild_dag() to ensure consistent fork-choice state.
     fn rebuild_ghostdag(&self) -> Result<(), NodeError> {
-        eprintln!("[recovery] Rebuilding GHOSTDAG from BlockStore...");
+        slog_info!("daemon", "ghostdag_rebuild_start");
         self.ghostdag.clear_all();
 
         let blocks = self.block_store.get_all_blocks_sorted_by_height();
@@ -579,11 +564,10 @@ impl DaemonNode {
                     .map(|s| s.as_str())
                     .or_else(|| e.downcast_ref::<&str>().copied())
                     .unwrap_or("unknown panic");
-                eprintln!(
-                    "[recovery] WARNING: GHOSTDAG failed to add block {} at height {}: {}",
-                    block.header.hash,
-                    block.header.height,
-                    msg
+                slog_warn!("daemon", "ghostdag_rebuild_block_failed",
+                    hash => block.header.hash,
+                    height => block.header.height,
+                    error => msg
                 );
                 if failed > max_failures {
                     return Err(NodeError::Init(format!(
@@ -594,19 +578,21 @@ impl DaemonNode {
             }
         }
         if failed > 0 {
-            eprintln!("[recovery] WARNING: GHOSTDAG had {} block failures", failed);
+            slog_warn!("daemon", "ghostdag_rebuild_partial_failure", failed => failed);
         }
 
         // Re-derive best tip from GHOSTDAG blue scores
         let tips = self.ghostdag.get_tips();
         if let Some(best_tip) = tips.first() {
             self.block_store.update_best_hash(best_tip);
-            eprintln!("[recovery] GHOSTDAG rebuilt: {} blocks ({} failed), best_tip={} (blue_score={})",
-                total, failed,
-                &best_tip[..std::cmp::min(16, best_tip.len())],
-                self.ghostdag.get_blue_score(best_tip));
+            slog_info!("daemon", "ghostdag_rebuilt",
+                total => total,
+                failed => failed,
+                best_tip => &best_tip[..std::cmp::min(16, best_tip.len())],
+                blue_score => self.ghostdag.get_blue_score(best_tip)
+            );
         } else {
-            eprintln!("[recovery] GHOSTDAG rebuilt: {} blocks ({} failed, no tips)", total, failed);
+            slog_info!("daemon", "ghostdag_rebuilt_no_tips", total => total, failed => failed);
         }
 
         Ok(())
@@ -614,14 +600,14 @@ impl DaemonNode {
 
     /// Replay all blocks from height 0 to rebuild UTXO state.
     fn replay_blocks(&self) -> Result<(), NodeError> {
-        eprintln!("[recovery] Replaying blocks to rebuild UTXO state...");
+        slog_info!("daemon", "utxo_replay_start");
         let blocks = self.block_store.get_all_blocks_sorted_by_height();
         for block in &blocks {
             self.utxo_set.apply_block_full(block, block.header.height)
                 .map_err(|e| NodeError::Init(format!("replay failed at height {}: {}",
                     block.header.height, e)))?;
         }
-        eprintln!("[recovery] UTXO state rebuilt from {} blocks", blocks.len());
+        slog_info!("daemon", "utxo_replay_complete", blocks => blocks.len());
         Ok(())
     }
 
@@ -651,12 +637,12 @@ impl DaemonNode {
     }
 
     fn print_banner(&self) {
-        eprintln!("╔══════════════════════════════════════════╗");
-        eprintln!("║   ShadowDAG Daemon — {}   ║", self.cfg.network.name());
-        eprintln!("╚══════════════════════════════════════════╝");
-        eprintln!("[daemon] data dir  : {}", self.cfg.data_dir.display());
-        eprintln!("[daemon] P2P port  : {}", self.cfg.p2p_port);
-        eprintln!("[daemon] RPC port  : {}", self.cfg.rpc_port);
+        slog_info!("daemon", "banner",
+            network => self.cfg.network.name(),
+            data_dir => self.cfg.data_dir.display(),
+            p2p_port => self.cfg.p2p_port,
+            rpc_port => self.cfg.rpc_port
+        );
     }
 }
 

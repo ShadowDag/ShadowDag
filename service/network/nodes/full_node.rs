@@ -21,7 +21,8 @@ use crate::engine::consensus::difficulty::retarget::{RetargetEngine, BlockTimeRe
 
 use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
 use crate::service::network::dos_guard::{DosGuard, DosVerdict, MsgType};
-use crate::errors::NodeError;
+use crate::errors::{NodeError, ConsensusError};
+use crate::{slog_info, slog_warn, slog_error};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Global next difficulty — written by FullNode after each block accepted,
@@ -126,10 +127,7 @@ impl FullNode {
             }
             let seeded_diff = retarget.ema_difficulty();
             set_next_difficulty(seeded_diff);
-            eprintln!(
-                "[FullNode] Retarget seeded from {} blocks: ema_difficulty={}",
-                seed_count, seeded_diff
-            );
+            slog_info!("node", "retarget_seeded", blocks => &seed_count.to_string(), ema_difficulty => &seeded_diff.to_string());
         } else {
             set_next_difficulty(genesis_diff);
         }
@@ -174,17 +172,16 @@ impl FullNode {
         match self.dos_guard.check(peer_id, &MsgType::Block, block_size) {
             DosVerdict::Allow => {},
             DosVerdict::BanActive => {
-                return Err(NodeError::Other(format!("BANNED: peer {} is banned", peer_id)));
+                return Err(NodeError::PeerBanned { peer: peer_id.to_string(), reason: "peer is banned".to_string() });
             },
             verdict => {
-                return Err(NodeError::Other(format!("DOS_REJECTED: peer {} — {:?}", peer_id, verdict)));
+                return Err(NodeError::PeerBanned { peer: peer_id.to_string(), reason: format!("DOS_REJECTED: {:?}", verdict) });
             },
         }
 
         // ── L0.5: Per-peer rate limiting ─────────────────────────────
         if self.is_peer_rate_limited(peer_id) {
-            return Err(NodeError::Other(format!("RATE_LIMITED: peer {} exceeds {} blocks/min",
-                              peer_id, MAX_BLOCKS_PER_PEER_PER_MIN)));
+            return Err(NodeError::PeerBanned { peer: peer_id.to_string(), reason: format!("RATE_LIMITED: exceeds {} blocks/min", MAX_BLOCKS_PER_PEER_PER_MIN) });
         }
 
         // ── L1 → L2 → L3 → DAG → L4 ────────────────────────────────
@@ -237,23 +234,23 @@ impl FullNode {
             block, &self.utxo_set, &ancestor_ts, &self.network, expected_diff
         );
         if !result.valid {
-            return Err(NodeError::Other(format!(
+            return Err(NodeError::BlockRejected(format!(
                 "Block validation failed: {}",
                 result.reason.unwrap_or_else(|| "unknown".to_string())
             )));
         }
 
         if self.dag_manager.block_exists(&block.header.hash) {
-            return Err(NodeError::Other(format!("Block {} already exists in DAG", &block.header.hash)));
+            return Err(NodeError::BlockRejected(format!("Block {} already exists in DAG", &block.header.hash)));
         }
 
         match BlockValidator::validate_parents_exist(block, &self.block_store, &self.dag_manager) {
             Ok(()) => {},
             Err(e) if e.to_string().contains("not found") => {
                 self.add_orphan(block.clone(), peer_id);
-                return Err(NodeError::Other(format!("ORPHAN: {}", e)));
+                return Err(NodeError::BlockRejected(format!("ORPHAN: {}", e)));
             },
-            Err(e) => return Err(NodeError::Other(format!("Parent validation failed: {}", e))),
+            Err(e) => return Err(NodeError::BlockRejected(format!("Parent validation failed: {}", e))),
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -264,11 +261,11 @@ impl FullNode {
         // ═══════════════════════════════════════════════════════════════
 
         if !self.block_store.save_block(block) {
-            return Err(NodeError::Other("Failed to save block to BlockStore".to_string()));
+            return Err(NodeError::BlockRejected("Failed to save block to BlockStore".to_string()));
         }
 
         self.dag_manager.add_block_validated(block, true)
-            .map_err(|e| NodeError::Other(format!("DAG insertion failed: {}", e)))?;
+            .map_err(|e| NodeError::BlockRejected(format!("DAG insertion failed: {}", e)))?;
 
         let dag_block = DagBlock {
             hash: block.header.hash.clone(),
@@ -315,22 +312,22 @@ impl FullNode {
             block, &self.utxo_set, &ancestor_ts, &self.network, expected_diff
         );
         if !result.valid {
-            return Err(NodeError::Other(result.reason.unwrap_or_else(|| "unknown".to_string())));
+            return Err(NodeError::BlockRejected(result.reason.unwrap_or_else(|| "unknown".to_string())));
         }
 
         if self.dag_manager.block_exists(&block.header.hash) {
-            return Err(NodeError::Other("Already exists".to_string()));
+            return Err(NodeError::BlockRejected("Already exists".to_string()));
         }
 
         BlockValidator::validate_parents_exist(block, &self.block_store, &self.dag_manager)
-            .map_err(|e| NodeError::Other(e.to_string()))?;
+            .map_err(|e| NodeError::BlockRejected(e.to_string()))?;
 
         if !self.block_store.save_block(block) {
-            return Err(NodeError::Other("Failed to save block".to_string()));
+            return Err(NodeError::BlockRejected("Failed to save block".to_string()));
         }
 
         self.dag_manager.add_block_validated(block, true)
-            .map_err(|e| NodeError::Other(format!("DAG insertion failed: {}", e)))?;
+            .map_err(|e| NodeError::BlockRejected(format!("DAG insertion failed: {}", e)))?;
 
         let dag_block = DagBlock {
             hash: block.header.hash.clone(),
@@ -409,8 +406,8 @@ impl FullNode {
         // this are considered final. This prevents an attacker from
         // secretly building a long side-chain and causing a massive reorg.
         if new_chain.len() as u64 > MAX_REORG_DEPTH {
-            return Err(NodeError::Other(format!(
-                "REJECT: reorg depth {} exceeds MAX_REORG_DEPTH {}",
+            return Err(NodeError::BlockRejected(format!(
+                "reorg depth {} exceeds MAX_REORG_DEPTH {}",
                 new_chain.len(), MAX_REORG_DEPTH
             )));
         }
@@ -444,7 +441,7 @@ impl FullNode {
                         use crate::config::consensus::emission_schedule::EmissionSchedule;
                         let expected_reward = EmissionSchedule::block_reward(block.header.height);
                         let expected_total = expected_reward.checked_add(applied_fees)
-                    .ok_or_else(|| NodeError::BlockValidation("reward + fees overflow".into()))?;
+                    .ok_or_else(|| NodeError::Consensus(ConsensusError::BlockValidation("reward + fees overflow".into())))?;
 
                         if let Some(cb) = block.body.transactions.first() {
                             if cb.is_coinbase() {
@@ -453,21 +450,13 @@ impl FullNode {
                                 {
                                     Some(t) => t,
                                     None => {
-                                        eprintln!(
-                                            "[FullNode] REJECT block {}: coinbase output overflow",
-                                            block_hash
-                                        );
+                                        slog_error!("node", "coinbase_output_overflow", block => block_hash);
                                         let _ = self.utxo_set.rollback_block_undo(block_hash);
                                         continue;
                                     }
                                 };
                                 if actual_total != expected_total {
-                                    eprintln!(
-                                        "[FullNode] REJECT block {}: coinbase {} != expected {} \
-                                         (emission {} + applied_fees {})",
-                                        block_hash, actual_total, expected_total,
-                                        expected_reward, applied_fees
-                                    );
+                                    slog_error!("node", "coinbase_mismatch", block => block_hash, actual => &actual_total.to_string(), expected => &expected_total.to_string());
                                     // Rollback this block's UTXO changes
                                     let _ = self.utxo_set.rollback_block_undo(block_hash);
                                     continue;
@@ -476,7 +465,7 @@ impl FullNode {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[FullNode] apply_block_dag error for {}: {}", block_hash, e);
+                        slog_error!("node", "apply_block_dag_error", block => block_hash, error => &e.to_string());
                     }
                 }
             }
@@ -529,10 +518,7 @@ impl FullNode {
                     if !to_prune.is_empty() {
                         let pruned = self.utxo_set.prune_finalized_undo_data(&to_prune);
                         if pruned > 0 {
-                            eprintln!(
-                                "[FullNode] Pruned {} finalized undo entries (finality_height={})",
-                                pruned, finality_height
-                            );
+                            slog_info!("node", "pruned_undo_entries", count => &pruned.to_string(), finality_height => &finality_height.to_string());
                         }
                     }
                 }
@@ -563,8 +549,7 @@ impl FullNode {
         if let Ok(counts) = self.orphan_count_by_peer.lock() {
             let peer_count = counts.get(peer_id).copied().unwrap_or(0);
             if peer_count >= MAX_ORPHAN_PER_PEER {
-                eprintln!("[FullNode] DROP orphan from {}: per-peer limit ({}) reached",
-                         peer_id, MAX_ORPHAN_PER_PEER);
+                slog_warn!("node", "orphan_per_peer_limit", peer => peer_id, limit => &MAX_ORPHAN_PER_PEER.to_string());
                 return;
             }
         }
@@ -638,7 +623,7 @@ impl FullNode {
         while let Some(current_parent) = queue.pop() {
             depth += 1;
             if depth > MAX_ORPHAN_DEPTH {
-                eprintln!("[FullNode] Orphan chain depth {} exceeds limit, stopping", depth);
+                slog_warn!("node", "orphan_chain_depth_exceeded", depth => &depth.to_string());
                 break;
             }
 
@@ -730,7 +715,7 @@ impl FullNode {
         // 1a: Structural validation (PoW, coinbase, etc.)
         let result = BlockValidator::validate_block_full_with_network(block, &self.utxo_set, &self.network);
         if !result.valid {
-            return Err(NodeError::Other(format!(
+            return Err(NodeError::BlockRejected(format!(
                 "Genesis validation failed: {}",
                 result.reason.unwrap_or_else(|| "unknown".to_string())
             )));
@@ -740,7 +725,7 @@ impl FullNode {
         // 1b: UTXO validation BEFORE any writes (genesis coinbase only)
         use crate::domain::utxo::utxo_validator::UtxoValidator;
         UtxoValidator::validate_block_utxos(block, &self.utxo_set, 0)
-            .map_err(|e| NodeError::Other(format!("Genesis UTXO validation failed: {}", e)))?;
+            .map_err(|e| NodeError::BlockRejected(format!("Genesis UTXO validation failed: {}", e)))?;
 
         // ═══════════════════════════════════════════════════════════════
         // PHASE 2: COMMIT (block is fully validated)
@@ -748,13 +733,13 @@ impl FullNode {
 
         // Save block
         if !self.block_store.save_block(block) {
-            return Err(NodeError::Other("Failed to save genesis to BlockStore".to_string()));
+            return Err(NodeError::BlockRejected("Failed to save genesis to BlockStore".to_string()));
         }
 
         // DAG insertion — genesis MUST succeed, otherwise the node starts
         // with an inconsistent state from the very first block.
         self.dag_manager.add_block_validated(block, true)
-            .map_err(|e| NodeError::Other(format!("Genesis DAG insertion failed (fatal): {}", e)))?;
+            .map_err(|e| NodeError::BlockRejected(format!("Genesis DAG insertion failed (fatal): {}", e)))?;
 
         // GHOSTDAG ordering
         let dag_block = DagBlock {
@@ -768,7 +753,7 @@ impl FullNode {
         // UTXO write + commitment ATOMICALLY (validation already passed in Phase 1)
         let _commitment = self.utxo_set.apply_block_write_with_commitment(
             &block.body.transactions, 0, &block.header.hash
-        ).map_err(|e| NodeError::Other(format!("Genesis UTXO write failed: {}", e)))?;
+        ).map_err(|e| NodeError::BlockRejected(format!("Genesis UTXO write failed: {}", e)))?;
 
         // Genesis is always best
         self.block_store.update_best_hash(&block.header.hash);

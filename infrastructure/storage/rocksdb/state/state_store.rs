@@ -25,8 +25,6 @@ use crate::errors::StorageError;
 const PFX_STATE:    &str = "state:";
 /// Prefix for state root
 const PFX_ROOT:     &str = "stateroot:";
-/// Prefix for snapshots
-const PFX_SNAPSHOT: &str = "snapshot:";
 
 pub struct StateStore {
     db: Arc<DB>,

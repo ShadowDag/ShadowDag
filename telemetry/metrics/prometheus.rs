@@ -5,6 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::io::Write;
+use crate::{slog_info, slog_error};
 
 pub struct PrometheusExporter {
     metrics: Arc<Mutex<Vec<(String, u64)>>>,
@@ -67,15 +68,13 @@ impl PrometheusExporter {
             let listener = match std::net::TcpListener::bind(&addr) {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("[prometheus] Failed to bind to {}: {}", addr, e);
+                    slog_error!("metrics", "prometheus_bind_failed", addr => &addr, error => &e.to_string());
                     return;
                 }
             };
 
-            eprintln!("[prometheus] Metrics server listening on http://{}", addr);
-            eprintln!("[prometheus]   GET /metrics  → Prometheus format");
-            eprintln!("[prometheus]   GET /health   → JSON health");
-            eprintln!("[prometheus]   GET /debug    → Diagnostics dump");
+            slog_info!("metrics", "prometheus_server_started", addr => &addr);
+            slog_info!("metrics", "prometheus_endpoints", routes => "/metrics, /health, /debug");
 
             for stream in listener.incoming().flatten() {
                 let mut buf = [0u8; 2048];

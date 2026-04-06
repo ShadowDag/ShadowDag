@@ -5,6 +5,7 @@
 
 use rocksdb::DB;
 use std::sync::Arc;
+use crate::slog_error;
 
 pub struct RuntimeManager {
     db: Arc<DB>,
@@ -30,7 +31,7 @@ impl RuntimeManager {
     /// كتابة state
     pub fn set_state(&self, key: &str, value: &str) {
         if let Err(e) = self.db.put(key.as_bytes(), value.as_bytes()) {
-            eprintln!("[RuntimeManager] DB put error: {}", e);
+            slog_error!("runtime", "runtime_manager_db_put_error", error => &e.to_string());
         }
     }
 
@@ -40,7 +41,7 @@ impl RuntimeManager {
             Ok(Some(data)) => String::from_utf8(data.to_vec()).ok(),
             Ok(None) => None,
             Err(e) => {
-                eprintln!("[RuntimeManager] DB get error: {}", e);
+                slog_error!("runtime", "runtime_manager_db_get_error", error => &e.to_string());
                 None
             }
         }

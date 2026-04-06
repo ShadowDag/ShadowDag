@@ -232,10 +232,6 @@ impl DandelionRelay {
         r < STEM_PROBABILITY as u64
     }
 
-    fn select_stem_peer(&mut self) -> Option<String> {
-        self.select_stem_peer_from(&[])
-    }
-
     /// Select a random stem peer from the given connected peer list.
     /// Returns None if no peers are connected — caller must fluff instead.
     fn select_stem_peer_from(&mut self, peers: &[String]) -> Option<String> {

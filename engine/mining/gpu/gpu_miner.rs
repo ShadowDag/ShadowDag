@@ -11,6 +11,7 @@ use std::time::Instant;
 use crate::domain::block::block::Block;
 use crate::engine::mining::algorithms::shadowhash::shadow_hash;
 use crate::engine::mining::pow::pow_validator::PowValidator;
+use crate::{slog_info, slog_warn};
 
 pub struct MineResult {
     pub nonce:     u64,
@@ -30,10 +31,7 @@ pub struct GpuMiner {
 impl GpuMiner {
     pub fn new(device_id: u32, difficulty: u64) -> Self {
         let threads = rayon::current_num_threads();
-        eprintln!(
-            "GpuMiner → device={} difficulty={} threads={}",
-            device_id, difficulty, threads
-        );
+        slog_info!("gpu", "gpu_miner_created", device => device_id, difficulty => difficulty, threads => threads);
         Self {
             device_id,
             difficulty,
@@ -44,23 +42,17 @@ impl GpuMiner {
     }
 
     pub fn initialize(&self) {
-        eprintln!(
-            "GpuMiner → initializing device={} threads={} batch={}",
-            self.device_id, self.threads, self.batch_size
-        );
+        slog_info!("gpu", "gpu_miner_initializing", device => self.device_id, threads => self.threads, batch => self.batch_size);
 
         rayon::ThreadPoolBuilder::new()
             .num_threads(self.threads)
             .build_global()
             .ok();
-        eprintln!("GpuMiner → thread pool ready");
+        slog_info!("gpu", "gpu_miner_thread_pool_ready");
     }
 
     pub fn mine(&mut self, mut block: Block) -> Option<Block> {
-        eprintln!(
-            "GpuMiner → mining block height={} difficulty={} on {} threads",
-            block.header.height, self.difficulty, self.threads
-        );
+        slog_info!("gpu", "gpu_mining_started", height => block.header.height, difficulty => self.difficulty, threads => self.threads);
 
         let start    = Instant::now();
         let found    = Arc::new(AtomicBool::new(false));
@@ -83,7 +75,7 @@ impl GpuMiner {
 
                 let start_nonce = match batch_idx.checked_mul(batch) {
                     Some(n) => n,
-                    None => break, // nonce space exhausted
+                    None => return None, // nonce space exhausted
                 };
                 let end_nonce   = start_nonce.saturating_add(batch);
                 let mut local_count: u64 = 0;
@@ -121,13 +113,10 @@ impl GpuMiner {
             block.header.nonce = nonce;
             block.header.hash  = hash.clone();
 
-            eprintln!(
-                "GpuMiner → ✅ block FOUND! nonce={} hash={}... time={}ms hashrate={:.2}MH/s",
-                nonce, &hash[..16], elapsed_ms, self.hashrate
-            );
+            slog_info!("gpu", "gpu_block_found", nonce => nonce, hash_prefix => &hash[..16], time_ms => elapsed_ms, hashrate_mhs => format!("{:.2}", self.hashrate));
             Some(block)
         } else {
-            eprintln!("GpuMiner → no valid nonce found in search range");
+            slog_warn!("gpu", "gpu_no_valid_nonce_found");
             None
         }
     }
@@ -157,15 +146,12 @@ impl GpuMiner {
         let elapsed_ms = start.elapsed().as_millis().max(1);
         self.hashrate  = (iters as f64 / elapsed_ms as f64) / 1000.0;
 
-        eprintln!(
-            "GpuMiner → benchmark: {:.2} MH/s ({} hashes in {}ms, {} valid)",
-            self.hashrate, iters, elapsed_ms, count
-        );
+        slog_info!("gpu", "gpu_benchmark_result", hashrate_mhs => format!("{:.2}", self.hashrate), hashes => iters, time_ms => elapsed_ms, valid => count);
         self.hashrate
     }
 
     pub fn stop(&self) {
-        eprintln!("GpuMiner → stopped device {}", self.device_id);
+        slog_info!("gpu", "gpu_miner_stopped", device => self.device_id);
     }
 
     pub fn available_threads() -> usize {

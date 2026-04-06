@@ -5,6 +5,7 @@
 
 use rocksdb::{DB, Options};
 use std::path::Path;
+use crate::slog_error;
 
 pub struct MinerStats {
     db: DB,
@@ -27,7 +28,7 @@ impl MinerStats {
     }
 
     pub fn set_hashrate(&self, rate: u64) {
-        if let Err(_e) = self.db.put("hashrate", rate.to_be_bytes()) { eprintln!("[DB] put error: {}", _e); }
+        if let Err(_e) = self.db.put("hashrate", rate.to_be_bytes()) { slog_error!("mining", "stats_put_hashrate_failed", error => _e); }
 
     }
 

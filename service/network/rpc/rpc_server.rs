@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use rocksdb::DB;
 
+use crate::{slog_info, slog_warn, slog_error};
 use crate::errors::NetworkError;
 use crate::config::consensus::consensus_params::ConsensusParams;
 use crate::domain::transaction::transaction::Transaction;
@@ -168,7 +169,7 @@ impl RpcState {
         if let Ok(Some(data)) = db.get(key) {
             if let Ok(pw) = String::from_utf8(data.to_vec()) {
                 if !pw.is_empty() {
-                    eprintln!("[RPC] Admin credentials loaded from DB");
+                    slog_info!("rpc", "admin_credentials_loaded");
                     return pw;
                 }
             }
@@ -176,13 +177,10 @@ impl RpcState {
         // First run: generate and persist
         let password = Self::generate_admin_password();
         if let Err(e) = db.put(key, password.as_bytes()) {
-            eprintln!("[RPC] WARNING: could not persist admin password: {}", e);
+            slog_warn!("rpc", "admin_password_persist_failed", error => e);
         }
-        eprintln!("[RPC] ════════════════════════════════════════════");
-        eprintln!("[RPC] FIRST RUN — Admin password generated:");
-        eprintln!("[RPC]   {}", password);
-        eprintln!("[RPC] This password is saved in the database.");
-        eprintln!("[RPC] ════════════════════════════════════════════");
+        slog_warn!("rpc", "first_run_admin_password", password => &password);
+        slog_warn!("rpc", "first_run_admin_password_notice", note => "Save this password — it will not be shown again");
         password
     }
 
@@ -196,7 +194,7 @@ impl RpcState {
         // If UTXO store fails, the RPC cannot serve correct data.
         let store = Arc::new(UtxoStore::new(db.clone())
             .map_err(|e| {
-                eprintln!("[RPC] ERROR: UTXO store init failed: {}. RPC cannot start without valid UTXO state.", e);
+                slog_error!("rpc", "utxo_store_init_failed", error => e);
                 NetworkError::Storage(e)
             })?);
         let utxo_store = UtxoSet::new(store as Arc<dyn crate::domain::traits::utxo_backend::UtxoBackend>);
@@ -220,13 +218,13 @@ impl RpcState {
 
     pub fn new_with_peers_path(peers_path: &str, db: Arc<DB>) -> Result<Self, NetworkError> {
         let peer_manager = PeerManager::new(peers_path)
-            .unwrap_or_else(PeerManager::new_default);
+            .unwrap_or_else(|| PeerManager::new_default().expect("PeerManager init failed"));
         let admin_password = Self::load_or_create_admin_password(&db);
         let block_store = BlockStore::new(db.clone())
             .map_err(|e| NetworkError::Storage(e))?;
         let store = Arc::new(UtxoStore::new(db.clone())
             .map_err(|e| {
-                eprintln!("[RPC] ERROR: UTXO store init failed: {}. Cannot serve correct state.", e);
+                slog_error!("rpc", "utxo_store_init_failed", error => e);
                 NetworkError::Storage(e)
             })?);
         let utxo_store = UtxoSet::new(store as Arc<dyn crate::domain::traits::utxo_backend::UtxoBackend>);
@@ -370,8 +368,7 @@ impl RpcServer {
                             Ok(s) => {
                                 let current = active_connections.load(std::sync::atomic::Ordering::Relaxed);
                                 if current >= MAX_RPC_CONNECTIONS {
-                                    eprintln!("[RPC] Connection limit reached ({}/{}), dropping request",
-                                        current, MAX_RPC_CONNECTIONS);
+                                    slog_warn!("rpc", "connection_limit_reached", current => current, max => MAX_RPC_CONNECTIONS);
                                     drop(s);
                                     continue;
                                 }
@@ -384,11 +381,11 @@ impl RpcServer {
                                     conn_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                 });
                             }
-                            Err(e) => eprintln!("[RPC] Accept error: {}", e),
+                            Err(e) => slog_error!("rpc", "accept_error", error => e),
                         }
                     }
                 }
-                Err(e) => eprintln!("[RPC] Failed to bind {}: {}", addr, e),
+                Err(e) => slog_error!("rpc", "bind_failed", addr => &addr, error => e),
             }
         });
     }
@@ -944,7 +941,7 @@ impl RpcServer {
                 // add_transaction() is storage-only and MUST NOT be used for external input.
                 match s.mempool.add_transaction_validated(&tx, &s.utxo_store) {
                     Ok(()) => RpcResponse::ok(id, json!(tx_hash)),
-                    Err(reason) => RpcResponse::err(id, ERR_INVALID_TX, reason),
+                    Err(reason) => RpcResponse::err(id, ERR_INVALID_TX, reason.to_string()),
                 }
             }
             Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
@@ -1218,8 +1215,7 @@ impl RpcServer {
         // We NEVER update best_height/best_hash from RPC.
         // We NEVER broadcast to P2P from RPC (event loop does that after validation).
         if crate::service::network::p2p::p2p::push_pending_block("rpc", block) {
-            eprintln!("[RPC] Block #{} queued for consensus validation: {}...",
-                height, &hash[..8.min(hash.len())]);
+            slog_info!("rpc", "block_queued_for_validation", height => height, hash => &hash[..8.min(hash.len())]);
             RpcResponse::ok(id, json!({
                 "queued": true,
                 "hash": hash,

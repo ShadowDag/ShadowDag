@@ -3,6 +3,7 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::{slog_info, slog_warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -100,15 +101,11 @@ impl RpcAuthManager {
         if mgr.users.is_empty() {
             // First run — generate and persist admin
             let password = generate_random_password();
-            eprintln!("╔══════════════════════════════════════════════════╗");
-            eprintln!("║  [RPC] First run — admin account created         ║");
-            eprintln!("║  Username: admin                                 ║");
-            eprintln!("║  Password: {}              ║", &password);
-            eprintln!("║  ⚠️  Save this — it won't be shown again!       ║");
-            eprintln!("╚══════════════════════════════════════════════════╝");
+            slog_warn!("rpc", "first_run_admin_created", username => "admin", password => &password);
+            slog_warn!("rpc", "first_run_admin_notice", note => "Save this password — it will not be shown again");
             mgr.add_user("admin", &password, AuthRole::Admin);
         } else {
-            eprintln!("[RPC] Loaded {} user(s) from DB", mgr.users.len());
+            slog_info!("rpc", "users_loaded_from_db", count => mgr.users.len());
         }
         mgr
     }

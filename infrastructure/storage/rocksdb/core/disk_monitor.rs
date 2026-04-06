@@ -7,6 +7,7 @@
 // Prevents database corruption from out-of-disk writes.
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::{slog_warn, slog_error};
 
 /// Minimum free disk space (1 GB) — below this, node enters safe mode
 pub const MIN_FREE_SPACE_BYTES: u64 = 1_073_741_824; // 1 GB
@@ -50,13 +51,11 @@ impl DiskMonitor {
 
         match free {
             Some(bytes) if bytes < MIN_FREE_SPACE_BYTES => {
-                eprintln!("[DiskMonitor] CRITICAL: Only {:.2} GB free! Node entering safe mode.",
-                    bytes as f64 / 1_073_741_824.0);
+                slog_error!("storage", "disk_space_critical", free_gb => format!("{:.2}", bytes as f64 / 1_073_741_824.0));
                 DiskStatus::Critical { free_bytes: bytes }
             }
             Some(bytes) if bytes < WARN_FREE_SPACE_BYTES => {
-                eprintln!("[DiskMonitor] WARNING: Only {:.2} GB free.",
-                    bytes as f64 / 1_073_741_824.0);
+                slog_warn!("storage", "disk_space_low", free_gb => format!("{:.2}", bytes as f64 / 1_073_741_824.0));
                 DiskStatus::Warning { free_bytes: bytes }
             }
             Some(bytes) => DiskStatus::Ok { free_bytes: bytes },

@@ -26,6 +26,7 @@ use crate::engine::dag::core::dag_manager::DagManager;
 use crate::domain::utxo::utxo_set::UtxoSet;
 use crate::domain::traits::tx_pool::TxPool;
 use crate::errors::ConsensusError;
+use crate::{slog_info, slog_error};
 
 pub struct MinerControllerStore {
     db: DB,
@@ -46,7 +47,7 @@ impl MinerControllerStore {
     }
 
     pub fn store_job(&self, id: &str, job: &str) {
-        if let Err(_e) = self.db.put(id, job) { eprintln!("[DB] put error: {}", _e); }
+        if let Err(_e) = self.db.put(id, job) { slog_error!("mining", "controller_store_put_failed", error => _e); }
     }
 }
 
@@ -105,12 +106,7 @@ impl<'a> MinerController<'a> {
             self.miner.difficulty,
         )?;
 
-        eprintln!(
-            "[MinerController] Template built: height={} parents={} txs={}",
-            block.header.height,
-            block.header.parents.len(),
-            block.body.transactions.len(),
-        );
+        slog_info!("mining", "template_built", height => block.header.height, parents => block.header.parents.len(), txs => block.body.transactions.len());
 
         // Validate parents before mining
         Miner::validate_parents(&block, self.dag_manager)?;
@@ -135,12 +131,7 @@ impl<'a> MinerController<'a> {
             block.header.timestamp,
         );
 
-        eprintln!(
-            "[MinerController] Block submitted to DAG: hash={}... height={} tips={}",
-            &block.header.hash[..block.header.hash.len().min(16)],
-            block.header.height,
-            self.tip_manager.tip_count(),
-        );
+        slog_info!("mining", "block_submitted_to_dag", hash_prefix => &block.header.hash[..block.header.hash.len().min(16)], height => block.header.height, tips => self.tip_manager.tip_count());
 
         Ok(())
     }
