@@ -415,7 +415,7 @@ impl ConnectionSession {
 }
 
 pub struct P2P {
-    pub peers:             PeerManager,
+    pub peers:             Arc<PeerManager>,
     pub message_pool:      Vec<String>,
     /// Seen TX hashes (capped at 50K to prevent memory leak)
     pub tx_seen:           HashSet<String>,
@@ -446,7 +446,7 @@ impl P2P {
         let magic = cfg.network.magic();
         slog_info!("p2p", "network_init", network => cfg.network.name(), port => cfg.p2p_port, magic => &format!("{:02x}{:02x}{:02x}{:02x}", magic[0], magic[1], magic[2], magic[3]));
         Ok(Self {
-            peers:             PeerManager::new_default_path(&cfg.peers_path_str())?,
+            peers:             Arc::new(PeerManager::new_default_path(&cfg.peers_path_str())?),
             message_pool:      Vec::new(),
             tx_seen:           HashSet::new(),
             peer_last_message: HashMap::new(),
@@ -459,14 +459,19 @@ impl P2P {
         })
     }
 
-    pub fn start(&mut self) {
+    pub fn start(&mut self) -> Result<(), crate::errors::NetworkError> {
         slog_info!("p2p", "network_start", listen_addr => &self.listen_addr);
 
-        let listen_addr = self.listen_addr.clone();
+        // Bind BEFORE spawning — fail fast if port unavailable
+        let listener = TcpListener::bind(&self.listen_addr)
+            .map_err(|e| crate::errors::NetworkError::ConnectionFailed(format!(
+                "P2P bind {} failed: {}", self.listen_addr, e
+            )))?;
+
         let magic = self.network_magic;
-        let known_peers = self.peers.get_addr_list_limited(100);
+        let peers = Arc::clone(&self.peers);
         thread::spawn(move || {
-            if let Err(e) = Self::accept_loop(&listen_addr, magic, &known_peers) {
+            if let Err(e) = Self::accept_loop(listener, magic, &peers) {
                 slog_error!("p2p", "accept_loop_error", error => &e.to_string());
             }
         });
@@ -478,11 +483,12 @@ impl P2P {
         slog_info!("p2p", "peers_connected", count => self.peers.count());
 
         self.request_headers_sync();
+        Ok(())
     }
 
-    fn accept_loop(addr: &str, magic: [u8; 4], known_peers: &[String]) -> std::io::Result<()> {
-        let listener = TcpListener::bind(addr)?;
-        slog_info!("p2p", "listener_bound", addr => addr);
+    fn accept_loop(listener: std::net::TcpListener, magic: [u8; 4], peer_manager: &Arc<PeerManager>) -> std::io::Result<()> {
+        let addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
+        slog_info!("p2p", "listener_bound", addr => &addr);
 
         // Connection throttle state
         let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -524,7 +530,8 @@ impl P2P {
                     }
 
                     slog_info!("p2p", "inbound_connection", addr => &peer_addr);
-                    let peers_snapshot = known_peers.to_vec();
+                    // Query fresh peer list on each connection (fix stale snapshot)
+                    let peers_snapshot = peer_manager.get_addr_list_limited(100);
                     let pending_clone = Arc::clone(&pending);
                     pending_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 

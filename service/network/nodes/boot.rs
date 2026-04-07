@@ -120,7 +120,7 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
     let _ = p2p.peers.discover_peers();
     slog_info!("boot", "p2p_bootstrapped", peer_count => p2p.peers.count());
 
-    relay_sync_mempool(&p2p.peers);
+    relay_sync_mempool(&*p2p.peers);
 
     let mempool = MempoolManager::new_with_peers_path(db.clone(), &cfg.peers_path_str())
         .map_err(|e| NodeError::Init(e.to_string()))?;
@@ -129,10 +129,10 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
     let rpc = RpcServer::new_for_network(cfg.rpc_port, &cfg.peers_path_str(), db.clone())
         .map_err(|e| NodeError::Init(format!("Failed to init RPC server: {}", e)))?;
     rpc.set_network_name(&format!("shadowdag-{}", cfg.network.name()));
-    rpc.start();
+    rpc.start().map_err(|e| NodeError::Init(format!("RPC start failed: {}", e)))?;
     slog_info!("boot", "rpc_server_started", port => cfg.rpc_port);
 
-    p2p.start();
+    p2p.start().map_err(|e| NodeError::Init(format!("P2P start failed: {}", e)))?;
     slog_info!("boot", "p2p_listener_started", address => p2p.listen_addr);
 
     // Initialize persistent indexes with shared DB (auto-recovers from disk)
