@@ -107,8 +107,20 @@ fn run(args: &[String]) -> Result<(), BootError> {
             "--network '{}' is not valid. Use: mainnet, testnet, or regtest", network_mode
         ))
     })?;
-    let rpc_port: Option<u16> = parse_flag_opt(args, "--rpc-port").and_then(|s| s.parse().ok());
-    let p2p_port: Option<u16> = parse_flag_opt(args, "--p2p-port").and_then(|s| s.parse().ok());
+    let rpc_port: Option<u16> = match parse_flag_opt(args, "--rpc-port") {
+        Some(s) => Some(s.parse().unwrap_or_else(|_| {
+            eprintln!("ERROR: Invalid --rpc-port value '{}' (must be 1-65535)", s);
+            std::process::exit(1);
+        })),
+        None => None,
+    };
+    let p2p_port: Option<u16> = match parse_flag_opt(args, "--p2p-port") {
+        Some(s) => Some(s.parse().unwrap_or_else(|_| {
+            eprintln!("ERROR: Invalid --p2p-port value '{}' (must be 1-65535)", s);
+            std::process::exit(1);
+        })),
+        None => None,
+    };
     let data_dir: Option<String> = parse_flag_opt(args, "--data-dir");
 
     let mut cfg = NodeConfig::for_network(network);
