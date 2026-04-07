@@ -38,7 +38,7 @@ use crate::runtime::node_runtime::lifecycle::Lifecycle;
 use crate::service::mempool::core::mempool_manager::MempoolManager;
 use crate::service::mempool::pools::tx_pool::TxPoolResult;
 use crate::service::network::nodes::full_node::FullNode;
-use crate::service::network::p2p::p2p::{P2P, P2PMessage, push_outbound, drain_pending_txs, drain_pending_blocks, report_bad_peer, report_bad_peer_cat};
+use crate::service::network::p2p::p2p::{P2P, P2PMessage, push_outbound, drain_pending_txs, drain_pending_blocks, requeue_pending_blocks, requeue_pending_txs, report_bad_peer, report_bad_peer_cat};
 use crate::engine::dag::security::dag_shield::DagShield;
 use crate::service::network::dos_guard::BanCategory;
 use crate::service::network::rpc::rpc_server::RpcServer;
@@ -254,11 +254,21 @@ impl DaemonNode {
             let mut did_work = false;
 
             // ── Drain pending blocks (peer-tagged) ─────────────────
-            let blocks = drain_pending_blocks();
+            // Take only BLOCK_BATCH_LIMIT items; return excess to the queue
+            // so they're processed on the next tick (no message loss under load).
+            let mut blocks = drain_pending_blocks();
+            let excess_blocks = if blocks.len() > BLOCK_BATCH_LIMIT {
+                blocks.split_off(BLOCK_BATCH_LIMIT)
+            } else {
+                Vec::new()
+            };
+            if !excess_blocks.is_empty() {
+                requeue_pending_blocks(excess_blocks);
+            }
             if !blocks.is_empty() {
                 did_work = true;
                 let batch_start = std::time::Instant::now();
-                for (peer_id, block) in blocks.into_iter().take(BLOCK_BATCH_LIMIT) {
+                for (peer_id, block) in blocks.into_iter() {
                     let hash_prefix = if block.header.hash.len() >= 16 {
                         &block.header.hash[..16]
                     } else {
@@ -281,13 +291,14 @@ impl DaemonNode {
                             total_blocks_processed += 1;
                             slog_info!("daemon", "block_processed", hash => hash_prefix, height => block.header.height, txs => block.body.transactions.len());
 
-                            // Notify finality manager of new accepted block
-                            // Simplified: assume accepted block is blue, dag_width=1
+                            // Notify finality manager with real DAG data
+                            let is_blue = self.ghostdag.get_blue_score(&block.header.hash) > 0;
+                            let dag_width = self.block_store.blocks_at_height(block.header.height) as u64;
                             self.finality_manager.lock().on_block(
                                 block.header.height,
                                 &block.header.hash,
-                                true,
-                                1,
+                                is_blue,
+                                dag_width.max(1),
                             );
 
                             // Broadcast accepted block to peers (gossip propagation)
@@ -314,12 +325,20 @@ impl DaemonNode {
             }
 
             // ── Drain pending transactions (peer-tagged) ────────────
-            let txs = drain_pending_txs();
+            let mut txs = drain_pending_txs();
+            let excess_txs = if txs.len() > TX_BATCH_LIMIT {
+                txs.split_off(TX_BATCH_LIMIT)
+            } else {
+                Vec::new()
+            };
+            if !excess_txs.is_empty() {
+                requeue_pending_txs(excess_txs);
+            }
             if !txs.is_empty() {
                 did_work = true;
                 {
                     let mut mempool = self.mempool.lock();
-                    for (peer_id, tx) in txs.into_iter().take(TX_BATCH_LIMIT) {
+                    for (peer_id, tx) in txs.into_iter() {
                         // ── DagShield safety net (defense-in-depth) ──
                         if let Err(rej) = DagShield::pre_validate_tx(&tx) {
                             total_txs_rejected += 1;
@@ -599,9 +618,17 @@ impl DaemonNode {
             slog_warn!("daemon", "ghostdag_rebuild_partial_failure", failed => failed);
         }
 
-        // Re-derive best tip from GHOSTDAG blue scores
+        // Re-derive best tip using proper GHOSTDAG selection rule:
+        // highest blue_score → highest height → lowest hash (deterministic)
         let tips = self.ghostdag.get_tips();
-        if let Some(best_tip) = tips.first() {
+        let best_tip = tips.iter()
+            .max_by(|a, b| {
+                self.ghostdag.get_blue_score(a).cmp(&self.ghostdag.get_blue_score(b))
+                    .then_with(|| self.ghostdag.get_chain_height(a).cmp(&self.ghostdag.get_chain_height(b)))
+                    .then_with(|| b.cmp(a)) // lower hash wins tie
+            })
+            .cloned();
+        if let Some(ref best_tip) = best_tip {
             self.block_store.update_best_hash(best_tip);
             slog_info!("daemon", "ghostdag_rebuilt",
                 total => total,

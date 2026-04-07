@@ -125,6 +125,25 @@ pub fn drain_pending_blocks() -> Vec<(String, Block)> {
     items
 }
 
+/// Requeue excess blocks that couldn't be processed in this tick.
+/// Prepends them to the front of the queue so they're processed first next tick.
+pub fn requeue_pending_blocks(items: Vec<(String, Block)>) {
+    if items.is_empty() { return; }
+    let mut q = PENDING_BLOCKS.lock();
+    let mut combined = items;
+    combined.extend(q.drain(..));
+    *q = combined;
+}
+
+/// Requeue excess transactions that couldn't be processed in this tick.
+pub fn requeue_pending_txs(items: Vec<(String, Transaction)>) {
+    if items.is_empty() { return; }
+    let mut q = PENDING_TXS.lock();
+    let mut combined = items;
+    combined.extend(q.drain(..));
+    *q = combined;
+}
+
 /// Push a block into the pending queue for consensus validation.
 /// Thread-safe: can be called from RPC or any thread.
 /// The daemon event loop drains this queue and processes each block
