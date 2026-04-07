@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}};
 use tokio::sync::broadcast;
+use crate::slog_warn;
 
 /// Subscription types for real-time event streaming
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,19 +98,21 @@ impl WsServer {
     /// Publish an event to all subscribers
     pub fn publish(&self, event_type: SubscriptionType, payload: String) {
         let event = WsEvent { event_type, payload };
-        let _ = self.event_tx.send(event);
+        if let Err(_e) = self.event_tx.send(event) {
+            slog_warn!("rpc", "ws_event_dropped", event_type => format!("{:?}", event_type));
+        }
     }
 
     /// Register a subscription for a connection
-    pub fn add_subscription(&self, conn_id: u64, sub_type: SubscriptionType) -> u64 {
-        let sub_id = self.next_sub_id.fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut subs) = self.subscriptions.lock() {
-            let conn_subs = subs.entry(conn_id).or_default();
-            if conn_subs.len() < self.max_subscriptions_per_conn {
-                conn_subs.push(WsSubscription { id: sub_id, sub_type });
-            }
+    pub fn add_subscription(&self, conn_id: u64, sub_type: SubscriptionType) -> Option<u64> {
+        let mut subs = self.subscriptions.lock().ok()?;
+        let conn_subs = subs.entry(conn_id).or_default();
+        if conn_subs.len() >= self.max_subscriptions_per_conn {
+            return None; // Limit reached — don't allocate sub_id
         }
-        sub_id
+        let sub_id = self.next_sub_id.fetch_add(1, Ordering::SeqCst);
+        conn_subs.push(WsSubscription { id: sub_id, sub_type });
+        Some(sub_id)
     }
 
     /// Remove a subscription
@@ -151,34 +154,39 @@ impl WsServer {
 
     /// Notify: new block accepted
     pub fn notify_new_block(&self, hash: &str, height: u64, tx_count: usize) {
-        self.publish(SubscriptionType::NewBlock, format!(
-            r#"{{"hash":"{}","height":{},"tx_count":{}}}"#,
-            hash, height, tx_count
-        ));
+        let payload = serde_json::json!({
+            "hash": hash,
+            "height": height,
+            "tx_count": tx_count,
+        }).to_string();
+        self.publish(SubscriptionType::NewBlock, payload);
     }
 
     /// Notify: new transaction in mempool
     pub fn notify_new_transaction(&self, txid: &str, fee: u64) {
-        self.publish(SubscriptionType::NewTransaction, format!(
-            r#"{{"txid":"{}","fee":{}}}"#,
-            txid, fee
-        ));
+        let payload = serde_json::json!({
+            "txid": txid,
+            "fee": fee,
+        }).to_string();
+        self.publish(SubscriptionType::NewTransaction, payload);
     }
 
     /// Notify: DAG tips changed
     pub fn notify_tips_changed(&self, tip_count: usize, best_hash: &str) {
-        self.publish(SubscriptionType::DagTipsChanged, format!(
-            r#"{{"tip_count":{},"best_hash":"{}"}}"#,
-            tip_count, best_hash
-        ));
+        let payload = serde_json::json!({
+            "tip_count": tip_count,
+            "best_hash": best_hash,
+        }).to_string();
+        self.publish(SubscriptionType::DagTipsChanged, payload);
     }
 
     /// Notify: pruning completed
     pub fn notify_pruning(&self, pruned_count: u64, lowest_height: u64) {
-        self.publish(SubscriptionType::PruningCompleted, format!(
-            r#"{{"pruned_count":{},"lowest_height":{}}}"#,
-            pruned_count, lowest_height
-        ));
+        let payload = serde_json::json!({
+            "pruned_count": pruned_count,
+            "lowest_height": lowest_height,
+        }).to_string();
+        self.publish(SubscriptionType::PruningCompleted, payload);
     }
 
     /// Available subscription types
@@ -201,7 +209,8 @@ mod tests {
     #[test]
     fn subscription_lifecycle() {
         let server = WsServer::new(18787);
-        let sub_id = server.add_subscription(1, SubscriptionType::NewBlock);
+        let sub_id = server.add_subscription(1, SubscriptionType::NewBlock)
+            .expect("subscription should succeed");
         assert!(sub_id > 0);
         assert_eq!(server.subscription_count(), 1);
         assert_eq!(server.connection_count(), 1);
@@ -226,9 +235,13 @@ mod tests {
     #[test]
     fn max_subscriptions_per_connection() {
         let server = WsServer::new(18787);
+        let mut accepted = 0;
         for _ in 0..15 {
-            server.add_subscription(1, SubscriptionType::NewBlock);
+            if server.add_subscription(1, SubscriptionType::NewBlock).is_some() {
+                accepted += 1;
+            }
         }
+        assert_eq!(accepted, server.max_subscriptions_per_conn);
         assert_eq!(server.subscription_count(), server.max_subscriptions_per_conn);
     }
 

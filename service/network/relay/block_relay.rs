@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::errors::NetworkError;
 use crate::domain::block::block::Block;
-use crate::slog_error;
+use crate::{slog_error, slog_warn};
 use crate::service::network::p2p::p2p::{P2PMessage, push_outbound};
 use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
@@ -79,11 +79,6 @@ impl BlockRelay {
             return;
         }
 
-        // Mark as relayed
-        if let Err(e) = self.db.put(key.as_bytes(), b"1") {
-            slog_error!("relay", "block_relay_db_put_error", error => e);
-        }
-
         // Serialize block as bincode for the P2PMessage::Block payload
         let block_bytes = match bincode::serialize(block) {
             Ok(d) => d,
@@ -96,6 +91,11 @@ impl BlockRelay {
         // Push to the global outbound queue — each peer connection thread
         // will drain this queue and send via its TCP stream.
         push_outbound(P2PMessage::Block { data: block_bytes });
+
+        // Mark AFTER successful queue push
+        if let Err(e) = self.db.put(key.as_bytes(), b"1") {
+            slog_error!("relay", "block_relay_db_put_error", error => e);
+        }
 
         log::debug!(
             "[BlockRelay] Queued block {} (height {}) for broadcast",
@@ -150,6 +150,12 @@ impl BlockRelay {
         };
 
         if let Ok(data) = bincode::serialize(&entry) {
+            // Enforce size limit at WRITE time (not just read time)
+            if data.len() > MAX_ORPHAN_ENTRY_SIZE {
+                slog_warn!("relay", "orphan_entry_too_large",
+                    size => data.len(), max => MAX_ORPHAN_ENTRY_SIZE);
+                return;
+            }
             let key = format!("orphan:block:{}", entry.block.header.hash);
             if let Err(_e) = self.db.put(key.as_bytes(), &data) {
             }

@@ -45,11 +45,6 @@ impl TxRelay {
             return;
         }
 
-        // Mark as relayed
-        if let Err(e) = self.db.put(key.as_bytes(), b"1") {
-            slog_error!("relay", "tx_relay_db_put_error", error => e);
-        }
-
         // Serialize transaction as bincode for the P2PMessage::Tx payload
         let tx_bytes = match bincode::serialize(tx) {
             Ok(d) => d,
@@ -62,6 +57,11 @@ impl TxRelay {
         // Push to the global outbound queue — each peer connection thread
         // will drain this queue and send via its TCP stream.
         push_outbound(P2PMessage::Tx { data: tx_bytes });
+
+        // Mark AFTER successful queue push
+        if let Err(e) = self.db.put(key.as_bytes(), b"1") {
+            slog_error!("relay", "tx_relay_db_put_error", error => e);
+        }
 
         log::debug!("[TxRelay] Queued tx {} for broadcast", &tx.hash[..8]);
     }

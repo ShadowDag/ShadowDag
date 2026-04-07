@@ -79,6 +79,8 @@ pub enum StateChange {
     AccountDestroyed { address: String, account: Account },
     /// Storage value changed
     StorageChange { address: String, key: String, old_value: Option<String>, new_value: Option<String> },
+    /// Contract code changed
+    CodeChanged { address: String, old_code_hash: String, old_code: Vec<u8> },
 }
 
 /// State snapshot ID
@@ -196,6 +198,12 @@ impl StateManager {
             .ok_or_else(|| VmError::Other(format!(
                 "account missing after get_or_create for {}", address
             )))?;
+
+        // Record old state for rollback
+        let old_code_hash = account.code_hash.clone();
+        let old_code = std::mem::take(&mut account.code);
+
+        // Apply new code
         let mut h = <Sha256 as Digest>::new();
         Digest::update(&mut h, &code);
         account.code_hash = hex::encode(Digest::finalize(h));
@@ -203,6 +211,14 @@ impl StateManager {
         if account.nonce == 0 {
             account.nonce = 1; // Contracts start at nonce 1
         }
+
+        // Journal entry for rollback
+        self.journal.push(StateChange::CodeChanged {
+            address: address.to_string(),
+            old_code_hash,
+            old_code,
+        });
+
         Ok(())
     }
 
@@ -330,6 +346,12 @@ impl StateManager {
                     }
                 }
             }
+            StateChange::CodeChanged { address, old_code_hash, old_code } => {
+                if let Some(acc) = self.accounts.get_mut(&address) {
+                    acc.code_hash = old_code_hash;
+                    acc.code = old_code;
+                }
+            }
         }
     }
 
@@ -338,15 +360,32 @@ impl StateManager {
     /// Compute state root hash (deterministic Merkle root of all accounts)
     pub fn state_root(&self) -> String {
         let mut h = <Sha256 as Digest>::new();
-        Digest::update(&mut h, b"ShadowDAG_StateRoot_v1");
+        Digest::update(&mut h, b"ShadowDAG_StateRoot_v2"); // v2 includes storage
 
         for (address, account) in &self.accounts {
             Digest::update(&mut h, address.as_bytes());
             Digest::update(&mut h, account.balance.to_le_bytes());
             Digest::update(&mut h, account.nonce.to_le_bytes());
             Digest::update(&mut h, account.code_hash.as_bytes());
+            // Include storage hash — different storage = different root
+            let storage_hash = self.compute_storage_hash(address);
+            Digest::update(&mut h, storage_hash.as_bytes());
         }
 
+        hex::encode(Digest::finalize(h))
+    }
+
+    /// Compute a deterministic hash of an account's storage entries.
+    fn compute_storage_hash(&self, address: &str) -> String {
+        let mut h = <Sha256 as Digest>::new();
+        Digest::update(&mut h, b"storage:");
+        if let Some(storage) = self.storage.get(address) {
+            // Sort keys for deterministic ordering (BTreeMap is already sorted)
+            for (key, value) in storage.iter() {
+                Digest::update(&mut h, key.as_bytes());
+                Digest::update(&mut h, value.as_bytes());
+            }
+        }
         hex::encode(Digest::finalize(h))
     }
 
