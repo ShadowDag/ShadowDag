@@ -198,6 +198,16 @@ impl Transaction {
             let pk_bytes = inp.pub_key.as_bytes();
             buf.extend_from_slice(&(pk_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(pk_bytes);
+
+            // Privacy fields (if present)
+            if let Some(ref ki) = inp.key_image {
+                buf.push(0x01); // marker: has key_image
+                let ki_bytes = ki.as_bytes();
+                buf.extend_from_slice(&(ki_bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(ki_bytes);
+            } else {
+                buf.push(0x00); // marker: no key_image
+            }
         }
 
         // 4. outputs — in original order (order matters for output indices)
@@ -209,6 +219,29 @@ impl Transaction {
             buf.extend_from_slice(addr_bytes);
             // amount: u64 LE
             buf.extend_from_slice(&out.amount.to_le_bytes());
+
+            // Privacy fields (if present)
+            if let Some(ref c) = out.commitment {
+                buf.push(0x01);
+                buf.extend_from_slice(&(c.len() as u32).to_le_bytes());
+                buf.extend_from_slice(c.as_bytes());
+            } else {
+                buf.push(0x00);
+            }
+            if let Some(ref rp) = out.range_proof {
+                buf.push(0x01);
+                buf.extend_from_slice(&(rp.len() as u32).to_le_bytes());
+                buf.extend_from_slice(rp.as_bytes());
+            } else {
+                buf.push(0x00);
+            }
+            if let Some(ref epk) = out.ephemeral_pubkey {
+                buf.push(0x01);
+                buf.extend_from_slice(&(epk.len() as u32).to_le_bytes());
+                buf.extend_from_slice(epk.as_bytes());
+            } else {
+                buf.push(0x00);
+            }
         }
 
         // 5. payload_hash — chain-state binding (replay protection)
