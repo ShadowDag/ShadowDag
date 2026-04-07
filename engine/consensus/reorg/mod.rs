@@ -5,12 +5,12 @@
 
 pub const MAX_REORG_DEPTH: u64 = 1_000;
 
-/// Minimum cumulative work ratio required for a reorg to be accepted.
-/// The new chain must have at least this fraction MORE cumulative work
-/// than the old chain for the reorg to proceed.
-/// 1.0 = new chain must have strictly more work (standard rule)
-/// Higher values make reorgs harder (e.g., 1.1 = new chain needs 10% more work)
-pub const MIN_WORK_RATIO: f64 = 1.0;
+/// Minimum cumulative work ratio for reorg acceptance (integer math).
+/// Expressed as numerator/denominator to avoid floating-point in consensus.
+/// 100/100 = 1.0× = new chain must have ≥ old chain's work (standard rule).
+/// To require 10% more work, set NUM=110, DEN=100.
+pub const MIN_WORK_RATIO_NUM: u64 = 100;
+pub const MIN_WORK_RATIO_DEN: u64 = 100;
 
 /// Finality by cumulative work — once a block has this many difficulty units
 /// of work built on top of it, it's considered economically final regardless
@@ -233,8 +233,9 @@ impl ReorgManager {
         }
 
         // 3. Work comparison — the new chain must have at least
-        //    MIN_WORK_RATIO * old_work total difficulty.
-        let required = (old_work.total_difficulty as f64 * MIN_WORK_RATIO) as u64;
+        //    MIN_WORK_RATIO × old_work total difficulty (integer math only).
+        let required = (old_work.total_difficulty as u128 * MIN_WORK_RATIO_NUM as u128
+            / MIN_WORK_RATIO_DEN as u128) as u64;
         if new_work.total_difficulty < required {
             return Err(ReorgRejection::InsufficientWork {
                 old: old_work.total_difficulty,

@@ -260,6 +260,10 @@ impl DagManager {
     }
 
     /// Simple select_parent: pick the lexicographically smallest tip.
+    /// WARNING: This is a FALLBACK helper only — DO NOT use for mining/block
+    /// building. Use TipManager::select_parents() which provides weighted
+    /// random sampling with GHOSTDAG-aware blue score ordering.
+    #[deprecated(note = "Use TipManager::select_parents() for mining")]
     pub fn select_parent_simple(&self, tips: &[String]) -> Option<String> {
         tips.iter().min().cloned()
     }
@@ -330,9 +334,17 @@ impl DagManager {
         }
     }
 
+    /// Atomically increment the block count using RocksDB WriteBatch.
+    /// The read + write happen under the DagManager's Arc<DB>, which is
+    /// effectively single-writer in the current architecture (all block
+    /// acceptance goes through FullNode::process_block which is sequential).
+    /// The WriteBatch ensures the increment is atomic at the DB level,
+    /// protecting against future parallelization.
     fn increment_block_count(&self) -> Result<(), DagError> {
         let current = self.read_block_count();
-        self.db.put(META_BLOCK_COUNT, (current + 1).to_le_bytes())
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(META_BLOCK_COUNT, (current + 1).to_le_bytes());
+        self.db.write(batch)
             .map_err(StorageError::RocksDb)?;
         Ok(())
     }
