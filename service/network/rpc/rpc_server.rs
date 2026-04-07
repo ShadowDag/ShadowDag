@@ -179,8 +179,12 @@ impl RpcState {
         if let Err(e) = db.put(key, password.as_bytes()) {
             slog_warn!("rpc", "admin_password_persist_failed", error => e);
         }
-        slog_warn!("rpc", "first_run_admin_password", password => &password);
-        slog_warn!("rpc", "first_run_admin_password_notice", note => "Save this password — it will not be shown again");
+        let masked = format!("{}...", &password[..4.min(password.len())]);
+        slog_warn!("rpc", "first_run_admin_password_generated", hint => masked);
+        eprintln!("╔══════════════════════════════════════════════════════╗");
+        eprintln!("║  RPC Admin Password (FIRST RUN — save this now):    ║");
+        eprintln!("║  {}  ║", password);
+        eprintln!("╚══════════════════════════════════════════════════════╝");
         password
     }
 

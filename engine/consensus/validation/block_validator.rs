@@ -359,6 +359,13 @@ impl BlockValidator {
     /// parents, which couples timestamps to the DAG structure. In a DAG,
     /// multiple parents provide independent timestamp witnesses — an
     /// attacker would need to control ALL tips to manipulate the band.
+    /// NOTE ON WALL-CLOCK DEPENDENCY (R1, R2):
+    /// SystemTime::now() is intentionally used as an anchor to prevent
+    /// timestamp manipulation. This is standard blockchain practice
+    /// (Bitcoin uses ±2 hours). Nodes with severely drifted clocks will
+    /// reject valid blocks, but this is the node operator's responsibility
+    /// (NTP is assumed). The DAG-based rules (R3–R6) provide secondary
+    /// protection independent of wall-clock accuracy.
     fn validate_timestamp(block: &Block, ancestors: &[u64]) -> Result<(), ConsensusError> {
 
         let now = SystemTime::now()
