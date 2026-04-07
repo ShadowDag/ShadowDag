@@ -95,10 +95,12 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
         slog_info!("boot", "genesis_hash", hash => genesis.header.hash);
 
         let _ = dag.add_block(&genesis);
-        blocks.save_block(&genesis);
+        if !blocks.save_block(&genesis) {
+            return Err(NodeError::Init("failed to save genesis block".to_string()));
+        }
 
         // Apply genesis UTXO state (coinbase outputs become spendable)
-        // Update best_hash ONLY after UTXO apply succeeds (atomicity)
+        // Update best_hash ONLY after BOTH save_block AND apply_block_full succeed (atomicity)
         if let Err(e) = utxo_set.apply_block_full(&genesis, 0) {
             slog_error!("boot", "genesis_utxo_failed", error => e);
             return Err(NodeError::Init(e.to_string()));

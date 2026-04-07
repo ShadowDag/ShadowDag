@@ -453,12 +453,28 @@ impl RpcServer {
         let mut request_line = String::new();
         reader.read_line(&mut request_line).map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
 
+        let req = request_line.trim();
+        if !(req.starts_with("POST /") || req.starts_with("POST / ")) {
+            Self::write_http_response(&mut stream, 405, json!({"error": "Only POST is allowed"}))?;
+            return Ok(());
+        }
+
         let mut content_length: usize = 0;
         let mut auth_token: Option<String> = None;
         let mut line = String::new();
+        let mut header_lines = 0usize;
+        let mut total_header_bytes = 0usize;
+        const MAX_HEADER_LINES: usize = 64;
+        const MAX_HEADER_BYTES: usize = 16 * 1024;
         loop {
             line.clear();
             reader.read_line(&mut line).map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+            header_lines += 1;
+            total_header_bytes += line.len();
+            if header_lines > MAX_HEADER_LINES || total_header_bytes > MAX_HEADER_BYTES {
+                Self::write_http_response(&mut stream, 431, json!({"error": "Request headers too large"}))?;
+                return Ok(());
+            }
             let trimmed = line.trim();
             if trimmed.is_empty() { break; }
             if let Some(v) = trimmed.strip_prefix("Content-Length:") {
@@ -523,7 +539,8 @@ impl RpcServer {
 
         let resp_json = serde_json::to_value(&response)
             .unwrap_or_else(|_| json!({"error": "internal"}));
-        Self::write_http_response(&mut stream, 200, resp_json)?;
+        let status = Self::response_http_status(&resp_json);
+        Self::write_http_response(&mut stream, status, resp_json)?;
         Ok(())
     }
 
@@ -544,6 +561,22 @@ impl RpcServer {
             }
             Err(_) => true,
         }
+    }
+
+    fn response_http_status(resp_json: &Value) -> u16 {
+        if let Some(err) = resp_json.get("error") {
+            if let Some(code) = err.get("code").and_then(|c| c.as_i64()) {
+                return match code {
+                    -32700 | -32600 => 400,  // Parse/invalid request
+                    -32601 => 404,           // Method not found
+                    -32001 => 401,           // Unauthorized
+                    -32005 => 429,           // Rate limited
+                    _ => 500,                // Internal error
+                };
+            }
+            return 500;
+        }
+        200
     }
 
     fn write_http_response(
