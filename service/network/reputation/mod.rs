@@ -187,7 +187,7 @@ impl ReputationManager {
         let _now = now_secs();
         // Use message count as a proxy for connection duration
         // (total_sent + total_ok) as a proxy for connection duration
-        let hours_active = (rec.total_ok + rec.total_sent) / 3600_u64.max(1);
+        let hours_active = (rec.total_ok + rec.total_sent) / 3600_u64;
         let age_bonus = ((hours_active as i32) * AGE_BONUS_PER_HOUR).min(MAX_AGE_BONUS);
 
         // Reliability bonus: high reliability gets extra points

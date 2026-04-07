@@ -237,7 +237,7 @@ impl RpcState {
         // NOTE: no data_dir available here — falls back to cwd for password file.
         let admin_password = Self::load_or_create_admin_password(&db, None);
         let block_store = BlockStore::new(db.clone())
-            .map_err(|e| NetworkError::Storage(e))?;
+            .map_err(NetworkError::Storage)?;
         // NO fallback — RPC MUST use the same UTXO state as the node.
         // If UTXO store fails, the RPC cannot serve correct data.
         let store = Arc::new(UtxoStore::new(db.clone())
@@ -272,7 +272,7 @@ impl RpcState {
         };
         let admin_password = Self::load_or_create_admin_password(&db, data_dir);
         let block_store = BlockStore::new(db.clone())
-            .map_err(|e| NetworkError::Storage(e))?;
+            .map_err(NetworkError::Storage)?;
         let store = Arc::new(UtxoStore::new(db.clone())
             .map_err(|e| {
                 slog_error!("rpc", "utxo_store_init_failed", error => e);
@@ -542,7 +542,7 @@ impl RpcServer {
                 // verified via RpcAuthManager. Read-only methods are open.
                 // EXCEPTION: localhost (127.0.0.1) is trusted for submitblock
                 // so the local miner can submit without auth overhead.
-                let is_localhost = peer_ip.map_or(false, |ip| ip.is_loopback());
+                let is_localhost = peer_ip.is_some_and(|ip| ip.is_loopback());
                 if requires_auth(&req.method) && !(is_localhost && req.method == "submitblock") {
                     match &auth_token {
                         Some(token) => {

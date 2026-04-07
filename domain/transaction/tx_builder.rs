@@ -197,6 +197,7 @@ pub fn build_tx_hash_from_refs(
 
 /// Build a batch of transactions efficiently.
 /// Useful for exchanges, payment processors, and UTXO consolidation.
+#[allow(clippy::type_complexity)]
 pub fn build_batch_transactions(
     private_key_hex: &str,
     public_key_hex:  &str,

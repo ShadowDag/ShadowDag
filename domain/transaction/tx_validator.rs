@@ -396,14 +396,13 @@ impl TxValidator {
         // Mandatory check: ring signatures must be valid in the consensus path.
         // block_validator already checks this, but tx_validator must also enforce
         // it so that mempool admission and standalone TX validation are safe.
-        if tx.is_confidential() {
-            if !RingValidator::validate(tx) {
+        if tx.is_confidential()
+            && !RingValidator::validate(tx) {
                 return Err(StorageError::Other(format!(
                     "ring signature verification failed for confidential tx {}",
                     tx.hash
                 )));
             }
-        }
 
         Ok(())
     }

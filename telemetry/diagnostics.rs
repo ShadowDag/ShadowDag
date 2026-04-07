@@ -69,7 +69,7 @@ pub fn collect() -> String {
 
     if let Ok(map) = hooks().lock() {
         for (name, hook) in map.iter() {
-            let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook()))
+            let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook))
                 .unwrap_or_else(|_| format!("\"<panic in {} diagnostic hook>\"", name));
             subsystems.push(format!("\"{}\":{}", name, output));
         }
@@ -105,7 +105,7 @@ pub fn dump_pretty() -> String {
     if let Ok(map) = hooks().lock() {
         for (name, hook) in map.iter() {
             lines.push(format!("── {} ──", name));
-            let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook()))
+            let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook))
                 .unwrap_or_else(|_| format!("<panic in {} hook>", name));
             lines.push(output);
             lines.push(String::new());

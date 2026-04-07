@@ -23,7 +23,6 @@ use shadowdag::domain::block::block_body::BlockBody;
 use shadowdag::domain::block::merkle_tree::MerkleTree;
 use shadowdag::domain::transaction::transaction::{Transaction, TxOutput, TxType};
 use sha2::{Sha256, Digest};
-use serde_json;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
@@ -62,14 +61,14 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         .map(|n| n.get())
         .unwrap_or(4);
     let threads: usize = parse_flag(args, "--threads",
-        &default_threads.to_string()).parse().unwrap_or(4).min(256).max(1);
+        &default_threads.to_string()).parse().unwrap_or(4).clamp(1, 256);
 
     let rpc_port = match network {
         NetworkMode::Testnet => 19332,
         NetworkMode::Regtest => 29332,
         _ => 9332,
     };
-    let rpc_addr = parse_flag(&args, "--rpc", &format!("127.0.0.1:{}", rpc_port));
+    let rpc_addr = parse_flag(args, "--rpc", &format!("127.0.0.1:{}", rpc_port));
 
     let owner_address = ConsensusParams::OWNER_REWARD_ADDRESS.to_string();
     let genesis = create_genesis_block_for(&network);
@@ -230,7 +229,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
                     nonce = nonce.wrapping_add(1);
 
                     // Progress report (thread 0 only)
-                    if thread_id == 0 && nonce.wrapping_sub(start_nonce) % 500_000 == 0 {
+                    if thread_id == 0 && nonce.wrapping_sub(start_nonce).is_multiple_of(500_000) {
                         let elapsed = start.elapsed().as_secs_f64();
                         let total = t_hash_count.load(Ordering::Relaxed);
                         let rate = total as f64 / elapsed.max(0.001);
@@ -305,7 +304,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         }
 
         // Stats every 10 blocks
-        if total_mined % 10 == 0 {
+        if total_mined.is_multiple_of(10) {
             let session_secs = session_start.elapsed().as_secs_f64();
             let avg_rate = if session_secs > 0.0 { total_mined as f64 / session_secs * 60.0 } else { 0.0 };
             let reward_sdag = emission as f64 / 100_000_000.0;

@@ -75,7 +75,7 @@ impl ConfirmedTxStore {
             let mut ctx_key = Vec::with_capacity(PFX_CTX.len() + tx_hash.len());
             ctx_key.extend_from_slice(PFX_CTX);
             ctx_key.extend_from_slice(tx_hash.as_bytes());
-            batch.put(&ctx_key, &height_bytes);
+            batch.put(&ctx_key, height_bytes);
 
             // btx:height:tx_hash → [] (for pruning by height)
             let mut btx_key = Vec::with_capacity(PFX_BTX.len() + 8 + 1 + tx_hash.len());
@@ -83,7 +83,7 @@ impl ConfirmedTxStore {
             btx_key.extend_from_slice(&height_bytes);
             btx_key.push(b':');
             btx_key.extend_from_slice(tx_hash.as_bytes());
-            batch.put(&btx_key, &[]);
+            batch.put(&btx_key, []);
         }
 
         self.db

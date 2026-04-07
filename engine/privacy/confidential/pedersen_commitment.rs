@@ -102,8 +102,8 @@ impl PedersenCommitment {
         let mut h = Sha256::new();
         h.update(b"ShadowDAG_Blinding_v2");
         h.update(master_secret);
-        h.update(&amount.to_le_bytes());
-        h.update(&output_index.to_le_bytes());
+        h.update(amount.to_le_bytes());
+        h.update(output_index.to_le_bytes());
         let hash: [u8; 32] = h.finalize().into();
         Option::from(Scalar::from_canonical_bytes(hash))
             .ok_or(CryptoError::NonCanonicalScalar)

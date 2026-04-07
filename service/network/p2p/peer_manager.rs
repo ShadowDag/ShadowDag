@@ -374,7 +374,7 @@ impl PeerManager {
         let mut batch = WriteBatch::default();
         batch.put(format!("{}{}", PFX_BAN, addr).as_bytes(), until.to_le_bytes());
         batch.put(format!("{}{}", PFX_BAN_COUNT, addr).as_bytes(), new_count.to_le_bytes());
-        batch.put(format!("{}{}", PFX_BAN_CAT, addr).as_bytes(), &[category as u8]);
+        batch.put(format!("{}{}", PFX_BAN_CAT, addr).as_bytes(), [category as u8]);
         let _ = db.write(batch);
         slog_warn!("p2p", "peer_banned", addr => addr, duration_secs => duration, ban_count => new_count, category => &format!("{:?}", category), reason => reason);
     }

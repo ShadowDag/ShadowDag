@@ -567,7 +567,7 @@ impl UtxoSet {
                     let key_str = key.to_string();
                     let addr_key = format!("addr:{}:{}", output.address, key_str);
                     ops.push(BatchWrite::Put { key: addr_key.as_bytes().to_vec(), value: key.as_ref().to_vec() });
-                    let meta_key = format!("cb_height:");
+                    let meta_key = "cb_height:".to_string();
                     let mut meta_key_bytes = meta_key.into_bytes();
                     meta_key_bytes.extend_from_slice(key.as_ref());
                     ops.push(BatchWrite::Put { key: meta_key_bytes.clone(), value: block_height.to_le_bytes().to_vec() });

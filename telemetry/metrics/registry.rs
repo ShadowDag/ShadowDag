@@ -150,6 +150,12 @@ pub struct MetricsRegistry {
     start_time: Instant,
 }
 
+impl Default for MetricsRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MetricsRegistry {
     pub fn new() -> Self {
         Self {

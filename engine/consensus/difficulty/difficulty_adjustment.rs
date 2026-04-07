@@ -108,7 +108,7 @@ impl DifficultyAdjustment {
         height: u64,
         window_timestamps: &[u64],
     ) -> u64 {
-        if height == 0 || height % RETARGET_BLOCK_INTERVAL != 0 {
+        if height == 0 || !height.is_multiple_of(RETARGET_BLOCK_INTERVAL) {
             return self.get_difficulty();
         }
 

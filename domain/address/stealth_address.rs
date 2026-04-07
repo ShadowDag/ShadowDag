@@ -60,7 +60,7 @@ pub fn derive_hash_scalar_with_context(
     h.update(shared_secret.compress().as_bytes());
     if !tx_hash.is_empty() || output_index != 0 {
         h.update(tx_hash.as_bytes());
-        h.update(&(output_index as u64).to_le_bytes());
+        h.update((output_index as u64).to_le_bytes());
     }
     let hash: [u8; 32] = h.finalize().into();
     Option::from(Scalar::from_canonical_bytes(hash))

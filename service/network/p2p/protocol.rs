@@ -675,11 +675,7 @@ impl VersionPayload {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let drift = if self.timestamp > now {
-            self.timestamp - now
-        } else {
-            now - self.timestamp
-        };
+        let drift = self.timestamp.abs_diff(now);
         if drift > MAX_TIMESTAMP_DRIFT_SECS {
             return Err(ProtocolError::new(
                 ProtocolErrorKind::TimestampDrift,
@@ -1267,7 +1263,7 @@ pub fn validate_hash_hex(hash: &str) -> Result<(), ProtocolError> {
             50,
         ));
     }
-    if !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F')) {
+    if !hash.bytes().all(|b: u8| b.is_ascii_hexdigit()) {
         return Err(ProtocolError::new(
             ProtocolErrorKind::FieldViolation,
             "hash contains non-hex characters",

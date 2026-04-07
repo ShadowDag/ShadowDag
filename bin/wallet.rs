@@ -389,7 +389,7 @@ fn validate_address(addr: &str) -> Result<(), String> {
     };
 
     if !valid_prefix {
-        return Err(format!("Invalid address prefix (expected SD1/ST1/SR1)"));
+        return Err("Invalid address prefix (expected SD1/ST1/SR1)".to_string());
     }
 
     let hex_part = &addr[prefix_len..];
