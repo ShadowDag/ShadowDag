@@ -86,6 +86,13 @@ const MAX_CACHE_SIZE: usize = 500_000;
 /// Eviction batch when cache is full
 const CACHE_EVICT_BATCH: usize = 50_000;
 
+/// Warning threshold for total UTXO set size in the database.
+/// When the UTXO set exceeds this count, a warning is logged to alert
+/// operators about potential resource pressure. This is NOT a hard limit
+/// (rejecting valid blocks would break consensus), but a monitoring signal.
+#[allow(dead_code)]
+pub const UTXO_SET_WARNING_THRESHOLD: usize = 50_000_000;
+
 pub struct UtxoSet {
     store: Arc<dyn UtxoBackend>,
     cache: RwLock<HashMap<UtxoKey, Utxo>>,
