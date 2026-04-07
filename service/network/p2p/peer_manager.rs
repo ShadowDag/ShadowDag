@@ -269,49 +269,49 @@ impl PeerManager {
 
     pub fn update_peer_height(&self, addr: &str, height: u64) {
         let db = self.lock_db();
-        // Update side key
-        let _ = db.put(format!("{}{}", PFX_HEIGHT, addr).as_bytes(), height.to_le_bytes());
-        // Also update the serialized record
+        let mut batch = WriteBatch::default();
+        batch.put(format!("{}{}", PFX_HEIGHT, addr).as_bytes(), height.to_le_bytes());
         if let Ok(Some(data)) = db.get(format!("{}{}", PFX_PEER, addr).as_bytes()) {
             if let Ok(mut rec) = bincode::deserialize::<PeerRecord>(&data) {
                 rec.best_height = height;
                 if let Ok(new_data) = bincode::serialize(&rec) {
-                    let _ = db.put(format!("{}{}", PFX_PEER, addr).as_bytes(), &new_data);
+                    batch.put(format!("{}{}", PFX_PEER, addr).as_bytes(), &new_data);
                 }
             }
         }
+        let _ = db.write(batch);
     }
 
     pub fn update_peer_latency(&self, addr: &str, latency_ms: u64) {
         let db = self.lock_db();
-        // Update side key
-        let _ = db.put(format!("{}{}", PFX_LATENCY, addr).as_bytes(), latency_ms.to_le_bytes());
-        // Also update the serialized record
+        let mut batch = WriteBatch::default();
+        batch.put(format!("{}{}", PFX_LATENCY, addr).as_bytes(), latency_ms.to_le_bytes());
         if let Ok(Some(data)) = db.get(format!("{}{}", PFX_PEER, addr).as_bytes()) {
             if let Ok(mut rec) = bincode::deserialize::<PeerRecord>(&data) {
                 rec.latency_ms = latency_ms;
                 if let Ok(new_data) = bincode::serialize(&rec) {
-                    let _ = db.put(format!("{}{}", PFX_PEER, addr).as_bytes(), &new_data);
+                    batch.put(format!("{}{}", PFX_PEER, addr).as_bytes(), &new_data);
                 }
             }
         }
+        let _ = db.write(batch);
     }
 
     pub fn touch_peer(&self, addr: &str) {
         let now = unix_now();
         let db = self.lock_db();
-        // Update side key
-        let _ = db.put(format!("{}{}", PFX_LAST_SEEN, addr).as_bytes(),
+        let mut batch = WriteBatch::default();
+        batch.put(format!("{}{}", PFX_LAST_SEEN, addr).as_bytes(),
                         now.to_le_bytes());
-        // Also update the serialized record
         if let Ok(Some(data)) = db.get(format!("{}{}", PFX_PEER, addr).as_bytes()) {
             if let Ok(mut rec) = bincode::deserialize::<PeerRecord>(&data) {
                 rec.last_seen = now;
                 if let Ok(new_data) = bincode::serialize(&rec) {
-                    let _ = db.put(format!("{}{}", PFX_PEER, addr).as_bytes(), &new_data);
+                    batch.put(format!("{}{}", PFX_PEER, addr).as_bytes(), &new_data);
                 }
             }
         }
+        let _ = db.write(batch);
     }
 
     pub fn get_peers(&self) -> Vec<String> {
@@ -339,8 +339,12 @@ impl PeerManager {
 
     pub fn get_best_peers(&self, limit: usize) -> Vec<PeerRecord> {
         let mut peers = self.get_peer_records();
-        peers.retain(|p| !self.is_banned(&p.addr));
-        peers.sort_by_key(|p| std::cmp::Reverse(p.health_score()));
+        peers.retain(|p| !self.is_banned(&p.addr) && p.is_active());
+        peers.sort_by(|a, b| {
+            b.health_score().cmp(&a.health_score())
+                .then_with(|| b.best_height.cmp(&a.best_height))
+                .then_with(|| a.addr.cmp(&b.addr))
+        });
         peers.truncate(limit);
         peers
     }

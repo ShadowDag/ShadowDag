@@ -69,22 +69,10 @@ impl DiskMonitor {
     }
 
     /// Get free space in bytes (platform-specific)
-    fn get_free_space(path: &str) -> Option<u64> {
-        // Use std::fs metadata to estimate — cross-platform approach
-        // On real systems, would use statvfs (Unix) or GetDiskFreeSpaceEx (Windows)
-        let _meta = std::fs::metadata(path).ok()?;
-        // Fallback: assume plenty of space if we can't determine
-        // In production: use platform-specific APIs
-        #[cfg(target_os = "windows")]
-        {
-            // Windows: use available_space from std (nightly) or winapi
-            // For now, return a safe estimate based on temp file creation
-            Some(100_000_000_000) // Assume 100GB if can't determine
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            Some(100_000_000_000) // Placeholder
-        }
+    fn get_free_space(_path: &str) -> Option<u64> {
+        // Platform-specific implementation needed
+        // Return None (unknown) instead of fake value
+        None
     }
 }
 
