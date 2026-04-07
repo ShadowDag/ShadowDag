@@ -201,6 +201,7 @@ impl DaemonNode {
             self.cfg.rpc_port,
             &self.cfg.peers_path_str(),
             self.db.clone(),
+            Some(&self.cfg.data_dir),
         ).map_err(|e| NodeError::Init(format!("Failed to init RPC server: {}", e)))?;
         rpc.set_network_name(self.cfg.network.name());
         rpc.set_network_ports(self.cfg.p2p_port, self.cfg.rpc_port);
@@ -545,6 +546,12 @@ impl DaemonNode {
     }
 
     /// Rebuild DAG topology from all blocks in BlockStore.
+    ///
+    /// LIMITATION: DagManager does not expose a clear_all() method, so stale
+    /// entries from the previous state may persist.  add_block_validated()
+    /// is idempotent for existing hashes, so the rebuild is still correct,
+    /// but orphaned entries from a corrupted prior state will remain until
+    /// a full re-index (--reindex) is performed.
     fn rebuild_dag(&self) -> Result<(), NodeError> {
         slog_info!("daemon", "dag_rebuild_start");
         let blocks = self.block_store.get_all_blocks_sorted_by_height();

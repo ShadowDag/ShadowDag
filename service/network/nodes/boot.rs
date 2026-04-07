@@ -128,9 +128,10 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
         .map_err(|e| NodeError::Init(e.to_string()))?;
 
     // Use network-specific peers path to prevent cross-network contamination
-    let rpc = RpcServer::new_for_network(cfg.rpc_port, &cfg.peers_path_str(), db.clone())
+    let rpc = RpcServer::new_for_network(cfg.rpc_port, &cfg.peers_path_str(), db.clone(), Some(&cfg.data_dir))
         .map_err(|e| NodeError::Init(format!("Failed to init RPC server: {}", e)))?;
     rpc.set_network_name(&format!("shadowdag-{}", cfg.network.name()));
+    rpc.set_network_ports(cfg.p2p_port, cfg.rpc_port);
     rpc.start().map_err(|e| NodeError::Init(format!("RPC start failed: {}", e)))?;
     slog_info!("boot", "rpc_server_started", port => cfg.rpc_port);
 

@@ -163,7 +163,10 @@ impl RpcState {
 
     /// Load admin password from RocksDB, or generate + persist on first run.
     /// This ensures the password survives restarts.
-    fn load_or_create_admin_password(db: &Arc<DB>) -> String {
+    ///
+    /// `data_dir` — directory to write the `rpc_password` file into.
+    /// When `None`, falls back to the current working directory (legacy behaviour).
+    fn load_or_create_admin_password(db: &Arc<DB>, data_dir: Option<&std::path::Path>) -> String {
         let key = b"rpc:admin_password";
         // Try to load existing password
         if let Ok(Some(data)) = db.get(key) {
@@ -184,8 +187,12 @@ impl RpcState {
         // SECURITY: Never log the full password to stderr/stdout (captured by
         // log aggregators, process monitors, shell history). Write to a
         // restricted file instead, and print only a masked hint to console.
-        // Attempt to write password to a file with restricted permissions
-        if let Ok(base) = std::env::current_dir() {
+        // Use the node's data_dir so the file lives next to the DB, not in
+        // whichever directory the process happened to start from.
+        let base_dir = data_dir
+            .map(|p| p.to_path_buf())
+            .or_else(|| std::env::current_dir().ok());
+        if let Some(base) = base_dir {
             let pw_path = base.join("rpc_password");
             eprintln!("╔══════════════════════════════════════════════════════╗");
             eprintln!("║  RPC Admin Password generated (first run)           ║");
@@ -214,7 +221,8 @@ impl RpcState {
     pub fn new(db: Arc<DB>) -> Result<Self, NetworkError> {
         // Persistent admin password: stored in RocksDB under "rpc:admin_password"
         // First run: generate + store. Subsequent runs: load from DB.
-        let admin_password = Self::load_or_create_admin_password(&db);
+        // NOTE: no data_dir available here — falls back to cwd for password file.
+        let admin_password = Self::load_or_create_admin_password(&db, None);
         let block_store = BlockStore::new(db.clone())
             .map_err(|e| NetworkError::Storage(e))?;
         // NO fallback — RPC MUST use the same UTXO state as the node.
@@ -243,13 +251,13 @@ impl RpcState {
         })
     }
 
-    pub fn new_with_peers_path(peers_path: &str, db: Arc<DB>) -> Result<Self, NetworkError> {
+    pub fn new_with_peers_path(peers_path: &str, db: Arc<DB>, data_dir: Option<&std::path::Path>) -> Result<Self, NetworkError> {
         let peer_manager = match PeerManager::new(peers_path) {
             Some(pm) => pm,
             None => PeerManager::new_default()
                 .map_err(|e| NetworkError::Other(format!("PeerManager init failed: {}", e)))?,
         };
-        let admin_password = Self::load_or_create_admin_password(&db);
+        let admin_password = Self::load_or_create_admin_password(&db, data_dir);
         let block_store = BlockStore::new(db.clone())
             .map_err(|e| NetworkError::Storage(e))?;
         let store = Arc::new(UtxoStore::new(db.clone())
@@ -290,8 +298,12 @@ impl RpcState {
                 self.best_height = block.header.height;
                 self.best_hash = best_hash;
             } else {
-                // Best hash exists but block is missing — set hash anyway
-                self.best_hash = best_hash;
+                // Best hash exists but block is missing — BlockStore is inconsistent.
+                // Clear state instead of leaving it half-updated (hash set but height stale).
+                slog_error!("rpc", "update_from_chain_block_missing",
+                    best_hash => &best_hash[..std::cmp::min(16, best_hash.len())]);
+                self.best_height = 0;
+                self.best_hash = String::new();
             }
         }
         // If no best hash in store, state stays at defaults (height=0, hash="")
@@ -336,9 +348,9 @@ impl RpcServer {
         })
     }
 
-    pub fn new_for_network(port: u16, peers_path: &str, db: Arc<DB>) -> Result<Self, NetworkError> {
+    pub fn new_for_network(port: u16, peers_path: &str, db: Arc<DB>, data_dir: Option<&std::path::Path>) -> Result<Self, NetworkError> {
         Ok(Self {
-            state: Arc::new(Mutex::new(RpcState::new_with_peers_path(peers_path, db)?)),
+            state: Arc::new(Mutex::new(RpcState::new_with_peers_path(peers_path, db, data_dir)?)),
             port,
             rate_table:       Arc::new(Mutex::new(HashMap::new())),
             max_request_size: MAX_REQUEST_SIZE,
@@ -1084,10 +1096,11 @@ impl RpcServer {
     }
 
     fn cmd_getmininginfo(id: Value, state: &SharedState) -> RpcResponse {
+        use crate::service::network::nodes::full_node::get_next_difficulty;
         match state.lock() {
             Ok(mut s) => { s.update_from_chain(); RpcResponse::ok(id, json!({
                 "blocks":       s.best_height,
-                "difficulty":   ConsensusParams::GENESIS_DIFFICULTY,
+                "difficulty":   get_next_difficulty(),
                 "block_reward": ConsensusParams::BLOCK_REWARD,
                 "miner_pct":    ConsensusParams::MINER_PERCENT,
                 "network":      s.network_name,
@@ -3077,7 +3090,7 @@ mod tests {
         let path = temp_db_path();
         let node_db = NodeDB::new(&path).unwrap();
         let peers_path = format!("{}_peers", path);
-        RpcServer::new_for_network(0, &peers_path, node_db.shared()).unwrap()
+        RpcServer::new_for_network(0, &peers_path, node_db.shared(), None).unwrap()
     }
 
     fn call(server: &RpcServer, method: &str) -> Value {

@@ -24,7 +24,7 @@ mod tests {
         let path = temp_db_path();
         let node_db = NodeDB::new(&path).unwrap();
         let peers_path = format!("{}_peers", path);
-        RpcServer::new_for_network(0, &peers_path, node_db.shared()).unwrap()
+        RpcServer::new_for_network(0, &peers_path, node_db.shared(), None).unwrap()
     }
 
     fn rpc_call(server: &mut RpcServer, method: &str, params: Vec<Value>) -> Value {
