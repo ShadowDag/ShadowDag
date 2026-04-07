@@ -68,7 +68,8 @@ pub fn generate_address(public_key_hex: &str, network: &str) -> String {
     let prefix = match network {
         "mainnet" => "SD1",
         "testnet" => "ST1",
-        _         => "SR1",
+        "regtest" => "SR1",
+        other => panic!("Unknown network '{}' — expected mainnet/testnet/regtest", other),
     };
 
     let pk_bytes = hex::decode(public_key_hex).unwrap_or_default();
@@ -228,8 +229,10 @@ pub fn parse_amount(sdag_str: &str) -> Result<u64, VmError> {
         }
         2 => {
             let whole: u64 = parts[0].parse().map_err(|e| VmError::Other(format!("{}", e)))?;
+            if parts[1].len() > 8 {
+                return Err(VmError::Other("Max 8 decimal places".to_string()));
+            }
             let frac_str = format!("{:0<8}", parts[1]);
-            if frac_str.len() > 8 { return Err(VmError::Other("Max 8 decimals".to_string())); }
             let frac: u64 = frac_str[..8].parse().map_err(|e| VmError::Other(format!("{}", e)))?;
             whole.checked_mul(100_000_000)
                 .and_then(|w| w.checked_add(frac))

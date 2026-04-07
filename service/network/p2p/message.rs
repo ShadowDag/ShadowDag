@@ -9,6 +9,8 @@ use serde::{Serialize, Deserialize};
 // for backward compatibility.
 pub use crate::domain::types::peer_address::PeerAddress;
 
+/// DEPRECATED: Use P2PMessage from p2p.rs for wire protocol.
+/// NetworkMessage is retained for JSON-based APIs only.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "payload")]
 pub enum NetworkMessage {
