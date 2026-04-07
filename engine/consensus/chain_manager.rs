@@ -77,14 +77,18 @@ impl ChainManager {
     ///
     /// Two layers of protection:
     ///   1. Checkpoint enforcement: cannot reorg below the last checkpoint
-    ///   2. Finality depth: cannot reorg deeper than FINALITY_DEPTH blocks
+    ///   2. Finality depth: cannot reorg deeper than `finality_depth` blocks
     ///
     /// Both checks must pass for the reorg to be allowed.
+    ///
+    /// `finality_depth` should come from `FinalityManager::current_depth()` so
+    /// it adapts dynamically to network conditions (k-cluster finality).
     #[inline(always)]
     pub fn reorg_allowed(
         fork_height: u64,
         _new_tip_hash: &str,
         new_tip_height: u64,
+        finality_depth: u64,
     ) -> bool {
         // Layer 1: Checkpoint enforcement — cannot reorg below last checkpoint
         if let Some(cp) = Checkpoints::last_checkpoint() {
@@ -93,10 +97,9 @@ impl ChainManager {
             }
         }
 
-        // Layer 2: Finality depth — cannot reorg deeper than FINALITY_DEPTH
-        use crate::engine::consensus::reorg::FINALITY_DEPTH;
-        if new_tip_height > FINALITY_DEPTH {
-            let finality_height = new_tip_height - FINALITY_DEPTH;
+        // Layer 2: Finality depth — cannot reorg deeper than finality_depth
+        if new_tip_height > finality_depth {
+            let finality_height = new_tip_height - finality_depth;
             if fork_height < finality_height {
                 return false;
             }
@@ -203,12 +206,12 @@ mod tests {
 
     #[test]
     fn reorg_allowed_above_checkpoint() {
-        assert!(ChainManager::reorg_allowed(1, "any", 5));
+        assert!(ChainManager::reorg_allowed(1, "any", 5, 200));
     }
 
     #[test]
-    fn reorg_blocked_below_checkpoint() {
-        assert!(ChainManager::reorg_allowed(0, "any", 1));
+    fn reorg_at_genesis_height_allowed() {
+        assert!(ChainManager::reorg_allowed(0, "any", 1, 200));
     }
 
     #[test]

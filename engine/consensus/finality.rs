@@ -22,7 +22,7 @@
 // increases up to MAX_FINALITY_DEPTH (2000) for stronger guarantees.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::{slog_info, slog_warn};
@@ -99,6 +99,8 @@ pub struct FinalityManager {
     epoch_width_sum: u64,
     /// Number of distinct heights observed in the current epoch.
     epoch_height_count: u64,
+    /// Set of heights already seen in the current epoch (for deduplication).
+    epoch_seen_heights: HashSet<u64>,
 
     // ── History ──
     /// Rolling window of per-epoch metrics.
@@ -128,6 +130,7 @@ impl FinalityManager {
             epoch_total_count: 0,
             epoch_width_sum: 0,
             epoch_height_count: 0,
+            epoch_seen_heights: HashSet::new(),
             epoch_history: VecDeque::with_capacity(HISTORY_WINDOW + 1),
             last_checkpoint: None,
             checkpoints: Vec::new(),
@@ -237,7 +240,9 @@ impl FinalityManager {
             self.epoch_blue_count += 1;
         }
         self.epoch_width_sum += dag_width_at_height;
-        self.epoch_height_count += 1;
+        if self.epoch_seen_heights.insert(height) {
+            self.epoch_height_count += 1;
+        }
 
         // Check if epoch boundary reached
         if self.epoch_total_count >= FINALITY_EPOCH {
@@ -326,6 +331,7 @@ impl FinalityManager {
         self.epoch_total_count = 0;
         self.epoch_width_sum = 0;
         self.epoch_height_count = 0;
+        self.epoch_seen_heights.clear();
     }
 
     // ── Auto-checkpoints ────────────────────────────────────────────────
