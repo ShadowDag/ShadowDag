@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::errors::DagError;
+use crate::slog_warn;
 
 pub const MAX_TRAVERSAL_DEPTH: usize = 10_000;
 
@@ -126,7 +127,10 @@ impl DagTraversal {
                         r.retain(|h| h != hash);
                         r
                     }
-                    Err(_) => Vec::new(),
+                    Err(e) => {
+                        slog_warn!("dag", "topo_sort_failed_in_ancestors", error => e.to_string());
+                        Vec::new()
+                    }
                 }
             }
         }

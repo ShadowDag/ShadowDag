@@ -130,7 +130,13 @@ impl Transaction {
             .expect("output sum overflow — malformed transaction")
     }
 
-    /// Produce a canonical, deterministic byte representation of this transaction.
+    /// Canonical serialization for transaction hashing (txid computation).
+    ///
+    /// IMPORTANT: Signatures are intentionally EXCLUDED from canonical_bytes
+    /// to prevent circular hashing (signature signs the hash, hash includes
+    /// the data). This is the same design as Bitcoin's SegWit: the txid
+    /// commits to the transaction structure, and signatures are verified
+    /// separately via signing_message().
     ///
     /// Fields are serialized in a fixed order. Integers use little-endian encoding.
     /// Strings are length-prefixed UTF-8 (u32 LE length + bytes).
