@@ -1294,7 +1294,7 @@ pub fn build_version_payload(
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
-        user_agent: format!("ShadowDAG/0.1.0 {}", node_id),
+        user_agent: format!("ShadowDAG/{} {}", env!("CARGO_PKG_VERSION"), node_id),
         bps,
         chain_id:   CHAIN_ID,
         services:   DEFAULT_SERVICES,
