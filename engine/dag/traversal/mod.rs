@@ -5,6 +5,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use crate::errors::DagError;
+
 pub const MAX_TRAVERSAL_DEPTH: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,9 +121,13 @@ impl DagTraversal {
             TraversalOrder::BreadthFirst => self.bfs(hash),
             TraversalOrder::DepthFirst => self.dfs(hash),
             TraversalOrder::TopologicalSort => {
-                let mut r = self.topo(hash);
-                r.retain(|h| h != hash);
-                r
+                match self.topo(hash) {
+                    Ok(mut r) => {
+                        r.retain(|h| h != hash);
+                        r
+                    }
+                    Err(_) => Vec::new(),
+                }
             }
         }
     }
@@ -175,7 +181,7 @@ impl DagTraversal {
     // ─────────────────────────────────────────
     // TOPO SORT (DETERMINISTIC)
     // ─────────────────────────────────────────
-    fn topo(&self, start: &str) -> Vec<String> {
+    fn topo(&self, start: &str) -> Result<Vec<String>, DagError> {
         let mut in_degree = HashMap::new();
         let mut queue = VecDeque::new();
         let mut all = HashSet::new();
@@ -189,7 +195,6 @@ impl DagTraversal {
             }
         }
 
-        // 🔥 ترتيب ثابت
         let mut zero_nodes: Vec<_> = in_degree
             .iter()
             .filter(|(_, &v)| v == 0)
@@ -224,10 +229,13 @@ impl DagTraversal {
         }
 
         if result.len() != all.len() {
-            return Vec::new();
+            return Err(DagError::Other(format!(
+                "topological sort incomplete: {} of {} nodes (possible cycle or corruption)",
+                result.len(), all.len()
+            )));
         }
 
-        result
+        Ok(result)
     }
 
     fn collect(&self, start: &str, visited: &mut HashSet<String>) {

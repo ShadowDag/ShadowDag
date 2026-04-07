@@ -12,7 +12,7 @@ use std::collections::{HashSet, VecDeque};
 use serde::{Serialize, Deserialize};
 use dashmap::DashMap;
 
-use crate::slog_info;
+use crate::{slog_info, slog_error};
 use crate::errors::{DagError, StorageError};
 
 /// GHOSTDAG K parameter — consensus-critical constant.
@@ -302,9 +302,12 @@ impl GhostDag {
 
         // Use a secondary content hash to prevent FNV-1a collision-based cache poisoning.
         // We hash all blue_set entries with a different seed to create a verification key.
+        // Sort entries for deterministic cache key (HashSet iteration order is non-deterministic).
         let content_hash = {
             let mut h: u64 = 0xcbf29ce484222325; // FNV offset but different seed
-            for b in blue_set {
+            let mut sorted_blues: Vec<&String> = blue_set.iter().collect();
+            sorted_blues.sort();
+            for b in &sorted_blues {
                 for byte in b.as_bytes() {
                     h = h.wrapping_mul(0x100000001b3);
                     h ^= *byte as u64;
@@ -406,15 +409,29 @@ impl GhostDag {
 
     pub fn get_blue_score(&self, hash: &str) -> u64 {
         self.db.get(format!("{}{}", PFX_BLUE_SCORE, hash))
-            .ok().flatten()
-            .and_then(|d| d[..8].try_into().ok().map(u64::from_le_bytes))
+            .ok()
+            .flatten()
+            .and_then(|d| {
+                if d.len() >= 8 {
+                    Some(u64::from_le_bytes(d[..8].try_into().unwrap()))
+                } else {
+                    None
+                }
+            })
             .unwrap_or(0)
     }
 
     pub fn get_chain_height(&self, hash: &str) -> u64 {
         self.db.get(format!("{}{}", PFX_CHAIN_HEIGHT, hash))
-            .ok().flatten()
-            .and_then(|d| d[..8].try_into().ok().map(u64::from_le_bytes))
+            .ok()
+            .flatten()
+            .and_then(|d| {
+                if d.len() >= 8 {
+                    Some(u64::from_le_bytes(d[..8].try_into().unwrap()))
+                } else {
+                    None
+                }
+            })
             .unwrap_or(0)
     }
 
@@ -427,7 +444,12 @@ impl GhostDag {
 
     pub fn get_full_blue_set(&self, hash: &str) -> std::collections::HashSet<String> {
         let parents = self.get_parents(hash);
-        self.reconstruct_full_blue_set(&parents)
+        let mut set = self.reconstruct_full_blue_set(&parents);
+        // Include this block's own blue set diff
+        for h in self.get_blue_set_diff(hash) {
+            set.insert(h);
+        }
+        set
     }
 
     pub fn get_parents(&self, hash: &str) -> Vec<String> {
@@ -441,7 +463,9 @@ impl GhostDag {
         let idx = self.order_counter.fetch_add(1, Ordering::SeqCst);
         // Persist counter to RocksDB so it survives restarts.
         // We persist idx+1 (the NEXT value to use) so recovery picks up correctly.
-        let _ = self.db.put(META_ORDER_COUNTER, (idx + 1).to_le_bytes());
+        if let Err(e) = self.db.put(META_ORDER_COUNTER, (idx + 1).to_le_bytes()) {
+            slog_error!("ghostdag", "write_failed", key => META_ORDER_COUNTER, error => e);
+        }
         idx
     }
 
@@ -506,7 +530,9 @@ impl GhostDag {
         // Genesis gets order_index=0; advance counter to 1 so the next block
         // gets order_index=1 (preventing duplicate index=0).
         self.order_counter.store(1, Ordering::SeqCst);
-        let _ = self.db.put(META_ORDER_COUNTER, 1u64.to_le_bytes());
+        if let Err(e) = self.db.put(META_ORDER_COUNTER, 1u64.to_le_bytes()) {
+            slog_error!("ghostdag", "write_failed", key => META_ORDER_COUNTER, error => e);
+        }
         Ok(())
     }
 
@@ -519,8 +545,14 @@ impl GhostDag {
     }
 
     pub fn store_blue_score(&self, hash: &str, score: u64) {
-        let _ = self.db.put(format!("{}{}", PFX_BLUE_SCORE, hash), score.to_le_bytes());
-        let _ = self.db.put(format!("{}{}", PFX_BLUE, hash), [1u8]);
+        let key_bs = format!("{}{}", PFX_BLUE_SCORE, hash);
+        if let Err(e) = self.db.put(&key_bs, score.to_le_bytes()) {
+            slog_error!("ghostdag", "write_failed", key => &key_bs, error => e);
+        }
+        let key_blue = format!("{}{}", PFX_BLUE, hash);
+        if let Err(e) = self.db.put(&key_blue, [1u8]) {
+            slog_error!("ghostdag", "write_failed", key => &key_blue, error => e);
+        }
     }
 
     pub fn is_blue_block(
@@ -599,11 +631,17 @@ impl GhostDag {
                 .map(|(k, _)| k.to_vec())
                 .collect();
             for k in keys {
-                let _ = self.db.delete(&k);
+                if let Err(e) = self.db.delete(&k) {
+                    slog_error!("ghostdag", "delete_failed", key => format!("{:?}", k), error => e);
+                }
             }
         }
-        let _ = self.db.delete(PFX_TIPS);
-        let _ = self.db.delete(META_ORDER_COUNTER);
+        if let Err(e) = self.db.delete(PFX_TIPS) {
+            slog_error!("ghostdag", "delete_failed", key => PFX_TIPS, error => e);
+        }
+        if let Err(e) = self.db.delete(META_ORDER_COUNTER) {
+            slog_error!("ghostdag", "delete_failed", key => META_ORDER_COUNTER, error => e);
+        }
         self.order_counter.store(0, std::sync::atomic::Ordering::SeqCst);
         self.anticone_cache.clear();
     }

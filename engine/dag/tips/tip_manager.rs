@@ -186,9 +186,11 @@ impl TipManager {
         let mut tips = self.tips.write().unwrap_or_else(|e| e.into_inner());
         let mut batch = WriteBatch::default();
 
-        // Prepare batch: remove parents from tip set (they now have a child)
+        // Remove parents from tips FIRST (they now have a child),
+        // so the eviction check below sees the correct tip count.
         for parent in parents {
             batch.delete(key_tip(parent));
+            tips.remove(parent);
         }
 
         // Add new block as tip
@@ -201,12 +203,10 @@ impl TipManager {
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
         batch.put(key_tip(block_hash), data);
 
-        // Write batch to DB first; only update in-memory state on success
+        // Write batch to DB; on failure, in-memory state is already updated
+        // but will be corrected on next recover_from_db() at restart.
         self.db.write(batch).map_err(StorageError::RocksDb)?;
 
-        for parent in parents {
-            tips.remove(parent);
-        }
         tips.insert(block_hash.to_string(), info);
         Ok(())
     }
@@ -244,8 +244,8 @@ impl TipManager {
             return sorted.iter().map(|t| t.hash.clone()).collect();
         }
 
-        // Tier 1: mandatory top tips (50% of slots, minimum 2)
-        let mandatory_count = (max_parents / 2).max(2).min(sorted.len());
+        // Tier 1: mandatory top tips (50% of slots, minimum 2, capped to max_parents)
+        let mandatory_count = (max_parents / 2).max(2).min(sorted.len()).min(max_parents);
         let mut selected: Vec<String> = sorted[..mandatory_count]
             .iter()
             .map(|t| t.hash.clone())
@@ -302,6 +302,8 @@ impl TipManager {
             }
         }
 
+        // Ensure total selected never exceeds max_parents
+        selected.truncate(max_parents);
         selected
     }
 
