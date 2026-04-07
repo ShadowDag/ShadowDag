@@ -134,6 +134,13 @@ pub fn drain_pending_blocks() -> Vec<(String, Block)> {
     items
 }
 
+/// Clean up global state for a disconnected peer.
+/// Removes targeted messages and pending counts to prevent resource leaks.
+pub fn cleanup_peer_state(peer_id: &str) {
+    { let mut q = TARGETED_MSGS.lock(); q.retain(|(target, _)| target != peer_id); }
+    { let mut p = PEER_PENDING.lock(); p.remove(peer_id); }
+}
+
 /// Drain all received peer addresses from Addr messages (call from node main loop).
 /// Thread-safe: works from ANY thread.
 pub fn drain_received_addrs() -> Vec<String> {
@@ -182,26 +189,28 @@ pub fn requeue_pending_txs(items: Vec<(String, Transaction)>) {
 /// The daemon event loop drains this queue and processes each block
 /// through FullNode::process_block() (full validation pipeline).
 pub fn push_pending_block(peer_id: &str, block: Block) -> bool {
-    // Per-peer limit check
+    // Reserve slot FIRST (increment before push) to close TOCTOU race.
+    // If the queue is full, rollback the increment.
     {
-        let pending = PEER_PENDING.lock();
-        if let Some(&(_, blk_count)) = pending.get(peer_id) {
-            if blk_count >= MAX_PENDING_BLOCKS_PER_PEER {
-                slog_warn!("p2p", "per_peer_block_limit_reached", peer => peer_id);
-                return false;
-            }
+        let mut pending = PEER_PENDING.lock();
+        let entry = pending.entry(peer_id.to_string()).or_insert((0, 0));
+        if entry.1 >= MAX_PENDING_BLOCKS_PER_PEER {
+            slog_warn!("p2p", "per_peer_block_limit_reached", peer => peer_id);
+            return false;
         }
+        entry.1 += 1;
     }
 
     let mut q = PENDING_BLOCKS.lock();
     if q.len() < 1_000 {
         q.push((peer_id.to_string(), block));
-        // Increment per-peer counter
-        let mut pending = PEER_PENDING.lock();
-        let entry = pending.entry(peer_id.to_string()).or_insert((0, 0));
-        entry.1 += 1;
         true
     } else {
+        // Rollback the increment since we couldn't push
+        let mut pending = PEER_PENDING.lock();
+        if let Some(entry) = pending.get_mut(peer_id) {
+            entry.1 = entry.1.saturating_sub(1);
+        }
         slog_warn!("p2p", "pending_block_queue_full");
         false
     }
@@ -210,26 +219,28 @@ pub fn push_pending_block(peer_id: &str, block: Block) -> bool {
 /// Push a transaction into the pending queue for mempool validation.
 /// Thread-safe: can be called from RPC or any thread.
 pub fn push_pending_tx(peer_id: &str, tx: Transaction) -> bool {
-    // Per-peer limit check
+    // Reserve slot FIRST (increment before push) to close TOCTOU race.
+    // If the queue is full, rollback the increment.
     {
-        let pending = PEER_PENDING.lock();
-        if let Some(&(tx_count, _)) = pending.get(peer_id) {
-            if tx_count >= MAX_PENDING_TXS_PER_PEER {
-                slog_warn!("p2p", "per_peer_tx_limit_reached", peer => peer_id);
-                return false;
-            }
+        let mut pending = PEER_PENDING.lock();
+        let entry = pending.entry(peer_id.to_string()).or_insert((0, 0));
+        if entry.0 >= MAX_PENDING_TXS_PER_PEER {
+            slog_warn!("p2p", "per_peer_tx_limit_reached", peer => peer_id);
+            return false;
         }
+        entry.0 += 1;
     }
 
     let mut q = PENDING_TXS.lock();
     if q.len() < 10_000 {
         q.push((peer_id.to_string(), tx));
-        // Increment per-peer counter
-        let mut pending = PEER_PENDING.lock();
-        let entry = pending.entry(peer_id.to_string()).or_insert((0, 0));
-        entry.0 += 1;
         true
     } else {
+        // Rollback the increment since we couldn't push
+        let mut pending = PEER_PENDING.lock();
+        if let Some(entry) = pending.get_mut(peer_id) {
+            entry.0 = entry.0.saturating_sub(1);
+        }
         slog_warn!("p2p", "pending_tx_queue_full");
         false
     }
@@ -511,7 +522,10 @@ impl P2P {
         });
 
         self.peers.bootstrap_for_network(&self.network);
-        let _ = self.peers.discover_peers();
+        let discovered = self.peers.discover_peers();
+        if discovered.is_empty() {
+            slog_warn!("p2p", "peer_discovery_found_none");
+        }
         self.connect_to_peers();
 
         slog_info!("p2p", "peers_connected", count => self.peers.count());
@@ -695,7 +709,8 @@ impl P2P {
         // ── Send our Version (after puzzle phase) ──────────────────────────
         let bytes = Self::send_version(&mut writer, 0, magic)?;
         session.record_bytes_sent(bytes);
-        session.protocol.sent_version().ok(); // best-effort state transition
+        session.protocol.sent_version()
+            .map_err(|e| NetworkError::ConnectionFailed(format!("protocol state error: {}", e)))?;
 
         // ── Main message loop ──────────────────────────────────────────────
         loop {
@@ -824,6 +839,7 @@ impl P2P {
         }
 
         slog_debug!("p2p", "connection_closed", addr => &peer_str, state => &session.protocol.state.to_string(), lifecycle => &session.protocol.lifecycle.to_string(), bytes_rx => session.protocol.bytes_received, bytes_tx => session.protocol.bytes_sent);
+        cleanup_peer_state(&peer_str);
         Ok(())
     }
 

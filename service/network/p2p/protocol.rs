@@ -936,13 +936,13 @@ impl ProtocolSession {
     }
 
     /// Transition: we sent our Version message.
+    /// Only allowed from PuzzleVerified — sending version from Init would
+    /// bypass the connection puzzle, weakening Sybil protection.
     pub fn sent_version(&mut self) -> Result<(), ProtocolError> {
-        if self.state != HandshakeState::PuzzleVerified
-            && self.state != HandshakeState::Init
-        {
+        if self.state != HandshakeState::PuzzleVerified {
             return Err(ProtocolError::new(
                 ProtocolErrorKind::InvalidTransition,
-                format!("cannot send version from state {}", self.state),
+                format!("cannot send version from state {:?}", self.state),
                 0,
             ));
         }
