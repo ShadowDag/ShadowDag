@@ -1,446 +1,410 @@
-# ShadowDAG — Architecture Guide
+# ShadowDAG Architecture Guide
 
-Complete reference for developers. Every directory, every file, and what it does.
-
----
-
-## Directory Map
-
-### `bin/` — Executable Binaries
-Entry points for running the node, miner, wallet, and tools.
-
-| File | Binary Name | Purpose |
-|------|-------------|---------|
-| `node.rs` | `shadowdag-node` | Full node with P2P, RPC, consensus |
-| `miner.rs` | `shadowdag-miner` | GPU miner with benchmark |
-| `wallet.rs` | `shadowdag-wallet` | Wallet CLI (create, send, stealth, invisible) |
-| `loadtest.rs` | `shadowdag-loadtest` | Transaction stress tester |
-| `mine_genesis.rs` | `mine-genesis` | Genesis block mining utility |
+Complete technical reference. All constants from the actual codebase.
 
 ---
 
-### `config/` — Configuration
-Static configuration for consensus, genesis, and network.
+## Codebase Statistics
 
-```
-config/
-├── consensus/
-│   ├── consensus_params.rs    # Chain ID, max supply, block reward, GHOSTDAG K
-│   └── emission_schedule.rs   # Halving schedule (every 210M blocks)
-├── genesis/
-│   └── genesis.rs             # Genesis block (hardcoded PoW, hash, nonce)
-├── network/
-│   ├── network_params.rs      # Ports, magic bytes, max peers
-│   └── bootstrap_nodes.rs     # DNS seeds for peer discovery
-├── node/
-│   ├── node_config.rs         # Node configuration (Mainnet/Testnet/Regtest)
-│   └── node_roles.rs          # Node types (Full/Light/Shadow)
-└── checkpoints.rs             # Block hash checkpoints
-```
+| Metric | Value |
+|--------|-------|
+| Total Rust files | 328 |
+| Total lines of code | 130,415 |
+| Binary targets | 5 |
+| Library modules | 12 top-level |
+| Test files | 21 |
+| Benchmark suites | 2 |
 
 ---
 
-### `domain/` — Core Data Types
-Pure data structures with no side effects. The foundation of everything.
+## 1. Binaries (`bin/`)
 
-```
-domain/
-├── address/
-│   ├── address.rs             # Address types (Standard/Stealth/MultiSig/Contract)
-│   ├── stealth_address.rs     # One-time stealth address generation (ECDH)
-│   ├── key_derivation.rs      # HMAC-SHA256 HD key derivation
-│   └── invisible_wallet.rs    # Auto-rotating invisible wallets
-├── block/
-│   ├── block.rs               # Block = Header + Body
-│   ├── block_header.rs        # Header: hash, parents, merkle_root, nonce, difficulty
-│   ├── block_body.rs          # Body: list of transactions
-│   ├── block_builder.rs       # Construct blocks from mempool
-│   ├── block_rules.rs         # Full block validation (header + PoW + transactions)
-│   ├── merkle_tree.rs         # SHA-256 Merkle tree with domain separation
-│   ├── merkle_proof.rs        # Merkle inclusion proof
-│   └── merkle_verifier.rs     # Verify Merkle proofs
-├── transaction/
-│   ├── transaction.rs         # Transaction: inputs, outputs, fee, hash
-│   ├── tx_builder.rs          # Build and sign transactions
-│   ├── tx_validator.rs        # Validate signatures, UTXO, amounts
-│   ├── tx_hash.rs             # Chain-ID-aware transaction hashing
-│   ├── tx_fee.rs              # Fee calculation (checked arithmetic)
-│   ├── tx_receipt.rs          # Transaction status tracking (7 states)
-│   └── decoy_transaction.rs   # Ring signature decoy transactions
-├── types/
-│   ├── amount.rs              # Integer-only amount math (no float)
-│   ├── difficulty.rs          # Difficulty range validation
-│   ├── hash.rs                # Hash utilities
-│   └── timestamp.rs           # Timestamp validation, median, ranges
-└── utxo/
-    ├── utxo.rs                # UTXO data structure
-    ├── utxo_set.rs            # UTXO set with cache + RocksDB
-    ├── utxo_spend.rs          # Spend/rollback UTXO operations
-    ├── utxo_validator.rs      # Ownership + double-spend validation
-    └── utxo_snapshot.rs       # UTXO snapshots every 1000 blocks
-```
+| Binary | File | Purpose |
+|--------|------|---------|
+| `shadowdag-node` | `node.rs` | Full node: P2P + RPC + consensus + GHOSTDAG |
+| `shadowdag-miner` | `miner.rs` | Multi-threaded ShadowHash miner via RPC |
+| `shadowdag-wallet` | `wallet.rs` | HD wallet: stealth, invisible, multisig, send/receive |
+| `shadowdag-loadtest` | `loadtest.rs` | HTTP RPC load tester with auth token support |
+| `mine-genesis` | `mine_genesis.rs` | One-shot genesis block miner for all networks |
 
 ---
 
-### `engine/` — Processing Engines
-Core algorithms: consensus, DAG, mining, privacy, crypto.
+## 2. Consensus (`config/consensus/` + `engine/consensus/`)
 
-```
-engine/
-├── consensus/
-│   ├── core/
-│   │   ├── consensus.rs           # Consensus state (RocksDB)
-│   │   ├── consensus_manager.rs   # Tip management
-│   │   └── fork_choice.rs         # Fork choice by blue score
-│   ├── difficulty/
-│   │   ├── difficulty.rs          # Difficulty math (u128 safe)
-│   │   ├── difficulty_adjustment.rs # EMA-based adjustment (RocksDB)
-│   │   ├── difficulty_window.rs   # Tiered window sizing
-│   │   └── retarget.rs           # LWMA + EMA retargeting
-│   ├── rewards/
-│   │   ├── reward.rs             # 95%/5% split logic
-│   │   ├── miner_reward.rs       # Miner portion
-│   │   ├── developer_reward.rs   # Developer portion
-│   │   └── emission.rs           # Emission with halving
-│   ├── validation/
-│   │   ├── block_validator.rs    # Full block validation pipeline
-│   │   ├── block_context.rs      # Block context wrapper
-│   │   └── consensus_validator.rs # Consensus state validation
-│   ├── state.rs                  # Consensus state tracking
-│   ├── reorg.rs                  # Chain reorganization handling
-│   ├── chain_manager.rs          # Chain comparison + tip selection
-│   └── block_processor.rs        # Block processing pipeline
-│
-├── crypto/
-│   ├── hash/
-│   │   ├── shadowhash.rs        # ShadowHash store (RocksDB)
-│   │   ├── blake3.rs            # Blake3 store
-│   │   ├── keccak.rs            # Keccak store
-│   │   └── sha3.rs              # SHA3 store
-│   ├── keys/
-│   │   ├── keypair.rs           # Key pair store
-│   │   ├── private_key.rs       # Private key store
-│   │   └── public_key.rs        # Public key store
-│   ├── signatures/
-│   │   ├── ed25519.rs           # Ed25519 signature store
-│   │   ├── schnorr.rs           # Schnorr signature store
-│   │   ├── falcon.rs            # Post-quantum Falcon
-│   │   └── dilithium.rs         # Post-quantum Dilithium
-│   ├── random/
-│   │   ├── csprng.rs            # Cryptographic RNG state
-│   │   └── entropy.rs           # Entropy collection
-│   └── serialization.rs         # Deterministic serialization
-│
-├── dag/
-│   ├── core/
-│   │   ├── dag.rs               # BlockDAG (RocksDB)
-│   │   ├── dag_manager.rs       # DAG block management
-│   │   ├── dag_state.rs         # Blue/red score tracking
-│   │   ├── block_graph.rs       # In-memory DAG graph
-│   │   └── bps_engine.rs        # Multi-BPS engine (1/10/32 BPS)
-│   ├── ghostdag/
-│   │   ├── ghostdag.rs          # GHOSTDAG consensus (K=18)
-│   │   ├── blue_set.rs          # Blue block set
-│   │   ├── red_set.rs           # Red block set
-│   │   └── ordering.rs          # Deterministic block ordering
-│   ├── tips/
-│   │   └── tip_manager.rs       # DAG tip management (thread-safe)
-│   ├── security/
-│   │   ├── dag_shield.rs        # Combined security validation
-│   │   ├── dos_protection.rs    # Block/TX DoS validation
-│   │   ├── flood_protection.rs  # Anti-flood (nonce, timestamp)
-│   │   ├── selfish_mining_guard.rs # Anti-selfish-mining
-│   │   └── spam_filter.rs       # Transaction spam filter
-│   ├── sync/
-│   │   ├── dag_sync.rs          # DAG synchronization
-│   │   ├── header_sync.rs       # Header-first sync
-│   │   └── block_locator.rs     # Block locator protocol
-│   ├── validation/
-│   │   ├── dag_validator.rs     # DAG structure validation
-│   │   ├── conflict_detector.rs # Conflict detection
-│   │   └── parent_validator.rs  # Parent relationship validation
-│   ├── simulator/
-│   │   └── network_simulator.rs # Full DAG network simulator
-│   ├── traversal/mod.rs         # BFS/DFS/topological traversal + LCA
-│   └── conflicts/mod.rs         # Conflict resolution (blue/red)
-│
-├── mining/
-│   ├── algorithms/
-│   │   ├── shadowhash.rs        # ShadowHash PoW (3-round, memory-hard)
-│   │   ├── anti_asic.rs         # ASIC resistance (4-stage hardening)
-│   │   └── hash_mix.rs          # Block data mixing
-│   ├── gpu/
-│   │   ├── gpu_miner.rs         # Rayon parallel GPU mining
-│   │   ├── cuda_miner.rs        # CUDA mining
-│   │   └── opencl_miner.rs      # OpenCL mining
-│   ├── miner/
-│   │   ├── miner.rs             # Miner implementation
-│   │   ├── block_template.rs    # Block template construction
-│   │   ├── miner_controller.rs  # Mining job persistence
-│   │   └── miner_stats.rs       # Hashrate statistics
-│   ├── pow/
-│   │   ├── pow_difficulty.rs    # Hybrid Dual EMA difficulty adjustment
-│   │   ├── pow_engine.rs        # PoW data persistence
-│   │   └── pow_validator.rs     # PoW validation (numeric target)
-│   └── stratum/
-│       └── stratum_server.rs    # Built-in mining pool (Stratum V1)
-│
-├── privacy/
-│   ├── ringct/
-│   │   ├── ring_signature.rs    # LSAG ring signatures v3
-│   │   ├── ring_builder.rs      # Ring construction (random position)
-│   │   ├── ring_validator.rs    # Ring signature verification
-│   │   └── key_image.rs         # Key images + RocksDB persistence
-│   ├── confidential/
-│   │   ├── bulletproofs.rs      # Fiat-Shamir range proofs
-│   │   ├── confidential_tx.rs   # Confidential transactions
-│   │   └── pedersen_commitment.rs # Pedersen commitments (Ristretto)
-│   ├── shadow_pool/
-│   │   ├── shadow_pool.rs       # Transaction mixing pool
-│   │   ├── shadow_transaction.rs # Shadow TX with delay tiers
-│   │   ├── mixer.rs             # Temporal mixing engine
-│   │   └── pool_manager.rs      # Privacy level routing
-│   └── stealth/
-│       ├── stealth_address.rs   # Stealth address generation
-│       ├── stealth_scanner.rs   # Blockchain scanning with view key
-│       └── view_key.rs          # HMAC-SHA256 view keys
-│
-├── orphans/mod.rs               # Orphan block management
-├── anti_double_spend/mod.rs     # Double-spend protection (RocksDB)
-├── tx_validation/mod.rs         # Multi-stage TX validation pipeline
-├── pruning/
-│   ├── mod.rs                   # Basic pruning
-│   └── pruning_engine.rs        # Advanced pruning (4 levels + UTXO proofs)
-└── state_snapshot/mod.rs        # UTXO state snapshots
-```
+### Core Parameters (`consensus_params.rs`)
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `CHAIN_ID` | `0xDA0C_0001` | Network identifier (wire protocol) |
+| `BLOCKS_PER_SECOND` | 10 | Target block production rate |
+| `BLOCK_TIME` | 1 second | Target inter-block time |
+| `GHOSTDAG_K` | 180 | Blue set anticone limit (18 x BPS) |
+| `MAX_PARENTS` | 80 | Maximum DAG parents per block (8 x BPS) |
+| `MAX_BLOCK_SIZE` | 2 MB | Maximum serialized block size |
+| `MAX_BLOCK_TXS` | 10,000 | Maximum transactions per block |
+| `COINBASE_MATURITY` | 1,000 blocks | Blocks before coinbase is spendable |
+| `MIN_FEE` | 100 satoshis | Minimum transaction fee |
+| `DUST_LIMIT` | 1,000 satoshis | Minimum output amount |
+
+### Emission Schedule (`emission_schedule.rs`)
+
+Smooth exponential decay (no hard halvings):
+
+| Parameter | Value |
+|-----------|-------|
+| Initial Reward | 10 SDAG (1,000,000,000 satoshis) |
+| Max Supply | 21,000,000,000 SDAG |
+| Decay Rate | 99.62% per step (0.38% reduction) |
+| Step Interval | ~30 days (2,592,000 seconds) |
+| Half-life | ~5.5 years (~182 steps) |
+| Minimum Reward | 1 satoshi |
+| Precision | 10^18 fixed-point |
+
+### Reward Split (`engine/consensus/rewards/reward.rs`)
+
+| Recipient | Share |
+|-----------|-------|
+| Miner | 95% |
+| Developer Fund | 5% |
+
+**Selfish Mining Penalties:**
+
+| Condition | Penalty |
+|-----------|---------|
+| Red block (anticone > K) | 80% reduction (keeps 20%) |
+| Late block (per second) | 5% compounded decay |
+| Minimum floor | 10% of normal reward |
+
+### Difficulty Adjustment (`engine/consensus/difficulty/retarget.rs`)
+
+| Parameter | Value |
+|-----------|-------|
+| Target Block Time | 1 second |
+| Short Window | max(144, BPS x 15) blocks |
+| Long Window | max(2016, BPS x 200) blocks |
+| EMA Alpha | 1/20 |
+| Max Adjust Up/Down | 4x per retarget |
+| DAG Rate Correction | Uses `dag_block_count` + `blue_score_rate` |
+| Match Rule | Strict equality (no tolerance) |
+
+### Finality (`engine/consensus/finality.rs` + `reorg/mod.rs`)
+
+| Parameter | Value |
+|-----------|-------|
+| Base Finality Depth | 200 blocks (~20s at 10 BPS) |
+| Min Finality Depth | 100 blocks |
+| Max Finality Depth | 2,000 blocks |
+| Finality Epoch | 1,000 blocks (metric recalculation) |
+| Checkpoint Interval | 10,000 blocks (auto) |
+| Max Reorg Depth | 1,000 blocks |
+| Economic Finality | 10,000 difficulty units |
+| Work Ratio | 100/100 (integer, >=1x required) |
 
 ---
 
-### `infrastructure/` — Storage Layer
-RocksDB database wrapper and all persistent stores.
+## 3. GHOSTDAG (`engine/dag/ghostdag/`)
 
-```
-infrastructure/storage/rocksdb/
-├── core/
-│   ├── db.rs                # NodeDB wrapper (WAL, recovery, error handling)
-│   ├── column_families.rs   # Column family definitions
-│   └── migrations.rs        # Schema versioning (v1-v6)
-├── blocks/
-│   ├── block_store.rs       # Block persistence
-│   ├── header_store.rs      # Header persistence
-│   └── block_index.rs       # Height-to-hash index
-├── transactions/
-│   ├── tx_store.rs          # Transaction persistence
-│   └── tx_index.rs          # Transaction index
-├── utxo/
-│   ├── utxo_store.rs        # UTXO persistence + address index
-│   └── utxo_index.rs        # UTXO ownership index
-├── dag/
-│   ├── dag_store.rs         # DAG block relationships
-│   └── dag_index.rs         # DAG index
-├── state/
-│   └── state_store.rs       # Contract state (Merkle roots)
-└── peers/
-    └── peer_store.rs        # Peer address persistence
-```
+### Blue/Red Classification
+
+- Block is **blue** if anticone size <= K (180)
+- Block is **red** if anticone size > K
+- Blue blocks get full rewards; red blocks get 20%
+- Selected parent: highest blue_score -> height -> lowest hash
+
+### Storage (RocksDB prefixes)
+
+| Prefix | Data |
+|--------|------|
+| `gd:blk:` | Block metadata |
+| `gd:par:` | Parent links |
+| `gd:chl:` | Children links |
+| `gd:blue:` | Blue set (diff per block) |
+| `gd:red:` | Red markers |
+| `gd:score:` | Blue scores |
+| `gd:sel:` | Selected parent |
+| `gd:order:` | Execution order index |
 
 ---
 
-### `runtime/` — Execution Runtime
+## 4. Mining (`engine/mining/`)
 
-```
-runtime/
-├── vm/                          # ShadowVM Smart Contract Engine
-│   ├── core/
-│   │   ├── vm.rs                # Main execution engine (119 opcodes)
-│   │   ├── u256.rs              # 256-bit unsigned integer
-│   │   ├── opcodes.rs           # Opcode definitions + gas costs
-│   │   ├── assembler.rs         # ASM <-> bytecode + disassembler
-│   │   ├── executor.rs          # Contract deployment + calls
-│   │   ├── journal.rs           # State rollback (checkpoints)
-│   │   └── vm_context.rs        # Storage context
-│   ├── contracts/
-│   │   ├── contract.rs          # Contract call wrapper
-│   │   ├── contract_abi.rs      # ABI encode/decode + selectors
-│   │   ├── contract_storage.rs  # RocksDB contract state
-│   │   └── token_standard.rs    # SRC-20 token standard
-│   └── gas/
-│       ├── gas_meter.rs         # Gas tracking (RocksDB)
-│       └── gas_rules.rs         # Gas limits + refunds
-├── event_bus/
-│   ├── event_bus.rs             # Event publication (RocksDB)
-│   ├── event_dispatcher.rs      # Event dispatch
-│   └── event_types.rs           # Event type definitions
-├── node_runtime/
-│   ├── runtime.rs               # Runtime wrapper
-│   ├── runtime_manager.rs       # Runtime lifecycle
-│   └── lifecycle.rs             # Start/stop/panic handlers
-└── scheduler/
-    ├── task_scheduler.rs        # Task persistence
-    └── async_runtime.rs         # Thread-based async runtime
-```
+### ShadowHash Algorithm (`algorithms/shadowhash.rs`)
+
+4-stage ASIC-resistant pipeline:
+
+| Stage | Algorithm | Purpose |
+|-------|-----------|---------|
+| 1 | SHA-256 | Compute-bound seed |
+| 2 | Blake3 + 256KB scratchpad | Memory-hard (16 mix rounds) |
+| 3 | SHA3-256 | ASIC-breaking combiner |
+| 4 | Anti-ASIC nonce mixing | Dynamic data-dependent access |
+
+**Key constants:**
+- `SCRATCHPAD_SIZE`: 262,144 bytes (256 KB)
+- `MIX_ROUNDS`: 16
+
+### PoW Validation (`pow/pow_validator.rs`)
+
+- Method: `hash_bytes <= target_bytes` (256-bit comparison)
+- Target: `MAX_TARGET / difficulty` (256-bit division)
+- NOT leading zeros — proper numeric comparison
 
 ---
 
-### `service/` — High-Level Services
+## 5. ShadowVM (`runtime/vm/`)
 
-```
-service/
-├── mempool/
-│   ├── core/
-│   │   ├── mempool.rs           # Main mempool (RocksDB, 50K cap)
-│   │   └── mempool_manager.rs   # Mempool orchestrator
-│   ├── fees/
-│   │   ├── fee_market.rs        # Dynamic fee estimation
-│   │   └── tx_prioritizer.rs    # Fee-based TX sorting
-│   ├── pools/
-│   │   ├── tx_pool.rs           # Transaction pool
-│   │   └── orphan_pool.rs       # Orphan transaction pool
-│   ├── index/mod.rs             # Mempool index (fee, spend tracking)
-│   └── eviction/mod.rs          # Eviction policies (age, fee)
-│
-├── network/
-│   ├── p2p/
-│   │   ├── p2p.rs               # P2P network layer (TCP)
-│   │   ├── peer.rs              # Peer connection state
-│   │   ├── peer_manager.rs      # Peer registry (RocksDB, bans, scoring)
-│   │   ├── protocol.rs          # Protocol messages + validation
-│   │   └── message.rs           # Network message types
-│   ├── nodes/
-│   │   ├── boot.rs              # Node bootstrap sequence
-│   │   ├── full_node.rs         # Full node implementation
-│   │   ├── light_node.rs        # SPV light node
-│   │   └── shadow_node.rs       # Privacy relay node
-│   ├── relay/
-│   │   ├── block_relay.rs       # Block broadcast + orphan pool
-│   │   ├── tx_relay.rs          # Transaction broadcast (dedup)
-│   │   └── inv_relay.rs         # Inventory announcements
-│   ├── rpc/
-│   │   ├── rpc_server.rs        # JSON-RPC server (16+ methods)
-│   │   ├── grpc_server.rs       # Binary gRPC server (18 methods)
-│   │   └── health.rs            # Health check + Prometheus metrics
-│   ├── discovery/               # Peer discovery (DNS seeds)
-│   ├── sync/mod.rs              # Block synchronization
-│   ├── connection_manager/mod.rs # Connection lifecycle
-│   ├── address_manager/mod.rs   # Address table (new/tried)
-│   ├── reputation/mod.rs        # Peer reputation scoring
-│   ├── dos_guard/mod.rs         # DoS protection
-│   └── ...                      # Additional network modules
-│
-├── wallet/
-│   ├── core/
-│   │   ├── wallet.rs            # HD wallet (AES-256-GCM encrypted)
-│   │   ├── wallet_manager.rs    # Wallet lifecycle
-│   │   └── wallet_sync.rs       # Wallet-chain sync
-│   ├── keys/
-│   │   ├── key_manager.rs       # Key storage (encrypted)
-│   │   ├── hd_wallet.rs         # Hierarchical deterministic derivation
-│   │   └── multisig.rs          # M-of-N multi-signature
-│   └── storage/
-│       ├── wallet_db.rs         # Wallet persistence
-│       └── address_book.rs      # Address book
-│
-├── events/
-│   ├── mod.rs                   # Event bus + node events
-│   └── pubsub.rs               # Pub-sub notification (10 topics)
-│
-└── rpc/auth/mod.rs              # RPC authentication (SHA-256 + tokens)
-```
+### Architecture
+
+- Stack-based (256-bit U256 elements)
+- 90+ opcodes in 16 categories
+- Deterministic execution (10 invariants enforced)
+- Gas-first: every opcode checked BEFORE execution
+- Atomic state: WriteBatch commits only on STOP/RETURN
+
+### Limits
+
+| Limit | Value |
+|-------|-------|
+| Max Contract Size | 24 KB |
+| Max Memory | 1 MB |
+| Default Gas Limit | 10,000,000 |
+| Max Gas Per TX | 10,000,000 |
+| Max Gas Per Block | 100,000,000 |
+| Min Opcode Cost | 1 gas |
+| Memory Cost | 3 gas/word + words^2/512 |
+| SSTORE Cost | 5,000 gas |
+| CREATE Cost | 32,000 gas |
+
+### Opcode Categories
+
+| Range | Category | Examples |
+|-------|----------|---------|
+| 0x00-0x0F | Control | STOP, NOP, GAS |
+| 0x10-0x1F | Stack | PUSH1-32, POP, DUP, SWAP |
+| 0x20-0x2F | Arithmetic | ADD, SUB, MUL, DIV, EXP |
+| 0x30-0x3F | Comparison | LT, GT, EQ, ISZERO |
+| 0x40-0x4F | Bitwise | AND, OR, XOR, SHL, SHR |
+| 0x50-0x5F | Storage | SLOAD(200), SSTORE(5000) |
+| 0x60-0x6F | Crypto | SHA256(30), ECRECOVER(3000) |
+| 0x70-0x7F | Context | CALLER, TIMESTAMP, BLOCKHASH |
+| 0x80-0x8F | Flow | JUMP, JUMPI |
+| 0x90-0x9F | Memory | MLOAD, MSTORE |
+| 0xA0-0xAF | Logging | LOG0-LOG4 |
+| 0xE0-0xEF | ShadowVM Extensions | STEALTHCHECK, RINGPROOF, DAGTIPS |
+
+### Determinism Invariants
+
+1. No floating point (f32/f64)
+2. No system time (TIMESTAMP from block header)
+3. No random (BLOCKHASH is only source)
+4. No I/O (no filesystem/network/process)
+5. Integer-only arithmetic (U256 wrapping)
+6. Deterministic storage parsing
+7. Pre-execution gas metering
+8. `has_gas()` restricted to VM internals
+9. All opcodes cost >= 1 gas
+10. Atomic state commits
 
 ---
 
-### `telemetry/` — Monitoring
+## 6. P2P Network (`service/network/`)
 
+### Wire Protocol (`p2p/protocol.rs`)
+
+**Header format** (13 bytes):
 ```
-telemetry/
-├── logging/
-│   ├── logger.rs                # Log recording (RocksDB)
-│   └── log_config.rs           # env_logger initialization
-├── metrics/
-│   ├── metrics.rs              # Metrics collection (RocksDB)
-│   └── prometheus.rs           # Prometheus HTTP exporter
-└── tracing/
-    └── tracing.rs              # Distributed tracing
+[Magic 4B][CommandID 1B][Length 4B BE][Checksum 4B SHA256]
 ```
+
+| Protocol Constant | Value |
+|-------------------|-------|
+| Protocol Version | 1 |
+| Chain ID | 0xDA0C_0001 |
+| Max Message Size | 4 MB |
+| Handshake Timeout | 10 seconds |
+| Puzzle Timeout | 30 seconds |
+
+### Connection Puzzle (Anti-Sybil)
+
+| Parameter | Value |
+|-----------|-------|
+| Difficulty | 3 leading hex zeros |
+| Average hashes | ~4,096 |
+| Expiry | 300 seconds |
+
+### DoS Guard (`dos_guard/mod.rs`)
+
+**Token Bucket:**
+- Refill: 800 tokens/second
+- Capacity: 4,000 tokens
+
+**Message Costs:**
+- TX: 3 tokens, Block: 8 tokens, GetBlocks: 5 tokens, Mempool: 10 tokens
+
+**Global Limits:**
+- Max TX/sec: 50,000
+- Max blocks/sec: 200
+
+### Reputation (`reputation/mod.rs`)
+
+- Initial score: 100, ban at -50, auto-ban at -80
+- Invalid block: -20, spam: -5, misbehavior: -50
+- Valid block: +2, valid TX: +1
+- Age bonus: +2/hour (max +48)
+- Reputation-aware eviction when at capacity
+
+### Peer Limits
+
+| Limit | Mainnet | Testnet | Regtest |
+|-------|---------|---------|---------|
+| Max Peers | 64 | 32 | 8 |
+| Max Inbound | 56 | 28 | 7 |
+| Max Outbound | 8 | 4 | 1 |
+| Per IP | 3 | 3 | 3 |
+| Per /16 Subnet | 2 | 2 | 2 |
 
 ---
 
-### `tests/` — Integration Tests
+## 7. Mempool (`service/mempool/`)
 
-| Test File | What It Tests |
-|-----------|---------------|
-| `consensus_tests.rs` | Block validation, fork choice |
-| `dag_tests.rs` | DAG operations, GHOSTDAG |
-| `db_tests.rs` | RocksDB read/write/batch |
-| `determinism_tests.rs` | Deterministic execution |
-| `dos_tests.rs` | DoS protection |
-| `genesis_tests.rs` | Genesis block integrity |
-| `mempool_tests.rs` | Mempool operations |
-| `mempool_advanced_tests.rs` | Fee markets, eviction |
-| `p2p_network_tests.rs` | Peer connections, messages |
-| `performance_tests.rs` | Throughput benchmarks |
-| `pow_genesis_tests.rs` | PoW mining verification |
-| `recovery_tests.rs` | Crash recovery |
-| `rpc_tests.rs` | JSON-RPC methods |
-| `security_tests.rs` | Security properties |
-| `stress_tests.rs` | High-load scenarios |
-| `transaction_tests.rs` | TX creation, signing |
-| `tx_layer_tests.rs` | TX pipeline |
-| `tx_validator_tests.rs` | Signature verification |
-| `utxo_tests.rs` | UTXO operations |
-| `utxo_layer_tests.rs` | UTXO set management |
-| `utxo_state_tests.rs` | UTXO state consistency |
+### Admission Pipeline
+
+```
+L1   Network:     Size, hash, input validation (no crypto)
+L1.5 Anti-replay: Timestamp range + payload_hash
+L1.6 Type-specific: SwapTx 2x fee, DexOrder 1.5x fee
+L2   Structural:  Signature verification
+L4   Execution:   Fee >= MIN_RELAY_FEE, fee_rate >= surge_price
+L5   Anti-spam:   Per-sender limit (25 TXs max)
+```
+
+### Surge Pricing (exponential)
+
+```
+Multiplier = 2^(utilization x 6), capped at 64x
+
+  0% full:  1.0x base rate
+ 25% full:  2.8x
+ 50% full:  8.0x
+ 75% full: 22.6x
+ 90% full: 39.4x
+100% full: 64.0x (cap)
+```
+
+### Eviction
+
+- CPFP-aware: descendant-package fee rate, not individual fee
+- Batch size: 256 TXs per eviction cycle
+- Max age: 72 hours
+- RBF: min 1,000 sat bump, max 25 ancestor depth
 
 ---
 
-## Data Flow
+## 8. Privacy (`engine/privacy/`)
 
-```
-User/Miner
-    │
-    ▼
-┌─────────┐    ┌──────────┐    ┌────────────┐
-│   RPC   │───▶│ Mempool  │───▶│   Block    │
-│ Server  │    │          │    │  Builder   │
-└─────────┘    └──────────┘    └────────────┘
-                                     │
-                                     ▼
-                              ┌────────────┐
-                              │   Mining   │
-                              │ (PoW/GPU)  │
-                              └────────────┘
-                                     │
-                                     ▼
-┌─────────┐    ┌──────────┐    ┌────────────┐
-│   P2P   │◀──▶│   DAG    │◀──│ Consensus  │
-│ Network │    │ Manager  │    │ Validator  │
-└─────────┘    └──────────┘    └────────────┘
-                    │
-                    ▼
-              ┌──────────┐
-              │ RocksDB  │
-              │ Storage  │
-              └──────────┘
-```
+| Layer | Implementation | Purpose |
+|-------|---------------|---------|
+| CLSAG Ring Signatures | `ringct/clsag.rs` | Sender anonymity (ring of decoys) |
+| Key Images | `ringct/key_image.rs` | Double-spend prevention |
+| Pedersen Commitments | `confidential/pedersen.rs` | Hidden amounts |
+| Bulletproofs | `confidential/bulletproofs.rs` | Range proofs (amount >= 0) |
+| Stealth Addresses | `stealth/stealth_address.rs` | One-time receive addresses |
+| Shadow Pool | `shadow_pool/` | Privacy-first TX aggregation |
+| Dandelion++ | `service/network/propagation/` | Network-layer anonymity |
 
-## Key Constants
+---
 
-| Constant | Value | Location |
-|----------|-------|----------|
-| Max Supply | 21 billion SDAG | `config/consensus/consensus_params.rs` |
-| Block Reward | 10 SDAG | `config/consensus/consensus_params.rs` |
-| Halving Interval | 210M blocks | `config/consensus/emission_schedule.rs` |
-| Miner Share | 95% | `config/consensus/consensus_params.rs` |
-| Dev Share | 5% | `config/consensus/consensus_params.rs` |
-| GHOSTDAG K | 18 | `config/consensus/consensus_params.rs` |
-| Max Parents | 8 | `config/consensus/consensus_params.rs` |
-| Max Block Size | 2 MB | `config/consensus/consensus_params.rs` |
-| Max TX per Block | 5,000 | `config/consensus/consensus_params.rs` |
-| Dust Limit | 546 satoshis | `domain/transaction/tx_validator.rs` |
-| Coinbase Maturity | 100 blocks | `domain/utxo/utxo_set.rs` |
-| Max Gas per TX | 10M | `runtime/vm/gas/gas_rules.rs` |
-| Target Block Time | 1 second | `engine/mining/pow/pow_difficulty.rs` |
-| Short EMA Window | 144 blocks | `engine/mining/pow/pow_difficulty.rs` |
-| Long EMA Window | 2016 blocks | `engine/mining/pow/pow_difficulty.rs` |
-| Min Ring Size | 3 | `engine/privacy/ringct/ring_signature.rs` |
-| Default Ring Size | 11 | `engine/privacy/ringct/ring_signature.rs` |
+## 9. Validation Pipeline (`engine/consensus/validation/`)
+
+### Block Validation (4 layers, strictly separated)
+
+| Layer | Checks | State Access |
+|-------|--------|-------------|
+| L1 Network | Size, format, DoS, duplicates | None |
+| PoW | ShadowHash recompute + target comparison | None |
+| L2 Structural | Merkle root, signatures, timestamps (6 rules) | None |
+| L3 Consensus | Difficulty match (strict), checkpoints, coinbase | None |
+| L4 Execution | UTXO apply in GHOSTDAG order | UTXO set |
+
+**SAFETY INVARIANT**: L1-L3 are 100% stateless. No DB reads.
+
+### Timestamp Rules
+
+| Rule | Check |
+|------|-------|
+| R1 | `ts <= now + 120s` (future cap) |
+| R2 | `ts >= now - 600s` (wall-clock anchor) |
+| R3 | `ts > MTP` (weighted median, no dedup) |
+| R4 | `ts > max_ancestor_ts` (strict monotonic) |
+| R5 | `ts <= max_parent + 30s` (jump cap) |
+| R6 | `ts <= max_parent + 10s` when >= 3 parents (DAG-dense) |
+
+---
+
+## 10. Storage (`infrastructure/storage/rocksdb/`)
+
+### RocksDB Configuration
+
+- WAL: Always enabled (`disable_wal(false)` x18)
+- Recovery mode: `TolerateCorruptedTailRecords`
+- Atomic flush: Enabled
+- Consensus writes: `sync=true`
+- Cache writes: `sync=false` (rebuildable)
+
+### Key Namespaces
+
+| Prefix | Store | Data |
+|--------|-------|------|
+| `blk:` | BlockStore | Serialized blocks |
+| `blk:height:` | BlockStore | Height index |
+| `blk:best_hash` | BlockStore | Current chain tip |
+| `tx:` | Mempool | Pending transactions |
+| `fee:` | Mempool | Fee index (inverted) |
+| `gd:*` | GhostDAG | DAG topology + scores |
+| `addr:` | UtxoStore | Address -> UTXO index |
+| `ban:` | PeerManager | Peer bans |
+| `chkpt:` | FinalityManager | Auto-checkpoints |
+
+---
+
+## 11. RPC (`service/network/rpc/`)
+
+### JSON-RPC over HTTP
+
+- Endpoint: `POST /` or `POST /rpc`
+- Auth: Bearer token for write methods
+- Request validation: method, headers (64 lines/16KB max), body size
+- HTTP status codes: 200/400/401/404/429/500 (not always 200)
+
+### gRPC
+
+- Binary length-prefixed protocol
+- Method dispatch via registered handlers
+- Non-blocking accept loop with graceful stop
+
+---
+
+## 12. CI/CD (`.github/workflows/ci.yml`)
+
+| Job | Command |
+|-----|---------|
+| Check | `cargo check --all-targets` |
+| Test | `cargo test --lib --bins` |
+| Clippy | `cargo clippy -- -D warnings` |
+
+Triggered on: push to main/develop, PRs to main.
+
+---
+
+## Design Rules
+
+1. **Integer math only** in consensus code (no f64 in critical paths)
+2. **RocksDB WAL always on** for crash safety
+3. **Atomic WriteBatch** for all multi-key state changes
+4. **Fail-stop** on consensus errors (no continue-on-error)
+5. **Stateless validation** in Phase 1 (L1-L3 read no state)
+6. **DAG-aware** everything (difficulty, finality, timestamps, fees)
+7. **Economic penalties** for misbehavior (red blocks, late blocks)
+8. **Deterministic VM** (10 invariants, no float/IO/random)
+9. **Defense in depth** (puzzle + reputation + diversity + DoS guard)
+10. **Smooth emission** (no halving cliffs, predictable supply curve)
