@@ -117,7 +117,10 @@ impl ConsensusState {
 
         let hash = data.hash.clone();
 
-        if data.is_chain_block && data.blue_score > self.chain.best_blue_score {
+        let should_update = data.blue_score > self.chain.best_blue_score
+            || (data.blue_score == self.chain.best_blue_score
+                && hash < self.chain.selected_tip);
+        if data.is_chain_block && should_update {
             self.chain.selected_tip = hash.clone();
             self.chain.best_blue_score = data.blue_score;
             self.chain.best_height = data.height;
@@ -151,7 +154,9 @@ impl ConsensusState {
                 blue_set_str.join(","),
                 red_set_str.join(","),
             );
-            let _ = db.put(key.as_bytes(), val.as_bytes());
+            if let Err(e) = db.put(key.as_bytes(), val.as_bytes()) {
+                slog_error!("consensus", "persist_block_data_failed", error => e);
+            }
         }
     }
 
@@ -165,7 +170,9 @@ impl ConsensusState {
                 self.chain.best_height,
                 self.chain.finality_point.as_deref().unwrap_or(""),
             );
-            let _ = db.put(CS_CHAIN_KEY.as_bytes(), val.as_bytes());
+            if let Err(e) = db.put(CS_CHAIN_KEY.as_bytes(), val.as_bytes()) {
+                slog_error!("consensus", "persist_chain_state_failed", error => e);
+            }
         }
     }
 
@@ -225,8 +232,14 @@ impl ConsensusState {
             };
             let parts: Vec<&str> = val_str.splitn(6, '|').collect();
             if parts.len() == 6 {
-                let blue_score: u64 = parts[0].parse().unwrap_or(0);
-                let height: u64 = parts[1].parse().unwrap_or(0);
+                let blue_score: u64 = parts[0].parse().unwrap_or_else(|e| {
+                    slog_warn!("consensus", "corrupt_blue_score_in_db", error => e);
+                    0
+                });
+                let height: u64 = parts[1].parse().unwrap_or_else(|e| {
+                    slog_warn!("consensus", "corrupt_height_in_db", error => e);
+                    0
+                });
                 let is_chain_block = parts[2] == "true";
                 let selected_parent = if parts[3].is_empty() {
                     None
@@ -292,8 +305,11 @@ impl ConsensusState {
             let mut current = &self.chain.selected_tip;
             let mut visited = HashSet::new();
 
-            while !current.is_empty() && !visited.contains(current) {
-                visited.insert(current.clone());
+            while !current.is_empty() {
+                if !visited.insert(current.clone()) {
+                    slog_error!("consensus", "cycle_detected_in_chain_path", block => current);
+                    break;
+                }
                 path.push(current.clone());
                 if let Some(parent) = self.block_data.get(current).and_then(|d| d.selected_parent.as_ref()) {
                     current = parent;
@@ -318,6 +334,15 @@ impl ConsensusState {
         if path.len() as u64 > depth + 1 {
             let idx = (path.len() as u64 - depth - 1) as usize;
             let new_fp = path[idx].clone();
+            // Ensure finality only moves forward (never regresses)
+            if let Some(ref old_fp) = self.chain.finality_point {
+                let old_height = self.block_data.get(old_fp).map(|d| d.height).unwrap_or(0);
+                let new_height = self.block_data.get(&new_fp).map(|d| d.height).unwrap_or(0);
+                if new_height < old_height {
+                    // Finality regression detected -- keep the old point
+                    return None;
+                }
+            }
             let changed = self.chain.finality_point.as_ref() != Some(&new_fp);
             self.chain.finality_point = Some(new_fp.clone());
             if changed {
