@@ -46,6 +46,9 @@ impl Executor {
             return Err(VmError::CodeTooLarge { size: bytecode.len(), limit: MAX_CONTRACT_SIZE });
         }
 
+        // Reject bytecode containing unimplemented opcodes
+        Self::validate_supported_opcodes(bytecode)?;
+
         // Generate deterministic contract address using deployer + bytecode + nonce
         let contract_addr = Self::compute_contract_address(deployer, bytecode, nonce);
 
@@ -63,6 +66,7 @@ impl Executor {
             timestamp,
             block_hash,
             &contract_addr,
+            &[], // deploy has no input data
         );
 
         // Only store bytecode and metadata if constructor succeeded
@@ -83,7 +87,7 @@ impl Executor {
     pub fn call(
         &self,
         contract_addr: &str,
-        _input_data: &[u8],
+        input_data: &[u8],
         caller:     &str,
         value:      u64,
         gas_limit:  u64,
@@ -127,6 +131,7 @@ impl Executor {
             timestamp,
             block_hash,
             contract_addr,
+            input_data,
         )
     }
 
@@ -146,6 +151,35 @@ impl Executor {
         let code_key = format!("code:{}", addr);
         self.context.get(&code_key)
             .and_then(|hex_str| hex::decode(&hex_str).ok())
+    }
+
+    /// Validate that bytecode does not contain unsupported opcodes.
+    ///
+    /// This is a simple byte-level scan -- it may match data bytes that happen
+    /// to equal an opcode value. For production, a proper disassembler would be
+    /// needed. But this prevents obvious cases of deploying contracts that use
+    /// unimplemented inter-contract calls or self-destruct.
+    fn validate_supported_opcodes(bytecode: &[u8]) -> Result<(), VmError> {
+        use crate::runtime::vm::core::opcodes::OpCode;
+        let unsupported: &[(u8, &str)] = &[
+            (OpCode::CALL as u8, "CALL"),
+            (OpCode::CALLCODE as u8, "CALLCODE"),
+            (OpCode::DELEGATECALL as u8, "DELEGATECALL"),
+            (OpCode::STATICCALL as u8, "STATICCALL"),
+            (OpCode::CREATE as u8, "CREATE"),
+            (OpCode::CREATE2 as u8, "CREATE2"),
+            (OpCode::SELFDESTRUCT as u8, "SELFDESTRUCT"),
+        ];
+        for &byte in bytecode {
+            for &(op, name) in unsupported {
+                if byte == op {
+                    return Err(VmError::ContractError(format!(
+                        "Bytecode contains unsupported opcode {} (0x{:02x})", name, op
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Compute deterministic contract address from deployer + bytecode + nonce
