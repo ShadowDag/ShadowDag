@@ -37,6 +37,7 @@ impl Executor {
         gas_limit: u64,
         timestamp: u64,
         block_hash: &str,
+        nonce:     u64,
     ) -> Result<(String, ExecutionResult), VmError> {
         if bytecode.is_empty() {
             return Err(VmError::ContractError("Empty bytecode".to_string()));
@@ -45,19 +46,10 @@ impl Executor {
             return Err(VmError::CodeTooLarge { size: bytecode.len(), limit: MAX_CONTRACT_SIZE });
         }
 
-        // Generate deterministic contract address
-        let contract_addr = Self::compute_contract_address(deployer, bytecode, timestamp);
+        // Generate deterministic contract address using deployer + bytecode + nonce
+        let contract_addr = Self::compute_contract_address(deployer, bytecode, nonce);
 
-        // Store the bytecode
-        let code_key = format!("code:{}", contract_addr);
-        self.context.set(&code_key, &hex::encode(bytecode));
-
-        // Store deployment metadata
-        let meta_key = format!("meta:{}", contract_addr);
-        let meta = format!("deployer={},timestamp={},size={}", deployer, timestamp, bytecode.len());
-        self.context.set(&meta_key, &meta);
-
-        // Execute constructor (the full bytecode is the constructor)
+        // Execute constructor FIRST (before storing anything)
         // Reuse the existing DB handle to avoid RocksDB lock conflicts
         let shared_db = self.context.storage().shared_db();
         let storage = ContractStorage::new(shared_db)?;
@@ -72,6 +64,16 @@ impl Executor {
             block_hash,
             &contract_addr,
         );
+
+        // Only store bytecode and metadata if constructor succeeded
+        if matches!(&result, ExecutionResult::Success { .. }) {
+            let code_key = format!("code:{}", contract_addr);
+            self.context.set(&code_key, &hex::encode(bytecode));
+
+            let meta_key = format!("meta:{}", contract_addr);
+            let meta = format!("deployer={},nonce={},size={}", deployer, nonce, bytecode.len());
+            self.context.set(&meta_key, &meta);
+        }
 
         Ok((contract_addr, result))
     }
@@ -146,13 +148,13 @@ impl Executor {
             .and_then(|hex_str| hex::decode(&hex_str).ok())
     }
 
-    /// Compute deterministic contract address from deployer + bytecode + timestamp
-    fn compute_contract_address(deployer: &str, bytecode: &[u8], timestamp: u64) -> String {
+    /// Compute deterministic contract address from deployer + bytecode + nonce
+    fn compute_contract_address(deployer: &str, bytecode: &[u8], nonce: u64) -> String {
         let mut h = Sha256::new();
-        h.update(b"ShadowDAG_Contract_v1");
+        h.update(b"ShadowDAG_Contract_v2");
         h.update(deployer.as_bytes());
         h.update(bytecode);
-        h.update(timestamp.to_le_bytes());
+        h.update(nonce.to_le_bytes());
         let hash = h.finalize();
         format!("SD1c{}", hex::encode(&hash[..20]))
     }
@@ -182,7 +184,7 @@ mod tests {
         let exec = make_executor();
         // Simple contract: PUSH1 42, STOP
         let bytecode = vec![0x10, 42, 0x00];
-        let (addr, result) = exec.deploy(&bytecode, "SD1deployer", 0, 100000, 1000, "bh").unwrap();
+        let (addr, result) = exec.deploy(&bytecode, "SD1deployer", 0, 100000, 1000, "bh", 0).unwrap();
 
         assert!(addr.starts_with("SD1c"));
         assert!(exec.contract_exists(&addr));
@@ -195,7 +197,7 @@ mod tests {
     #[test]
     fn deploy_empty_fails() {
         let exec = make_executor();
-        assert!(exec.deploy(&[], "SD1x", 0, 100000, 1000, "bh").is_err());
+        assert!(exec.deploy(&[], "SD1x", 0, 100000, 1000, "bh", 0).is_err());
     }
 
     #[test]
@@ -213,7 +215,7 @@ mod tests {
     fn get_code_returns_bytecode() {
         let exec = make_executor();
         let bytecode = vec![0x10, 1, 0x10, 2, 0x20, 0x00];
-        let (addr, _) = exec.deploy(&bytecode, "SD1dep", 0, 100000, 2000, "bh").unwrap();
+        let (addr, _) = exec.deploy(&bytecode, "SD1dep", 0, 100000, 2000, "bh", 0).unwrap();
         let code = exec.get_code(&addr).unwrap();
         assert_eq!(code, bytecode);
     }
