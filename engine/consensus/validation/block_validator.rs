@@ -258,19 +258,24 @@ impl BlockValidator {
         expected_difficulty: Option<u64>,
     ) -> Result<(), ConsensusError> {
         if let Some(expected) = expected_difficulty {
-            // Tolerance-based difficulty validation (±12.5%).
-            // The miner gets difficulty from getblocktemplate, but between
-            // template fetch and block submission, the retarget engine may
-            // have processed another block and adjusted slightly.
-            // A strict equality check would cause spurious rejections.
-            let tolerance = (expected / 8).max(1); // 12.5%, minimum 1
-            let min_ok = expected.saturating_sub(tolerance);
-            let max_ok = expected.saturating_add(tolerance);
-
-            if block.header.difficulty < min_ok || block.header.difficulty > max_ok {
+            // STRICT difficulty match — consensus rule, NOT a UX convenience.
+            //
+            // The block's difficulty MUST match the expected difficulty exactly.
+            // Previous code allowed ±12.5% tolerance, which was WRONG because:
+            //   1. A miner could submit blocks at 87.5% of true difficulty
+            //   2. Over many blocks, this lowers the effective security by ~12.5%
+            //   3. An attacker could exploit the tolerance band to mine faster
+            //
+            // The "spurious rejection" concern was a misunderstanding:
+            //   - All nodes compute expected_difficulty from the SAME retarget
+            //     state (same selected chain → same difficulty window → same result)
+            //   - If a miner's template is stale, they should fetch a new one
+            //   - Stale-template blocks are correctly rejected, forcing miners
+            //     to stay synchronized (which is the desired behavior)
+            if block.header.difficulty != expected {
                 return Err(ConsensusError::Difficulty(format!(
-                    "difficulty mismatch: header={} expected={} (tolerance ±{})",
-                    block.header.difficulty, expected, tolerance
+                    "difficulty mismatch: header={} expected={} (must match exactly)",
+                    block.header.difficulty, expected
                 )));
             }
         }

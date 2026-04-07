@@ -401,10 +401,10 @@ impl RetargetEngine {
         d.clamp(MIN_DIFFICULTY, MAX_DIFFICULTY)
     }
 
+    /// Validate that a block's claimed difficulty matches the expected value.
+    /// STRICT equality — no tolerance. This is a consensus rule.
     pub fn validate_difficulty(&self, claimed: u64, expected: u64) -> bool {
-        let tolerance = expected / 8;
-        claimed >= expected.saturating_sub(tolerance)
-            && claimed <= expected.saturating_add(tolerance)
+        claimed == expected
     }
 
     pub fn median_past_time(&self, last_n: usize) -> u64 {
@@ -551,12 +551,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_difficulty_bounds() {
+    fn validate_difficulty_strict_equality() {
         let engine = RetargetEngine::new(32);
-        assert!(engine.validate_difficulty(32, 32));
-        // tolerance = 32/8 = 4, so 28..=36 is valid
-        assert!(engine.validate_difficulty(28, 32));
-        assert!(!engine.validate_difficulty(10, 32));
+        assert!(engine.validate_difficulty(32, 32));   // exact match
+        assert!(!engine.validate_difficulty(28, 32));   // 28 != 32 → rejected
+        assert!(!engine.validate_difficulty(36, 32));   // 36 != 32 → rejected
+        assert!(!engine.validate_difficulty(10, 32));   // far off → rejected
     }
 
     // ── DAG-aware tests ─────────────────────────────────────────────
