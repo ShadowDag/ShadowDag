@@ -465,11 +465,28 @@ impl FullNode {
             )));
         }
 
-        // Rollback blocks that were on the old chain but not the new one
-        // (simplified: rollback current_best if it's not in new_chain)
+        // Rollback entire old chain from current_best back to fork point
         if !current_best.is_empty() && !new_chain.contains(&current_best) {
-            // Need to rollback the old tip
-            let _ = self.utxo_set.rollback_block_undo(&current_best);
+            let mut cursor = current_best.clone();
+            let mut rollback_count = 0u64;
+            while !cursor.is_empty() && !new_chain.contains(&cursor) {
+                if rollback_count > MAX_REORG_DEPTH {
+                    return Err(NodeError::BlockRejected(format!(
+                        "reorg rollback depth {} exceeds MAX_REORG_DEPTH", rollback_count
+                    )));
+                }
+                if let Err(e) = self.utxo_set.rollback_block_undo(&cursor) {
+                    slog_error!("node", "rollback_failed", block => &cursor, error => e);
+                }
+                rollback_count += 1;
+                // Walk to parent via selected_parent
+                cursor = self.block_store.get_block(&cursor)
+                    .and_then(|b| b.header.selected_parent.clone())
+                    .unwrap_or_default();
+            }
+            if rollback_count > 0 {
+                slog_info!("node", "reorg_rollback_complete", blocks => rollback_count);
+            }
         }
 
         // Apply blocks in GHOSTDAG order (new chain)
@@ -505,20 +522,27 @@ impl FullNode {
                                     None => {
                                         slog_error!("node", "coinbase_output_overflow", block => block_hash);
                                         let _ = self.utxo_set.rollback_block_undo(block_hash);
-                                        continue;
+                                        return Err(NodeError::BlockRejected(format!(
+                                            "coinbase output overflow in {}", block_hash
+                                        )));
                                     }
                                 };
                                 if actual_total != expected_total {
                                     slog_error!("node", "coinbase_mismatch", block => block_hash, actual => &actual_total.to_string(), expected => &expected_total.to_string());
                                     // Rollback this block's UTXO changes
                                     let _ = self.utxo_set.rollback_block_undo(block_hash);
-                                    continue;
+                                    return Err(NodeError::BlockRejected(format!(
+                                        "coinbase mismatch in {}: actual={}, expected={}",
+                                        block_hash, actual_total, expected_total
+                                    )));
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        slog_error!("node", "apply_block_dag_error", block => block_hash, error => &e.to_string());
+                        return Err(NodeError::BlockRejected(format!(
+                            "apply_block_dag_ordered failed for {}: {}", block_hash, e
+                        )));
                     }
                 }
             }

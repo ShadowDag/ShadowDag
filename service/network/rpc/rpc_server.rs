@@ -372,52 +372,57 @@ impl RpcServer {
         }
     }
 
-    pub fn start(&self) {
+    pub fn start(&self) -> Result<(), NetworkError> {
         // Sync with actual chain state before accepting RPC requests
         self.sync_chain_state();
 
         let addr       = format!("127.0.0.1:{}", self.port);
+
+        // Bind BEFORE spawning thread — fail fast if port unavailable
+        let listener = TcpListener::bind(&addr)
+            .map_err(|e| NetworkError::ConnectionFailed(format!("RPC bind {} failed: {}", addr, e)))?;
+
         let state      = Arc::clone(&self.state);
         let rate_table = Arc::clone(&self.rate_table);
+        let max_req_size = self.max_request_size;
 
         thread::spawn(move || {
-            match TcpListener::bind(&addr) {
-                Ok(listener) => {
-                    /// Max concurrent RPC connections to prevent unbounded resource usage.
-                    const MAX_RPC_CONNECTIONS: usize = 1000;
-                    let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            /// Max concurrent RPC connections to prevent unbounded resource usage.
+            const MAX_RPC_CONNECTIONS: usize = 1000;
+            let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-                    for stream in listener.incoming() {
-                        match stream {
-                            Ok(s) => {
-                                let current = active_connections.load(std::sync::atomic::Ordering::Relaxed);
-                                if current >= MAX_RPC_CONNECTIONS {
-                                    slog_warn!("rpc", "connection_limit_reached", current => current, max => MAX_RPC_CONNECTIONS);
-                                    drop(s);
-                                    continue;
-                                }
-                                let sc = Arc::clone(&state);
-                                let rt = Arc::clone(&rate_table);
-                                let conn_count = Arc::clone(&active_connections);
-                                conn_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                thread::spawn(move || {
-                                    let _result = Self::handle_connection(s, sc, rt);
-                                    conn_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                                });
-                            }
-                            Err(e) => slog_error!("rpc", "accept_error", error => e),
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(s) => {
+                        let current = active_connections.load(std::sync::atomic::Ordering::Relaxed);
+                        if current >= MAX_RPC_CONNECTIONS {
+                            slog_warn!("rpc", "connection_limit_reached", current => current, max => MAX_RPC_CONNECTIONS);
+                            drop(s);
+                            continue;
                         }
+                        let sc = Arc::clone(&state);
+                        let rt = Arc::clone(&rate_table);
+                        let conn_count = Arc::clone(&active_connections);
+                        conn_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let mrs = max_req_size;
+                        thread::spawn(move || {
+                            let _result = Self::handle_connection(s, sc, rt, mrs);
+                            conn_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        });
                     }
+                    Err(e) => slog_error!("rpc", "accept_error", error => e),
                 }
-                Err(e) => slog_error!("rpc", "bind_failed", addr => &addr, error => e),
             }
         });
+
+        Ok(())
     }
 
     fn handle_connection(
         mut stream: TcpStream,
         state:      SharedState,
         rate_table: RateTable,
+        max_request_size: usize,
     ) -> Result<(), NetworkError> {
         stream.set_read_timeout(Some(Duration::from_secs(RPC_READ_TIMEOUT_SECS)))
             .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
@@ -473,7 +478,7 @@ impl RpcServer {
             }
         }
 
-        if content_length > MAX_BODY {
+        if content_length > max_request_size {
             Self::write_http_response(&mut stream, 413,
                 json!({"error": "Request body too large"}))?;
             return Ok(());
