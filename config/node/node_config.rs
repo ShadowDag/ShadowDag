@@ -228,15 +228,25 @@ impl NodeConfig {
                 "--testnet" => { network = NetworkMode::Testnet; }
                 "--regtest" => { network = NetworkMode::Regtest; }
                 "--network" if i+1 < args.len() => {
-                    network = args[i+1].parse().unwrap_or(NetworkMode::Mainnet);
+                    let val = &args[i+1];
+                    network = val.parse().unwrap_or_else(|_| {
+                        eprintln!("WARNING: Unknown --network '{}', falling back to mainnet", val);
+                        NetworkMode::Mainnet
+                    });
                     i += 1;
                 }
                 "--port" if i+1 < args.len() => {
-                    p2p_override = args[i+1].parse().ok();
+                    match args[i+1].parse::<u16>() {
+                        Ok(p) if p > 0 => p2p_override = Some(p),
+                        _ => eprintln!("WARNING: Invalid --port '{}', using default", args[i+1]),
+                    }
                     i += 1;
                 }
                 "--rpcport" if i+1 < args.len() => {
-                    rpc_override = args[i+1].parse().ok();
+                    match args[i+1].parse::<u16>() {
+                        Ok(p) if p > 0 => rpc_override = Some(p),
+                        _ => eprintln!("WARNING: Invalid --rpcport '{}', using default", args[i+1]),
+                    }
                     i += 1;
                 }
                 "--mine" => { mining = true; }
@@ -257,6 +267,8 @@ impl NodeConfig {
         cfg
     }
 
+    /// Initialize ALL data directories needed by the node.
+    /// Must match the full set used by NetworkMode::init_dirs().
     pub fn init_dirs(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.data_dir)?;
         std::fs::create_dir_all(self.data_dir.join("blocks"))?;
@@ -264,6 +276,10 @@ impl NodeConfig {
         std::fs::create_dir_all(self.data_dir.join("peers"))?;
         std::fs::create_dir_all(self.data_dir.join("mempool"))?;
         std::fs::create_dir_all(self.data_dir.join("dag"))?;
+        std::fs::create_dir_all(self.data_dir.join("wallet"))?;
+        std::fs::create_dir_all(self.data_dir.join("snapshots"))?;
+        std::fs::create_dir_all(self.data_dir.join("dsp"))?;
+        std::fs::create_dir_all(self.data_dir.join("runtime"))?;
         Ok(())
     }
 

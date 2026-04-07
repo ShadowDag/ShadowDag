@@ -557,7 +557,9 @@ impl DaemonNode {
         let blocks = self.block_store.get_all_blocks_sorted_by_height();
         let total = blocks.len() as u64;
         let mut failed = 0u64;
-        let max_failures = (total / 10).clamp(1, 100);
+        // Strict threshold: allow at most 1% failures or 10 blocks, whichever is smaller.
+        // Recovery is a safety operation — partial results are dangerous.
+        let max_failures = (total / 100).clamp(1, 10);
         for block in &blocks {
             // Use validated=true since these blocks were already accepted
             if let Err(e) = self.dag.add_block_validated(block, true) {
@@ -591,7 +593,9 @@ impl DaemonNode {
         let blocks = self.block_store.get_all_blocks_sorted_by_height();
         let total = blocks.len() as u64;
         let mut failed = 0u64;
-        let max_failures = (total / 10).clamp(1, 100);
+        // Strict threshold: allow at most 1% failures or 10 blocks, whichever is smaller.
+        // Recovery is a safety operation — partial results are dangerous.
+        let max_failures = (total / 100).clamp(1, 10);
         for block in &blocks {
             let dag_block = crate::engine::dag::ghostdag::ghostdag::DagBlock {
                 hash: block.header.hash.clone(),

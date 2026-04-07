@@ -188,15 +188,15 @@ fn parse_config(args: &[String]) -> Result<NodeConfig, BootError> {
         ))
     })?;
 
-    let rpc_port: Option<u16> = match parse_flag_opt(args, "--rpc-port") {
+    let rpc_port: Option<u16> = match parse_flag_opt(args, "--rpc-port")? {
         Some(s) => Some(parse_port(&s, "--rpc-port")?),
         None => None,
     };
-    let p2p_port: Option<u16> = match parse_flag_opt(args, "--p2p-port") {
+    let p2p_port: Option<u16> = match parse_flag_opt(args, "--p2p-port")? {
         Some(s) => Some(parse_port(&s, "--p2p-port")?),
         None => None,
     };
-    let data_dir: Option<String> = parse_flag_opt(args, "--data-dir");
+    let data_dir: Option<String> = parse_flag_opt(args, "--data-dir")?;
 
     let mut cfg = NodeConfig::for_network(network);
     if let Some(port) = rpc_port { cfg.rpc_port = port; }
@@ -260,26 +260,50 @@ fn print_help() {
 }
 
 fn parse_flag(args: &[String], name: &str, default: &str) -> String {
-    parse_flag_opt(args, name).unwrap_or_else(|| default.to_string())
+    match parse_flag_opt(args, name) {
+        Ok(Some(val)) => val,
+        Ok(None) => default.to_string(),
+        Err(_) => default.to_string(), // parse_config handles errors for critical flags
+    }
 }
 
 /// Parse a port string into u16, returning a proper BootError on failure.
 fn parse_port(s: &str, flag_name: &str) -> Result<u16, BootError> {
-    s.parse::<u16>().map_err(|_| {
+    let port = s.parse::<u16>().map_err(|_| {
         BootError::InvalidArg(format!(
             "{} value '{}' is not valid (must be 1-65535)", flag_name, s
         ))
-    })
+    })?;
+    if port == 0 {
+        return Err(BootError::InvalidArg(format!(
+            "{} value '0' is not valid (must be 1-65535)", flag_name
+        )));
+    }
+    Ok(port)
 }
 
-fn parse_flag_opt(args: &[String], name: &str) -> Option<String> {
+/// Parse an optional CLI flag. Returns:
+/// - Ok(Some(value)) if flag is present with a value
+/// - Ok(None) if flag is not present at all
+/// - Err if flag is present but missing its value
+fn parse_flag_opt(args: &[String], name: &str) -> Result<Option<String>, BootError> {
     for (i, arg) in args.iter().enumerate() {
         if arg == name {
-            return args.get(i + 1).cloned();
+            return match args.get(i + 1) {
+                Some(val) if !val.starts_with("--") => Ok(Some(val.clone())),
+                _ => Err(BootError::InvalidArg(format!(
+                    "{} requires a value (e.g. {}=VALUE)", name, name
+                ))),
+            };
         }
         if let Some(val) = arg.strip_prefix(&format!("{}=", name)) {
-            return Some(val.to_string());
+            if val.is_empty() {
+                return Err(BootError::InvalidArg(format!(
+                    "{} requires a non-empty value", name
+                )));
+            }
+            return Ok(Some(val.to_string()));
         }
     }
-    None
+    Ok(None)
 }
