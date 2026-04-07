@@ -775,7 +775,7 @@ impl Mempool {
         let _ = total_evicted; // suppress unused warning
     }
 
-    pub fn get_transactions_for_block(
+    pub fn select_transactions_for_block(
         &self,
         utxo_set:  &UtxoSet,
         max_count: usize,
@@ -1286,7 +1286,7 @@ impl crate::domain::traits::tx_pool::TxPool for Mempool {
         utxo_set: &crate::domain::utxo::utxo_set::UtxoSet,
         max_count: usize,
     ) -> Vec<Transaction> {
-        self.get_transactions_for_block(utxo_set, max_count)
+        self.select_transactions_for_block(utxo_set, max_count)
     }
 }
 

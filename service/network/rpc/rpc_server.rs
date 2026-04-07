@@ -184,14 +184,14 @@ impl RpcState {
         // SECURITY: Never log the full password to stderr/stdout (captured by
         // log aggregators, process monitors, shell history). Write to a
         // restricted file instead, and print only a masked hint to console.
-        eprintln!("╔══════════════════════════════════════════════════════╗");
-        eprintln!("║  RPC Admin Password generated (first run)           ║");
-        eprintln!("║  Hint: {}                                           ║", masked);
-        eprintln!("║  Full password saved to: <data_dir>/rpc_password    ║");
-        eprintln!("╚══════════════════════════════════════════════════════╝");
         // Attempt to write password to a file with restricted permissions
         if let Ok(base) = std::env::current_dir() {
             let pw_path = base.join("rpc_password");
+            eprintln!("╔══════════════════════════════════════════════════════╗");
+            eprintln!("║  RPC Admin Password generated (first run)           ║");
+            eprintln!("║  Hint: {}                                           ║", masked);
+            eprintln!("║  Full password saved to: {}  ║", pw_path.display());
+            eprintln!("╚══════════════════════════════════════════════════════╝");
             if std::fs::write(&pw_path, password.as_bytes()).is_ok() {
                 // Best-effort: restrict permissions on Unix
                 #[cfg(unix)]
@@ -201,6 +201,12 @@ impl RpcState {
                         std::fs::Permissions::from_mode(0o600));
                 }
             }
+        } else {
+            eprintln!("╔══════════════════════════════════════════════════════╗");
+            eprintln!("║  RPC Admin Password generated (first run)           ║");
+            eprintln!("║  Hint: {}                                           ║", masked);
+            eprintln!("║  WARNING: Could not determine data dir for password ║");
+            eprintln!("╚══════════════════════════════════════════════════════╝");
         }
         password
     }

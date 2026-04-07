@@ -202,7 +202,7 @@ mod tests {
         }
         let utxo_set = crate::domain::utxo::utxo_set::UtxoSet::new_empty();
         let start = Instant::now();
-        let selected = pool.get_transactions_for_block(&utxo_set, 500);
+        let selected = pool.select_transactions_for_block(&utxo_set, 500);
         let elapsed = start.elapsed();
         println!("[PERF] Select 500 from 1000: {} selected in {:.2}ms", selected.len(), elapsed.as_millis());
         assert!(selected.len() <= 500);

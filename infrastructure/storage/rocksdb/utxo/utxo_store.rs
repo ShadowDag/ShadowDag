@@ -89,6 +89,15 @@ impl UtxoStore {
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
         let mut batch = WriteBatch::default();
         batch.put(key.as_bytes(), &data);
+
+        // Delete address index entry for spent UTXO
+        let mut addr_key = Vec::with_capacity(5 + utxo.address.len() + 1 + 36);
+        addr_key.extend_from_slice(b"addr:");
+        addr_key.extend_from_slice(utxo.address.as_bytes());
+        addr_key.extend_from_slice(b":");
+        addr_key.extend_from_slice(key.as_bytes());
+        batch.delete(&addr_key);
+
         self.db.write(batch)?;
         Ok(())
     }
@@ -143,6 +152,14 @@ impl UtxoStore {
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
             batch.put(key.as_bytes(), data);
+
+            // Delete address index entry for spent UTXO
+            let mut addr_key = Vec::with_capacity(5 + utxo.address.len() + 1 + 36);
+            addr_key.extend_from_slice(b"addr:");
+            addr_key.extend_from_slice(utxo.address.as_bytes());
+            addr_key.extend_from_slice(b":");
+            addr_key.extend_from_slice(key.as_bytes());
+            batch.delete(&addr_key);
         }
 
         for (i, output) in tx.outputs.iter().enumerate() {

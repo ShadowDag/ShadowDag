@@ -151,7 +151,7 @@ fn run(args: &[String]) -> Result<(), BootError> {
     println!();
 
     // ── Initialize data directories ──────────────────────────────────
-    if let Err(e) = cfg.network.init_dirs() {
+    if let Err(e) = cfg.init_dirs() {
         return Err(BootError::InitFailed(format!(
             "failed to initialize data directories at '{}': {}",
             cfg.data_dir.display(), e

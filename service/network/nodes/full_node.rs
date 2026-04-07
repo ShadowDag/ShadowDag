@@ -313,18 +313,14 @@ impl FullNode {
         // NO UTXO execution here. UTXO is handled in Phase 3.
         // ═══════════════════════════════════════════════════════════════
 
-        if !self.block_store.save_block(block) {
-            return Err(NodeError::BlockRejected("Failed to save block to BlockStore".to_string()));
+        if let Err(e) = self.dag_manager.add_block_validated(block, true) {
+            return Err(NodeError::BlockRejected(format!("DAG insertion failed: {}", e)));
         }
 
-        if let Err(e) = self.dag_manager.add_block_validated(block, true) {
-            // Cleanup: BlockStore has no delete_block(), so the saved block becomes
-            // an orphan in storage. Log the inconsistency for crash recovery to handle.
-            slog_error!("node", "dag_insert_failed_block_orphaned",
+        if !self.block_store.save_block(block) {
+            slog_error!("node", "block_store_save_failed_after_dag",
                 block => &block.header.hash,
-                error => &format!("{}", e),
-                note => "block saved in BlockStore but not in DAG — recovery will reconcile");
-            return Err(NodeError::BlockRejected(format!("DAG insertion failed: {}", e)));
+                note => "block in DAG but not persisted — recovery will reconcile");
         }
 
         let dag_block = DagBlock {
@@ -382,12 +378,14 @@ impl FullNode {
         BlockValidator::validate_parents_exist(block, &self.block_store, &self.dag_manager)
             .map_err(|e| NodeError::BlockRejected(e.to_string()))?;
 
-        if !self.block_store.save_block(block) {
-            return Err(NodeError::BlockRejected("Failed to save block".to_string()));
-        }
-
         self.dag_manager.add_block_validated(block, true)
             .map_err(|e| NodeError::BlockRejected(format!("DAG insertion failed: {}", e)))?;
+
+        if !self.block_store.save_block(block) {
+            slog_error!("node", "block_store_save_failed_after_dag",
+                block => &block.header.hash,
+                note => "block in DAG but not persisted — recovery will reconcile");
+        }
 
         let dag_block = DagBlock {
             hash: block.header.hash.clone(),

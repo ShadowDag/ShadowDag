@@ -70,7 +70,7 @@ mod tests {
 
         // Create a dummy utxo_set for the method call
         let utxo_set = crate::domain::utxo::utxo_set::UtxoSet::new_empty();
-        let selected = mempool.get_transactions_for_block(&utxo_set, 3);
+        let selected = mempool.select_transactions_for_block(&utxo_set, 3);
         assert!(selected.len() <= 3);
 
         for w in selected.windows(2) {
