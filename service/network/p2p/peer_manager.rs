@@ -94,6 +94,15 @@ impl PeerManager {
     pub fn global(path: &str) -> Result<Arc<Self>, NetworkError> {
         // Fast path: already initialised.
         if let Some(pm) = PEER_MANAGER_INSTANCE.get() {
+            // Warn if caller requests a different path than what was initialised.
+            // OnceLock returns the same instance regardless of path after first init,
+            // which silently ignores the new path. This makes the mismatch visible.
+            if pm._network_path != path {
+                slog_warn!("p2p", "peer_manager_path_mismatch",
+                    requested => path,
+                    active => &pm._network_path
+                );
+            }
             return Ok(pm.clone());
         }
 
