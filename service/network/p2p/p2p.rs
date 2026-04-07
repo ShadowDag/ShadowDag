@@ -138,8 +138,17 @@ pub fn drain_received_addrs() -> Vec<String> {
 
 /// Requeue excess blocks that couldn't be processed in this tick.
 /// Prepends them to the front of the queue so they're processed first next tick.
+/// Re-increments PEER_PENDING block counts that were decremented during drain.
 pub fn requeue_pending_blocks(items: Vec<(String, Block)>) {
     if items.is_empty() { return; }
+    // Restore per-peer pending counts that were decremented during drain
+    {
+        let mut counts = PEER_PENDING.lock();
+        for (peer_id, _) in &items {
+            let entry = counts.entry(peer_id.clone()).or_insert((0, 0));
+            entry.1 = entry.1.saturating_add(1);
+        }
+    }
     let mut q = PENDING_BLOCKS.lock();
     let mut combined = items;
     combined.extend(q.drain(..));
@@ -147,8 +156,17 @@ pub fn requeue_pending_blocks(items: Vec<(String, Block)>) {
 }
 
 /// Requeue excess transactions that couldn't be processed in this tick.
+/// Re-increments PEER_PENDING tx counts that were decremented during drain.
 pub fn requeue_pending_txs(items: Vec<(String, Transaction)>) {
     if items.is_empty() { return; }
+    // Restore per-peer pending counts that were decremented during drain
+    {
+        let mut counts = PEER_PENDING.lock();
+        for (peer_id, _) in &items {
+            let entry = counts.entry(peer_id.clone()).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(1);
+        }
+    }
     let mut q = PENDING_TXS.lock();
     let mut combined = items;
     combined.extend(q.drain(..));

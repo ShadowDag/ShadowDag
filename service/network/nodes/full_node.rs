@@ -307,20 +307,23 @@ impl FullNode {
         }
 
         // ═══════════════════════════════════════════════════════════════
-        // PHASE 2: ACCEPT INTO DAG (no UTXO — structure only)
+        // PHASE 2: PERSIST THEN ACCEPT INTO DAG (no UTXO — structure only)
         //
-        // A structurally valid block is ALWAYS accepted into the DAG.
-        // NO UTXO execution here. UTXO is handled in Phase 3.
+        // BlockStore is the source of truth. Persist FIRST so that if
+        // the node crashes after save but before DAG insertion, recovery
+        // can rebuild the DAG from BlockStore. If save fails, we must
+        // NOT insert into the DAG (no topology without data).
         // ═══════════════════════════════════════════════════════════════
+
+        if !self.block_store.save_block(block) {
+            return Err(NodeError::BlockRejected(format!(
+                "BlockStore save failed for {} — refusing to add to DAG without persistence",
+                &block.header.hash
+            )));
+        }
 
         if let Err(e) = self.dag_manager.add_block_validated(block, true) {
             return Err(NodeError::BlockRejected(format!("DAG insertion failed: {}", e)));
-        }
-
-        if !self.block_store.save_block(block) {
-            slog_error!("node", "block_store_save_failed_after_dag",
-                block => &block.header.hash,
-                note => "block in DAG but not persisted — recovery will reconcile");
         }
 
         let dag_block = DagBlock {
@@ -378,14 +381,15 @@ impl FullNode {
         BlockValidator::validate_parents_exist(block, &self.block_store, &self.dag_manager)
             .map_err(|e| NodeError::BlockRejected(e.to_string()))?;
 
+        if !self.block_store.save_block(block) {
+            return Err(NodeError::BlockRejected(format!(
+                "BlockStore save failed for {} — refusing to add to DAG without persistence",
+                &block.header.hash
+            )));
+        }
+
         self.dag_manager.add_block_validated(block, true)
             .map_err(|e| NodeError::BlockRejected(format!("DAG insertion failed: {}", e)))?;
-
-        if !self.block_store.save_block(block) {
-            slog_error!("node", "block_store_save_failed_after_dag",
-                block => &block.header.hash,
-                note => "block in DAG but not persisted — recovery will reconcile");
-        }
 
         let dag_block = DagBlock {
             hash: block.header.hash.clone(),

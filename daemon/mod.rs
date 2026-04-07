@@ -286,7 +286,7 @@ impl DaemonNode {
                         continue;
                     }
 
-                    match self.full_node.process_block(&block) {
+                    match self.full_node.process_block_from_peer(&block, &peer_id) {
                         Ok(()) => {
                             total_blocks_processed += 1;
                             slog_info!("daemon", "block_processed", hash => hash_prefix, height => block.header.height, txs => block.body.transactions.len());
