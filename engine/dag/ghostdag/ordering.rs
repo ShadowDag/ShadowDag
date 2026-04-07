@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use crate::errors::{DagError, StorageError};
-use crate::{slog_error, slog_warn};
+use crate::slog_error;
 
 const ORDER_PREFIX: &str = "order:";
 
@@ -17,7 +17,7 @@ pub struct OrderingStore {
 }
 
 impl OrderingStore {
-    pub fn new(path: &str) -> Option<Self> {
+    pub fn new(path: &str) -> Result<Self, DagError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
 
@@ -25,18 +25,15 @@ impl OrderingStore {
         opts.set_max_open_files(1000);
 
         match DB::open(&opts, Path::new(path)) {
-            Ok(db) => Some(Self { db }),
+            Ok(db) => Ok(Self { db }),
             Err(e) => {
                 slog_error!("ghostdag", "ordering_store_open_failed", error => e);
-                None
+                Err(StorageError::OpenFailed {
+                    path: path.to_string(),
+                    reason: e.to_string(),
+                }.into())
             }
         }
-    }
-
-    pub fn new_required(path: &str) -> Result<Self, DagError> {
-        Self::new(path).ok_or_else(|| {
-            StorageError::OpenFailed { path: path.to_string(), reason: "cannot open DB".to_string() }.into()
-        })
     }
 
     #[inline]
@@ -77,7 +74,7 @@ impl OrderingStore {
         blocks: &[String],
         all_blocks: &HashMap<String, Vec<String>>,
         ghostdag: &crate::engine::dag::ghostdag::ghostdag::GhostDag,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>, DagError> {
         let block_set: HashSet<&str> = blocks.iter().map(|s| s.as_str()).collect();
 
         let mut in_degree: HashMap<String, usize> = HashMap::with_capacity(blocks.len());
@@ -153,10 +150,13 @@ impl OrderingStore {
         }
 
         if ordered.len() != blocks.len() {
-            slog_warn!("ghostdag", "cycle_detected", ordered => ordered.len(), expected => blocks.len());
+            return Err(DagError::Other(format!(
+                "ordering incomplete: {} of {} blocks (cycle or corruption)",
+                ordered.len(), blocks.len()
+            )));
         }
 
-        ordered
+        Ok(ordered)
     }
 
     pub fn sort_by_blue_score(
@@ -205,8 +205,8 @@ impl OrderingStore {
         blocks: &[String],
         all_blocks: &HashMap<String, Vec<String>>,
         ghostdag: &crate::engine::dag::ghostdag::ghostdag::GhostDag,
-    ) -> Vec<String> {
-        let ordered = self.order_blocks(blocks, all_blocks, ghostdag);
+    ) -> Result<Vec<String>, DagError> {
+        let ordered = self.order_blocks(blocks, all_blocks, ghostdag)?;
 
         let mut batch = WriteBatch::default();
 
@@ -219,7 +219,7 @@ impl OrderingStore {
             slog_error!("ghostdag", "ordering_batch_write_failed", error => e);
         }
 
-        ordered
+        Ok(ordered)
     }
 
     fn sort_vec(vec: &mut [String], blue_cache: &HashMap<String, u64>) {

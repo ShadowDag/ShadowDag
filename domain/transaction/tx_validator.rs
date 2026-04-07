@@ -164,6 +164,14 @@ impl TxValidator {
             return false;
         }
 
+        // Declared fee must exactly match actual fee (input_sum - output_sum).
+        // Without this, a TX could declare fee=1 while the real difference is
+        // much higher, enabling fee manipulation and silent miner surplus.
+        let actual_fee = input_sum.saturating_sub(output_sum);
+        if actual_fee != tx.fee {
+            return false;
+        }
+
         true
     }
 
@@ -260,7 +268,17 @@ impl TxValidator {
             None => return false,
         };
 
-        input_sum >= required
+        if input_sum < required {
+            return false;
+        }
+
+        // Declared fee must exactly match actual fee (input_sum - output_sum).
+        let actual_fee = input_sum.saturating_sub(output_sum);
+        if actual_fee != tx.fee {
+            return false;
+        }
+
+        true
     }
 
     pub fn validate(tx: &Transaction, utxo_set: &UtxoSet) -> bool {
