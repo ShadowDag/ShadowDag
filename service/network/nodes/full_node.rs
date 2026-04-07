@@ -317,8 +317,15 @@ impl FullNode {
             return Err(NodeError::BlockRejected("Failed to save block to BlockStore".to_string()));
         }
 
-        self.dag_manager.add_block_validated(block, true)
-            .map_err(|e| NodeError::BlockRejected(format!("DAG insertion failed: {}", e)))?;
+        if let Err(e) = self.dag_manager.add_block_validated(block, true) {
+            // Cleanup: BlockStore has no delete_block(), so the saved block becomes
+            // an orphan in storage. Log the inconsistency for crash recovery to handle.
+            slog_error!("node", "dag_insert_failed_block_orphaned",
+                block => &block.header.hash,
+                error => &format!("{}", e),
+                note => "block saved in BlockStore but not in DAG — recovery will reconcile");
+            return Err(NodeError::BlockRejected(format!("DAG insertion failed: {}", e)));
+        }
 
         let dag_block = DagBlock {
             hash: block.header.hash.clone(),
@@ -485,14 +492,15 @@ impl FullNode {
             let mut cursor = current_best.clone();
             let mut rollback_count = 0u64;
             while !cursor.is_empty() && !new_chain.contains(&cursor) {
-                if rollback_count > MAX_REORG_DEPTH {
+                if rollback_count >= MAX_REORG_DEPTH {
                     return Err(NodeError::BlockRejected(format!(
                         "reorg rollback depth {} exceeds MAX_REORG_DEPTH", rollback_count
                     )));
                 }
-                if let Err(e) = self.utxo_set.rollback_block_undo(&cursor) {
-                    slog_error!("node", "rollback_failed", block => &cursor, error => e);
-                }
+                self.utxo_set.rollback_block_undo(&cursor).map_err(|e| {
+                    slog_error!("node", "rollback_failed", block => &cursor, error => &format!("{}", e));
+                    NodeError::BlockRejected(format!("rollback failed for {}: {}", cursor, e))
+                })?;
                 rollback_count += 1;
                 // Walk to parent via selected_parent
                 cursor = self.block_store.get_block(&cursor)
