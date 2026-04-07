@@ -11,6 +11,7 @@
 //
 // ═══════════════════════════════════════════════════════════════════════════
 
+use std::sync::OnceLock;
 use sha2::{Sha256, Digest};
 
 use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
@@ -284,8 +285,10 @@ fn mine_genesis(p: &GenesisParams, merkle_root: &str) -> (u64, String) {
 
         // Safety: prevent infinite loop in case of misconfiguration
         if nonce > 100_000_000 {
-            slog_error!("genesis", "nonce_search_exhausted", attempts => "100000000");
-            return (0, "0".repeat(64));
+            panic!(
+                "FATAL: Genesis mining failed after 100,000,000 attempts. \
+                 This indicates a misconfigured difficulty target."
+            );
         }
     }
 }
@@ -391,14 +394,23 @@ pub fn genesis_difficulty_for(network: &NetworkMode) -> u64 {
     }
 }
 
-/// Get the mainnet genesis hash
+static GENESIS_HASH_MAINNET: OnceLock<String> = OnceLock::new();
+static GENESIS_HASH_TESTNET: OnceLock<String> = OnceLock::new();
+static GENESIS_HASH_REGTEST: OnceLock<String> = OnceLock::new();
+
+/// Get the mainnet genesis hash (cached after first call)
 pub fn genesis_hash() -> String {
-    create_genesis_block().header.hash
+    genesis_hash_for(&NetworkMode::Mainnet)
 }
 
-/// Get genesis hash for a specific network
+/// Get genesis hash for a specific network (cached after first call)
 pub fn genesis_hash_for(network: &NetworkMode) -> String {
-    create_genesis_block_for(network).header.hash
+    let lock = match network {
+        NetworkMode::Mainnet => &GENESIS_HASH_MAINNET,
+        NetworkMode::Testnet => &GENESIS_HASH_TESTNET,
+        NetworkMode::Regtest => &GENESIS_HASH_REGTEST,
+    };
+    lock.get_or_init(|| create_genesis_block_for(network).header.hash).clone()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

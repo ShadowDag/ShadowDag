@@ -35,10 +35,16 @@ impl Checkpoints {
         true
     }
 
+    /// Returns the last HARDCODED checkpoint.
+    /// For the most recent checkpoint including auto-generated ones,
+    /// use `all_with_dynamic(db)` and take the last entry.
     pub fn last_checkpoint() -> Option<CheckpointEntry> {
         Self::all().last().cloned()
     }
 
+    /// Returns true if `height` is at or before the last HARDCODED checkpoint.
+    /// For the most recent checkpoint including auto-generated ones,
+    /// use `all_with_dynamic(db)` and take the last entry.
     pub fn before_last_checkpoint(height: u64) -> bool {
         match Self::last_checkpoint() {
             Some(cp) => height <= cp.height,
@@ -46,10 +52,16 @@ impl Checkpoints {
         }
     }
 
+    /// Returns the number of HARDCODED checkpoints.
+    /// For the total count including auto-generated ones,
+    /// use `all_with_dynamic(db).len()`.
     pub fn count() -> usize {
         Self::all().len()
     }
 
+    /// Returns a HARDCODED checkpoint at the given height, if one exists.
+    /// For checkpoints including auto-generated ones,
+    /// use `all_with_dynamic(db)` and search the result.
     pub fn get(height: u64) -> Option<CheckpointEntry> {
         Self::all().into_iter().find(|cp| cp.height == height)
     }
