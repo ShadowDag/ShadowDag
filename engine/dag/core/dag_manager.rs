@@ -95,6 +95,11 @@ impl DagManager {
     /// Canonical value defined in block_validator::MAX_FUTURE_SECS.
     const MAX_FUTURE_TIMESTAMP: u64 = 120;
 
+    /// Maximum children any single block can have in the DAG.
+    /// Prevents any block from becoming a "hotspot" that slows traversal.
+    /// At 10 BPS with MAX_PARENTS=80, realistic max is ~80-160 children.
+    const MAX_CHILDREN_PER_BLOCK: usize = 256;
+
     // ADD BLOCK (delegates to add_block_validated with validated=false)
     pub fn add_block(&self, block: &Block) -> Result<(), DagError> {
         self.add_block_validated(block, false)
@@ -185,6 +190,27 @@ impl DagManager {
             // Conservative: if walk limit exceeded, treat as cycle (reject block)
             if self.would_create_cycle(hash, p).unwrap_or(true) {
                 return Err(DagError::Other(format!("cycle detected via {}", p)));
+            }
+
+            // Fanout limit: reject if parent already has too many children.
+            // This prevents any block from becoming a traversal bottleneck.
+            let child_count = self.get_children(p).len();
+            if child_count >= Self::MAX_CHILDREN_PER_BLOCK {
+                return Err(DagError::Other(format!(
+                    "parent {} already has {} children (max {})",
+                    p, child_count, Self::MAX_CHILDREN_PER_BLOCK
+                )));
+            }
+        }
+
+        // Deterministic parent ordering: parents MUST be sorted lexicographically.
+        // This ensures all nodes process the same block identically, preventing
+        // ordering-dependent divergence in merkle roots or hash computations.
+        for i in 1..parents.len() {
+            if parents[i] <= parents[i - 1] {
+                return Err(DagError::Other(
+                    "parents must be sorted in strictly ascending lexicographic order".into()
+                ));
             }
         }
 
