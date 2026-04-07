@@ -299,14 +299,18 @@ impl BlockValidator {
         network:             &NetworkMode,
         expected_difficulty:  Option<u64>,
     ) -> BlockValidationResult {
-        // Genesis has its own rules
-        if block.header.height == 0 {
-            return Self::validate_genesis(block, network);
-        }
-
-        // L1: Network layer — cheapest checks (format, size, DoS)
+        // L1: Network layer — always runs, even for genesis.
+        // Format, size, and DoS checks apply to ALL blocks regardless of height.
         if let Err(reason) = Self::validate_network_layer(block) {
             return BlockValidationResult::fail(&reason.to_string());
+        }
+
+        // Genesis path — after L1 but before L2/L3.
+        // L2 structural validation (timestamp, parents) is NOT required for
+        // genesis (no parents = no timestamp/parent validation), but L1
+        // (format, size, duplicates) must still be enforced above.
+        if block.header.height == 0 {
+            return Self::validate_genesis(block, network);
         }
 
         // PoW EARLY: validate proof-of-work BEFORE expensive signature checks.
@@ -661,11 +665,12 @@ impl BlockValidator {
             // Parent must exist
             let parent_block = block_store.get_block(parent_hash)
                 .ok_or_else(|| {
-                    // Fallback: check DAG for existence (but we need height)
+                    // Check DAG for existence — but even if the parent is in the
+                    // DAG, we REJECT it because block data (from BlockStore) is
+                    // required for height validation below. A parent in the DAG
+                    // but missing from BlockStore means we cannot verify the
+                    // height rule, so the block must be rejected.
                     if dag_manager.block_exists(parent_hash) {
-                        // Parent exists in DAG but not in block store — this
-                        // shouldn't happen in normal operation, but we allow it
-                        // and skip the height check for this parent.
                         return ConsensusError::BlockValidation(format!("parent {} in DAG but not in block store", parent_hash));
                     }
                     ConsensusError::BlockValidation(format!("parent {} not found", parent_hash))
