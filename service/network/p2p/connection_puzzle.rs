@@ -9,7 +9,7 @@
 // This makes it expensive to create thousands of fake connections.
 //
 // Puzzle: SHA-256(challenge || nonce) must have N leading zeros.
-// Difficulty is low (N=2, ~256 hashes) — trivial for real nodes,
+// Difficulty is moderate (N=3, ~4096 hashes) — trivial for real nodes,
 // but expensive at scale for an attacker with 10,000 fake nodes.
 // ═══════════════════════════════════════════════════════════════════════════
 

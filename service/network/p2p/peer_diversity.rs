@@ -107,7 +107,20 @@ impl PeerIdentity {
         msg.extend_from_slice(self.nonce.as_bytes());
 
         let sig = Signature::from_bytes(&sig_arr);
-        vk.verify(&msg, &sig).is_ok()
+        if vk.verify(&msg, &sig).is_err() {
+            return false;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Reject identities from the future or too old (5 minutes)
+        if self.timestamp > now + 30 { return false; } // max 30s future
+        if now.saturating_sub(self.timestamp) > 300 { return false; } // max 5 min old
+
+        true
     }
 
     /// Unique peer ID derived from public key

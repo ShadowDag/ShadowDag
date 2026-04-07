@@ -372,18 +372,32 @@ fn cmd_balance(args: &[String]) {
 
 /// Validate a ShadowDAG address format.
 /// Valid formats: SD1... (mainnet), ST1... (testnet), SR1... (regtest)
-/// Must be 44 chars: 3-char prefix + 1-char type + 40 hex chars
+/// Type prefixes: SD1 (standard), SD1s (stealth), SD1c (contract), SD1m (multisig)
+/// Address = prefix (3 or 4 chars) + 40 hex chars
 fn validate_address(addr: &str) -> Result<(), String> {
-    if addr.len() != 44 {
-        return Err(format!("Address must be 44 characters, got {}", addr.len()));
+    // Type prefixes: SD1 (standard), SD1s (stealth), SD1c (contract), SD1m (multisig)
+    // Network prefixes: SD1/ST1/SR1
+    let (prefix_len, valid_prefix) = if addr.starts_with("SD1s") || addr.starts_with("SD1c") || addr.starts_with("SD1m")
+        || addr.starts_with("ST1s") || addr.starts_with("ST1c") || addr.starts_with("ST1m")
+        || addr.starts_with("SR1s") || addr.starts_with("SR1c") || addr.starts_with("SR1m")
+    {
+        (4, true)
+    } else if addr.starts_with("SD1") || addr.starts_with("ST1") || addr.starts_with("SR1") {
+        (3, true)
+    } else {
+        (0, false)
+    };
+
+    if !valid_prefix {
+        return Err(format!("Invalid address prefix (expected SD1/ST1/SR1)"));
     }
-    let prefix = &addr[..3];
-    if !["SD1", "ST1", "SR1"].contains(&prefix) {
-        return Err(format!("Invalid network prefix '{}' (expected SD1/ST1/SR1)", prefix));
+
+    let hex_part = &addr[prefix_len..];
+    if hex_part.len() != 40 {
+        return Err(format!("Address hex part must be 40 characters, got {}", hex_part.len()));
     }
-    // Check that characters after prefix are valid hex or type markers
-    if !addr[4..].chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("Address contains invalid characters (expected hex after prefix)".into());
+    if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Address contains invalid characters".into());
     }
     Ok(())
 }
