@@ -16,6 +16,13 @@ repository = "https://github.com/shadowdag/shadowdag"
 keywords = ["blockchain", "dag", "privacy", "mining", "cryptocurrency"]
 categories = ["cryptography::cryptocurrencies"]
 
+[features]
+default = []
+# Production mode: reduces logging verbosity, enables performance optimizations
+production = []
+# Development mode: verbose logging, extra debug assertions
+dev-mode = []
+
 [lib]
 name = "shadowdag"
 path = "lib.rs"
