@@ -3,6 +3,8 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::slog_warn;
+
 pub const MAX_REORG_DEPTH: u64 = 1_000;
 
 /// Minimum cumulative work ratio for reorg acceptance (integer math).
@@ -168,9 +170,10 @@ impl ReorgManager {
             }
         }
 
-        // no common ancestor
+        // No common ancestor found — treat as too deep to be safe.
+        // Without a shared ancestor the fork cannot be evaluated reliably.
         if i == 0 || j == 0 {
-            return ReorgResult::NoReorg;
+            return ReorgResult::TooDeep;
         }
 
         let ancestor_idx_old = i - 1;
@@ -245,7 +248,10 @@ impl ReorgManager {
 
         // 4. Deterministic tiebreaker for equal-work chains (issue #42):
         //    lower tip hash wins, preventing deadlock between nodes seeing
-        //    different orderings.
+        //    different orderings. This is an intentional string comparison —
+        //    it is safe and deterministic because all block hashes use the
+        //    same lowercase hex encoding, so lexicographic order on strings
+        //    is consistent across all nodes.
         if new_work.total_difficulty == old_work.total_difficulty
             && new_tip_hash >= old_tip_hash
         {
@@ -290,12 +296,22 @@ impl ReorgManager {
                 let old_work = if old_ancestor_end < old_difficulties.len() {
                     CumulativeWork::from_difficulties(&old_difficulties[old_ancestor_end..])
                 } else {
+                    slog_warn!("reorg", "difficulty_length_mismatch",
+                        chain_len => old_chain.len(),
+                        diff_len => old_difficulties.len(),
+                        ancestor_end => old_ancestor_end
+                    );
                     CumulativeWork::from_difficulties(&[])
                 };
 
                 let new_work = if new_ancestor_end < new_difficulties.len() {
                     CumulativeWork::from_difficulties(&new_difficulties[new_ancestor_end..])
                 } else {
+                    slog_warn!("reorg", "difficulty_length_mismatch",
+                        chain_len => new_chain.len(),
+                        diff_len => new_difficulties.len(),
+                        ancestor_end => new_ancestor_end
+                    );
                     CumulativeWork::from_difficulties(&[])
                 };
 
