@@ -34,29 +34,22 @@ impl TxStore {
         })
     }
 
-    pub fn save_tx(&self, tx: &Transaction) -> bool {
-        match bincode::serialize(tx) {
-            Ok(data) => {
-                match self.db.put(tx.hash.as_bytes(), &data) {
-                    Ok(_)  => true,
-                    Err(_e) => {
-                        false
-                    }
-                }
-            }
-            Err(_e) => {
-                false
-            }
-        }
+    pub fn save_tx(&self, tx: &Transaction) -> Result<(), StorageError> {
+        let data = bincode::serialize(tx)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        self.db.put(tx.hash.as_bytes(), &data)
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
-    pub fn get_tx(&self, hash: &str) -> Option<Transaction> {
+    pub fn get_tx(&self, hash: &str) -> Result<Option<Transaction>, StorageError> {
         match self.db.get(hash.as_bytes()) {
-            Ok(Some(data)) => bincode::deserialize(&data).ok(),
-            Ok(None)       => None,
-            Err(_e)         => {
-                None
+            Ok(Some(data)) => {
+                let tx = bincode::deserialize(&data)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                Ok(Some(tx))
             }
+            Ok(None) => Ok(None),
+            Err(e) => Err(StorageError::ReadFailed(e.to_string())),
         }
     }
 
@@ -128,9 +121,9 @@ mod tests {
         let store = TxStore::new(&tmp_path()).expect("open TxStore");
         let tx = make_tx("tx_abc");
 
-        assert!(store.save_tx(&tx));
+        store.save_tx(&tx).unwrap();
 
-        let loaded = store.get_tx("tx_abc").expect("tx should exist");
+        let loaded = store.get_tx("tx_abc").unwrap().expect("tx should exist");
         assert_eq!(loaded.hash, "tx_abc");
         assert_eq!(loaded.fee, 10);
         assert_eq!(loaded.outputs.len(), 1);
@@ -141,7 +134,7 @@ mod tests {
     fn get_returns_none_for_unknown_tx() {
         let store = TxStore::new(&tmp_path()).expect("open TxStore");
 
-        assert!(store.get_tx("nonexistent").is_none());
+        assert!(store.get_tx("nonexistent").unwrap().is_none());
     }
 
     #[test]
@@ -150,7 +143,7 @@ mod tests {
         let tx = make_tx("exists_check");
 
         assert!(!store.tx_exists("exists_check"));
-        store.save_tx(&tx);
+        store.save_tx(&tx).unwrap();
         assert!(store.tx_exists("exists_check"));
         assert!(!store.tx_exists("no_such_tx"));
     }

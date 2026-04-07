@@ -83,10 +83,22 @@ impl NodeDB {
             Ok(db) => {
                 return Ok(Self { db: Arc::new(db) });
             }
-            Err(_e) => {
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                let looks_corrupt = msg.contains("corruption")
+                    || msg.contains("checksum")
+                    || msg.contains("manifest");
+                if !looks_corrupt {
+                    return Err(StorageError::OpenFailed {
+                        path: path.to_string(),
+                        reason: e.to_string(),
+                    });
+                }
+                slog_warn!("storage", "db_corruption_detected", path => path, error => &e.to_string());
             }
         }
 
+        // Only reach here for corruption errors — attempt repair
         DB::repair(&opts, Path::new(path))
             .map_err(|re| StorageError::OpenFailed { path: path.to_string(), reason: format!("repair failed: {}", re) })?;
 
