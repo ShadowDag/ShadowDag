@@ -211,13 +211,18 @@ impl PeerManager {
         let data = bincode::serialize(&record)
             .map_err(|e| NetworkError::Serialization(e.to_string()))?;
         let db   = self.lock_db();
+        let already_exists = db.get(format!("{}{}", PFX_PEER, record.addr).as_bytes())
+            .map(|v| v.is_some()).unwrap_or(false);
         let mut batch = WriteBatch::default();
         let key = format!("{}{}", PFX_PEER, record.addr);
         batch.put(key.as_bytes(), &data);
         batch.put(format!("{}{}", PFX_LAST_SEEN, record.addr).as_bytes(),
                   unix_now().to_le_bytes());
-        batch.put(format!("{}{}", PFX_CONN_COUNT, ip).as_bytes(),
-                  (count + 1).to_le_bytes());
+        // Only increment conn_count if this is a NEW peer
+        if !already_exists {
+            batch.put(format!("{}{}", PFX_CONN_COUNT, ip).as_bytes(),
+                      (count + 1).to_le_bytes());
+        }
         db.write(batch).map_err(|e| NetworkError::Storage(crate::errors::StorageError::WriteFailed(e.to_string())))
     }
 
@@ -291,7 +296,7 @@ impl PeerManager {
 
     pub fn get_best_peers(&self, limit: usize) -> Vec<PeerRecord> {
         let mut peers = self.get_peer_records();
-        peers.retain(|p| !p.is_banned);
+        peers.retain(|p| !self.is_banned(&p.addr));
         peers.sort_by_key(|p| std::cmp::Reverse(p.health_score()));
         peers.truncate(limit);
         peers

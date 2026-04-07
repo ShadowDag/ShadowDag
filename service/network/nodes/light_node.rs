@@ -72,6 +72,15 @@ impl LightNode {
             return false;
         }
 
+        // Must point to previous tip
+        if let Some(prev) = self.headers.last() {
+            let parent_ok = header.selected_parent.as_deref() == Some(prev.hash.as_str())
+                || header.parents.iter().any(|p| p == &prev.hash);
+            if !parent_ok {
+                return false;
+            }
+        }
+
         self.best_height = header.height;
 
         // Keep cache bounded

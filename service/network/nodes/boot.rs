@@ -96,13 +96,14 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
 
         let _ = dag.add_block(&genesis);
         blocks.save_block(&genesis);
-        blocks.update_best_hash(&genesis.header.hash);
 
         // Apply genesis UTXO state (coinbase outputs become spendable)
+        // Update best_hash ONLY after UTXO apply succeeds (atomicity)
         if let Err(e) = utxo_set.apply_block_full(&genesis, 0) {
             slog_error!("boot", "genesis_utxo_failed", error => e);
             return Err(NodeError::Init(e.to_string()));
         }
+        blocks.update_best_hash(&genesis.header.hash);
         slog_info!("boot", "genesis_created");
     } else {
         // WARNING: boot.rs is DEPRECATED. It does NOT include crash recovery.
@@ -116,9 +117,8 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
 
     let mut p2p = P2P::new_with_config(&cfg)?;
 
-    p2p.peers.bootstrap_for_network(&cfg.network);
-    let _ = p2p.peers.discover_peers();
-    slog_info!("boot", "p2p_bootstrapped", peer_count => p2p.peers.count());
+    // NOTE: bootstrap_for_network + discover_peers are called inside P2P::start(),
+    // so we do NOT duplicate them here.
 
     relay_sync_mempool(&*p2p.peers);
 
