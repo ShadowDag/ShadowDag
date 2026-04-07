@@ -129,7 +129,7 @@ impl<'a> MinerController<'a> {
             block.header.blue_score,
             block.header.height,
             block.header.timestamp,
-        );
+        )?;
 
         slog_info!("mining", "block_submitted_to_dag", hash_prefix => &block.header.hash[..block.header.hash.len().min(16)], height => block.header.height, tips => self.tip_manager.tip_count());
 
