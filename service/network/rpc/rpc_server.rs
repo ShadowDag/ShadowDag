@@ -590,7 +590,10 @@ impl RpcServer {
                 let bucket = table.entry(ip).or_insert_with(RateBucket::new);
                 bucket.try_consume()
             }
-            Err(_) => true,
+            Err(e) => {
+                slog_error!("rpc", "rate_limit_lock_poisoned", error => e);
+                false // fail-closed: deny on lock failure
+            }
         }
     }
 

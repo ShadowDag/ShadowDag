@@ -323,6 +323,8 @@ impl FullNode {
         }
 
         if let Err(e) = self.dag_manager.add_block_validated(block, true) {
+            // Clean up persisted block — DAG rejected it, so it must not remain in BlockStore
+            let _ = self.block_store.delete_block(&block.header.hash);
             return Err(NodeError::BlockRejected(format!("DAG insertion failed: {}", e)));
         }
 
@@ -388,8 +390,11 @@ impl FullNode {
             )));
         }
 
-        self.dag_manager.add_block_validated(block, true)
-            .map_err(|e| NodeError::BlockRejected(format!("DAG insertion failed: {}", e)))?;
+        if let Err(e) = self.dag_manager.add_block_validated(block, true) {
+            // Clean up persisted block — DAG rejected it, so it must not remain in BlockStore
+            let _ = self.block_store.delete_block(&block.header.hash);
+            return Err(NodeError::BlockRejected(format!("DAG insertion failed: {}", e)));
+        }
 
         let dag_block = DagBlock {
             hash: block.header.hash.clone(),
@@ -751,20 +756,53 @@ impl FullNode {
                 Err(_) => continue,
             };
 
-            let mut blocks_to_process: Vec<Block> = Vec::new();
+            // Remove from pool, preserving (block, timestamp, peer_id) for re-insertion on failure
+            let mut entries_to_process: Vec<(Block, u64, String)> = Vec::new();
             if let Ok(mut pool) = self.orphan_pool.lock() {
                 for hash in &waiting {
-                    if let Some((block, _, _)) = pool.remove(hash) {
-                        blocks_to_process.push(block);
+                    if let Some(entry) = pool.remove(hash) {
+                        entries_to_process.push(entry);
                     }
                 }
             }
 
-            for block in blocks_to_process {
+            for (block, timestamp, peer_id) in entries_to_process {
                 let hash = block.header.hash.clone();
-                if self.process_block_without_orphans(&block).is_ok() {
-                    // This block was accepted — its children may now be ready
-                    queue.push(hash);
+                match self.process_block_without_orphans(&block) {
+                    Ok(()) => {
+                        // Success — decrement peer count and queue children
+                        if let Ok(mut counts) = self.orphan_count_by_peer.lock() {
+                            if let Some(c) = counts.get_mut(&peer_id) {
+                                *c = c.saturating_sub(1);
+                                if *c == 0 { counts.remove(&peer_id); }
+                            }
+                        }
+                        queue.push(hash);
+                    }
+                    Err(ref e) if e.to_string().contains("not found") => {
+                        // Still orphan — re-insert into pool and parent index
+                        if let Ok(mut pool) = self.orphan_pool.lock() {
+                            pool.insert(hash.clone(), (block.clone(), timestamp, peer_id));
+                        }
+                        if let Ok(mut by_parent) = self.orphan_by_parent.lock() {
+                            for p in &block.header.parents {
+                                by_parent.entry(p.clone())
+                                    .or_insert_with(Vec::new)
+                                    .push(hash.clone());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Permanent failure — decrement peer count, log warning
+                        if let Ok(mut counts) = self.orphan_count_by_peer.lock() {
+                            if let Some(c) = counts.get_mut(&peer_id) {
+                                *c = c.saturating_sub(1);
+                                if *c == 0 { counts.remove(&peer_id); }
+                            }
+                        }
+                        slog_warn!("node", "orphan_processing_failed",
+                            hash => &hash, error => &format!("{}", e));
+                    }
                 }
             }
         }
