@@ -865,7 +865,15 @@ impl ProtocolSession {
         }
 
         if self.state.is_established() {
-            return Ok(()); // all commands allowed after handshake
+            // Block handshake commands after connection is established
+            if matches!(cmd, CommandId::Version | CommandId::VerAck | CommandId::PuzzleChallenge | CommandId::PuzzleSolution) {
+                return Err(ProtocolError::new(
+                    ProtocolErrorKind::DuplicateHandshake,
+                    format!("{:?} not allowed after handshake", cmd),
+                    100,
+                ));
+            }
+            return Ok(());
         }
 
         if cmd.allowed_before_handshake() {
@@ -964,13 +972,19 @@ impl ProtocolSession {
 
     /// Transition: we received VerAck from the peer.
     pub fn received_verack(&mut self) -> Result<(), ProtocolError> {
-        if self.state != HandshakeState::AwaitPeerVerAck
-            && self.state != HandshakeState::AwaitVersion
-        {
+        if self.state != HandshakeState::AwaitPeerVerAck {
             return Err(ProtocolError::new(
                 ProtocolErrorKind::InvalidTransition,
-                format!("unexpected VerAck in state {}", self.state),
+                format!("unexpected VerAck in state {:?}", self.state),
                 50,
+            ));
+        }
+        // Ensure we actually received Version first
+        if self.peer_version.is_none() {
+            return Err(ProtocolError::new(
+                ProtocolErrorKind::PrematureMessage,
+                "received VerAck before Version",
+                100,
             ));
         }
         self.state = HandshakeState::Established;

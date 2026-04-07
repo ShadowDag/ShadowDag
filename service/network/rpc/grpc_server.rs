@@ -24,7 +24,8 @@
 
 use crate::{slog_info, slog_error};
 use std::collections::HashMap;
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -192,23 +193,23 @@ impl GrpcStats {
 }
 
 /// Request handler function type
-pub type HandlerFn = Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
+pub type HandlerFn = Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
 
 /// gRPC Server
 pub struct GrpcServer {
     port:     u16,
-    running:  AtomicBool,
+    running:  Arc<AtomicBool>,
     stats:    Arc<GrpcStats>,
-    handlers: RwLock<HashMap<u8, HandlerFn>>,
+    handlers: Arc<RwLock<HashMap<u8, HandlerFn>>>,
 }
 
 impl GrpcServer {
     pub fn new(port: u16) -> Self {
         Self {
             port,
-            running:  AtomicBool::new(false),
+            running:  Arc::new(AtomicBool::new(false)),
             stats:    Arc::new(GrpcStats::new()),
-            handlers: RwLock::new(HashMap::new()),
+            handlers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -216,7 +217,7 @@ impl GrpcServer {
     pub fn register_handler<F>(&self, method: GrpcMethod, handler: F)
     where F: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static
     {
-        self.handlers.write().unwrap_or_else(|e| e.into_inner()).insert(method as u8, Box::new(handler));
+        self.handlers.write().unwrap_or_else(|e| e.into_inner()).insert(method as u8, Arc::new(handler));
     }
 
     /// Register all default handlers
@@ -268,9 +269,69 @@ impl GrpcServer {
         }
     }
 
+    /// Handle a single client connection: read requests and write responses.
+    fn handle_connection(
+        stream: &mut TcpStream,
+        handlers: &RwLock<HashMap<u8, HandlerFn>>,
+        stats: &GrpcStats,
+    ) {
+        loop {
+            // Read 4-byte length prefix
+            let mut len_buf = [0u8; 4];
+            if stream.read_exact(&mut len_buf).is_err() {
+                break; // Client disconnected or read error
+            }
+            let msg_len = u32::from_be_bytes(len_buf) as usize;
+            if msg_len < 9 || msg_len > MAX_MESSAGE_SIZE {
+                break; // Invalid message size
+            }
+
+            // Read payload (method_id + req_id + data)
+            let mut payload = vec![0u8; msg_len];
+            if stream.read_exact(&mut payload).is_err() {
+                break;
+            }
+
+            // Reconstruct wire format for parse_request: [4B len][payload]
+            let mut wire = Vec::with_capacity(4 + msg_len);
+            wire.extend_from_slice(&len_buf);
+            wire.extend_from_slice(&payload);
+
+            let req = match parse_request(&wire) {
+                Some(r) => r,
+                None => break,
+            };
+
+            // Dispatch to handler
+            stats.total_requests.fetch_add(1, Ordering::Relaxed);
+            let method_byte = req.method as u8;
+            let response = {
+                let h = handlers.read().unwrap_or_else(|e| e.into_inner());
+                match h.get(&method_byte) {
+                    Some(handler) => {
+                        let result = handler(&req.payload);
+                        GrpcResponse::ok(req.req_id, result)
+                    }
+                    None => {
+                        stats.total_errors.fetch_add(1, Ordering::Relaxed);
+                        GrpcResponse::err(req.req_id, &format!("No handler for {:?}", req.method))
+                    }
+                }
+            };
+
+            // Write response back
+            let resp_bytes = response.to_bytes();
+            stats.bytes_sent.fetch_add(resp_bytes.len() as u64, Ordering::Relaxed);
+            if stream.write_all(&resp_bytes).is_err() {
+                break;
+            }
+
+            stats.bytes_received.fetch_add((4 + msg_len) as u64, Ordering::Relaxed);
+        }
+    }
+
     /// Start the TCP server
     pub fn start(&self) {
-        self.running.store(true, Ordering::Relaxed);
         let addr = format!("0.0.0.0:{}", self.port);
 
         slog_info!("rpc", "grpc_server_listening", addr => &addr, protocol => "binary length-prefixed", max_message_size => MAX_MESSAGE_SIZE);
@@ -283,6 +344,9 @@ impl GrpcServer {
             }
         };
 
+        // Only set running to true AFTER successful bind
+        self.running.store(true, Ordering::Relaxed);
+
         for stream in listener.incoming() {
             if !self.running.load(Ordering::Relaxed) { break; }
 
@@ -291,10 +355,16 @@ impl GrpcServer {
             }
 
             match stream {
-                Ok(_stream) => {
+                Ok(mut stream) => {
                     self.stats.active_conns.fetch_add(1, Ordering::Relaxed);
-                    // In production: spawn thread to handle connection
-                    self.stats.active_conns.fetch_sub(1, Ordering::Relaxed);
+                    let handlers = Arc::clone(&self.handlers);
+                    let stats = Arc::clone(&self.stats);
+                    let running = Arc::clone(&self.running);
+                    std::thread::spawn(move || {
+                        let _ = running; // keep reference so we can check if needed
+                        Self::handle_connection(&mut stream, &handlers, &stats);
+                        stats.active_conns.fetch_sub(1, Ordering::Relaxed);
+                    });
                 }
                 Err(e) => slog_error!("rpc", "grpc_accept_error", error => e),
             }

@@ -425,16 +425,31 @@ impl FullNode {
             return Ok(()); // No chain change
         }
 
-        // Build the selected parent chain from new tip back to a common ancestor
-        // with the old chain. For now, use a simplified approach:
-        // walk new tip's selected parent chain until we find a block that
-        // was already applied (exists in UTXO commitment store).
+        // Build the selected parent chain from new tip back to the true fork
+        // point with the old chain. Walk both chains (new tip and current best)
+        // back via selected_parent to find where they diverge.
+        use std::collections::HashSet;
+
+        // First, collect the old chain's selected-parent ancestry
+        let mut old_chain_set = HashSet::new();
+        {
+            let mut cursor = current_best.clone();
+            while !cursor.is_empty() {
+                old_chain_set.insert(cursor.clone());
+                cursor = self.block_store.get_block(&cursor)
+                    .and_then(|b| b.header.selected_parent.clone())
+                    .unwrap_or_default();
+            }
+        }
+
+        // Walk the new tip's selected-parent chain until we hit a block
+        // that exists in the old chain (the true fork point).
         let mut new_chain: Vec<String> = Vec::new();
         let mut cursor = best_tip.clone();
 
         loop {
-            if self.utxo_set.get_commitment(&cursor).is_some() && cursor != best_tip {
-                // This block was already applied — it's our split point
+            if old_chain_set.contains(&cursor) && cursor != best_tip {
+                // This block is on the old chain — it's our fork point
                 break;
             }
             new_chain.push(cursor.clone());

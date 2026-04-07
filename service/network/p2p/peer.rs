@@ -111,14 +111,24 @@ impl Peer {
     /// is fully established.
     pub fn connect(&mut self) {
         self.connected_at = Some(Instant::now());
+        // Set initial handshake state based on connection direction
+        if self.protocol.is_outbound {
+            self.protocol.state = HandshakeState::AwaitPuzzleChallenge;
+        } else {
+            self.protocol.state = HandshakeState::AwaitPuzzleSolution;
+        }
         // connected remains false — set only by on_handshake_complete()
     }
 
     /// Called after the full handshake (puzzle + version + verack) completes.
     /// This is the ONLY path to connected=true.
-    pub fn on_handshake_complete(&mut self) {
+    pub fn on_handshake_complete(&mut self) -> bool {
+        if !self.protocol.is_established() {
+            return false; // Cannot mark connected before establishment
+        }
         self.connected = true;
         self.send_get_peers();
+        true
     }
 
     /// Request peers from this connection.
