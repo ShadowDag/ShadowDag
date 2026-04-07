@@ -51,7 +51,11 @@ impl GasMeter {
     ///
     /// Returns `GasResult::Ok(remaining)` on success, or
     /// `GasResult::OutOfGas` if insufficient gas remains.
-    /// On failure, `gas_used` is set to `gas_limit` (all gas consumed).
+    ///
+    /// **Intentional design:** On failure, `gas_used` is set to `gas_limit`
+    /// (all gas consumed). This matches EVM semantics and prevents
+    /// gas-manipulation attacks where a contract deliberately runs out of gas
+    /// at a precise point to exploit partial-execution side effects.
     pub fn consume(&mut self, cost: u64) -> GasResult {
         // Overflow-safe addition
         let new_used = match self.gas_used.checked_add(cost) {

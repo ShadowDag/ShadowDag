@@ -60,8 +60,18 @@ pub fn modexp_precompile(input: &[u8], gas_limit: u64) -> PrecompileResult {
         return PrecompileResult::err("modexp: insufficient gas", gas_cost);
     }
 
+    // Reject inputs that exceed 128-bit (16 bytes) — bytes_to_u128 silently
+    // truncates larger values which would produce incorrect results.
+    if base_len > 16 || exp_len > 16 || mod_len > 16 {
+        return PrecompileResult {
+            output: vec![],
+            gas_used: gas_cost,
+            success: false,
+            error: Some("modexp inputs limited to 128-bit (16 bytes); use U256 ops for larger values".into()),
+        };
+    }
+
     // Convert to u128 for basic modexp (handles up to 16-byte values)
-    // For larger values, we use byte-level modular exponentiation
     if mod_len == 0 {
         return PrecompileResult::ok(vec![0u8; mod_len.max(1)], gas_cost);
     }

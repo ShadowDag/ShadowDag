@@ -35,8 +35,11 @@ impl GasRules {
     pub fn charge(&mut self, _key: &str, cost: u64) -> Result<u64, VmError> {
         match self.meter.consume(cost) {
             GasResult::Ok(remaining) => Ok(remaining),
-            GasResult::OutOfGas { available, required } => {
-                Err(VmError::OutOfGas { used: available, limit: required })
+            GasResult::OutOfGas { .. } => {
+                Err(VmError::OutOfGas {
+                    used:  self.meter.gas_used(),
+                    limit: self.meter.gas_limit(),
+                })
             }
         }
     }
@@ -52,9 +55,9 @@ impl GasRules {
         self.meter.gas_remaining()
     }
 
-    /// Check if within gas budget
-    pub fn has_gas(&self, _key: &str, _gas_limit: u64) -> bool {
-        self.meter.gas_remaining() > 0
+    /// Check if there is enough gas remaining for the given cost.
+    pub fn has_gas(&self, cost: u64) -> bool {
+        self.meter.gas_remaining() >= cost
     }
 
     /// Access the underlying meter

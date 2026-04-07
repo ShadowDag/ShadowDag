@@ -46,6 +46,13 @@ pub struct NetworkStats {
     pub block_rate_bps:   f64,
 }
 
+/// Explorer index that maintains a sliding window of the most recent blocks
+/// and transactions for display purposes.
+///
+/// **Limitation:** `find_block`, `find_tx`, and `block_at_height` only search
+/// within the in-memory window (up to `MAX_RECENT_BLOCKS` / `MAX_RECENT_TXS`).
+/// They will return `None` for blocks or transactions that have aged out of the
+/// window. For full lookups, use `TxIndex` or `BlockStore` directly.
 pub struct ExplorerIndex {
     recent_blocks: VecDeque<ExplorerBlock>,
     recent_txs:    VecDeque<ExplorerTx>,
@@ -99,8 +106,9 @@ impl ExplorerIndex {
             };
             let time_span = new_block.timestamp.saturating_sub(oldest.timestamp);
             if time_span > 0 {
+                // Number of intervals = count - 1 (fence-post correction)
                 let count = self.recent_blocks.len() as f64;
-                self.stats.block_rate_bps = count / time_span as f64;
+                self.stats.block_rate_bps = (count - 1.0) / time_span as f64;
             }
         }
     }

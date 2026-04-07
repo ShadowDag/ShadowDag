@@ -135,7 +135,13 @@ impl TxIndex {
 
     fn write_record_to_db(&self, record: &TxRecord) {
         let key = Self::db_key(&record.hash);
-        let val = serde_json::to_vec(record).unwrap_or_default();
+        let val = match serde_json::to_vec(record) {
+            Ok(v) => v,
+            Err(e) => {
+                slog_error!("index", "tx_index_serialize_error", error => &e.to_string());
+                return;
+            }
+        };
         if let Err(e) = self.db.put(&key, &val) {
             slog_error!("index", "tx_index_db_put_error", error => &e.to_string());
         }
@@ -151,10 +157,20 @@ impl TxIndex {
     fn write_block_map_to_db(&self, block_hash: &str) {
         let db_key = Self::db_block_key(block_hash);
         if let Some(list) = self.block_tx_map.get(block_hash) {
-            let val = serde_json::to_vec(list).unwrap_or_default();
-            let _ = self.db.put(&db_key, &val);
+            let val = match serde_json::to_vec(list) {
+                Ok(v) => v,
+                Err(e) => {
+                    slog_error!("index", "tx_index_block_map_serialize_error", error => &e.to_string());
+                    return;
+                }
+            };
+            if let Err(e) = self.db.put(&db_key, &val) {
+                slog_error!("index", "tx_index_block_map_put_error", error => &e.to_string());
+            }
         } else {
-            let _ = self.db.delete(&db_key);
+            if let Err(e) = self.db.delete(&db_key) {
+                slog_error!("index", "tx_index_block_map_delete_error", error => &e.to_string());
+            }
         }
     }
 
@@ -226,12 +242,14 @@ impl TxIndex {
                 list.retain(|h| h != hash);
             }
             self.write_block_map_to_db(&rec.block_hash);
+            self.total_indexed = self.total_indexed.saturating_sub(1);
             return true;
         }
         // Check DB even if not in cache
         if let Some(rec) = self.load_record_from_db(hash) {
             self.delete_record_from_db(hash);
             self.write_block_map_to_db(&rec.block_hash);
+            self.total_indexed = self.total_indexed.saturating_sub(1);
             return true;
         }
         false
@@ -244,6 +262,7 @@ impl TxIndex {
             self.records.remove(h);
             self.delete_record_from_db(h);
         }
+        self.total_indexed = self.total_indexed.saturating_sub(count as u64);
         // Remove block map entry from DB
         let db_key = Self::db_block_key(block_hash);
         let _ = self.db.delete(&db_key);
