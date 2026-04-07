@@ -370,9 +370,33 @@ fn cmd_balance(args: &[String]) {
     }
 }
 
+/// Validate a ShadowDAG address format.
+/// Valid formats: SD1... (mainnet), ST1... (testnet), SR1... (regtest)
+/// Must be 44 chars: 3-char prefix + 1-char type + 40 hex chars
+fn validate_address(addr: &str) -> Result<(), String> {
+    if addr.len() != 44 {
+        return Err(format!("Address must be 44 characters, got {}", addr.len()));
+    }
+    let prefix = &addr[..3];
+    if !["SD1", "ST1", "SR1"].contains(&prefix) {
+        return Err(format!("Invalid network prefix '{}' (expected SD1/ST1/SR1)", prefix));
+    }
+    // Check that characters after prefix are valid hex or type markers
+    if !addr[4..].chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Address contains invalid characters (expected hex after prefix)".into());
+    }
+    Ok(())
+}
+
 fn cmd_send(args: &[String]) {
     let to = match args.get(2) {
-        Some(addr) => addr.clone(),
+        Some(addr) => {
+            if let Err(e) = validate_address(addr) {
+                eprintln!("Error: Invalid destination address: {}", e);
+                return;
+            }
+            addr.clone()
+        }
         None => { eprintln!("Usage: shadowdag-wallet send <to_address> <amount> [fee]"); return; }
     };
     let amount_str = match args.get(3) {
