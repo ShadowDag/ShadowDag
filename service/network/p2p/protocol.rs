@@ -658,7 +658,8 @@ impl VersionPayload {
         }
 
         // Chain ID must match — prevents cross-chain connections.
-        if self.chain_id != 0 && self.chain_id != CHAIN_ID {
+        // Strict: chain_id == 0 (unset/legacy) is also rejected; peers must update.
+        if self.chain_id != CHAIN_ID {
             return Err(ProtocolError::new(
                 ProtocolErrorKind::BpsMismatch,
                 format!("chain_id 0x{:08X} != expected 0x{:08X}", self.chain_id, CHAIN_ID),

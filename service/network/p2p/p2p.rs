@@ -91,6 +91,11 @@ static OUTBOUND_MSGS: Lazy<Arc<PlMutex<(u64, Vec<(u64, P2PMessage)>)>>> =
 static TARGETED_MSGS: Lazy<Arc<PlMutex<Vec<(String, P2PMessage)>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(64))));
 
+/// Received peer addresses from Addr messages — drained by daemon event loop
+/// and fed to PeerManager.
+static RECEIVED_ADDRS: Lazy<Arc<PlMutex<Vec<String>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(Vec::new())));
+
 /// Drain all pending transactions received by P2P (call from node main loop).
 /// Returns (peer_id, transaction) tuples for ban attribution.
 /// Thread-safe: works from ANY thread, not just the one that pushed.
@@ -123,6 +128,12 @@ pub fn drain_pending_blocks() -> Vec<(String, Block)> {
         }
     }
     items
+}
+
+/// Drain all received peer addresses from Addr messages (call from node main loop).
+/// Thread-safe: works from ANY thread.
+pub fn drain_received_addrs() -> Vec<String> {
+    std::mem::take(&mut *RECEIVED_ADDRS.lock())
 }
 
 /// Requeue excess blocks that couldn't be processed in this tick.
@@ -1083,7 +1094,15 @@ impl P2P {
                     DOS_GUARD.add_ban_score_cat(peer, pe.ban_score as u64, &pe.message, BanCategory::Malformed);
                     return Ok(());
                 }
-                // Addresses are processed by the peer manager
+                // Queue addresses for the daemon event loop to feed to PeerManager
+                {
+                    let mut q = RECEIVED_ADDRS.lock();
+                    for addr in peers {
+                        if q.len() < 4096 {
+                            q.push(addr.clone());
+                        }
+                    }
+                }
                 slog_debug!("p2p", "received_addresses", count => peers.len(), addr => peer);
             }
 
@@ -1305,10 +1324,13 @@ impl P2P {
         }
     }
 
+    /// NOTE: Header sync happens via peer dispatch (GetHeaders/Headers messages),
+    /// not from this function. This only logs the intent to sync.
+    /// TODO: Implement proactive header request to connected peers.
     fn request_headers_sync(&self) {
-        slog_info!("p2p", "requesting_headers_sync", height => self.best_height);
-        // NOTE: actual sync is performed inside each peer connection via dispatch_message.
-        // A full implementation would iterate connected peers and send GetHeaders.
+        slog_info!("p2p", "requesting_headers_sync",
+            height => self.best_height,
+            note => "sync initiated via per-peer GetHeaders exchange");
     }
 
     pub fn allow_peer(&mut self, peer_id: &str) -> bool {

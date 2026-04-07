@@ -65,9 +65,36 @@ impl LightNode {
         slog_info!("node", "light_node_stopped");
     }
 
+    /// Validate header hash and PoW before accepting.
+    fn validate_header_basic(header: &BlockHeader) -> bool {
+        // 1. Hash must be non-empty and valid hex (64 lowercase hex chars)
+        if header.hash.len() != 64 || !header.hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
+        }
+        // 2. PoW: hash must meet difficulty target
+        use crate::engine::mining::pow::pow_validator::PowValidator;
+        if header.difficulty > 0 && !PowValidator::hash_meets_target(&header.hash, header.difficulty) {
+            return false;
+        }
+        // 3. Timestamp sanity: reject headers too far in the future
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if header.timestamp > now + 120 { // MAX_FUTURE_SECS
+            return false;
+        }
+        true
+    }
+
     /// Add a block header to our chain.
     /// First header MUST be genesis (height 0) to establish root of trust.
     pub fn add_header(&mut self, header: BlockHeader) -> bool {
+        // Validate header hash and PoW BEFORE accepting
+        if !Self::validate_header_basic(&header) {
+            return false;
+        }
+
         if self.headers.is_empty() {
             // First header must be genesis — no arbitrary starting point
             if header.height != 0 {
@@ -164,14 +191,22 @@ mod tests {
     use super::*;
 
     fn make_header(height: u64) -> BlockHeader {
+        // Use valid 64-char hex hashes so validate_header_basic passes.
+        // Difficulty 0 bypasses PoW check (genesis-style for testing).
+        let hash = format!("{:0>64x}", height + 1);
+        let parent_hash = format!("{:0>64x}", height.saturating_sub(1) + 1);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         BlockHeader {
             version: 1,
-            hash: format!("hash_{}", height),
-            parents: vec![format!("hash_{}", height.saturating_sub(1))],
+            hash,
+            parents: vec![parent_hash],
             merkle_root: "merkle_root".to_string(),
-            timestamp: 1735689600 + height * 1000,
+            timestamp: now - 60 + height,
             nonce: 0,
-            difficulty: 4,
+            difficulty: 0,
             height,
             blue_score: 0,
             selected_parent: None,
@@ -183,9 +218,13 @@ mod tests {
     #[test]
     fn add_header_increments_height() {
         let mut node = LightNode::new("testnet");
+        // First header must be genesis (height 0)
+        assert!(node.add_header(make_header(0)));
+        assert_eq!(node.best_height(), 0);
+        // Then add height 1
         assert!(node.add_header(make_header(1)));
         assert_eq!(node.best_height(), 1);
-        assert_eq!(node.header_count(), 1);
+        assert_eq!(node.header_count(), 2);
     }
 
     #[test]

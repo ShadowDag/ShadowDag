@@ -227,6 +227,9 @@ impl PeerManager {
     }
 
     pub fn remove_peer(&self, addr: &str) -> Result<(), NetworkError> {
+        if !self.peer_exists(addr) {
+            return Ok(()); // Nothing to remove
+        }
         let ip    = addr.split(':').next().unwrap_or(addr);
         let count = self.conn_count_for_ip(ip);
         let db    = self.lock_db();
@@ -257,18 +260,49 @@ impl PeerManager {
 
     pub fn update_peer_height(&self, addr: &str, height: u64) {
         let db = self.lock_db();
-        let _  = db.put(format!("{}{}", PFX_HEIGHT, addr).as_bytes(), height.to_le_bytes());
+        // Update side key
+        let _ = db.put(format!("{}{}", PFX_HEIGHT, addr).as_bytes(), height.to_le_bytes());
+        // Also update the serialized record
+        if let Ok(Some(data)) = db.get(format!("{}{}", PFX_PEER, addr).as_bytes()) {
+            if let Ok(mut rec) = bincode::deserialize::<PeerRecord>(&data) {
+                rec.best_height = height;
+                if let Ok(new_data) = bincode::serialize(&rec) {
+                    let _ = db.put(format!("{}{}", PFX_PEER, addr).as_bytes(), &new_data);
+                }
+            }
+        }
     }
 
     pub fn update_peer_latency(&self, addr: &str, latency_ms: u64) {
         let db = self.lock_db();
-        let _  = db.put(format!("{}{}", PFX_LATENCY, addr).as_bytes(), latency_ms.to_le_bytes());
+        // Update side key
+        let _ = db.put(format!("{}{}", PFX_LATENCY, addr).as_bytes(), latency_ms.to_le_bytes());
+        // Also update the serialized record
+        if let Ok(Some(data)) = db.get(format!("{}{}", PFX_PEER, addr).as_bytes()) {
+            if let Ok(mut rec) = bincode::deserialize::<PeerRecord>(&data) {
+                rec.latency_ms = latency_ms;
+                if let Ok(new_data) = bincode::serialize(&rec) {
+                    let _ = db.put(format!("{}{}", PFX_PEER, addr).as_bytes(), &new_data);
+                }
+            }
+        }
     }
 
     pub fn touch_peer(&self, addr: &str) {
+        let now = unix_now();
         let db = self.lock_db();
-        let _  = db.put(format!("{}{}", PFX_LAST_SEEN, addr).as_bytes(),
-                        unix_now().to_le_bytes());
+        // Update side key
+        let _ = db.put(format!("{}{}", PFX_LAST_SEEN, addr).as_bytes(),
+                        now.to_le_bytes());
+        // Also update the serialized record
+        if let Ok(Some(data)) = db.get(format!("{}{}", PFX_PEER, addr).as_bytes()) {
+            if let Ok(mut rec) = bincode::deserialize::<PeerRecord>(&data) {
+                rec.last_seen = now;
+                if let Ok(new_data) = bincode::serialize(&rec) {
+                    let _ = db.put(format!("{}{}", PFX_PEER, addr).as_bytes(), &new_data);
+                }
+            }
+        }
     }
 
     pub fn get_peers(&self) -> Vec<String> {
