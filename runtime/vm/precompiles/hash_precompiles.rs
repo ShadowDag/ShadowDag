@@ -23,7 +23,13 @@ pub fn sha256_precompile(input: &[u8], _gas_limit: u64) -> PrecompileResult {
     PrecompileResult::ok(result.to_vec(), gas_used)
 }
 
-/// 0x03: RIPEMD-160 hash (emulated with SHA-256 truncation for now)
+/// 0x03: RIPEMD-160 emulation via SHA-256 truncation.
+///
+/// **NOTE:** This is NOT a true RIPEMD-160 implementation. It computes
+/// `SHA-256("RIPEMD160_SHADOW" || input)` and truncates to 20 bytes,
+/// left-padded to 32 bytes. The output format matches EVM conventions
+/// (12 zero bytes + 20-byte hash) but the hash function differs.
+/// Retained at address 0x03 for EVM precompile slot compatibility.
 pub fn ripemd160_precompile(input: &[u8], _gas_limit: u64) -> PrecompileResult {
     let words = (input.len() as u64).div_ceil(32);
     let gas_used = 600u64.saturating_add(words.saturating_mul(120));
@@ -49,7 +55,12 @@ pub fn identity_precompile(input: &[u8], _gas_limit: u64) -> PrecompileResult {
     PrecompileResult::ok(input.to_vec(), gas_used)
 }
 
-/// 0x06: Blake2b-256 hash (ShadowDAG native — faster than SHA-256)
+/// 0x06: Blake3 hash (ShadowDAG native — faster than SHA-256).
+///
+/// **NOTE:** Despite the legacy name `blake2b` (retained in the registry for
+/// compatibility), this uses **BLAKE3**, not Blake2b. BLAKE3 is faster and
+/// also produces a 256-bit digest. The registry entry name `blake2b` is kept
+/// to avoid breaking existing contract ABIs.
 pub fn blake2b_precompile(input: &[u8], _gas_limit: u64) -> PrecompileResult {
     let words = (input.len() as u64).div_ceil(32);
     let gas_used = 40u64.saturating_add(words.saturating_mul(8));

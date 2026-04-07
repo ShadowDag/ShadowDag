@@ -134,7 +134,13 @@ impl UtxoIndex {
             Err(e) => { slog_error!("index", "bad_utxo_key", error => &e.to_string()); return; }
         };
         let key = Self::db_key(&utxo_key);
-        let val = serde_json::to_vec(utxo).unwrap_or_default();
+        let val = match serde_json::to_vec(utxo) {
+            Ok(v) => v,
+            Err(e) => {
+                slog_error!("index", "utxo_index_serialize_error", error => &e.to_string());
+                return;
+            }
+        };
         if let Err(e) = self.db.put(&key, &val) {
             slog_error!("index", "utxo_index_db_put_error", error => &e.to_string());
         }
@@ -151,10 +157,20 @@ impl UtxoIndex {
     fn write_addr_set_to_db(&self, addr: &str) {
         let db_key = Self::db_addr_key(addr);
         if let Some(set) = self.addr_index.get(addr) {
-            let val = serde_json::to_vec(set).unwrap_or_default();
-            let _ = self.db.put(&db_key, &val);
+            let val = match serde_json::to_vec(set) {
+                Ok(v) => v,
+                Err(e) => {
+                    slog_error!("index", "utxo_index_addr_set_serialize_error", error => &e.to_string());
+                    return;
+                }
+            };
+            if let Err(e) = self.db.put(&db_key, &val) {
+                slog_error!("index", "utxo_index_addr_set_put_error", error => &e.to_string());
+            }
         } else {
-            let _ = self.db.delete(&db_key);
+            if let Err(e) = self.db.delete(&db_key) {
+                slog_error!("index", "utxo_index_addr_set_delete_error", error => &e.to_string());
+            }
         }
     }
 
@@ -225,6 +241,10 @@ impl UtxoIndex {
                 }
             }
             self.write_addr_set_to_db(&utxo.address);
+            self.total_utxos = self.total_utxos.saturating_sub(1);
+            if utxo.is_spent {
+                self.spent_utxos = self.spent_utxos.saturating_sub(1);
+            }
             return true;
         }
         // Even if not in cache, check DB
@@ -232,6 +252,10 @@ impl UtxoIndex {
             self.delete_record_from_db(key);
             // Clean addr set in DB
             self.write_addr_set_to_db(&utxo.address);
+            self.total_utxos = self.total_utxos.saturating_sub(1);
+            if utxo.is_spent {
+                self.spent_utxos = self.spent_utxos.saturating_sub(1);
+            }
             return true;
         }
         false
@@ -278,11 +302,23 @@ impl UtxoIndex {
 
     pub fn balance(&self, address: &str) -> u64 {
         self.addr_index.get(address)
-            .map(|keys| keys.iter()
-                .filter_map(|k| self.utxos.get(k))
-                .filter(|u| !u.is_spent)
-                .try_fold(0u64, |acc, u| acc.checked_add(u.amount))
-                .unwrap_or(u64::MAX))
+            .map(|keys| {
+                let mut sum = 0u64;
+                for k in keys {
+                    if let Some(u) = self.utxos.get(k) {
+                        if !u.is_spent {
+                            match sum.checked_add(u.amount) {
+                                Some(v) => sum = v,
+                                None => {
+                                    slog_warn!("index", "balance_overflow", address => address);
+                                    return sum; // return partial sum before overflow
+                                }
+                            }
+                        }
+                    }
+                }
+                sum
+            })
             .unwrap_or(0)
     }
 
@@ -302,13 +338,17 @@ impl UtxoIndex {
     pub fn address_count(&self) -> usize { self.addr_index.len() }
 
     pub fn total_supply(&self) -> u64 {
-        self.utxos.values()
-            .filter(|u| !u.is_spent)
-            .try_fold(0u64, |acc, u| acc.checked_add(u.amount))
-            .unwrap_or_else(|| {
-                slog_warn!("index", "total_supply_overflow");
-                u64::MAX
-            })
+        let mut sum = 0u64;
+        for u in self.utxos.values().filter(|u| !u.is_spent) {
+            match sum.checked_add(u.amount) {
+                Some(v) => sum = v,
+                None => {
+                    slog_warn!("index", "total_supply_overflow");
+                    return sum; // return partial sum before overflow
+                }
+            }
+        }
+        sum
     }
 
     pub fn rollback_block(&mut self, block_hash: &str) -> usize {

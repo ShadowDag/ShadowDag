@@ -157,7 +157,16 @@ impl PrecompileRegistry {
                 }
 
                 // Execute the precompile function
-                (entry.func)(input, gas_limit)
+                let mut result = (entry.func)(input, gas_limit);
+
+                // Enforce that the precompile does not report more gas than allocated.
+                // If a precompile implementation has a bug that over-reports gas_used,
+                // cap it to the gas_limit to maintain accounting invariants.
+                if result.gas_used > gas_limit {
+                    result.gas_used = gas_limit;
+                }
+
+                result
             }
             None => PrecompileResult::err("unknown precompile address", 0),
         }

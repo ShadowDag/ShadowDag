@@ -16,14 +16,19 @@ const GAS_ECRECOVER: u64 = 3_000;
 const GAS_ED25519_VERIFY: u64 = 2_000;
 const GAS_PEDERSEN_COMMIT: u64 = 5_000;
 
-/// 0x01: ECRECOVER — recover public key from Ed25519 signature
+/// 0x01: Ed25519 signature verification and address recovery.
+///
+/// **NOTE:** Despite the legacy name `ecrecover` (retained in the registry for
+/// EVM tooling compatibility at address 0x01), this is an **Ed25519 verify +
+/// address derivation**, NOT secp256k1 ECDSA recovery. ShadowDAG uses Ed25519
+/// as its native signature scheme.
 ///
 /// Input format (128 bytes):
 ///   [0..32]   message hash
-///   [32..64]  public key (32 bytes)
-///   [64..128] signature (64 bytes)
+///   [32..64]  public key (32 bytes, Ed25519)
+///   [64..128] signature (64 bytes, Ed25519)
 ///
-/// Output: 32-byte address derived from the public key (if valid), else empty
+/// Output: 32-byte address derived from SHA-256(pubkey) (if valid), else 32 zero bytes
 pub fn ecrecover(input: &[u8], _gas_limit: u64) -> PrecompileResult {
     let gas_used = GAS_ECRECOVER;
 
@@ -106,7 +111,13 @@ pub fn ed25519_verify(input: &[u8], _gas_limit: u64) -> PrecompileResult {
     }
 }
 
-/// 0x09: PEDERSEN_COMMIT — create a Pedersen commitment
+/// 0x09: Hash-based commitment (domain-separated SHA-256).
+///
+/// **NOTE:** This is a SHA-256 domain-separated hash commitment, NOT a
+/// Pedersen commitment on an elliptic curve. The name `pedersen_commit` is
+/// retained for registry/ABI compatibility. For actual Pedersen commitments
+/// with homomorphic properties, use the privacy layer
+/// (`engine/privacy/confidential/pedersen_commitment.rs`).
 ///
 /// Input format (40 bytes):
 ///   [0..8]   value (u64 LE)
@@ -114,7 +125,7 @@ pub fn ed25519_verify(input: &[u8], _gas_limit: u64) -> PrecompileResult {
 ///
 /// Output: 32-byte commitment hash
 ///
-/// Commitment = H(value || blinding_factor || "PEDERSEN_SHADOW_V1")
+/// Commitment = SHA-256("PEDERSEN_SHADOW_V1" || value || blinding_factor)
 pub fn pedersen_commit(input: &[u8], _gas_limit: u64) -> PrecompileResult {
     let gas_used = GAS_PEDERSEN_COMMIT;
 
