@@ -307,6 +307,7 @@ impl BlockStore {
     /// Returns the number of blocks pruned.
     pub fn prune_blocks_below_height(&self, below_height: u64) -> u64 {
         let mut pruned = 0u64;
+        let mut pending = 0u64;
         let mut batch = rocksdb::WriteBatch::default();
 
         // Iterate actual blocks instead of every possible height (O(blocks) not O(height))
@@ -336,13 +337,19 @@ impl BlockStore {
 
             if block.header.height < below_height {
                 batch.delete(&*k);
-                pruned += 1;
+                pending += 1;
 
                 // Write in batches of 1000 to limit memory
-                if pruned.is_multiple_of(1000) {
-                    if let Err(e) = self.db.write(batch) {
-                        slog_error!("storage", "pruning_batch_write_failed", error => e);
-                        return pruned;
+                if pending >= 1000 {
+                    match self.db.write(batch) {
+                        Ok(_) => {
+                            pruned += pending;
+                            pending = 0;
+                        }
+                        Err(e) => {
+                            slog_error!("storage", "pruning_batch_write_failed", error => e);
+                            return pruned;
+                        }
                     }
                     batch = rocksdb::WriteBatch::default();
                 }
@@ -350,9 +357,14 @@ impl BlockStore {
         }
 
         // Write remaining batch
-        if !pruned.is_multiple_of(1000) {
-            if let Err(e) = self.db.write(batch) {
-                slog_error!("storage", "final_pruning_batch_failed", error => e);
+        if pending > 0 {
+            match self.db.write(batch) {
+                Ok(_) => {
+                    pruned += pending;
+                }
+                Err(e) => {
+                    slog_error!("storage", "final_pruning_batch_failed", error => e);
+                }
             }
         }
         pruned

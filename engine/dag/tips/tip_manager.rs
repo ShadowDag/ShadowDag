@@ -146,60 +146,69 @@ impl TipManager {
 
     // ── Persistence helpers ──────────────────────────────────────────────
 
-    fn persist_tip(&self, info: &TipInfo) {
-        if let Ok(data) = bincode::serialize(info) {
-            let _ = self.db.put(key_tip(&info.hash), data);
-        }
+    fn persist_tip(&self, info: &TipInfo) -> Result<(), StorageError> {
+        let data = bincode::serialize(info)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        self.db.put(key_tip(&info.hash), data)
+            .map_err(StorageError::RocksDb)
     }
 
-    fn delete_tip_from_db(&self, hash: &str) {
-        let _ = self.db.delete(key_tip(hash));
+    fn delete_tip_from_db(&self, hash: &str) -> Result<(), StorageError> {
+        self.db.delete(key_tip(hash))
+            .map_err(StorageError::RocksDb)
     }
 
     // ── Public API ───────────────────────────────────────────────────────
 
     /// Add a new tip to the set
-    pub fn add_tip(&self, info: TipInfo) {
+    pub fn add_tip(&self, info: TipInfo) -> Result<(), StorageError> {
         let mut tips = self.tips.write().unwrap_or_else(|e| e.into_inner());
 
         // If at capacity, evict the lowest blue-score tip
         if tips.len() >= self.max_tips {
-            self.evict_lowest_score(&mut tips);
+            self.evict_lowest_score(&mut tips)?;
         }
 
-        self.persist_tip(&info);
+        self.persist_tip(&info)?;
         tips.insert(info.hash.clone(), info);
+        Ok(())
     }
 
     /// Remove a tip (when it gets referenced as a parent)
-    pub fn remove_tip(&self, hash: &str) {
-        self.delete_tip_from_db(hash);
+    pub fn remove_tip(&self, hash: &str) -> Result<(), StorageError> {
+        self.delete_tip_from_db(hash)?;
         self.tips.write().unwrap_or_else(|e| e.into_inner()).remove(hash);
+        Ok(())
     }
 
     /// Called when a new block arrives: removes parents from tips, adds new block as tip
-    pub fn on_new_block(&self, block_hash: &str, parents: &[String], blue_score: u64, height: u64, timestamp: u64) {
+    pub fn on_new_block(&self, block_hash: &str, parents: &[String], blue_score: u64, height: u64, timestamp: u64) -> Result<(), StorageError> {
         let mut tips = self.tips.write().unwrap_or_else(|e| e.into_inner());
         let mut batch = WriteBatch::default();
 
-        // Remove parents from tip set (they now have a child)
+        // Prepare batch: remove parents from tip set (they now have a child)
         for parent in parents {
-            tips.remove(parent);
             batch.delete(key_tip(parent));
         }
 
         // Add new block as tip
         let info = TipInfo::new(block_hash.to_string(), blue_score, height, timestamp);
         if tips.len() >= self.max_tips {
-            self.evict_lowest_score(&mut tips);
+            self.evict_lowest_score(&mut tips)?;
         }
 
-        if let Ok(data) = bincode::serialize(&info) {
-            batch.put(key_tip(block_hash), data);
-        }
+        let data = bincode::serialize(&info)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        batch.put(key_tip(block_hash), data);
 
-        let _ = self.db.write(batch);
+        // Write batch to DB first; only update in-memory state on success
+        self.db.write(batch).map_err(StorageError::RocksDb)?;
+
+        for parent in parents {
+            tips.remove(parent);
+        }
         tips.insert(block_hash.to_string(), info);
+        Ok(())
     }
 
     /// Select parents for a new block using **mandatory + weighted random** strategy.
@@ -348,12 +357,12 @@ impl TipManager {
     }
 
     /// Remove stale tips (older than threshold)
-    pub fn prune_stale(&self) -> usize {
+    pub fn prune_stale(&self) -> Result<usize, StorageError> {
         let mut tips = self.tips.write().unwrap_or_else(|e| e.into_inner());
         let before = tips.len();
 
         if tips.len() <= MIN_TIPS {
-            return 0;
+            return Ok(0);
         }
 
         let stale: Vec<String> = tips.values()
@@ -363,11 +372,11 @@ impl TipManager {
 
         for hash in &stale {
             if tips.len() <= MIN_TIPS { break; }
-            self.delete_tip_from_db(hash);
+            self.delete_tip_from_db(hash)?;
             tips.remove(hash);
         }
 
-        before - tips.len()
+        Ok(before - tips.len())
     }
 
     /// Get DAG width (number of tips = parallelism level)
@@ -398,14 +407,18 @@ impl TipManager {
         &self.db
     }
 
-    fn evict_lowest_score(&self, tips: &mut HashMap<String, TipInfo>) {
+    fn evict_lowest_score(&self, tips: &mut HashMap<String, TipInfo>) -> Result<(), StorageError> {
         if let Some(lowest) = tips.values()
-            .min_by_key(|t| t.blue_score)
+            .min_by(|a, b| {
+                a.blue_score.cmp(&b.blue_score)
+                    .then_with(|| b.hash.cmp(&a.hash)) // higher hash evicted first
+            })
             .map(|t| t.hash.clone())
         {
-            self.delete_tip_from_db(&lowest);
+            self.delete_tip_from_db(&lowest)?;
             tips.remove(&lowest);
         }
+        Ok(())
     }
 }
 
@@ -434,24 +447,24 @@ mod tests {
     #[test]
     fn add_and_count() {
         let mgr = TipManager::new(tmp_path().as_str()).unwrap();
-        mgr.add_tip(tip("a", 10, 1));
-        mgr.add_tip(tip("b", 20, 2));
+        mgr.add_tip(tip("a", 10, 1)).unwrap();
+        mgr.add_tip(tip("b", 20, 2)).unwrap();
         assert_eq!(mgr.tip_count(), 2);
     }
 
     #[test]
     fn remove_tip() {
         let mgr = TipManager::new(tmp_path().as_str()).unwrap();
-        mgr.add_tip(tip("a", 10, 1));
-        mgr.remove_tip("a");
+        mgr.add_tip(tip("a", 10, 1)).unwrap();
+        mgr.remove_tip("a").unwrap();
         assert_eq!(mgr.tip_count(), 0);
     }
 
     #[test]
     fn on_new_block_updates_tips() {
         let mgr = TipManager::new(tmp_path().as_str()).unwrap();
-        mgr.add_tip(tip("genesis", 0, 0));
-        mgr.on_new_block("block1", &["genesis".to_string()], 1, 1, 1000);
+        mgr.add_tip(tip("genesis", 0, 0)).unwrap();
+        mgr.on_new_block("block1", &["genesis".to_string()], 1, 1, 1000).unwrap();
 
         assert!(!mgr.is_tip("genesis"));
         assert!(mgr.is_tip("block1"));
@@ -460,9 +473,9 @@ mod tests {
     #[test]
     fn select_parents_by_blue_score() {
         let mgr = TipManager::new(tmp_path().as_str()).unwrap();
-        mgr.add_tip(tip("low", 5, 1));
-        mgr.add_tip(tip("high", 100, 10));
-        mgr.add_tip(tip("mid", 50, 5));
+        mgr.add_tip(tip("low", 5, 1)).unwrap();
+        mgr.add_tip(tip("high", 100, 10)).unwrap();
+        mgr.add_tip(tip("mid", 50, 5)).unwrap();
 
         let parents = mgr.select_parents(2);
         assert_eq!(parents[0], "high");
@@ -472,9 +485,9 @@ mod tests {
     #[test]
     fn best_tip_is_highest_score() {
         let mgr = TipManager::new(tmp_path().as_str()).unwrap();
-        mgr.add_tip(tip("a", 10, 1));
-        mgr.add_tip(tip("b", 99, 5));
-        mgr.add_tip(tip("c", 50, 3));
+        mgr.add_tip(tip("a", 10, 1)).unwrap();
+        mgr.add_tip(tip("b", 99, 5)).unwrap();
+        mgr.add_tip(tip("c", 50, 3)).unwrap();
 
         let best = mgr.best_tip().unwrap();
         assert_eq!(best.hash, "b");
@@ -484,10 +497,10 @@ mod tests {
     #[test]
     fn evicts_at_capacity() {
         let mgr = TipManager::with_max_tips(tmp_path().as_str(), 3).unwrap();
-        mgr.add_tip(tip("a", 10, 1));
-        mgr.add_tip(tip("b", 20, 2));
-        mgr.add_tip(tip("c", 30, 3));
-        mgr.add_tip(tip("d", 40, 4)); // Should evict "a" (lowest score)
+        mgr.add_tip(tip("a", 10, 1)).unwrap();
+        mgr.add_tip(tip("b", 20, 2)).unwrap();
+        mgr.add_tip(tip("c", 30, 3)).unwrap();
+        mgr.add_tip(tip("d", 40, 4)).unwrap(); // Should evict "a" (lowest score)
 
         assert_eq!(mgr.tip_count(), 3);
         assert!(!mgr.is_tip("a"));
@@ -497,16 +510,16 @@ mod tests {
     #[test]
     fn dag_width_equals_tip_count() {
         let mgr = TipManager::new(tmp_path().as_str()).unwrap();
-        mgr.add_tip(tip("a", 1, 1));
-        mgr.add_tip(tip("b", 2, 2));
+        mgr.add_tip(tip("a", 1, 1)).unwrap();
+        mgr.add_tip(tip("b", 2, 2)).unwrap();
         assert_eq!(mgr.dag_width(), 2);
     }
 
     #[test]
     fn best_height_and_score() {
         let mgr = TipManager::new(tmp_path().as_str()).unwrap();
-        mgr.add_tip(tip("a", 10, 5));
-        mgr.add_tip(tip("b", 20, 8));
+        mgr.add_tip(tip("a", 10, 5)).unwrap();
+        mgr.add_tip(tip("b", 20, 8)).unwrap();
         assert_eq!(mgr.best_blue_score(), 20);
         assert_eq!(mgr.best_height(), 8);
     }
@@ -518,9 +531,9 @@ mod tests {
         // Add tips and drop
         {
             let mgr = TipManager::new(path.as_str()).unwrap();
-            mgr.add_tip(tip("t1", 10, 1));
-            mgr.add_tip(tip("t2", 20, 2));
-            mgr.add_tip(tip("t3", 30, 3));
+            mgr.add_tip(tip("t1", 10, 1)).unwrap();
+            mgr.add_tip(tip("t2", 20, 2)).unwrap();
+            mgr.add_tip(tip("t3", 30, 3)).unwrap();
             assert_eq!(mgr.tip_count(), 3);
         }
 
@@ -541,9 +554,9 @@ mod tests {
 
         {
             let mgr = TipManager::new(path.as_str()).unwrap();
-            mgr.add_tip(tip("a", 10, 1));
-            mgr.add_tip(tip("b", 20, 2));
-            mgr.remove_tip("a");
+            mgr.add_tip(tip("a", 10, 1)).unwrap();
+            mgr.add_tip(tip("b", 20, 2)).unwrap();
+            mgr.remove_tip("a").unwrap();
             assert_eq!(mgr.tip_count(), 1);
         }
 
