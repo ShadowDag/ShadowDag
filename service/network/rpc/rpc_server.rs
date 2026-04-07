@@ -180,11 +180,28 @@ impl RpcState {
             slog_warn!("rpc", "admin_password_persist_failed", error => e);
         }
         let masked = format!("{}...", &password[..4.min(password.len())]);
-        slog_warn!("rpc", "first_run_admin_password_generated", hint => masked);
+        slog_warn!("rpc", "first_run_admin_password_generated", hint => &masked);
+        // SECURITY: Never log the full password to stderr/stdout (captured by
+        // log aggregators, process monitors, shell history). Write to a
+        // restricted file instead, and print only a masked hint to console.
         eprintln!("╔══════════════════════════════════════════════════════╗");
-        eprintln!("║  RPC Admin Password (FIRST RUN — save this now):    ║");
-        eprintln!("║  {}  ║", password);
+        eprintln!("║  RPC Admin Password generated (first run)           ║");
+        eprintln!("║  Hint: {}                                           ║", masked);
+        eprintln!("║  Full password saved to: <data_dir>/rpc_password    ║");
         eprintln!("╚══════════════════════════════════════════════════════╝");
+        // Attempt to write password to a file with restricted permissions
+        if let Ok(base) = std::env::current_dir() {
+            let pw_path = base.join("rpc_password");
+            if std::fs::write(&pw_path, password.as_bytes()).is_ok() {
+                // Best-effort: restrict permissions on Unix
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&pw_path,
+                        std::fs::Permissions::from_mode(0o600));
+                }
+            }
+        }
         password
     }
 
