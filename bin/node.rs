@@ -37,6 +37,18 @@ enum BootError {
     StartFailed(String),
 }
 
+impl BootError {
+    /// Error category for structured logging
+    fn category(&self) -> &'static str {
+        match self {
+            BootError::InvalidArg(_)   => "config",
+            BootError::GenesisFailed(_) => "genesis",
+            BootError::InitFailed(_)    => "init",
+            BootError::StartFailed(_)   => "start",
+        }
+    }
+}
+
 impl std::fmt::Display for BootError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -65,6 +77,13 @@ fn main() {
 
     // run() returns all errors cleanly — main() just formats and exits.
     if let Err(e) = run(&args) {
+        // Structured error logging (goes to slog if initialized, otherwise stderr)
+        slog_error!("node", "fatal_startup_error",
+            error => e.to_string(),
+            category => e.category(),
+            phase => "startup"
+        );
+
         eprintln!();
         eprintln!("╔══════════════════════════════════════════════╗");
         eprintln!("║   ShadowDAG node failed to start             ║");
@@ -94,19 +113,81 @@ fn main() {
             }
         }
         eprintln!();
+
+        // Cleanup hint: Rust drops all owned values when run() returns Err,
+        // including DaemonNode (flushes RocksDB), TcpListeners (closes ports),
+        // and any Arc<DB> handles. No explicit cleanup hook needed.
         std::process::exit(1);
     }
 }
 
 /// The actual boot sequence. Returns `Err` on any failure instead of panicking.
+///
+/// Phases (executed in strict order):
+///   1. parse_config  — CLI flags → NodeConfig
+///   2. verify_genesis — integrity check on genesis block
+///   3. init_storage  — create data directories
+///   4. init_daemon   — open DB, DAG, UTXO, mempool
+///   5. start_services — bind P2P/RPC, bootstrap network
+///   6. run_loop      — main event loop (blocks until shutdown)
 fn run(args: &[String]) -> Result<(), BootError> {
-    // ── Parse CLI flags ──────────────────────────────────────────────
+    // ── Phase 1: Parse configuration ─────────────────────────────────
+    let cfg = parse_config(args)?;
+
+    // ── Phase 2: Verify genesis block integrity ──────────────────────
+    let genesis = create_genesis_block_for(&cfg.network);
+    if let Err(reason) = verify_genesis_detailed(&genesis, &cfg.network) {
+        return Err(BootError::GenesisFailed(format!(
+            "{} (network: {})", reason, cfg.network.name()
+        )));
+    }
+
+    // ── Phase 3: Banner + initialize storage ─────────────────────────
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║     S H A D O W D A G  —  Full Node          ║");
+    println!("║     Privacy • Speed • Decentralization        ║");
+    println!("╚══════════════════════════════════════════════╝");
+    slog_info!("node", "config",
+        version => env!("CARGO_PKG_VERSION"),
+        network => cfg.network.name(),
+        p2p_port => cfg.p2p_port,
+        rpc_port => cfg.rpc_port,
+        data_dir => cfg.data_dir.display(),
+        genesis => &genesis.header.hash[..16],
+        emission => EmissionSchedule::info(0));
+    println!();
+
+    if let Err(e) = cfg.init_dirs() {
+        return Err(BootError::InitFailed(format!(
+            "failed to initialize data directories at '{}': {}",
+            cfg.data_dir.display(), e
+        )));
+    }
+
+    // ── Phase 4: Initialize daemon (DB, DAG, consensus) ──────────────
+    let mut daemon = DaemonNode::new(cfg)
+        .map_err(|e| BootError::InitFailed(e.to_string()))?;
+
+    // ── Phase 5: Start network services (P2P, RPC) ───────────────────
+    daemon.start()
+        .map_err(|e| BootError::StartFailed(e.to_string()))?;
+
+    slog_info!("node", "all_services_started");
+
+    // ── Phase 6: Main event loop (blocks until shutdown signal) ───────
+    daemon.run_event_loop();
+    Ok(())
+}
+
+/// Phase 1: Parse CLI flags into NodeConfig.
+fn parse_config(args: &[String]) -> Result<NodeConfig, BootError> {
     let network_mode = parse_flag(args, "--network", "mainnet");
     let network: NetworkMode = network_mode.parse().map_err(|_| {
         BootError::InvalidArg(format!(
             "--network '{}' is not valid. Use: mainnet, testnet, or regtest", network_mode
         ))
     })?;
+
     let rpc_port: Option<u16> = match parse_flag_opt(args, "--rpc-port") {
         Some(s) => Some(parse_port(&s, "--rpc-port")?),
         None => None,
@@ -122,50 +203,7 @@ fn run(args: &[String]) -> Result<(), BootError> {
     if let Some(port) = p2p_port { cfg.p2p_port = port; }
     if let Some(dir)  = data_dir { cfg.data_dir = std::path::PathBuf::from(dir); }
 
-    // ── Verify genesis block integrity ───────────────────────────────
-    let genesis = create_genesis_block_for(&cfg.network);
-    if let Err(reason) = verify_genesis_detailed(&genesis, &cfg.network) {
-        return Err(BootError::GenesisFailed(format!(
-            "{} (network: {})", reason, cfg.network.name()
-        )));
-    }
-
-    // ── Banner ───────────────────────────────────────────────────────
-    println!("╔══════════════════════════════════════════════╗");
-    println!("║     S H A D O W D A G  —  Full Node          ║");
-    println!("║     Privacy • Speed • Decentralization        ║");
-    println!("╚══════════════════════════════════════════════╝");
-    slog_info!("node", "config", version => "1.0.0",
-        network => cfg.network.name(),
-        p2p_port => cfg.p2p_port,
-        rpc_port => cfg.rpc_port,
-        data_dir => cfg.data_dir.display(),
-        genesis => &genesis.header.hash[..16],
-        emission => EmissionSchedule::info(0));
-    println!();
-
-    // ── Initialize data directories ──────────────────────────────────
-    if let Err(e) = cfg.init_dirs() {
-        return Err(BootError::InitFailed(format!(
-            "failed to initialize data directories at '{}': {}",
-            cfg.data_dir.display(), e
-        )));
-    }
-
-    // ── Create and start daemon ──────────────────────────────────────
-    let mut daemon = DaemonNode::new(cfg)
-        .map_err(|e| BootError::InitFailed(e.to_string()))?;
-
-    daemon.start()
-        .map_err(|e| BootError::StartFailed(e.to_string()))?;
-
-    slog_info!("node", "all_services_started");
-
-    // Main event loop — drains P2P pending queues (blocks + transactions)
-    // and processes them through the full consensus pipeline.
-    // Without this, P2P data piles up in queues and is never processed.
-    daemon.run_event_loop();
-    Ok(())
+    Ok(cfg)
 }
 
 fn print_version() {
