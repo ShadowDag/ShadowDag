@@ -214,7 +214,7 @@ impl EmissionSchedule {
 
         while h <= height {
             let step = (h / interval) as u32;
-            let step_end = ((step as u64 + 1) * interval).min(height + 1);
+            let step_end = (step as u64).saturating_add(1).saturating_mul(interval).min(height.saturating_add(1));
             let blocks_in_step = step_end - h;
             let reward = Self::block_reward_at_bps(h, bps);
 
@@ -251,12 +251,19 @@ impl EmissionSchedule {
 
     /// Height at which reward drops below a given percentage of initial with specific BPS rate.
     pub fn height_at_percent_at_bps(target_pct: f64, bps: u64) -> u64 {
+        // Validate input: percent must be in (0, 100]
+        if !target_pct.is_finite() || target_pct <= 0.0 || target_pct > 100.0 {
+            return 0; // Invalid input — return genesis height
+        }
         let interval = Self::reduction_interval_for_bps(bps);
         // Solve: DECAY^step = target_pct/100
         // step = ln(target_pct/100) / ln(DECAY_NUM/DECAY_DEN)
         let decay_ratio = DECAY_NUM as f64 / DECAY_DEN as f64;
         let steps = (target_pct / 100.0).ln() / decay_ratio.ln();
-        (steps.ceil() as u64) * interval
+        if !steps.is_finite() || steps < 0.0 {
+            return 0;
+        }
+        (steps.ceil() as u64).saturating_mul(interval)
     }
 
     /// Human-readable info
