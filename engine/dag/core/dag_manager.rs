@@ -203,9 +203,12 @@ impl DagManager {
             }
         }
 
-        // Deterministic parent ordering: parents MUST be sorted lexicographically.
-        // This ensures all nodes process the same block identically, preventing
-        // ordering-dependent divergence in merkle roots or hash computations.
+        // Deterministic parent ordering: parents MUST be sorted in strictly ascending
+        // lexicographic order. This ensures all nodes process the same block
+        // identically, preventing ordering-dependent divergence in merkle roots or
+        // hash computations.
+        // See also: DagValidatorStore doc comment (engine/dag/validation/dag_validator.rs)
+        // which documents that parent validation is handled here, not in the store.
         for i in 1..parents.len() {
             if parents[i] <= parents[i - 1] {
                 return Err(DagError::Other(

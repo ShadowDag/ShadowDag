@@ -18,6 +18,10 @@ pub use crate::engine::dag::ghostdag::ghostdag::GHOSTDAG_K;
 const CF_BLUE: &str = "blue_cf";
 const CF_BSET: &str = "bset_cf";
 
+/// Maximum allowed blue set size before truncation.
+/// Prevents CPU blowup from processing excessively large blue sets.
+const MAX_BLUE_SET_SIZE: usize = 10_000;
+
 pub struct BlueSetStore {
     db: DB,
     write_opts: WriteOptions,
@@ -213,8 +217,18 @@ impl BlueSetStore {
         all_blocks: &HashMap<String, Vec<String>>,
         ghostdag: &crate::engine::dag::ghostdag::ghostdag::GhostDag,
     ) -> HashSet<String> {
-        let blue_set =
+        let mut blue_set =
             ghostdag.build_blue_set_for_past(block_hash, parents, all_blocks);
+
+        // Size guard: truncate oversized blue sets to prevent CPU blowup
+        if blue_set.len() > MAX_BLUE_SET_SIZE {
+            slog_warn!("ghostdag", "blue_set_too_large",
+                size => blue_set.len(), max => MAX_BLUE_SET_SIZE);
+            let truncated: HashSet<String> = blue_set.into_iter()
+                .take(MAX_BLUE_SET_SIZE)
+                .collect();
+            blue_set = truncated;
+        }
 
         let blue_cf = self.blue_cf();
         let bset_cf = self.bset_cf();
