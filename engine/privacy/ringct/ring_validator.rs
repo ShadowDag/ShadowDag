@@ -10,24 +10,44 @@ pub struct RingValidator;
 
 impl RingValidator {
     pub fn validate(tx: &Transaction) -> bool {
+        // 1. Ring signature verification
         if !RingSignature::verify(tx) {
             return false;
         }
-
+        // 2. Non-empty outputs
         if tx.outputs.is_empty() {
             return false;
         }
-
-        // Every input in a privacy TX must carry a valid key image.
-        // Key images MUST be exactly 32 bytes (64 hex chars).
-        // Accepting shorter values (e.g., 9 bytes) breaks untraceability.
+        // 3. Key image validation
         let key_images = RingSignature::key_images(tx);
         if key_images.is_empty() && !tx.inputs.is_empty() {
             return false;
         }
+        // 4. Key image format check (64 hex chars = 32 bytes compressed Ristretto)
         for ki in &key_images {
             if ki.len() != 64 || !ki.chars().all(|c| c.is_ascii_hexdigit()) {
                 return false;
+            }
+        }
+        // 5. Key image UNIQUENESS within this transaction
+        // Duplicate key images = double-spend attempt within the same TX
+        {
+            let mut seen = std::collections::HashSet::with_capacity(key_images.len());
+            for ki in &key_images {
+                if !seen.insert(ki.as_str()) {
+                    return false; // Duplicate key image
+                }
+            }
+        }
+        // 6. Ring size validation (minimum mixin for privacy)
+        // Each input must have ring_members with at least MIN_RING_SIZE entries
+        const MIN_RING_SIZE: usize = 4;  // Minimum 4 decoys for meaningful privacy
+        const MAX_RING_SIZE: usize = 64; // Cap to prevent DoS
+        for input in &tx.inputs {
+            if let Some(ref members) = input.ring_members {
+                if members.len() < MIN_RING_SIZE || members.len() > MAX_RING_SIZE {
+                    return false;
+                }
             }
         }
 

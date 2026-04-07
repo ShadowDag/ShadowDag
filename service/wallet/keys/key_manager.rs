@@ -13,7 +13,6 @@ use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
 use zeroize::Zeroize;
 use crate::errors::WalletError;
-use crate::{slog_error, slog_warn};
 
 const PBKDF2_ITER: u32 = 600_000;
 const SALT_LEN: usize = 16;
@@ -119,28 +118,7 @@ impl KeyManager {
         buf
     }
 
-    /// REMOVED: Plaintext key storage is a security vulnerability.
-    /// Use store_key_encrypted() instead. Private keys must NEVER be stored
-    /// in plaintext on disk.
-    #[deprecated(note = "Use store_key_encrypted() — plaintext storage is insecure")]
-    pub fn store_key(&self, key_id: &str, key_data: &str) {
-        // Prefix with warning marker so plaintext keys are identifiable
-        let marked = format!("INSECURE_PLAINTEXT:{}", key_data);
-        if let Err(e) = self.db.put(key_id.as_bytes(), marked.as_bytes()) {
-            slog_error!("wallet", "store_key_error", error => &e.to_string());
-        }
-        slog_warn!("wallet", "plaintext_key_stored", detail => "Use store_key_encrypted()");
-    }
-
-    #[deprecated(note = "Use get_key_decrypted() — plaintext retrieval is insecure")]
-    pub fn get_key(&self, key_id: &str) -> Option<String> {
-        match self.db.get(key_id.as_bytes()) {
-            Ok(Some(data)) => {
-                let s = String::from_utf8(data.to_vec()).ok()?;
-                // Strip the insecure marker if present
-                Some(s.strip_prefix("INSECURE_PLAINTEXT:").unwrap_or(&s).to_string())
-            }
-            _ => None,
-        }
-    }
+    // Plaintext key storage has been removed. Use store_key_encrypted() and
+    // get_key_decrypted() instead. Private keys must NEVER be stored in
+    // plaintext on disk.
 }

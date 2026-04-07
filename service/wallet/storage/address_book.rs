@@ -5,11 +5,11 @@
 
 use rocksdb::{DB, Options};
 use std::path::Path;
+use crate::errors::WalletError;
 use crate::slog_error;
 
 pub struct AddressBook {
     db: DB,
-
 }
 
 impl AddressBook {
@@ -24,24 +24,18 @@ impl AddressBook {
             })?;
 
         Ok(Self { db })
-
     }
 
     pub fn add_address(&self, name: &str, address: &str) {
         if let Err(_e) = self.db.put(name, address) { slog_error!("wallet", "db_put_error", error => &_e.to_string()); }
-
     }
 
-    pub fn get_address(&self, name: &str) -> Option<String> {
-        match self.db.get(name).unwrap_or(None) {
-            Some(data) => {
-                Some(String::from_utf8(data.to_vec()).ok()?)
-            }
-
-            None => None
-
+    pub fn get_address(&self, name: &str) -> Result<Option<String>, WalletError> {
+        match self.db.get(name) {
+            Ok(Some(data)) => Ok(Some(String::from_utf8(data.to_vec())
+                .map_err(|e| WalletError::Other(format!("utf8 error: {}", e)))?)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(WalletError::Other(format!("db read failed: {}", e))),
         }
-
     }
-
 }
