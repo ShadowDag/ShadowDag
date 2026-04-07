@@ -60,7 +60,7 @@ pub const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 /// Wire frame header size: magic(4) + cmd(1) + len(4) + checksum(4) = 13.
 pub const WIRE_HEADER_SIZE: usize = 13;
 
-/// Maximum blocks per single GetBlocks / Headers response.
+/// Maximum blocks per single GetBlock / Headers response.
 pub const MAX_BLOCKS_PER_MSG: usize = 500;
 
 /// Maximum inventory items per single Inv / GetData message.
@@ -153,7 +153,7 @@ pub enum CommandId {
     Tx              = 0x0A,
     GetHeaders      = 0x0B,
     Headers         = 0x0C,
-    GetBlocks       = 0x0D,
+    GetBlock       = 0x0D,
     Reject          = 0x0E,
     PuzzleChallenge = 0x10,
     PuzzleSolution  = 0x11,
@@ -180,7 +180,7 @@ impl CommandId {
             0x0A => Some(Self::Tx),
             0x0B => Some(Self::GetHeaders),
             0x0C => Some(Self::Headers),
-            0x0D => Some(Self::GetBlocks),
+            0x0D => Some(Self::GetBlock),
             0x0E => Some(Self::Reject),
             0x10 => Some(Self::PuzzleChallenge),
             0x11 => Some(Self::PuzzleSolution),
@@ -221,7 +221,7 @@ impl CommandId {
             Self::Tx              => "tx",
             Self::GetHeaders      => "getheaders",
             Self::Headers         => "headers",
-            Self::GetBlocks       => "getblocks",
+            Self::GetBlock       => "getblock",
             Self::Reject          => "reject",
             Self::PuzzleChallenge => "puzzle_challenge",
             Self::PuzzleSolution  => "puzzle_solution",
@@ -585,7 +585,7 @@ pub fn payload_size_bounds(cmd: CommandId) -> (usize, usize) {
         CommandId::Tx              => (BINCODE_TAG + 12, MAX_MESSAGE_SIZE),
         CommandId::GetHeaders      => (BINCODE_TAG + 1, BINCODE_TAG + 1024),
         CommandId::Headers         => (BINCODE_TAG + 1, BINCODE_TAG + 512 * 1024),
-        CommandId::GetBlocks       => (BINCODE_TAG + 1, BINCODE_TAG + 1024),
+        CommandId::GetBlock       => (BINCODE_TAG + 1, BINCODE_TAG + 1024),
         CommandId::Reject          => (BINCODE_TAG + 1, BINCODE_TAG + MAX_REJECT_REASON_LEN + 64),
         CommandId::PuzzleChallenge => (BINCODE_TAG + 4, BINCODE_TAG + 256),
         CommandId::PuzzleSolution  => (BINCODE_TAG + 12, BINCODE_TAG + 512),
@@ -1420,7 +1420,7 @@ mod tests {
             CommandId::Version, CommandId::VerAck, CommandId::Ping, CommandId::Pong,
             CommandId::GetAddr, CommandId::Addr, CommandId::Inv, CommandId::GetData,
             CommandId::Block, CommandId::Tx, CommandId::GetHeaders, CommandId::Headers,
-            CommandId::GetBlocks, CommandId::Reject, CommandId::PuzzleChallenge,
+            CommandId::GetBlock, CommandId::Reject, CommandId::PuzzleChallenge,
             CommandId::PuzzleSolution, CommandId::ShadowTx, CommandId::OnionTx,
             CommandId::GetMempool,
         ];

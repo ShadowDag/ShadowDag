@@ -133,16 +133,15 @@ impl LightNode {
         true
     }
 
-    /// Verify a transaction exists in a block using Merkle proof
+    /// Verify a transaction exists in a block using Merkle proof.
+    /// Finds the header by block_hash (stronger than height alone).
     pub fn verify_tx_inclusion(
         &self,
-        tx_hash:     &str,
-        proof:       &MerkleProof,
-        block_height: u64,
+        tx_hash:    &str,
+        proof:      &MerkleProof,
+        block_hash: &str,
     ) -> bool {
-        // Find the header for this block
-        let header = self.headers.iter().find(|h| h.height == block_height);
-
+        let header = self.headers.iter().find(|h| h.hash == block_hash);
         match header {
             Some(h) => MerkleVerifier::verify(
                 tx_hash.to_string(),
