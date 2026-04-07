@@ -65,18 +65,33 @@ impl LightNode {
         slog_info!("node", "light_node_stopped");
     }
 
-    /// Add a block header to our chain
+    /// Add a block header to our chain.
+    /// First header MUST be genesis (height 0) to establish root of trust.
     pub fn add_header(&mut self, header: BlockHeader) -> bool {
-        // Basic validation
-        if header.height != self.best_height + 1 && self.best_height > 0 {
+        if self.headers.is_empty() {
+            // First header must be genesis — no arbitrary starting point
+            if header.height != 0 {
+                return false;
+            }
+            self.best_height = 0;
+            self.headers.push(header);
+            return true;
+        }
+
+        // Subsequent headers must be exactly +1
+        if header.height != self.best_height + 1 {
             return false;
         }
 
-        // Must point to previous tip
+        // Must point to previous tip (parent continuity)
         if let Some(prev) = self.headers.last() {
             let parent_ok = header.selected_parent.as_deref() == Some(prev.hash.as_str())
                 || header.parents.iter().any(|p| p == &prev.hash);
             if !parent_ok {
+                return false;
+            }
+            // Monotonic timestamp
+            if header.timestamp < prev.timestamp {
                 return false;
             }
         }

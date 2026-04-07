@@ -121,7 +121,12 @@ impl WsServer {
             if let Some(conn_subs) = subs.get_mut(&conn_id) {
                 let before = conn_subs.len();
                 conn_subs.retain(|s| s.id != sub_id);
-                return conn_subs.len() < before;
+                let removed = conn_subs.len() < before;
+                // Clean up empty entry so connection_count() stays accurate
+                if conn_subs.is_empty() {
+                    subs.remove(&conn_id);
+                }
+                return removed;
             }
         }
         false
