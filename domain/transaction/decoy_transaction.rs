@@ -3,6 +3,9 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use rand::Rng;
+use rand::seq::SliceRandom;
+
 use crate::domain::transaction::transaction::Transaction;
 
 #[derive(Clone)]
@@ -39,19 +42,26 @@ impl Ring {
         pool:      &[Transaction],
         ring_size: usize,
     ) -> Self {
+        let mut rng = rand::thread_rng();
+
         let actual_size = ring_size.max(1).min(pool.len() + 1);
         let mut members = Vec::with_capacity(actual_size);
 
+        // Randomly sample decoys from pool instead of taking first N
         let decoys_needed = actual_size.saturating_sub(1);
-        for (i, tx) in pool.iter().take(decoys_needed).enumerate() {
-            if tx.hash != real_tx.hash {
-                members.push(DecoyTransaction::new_decoy(tx.clone(), i));
-            }
+        let mut candidates: Vec<&Transaction> = pool.iter()
+            .filter(|tx| tx.hash != real_tx.hash)
+            .collect();
+        candidates.shuffle(&mut rng);
+        for (i, tx) in candidates.into_iter().take(decoys_needed).enumerate() {
+            members.push(DecoyTransaction::new_decoy(tx.clone(), i));
         }
 
-        let real_pos = members.len() / 2;
+        // Insert real TX at a random position (not deterministic middle)
+        let real_pos = rng.gen_range(0..=members.len());
         members.insert(real_pos, DecoyTransaction::new_real(real_tx, real_pos));
 
+        // Re-index all members after insertion
         for (i, m) in members.iter_mut().enumerate() {
             m.ring_index = i;
         }

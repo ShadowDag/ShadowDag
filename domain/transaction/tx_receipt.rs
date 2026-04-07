@@ -158,6 +158,11 @@ impl ReceiptStore {
             self.evict_old(&mut receipts);
         }
 
+        // Still full after eviction — reject new receipt
+        if receipts.len() >= self.max_size {
+            return;
+        }
+
         receipts.insert(receipt.tx_hash.clone(), receipt);
     }
 
@@ -202,7 +207,11 @@ impl ReceiptStore {
                 _ => continue,
             };
             let confs = current_height.saturating_sub(bht);
-            receipt.set_confirmed(&bh, bht, confs);
+            // Only transition to Confirmed when there is at least 1 confirmation.
+            // 0 confirmations means the block is at the current height — stay at InBlock.
+            if confs > 0 {
+                receipt.set_confirmed(&bh, bht, confs);
+            }
         }
     }
 

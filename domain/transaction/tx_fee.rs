@@ -20,10 +20,10 @@ impl TxFee {
 
         for input in &tx.inputs {
             let key = utxo_key(&input.txid, input.index)?;
-            if let Some(utxo) = utxo_set.get_utxo(&key) {
-                input_sum = input_sum.checked_add(utxo.amount)
-                    .ok_or_else(|| StorageError::Other("Input sum overflow".to_string()))?;
-            }
+            let utxo = utxo_set.get_utxo(&key)
+                .ok_or_else(|| StorageError::KeyNotFound(format!("input utxo {} not found", key)))?;
+            input_sum = input_sum.checked_add(utxo.amount)
+                .ok_or_else(|| StorageError::Other("Input sum overflow".to_string()))?;
         }
 
         for output in &tx.outputs {

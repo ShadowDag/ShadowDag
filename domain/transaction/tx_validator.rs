@@ -226,6 +226,13 @@ impl TxValidator {
         if tx.is_coinbase() { return Self::validate_outputs_only(tx); }
         if tx.inputs.is_empty() { return false; }
 
+        // Anti-replay: timestamp range check
+        if Self::validate_tx_timestamp(tx).is_err() { return false; }
+        // Payload hash format
+        if Self::validate_payload_hash_format(tx).is_err() { return false; }
+        // Ring signature for confidential TXs
+        if tx.is_confidential() && !RingValidator::validate(tx) { return false; }
+
         let mut seen_inputs: HashSet<UtxoKey> = HashSet::with_capacity(tx.inputs.len());
         let mut input_sum: u64 = 0;
         let signing_msg = TxHash::signing_message_for_network(tx, network);
