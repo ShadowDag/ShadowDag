@@ -90,7 +90,11 @@ impl MerkleTree {
         Self::compute_root(&hashes)
     }
 
-    /// Compute Merkle root from a hash list (insertion order, NO sorting).
+    /// Returns the Merkle root for a list of transaction hashes.
+    /// NOTE: For empty sets, returns all-zeros. For consensus-critical
+    /// computation, use `build()` which includes height/parents context
+    /// so that empty blocks at different DAG positions have distinct roots.
+    #[deprecated(note = "Use MerkleTree::build() for consensus-safe Merkle roots")]
     pub fn calculate_root(hashes: Vec<String>) -> String {
         if hashes.is_empty() {
             return "0".repeat(64);

@@ -7,7 +7,9 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::domain::block::block::Block;
+use crate::domain::block::merkle_tree::MerkleTree;
 use crate::domain::traits::pow_checker::PowChecker;
+use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
 
 /// Maximum future timestamp drift (consensus: 120 seconds).
 /// Canonical value defined in block_validator::MAX_FUTURE_SECS.
@@ -33,6 +35,32 @@ impl BlockRules {
         if block.header.timestamp > now + MAX_FUTURE_TIME_SECS {
             return false;
         }
+
+        // Recompute hash from header fields and verify it matches claimed hash
+        let computed = shadow_hash_raw_full(
+            block.header.version,
+            block.header.height,
+            block.header.timestamp,
+            block.header.nonce,
+            block.header.extra_nonce,
+            block.header.difficulty,
+            &block.header.merkle_root,
+            &block.header.parents,
+        );
+        if computed != block.header.hash {
+            return false; // Hash doesn't match header content
+        }
+
+        // Verify merkle root matches the block body transactions
+        let computed_merkle = MerkleTree::build(
+            &block.body.transactions,
+            block.header.height,
+            &block.header.parents,
+        );
+        if computed_merkle != block.header.merkle_root {
+            return false;
+        }
+
         pow.hash_meets_target(&block.header.hash, block.header.difficulty)
     }
 }
