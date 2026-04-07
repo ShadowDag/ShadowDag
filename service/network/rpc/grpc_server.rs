@@ -131,14 +131,20 @@ impl GrpcResponse {
         Self { success: false, payload: vec![], req_id, error: Some(error.to_string()) }
     }
 
-    /// Serialize to wire format: [4B len][1B status][8B req_id][payload]
+    /// Serialize to wire format: [4B len][1B status][8B req_id][body]
+    /// On success, body = payload. On failure, body = error message string.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let payload_len = 1 + 8 + self.payload.len();
+        let body = if self.success {
+            self.payload.clone()
+        } else {
+            self.error.clone().unwrap_or_else(|| "Unknown error".into()).into_bytes()
+        };
+        let payload_len = 1 + 8 + body.len(); // status + req_id + body
         let mut buf = Vec::with_capacity(4 + payload_len);
         buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
         buf.push(if self.success { 1 } else { 0 });
         buf.extend_from_slice(&self.req_id.to_be_bytes());
-        buf.extend_from_slice(&self.payload);
+        buf.extend_from_slice(&body);
         buf
     }
 }

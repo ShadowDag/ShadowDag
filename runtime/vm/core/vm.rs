@@ -288,6 +288,7 @@ impl VM {
         timestamp:  u64,
         block_hash: &str,
         contract_addr: &str,
+        input_data: &[u8],
     ) -> ExecutionResult {
         // --- Pre-execution validation ---
         if bytecode.len() > MAX_CODE_SIZE {
@@ -300,15 +301,21 @@ impl VM {
         // --- Initialize execution state ---
         let mut gas = GasMeter::new(gas_limit);
         let mut stack: Vec<U256> = Vec::with_capacity(64);
-        let mut memory: Vec<u8> = vec![0u8; 256];
+        let init_mem_size = 256usize.max(input_data.len());
+        let mut memory: Vec<u8> = vec![0u8; init_mem_size];
         let mut pc: usize = 0;
         let mut logs: Vec<LogEntry> = Vec::new();
         let mut return_data: Vec<u8> = Vec::new();
 
         // Charge gas for initial memory allocation (issue #94)
-        let init_mem_cost = (256u64 / 32) * MEMORY_GAS_PER_WORD;
+        let init_mem_cost = (init_mem_size as u64 / 32) * MEMORY_GAS_PER_WORD;
         if let GasResult::OutOfGas { .. } = gas.consume(init_mem_cost) {
             return ExecutionResult::OutOfGas { gas_used: gas.gas_used() };
+        }
+
+        // Copy input_data into the start of VM memory (Fix #39)
+        if !input_data.is_empty() {
+            memory[..input_data.len()].copy_from_slice(input_data);
         }
 
         // Pending state changes -- only committed on success
@@ -627,7 +634,21 @@ impl VM {
                 OpCode::CALLER     => { stack.push(U256::from_u64(Self::addr_to_u64(caller))); }
                 OpCode::CALLVALUE  => { stack.push(U256::from_u64(value)); }
                 OpCode::TIMESTAMP  => { stack.push(U256::from_u64(timestamp)); }
-                OpCode::BLOCKHASH  => { stack.push(U256::from_u64(Self::addr_to_u64(block_hash))); }
+                OpCode::BLOCKHASH  => {
+                    // Parse full 256-bit block hash instead of truncating to 64-bit
+                    let val = if block_hash.len() == 64 {
+                        U256::from_hex(block_hash).unwrap_or(U256::ZERO)
+                    } else {
+                        // Fallback: hash the string to get deterministic 256-bit value
+                        let mut h = Sha256::new();
+                        h.update(block_hash.as_bytes());
+                        let hash = h.finalize();
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&hash);
+                        U256::from_be_bytes(&arr)
+                    };
+                    stack.push(val);
+                }
                 OpCode::BALANCE    => {
                     let addr = match Self::pop1(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
                     let addr_key = format!("balance:{}", addr.as_u64());
@@ -919,7 +940,7 @@ mod tests {
     }
 
     fn exec(vm: &VM, bytecode: &[u8], gas: u64) -> ExecutionResult {
-        vm.execute_bytecode(bytecode, gas, "SD1caller", 0, 1000, "blockhash", "SD1contract")
+        vm.execute_bytecode(bytecode, gas, "SD1caller", 0, 1000, "blockhash", "SD1contract", &[])
     }
 
     #[test]
