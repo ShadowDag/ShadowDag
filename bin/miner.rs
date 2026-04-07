@@ -71,11 +71,14 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
     let owner_address = ConsensusParams::OWNER_REWARD_ADDRESS.to_string();
     let genesis = create_genesis_block_for(&network);
 
-    // Initialize rayon thread pool
-    rayon::ThreadPoolBuilder::new()
+    // Initialize rayon thread pool — fail loudly if it can't be built
+    if let Err(e) = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global()
-        .ok();
+    {
+        eprintln!("[miner] WARNING: Failed to build rayon thread pool: {}", e);
+        eprintln!("[miner] Falling back to default thread pool");
+    }
 
     println!("╔══════════════════════════════════════════════╗");
     println!("║     S H A D O W D A G  —  Miner v1.1         ║");

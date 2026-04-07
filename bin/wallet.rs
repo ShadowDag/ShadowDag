@@ -28,18 +28,45 @@ use shadowdag::domain::address::invisible_wallet::InvisibleWallet;
 use shadowdag::errors::WalletError;
 use shadowdag::{slog_warn, slog_error};
 
-const MAX_SDAG_AMOUNT: f64 = 21_000_000.0;
-const SATS_PER_SDAG: f64 = 100_000_000.0;
+const MAX_SDAG_SATS: u64 = 21_000_000 * 100_000_000; // 21M SDAG in satoshis
 
-fn safe_sdag_to_sats(sdag: f64) -> Option<u64> {
-    if !sdag.is_finite() || sdag <= 0.0 || sdag > MAX_SDAG_AMOUNT {
+/// Parse a SDAG amount string to satoshis using integer-only arithmetic.
+/// Avoids f64 rounding errors in monetary calculations.
+///
+/// Accepts: "1.5", "0.00000001", "100", "1234.56789012" (truncates to 8 decimals)
+fn safe_sdag_to_sats(input: &str) -> Option<u64> {
+    let input = input.trim();
+    if input.is_empty() || input.starts_with('-') {
         return None;
     }
-    let sats = sdag * SATS_PER_SDAG;
-    if sats > u64::MAX as f64 {
+
+    let (whole_str, frac_str) = match input.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (input, ""),
+    };
+
+    let whole: u64 = if whole_str.is_empty() { 0 } else {
+        whole_str.parse().ok()?
+    };
+
+    // Pad or truncate fractional part to exactly 8 digits
+    let mut frac_padded = String::with_capacity(8);
+    for (i, ch) in frac_str.chars().enumerate() {
+        if i >= 8 { break; }
+        if !ch.is_ascii_digit() { return None; }
+        frac_padded.push(ch);
+    }
+    while frac_padded.len() < 8 {
+        frac_padded.push('0');
+    }
+
+    let frac: u64 = frac_padded.parse().ok()?;
+    let sats = whole.checked_mul(100_000_000)?.checked_add(frac)?;
+
+    if sats == 0 || sats > MAX_SDAG_SATS {
         return None;
     }
-    Some(sats as u64)
+    Some(sats)
 }
 
 // ---------------------------------------------------------------------------
@@ -348,17 +375,16 @@ fn cmd_send(args: &[String]) {
         Some(addr) => addr.clone(),
         None => { eprintln!("Usage: shadowdag-wallet send <to_address> <amount> [fee]"); return; }
     };
-    let amount_sdag = match args.get(3).and_then(|s| s.parse::<f64>().ok()) {
-        Some(a) => a,
+    let amount_str = match args.get(3) {
+        Some(s) => s.as_str(),
         None => { eprintln!("Usage: shadowdag-wallet send <to_address> <amount> [fee]"); return; }
     };
-    let amount = match safe_sdag_to_sats(amount_sdag) {
+    let amount = match safe_sdag_to_sats(amount_str) {
         Some(a) => a,
         None => { eprintln!("Error: invalid amount (must be 0 < amount <= 21,000,000)"); return; }
     };
     let fee: u64 = args.get(4)
-        .and_then(|s| s.parse::<f64>().ok())
-        .and_then(safe_sdag_to_sats)
+        .and_then(|s| safe_sdag_to_sats(s))
         .unwrap_or(1); // default 1 sat fee
 
     // Load and unlock wallet — signing keys are derived from the encrypted
@@ -383,7 +409,7 @@ fn cmd_send(args: &[String]) {
             println!("  TxID   : {}", built_tx.txid);
             println!("  From   : {}", from_address);
             println!("  To     : {}", to);
-            println!("  Amount : {:.8} SDAG", amount_sdag);
+            println!("  Amount : {} SDAG", amount_str);
             println!("  Fee    : {:.8} SDAG", fee as f64 / 100_000_000.0);
             println!("  Raw    : {}", built_tx.raw_hex);
             println!();
