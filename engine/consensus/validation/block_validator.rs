@@ -649,6 +649,10 @@ impl BlockValidator {
     ///
     /// Without the height check, an attacker could claim an arbitrary height,
     /// which breaks difficulty retarget, emission schedule, and coinbase maturity.
+    ///
+    /// Uses `block_store.get_block_height()` instead of `get_block()` so that
+    /// pruned parents (body deleted but height index preserved) still pass
+    /// validation. This prevents pruning from breaking parent checks.
     pub fn validate_parents_exist(
         block: &Block,
         block_store: &BlockStore,
@@ -662,22 +666,22 @@ impl BlockValidator {
         let mut max_parent_height: u64 = 0;
 
         for parent_hash in &block.header.parents {
-            // Parent must exist
-            let parent_block = block_store.get_block(parent_hash)
+            // Parent height must be retrievable (survives pruning via h2h index)
+            let parent_height = block_store.get_block_height(parent_hash)
                 .ok_or_else(|| {
                     // Check DAG for existence — but even if the parent is in the
-                    // DAG, we REJECT it because block data (from BlockStore) is
-                    // required for height validation below. A parent in the DAG
-                    // but missing from BlockStore means we cannot verify the
-                    // height rule, so the block must be rejected.
+                    // DAG, we REJECT it because height data is required for the
+                    // height rule below. A parent in the DAG but missing from
+                    // both BlockStore and height index means we cannot verify
+                    // the height rule, so the block must be rejected.
                     if dag_manager.block_exists(parent_hash) {
-                        return ConsensusError::BlockValidation(format!("parent {} in DAG but not in block store", parent_hash));
+                        return ConsensusError::BlockValidation(format!("parent {} in DAG but height unknown", parent_hash));
                     }
                     ConsensusError::BlockValidation(format!("parent {} not found", parent_hash))
                 })?;
 
-            if parent_block.header.height > max_parent_height {
-                max_parent_height = parent_block.header.height;
+            if parent_height > max_parent_height {
+                max_parent_height = parent_height;
             }
         }
 

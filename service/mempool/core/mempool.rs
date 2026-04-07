@@ -688,7 +688,10 @@ impl Mempool {
                     self.meta_dec(META_TOTAL_BYTES, tx_bytes);
                     self.meta_dec(META_TOTAL_FEES, tx_fee);
                 }
-                Err(_e) => {}
+                Err(e) => {
+                    slog_error!("mempool", "remove_transaction_write_failed",
+                        txid => txid, error => e);
+                }
             }
         }
     }

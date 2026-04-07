@@ -403,6 +403,21 @@ impl FullNode {
         Ok(())
     }
 
+    /// Select the best tip from a set of DAG tips using the canonical rule:
+    ///   highest blue_score -> highest chain_height -> lowest hash (deterministic)
+    ///
+    /// This MUST be used everywhere a "best tip" is chosen (runtime AND recovery)
+    /// to guarantee consistent fork-choice across restarts.
+    pub fn select_best_tip(tips: &[String], ghostdag: &GhostDag) -> Option<String> {
+        tips.iter()
+            .max_by(|a, b| {
+                ghostdag.get_blue_score(a).cmp(&ghostdag.get_blue_score(b))
+                    .then_with(|| ghostdag.get_chain_height(a).cmp(&ghostdag.get_chain_height(b)))
+                    .then_with(|| b.cmp(a)) // lower hash wins
+            })
+            .cloned()
+    }
+
     /// Recompute the virtual selected parent chain after DAG changes.
     ///
     /// Walks the GHOSTDAG ordering to determine which blocks should
@@ -415,17 +430,11 @@ impl FullNode {
         let tips = self.ghostdag.get_tips();
         if tips.is_empty() { return Ok(()); }
 
-        // Find tip with highest blue score
-        let mut best_tip = tips[0].clone();
-        let mut best_score = self.ghostdag.get_blue_score(&best_tip);
-
-        for tip in &tips[1..] {
-            let score = self.ghostdag.get_blue_score(tip);
-            if score > best_score || (score == best_score && *tip < best_tip) {
-                best_tip = tip.clone();
-                best_score = score;
-            }
-        }
+        // Use canonical tip selection: blue_score -> height -> hash
+        let best_tip = match Self::select_best_tip(&tips, &self.ghostdag) {
+            Some(tip) => tip,
+            None => return Ok(()),
+        };
 
         let current_best = self.block_store.get_best_hash()
             .unwrap_or_default();
@@ -482,7 +491,7 @@ impl FullNode {
         // Reject reorgs deeper than MAX_REORG_DEPTH. Blocks older than
         // this are considered final. This prevents an attacker from
         // secretly building a long side-chain and causing a massive reorg.
-        if new_chain.len() as u64 > MAX_REORG_DEPTH {
+        if new_chain.len() as u64 >= MAX_REORG_DEPTH {
             return Err(NodeError::BlockRejected(format!(
                 "reorg depth {} exceeds MAX_REORG_DEPTH {}",
                 new_chain.len(), MAX_REORG_DEPTH

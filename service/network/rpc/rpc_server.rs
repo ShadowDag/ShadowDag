@@ -194,18 +194,31 @@ impl RpcState {
             .or_else(|| std::env::current_dir().ok());
         if let Some(base) = base_dir {
             let pw_path = base.join("rpc_password");
-            eprintln!("╔══════════════════════════════════════════════════════╗");
-            eprintln!("║  RPC Admin Password generated (first run)           ║");
-            eprintln!("║  Hint: {}                                           ║", masked);
-            eprintln!("║  Full password saved to: {}  ║", pw_path.display());
-            eprintln!("╚══════════════════════════════════════════════════════╝");
-            if std::fs::write(&pw_path, password.as_bytes()).is_ok() {
-                // Best-effort: restrict permissions on Unix
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&pw_path,
-                        std::fs::Permissions::from_mode(0o600));
+            match std::fs::write(&pw_path, password.as_bytes()) {
+                Ok(_) => {
+                    // Best-effort: restrict permissions on Unix
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(&pw_path,
+                            std::fs::Permissions::from_mode(0o600));
+                    }
+                    let pw_display = pw_path.display().to_string();
+                    eprintln!("╔══════════════════════════════════════════════════════╗");
+                    eprintln!("║  RPC Admin Password generated (first run)           ║");
+                    eprintln!("║  Hint: {}                                           ║", masked);
+                    eprintln!("║  Full password saved to:                            ║");
+                    eprintln!("║  {}  ║", pw_display);
+                    eprintln!("╚══════════════════════════════════════════════════════╝");
+                }
+                Err(e) => {
+                    slog_warn!("rpc", "rpc_password_file_write_failed",
+                        path => pw_path.display(), error => e);
+                    eprintln!("╔══════════════════════════════════════════════════════╗");
+                    eprintln!("║  RPC Admin Password generated (first run)           ║");
+                    eprintln!("║  Hint: {}                                           ║", masked);
+                    eprintln!("║  WARNING: Could not write password to: {}  ║", pw_path.display());
+                    eprintln!("╚══════════════════════════════════════════════════════╝");
                 }
             }
         } else {
