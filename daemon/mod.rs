@@ -202,7 +202,7 @@ impl DaemonNode {
             &self.cfg.peers_path_str(),
             self.db.clone(),
         ).map_err(|e| NodeError::Init(format!("Failed to init RPC server: {}", e)))?;
-        rpc.set_network_name(&format!("shadowdag-{}", self.cfg.network.name()));
+        rpc.set_network_name(self.cfg.network.name());
         rpc.set_network_ports(self.cfg.p2p_port, self.cfg.rpc_port);
         rpc.start().map_err(|e| NodeError::Init(format!("RPC start failed: {}", e)))?;
         slog_info!("daemon", "rpc_started", port => self.cfg.rpc_port);

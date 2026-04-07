@@ -28,7 +28,7 @@ use shadowdag::domain::address::invisible_wallet::InvisibleWallet;
 use shadowdag::errors::WalletError;
 use shadowdag::{slog_warn, slog_error};
 
-const MAX_SDAG_SATS: u64 = 21_000_000 * 100_000_000; // 21M SDAG in satoshis
+const MAX_SDAG_SATS: u64 = 21_000_000_000 * 100_000_000; // 21B SDAG in satoshis
 
 /// Parse a SDAG amount string to satoshis using integer-only arithmetic.
 /// Avoids f64 rounding errors in monetary calculations.
@@ -405,7 +405,7 @@ fn cmd_send(args: &[String]) {
     };
     let amount = match safe_sdag_to_sats(amount_str) {
         Some(a) => a,
-        None => { eprintln!("Error: invalid amount (must be 0 < amount <= 21,000,000)"); return; }
+        None => { eprintln!("Error: invalid amount (must be 0 < amount <= 21,000,000,000)"); return; }
     };
     let fee: u64 = args.get(4)
         .and_then(|s| safe_sdag_to_sats(s))

@@ -26,7 +26,7 @@ use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::service::rpc::auth::RpcAuthManager;
 use crate::engine::dag::security::dag_shield::DagShield;
 
-pub const RPC_PORT:    u16   = 8332;
+pub const RPC_PORT:    u16   = 9332;
 pub const RPC_VERSION: &str  = "2.0";
 
 pub const MAX_BODY:         usize = 1024 * 1024;

@@ -11,7 +11,7 @@
 //   shadowdag-loadtest --tps=1000            # Target 1000 TPS
 //   shadowdag-loadtest --duration=60         # Run for 60 seconds
 //   shadowdag-loadtest --wallets=100         # Use 100 wallets
-//   shadowdag-loadtest --rpc=127.0.0.1:7778  # Connect to node
+//   shadowdag-loadtest --rpc=127.0.0.1:9332  # Connect to node
 // ═══════════════════════════════════════════════════════════════════════════
 
 use std::io::{BufRead, BufReader, Write};
@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use shadowdag::domain::transaction::transaction::{Transaction, TxInput, TxOutput};
 use shadowdag::domain::transaction::tx_builder::generate_keypair;
 use shadowdag::errors::NetworkError;
-use shadowdag::{slog_info, slog_warn, slog_error, slog_fatal};
+use shadowdag::{slog_info, slog_warn, slog_fatal};
 use sha2::{Sha256, Digest};
 
 fn main() {
@@ -36,7 +36,8 @@ fn main() {
     let target_tps: u64 = parse_flag(&args, "--tps", "100").parse().unwrap_or(100);
     let duration_sec: u64 = parse_flag(&args, "--duration", "30").parse().unwrap_or(30);
     let num_wallets: usize = parse_flag(&args, "--wallets", "10").parse().unwrap_or(10);
-    let rpc_addr = parse_flag(&args, "--rpc", "127.0.0.1:7778");
+    let rpc_addr = parse_flag(&args, "--rpc", "127.0.0.1:9332");
+    let rpc_token = parse_flag(&args, "--rpc-token", "");
 
     println!("╔══════════════════════════════════════════════╗");
     println!("║  S H A D O W D A G  —  Load Tester            ║");
@@ -60,22 +61,17 @@ fn main() {
     let total_sent = AtomicU64::new(0);
     let total_errors = AtomicU64::new(0);
 
-    // Connect to the node's RPC endpoint
+    // Verify RPC endpoint is reachable
     slog_info!("loadtest", "connecting_to_rpc", addr => &rpc_addr);
-    let mut stream = match TcpStream::connect(&rpc_addr) {
-        Ok(s) => {
+    match TcpStream::connect(&rpc_addr) {
+        Ok(_) => {
             slog_info!("loadtest", "rpc_connected");
-            s
         }
         Err(e) => {
             slog_fatal!("loadtest", "rpc_connect_failed", addr => &rpc_addr, error => e);
             std::process::exit(1);
         }
     };
-    stream.set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("Failed to set read timeout");
-    stream.set_write_timeout(Some(Duration::from_secs(10)))
-        .expect("Failed to set write timeout");
 
     let start = Instant::now();
     let interval = Duration::from_micros(1_000_000 / target_tps.max(1));
@@ -83,39 +79,7 @@ fn main() {
     let mut tx_count: u64 = 0;
     let mut last_report = Instant::now();
 
-    // Backpressure: limit the number of unanswered/pending requests to avoid
-    // overwhelming the node's RPC server when it cannot keep up.
-    const MAX_PENDING: usize = 100;
-    // Accurate response tracking: `sent_count` is incremented on each
-    // successful send and `ack_count` is incremented for each RPC response
-    // (success or error) we read back. `pending = sent_count - ack_count`
-    // gives the exact number of in-flight requests at any point in time.
-    let mut sent_count: u64 = 0;
-    let mut ack_count: u64 = 0;
-
     while start.elapsed() < Duration::from_secs(duration_sec) {
-        // Drain any responses that arrived since the last iteration so that
-        // ack_count stays up-to-date and we release backpressure promptly.
-        // The socket has a read timeout so `read_line` won't block forever;
-        // we attempt non-blocking reads until there is nothing left.
-        {
-            let reader = BufReader::new(stream.try_clone().expect("clone tcp stream"));
-            for _line in reader.lines() {
-                match _line {
-                    Ok(_) => ack_count += 1,
-                    Err(_) => break, // no more data / timeout
-                }
-            }
-        }
-
-        let pending = (sent_count - ack_count) as usize;
-
-        // Backpressure: wait if too many requests are pending
-        if pending >= MAX_PENDING {
-            slog_warn!("loadtest", "backpressure", pending => pending, sent => sent_count, ack => ack_count);
-            std::thread::sleep(Duration::from_millis(50));
-            continue;
-        }
         // Generate a random transaction
         let from_idx = tx_count as usize % wallets.len();
         let to_idx = (tx_count as usize + 1) % wallets.len();
@@ -127,32 +91,15 @@ fn main() {
         );
 
         // Submit transaction to node via RPC
-        match rpc_submit_tx(&mut stream, &tx, tx_count) {
+        match rpc_submit_tx(&rpc_addr, &tx, tx_count, &rpc_token) {
             Ok(_) => {
-                sent_count += 1;
                 total_sent.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
                 total_errors.fetch_add(1, Ordering::Relaxed);
-                // Reconnect on connection errors
                 let e_msg = e.to_string();
                 if e_msg.contains("Broken pipe") || e_msg.contains("connection") {
-                    slog_warn!("loadtest", "connection_lost_reconnecting");
-                    match TcpStream::connect(&rpc_addr) {
-                        Ok(s) => {
-                            if s.set_read_timeout(Some(Duration::from_secs(10))).is_err()
-                                || s.set_write_timeout(Some(Duration::from_secs(10))).is_err()
-                            {
-                                slog_error!("loadtest", "reconnect_timeout_failed");
-                                break;
-                            }
-                            stream = s;
-                        }
-                        Err(re) => {
-                            slog_error!("loadtest", "reconnect_failed", error => re);
-                            break;
-                        }
-                    }
+                    slog_warn!("loadtest", "connection_error", error => &e_msg);
                 }
             }
         }
@@ -194,26 +141,64 @@ fn main() {
     println!("Error Rate       : {:.1}%", if tx_count > 0 { errors as f64 / tx_count as f64 * 100.0 } else { 0.0 });
 }
 
-/// Submit a transaction to the node via JSON-RPC over TCP.
-fn rpc_submit_tx(stream: &mut TcpStream, tx: &Transaction, id: u64) -> Result<String, NetworkError> {
+/// Submit a transaction to the node via JSON-RPC over HTTP.
+fn rpc_submit_tx(addr: &str, tx: &Transaction, id: u64, token: &str) -> Result<String, NetworkError> {
     let tx_json = serde_json::to_string(tx).map_err(|e| NetworkError::Other(format!("serialize: {}", e)))?;
 
-    let request = serde_json::json!({
+    let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "sendrawtransaction",
         "params": [tx_json]
     });
 
-    let mut payload = serde_json::to_string(&request).map_err(|e| NetworkError::Other(format!("serialize: {}", e)))?;
-    payload.push('\n');
+    let body_str = serde_json::to_string(&body).map_err(|e| NetworkError::Other(format!("serialize: {}", e)))?;
 
-    stream.write_all(payload.as_bytes()).map_err(|e| NetworkError::Other(format!("write: {}", e)))?;
+    let mut request = format!(
+        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        addr, body_str.len()
+    );
+    if !token.is_empty() {
+        request.push_str(&format!("Authorization: Bearer {}\r\n", token));
+    }
+    request.push_str(&format!("\r\n{}", body_str));
+
+    let mut stream = TcpStream::connect(addr).map_err(|e| NetworkError::Other(format!("connect: {}", e)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
+
+    stream.write_all(request.as_bytes()).map_err(|e| NetworkError::Other(format!("write: {}", e)))?;
     stream.flush().map_err(|e| NetworkError::Other(format!("flush: {}", e)))?;
 
-    let mut reader = BufReader::new(stream.try_clone().map_err(|e| NetworkError::Other(format!("clone: {}", e)))?);
-    let mut response = String::new();
-    reader.read_line(&mut response).map_err(|e| NetworkError::Other(format!("read: {}", e)))?;
+    // Read HTTP response: skip headers until empty line, then read body by Content-Length
+    let mut reader = BufReader::new(&stream);
+    let mut content_length: usize = 0;
+
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() { break; }
+                if trimmed.len() > 15 && trimmed[..15].eq_ignore_ascii_case("content-length:") {
+                    content_length = trimmed[15..].trim().parse().unwrap_or(0);
+                }
+            }
+            Err(e) => return Err(NetworkError::Other(format!("read header: {}", e))),
+        }
+    }
+
+    let response = if content_length > 0 {
+        let mut buf = vec![0u8; content_length];
+        std::io::Read::read_exact(&mut reader, &mut buf)
+            .map_err(|e| NetworkError::Other(format!("read body: {}", e)))?;
+        String::from_utf8(buf).map_err(|e| NetworkError::Other(format!("utf8: {}", e)))?
+    } else {
+        let mut buf = vec![0u8; 65536];
+        let n = std::io::Read::read(&mut reader, &mut buf).unwrap_or(0);
+        String::from_utf8(buf[..n].to_vec()).map_err(|e| NetworkError::Other(format!("utf8: {}", e)))?
+    };
 
     if response.contains("\"error\"") && !response.contains("\"error\":null") {
         return Err(NetworkError::Other(format!("rpc error: {}", response.trim())));
@@ -284,6 +269,7 @@ fn print_help() {
     println!("  --tps=<n>          Target transactions per second (default: 100)");
     println!("  --duration=<sec>   Test duration in seconds (default: 30)");
     println!("  --wallets=<n>      Number of test wallets (default: 10)");
-    println!("  --rpc=<addr:port>  Node RPC endpoint (default: 127.0.0.1:7778)");
+    println!("  --rpc=<addr:port>  Node RPC endpoint (default: 127.0.0.1:9332)");
+    println!("  --rpc-token=<tok>  Optional RPC bearer token for authentication");
     println!("  --help, -h         Show this help");
 }
