@@ -13,7 +13,11 @@ use crate::domain::traits::tx_pool::TxPool;
 pub struct BlockBuilder;
 
 impl BlockBuilder {
-    /// Build a block from mempool transactions WITH a pre-built coinbase.
+    /// Build a block TEMPLATE (hash is empty -- must be set by miner after PoW).
+    ///
+    /// The returned block is NOT valid for consensus until the miner fills in:
+    /// - `header.hash` (computed via ShadowHash)
+    /// - `header.nonce` / `header.extra_nonce` (found via mining)
     ///
     /// The coinbase MUST be provided by the caller (from Miner or BlockTemplateBuilder)
     /// because the validator requires: block.body.transactions[0].is_coinbase() == true.
@@ -30,8 +34,15 @@ impl BlockBuilder {
         max_txs:    usize,
         difficulty: u64,
         timestamp:  u64,
-    ) -> Block {
-        assert!(coinbase.is_coinbase(), "First transaction must be a coinbase");
+    ) -> Result<Block, String> {
+        if !coinbase.is_coinbase() {
+            return Err("first transaction must be coinbase".to_string());
+        }
+
+        // Non-genesis blocks MUST have parents
+        if height > 0 && parents.is_empty() {
+            return Err("non-genesis block requires at least one parent".to_string());
+        }
 
         // Reserve one slot for coinbase
         let mempool_txs: Vec<Transaction> =
@@ -41,14 +52,17 @@ impl BlockBuilder {
         let mut all_txs = vec![coinbase];
         all_txs.extend(mempool_txs);
 
-        let tx_hashes: Vec<String> = all_txs.iter().map(|tx| tx.hash.clone()).collect();
-        let merkle_root = MerkleTree::calculate_root(tx_hashes);
+        #[allow(deprecated)]
+        let merkle_root = {
+            let tx_hashes: Vec<String> = all_txs.iter().map(|tx| tx.hash.clone()).collect();
+            MerkleTree::calculate_root(tx_hashes)
+        };
 
         let selected_parent = parents.first().cloned();
 
         let header = BlockHeader {
             version,
-            hash:            String::new(),
+            hash:            String::new(),  // Template: filled by miner after PoW
             parents,
             merkle_root,
             timestamp,
@@ -63,6 +77,6 @@ impl BlockBuilder {
 
         let body = BlockBody { transactions: all_txs };
 
-        Block { header, body }
+        Ok(Block { header, body })
     }
 }

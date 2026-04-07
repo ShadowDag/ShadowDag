@@ -46,8 +46,17 @@ impl BootstrapNodes {
         Self::for_network(network).into_iter().map(|s| s.to_string()).collect()
     }
 
-    /// Return DNS hostnames only (no port), for DNS seed resolution.
+    /// Return full seed addresses (host:port) for bootstrap connections.
+    /// Unlike `dns_hostnames()`, this preserves ports so that regtest
+    /// entries like `127.0.0.1:29333` and `127.0.0.1:29334` remain distinct.
     pub fn dns_seeds(network: &NetworkMode) -> Vec<&'static str> {
+        Self::for_network(network)
+    }
+
+    /// Return DNS hostnames only (no port), for DNS-only seed resolution.
+    /// WARNING: This collapses entries that share a hostname (e.g. regtest
+    /// localhost entries). Use `dns_seeds()` for connection bootstrapping.
+    pub fn dns_hostnames(network: &NetworkMode) -> Vec<&'static str> {
         Self::for_network(network)
             .into_iter()
             .map(|s| s.split(':').next().unwrap_or(s))
