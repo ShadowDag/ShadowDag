@@ -835,6 +835,24 @@ impl BlockValidator {
             return BlockValidationResult::fail(&format!("genesis coinbase invalid: {}", e));
         }
 
+        // Structural TX validation for non-coinbase transactions in genesis.
+        // Signatures must be valid even in the genesis block to prevent
+        // injection of unsigned spends.
+        for (i, tx) in block.body.transactions.iter().enumerate() {
+            if !tx.is_coinbase() {
+                if !TxValidator::validate_structure_for_network(tx, network) {
+                    return BlockValidationResult::fail(&format!(
+                        "genesis tx {} structural validation failed", i
+                    ));
+                }
+                if !TxValidator::verify_signatures(tx) {
+                    return BlockValidationResult::fail(&format!(
+                        "genesis tx {} signature verification failed", i
+                    ));
+                }
+            }
+        }
+
         let mut changes = Vec::with_capacity(block.body.transactions.len() * 2);
 
         for tx in &block.body.transactions {

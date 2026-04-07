@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
 
 use crate::service::network::p2p::peer_manager::PeerManager;
+use crate::config::genesis::genesis::genesis_hash;
 
 pub const MAX_CONCURRENT_DOWNLOADS:  usize = 32;
 pub const MAX_HEADER_BATCH:          usize = 2_000;
@@ -117,9 +118,11 @@ pub struct BlockSyncManager {
     best_height:    Arc<AtomicU64>,
     is_running:     Arc<AtomicBool>,
 
-    headers:        Arc<RwLock<HashMap<u64, SyncHeader>>>,     // Lock order: 2
+    headers:            Arc<RwLock<HashMap<String, SyncHeader>>>,       // Lock order: 2 — hash -> header
+    headers_by_height:  Arc<RwLock<HashMap<u64, Vec<String>>>>,         // Lock order: 2b — height -> [hashes]
 
     pending:        Arc<Mutex<VecDeque<DownloadJob>>>,         // Lock order: 5
+    pending_set:    Arc<Mutex<HashSet<String>>>,               // Lock order: 5b — dedup
 
     in_flight:      Arc<Mutex<HashMap<String, DownloadJob>>>,  // Lock order: 6
 
@@ -134,16 +137,18 @@ impl BlockSyncManager {
     pub fn new(peers: Arc<PeerManager>) -> Self {
         Self {
             _peers: peers,
-            phase:         Arc::new(RwLock::new(SyncPhase::Idle)),
-            local_height:  Arc::new(AtomicU64::new(0)),
-            best_height:   Arc::new(AtomicU64::new(0)),
-            is_running:    Arc::new(AtomicBool::new(false)),
-            headers:       Arc::new(RwLock::new(HashMap::new())),
-            pending:       Arc::new(Mutex::new(VecDeque::new())),
-            in_flight:     Arc::new(Mutex::new(HashMap::new())),
-            completed:     Arc::new(Mutex::new(HashSet::new())),
-            peer_states:   Arc::new(RwLock::new(HashMap::new())),
-            best_snapshot: Arc::new(RwLock::new(None)),
+            phase:             Arc::new(RwLock::new(SyncPhase::Idle)),
+            local_height:      Arc::new(AtomicU64::new(0)),
+            best_height:       Arc::new(AtomicU64::new(0)),
+            is_running:        Arc::new(AtomicBool::new(false)),
+            headers:           Arc::new(RwLock::new(HashMap::new())),
+            headers_by_height: Arc::new(RwLock::new(HashMap::new())),
+            pending:           Arc::new(Mutex::new(VecDeque::new())),
+            pending_set:       Arc::new(Mutex::new(HashSet::new())),
+            in_flight:         Arc::new(Mutex::new(HashMap::new())),
+            completed:         Arc::new(Mutex::new(HashSet::new())),
+            peer_states:       Arc::new(RwLock::new(HashMap::new())),
+            best_snapshot:     Arc::new(RwLock::new(None)),
         }
     }
 
@@ -236,27 +241,31 @@ impl BlockSyncManager {
             return;
         }
         let mut map = self.headers.write().unwrap_or_else(|e| e.into_inner());
+        let mut by_height = self.headers_by_height.write().unwrap_or_else(|e| e.into_inner());
         for h in &headers {
-            map.insert(h.height, h.clone());
+            map.insert(h.hash.clone(), h.clone());
+            by_height.entry(h.height).or_default().push(h.hash.clone());
         }
         let _max_h = headers.iter().map(|h| h.height).max().unwrap_or(0);
     }
 
     pub fn build_header_locator(&self) -> Vec<String> {
-        let headers = self.headers.read().unwrap_or_else(|e| e.into_inner());
+        let by_height = self.headers_by_height.read().unwrap_or_else(|e| e.into_inner());
         let local_h = self.local_height.load(Ordering::SeqCst);
         let mut locator = Vec::new();
         let mut step = 1u64;
         let mut h = local_h;
         loop {
-            if let Some(hdr) = headers.get(&h) {
-                locator.push(hdr.hash.clone());
+            if let Some(hashes) = by_height.get(&h) {
+                if let Some(first) = hashes.first() {
+                    locator.push(first.clone());
+                }
             }
             if h < step { break; }
             h -= step;
             step *= 2;
         }
-        locator.push("genesis_hash".to_string());
+        locator.push(genesis_hash());
         locator
     }
 
@@ -264,16 +273,19 @@ impl BlockSyncManager {
         let headers = self.headers.read().unwrap_or_else(|e| e.into_inner());
         let local_h = self.local_height.load(Ordering::SeqCst);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending_set = self.pending_set.lock().unwrap_or_else(|e| e.into_inner());
         let inflight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
         let completed = self.completed.lock().unwrap_or_else(|e| e.into_inner());
 
-        for (height, hdr) in headers.iter() {
-            if *height <= local_h { continue; }
-            if inflight.contains_key(&hdr.hash) { continue; }
-            if completed.contains(&hdr.hash) { continue; }
+        for (hash, hdr) in headers.iter() {
+            if hdr.height <= local_h { continue; }
+            if inflight.contains_key(hash) { continue; }
+            if completed.contains(hash) { continue; }
+            if pending_set.contains(hash) { continue; }
+            pending_set.insert(hash.clone());
             pending.push_back(DownloadJob {
-                hash:        hdr.hash.clone(),
-                _height:     *height,
+                hash:        hash.clone(),
+                _height:     hdr.height,
                 assigned_to: String::new(),
                 started_at:  0,
                 retries:     0,
@@ -283,9 +295,10 @@ impl BlockSyncManager {
     }
 
     pub fn next_download_batch(&self, peer: &str) -> Vec<String> {
-        let mut pending  = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        let mut inflight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-        let mut batch    = Vec::new();
+        let mut pending     = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending_set = self.pending_set.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inflight    = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        let mut batch       = Vec::new();
 
         while batch.len() < MAX_BLOCK_BATCH {
             match pending.pop_front() {
@@ -293,12 +306,22 @@ impl BlockSyncManager {
                     job.assigned_to = peer.to_string();
                     job.started_at  = unix_now();
                     let hash = job.hash.clone();
+                    pending_set.remove(&hash);
                     inflight.insert(hash.clone(), job);
                     batch.push(hash);
                 }
                 None => break,
             }
         }
+
+        // Increment peer in_flight count
+        if !batch.is_empty() {
+            let mut states = self.peer_states.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(ps) = states.get_mut(peer) {
+                ps.in_flight += batch.len();
+            }
+        }
+
         batch
     }
 
@@ -309,9 +332,8 @@ impl BlockSyncManager {
         if inflight.remove(hash).is_some() {
             completed.insert(hash.to_string());
 
-            if let Some(hdr) = self.headers.read().unwrap_or_else(|e| e.into_inner()).iter()
-                .find(|(_, h)| h.hash == hash)
-                .map(|(_, h)| h.clone())
+            if let Some(hdr) = self.headers.read().unwrap_or_else(|e| e.into_inner())
+                .get(hash).cloned()
             {
                 let cur = self.local_height.load(Ordering::SeqCst);
                 if hdr.height > cur {
