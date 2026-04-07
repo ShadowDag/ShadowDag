@@ -33,6 +33,10 @@ pub const MEDIAN_TIME_SPAN: usize = 11;
 pub const MAX_BLOCK_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_TX_BYTES_IN_BLOCK: usize = 100 * 1024;
 
+/// Maximum transactions per block during validation (anti-DoS budget).
+/// Prevents worst-case CPU consumption from blocks with excessive TXs.
+pub const MAX_TXS_PER_BLOCK_VALIDATION: usize = 10_000;
+
 /// Maximum how far in the past a block timestamp can be relative to wall clock.
 /// Prevents miners from backdating blocks to manipulate difficulty windows.
 /// 10 minutes is generous enough for clock skew but tight enough to prevent
@@ -167,6 +171,15 @@ impl BlockValidator {
     /// **L1 Network** — cheapest checks first. Reject malformed data
     /// before spending CPU on crypto or DB lookups.
     pub fn validate_network_layer(block: &Block) -> Result<(), ConsensusError> {
+        // ── Early cost guards (O(1), before ANY iteration) ──────────
+        // Reject obviously oversized blocks before spending CPU on
+        // serialization, signature checks, or merkle computation.
+        if block.body.transactions.len() > MAX_TXS_PER_BLOCK_VALIDATION {
+            return Err(ConsensusError::BlockValidation(format!(
+                "too many transactions: {} > {}",
+                block.body.transactions.len(), MAX_TXS_PER_BLOCK_VALIDATION
+            )));
+        }
         if block.header.version == 0 {
             return Err(ConsensusError::BlockValidation("version=0".into()));
         }
@@ -485,16 +498,29 @@ impl BlockValidator {
     // ─────────────────────────────────────────
 
     fn validate_block_size(block: &Block) -> Result<(), ConsensusError> {
-        // Check individual transaction sizes
-        for tx in &block.body.transactions {
-            let size = bincode::serialize(&tx).map(|b| b.len()).unwrap_or(0);
+        // ── Cheap estimate first (O(1)) ─────────────────────────────
+        // Approximate block size without full serialization to reject
+        // obviously oversized blocks before expensive bincode::serialize.
+        let tx_count = block.body.transactions.len();
+        let cheap_estimate = 256 + tx_count * 200; // header + ~200 bytes per TX estimate
+        if cheap_estimate > MAX_BLOCK_BYTES * 2 {
+            return Err(ConsensusError::BlockValidation(format!(
+                "block likely too large: ~{} bytes estimated ({} txs)",
+                cheap_estimate, tx_count
+            )));
+        }
 
+        // ── Per-TX size check ───────────────────────────────────────
+        for tx in &block.body.transactions {
+            let size = tx.canonical_bytes().len();
             if size > MAX_TX_BYTES_IN_BLOCK {
-                return Err(ConsensusError::BlockValidation("tx too large".into()));
+                return Err(ConsensusError::BlockValidation(format!(
+                    "tx too large: {} > {} bytes", size, MAX_TX_BYTES_IN_BLOCK
+                )));
             }
         }
 
-        // Check full serialized block size (includes headers, length prefixes, etc.)
+        // ── Full serialized block size (precise but expensive) ──────
         let full_size = bincode::serialize(block).map(|b| b.len()).unwrap_or(0);
         if full_size > MAX_BLOCK_BYTES {
             return Err(ConsensusError::BlockValidation(
