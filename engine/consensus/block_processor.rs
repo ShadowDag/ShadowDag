@@ -10,6 +10,7 @@ use crate::engine::consensus::chain_manager::ChainManager;
 use crate::domain::utxo::utxo_set::UtxoSet;
 use crate::errors::ConsensusError;
 use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
+use crate::slog_error;
 
 pub struct BlockProcessor;
 
@@ -32,6 +33,15 @@ impl BlockProcessor {
     // FIND FORK
     // ─────────────────────────────────────────
 
+    /// Find the common ancestor (fork point) of two chain tips by walking
+    /// back through selected parents up to `max_depth` steps from each tip.
+    ///
+    /// # Truncation behavior
+    /// Returns `None` if no common ancestor is found within `max_depth` steps.
+    /// This can happen either because the chains truly share no common ancestor
+    /// (disjoint DAGs) **or** because the fork point is deeper than `max_depth`.
+    /// Callers should treat `None` as an error when a fork point is expected
+    /// to exist (e.g., during reorgs on the same network).
     pub fn find_fork_point(
         tip_a:     &str,
         tip_b:     &str,
@@ -147,14 +157,18 @@ impl BlockProcessor {
                 for prev in applied.iter().rev() {
                     if let Some(b) = block_store.get_block(prev) {
                         #[allow(deprecated)]
-                        let _ = utxo_set.rollback_block(&b.body.transactions);
+                        if let Err(re) = utxo_set.rollback_block(&b.body.transactions) {
+                            slog_error!("consensus", "restore_after_failed_reorg", error => re);
+                        }
                     }
                 }
 
                 // 🔥 restore old chain
                 for h in rollback_chain.iter().rev() {
                     if let Some(b) = block_store.get_block(h) {
-                        let _ = utxo_set.apply_block(&b.body.transactions, b.header.height);
+                        if let Err(re) = utxo_set.apply_block(&b.body.transactions, b.header.height) {
+                            slog_error!("consensus", "restore_after_failed_reorg", error => re);
+                        }
                     }
                 }
 
@@ -164,13 +178,22 @@ impl BlockProcessor {
             applied.push(hash.clone());
         }
 
-        Ok(fork)
+        Ok(new_tip.to_string())
     }
 
     // ─────────────────────────────────────────
     // COLLECT CHAIN
     // ─────────────────────────────────────────
 
+    /// Collect the chain of block hashes from `tip` back toward `stop`
+    /// (exclusive of `stop`), following selected parents up to `max_depth` steps.
+    ///
+    /// # Truncation behavior
+    /// If `stop` is not reached within `max_depth` steps, the returned chain
+    /// is silently truncated -- it will contain only the blocks encountered
+    /// before the depth limit was hit. The chain may also be truncated if a
+    /// block has no selected parent (e.g., genesis). Callers that require a
+    /// complete path should verify that the last element's parent equals `stop`.
     #[inline(always)]
     fn collect_chain(
         tip:      &str,
