@@ -602,23 +602,40 @@ impl DaemonNode {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.ghostdag.add_block(dag_block)
             }));
-            if let Err(e) = result {
-                failed += 1;
-                let msg = e.downcast_ref::<String>()
-                    .map(|s| s.as_str())
-                    .or_else(|| e.downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown panic");
-                slog_warn!("daemon", "ghostdag_rebuild_block_failed",
-                    hash => block.header.hash,
-                    height => block.header.height,
-                    error => msg
-                );
-                if failed > max_failures {
-                    return Err(NodeError::Init(format!(
-                        "GHOSTDAG rebuild aborted: {} failures exceeds threshold {} (of {} blocks)",
-                        failed, max_failures, total
-                    )));
+            match result {
+                Err(e) => {
+                    failed += 1;
+                    let msg = e.downcast_ref::<String>()
+                        .map(|s| s.as_str())
+                        .or_else(|| e.downcast_ref::<&str>().copied())
+                        .unwrap_or("unknown panic");
+                    slog_warn!("daemon", "ghostdag_rebuild_block_panicked",
+                        hash => block.header.hash,
+                        height => block.header.height,
+                        error => msg
+                    );
+                    if failed > max_failures {
+                        return Err(NodeError::Init(format!(
+                            "GHOSTDAG rebuild aborted: {} failures exceeds threshold {} (of {} blocks)",
+                            failed, max_failures, total
+                        )));
+                    }
                 }
+                Ok(Err(e)) => {
+                    failed += 1;
+                    slog_warn!("daemon", "ghostdag_rebuild_block_failed",
+                        hash => block.header.hash,
+                        height => block.header.height,
+                        error => e.to_string()
+                    );
+                    if failed > max_failures {
+                        return Err(NodeError::Init(format!(
+                            "GHOSTDAG rebuild aborted: {} failures exceeds threshold {} (of {} blocks)",
+                            failed, max_failures, total
+                        )));
+                    }
+                }
+                Ok(Ok(_)) => {}
             }
         }
         if failed > 0 {

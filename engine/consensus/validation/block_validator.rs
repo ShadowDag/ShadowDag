@@ -820,6 +820,21 @@ impl BlockValidator {
             return BlockValidationResult::fail("genesis has parents");
         }
 
+        // Verify merkle root matches body
+        let computed_merkle = MerkleTree::build(
+            &block.body.transactions,
+            block.header.height,
+            &block.header.parents,
+        );
+        if computed_merkle != block.header.merkle_root {
+            return BlockValidationResult::fail("genesis merkle mismatch");
+        }
+
+        // Validate coinbase structure
+        if let Err(e) = Self::validate_coinbase(block) {
+            return BlockValidationResult::fail(&format!("genesis coinbase invalid: {}", e));
+        }
+
         let mut changes = Vec::with_capacity(block.body.transactions.len() * 2);
 
         for tx in &block.body.transactions {

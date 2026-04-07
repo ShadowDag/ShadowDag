@@ -334,7 +334,8 @@ impl FullNode {
             height: block.header.height,
             timestamp: block.header.timestamp,
         };
-        let _ghostdag_data = self.ghostdag.add_block(dag_block);
+        let _ghostdag_data = self.ghostdag.add_block(dag_block)
+            .map_err(|e| NodeError::BlockRejected(format!("GHOSTDAG failed: {}", e)))?;
 
         // ═══════════════════════════════════════════════════════════════
         // PHASE 3: RECOMPUTE VIRTUAL CHAIN (GHOSTDAG-ordered execution)
@@ -410,7 +411,8 @@ impl FullNode {
             height: block.header.height,
             timestamp: block.header.timestamp,
         };
-        let _ghostdag_data = self.ghostdag.add_block(dag_block);
+        let _ghostdag_data = self.ghostdag.add_block(dag_block)
+            .map_err(|e| NodeError::BlockRejected(format!("GHOSTDAG failed: {}", e)))?;
 
         if let Err(e) = self.recompute_virtual_chain() {
             // Best-effort cleanup: DAG/GHOSTDAG don't support remove, but
@@ -947,7 +949,8 @@ impl FullNode {
             height: block.header.height,
             timestamp: block.header.timestamp,
         };
-        let _ghostdag_data = self.ghostdag.add_block(dag_block);
+        let _ghostdag_data = self.ghostdag.add_block(dag_block)
+            .map_err(|e| NodeError::BlockRejected(format!("GHOSTDAG failed: {}", e)))?;
 
         // UTXO write + commitment ATOMICALLY (validation already passed in Phase 1)
         let _commitment = self.utxo_set.apply_block_write_with_commitment(

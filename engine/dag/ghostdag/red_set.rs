@@ -144,7 +144,7 @@ impl RedSetStore {
             crate::engine::dag::ghostdag::ghostdag::MAX_ANTICONE_WALK,
         );
 
-        let blue_set = ghostdag.get_blue_set(block_hash);
+        let blue_set = ghostdag.get_blue_set_diff(block_hash);
 
         let mut red_set = HashSet::with_capacity(past.len());
 

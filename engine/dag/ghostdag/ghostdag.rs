@@ -119,19 +119,19 @@ impl GhostDag {
 
     // ================= CORE =================
 
-    pub fn add_block(&self, block: DagBlock) -> GhostdagData {
+    pub fn add_block(&self, block: DagBlock) -> Result<GhostdagData, DagError> {
         let hash = block.hash.clone();
 
         if block.parents.is_empty() {
-            self.store_genesis(&hash, &block);
-            return GhostdagData {
+            self.store_genesis(&hash, &block)?;
+            return Ok(GhostdagData {
                 blue_score: 0,
                 blue_set: vec![hash.clone()],
                 red_set: vec![],
                 selected_parent: hash.clone(),
                 merge_set_blues: vec![hash.clone()],
                 merge_set_reds: vec![],
-            };
+            });
         }
 
         let selected_parent = self.select_parent(&block.parents);
@@ -163,7 +163,7 @@ impl GhostDag {
             tips.into_iter().collect()
         };
 
-        if let Err(e) = self.persist_block(
+        self.persist_block(
             &hash,
             &block,
             &selected_parent,
@@ -174,18 +174,16 @@ impl GhostDag {
             chain_height,
             order_index,
             Some(&new_tips),
-        ) {
-            slog_info!("ghostdag", "persist_block_failed", hash => &hash, error => e.to_string());
-        }
+        )?;
 
-        GhostdagData {
+        Ok(GhostdagData {
             blue_score,
             blue_set,
             red_set: merge_reds.clone(),
             selected_parent,
             merge_set_blues: merge_blues,
             merge_set_reds: merge_reds,
-        }
+        })
     }
 
     pub fn select_parent(&self, parents: &[String]) -> String {
@@ -250,7 +248,7 @@ impl GhostDag {
         let mut reds = Vec::new();
 
         // Use the full cumulative blue set, not just the diff stored for this block.
-        // get_blue_set() returns only the DIFF (new blues from that block).
+        // get_blue_set_diff() returns only the DIFF (new blues from that block).
         // We need the full set for correct anticone classification.
         let mut current_blues: HashSet<String> =
             self.reconstruct_full_blue_set(&[selected_parent.to_string()]);
@@ -420,11 +418,16 @@ impl GhostDag {
             .unwrap_or(0)
     }
 
-    pub fn get_blue_set(&self, hash: &str) -> Vec<String> {
+    pub fn get_blue_set_diff(&self, hash: &str) -> Vec<String> {
         self.db.get(format!("{}{}", PFX_BLUE_SET, hash))
             .ok().flatten()
             .and_then(|d| bincode::deserialize::<Vec<String>>(&d).ok())
             .unwrap_or_default()
+    }
+
+    pub fn get_full_blue_set(&self, hash: &str) -> std::collections::HashSet<String> {
+        let parents = self.get_parents(hash);
+        self.reconstruct_full_blue_set(&parents)
     }
 
     pub fn get_parents(&self, hash: &str) -> Vec<String> {
@@ -497,15 +500,14 @@ impl GhostDag {
         Ok(())
     }
 
-    fn store_genesis(&self, hash: &str, block: &DagBlock) {
-        if let Err(e) = self.persist_block(hash, block, hash, &[hash.to_string()], &[], &[], 0, 0, 0, Some(&[hash.to_string()])) {
-            slog_info!("ghostdag", "store_genesis_failed", hash => hash, error => e.to_string());
-        }
+    fn store_genesis(&self, hash: &str, block: &DagBlock) -> Result<(), DagError> {
+        self.persist_block(hash, block, hash, &[hash.to_string()], &[], &[], 0, 0, 0, Some(&[hash.to_string()]))?;
 
         // Genesis gets order_index=0; advance counter to 1 so the next block
         // gets order_index=1 (preventing duplicate index=0).
         self.order_counter.store(1, Ordering::SeqCst);
         let _ = self.db.put(META_ORDER_COUNTER, 1u64.to_le_bytes());
+        Ok(())
     }
 
     // ================= ADDED METHODS =================
@@ -554,7 +556,7 @@ impl GhostDag {
         const MAX_WALK: usize = 10_000;
 
         loop {
-            let diff = self.get_blue_set(&current);
+            let diff = self.get_blue_set_diff(&current);
             if diff.is_empty() && depth > 0 {
                 break;
             }
@@ -732,7 +734,7 @@ mod tests {
         let dag = make_ghostdag("sp_roundtrip");
 
         // Add genesis first so it exists in storage.
-        dag.add_block(genesis_block());
+        dag.add_block(genesis_block()).unwrap();
 
         // Add a child referencing genesis as its parent.
         let child = DagBlock {
@@ -741,7 +743,7 @@ mod tests {
             height: 1,
             timestamp: 1,
         };
-        let data = dag.add_block(child);
+        let data = dag.add_block(child).unwrap();
 
         // The selected parent should be genesis (only parent).
         assert_eq!(data.selected_parent, "genesis");
@@ -762,7 +764,7 @@ mod tests {
     #[test]
     fn test_add_genesis_block() {
         let dag = make_ghostdag("genesis");
-        let data = dag.add_block(genesis_block());
+        let data = dag.add_block(genesis_block()).unwrap();
 
         assert_eq!(data.blue_score, 0);
         assert_eq!(data.selected_parent, "genesis");
@@ -780,7 +782,7 @@ mod tests {
     #[test]
     fn test_linear_chain_blue_scores_increment() {
         let dag = make_ghostdag("linear_chain");
-        dag.add_block(genesis_block());
+        dag.add_block(genesis_block()).unwrap();
 
         // Build a linear chain of 5 blocks.
         for i in 1..=5u64 {
@@ -795,7 +797,7 @@ mod tests {
                 height: i,
                 timestamp: i,
             };
-            dag.add_block(block);
+            dag.add_block(block).unwrap();
         }
 
         // In a linear chain, blue scores should be monotonically increasing.
@@ -823,7 +825,7 @@ mod tests {
     #[test]
     fn test_fork_creates_two_tips() {
         let dag = make_ghostdag("fork");
-        dag.add_block(genesis_block());
+        dag.add_block(genesis_block()).unwrap();
 
         let left = DagBlock {
             hash: "left".to_string(),
@@ -837,8 +839,8 @@ mod tests {
             height: 1,
             timestamp: 2,
         };
-        dag.add_block(left);
-        dag.add_block(right);
+        dag.add_block(left).unwrap();
+        dag.add_block(right).unwrap();
 
         let tips = dag.get_tips();
         assert_eq!(tips.len(), 2);
@@ -851,20 +853,20 @@ mod tests {
     #[test]
     fn test_merge_block_reduces_tips() {
         let dag = make_ghostdag("merge");
-        dag.add_block(genesis_block());
+        dag.add_block(genesis_block()).unwrap();
 
         dag.add_block(DagBlock {
             hash: "left".to_string(),
             parents: vec!["genesis".to_string()],
             height: 1,
             timestamp: 1,
-        });
+        }).unwrap();
         dag.add_block(DagBlock {
             hash: "right".to_string(),
             parents: vec!["genesis".to_string()],
             height: 1,
             timestamp: 2,
-        });
+        }).unwrap();
 
         // Merge both branches.
         let merge = DagBlock {
@@ -873,7 +875,7 @@ mod tests {
             height: 2,
             timestamp: 3,
         };
-        let data = dag.add_block(merge);
+        let data = dag.add_block(merge).unwrap();
 
         // Blue score should be > 0 after merge.
         assert!(data.blue_score > 0);
@@ -889,14 +891,14 @@ mod tests {
     #[test]
     fn test_get_parents_after_add_block() {
         let dag = make_ghostdag("parents");
-        dag.add_block(genesis_block());
+        dag.add_block(genesis_block()).unwrap();
 
         dag.add_block(DagBlock {
             hash: "child".to_string(),
             parents: vec!["genesis".to_string()],
             height: 1,
             timestamp: 1,
-        });
+        }).unwrap();
 
         let parents = dag.get_parents("child");
         assert_eq!(parents, vec!["genesis".to_string()]);
@@ -908,7 +910,7 @@ mod tests {
     #[test]
     fn test_clear_all_resets_state() {
         let dag = make_ghostdag("clear_all");
-        dag.add_block(genesis_block());
+        dag.add_block(genesis_block()).unwrap();
         dag.store_blue_score("extra", 42);
 
         // Verify data exists before clear.
@@ -927,14 +929,14 @@ mod tests {
     #[test]
     fn test_get_stats_on_linear_chain() {
         let dag = make_ghostdag("stats");
-        dag.add_block(genesis_block());
+        dag.add_block(genesis_block()).unwrap();
 
         dag.add_block(DagBlock {
             hash: "b1".to_string(),
             parents: vec!["genesis".to_string()],
             height: 1,
             timestamp: 1,
-        });
+        }).unwrap();
 
         let stats = dag.get_stats();
         assert_eq!(stats.tip_count, 1);
