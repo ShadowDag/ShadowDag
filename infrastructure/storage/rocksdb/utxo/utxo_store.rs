@@ -4,6 +4,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use rocksdb::{DB, IteratorMode, Options, WriteBatch};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::domain::transaction::transaction::Transaction;
@@ -136,9 +137,15 @@ impl UtxoStore {
 
     pub fn apply_transaction(&self, tx: &Transaction) -> Result<(), StorageError> {
         let mut batch = WriteBatch::default();
+        let mut spent_in_tx: HashSet<Vec<u8>> = HashSet::new();
 
         for input in &tx.inputs {
             let key = utxo_key(&input.txid, input.index)?;
+
+            // Detect duplicate inputs within the same transaction
+            if !spent_in_tx.insert(key.as_bytes().to_vec()) {
+                return Err(StorageError::WriteFailed("duplicate input in transaction".to_string()));
+            }
             let mut utxo = self.get_utxo(&key)?
                 .ok_or_else(|| StorageError::KeyNotFound(format!("input utxo {}", key)))?;
 

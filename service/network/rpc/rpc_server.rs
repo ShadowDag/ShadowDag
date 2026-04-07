@@ -235,6 +235,7 @@ impl RpcState {
         // Persistent admin password: stored in RocksDB under "rpc:admin_password"
         // First run: generate + store. Subsequent runs: load from DB.
         // NOTE: no data_dir available here — falls back to cwd for password file.
+        slog_warn!("rpc", "rpc_new_without_data_dir", note => "admin password will use cwd — prefer new_for_network with explicit data_dir");
         let admin_password = Self::load_or_create_admin_password(&db, None);
         let block_store = BlockStore::new(db.clone())
             .map_err(NetworkError::Storage)?;
@@ -540,10 +541,13 @@ impl RpcServer {
 
                 // AUTH CHECK: write methods require valid Bearer token
                 // verified via RpcAuthManager. Read-only methods are open.
-                // EXCEPTION: localhost (127.0.0.1) is trusted for submitblock
-                // so the local miner can submit without auth overhead.
+                // EXCEPTION: localhost (127.0.0.1) MAY be trusted for submitblock
+                // but ONLY when SHADOWDAG_RPC_LOCAL_NOAUTH=1|true is set.
+                let allow_local_noauth = std::env::var("SHADOWDAG_RPC_LOCAL_NOAUTH")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
                 let is_localhost = peer_ip.is_some_and(|ip| ip.is_loopback());
-                if requires_auth(&req.method) && !(is_localhost && req.method == "submitblock") {
+                if requires_auth(&req.method) && !(allow_local_noauth && is_localhost && req.method == "submitblock") {
                     match &auth_token {
                         Some(token) => {
                             let mut s = state.lock().map_err(|_| NetworkError::Other("State lock error".to_string()))?;

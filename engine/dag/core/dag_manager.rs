@@ -182,7 +182,8 @@ impl DagManager {
                 return Err(DagError::OrphanBlock(hash.to_string(), p.to_string()));
             }
 
-            if self.would_create_cycle(hash, p) {
+            // Conservative: if walk limit exceeded, treat as cycle (reject block)
+            if self.would_create_cycle(hash, p).unwrap_or(true) {
                 return Err(DagError::Other(format!("cycle detected via {}", p)));
             }
         }
@@ -269,8 +270,9 @@ impl DagManager {
         tips.iter().min().cloned()
     }
 
-    // BFS cycle detection
-    fn would_create_cycle(&self, target: &str, start: &str) -> bool {
+    // BFS cycle detection — returns Err when walk limit is exceeded
+    // (conservative: callers should treat Err as "assume cycle")
+    fn would_create_cycle(&self, target: &str, start: &str) -> Result<bool, DagError> {
         let mut visited: HashSet<String> = HashSet::with_capacity(64);
         let mut queue: VecDeque<String> = VecDeque::with_capacity(64);
         let mut cache: HashMap<String, Vec<String>> = HashMap::new();
@@ -282,12 +284,14 @@ impl DagManager {
         while let Some(current) = queue.pop_front() {
 
             if walked >= MAX_ANCESTOR_WALK {
-                break;
+                return Err(DagError::Other(format!(
+                    "cycle detection walk limit {} exceeded", MAX_ANCESTOR_WALK
+                )));
             }
             walked += 1;
 
             if current == target {
-                return true;
+                return Ok(true);
             }
 
             if !cache.contains_key(&current) {
@@ -304,7 +308,7 @@ impl DagManager {
             }
         }
 
-        false
+        Ok(false)
     }
 
     // DAG SIZE
