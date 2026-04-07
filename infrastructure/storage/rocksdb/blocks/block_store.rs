@@ -352,6 +352,33 @@ impl BlockStore {
         pruned
     }
 
+    /// Delete a block from the store (block data, height index, and h2h index).
+    /// Used for cleanup when DAG insertion fails after a successful save.
+    pub fn delete_block(&self, hash: &str) -> bool {
+        let block_key = format!("{}{}", BLK_PREFIX, hash);
+        // Try to get the block first so we can remove height index too
+        let height = self.get_block(hash).map(|b| b.header.height);
+
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete(block_key.as_bytes());
+
+        if let Some(h) = height {
+            let height_key = format!("{}height:{}:{}", BLK_PREFIX, h, hash);
+            batch.delete(height_key.as_bytes());
+        }
+
+        let h2h_key = format!("{}h2h:{}", BLK_PREFIX, hash);
+        batch.delete(h2h_key.as_bytes());
+
+        match self.db.write(batch) {
+            Ok(_) => true,
+            Err(e) => {
+                slog_error!("storage", "delete_block_failed", hash => hash, error => e);
+                false
+            }
+        }
+    }
+
     /// Check if a block body exists (not pruned).
     pub fn has_block_body(&self, hash: &str) -> bool {
         self.block_exists(hash)
