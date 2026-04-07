@@ -8,7 +8,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering}
 };
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use serde::{Serialize, Deserialize};
 use dashmap::DashMap;
 
@@ -187,11 +187,24 @@ impl GhostDag {
     }
 
     pub fn select_parent(&self, parents: &[String]) -> String {
+        // Pre-fetch blue scores and chain heights for consistent ordering during sort.
+        // Without this, concurrent DB writes could produce inconsistent reads across
+        // multiple get_blue_score/get_chain_height calls within the sort closure.
+        let scores: HashMap<&String, u64> = parents.iter()
+            .map(|p| (p, self.get_blue_score(p)))
+            .collect();
+        let heights: HashMap<&String, u64> = parents.iter()
+            .map(|p| (p, self.get_chain_height(p)))
+            .collect();
+
         parents.iter()
             .max_by(|a, b| {
-                self.get_blue_score(a)
-                    .cmp(&self.get_blue_score(b))
-                    .then_with(|| self.get_chain_height(a).cmp(&self.get_chain_height(b)))
+                scores.get(a).copied().unwrap_or(0)
+                    .cmp(&scores.get(b).copied().unwrap_or(0))
+                    .then_with(|| {
+                        heights.get(a).copied().unwrap_or(0)
+                            .cmp(&heights.get(b).copied().unwrap_or(0))
+                    })
                     .then(a.cmp(b))
             })
             .cloned()

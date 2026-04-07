@@ -13,10 +13,22 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::errors::{DagError, StorageError};
+use crate::slog_error;
 
 // prefix
 const VALIDATION_PREFIX: &[u8] = b"val:";
 
+/// Persistent key-value store for validation results.
+///
+/// NOTE: This is a **storage wrapper**, not a block validator. It does not
+/// perform structural checks such as parent existence or ordering.
+///
+/// Parent existence is enforced in `DagManager::add_block_validated()`
+/// (`engine/dag/core/dag_manager.rs`) which rejects blocks whose parents
+/// are not already in the DAG (`if !self.block_exists(p)`).
+///
+/// Parent ordering (strict ascending lexicographic) is likewise enforced
+/// in `DagManager::add_block_validated()`.
 pub struct DagValidatorStore {
     db: Arc<DB>,
     write_opts: WriteOptions,
@@ -118,7 +130,9 @@ impl DagValidatorStore {
         let mut buf = Vec::with_capacity(VALIDATION_PREFIX.len() + key.len());
         Self::build_key_into(&mut buf, key);
 
-        let _ = self.db.put_opt(&buf, value.as_bytes(), &self.write_opts);
+        if let Err(e) = self.db.put_opt(&buf, value.as_bytes(), &self.write_opts) {
+            slog_error!("dag_validator", "store_validation_failed", error => e);
+        }
     }
 
     // ─────────────────────────────────────────
@@ -133,7 +147,9 @@ impl DagValidatorStore {
             batch.put(&key_buf, value.as_bytes());
         }
 
-        let _ = self.db.write_opt(batch, &self.write_opts);
+        if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
+            slog_error!("dag_validator", "store_batch_failed", error => e);
+        }
     }
 
     // ─────────────────────────────────────────
