@@ -625,8 +625,8 @@ impl Mempool {
                 batch.delete(inp_key.as_bytes());
             }
 
-            // Clean up sender index
-            if let Some(sender) = Self::tx_sender(&tx) {
+            // Clean up sender index for ALL owners (not just the first)
+            for sender in Self::tx_senders(&tx) {
                 let sender_key = format!("sender:{}:{}", sender, txid);
                 batch.delete(sender_key.as_bytes());
             }
