@@ -108,7 +108,7 @@ impl DagManager {
     ///
     /// If `validated == false`, performs full validation before inserting:
     ///   - PoW validation (hash matches difficulty target)
-    ///   - Timestamp not too far in the future (max 2 hours)
+    ///   - Timestamp not too far in the future (max 120 seconds)
     ///
     /// If `validated == true`, skips these checks (block already validated by consensus).
     pub fn add_block_validated(&self, block: &Block, validated: bool) -> Result<(), DagError> {
@@ -223,6 +223,7 @@ impl DagManager {
     /// Callers that need the full block should use BlockStore::get_block()
     /// directly. This method returns None because the DAG no longer stores
     /// serialized block data.
+    #[deprecated(note = "DAG stores topology only — use BlockStore::get_block()")]
     pub fn get_block(&self, _hash: &str) -> Option<Block> {
         // DAG no longer stores full block data — delegate to BlockStore.
         None

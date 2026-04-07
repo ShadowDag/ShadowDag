@@ -449,6 +449,7 @@ pub struct P2P {
 // panic on initialization failure (remote DoS via resource exhaustion).
 
 impl P2P {
+    #[deprecated(note = "Use P2P::new_with_config() — P2P::new() defaults to Mainnet which may be wrong")]
     pub fn new() -> Result<Self, crate::errors::NetworkError> {
         Self::new_with_config(&NodeConfig::for_network(NetworkMode::Mainnet))
     }

@@ -359,6 +359,8 @@ pub enum ProtocolErrorKind {
     IncompatibleVersion,
     /// BPS mismatch (different consensus rules).
     BpsMismatch,
+    /// Chain ID mismatch — peer is on a different chain.
+    ChainMismatch,
     /// Timestamp too far from local clock.
     TimestampDrift,
     /// Message field violates protocol limits (list too long, hash wrong size, etc.).
@@ -389,6 +391,7 @@ impl fmt::Display for ProtocolErrorKind {
             Self::PuzzleTimeout       => "PUZZLE_TIMEOUT",
             Self::IncompatibleVersion => "INCOMPAT_VER",
             Self::BpsMismatch         => "BPS_MISMATCH",
+            Self::ChainMismatch       => "CHAIN_MISMATCH",
             Self::TimestampDrift      => "TIMESTAMP_DRIFT",
             Self::FieldViolation      => "FIELD_VIOLATION",
             Self::DuplicateHandshake  => "DUP_HANDSHAKE",
@@ -661,7 +664,7 @@ impl VersionPayload {
         // Strict: chain_id == 0 (unset/legacy) is also rejected; peers must update.
         if self.chain_id != CHAIN_ID {
             return Err(ProtocolError::new(
-                ProtocolErrorKind::BpsMismatch,
+                ProtocolErrorKind::ChainMismatch,
                 format!("chain_id 0x{:08X} != expected 0x{:08X}", self.chain_id, CHAIN_ID),
                 100,
             ));
