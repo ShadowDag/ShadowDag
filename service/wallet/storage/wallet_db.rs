@@ -39,8 +39,9 @@ impl WalletDB {
     pub fn get_wallet(&self, address: &str) -> Result<Option<Wallet>, WalletError> {
         match self.db.get(address) {
             Ok(Some(data)) => {
-                let wallet = bincode::deserialize(&data)
+                let mut wallet: Wallet = bincode::deserialize(&data)
                     .map_err(|e| WalletError::Other(format!("deserialize failed: {}", e)))?;
+                wallet.force_locked_after_load();
                 Ok(Some(wallet))
             }
             Ok(None) => Ok(None),

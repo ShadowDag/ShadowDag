@@ -190,7 +190,10 @@ impl BlockStore {
             }
         }
 
-        blocks.sort_by_key(|b| b.header.height);
+        blocks.sort_by(|a, b| {
+            a.header.height.cmp(&b.header.height)
+                .then_with(|| a.header.hash.cmp(&b.header.hash))
+        });
         blocks
     }
 

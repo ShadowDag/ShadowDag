@@ -132,9 +132,14 @@ impl Wallet {
         Ok((mnemonic, enc))
     }
 
-    pub fn restore_from_seed(&mut self, seed: Vec<u8>) {
+    pub fn restore_from_seed(&mut self, seed: Vec<u8>) -> Result<(), WalletError> {
         self.session_key = Some(seed);
         self.locked = false;
+        // Create default account if empty (critical for usability after restore)
+        if self.state.accounts.is_empty() {
+            self.add_account(0, "Default")?;
+        }
+        Ok(())
     }
 
     pub fn unlock(&mut self, enc_seed: &EncryptedSeed, password: &str) -> Result<(), WalletError> {
@@ -150,6 +155,14 @@ impl Wallet {
     }
 
     pub fn is_locked(&self) -> bool { self.locked }
+
+    /// Force wallet into locked state after deserialization.
+    /// `session_key` is `#[serde(skip)]`, so after load the wallet appears
+    /// unlocked but has no key — this fixes that inconsistency.
+    pub fn force_locked_after_load(&mut self) {
+        self.session_key = None;
+        self.locked = true;
+    }
     pub fn address(&self) -> String {
         self.state.accounts
             .first()
@@ -214,7 +227,10 @@ impl Wallet {
         };
 
         if let Some(acc) = self.state.accounts.iter_mut().find(|a| a.index == account) {
-            acc.addresses.push(wa.clone());
+            // Dedup: don't add if an address with the same index and is_change already exists
+            if !acc.addresses.iter().any(|a| a.is_change && a.index == addr_index) {
+                acc.addresses.push(wa.clone());
+            }
         }
         Ok(wa)
     }
@@ -329,7 +345,13 @@ impl Wallet {
 
         let mut outputs = vec![TxOut { address: to_address.to_string(), amount }];
         if change > DUST_LIMIT {
-            let change_addr = self.derive_change_address(from_account, 1)
+            let next_idx = acc.addresses.iter()
+                .filter(|a| a.is_change)
+                .map(|a| a.index)
+                .max()
+                .map(|x| x + 1)
+                .unwrap_or(1);
+            let change_addr = self.derive_change_address(from_account, next_idx)
                 .map(|a| a.address)
                 .unwrap_or_else(|_| primary.to_string());
             outputs.push(TxOut { address: change_addr, amount: change });
@@ -355,7 +377,10 @@ impl Wallet {
             _          => "SD",
         };
         if !addr.starts_with(prefix) { return false; }
-        addr.len() >= 30 && addr.len() <= 80
+        let rest = &addr[prefix.len()..];
+        // Must have version char + 40 hex chars (minimum)
+        if rest.len() < 41 { return false; }
+        rest[1..].chars().all(|c| c.is_ascii_hexdigit())
     }
 }
 

@@ -288,7 +288,7 @@ impl UtxoStore {
 
     /// Prune spent UTXOs from the database to reclaim disk space.
     /// Only deletes UTXOs where `spent == true`. Returns count pruned.
-    pub fn prune_spent(&self) -> u64 {
+    pub fn prune_spent(&self) -> Result<u64, StorageError> {
         let mut batch = WriteBatch::default();
         let mut count = 0u64;
 
@@ -303,16 +303,16 @@ impl UtxoStore {
                     count += 1;
                     // Write in batches to limit memory
                     if count % 10_000 == 0 {
-                        let _ = self.db.write(batch);
+                        self.db.write(batch).map_err(StorageError::RocksDb)?;
                         batch = WriteBatch::default();
                     }
                 }
             }
         }
         if count % 10_000 != 0 {
-            let _ = self.db.write(batch);
+            self.db.write(batch).map_err(StorageError::RocksDb)?;
         }
-        count
+        Ok(count)
     }
 
     /// Compact the RocksDB to reclaim space after pruning
@@ -388,7 +388,7 @@ impl crate::domain::traits::utxo_backend::UtxoBackend for UtxoStore {
         self.db.write(batch).map_err(StorageError::from)
     }
 
-    fn prune_spent(&self) -> u64 {
+    fn prune_spent(&self) -> Result<u64, StorageError> {
         self.prune_spent()
     }
 
