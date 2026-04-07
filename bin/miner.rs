@@ -58,8 +58,11 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
     let network: NetworkMode = network_str.parse().map_err(|_| {
         NodeError::Init(format!("invalid --network '{}'. Use: mainnet, testnet, or regtest", network_str))
     })?;
+    let default_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let threads: usize = parse_flag(args, "--threads",
-        &num_cpus().to_string()).parse().unwrap_or(4).min(256).max(1);
+        &default_threads.to_string()).parse().unwrap_or(4).min(256).max(1);
 
     let rpc_port = match network {
         NetworkMode::Testnet => 19332,
@@ -522,6 +525,3 @@ fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
-fn num_cpus() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
-}
