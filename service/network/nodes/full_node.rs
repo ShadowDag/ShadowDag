@@ -351,7 +351,15 @@ impl FullNode {
         // This ensures that if Block B arrives before Block A, but
         // GHOSTDAG orders A before B, A's txs execute first.
         // ═══════════════════════════════════════════════════════════════
-        self.recompute_virtual_chain()?;
+        if let Err(e) = self.recompute_virtual_chain() {
+            // Best-effort cleanup: DAG/GHOSTDAG don't support remove, but
+            // we can at least remove the block from BlockStore to prevent
+            // the inconsistency from persisting across restarts.
+            let _ = self.block_store.delete_block(&block.header.hash);
+            slog_error!("node", "virtual_chain_recompute_failed_after_insert",
+                hash => &block.header.hash, error => &e.to_string());
+            return Err(e);
+        }
 
         self.process_orphans_of(&block.header.hash);
 
@@ -404,7 +412,15 @@ impl FullNode {
         };
         let _ghostdag_data = self.ghostdag.add_block(dag_block);
 
-        self.recompute_virtual_chain()?;
+        if let Err(e) = self.recompute_virtual_chain() {
+            // Best-effort cleanup: DAG/GHOSTDAG don't support remove, but
+            // we can at least remove the block from BlockStore to prevent
+            // the inconsistency from persisting across restarts.
+            let _ = self.block_store.delete_block(&block.header.hash);
+            slog_error!("node", "virtual_chain_recompute_failed_after_insert",
+                hash => &block.header.hash, error => &e.to_string());
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -529,6 +545,9 @@ impl FullNode {
         }
 
         // Apply blocks in GHOSTDAG order (new chain)
+        // Track successfully applied blocks so we can rollback on partial failure
+        let mut applied_new: Vec<String> = Vec::new();
+
         for block_hash in &new_chain {
             // Skip if already applied
             if self.utxo_set.get_commitment(block_hash).is_some() {
@@ -542,6 +561,8 @@ impl FullNode {
                     block_hash,
                 ) {
                     Ok((_applied, _skipped, applied_fees)) => {
+                        applied_new.push(block_hash.clone());
+
                         // POST-EXECUTION COINBASE VALIDATION
                         //
                         // Coinbase amounts can only be validated AFTER execution
@@ -550,7 +571,13 @@ impl FullNode {
                         use crate::config::consensus::emission_schedule::EmissionSchedule;
                         let expected_reward = EmissionSchedule::block_reward(block.header.height);
                         let expected_total = expected_reward.checked_add(applied_fees)
-                    .ok_or_else(|| NodeError::Consensus(ConsensusError::BlockValidation("reward + fees overflow".into())))?;
+                    .ok_or_else(|| {
+                        // Rollback partially-applied new chain
+                        for hash in applied_new.iter().rev() {
+                            let _ = self.utxo_set.rollback_block_undo(hash);
+                        }
+                        NodeError::Consensus(ConsensusError::BlockValidation("reward + fees overflow".into()))
+                    })?;
 
                         if let Some(cb) = block.body.transactions.first() {
                             if cb.is_coinbase() {
@@ -560,7 +587,10 @@ impl FullNode {
                                     Some(t) => t,
                                     None => {
                                         slog_error!("node", "coinbase_output_overflow", block => block_hash);
-                                        let _ = self.utxo_set.rollback_block_undo(block_hash);
+                                        // Rollback partially-applied new chain
+                                        for hash in applied_new.iter().rev() {
+                                            let _ = self.utxo_set.rollback_block_undo(hash);
+                                        }
                                         return Err(NodeError::BlockRejected(format!(
                                             "coinbase output overflow in {}", block_hash
                                         )));
@@ -568,8 +598,10 @@ impl FullNode {
                                 };
                                 if actual_total != expected_total {
                                     slog_error!("node", "coinbase_mismatch", block => block_hash, actual => &actual_total.to_string(), expected => &expected_total.to_string());
-                                    // Rollback this block's UTXO changes
-                                    let _ = self.utxo_set.rollback_block_undo(block_hash);
+                                    // Rollback partially-applied new chain
+                                    for hash in applied_new.iter().rev() {
+                                        let _ = self.utxo_set.rollback_block_undo(hash);
+                                    }
                                     return Err(NodeError::BlockRejected(format!(
                                         "coinbase mismatch in {}: actual={}, expected={}",
                                         block_hash, actual_total, expected_total
@@ -579,11 +611,23 @@ impl FullNode {
                         }
                     }
                     Err(e) => {
+                        // Rollback partially-applied new chain
+                        for hash in applied_new.iter().rev() {
+                            let _ = self.utxo_set.rollback_block_undo(hash);
+                        }
                         return Err(NodeError::BlockRejected(format!(
                             "apply_block_dag_ordered failed for {}: {}", block_hash, e
                         )));
                     }
                 }
+            } else {
+                // Missing block in store — rollback partially-applied new chain
+                for hash in applied_new.iter().rev() {
+                    let _ = self.utxo_set.rollback_block_undo(hash);
+                }
+                return Err(NodeError::BlockRejected(format!(
+                    "block {} missing from store during virtual chain apply", block_hash
+                )));
             }
         }
 

@@ -645,16 +645,42 @@ impl DaemonNode {
         Ok(())
     }
 
-    /// Replay all blocks from height 0 to rebuild UTXO state.
+    /// Replay blocks along the selected-parent chain to rebuild UTXO state.
+    ///
+    /// Walks the selected-parent chain from best_tip back to genesis, reverses
+    /// the order, then replays in GHOSTDAG order using apply_block_dag_ordered().
+    /// This produces identical UTXO state to the live path (which also uses
+    /// GHOSTDAG ordering), unlike the previous height-sorted approach which
+    /// could diverge when parallel blocks exist at the same height.
     fn replay_blocks(&self) -> Result<(), NodeError> {
         slog_info!("daemon", "utxo_replay_start");
-        let blocks = self.block_store.get_all_blocks_sorted_by_height();
-        for block in &blocks {
-            self.utxo_set.apply_block_full(block, block.header.height)
-                .map_err(|e| NodeError::Init(format!("replay failed at height {}: {}",
-                    block.header.height, e)))?;
+
+        let best_tip = self.block_store.get_best_hash()
+            .ok_or_else(|| NodeError::Init("no best tip for replay".into()))?;
+
+        // Walk selected-parent chain from best_tip back to genesis
+        let mut chain = Vec::new();
+        let mut cursor = best_tip;
+        loop {
+            let block = self.block_store.get_block(&cursor)
+                .ok_or_else(|| NodeError::Init(format!("missing block {} during replay", cursor)))?;
+            let parent = block.header.selected_parent.clone();
+            chain.push(block);
+            match parent {
+                Some(p) => cursor = p,
+                None => break, // Genesis reached
+            }
         }
-        slog_info!("daemon", "utxo_replay_complete", blocks => blocks.len());
+        chain.reverse();
+
+        for block in &chain {
+            self.utxo_set.apply_block_dag_ordered(
+                &block.body.transactions, block.header.height, &block.header.hash
+            ).map_err(|e| NodeError::Init(format!("replay failed for {}: {}",
+                block.header.hash, e)))?;
+        }
+
+        slog_info!("daemon", "utxo_replay_complete", blocks => chain.len());
         Ok(())
     }
 

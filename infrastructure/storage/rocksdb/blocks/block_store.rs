@@ -133,18 +133,26 @@ impl BlockStore {
         let prefix = BLK_PREFIX.as_bytes();
         let iter = self.db.prefix_iterator(prefix);
         for item in iter {
-            if blocks.len() >= limit { break; }
             if let Ok((k, v)) = item {
                 let key_str = String::from_utf8(k.to_vec()).unwrap_or_default();
-                // Skip metadata keys (best_hash, height index)
+                // Skip metadata keys (best_hash, height index, h2h index, utxo_commit)
                 if !key_str.starts_with(BLK_PREFIX) { break; }
                 if key_str == "blk:best_hash" { continue; }
                 if key_str.contains(":height:") { continue; }
+                if key_str.contains(":h2h:") { continue; }
+                if key_str.contains(":utxo_commit:") { continue; }
                 if let Ok(block) = bincode::deserialize::<Block>(&v) {
                     blocks.push(block);
                 }
             }
         }
+        // Sort by height descending (most recent first), with hash tiebreaker
+        // for deterministic ordering among blocks at the same height.
+        blocks.sort_by(|a, b| {
+            b.header.height.cmp(&a.header.height)
+                .then_with(|| a.header.hash.cmp(&b.header.hash))
+        });
+        blocks.truncate(limit);
         blocks
     }
 
