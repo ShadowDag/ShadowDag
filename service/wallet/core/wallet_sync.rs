@@ -8,7 +8,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::service::wallet::storage::wallet_db::WalletDB;
-use crate::{slog_info, slog_warn};
+use crate::service::wallet::core::wallet::Wallet;
+use crate::errors::WalletError;
 
 pub struct WalletSync {
     db:               WalletDB,
@@ -23,18 +24,19 @@ impl WalletSync {
         }
     }
 
-    /// Sync wallet state for a given address by loading from DB
-    pub fn sync_wallet(&self, address: &str) {
-        let wallet_data = self.db.get_wallet(address);
-
-        match wallet_data {
-            Some(wallet) => {
-                slog_info!("wallet", "wallet_synced", address => wallet.address());
-            }
-            None => {
-                slog_warn!("wallet", "wallet_not_found", address => address);
-            }
-        }
+    /// Load wallet state from the LOCAL database.
+    ///
+    /// NOTE: This does NOT perform network synchronization (block scanning,
+    /// UTXO matching, confirmation tracking). It only retrieves the locally
+    /// cached wallet state. Full chain sync requires the node's UTXO set
+    /// and block processing pipeline.
+    ///
+    /// TODO: Implement real wallet sync with:
+    /// - Block scanning for relevant transactions
+    /// - UTXO set querying for balance calculation
+    /// - Confirmation depth tracking
+    pub fn sync_wallet(&self, address: &str) -> Result<Option<Wallet>, WalletError> {
+        self.db.get_wallet(address)
     }
 
     /// Update the last synced block height

@@ -4,26 +4,23 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::service::wallet::keys::key_manager::KeyManager;
+use crate::errors::WalletError;
 
 pub struct HDWallet {
     key_manager: KeyManager,
-
+    password: String,
 }
 
 impl HDWallet {
-    pub fn new(key_manager: KeyManager) -> Self {
-        Self { key_manager }
-
+    pub fn new(key_manager: KeyManager, password: String) -> Self {
+        Self { key_manager, password }
     }
 
-    #[allow(deprecated)]
-    pub fn save_key(&self, id: &str, key: &str) {
-        self.key_manager.store_key(id, key);
+    pub fn save_key(&self, id: &str, key: &str) -> Result<(), WalletError> {
+        self.key_manager.store_key_encrypted(id, key.to_string(), &self.password)
     }
 
-    #[allow(deprecated)]
-    pub fn load_key(&self, id: &str) -> Option<String> {
-        self.key_manager.get_key(id)
+    pub fn load_key(&self, id: &str) -> Result<String, WalletError> {
+        self.key_manager.get_key_decrypted(id, &self.password)
     }
-
 }

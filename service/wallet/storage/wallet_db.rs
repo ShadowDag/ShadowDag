@@ -8,11 +8,10 @@ use std::path::Path;
 use bincode;
 
 use crate::service::wallet::core::wallet::Wallet;
-use crate::slog_error;
+use crate::errors::WalletError;
 
 pub struct WalletDB {
     db: DB,
-
 }
 
 impl WalletDB {
@@ -27,30 +26,25 @@ impl WalletDB {
             })?;
 
         Ok(Self { db })
-
     }
 
-    pub fn save_wallet(&self, wallet: &Wallet) {
-        let data = bincode::serialize(wallet).unwrap_or_default();
-
-        if let Err(_e) = self.db.put(wallet.address(), data) { slog_error!("wallet", "db_put_error", error => &_e.to_string()); }
-
+    pub fn save_wallet(&self, wallet: &Wallet) -> Result<(), WalletError> {
+        let data = bincode::serialize(wallet)
+            .map_err(|e| WalletError::Other(format!("serialize failed: {}", e)))?;
+        self.db.put(wallet.address(), data)
+            .map_err(|e| WalletError::Other(format!("db put failed: {}", e)))?;
+        Ok(())
     }
 
-    pub fn get_wallet(&self, address: &str) -> Option<Wallet> {
-        match self.db.get(address).unwrap_or(None) {
-            Some(data) => {
-                let wallet: Wallet =
-                    bincode::deserialize(&data).ok()?;
-
-                Some(wallet)
-
+    pub fn get_wallet(&self, address: &str) -> Result<Option<Wallet>, WalletError> {
+        match self.db.get(address) {
+            Ok(Some(data)) => {
+                let wallet = bincode::deserialize(&data)
+                    .map_err(|e| WalletError::Other(format!("deserialize failed: {}", e)))?;
+                Ok(Some(wallet))
             }
-
-            None => None
-
+            Ok(None) => Ok(None),
+            Err(e) => Err(WalletError::Other(format!("db read failed: {}", e))),
         }
-
     }
-
 }

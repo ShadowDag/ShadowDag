@@ -42,7 +42,7 @@ pub struct MultisigConfig {
 
 impl MultisigConfig {
     /// Create a new M-of-N multisig configuration
-    pub fn new(threshold: usize, public_keys: Vec<String>) -> Result<Self, WalletError> {
+    pub fn new(threshold: usize, public_keys: Vec<String>, network: &str) -> Result<Self, WalletError> {
         let total = public_keys.len();
 
         if threshold == 0 {
@@ -64,7 +64,7 @@ impl MultisigConfig {
             return Err(WalletError::Other("Duplicate public keys detected".to_string()));
         }
 
-        let address = Self::compute_address(threshold, &sorted_keys);
+        let address = Self::compute_address(threshold, &sorted_keys, network);
 
         Ok(Self {
             threshold,
@@ -75,16 +75,22 @@ impl MultisigConfig {
     }
 
     /// Generate deterministic multisig address
-    fn compute_address(threshold: usize, sorted_keys: &[String]) -> String {
+    fn compute_address(threshold: usize, sorted_keys: &[String], network: &str) -> String {
         let mut h = Sha256::new();
-        h.update(b"ShadowDAG_MultiSig_v1");
+        h.update(b"ShadowDAG_MultiSig_v2"); // v2 includes network
+        h.update(network.as_bytes()); // Network separation
         h.update((threshold as u32).to_le_bytes());
         h.update((sorted_keys.len() as u32).to_le_bytes());
         for key in sorted_keys {
             h.update(key.as_bytes());
         }
         let hash = h.finalize();
-        format!("SD1m{}", hex::encode(&hash[..20]))
+        let prefix = match network {
+            "testnet" => "ST1m",
+            "regtest" => "SR1m",
+            _ => "SD1m", // mainnet default
+        };
+        format!("{}{}", prefix, hex::encode(&hash[..20]))
     }
 
     /// Check if a public key is a signer
@@ -294,7 +300,7 @@ mod tests {
 
     #[test]
     fn create_2_of_3() {
-        let config = MultisigConfig::new(2, make_keys(3)).unwrap();
+        let config = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap();
         assert_eq!(config.threshold, 2);
         assert_eq!(config.total, 3);
         assert!(config.address.starts_with("SD1m"));
@@ -303,18 +309,18 @@ mod tests {
 
     #[test]
     fn threshold_exceeds_total_fails() {
-        assert!(MultisigConfig::new(4, make_keys(3)).is_err());
+        assert!(MultisigConfig::new(4, make_keys(3), "mainnet").is_err());
     }
 
     #[test]
     fn duplicate_keys_fail() {
         let keys = vec!["same".into(), "same".into(), "other".into()];
-        assert!(MultisigConfig::new(2, keys).is_err());
+        assert!(MultisigConfig::new(2, keys, "mainnet").is_err());
     }
 
     #[test]
     fn add_signatures_until_complete() {
-        let config = MultisigConfig::new(2, make_keys(3)).unwrap();
+        let config = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap();
         let mut pending = PendingMultisig::new("tx1".into(), config, vec![]);
 
         assert!(!pending.is_complete());
@@ -330,7 +336,7 @@ mod tests {
 
     #[test]
     fn duplicate_signature_rejected() {
-        let config = MultisigConfig::new(2, make_keys(3)).unwrap();
+        let config = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap();
         let mut pending = PendingMultisig::new("tx1".into(), config, vec![]);
         pending.add_signature("pubkey_00", "sig_0").unwrap();
         assert!(pending.add_signature("pubkey_00", "sig_again").is_err());
@@ -338,14 +344,14 @@ mod tests {
 
     #[test]
     fn unauthorized_signer_rejected() {
-        let config = MultisigConfig::new(2, make_keys(3)).unwrap();
+        let config = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap();
         let mut pending = PendingMultisig::new("tx1".into(), config, vec![]);
         assert!(pending.add_signature("unknown_key", "sig").is_err());
     }
 
     #[test]
     fn pending_signers_tracked() {
-        let config = MultisigConfig::new(2, make_keys(3)).unwrap();
+        let config = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap();
         let mut pending = PendingMultisig::new("tx1".into(), config, vec![]);
         pending.add_signature("pubkey_00", "sig_0").unwrap();
 
@@ -357,7 +363,7 @@ mod tests {
     #[test]
     fn manager_full_flow() {
         let mut mgr = MultisigManager::new();
-        let config = MultisigConfig::new(2, make_keys(3)).unwrap();
+        let config = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap();
         let addr = mgr.register(config);
 
         mgr.initiate("tx1".into(), &addr, vec![1, 2, 3]).unwrap();
@@ -370,15 +376,15 @@ mod tests {
 
     #[test]
     fn address_is_deterministic() {
-        let a1 = MultisigConfig::new(2, make_keys(3)).unwrap().address;
-        let a2 = MultisigConfig::new(2, make_keys(3)).unwrap().address;
+        let a1 = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap().address;
+        let a2 = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap().address;
         assert_eq!(a1, a2);
     }
 
     #[test]
     fn different_threshold_different_address() {
-        let a2 = MultisigConfig::new(2, make_keys(3)).unwrap().address;
-        let a3 = MultisigConfig::new(3, make_keys(3)).unwrap().address;
+        let a2 = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap().address;
+        let a3 = MultisigConfig::new(3, make_keys(3), "mainnet").unwrap().address;
         assert_ne!(a2, a3);
     }
 }

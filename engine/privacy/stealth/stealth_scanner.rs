@@ -157,11 +157,20 @@ impl StealthScanner {
             .collect()
     }
 
-    /// Scan multiple blocks (e.g., during initial sync).
+    /// Scan blocks for stealth transactions belonging to this wallet.
+    /// Uses batched processing to limit memory growth during initial sync.
     pub fn scan_blocks(&self, blocks: &[Block]) -> Vec<ScanResult> {
-        blocks.iter()
-            .flat_map(|block| self.scan_block(block))
-            .collect()
+        const SCAN_BATCH_SIZE: usize = 100;
+        let mut all_results = Vec::new();
+
+        for chunk in blocks.chunks(SCAN_BATCH_SIZE) {
+            let batch_results: Vec<ScanResult> = chunk.iter()
+                .flat_map(|block| self.scan_block(block))
+                .collect();
+            all_results.extend(batch_results);
+        }
+
+        all_results
     }
 
     /// Scan a list of transactions.

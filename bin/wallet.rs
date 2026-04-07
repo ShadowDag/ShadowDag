@@ -165,18 +165,22 @@ fn load_and_unlock_wallet() -> Result<Wallet, WalletError> {
     let addr = temp.address();
 
     // Try to load persisted wallet state (UTXOs, history, etc.)
-    let result = if let Some(mut persisted) = db.get_wallet(&addr) {
-        if let Err(e) = persisted.unlock(&enc_seed, &password) {
-            // Rate limit after failed password attempt
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            zeroize_password(password);
-            return Err(e);
+    let result = match db.get_wallet(&addr) {
+        Ok(Some(mut persisted)) => {
+            if let Err(e) = persisted.unlock(&enc_seed, &password) {
+                // Rate limit after failed password attempt
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                zeroize_password(password);
+                return Err(e);
+            }
+            Ok(persisted)
         }
-        Ok(persisted)
-    } else {
-        // First time loading -- just save and return
-        db.save_wallet(&temp);
-        Ok(temp)
+        Ok(None) => {
+            // First time loading -- just save and return
+            db.save_wallet(&temp)?;
+            Ok(temp)
+        }
+        Err(e) => Err(e),
     };
 
     // Zeroize password from memory after use
@@ -263,7 +267,15 @@ fn cmd_new(args: &[String]) {
             return;
         }
     };
-    db.save_wallet(&wallet);
+    if let Err(e) = db.save_wallet(&wallet) {
+        slog_error!("wallet", "wallet_save_failed", error => &e.to_string());
+        println!();
+        println!("  WARNING: Failed to persist wallet: {}", e);
+        println!("  Mnemonic (WRITE THIS DOWN — wallet NOT saved):");
+        println!("  {}", mnemonic.join(" "));
+        println!();
+        return;
+    }
 
     let address = wallet.address();
     let acc = wallet.accounts().first();
