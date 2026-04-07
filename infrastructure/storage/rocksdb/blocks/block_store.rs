@@ -36,6 +36,10 @@ impl BlockStore {
     pub fn save_block(&self, block: &Block) -> bool {
         let hash = &block.header.hash;
         let block_key = format!("{}{}", BLK_PREFIX, hash);
+        // Check if block already exists — don't overwrite
+        if self.db.get_pinned(block_key.as_bytes()).ok().flatten().is_some() {
+            return false; // Already exists — don't overwrite
+        }
         match bincode::serialize(block) {
             Ok(data) => {
                 let mut batch = rocksdb::WriteBatch::default();

@@ -108,17 +108,11 @@ fn run(args: &[String]) -> Result<(), BootError> {
         ))
     })?;
     let rpc_port: Option<u16> = match parse_flag_opt(args, "--rpc-port") {
-        Some(s) => Some(s.parse().unwrap_or_else(|_| {
-            eprintln!("ERROR: Invalid --rpc-port value '{}' (must be 1-65535)", s);
-            std::process::exit(1);
-        })),
+        Some(s) => Some(parse_port(&s, "--rpc-port")?),
         None => None,
     };
     let p2p_port: Option<u16> = match parse_flag_opt(args, "--p2p-port") {
-        Some(s) => Some(s.parse().unwrap_or_else(|_| {
-            eprintln!("ERROR: Invalid --p2p-port value '{}' (must be 1-65535)", s);
-            std::process::exit(1);
-        })),
+        Some(s) => Some(parse_port(&s, "--p2p-port")?),
         None => None,
     };
     let data_dir: Option<String> = parse_flag_opt(args, "--data-dir");
@@ -229,6 +223,15 @@ fn print_help() {
 
 fn parse_flag(args: &[String], name: &str, default: &str) -> String {
     parse_flag_opt(args, name).unwrap_or_else(|| default.to_string())
+}
+
+/// Parse a port string into u16, returning a proper BootError on failure.
+fn parse_port(s: &str, flag_name: &str) -> Result<u16, BootError> {
+    s.parse::<u16>().map_err(|_| {
+        BootError::InvalidArg(format!(
+            "{} value '{}' is not valid (must be 1-65535)", flag_name, s
+        ))
+    })
 }
 
 fn parse_flag_opt(args: &[String], name: &str) -> Option<String> {
