@@ -93,7 +93,7 @@ impl ShadowTransaction {
 
         let mut entropy = [0u8; 32];
         OsRng.fill_bytes(&mut entropy);
-        let decoy_hash = hex::encode(&entropy);
+        let decoy_hash = hex::encode(entropy);
 
         let tx = Transaction {
             hash: decoy_hash.clone(),

@@ -47,6 +47,7 @@ impl Level {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s.to_uppercase().as_str() {
             "TRACE" => Level::Trace,
@@ -226,12 +227,8 @@ pub fn emit(event: LogEvent) {
         LogFormat::Compact => event.to_compact(),
     };
 
-    // WARN and above go to stderr; INFO and below go to stdout.
-    if event.level >= Level::Warn {
-        eprintln!("{}", line);
-    } else {
-        eprintln!("{}", line);
-    }
+    // All log output goes to stderr (stdout reserved for structured data/RPC).
+    eprintln!("{}", line);
 }
 
 /// Log event counters (for metrics/diagnostics).

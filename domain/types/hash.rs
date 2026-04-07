@@ -68,7 +68,7 @@ pub fn validate_hex_strict(hex: &str, expected_chars: usize) -> Result<(), HexPa
         return Err(HexParseError::BadLength { expected: expected_chars, got: hex.len() });
     }
     for (i, b) in hex.bytes().enumerate() {
-        if !matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F') {
+        if !b.is_ascii_hexdigit() {
             return Err(HexParseError::InvalidChar { offset: i, byte: b });
         }
     }

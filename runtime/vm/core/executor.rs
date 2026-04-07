@@ -29,6 +29,7 @@ impl Executor {
     }
 
     /// Deploy a new contract. Returns the contract address.
+    #[allow(clippy::too_many_arguments)]
     pub fn deploy(
         &self,
         bytecode:  &[u8],

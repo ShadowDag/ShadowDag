@@ -30,6 +30,7 @@ pub enum SubscriptionType {
 }
 
 impl SubscriptionType {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "new_block" | "newBlock"           => Some(Self::NewBlock),

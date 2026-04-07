@@ -51,7 +51,7 @@ impl BlockStore {
                 // Hash-to-height reverse index: survives pruning so
                 // validate_parents_exist can check height without the full block.
                 let h2h_key = format!("{}h2h:{}", BLK_PREFIX, hash);
-                batch.put(h2h_key.as_bytes(), &block.header.height.to_le_bytes());
+                batch.put(h2h_key.as_bytes(), block.header.height.to_le_bytes());
                 match self.db.write(batch) {
                     Ok(_) => true,
                     Err(e) => {
@@ -132,18 +132,16 @@ impl BlockStore {
         let mut blocks: Vec<Block> = Vec::new();
         let prefix = BLK_PREFIX.as_bytes();
         let iter = self.db.prefix_iterator(prefix);
-        for item in iter {
-            if let Ok((k, v)) = item {
-                let key_str = String::from_utf8(k.to_vec()).unwrap_or_default();
-                // Skip metadata keys (best_hash, height index, h2h index, utxo_commit)
-                if !key_str.starts_with(BLK_PREFIX) { break; }
-                if key_str == "blk:best_hash" { continue; }
-                if key_str.contains(":height:") { continue; }
-                if key_str.contains(":h2h:") { continue; }
-                if key_str.contains(":utxo_commit:") { continue; }
-                if let Ok(block) = bincode::deserialize::<Block>(&v) {
-                    blocks.push(block);
-                }
+        for (k, v) in iter.flatten() {
+            let key_str = String::from_utf8(k.to_vec()).unwrap_or_default();
+            // Skip metadata keys (best_hash, height index, h2h index, utxo_commit)
+            if !key_str.starts_with(BLK_PREFIX) { break; }
+            if key_str == "blk:best_hash" { continue; }
+            if key_str.contains(":height:") { continue; }
+            if key_str.contains(":h2h:") { continue; }
+            if key_str.contains(":utxo_commit:") { continue; }
+            if let Ok(block) = bincode::deserialize::<Block>(&v) {
+                blocks.push(block);
             }
         }
         // Sort by height descending (most recent first), with hash tiebreaker
@@ -341,7 +339,7 @@ impl BlockStore {
                 pruned += 1;
 
                 // Write in batches of 1000 to limit memory
-                if pruned % 1000 == 0 {
+                if pruned.is_multiple_of(1000) {
                     if let Err(e) = self.db.write(batch) {
                         slog_error!("storage", "pruning_batch_write_failed", error => e);
                         return pruned;
@@ -352,7 +350,7 @@ impl BlockStore {
         }
 
         // Write remaining batch
-        if pruned % 1000 != 0 {
+        if !pruned.is_multiple_of(1000) {
             if let Err(e) = self.db.write(batch) {
                 slog_error!("storage", "final_pruning_batch_failed", error => e);
             }

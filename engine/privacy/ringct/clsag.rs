@@ -98,8 +98,8 @@ pub fn sign(
 
     // Generate random response scalars for every non-signer position.
     // We generate for ALL positions uniformly and overwrite the signer's later.
-    for i in 0..n {
-        s[i] = Scalar::random(&mut OsRng);
+    for item in s.iter_mut().take(n) {
+        *item = Scalar::random(&mut OsRng);
     }
 
     // Propagate challenges: always iterate exactly n-1 steps starting from

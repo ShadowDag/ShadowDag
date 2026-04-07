@@ -283,7 +283,7 @@ pub fn compute_contract_address(deployer: &str, bytecode: &[u8], timestamp: u64)
     hasher.update(b"ShadowDAG_Contract_v1");
     hasher.update(deployer.as_bytes());
     hasher.update(bytecode);
-    hasher.update(&timestamp.to_le_bytes());
+    hasher.update(timestamp.to_le_bytes());
     let hash = hasher.finalize();
     format!("SD1c{}", hex::encode(&hash[..20]))
 }

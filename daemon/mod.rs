@@ -557,7 +557,7 @@ impl DaemonNode {
         let blocks = self.block_store.get_all_blocks_sorted_by_height();
         let total = blocks.len() as u64;
         let mut failed = 0u64;
-        let max_failures = std::cmp::min(100, std::cmp::max(1, total / 10));
+        let max_failures = (total / 10).clamp(1, 100);
         for block in &blocks {
             // Use validated=true since these blocks were already accepted
             if let Err(e) = self.dag.add_block_validated(block, true) {
@@ -591,7 +591,7 @@ impl DaemonNode {
         let blocks = self.block_store.get_all_blocks_sorted_by_height();
         let total = blocks.len() as u64;
         let mut failed = 0u64;
-        let max_failures = std::cmp::min(100, std::cmp::max(1, total / 10));
+        let max_failures = (total / 10).clamp(1, 100);
         for block in &blocks {
             let dag_block = crate::engine::dag::ghostdag::ghostdag::DagBlock {
                 hash: block.header.hash.clone(),

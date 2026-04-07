@@ -60,7 +60,7 @@ impl MempoolManager {
             dandelion:      DandelionRelay::new(),
 
             event_bus: EventBus::new(db.clone())
-                .map_err(|e| MempoolError::Storage(e))?,
+                .map_err(MempoolError::Storage)?,
         })
     }
 

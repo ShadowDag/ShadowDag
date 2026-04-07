@@ -194,6 +194,7 @@ impl Peer {
         self.last_refill = now;
     }
 
+    #[allow(dead_code)]
     fn check_rate_limit(&mut self) -> bool {
         self.refill_tokens();
         self.tokens >= 1.0

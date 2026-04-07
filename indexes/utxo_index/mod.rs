@@ -167,10 +167,8 @@ impl UtxoIndex {
             if let Err(e) = self.db.put(&db_key, &val) {
                 slog_error!("index", "utxo_index_addr_set_put_error", error => &e.to_string());
             }
-        } else {
-            if let Err(e) = self.db.delete(&db_key) {
-                slog_error!("index", "utxo_index_addr_set_delete_error", error => &e.to_string());
-            }
+        } else if let Err(e) = self.db.delete(&db_key) {
+            slog_error!("index", "utxo_index_addr_set_delete_error", error => &e.to_string());
         }
     }
 

@@ -72,7 +72,7 @@ fn generate_layer_entropy(master_secret: &[u8], layer_index: usize) -> [u8; 32] 
     let mut h = Sha256::new();
     h.update(b"ShadowDAG_OnionLayer_v1");
     h.update(master_secret);
-    h.update(&(layer_index as u64).to_le_bytes());
+    h.update((layer_index as u64).to_le_bytes());
     h.finalize().into()
 }
 

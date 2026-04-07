@@ -56,6 +56,7 @@ pub fn shadow_hash_raw(
 
 /// Hash from raw header fields including extra_nonce.
 /// This is the canonical hash function — ALL validation must use this.
+#[allow(clippy::too_many_arguments)]
 pub fn shadow_hash_raw_full(
     version:      u32,
     height:       u64,

@@ -84,10 +84,7 @@ impl CudaMiner {
                 Some(n) => n,
                 None => break, // nonce space exhausted
             };
-            let end_nonce = match start_nonce.checked_add(batch_size) {
-                Some(n) => n,
-                None => u64::MAX,
-            };
+            let end_nonce = start_nonce.saturating_add(batch_size);
 
             let found: Option<u64> = (start_nonce..end_nonce)
                 .into_par_iter()

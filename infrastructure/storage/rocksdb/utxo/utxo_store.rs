@@ -302,14 +302,14 @@ impl UtxoStore {
                     batch.delete(&k);
                     count += 1;
                     // Write in batches to limit memory
-                    if count % 10_000 == 0 {
+                    if count.is_multiple_of(10_000) {
                         self.db.write(batch).map_err(StorageError::RocksDb)?;
                         batch = WriteBatch::default();
                     }
                 }
             }
         }
-        if count % 10_000 != 0 {
+        if !count.is_multiple_of(10_000) {
             self.db.write(batch).map_err(StorageError::RocksDb)?;
         }
         Ok(count)

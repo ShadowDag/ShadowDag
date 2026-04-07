@@ -56,14 +56,17 @@ use parking_lot::Mutex as PlMutex;
 use once_cell::sync::Lazy;
 
 /// (peer_id, transaction) — peer attribution for ban feedback on rejection.
+#[allow(clippy::type_complexity)]
 static PENDING_TXS: Lazy<Arc<PlMutex<Vec<(String, Transaction)>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(1024))));
 /// (peer_id, block) — peer attribution for ban feedback on rejection.
+#[allow(clippy::type_complexity)]
 static PENDING_BLOCKS: Lazy<Arc<PlMutex<Vec<(String, Block)>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(128))));
 
 /// Per-peer pending counts: prevents one peer from monopolizing the queue.
 /// Key: peer_id, Value: (pending_tx_count, pending_block_count)
+#[allow(clippy::type_complexity)]
 static PEER_PENDING: Lazy<Arc<PlMutex<HashMap<String, (u32, u32)>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(HashMap::new())));
 
@@ -82,6 +85,7 @@ const PONG_TIMEOUT_SECS: u64 = 120;
 
 /// Broadcast outbound queue: (sequence_number, message).
 /// Each peer tracks `last_outbound_seq` so every peer gets every message.
+#[allow(clippy::type_complexity)]
 static OUTBOUND_MSGS: Lazy<Arc<PlMutex<(u64, Vec<(u64, P2PMessage)>)>>> =
     Lazy::new(|| Arc::new(PlMutex::new((0, Vec::with_capacity(256)))));
 

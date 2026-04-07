@@ -28,9 +28,8 @@ impl EventBus {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         let db = open_shared_db(source, &opts)
-            .map_err(|e| {
+            .inspect_err(|e| {
                 slog_error!("runtime", "event_bus_db_init_failed", error => &e.to_string());
-                e
             })?;
         let (broadcast_tx, _) = broadcast::channel(4096);
         Ok(Self { db, broadcast_tx })

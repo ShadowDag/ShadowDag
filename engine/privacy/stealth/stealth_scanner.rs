@@ -76,7 +76,7 @@ impl StealthScanner {
         h.update(b"ShadowDAG_StealthDH_v1");
         h.update(shared_secret.compress().as_bytes());
         h.update(tx_hash.as_bytes());
-        h.update(&(output_index as u64).to_le_bytes());
+        h.update((output_index as u64).to_le_bytes());
         let hash: [u8; 32] = h.finalize().into();
         let hs: Scalar = Option::from(Scalar::from_canonical_bytes(hash))
             .ok_or_else(|| CryptoError::InvalidKey("Hash scalar is not canonical".to_string()))?;

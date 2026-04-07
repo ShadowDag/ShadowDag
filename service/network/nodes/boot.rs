@@ -77,7 +77,7 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
         }
     };
     let blocks = BlockStore::new(db.clone())
-        .map_err(|e| NodeError::Storage(e))?;
+        .map_err(NodeError::Storage)?;
     let utxo_store = match UtxoStore::new(db.clone()) {
         Ok(s) => s,
         Err(e) => {
@@ -122,7 +122,7 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
     // NOTE: bootstrap_for_network + discover_peers are called inside P2P::start(),
     // so we do NOT duplicate them here.
 
-    relay_sync_mempool(&*p2p.peers);
+    relay_sync_mempool(&p2p.peers);
 
     let mempool = MempoolManager::new_with_peers_path(db.clone(), &cfg.peers_path_str())
         .map_err(|e| NodeError::Init(e.to_string()))?;

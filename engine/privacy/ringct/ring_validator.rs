@@ -54,7 +54,7 @@ impl RingValidator {
         true
     }
 
-    #[deprecated(since = "1.0", note = "Use validate() instead. quick_validate skips ring signature verification!")]
+    #[deprecated(since = "1.0.0", note = "Use validate() instead. quick_validate skips ring signature verification!")]
     pub fn quick_validate(tx: &Transaction) -> bool {
         Self::validate(tx)
     }

@@ -104,9 +104,8 @@ impl DoubleSpendProtector {
             Err(e) => {
                 slog_warn!("consensus", "dsp_store_open_failed", error => &e.to_string());
                 let fallback = std::env::temp_dir().join(format!("shadowdag_dsp_{}", std::process::id()));
-                Self::new(&fallback.to_string_lossy()).map_err(|e2| {
+                Self::new(&fallback.to_string_lossy()).inspect_err(|e2| {
                     slog_error!("consensus", "dsp_fallback_failed", error => &e2.to_string());
-                    e2
                 })
             }
         }

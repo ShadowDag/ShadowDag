@@ -183,8 +183,8 @@ impl RingSignature {
         // Generate random r values for ALL positions uniformly.
         // This ensures every position does the same work, preventing
         // timing side-channels from leaking the signer position.
-        for i in 0..ring_size {
-            OsRng.fill_bytes(&mut r_values[i]);
+        for item in r_values.iter_mut().take(ring_size) {
+            OsRng.fill_bytes(item);
         }
 
         // Pre-compute signer's r value so that compute_link at the signer

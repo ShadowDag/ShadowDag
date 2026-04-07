@@ -193,9 +193,9 @@ impl PowValidator {
             return None;
         }
         let mut bytes = [0u8; 32];
-        for i in 0..32 {
+        for (i, byte) in bytes.iter_mut().enumerate() {
             let pair = hex_str.get(i * 2..i * 2 + 2)?;
-            bytes[i] = u8::from_str_radix(pair, 16).ok()?;
+            *byte = u8::from_str_radix(pair, 16).ok()?;
         }
         Some(bytes)
     }

@@ -266,9 +266,8 @@ impl Mempool {
 
 impl Mempool {
     pub fn new<S: Into<SharedDbSource>>(source: S) -> Result<Self, MempoolError> {
-        Self::try_new(source).map_err(|e| {
+        Self::try_new(source).inspect_err(|e| {
             slog_error!("mempool", "storage_unavailable", error => &e.to_string());
-            e
         })
     }
 
@@ -1176,8 +1175,8 @@ impl Mempool {
                 break;
             }
             if let Some(tx) = self.get_transaction(&current) {
-                total_fee = total_fee.checked_add(tx.fee).unwrap_or(u64::MAX);
-                total_size = total_size.checked_add(tx.canonical_bytes().len() as u64).unwrap_or(u64::MAX);
+                total_fee = total_fee.saturating_add(tx.fee);
+                total_size = total_size.saturating_add(tx.canonical_bytes().len() as u64);
                 for dep in self.get_dependencies(&current) {
                     if !visited.contains(&dep) {
                         queue.push_back(dep);
@@ -1210,8 +1209,8 @@ impl Mempool {
             if !visited.insert(current.clone()) { continue; }
             if visited.len() > Self::MAX_PACKAGE_DEPTH { break; }
             if let Some(tx) = self.get_transaction(&current) {
-                total_fee  = total_fee.checked_add(tx.fee).unwrap_or(u64::MAX);
-                total_size = total_size.checked_add(tx.canonical_bytes().len() as u64).unwrap_or(u64::MAX);
+                total_fee  = total_fee.saturating_add(tx.fee);
+                total_size = total_size.saturating_add(tx.canonical_bytes().len() as u64);
                 for dep in self.get_dependents(&current) {
                     if !visited.contains(&dep) {
                         queue.push_back(dep);
@@ -1246,7 +1245,7 @@ impl Mempool {
                 break;
             }
             if let Some(tx) = self.get_transaction(&current) {
-                total_fee = total_fee.checked_add(tx.fee).unwrap_or(u64::MAX);
+                total_fee = total_fee.saturating_add(tx.fee);
                 for dep in self.get_dependents(&current) {
                     if !visited.contains(&dep) {
                         queue.push_back(dep);

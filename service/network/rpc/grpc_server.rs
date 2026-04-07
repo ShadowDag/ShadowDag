@@ -288,7 +288,7 @@ impl GrpcServer {
                 break; // Client disconnected or read error
             }
             let msg_len = u32::from_be_bytes(len_buf) as usize;
-            if msg_len < 9 || msg_len > MAX_MESSAGE_SIZE {
+            if !(9..=MAX_MESSAGE_SIZE).contains(&msg_len) {
                 break; // Invalid message size
             }
 

@@ -332,7 +332,7 @@ impl FinalityManager {
 
     /// Create an automatic checkpoint if the height is at a checkpoint boundary.
     fn maybe_create_checkpoint(&mut self, height: u64, hash: &str) {
-        if height == 0 || height % self.checkpoint_interval != 0 {
+        if height == 0 || !height.is_multiple_of(self.checkpoint_interval) {
             return;
         }
 

@@ -159,7 +159,7 @@ impl RetargetEngine {
                 // Also count same-timestamp pairs for extra sensitivity
                 let same_ts = self.count_same_timestamp_pairs();
                 if same_ts > 0 {
-                    let boost = (same_ts as u64 + 1).min(MAX_ADJUST_UP);
+                    let boost = (same_ts + 1).min(MAX_ADJUST_UP);
                     blended = blended.saturating_mul(boost);
                 }
 
@@ -195,7 +195,7 @@ impl RetargetEngine {
             if same_pct > 25 {
                 // Reduce effective block time proportionally
                 // e.g. 50% same-ts → blended_time / 2
-                let divisor = (same_pct / 25).min(4).max(1);
+                let divisor = (same_pct / 25).clamp(1, 4);
                 blended_time = (blended_time / divisor).max(1);
             }
         }

@@ -94,7 +94,7 @@ impl Address {
 
         // STRICT: hex part must be exactly 40 chars (20 bytes) and all hex
         hex_part.len() == expected_hex_len
-            && hex_part.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
+            && hex_part.bytes().all(|b: u8| b.is_ascii_hexdigit())
     }
 
     /// Create a Schnorr address from a 32-byte x-only public key (BIP-340 style)
