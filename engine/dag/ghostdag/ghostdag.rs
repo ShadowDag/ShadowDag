@@ -13,6 +13,7 @@ use serde::{Serialize, Deserialize};
 use dashmap::DashMap;
 
 use crate::slog_info;
+use crate::errors::{DagError, StorageError};
 
 /// GHOSTDAG K parameter — consensus-critical constant.
 /// This value MUST be identical on all nodes to ensure consistent
@@ -154,7 +155,15 @@ impl GhostDag {
 
         let order_index = self.next_order_index();
 
-        self.persist_block(
+        // Compute new tips before persist so they go into the same WriteBatch
+        let new_tips: Vec<String> = {
+            let mut tips = self.get_tips_inner();
+            for p in &block.parents { tips.remove(p); }
+            tips.insert(hash.clone());
+            tips.into_iter().collect()
+        };
+
+        if let Err(e) = self.persist_block(
             &hash,
             &block,
             &selected_parent,
@@ -164,16 +173,9 @@ impl GhostDag {
             blue_score,
             chain_height,
             order_index,
-        );
-
-        // Tips update
-        {
-            let mut tips = self.get_tips_inner();
-            for p in &block.parents { tips.remove(p); }
-            tips.insert(hash.clone());
-            if let Ok(data) = bincode::serialize(&tips.into_iter().collect::<Vec<_>>()) {
-                let _ = self.db.put(PFX_TIPS, &data);
-            }
+            Some(&new_tips),
+        ) {
+            slog_info!("ghostdag", "persist_block_failed", hash => &hash, error => e.to_string());
         }
 
         GhostdagData {
@@ -247,8 +249,11 @@ impl GhostDag {
         let mut blues = Vec::new();
         let mut reds = Vec::new();
 
+        // Use the full cumulative blue set, not just the diff stored for this block.
+        // get_blue_set() returns only the DIFF (new blues from that block).
+        // We need the full set for correct anticone classification.
         let mut current_blues: HashSet<String> =
-            self.get_blue_set(selected_parent).into_iter().collect();
+            self.reconstruct_full_blue_set(&[selected_parent.to_string()]);
 
         for h in merge_set {
             let anticone = self.compute_anticone_with_blues(h, &current_blues);
@@ -449,7 +454,8 @@ impl GhostDag {
         blue_score: u64,
         chain_height: u64,
         order_index: u64,
-    ) {
+        new_tips: Option<&[String]>,
+    ) -> Result<(), DagError> {
         let mut batch = WriteBatch::default();
 
         batch.put(format!("{}{}", PFX_BLOCK, hash), bincode::serialize(block).unwrap_or_default());
@@ -478,13 +484,28 @@ impl GhostDag {
             batch.put(format!("{}{}", PFX_RED, r), [1u8]);
         }
 
-        let _ = self.db.write(batch);
+        // Include tips update in the same atomic WriteBatch to prevent
+        // inconsistency if the process crashes between block persist and
+        // tips update.
+        if let Some(tips) = new_tips {
+            if let Ok(data) = bincode::serialize(&tips) {
+                batch.put(PFX_TIPS, data);
+            }
+        }
+
+        self.db.write(batch).map_err(|e| DagError::Storage(StorageError::WriteFailed(e.to_string())))?;
+        Ok(())
     }
 
     fn store_genesis(&self, hash: &str, block: &DagBlock) {
-        self.persist_block(hash, block, hash, &[hash.to_string()], &[], &[], 0, 0, 0);
+        if let Err(e) = self.persist_block(hash, block, hash, &[hash.to_string()], &[], &[], 0, 0, 0, Some(&[hash.to_string()])) {
+            slog_info!("ghostdag", "store_genesis_failed", hash => hash, error => e.to_string());
+        }
 
-        let _ = self.db.put(PFX_TIPS, bincode::serialize(&vec![hash.to_string()]).unwrap_or_default());
+        // Genesis gets order_index=0; advance counter to 1 so the next block
+        // gets order_index=1 (preventing duplicate index=0).
+        self.order_counter.store(1, Ordering::SeqCst);
+        let _ = self.db.put(META_ORDER_COUNTER, 1u64.to_le_bytes());
     }
 
     // ================= ADDED METHODS =================
