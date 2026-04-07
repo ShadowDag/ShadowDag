@@ -48,6 +48,10 @@ impl BlockStore {
                 // Multiple blocks can exist at the same height
                 let height_key = format!("{}height:{}:{}", BLK_PREFIX, block.header.height, hash);
                 batch.put(height_key.as_bytes(), hash.as_bytes());
+                // Hash-to-height reverse index: survives pruning so
+                // validate_parents_exist can check height without the full block.
+                let h2h_key = format!("{}h2h:{}", BLK_PREFIX, hash);
+                batch.put(h2h_key.as_bytes(), &block.header.height.to_le_bytes());
                 match self.db.write(batch) {
                     Ok(_) => true,
                     Err(e) => {
@@ -242,6 +246,35 @@ impl BlockStore {
     /// Get the number of blocks at a specific height (DAG parallelism metric).
     pub fn blocks_at_height(&self, height: u64) -> usize {
         self.get_block_hashes_at_height(height).len()
+    }
+
+    // ── Height lookup (survives pruning) ────────────────────────────────
+
+    /// Retrieve a block's height even after the block body has been pruned.
+    /// First tries the full block; falls back to the dedicated height-by-hash
+    /// index which survives pruning.
+    pub fn get_block_height(&self, hash: &str) -> Option<u64> {
+        // Fast path: full block still available
+        if let Some(block) = self.get_block(hash) {
+            return Some(block.header.height);
+        }
+        // Fallback: dedicated hash-to-height index (written by save_block)
+        self.get_block_height_from_index(hash)
+    }
+
+    /// Read height from the dedicated `blk:h2h:{hash}` index.
+    /// This key is written by `save_block` alongside the block data and
+    /// is NOT deleted by `prune_block_body`, so it survives pruning.
+    fn get_block_height_from_index(&self, hash: &str) -> Option<u64> {
+        let key = format!("{}h2h:{}", BLK_PREFIX, hash);
+        match self.db.get(key.as_bytes()) {
+            Ok(Some(data)) if data.len() >= 8 => {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&data[..8]);
+                Some(u64::from_le_bytes(buf))
+            }
+            _ => None,
+        }
     }
 
     // ── Pruning ────────────────────────────────────────────────────────────

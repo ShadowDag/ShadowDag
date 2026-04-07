@@ -625,16 +625,11 @@ impl DaemonNode {
             slog_warn!("daemon", "ghostdag_rebuild_partial_failure", failed => failed);
         }
 
-        // Re-derive best tip using proper GHOSTDAG selection rule:
-        // highest blue_score → highest height → lowest hash (deterministic)
+        // Re-derive best tip using the canonical GHOSTDAG selection rule.
+        // Uses FullNode::select_best_tip to guarantee runtime and recovery
+        // always agree on fork-choice (blue_score -> height -> hash).
         let tips = self.ghostdag.get_tips();
-        let best_tip = tips.iter()
-            .max_by(|a, b| {
-                self.ghostdag.get_blue_score(a).cmp(&self.ghostdag.get_blue_score(b))
-                    .then_with(|| self.ghostdag.get_chain_height(a).cmp(&self.ghostdag.get_chain_height(b)))
-                    .then_with(|| b.cmp(a)) // lower hash wins tie
-            })
-            .cloned();
+        let best_tip = FullNode::select_best_tip(&tips, &self.ghostdag);
         if let Some(ref best_tip) = best_tip {
             self.block_store.update_best_hash(best_tip);
             slog_info!("daemon", "ghostdag_rebuilt",
