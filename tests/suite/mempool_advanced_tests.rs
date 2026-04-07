@@ -89,7 +89,7 @@ mod tests {
             }
         }
 
-        let selected = pool.get_transactions_for_block(&us, 4);
+        let selected = pool.select_transactions_for_block(&us, 4);
         assert!(!selected.is_empty(), "At least one TX must be selected");
         for w in selected.windows(2) {
             assert!(
@@ -165,7 +165,7 @@ mod tests {
             pool.add_transaction_test(&make_tx(&format!("topn_tx_{:010}", i), i as u64 + 1, 1_000));
         }
         let us = dummy_utxo_set();
-        let selected = pool.get_transactions_for_block(&us, 10);
+        let selected = pool.select_transactions_for_block(&us, 10);
         assert!(selected.len() <= 10, "Must return at most 10 transactions");
     }
 

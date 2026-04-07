@@ -257,6 +257,16 @@ impl NodeConfig {
         cfg
     }
 
+    pub fn init_dirs(&self) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.data_dir)?;
+        std::fs::create_dir_all(self.data_dir.join("blocks"))?;
+        std::fs::create_dir_all(self.data_dir.join("utxo"))?;
+        std::fs::create_dir_all(self.data_dir.join("peers"))?;
+        std::fs::create_dir_all(self.data_dir.join("mempool"))?;
+        std::fs::create_dir_all(self.data_dir.join("dag"))?;
+        Ok(())
+    }
+
     pub fn blocks_path(&self)   -> std::path::PathBuf { self.network.blocks_path() }
     pub fn peers_path(&self)    -> std::path::PathBuf { self.network.peers_path() }
     pub fn utxo_path(&self)     -> std::path::PathBuf { self.network.utxo_path() }
