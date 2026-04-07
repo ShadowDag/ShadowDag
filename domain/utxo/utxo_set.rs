@@ -245,7 +245,7 @@ impl UtxoSet {
     /// Prune spent UTXOs from the backing store to reclaim disk space.
     /// Spent UTXOs are kept for a maturity window for reorg safety,
     /// then can be safely deleted. Returns the number pruned.
-    pub fn prune_spent_utxos(&self) -> u64 {
+    pub fn prune_spent_utxos(&self) -> Result<u64, crate::errors::StorageError> {
         self.store.prune_spent()
     }
 
