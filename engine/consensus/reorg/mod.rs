@@ -42,6 +42,7 @@ pub struct ReorgEvent {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReorgResult {
     NoReorg,
+    Extended(ReorgEvent),  // Chain grew without fork (depth=0, no blocks removed)
     Reorged(ReorgEvent),
     TooDeep,
 }
@@ -134,9 +135,9 @@ impl ReorgManager {
             return ReorgResult::NoReorg;
         }
 
-        // 2. Fast path (extension)
+        // 2. Fast path (extension — chain grew, no fork)
         if j > i && new_chain[..i] == *old_chain {
-            return ReorgResult::Reorged(ReorgEvent {
+            return ReorgResult::Extended(ReorgEvent {
                 old_tip:         old_tip.clone(),
                 new_tip:         new_tip.clone(),
                 common_ancestor: old_tip.clone(),
@@ -272,6 +273,10 @@ impl ReorgManager {
         let result = self.detect(old_chain, new_chain);
 
         match &result {
+            ReorgResult::Extended(_) => {
+                // Chain extension (no fork) — no economic validation needed
+                Ok(result)
+            }
             ReorgResult::Reorged(event) => {
                 let depth = event.depth;
 

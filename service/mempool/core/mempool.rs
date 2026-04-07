@@ -86,12 +86,22 @@ impl Mempool {
         let _ = self.db.put(key, val.to_le_bytes());
     }
 
+    /// Increment a metadata counter by `delta`.
+    ///
+    /// SAFETY: This is a read-then-write without RocksDB-level atomicity.
+    /// However, all Mempool mutations are serialized by the `Arc<Mutex<MempoolManager>>`
+    /// in `daemon::mod`, so concurrent access cannot occur in practice.
+    /// If Mempool is ever used outside that Mutex, these must be converted to
+    /// RocksDB merge operations or wrapped in a WriteBatch.
     #[inline]
     fn meta_inc(&self, key: &[u8], delta: u64) {
         let cur = self.meta_get_u64(key);
         self.meta_set_u64(key, cur.saturating_add(delta));
     }
 
+    /// Decrement a metadata counter by `delta` (saturating).
+    ///
+    /// SAFETY: Same serialization guarantee as `meta_inc` — see its doc comment.
     #[inline]
     fn meta_dec(&self, key: &[u8], delta: u64) {
         let cur = self.meta_get_u64(key);
@@ -135,6 +145,18 @@ impl Mempool {
     fn tx_sender(tx: &Transaction) -> Option<&str> {
         if tx.is_coinbase() { return None; }
         tx.inputs.first().map(|inp| inp.owner.as_str())
+    }
+
+    /// Extract ALL unique sender addresses from a transaction's inputs.
+    /// Prevents per-sender limit bypass when a TX has inputs from multiple owners.
+    fn tx_senders(tx: &Transaction) -> Vec<&str> {
+        if tx.is_coinbase() { return Vec::new(); }
+        let mut senders: Vec<&str> = tx.inputs.iter()
+            .map(|inp| inp.owner.as_str())
+            .collect();
+        senders.sort_unstable();
+        senders.dedup();
+        senders
     }
 
     // ── Surge pricing ────────────────────────────────────────────────────
@@ -364,7 +386,9 @@ impl Mempool {
         // ── L5 Anti-spam: per-sender rate limit ─────────────────────
         // Prevents a single wallet from monopolizing the pool with
         // cheap TXs. Legitimate batching (25 TXs) is still allowed.
-        if let Some(sender) = Self::tx_sender(tx) {
+        // Checks ALL unique owners across inputs to prevent bypass via
+        // multi-owner transactions.
+        for sender in Self::tx_senders(tx) {
             if self.sender_tx_count(sender) >= MAX_TXS_PER_SENDER {
                 return false;
             }
@@ -474,8 +498,8 @@ impl Mempool {
             }
         }
 
-        // Sender index for per-address anti-spam
-        if let Some(sender) = Self::tx_sender(tx) {
+        // Sender index for per-address anti-spam (all unique owners)
+        for sender in Self::tx_senders(tx) {
             let sender_key = format!("sender:{}:{}", sender, tx.hash);
             batch.put(sender_key.as_bytes(), b"1");
         }

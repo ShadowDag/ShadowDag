@@ -15,9 +15,10 @@ use crate::slog_error;
 /// Retarget every 120 seconds worth of blocks to maintain ~2-minute windows.
 /// At ConsensusParams::BLOCKS_PER_SECOND the actual block count per retarget
 /// = 120 * BPS (e.g. DEFAULT_BPS -> 1200 blocks). Callers that compare
-/// against block height must multiply by BPS; `on_new_block` currently uses
-/// raw height.
+/// against block height must use RETARGET_BLOCK_INTERVAL, which is BPS-scaled.
 pub const RETARGET_INTERVAL: u64 = 120;
+/// Retarget interval scaled by BPS. At 10 BPS, 120 seconds = 1200 blocks.
+pub const RETARGET_BLOCK_INTERVAL: u64 = RETARGET_INTERVAL * 10; // 10 BPS default
 pub const ADJUSTMENT_FACTOR_MAX: u64 = 4;
 pub const TARGET_BLOCK_TIME_SECS: u64 = 1;
 
@@ -107,7 +108,7 @@ impl DifficultyAdjustment {
         height: u64,
         window_timestamps: &[u64],
     ) -> u64 {
-        if height == 0 || !height.is_multiple_of(RETARGET_INTERVAL) {
+        if height == 0 || height % RETARGET_BLOCK_INTERVAL != 0 {
             return self.get_difficulty();
         }
 
@@ -335,7 +336,7 @@ mod tests {
         da.set_difficulty(500).unwrap();
         // Last two timestamps are not monotonically increasing
         let ts = vec![1, 2, 3, 4, 6, 5];
-        let d = da.on_new_block(RETARGET_INTERVAL, &ts);
+        let d = da.on_new_block(RETARGET_BLOCK_INTERVAL, &ts);
         // Should refuse to adjust, return current difficulty
         assert_eq!(d, 500);
     }
@@ -347,7 +348,7 @@ mod tests {
         // 10 timestamps with impossibly compressed span
         // expected span = 9 * 1 = 9; actual span = 1; 1 < 9/4 = 2
         let ts: Vec<u64> = (0..10).map(|i| 100 + if i == 9 { 1 } else { 0 }).collect();
-        let d = da.on_new_block(RETARGET_INTERVAL, &ts);
+        let d = da.on_new_block(RETARGET_BLOCK_INTERVAL, &ts);
         assert_eq!(d, 500);
     }
 

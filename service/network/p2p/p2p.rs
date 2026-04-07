@@ -130,9 +130,24 @@ pub fn drain_pending_blocks() -> Vec<(String, Block)> {
 /// The daemon event loop drains this queue and processes each block
 /// through FullNode::process_block() (full validation pipeline).
 pub fn push_pending_block(peer_id: &str, block: Block) -> bool {
+    // Per-peer limit check
+    {
+        let pending = PEER_PENDING.lock();
+        if let Some(&(_, blk_count)) = pending.get(peer_id) {
+            if blk_count >= MAX_PENDING_BLOCKS_PER_PEER {
+                slog_warn!("p2p", "per_peer_block_limit_reached", peer => peer_id);
+                return false;
+            }
+        }
+    }
+
     let mut q = PENDING_BLOCKS.lock();
     if q.len() < 1_000 {
         q.push((peer_id.to_string(), block));
+        // Increment per-peer counter
+        let mut pending = PEER_PENDING.lock();
+        let entry = pending.entry(peer_id.to_string()).or_insert((0, 0));
+        entry.1 += 1;
         true
     } else {
         slog_warn!("p2p", "pending_block_queue_full");
@@ -143,9 +158,24 @@ pub fn push_pending_block(peer_id: &str, block: Block) -> bool {
 /// Push a transaction into the pending queue for mempool validation.
 /// Thread-safe: can be called from RPC or any thread.
 pub fn push_pending_tx(peer_id: &str, tx: Transaction) -> bool {
+    // Per-peer limit check
+    {
+        let pending = PEER_PENDING.lock();
+        if let Some(&(tx_count, _)) = pending.get(peer_id) {
+            if tx_count >= MAX_PENDING_TXS_PER_PEER {
+                slog_warn!("p2p", "per_peer_tx_limit_reached", peer => peer_id);
+                return false;
+            }
+        }
+    }
+
     let mut q = PENDING_TXS.lock();
     if q.len() < 10_000 {
         q.push((peer_id.to_string(), tx));
+        // Increment per-peer counter
+        let mut pending = PEER_PENDING.lock();
+        let entry = pending.entry(peer_id.to_string()).or_insert((0, 0));
+        entry.0 += 1;
         true
     } else {
         slog_warn!("p2p", "pending_tx_queue_full");
