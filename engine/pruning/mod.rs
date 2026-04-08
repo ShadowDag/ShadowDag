@@ -44,24 +44,25 @@ impl PruningEngine {
         current_height: u64,
     ) -> Vec<String> {
         let cutoff = current_height.saturating_sub(self.depth);
-        let mut prunable: Vec<String> = block_heights.iter()
+        let mut prunable: Vec<(String, u64)> = block_heights.iter()
             .filter(|(hash, &height)| {
                 height < cutoff && !self.prune_set.contains(*hash)
             })
-            .map(|(hash, _)| hash.clone())
-            .take(PRUNE_BATCH_SIZE)
+            .map(|(hash, &h)| (hash.clone(), h))
             .collect();
 
-        prunable.sort();
-        prunable
+        // Sort by height first for deterministic selection, then truncate
+        prunable.sort_by_key(|(_, h)| *h);
+        prunable.truncate(PRUNE_BATCH_SIZE);
+
+        prunable.into_iter().map(|(hash, _)| hash).collect()
     }
 
     pub fn mark_pruned(&mut self, hashes: &[String]) {
         for hash in hashes {
-            self.prune_set.insert(hash.clone());
-            self.pruned_count += 1;
-        }
-        if !hashes.is_empty() {
+            if self.prune_set.insert(hash.clone()) {
+                self.pruned_count += 1; // Only count if actually new
+            }
         }
     }
 

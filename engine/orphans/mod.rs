@@ -38,6 +38,9 @@ pub struct OrphanManager {
     orphans:     HashMap<String, OrphanBlock>,
 
     waiting_for: HashMap<String, HashSet<String>>,
+    /// Tracks which parents each orphan is still waiting for.
+    /// An orphan is only ready when its pending_parents set becomes empty.
+    pending_parents: HashMap<String, HashSet<String>>,
     pub eviction_count: u64,
 }
 
@@ -50,9 +53,10 @@ impl Default for OrphanManager {
 impl OrphanManager {
     pub fn new() -> Self {
         Self {
-            orphans:        HashMap::new(),
-            waiting_for:    HashMap::new(),
-            eviction_count: 0,
+            orphans:         HashMap::new(),
+            waiting_for:     HashMap::new(),
+            pending_parents: HashMap::new(),
+            eviction_count:  0,
         }
     }
 
@@ -72,23 +76,42 @@ impl OrphanManager {
                 .insert(hash.to_string());
         }
 
+        // Track which parents this orphan is still waiting for
+        self.pending_parents.insert(
+            hash.to_string(),
+            parents.iter().cloned().collect(),
+        );
+
         self.orphans.insert(hash.to_string(), OrphanBlock::new(hash, parents, raw_data));
         true
     }
 
     pub fn get_ready(&mut self, parent_hash: &str) -> Vec<OrphanBlock> {
-        let ready_hashes: HashSet<String> = self
+        let candidate_hashes: HashSet<String> = self
             .waiting_for
             .remove(parent_hash)
             .unwrap_or_default();
 
         let mut ready = Vec::new();
-        for hash in &ready_hashes {
+        for hash in &candidate_hashes {
+            // Remove arrived parent from this orphan's pending set
+            if let Some(pending) = self.pending_parents.get_mut(hash) {
+                pending.remove(parent_hash);
+                if !pending.is_empty() {
+                    // Still waiting for other parents — not ready yet
+                    continue;
+                }
+            }
+            // All parents resolved — remove from tracking and return as ready
+            self.pending_parents.remove(hash);
             if let Some(orphan) = self.orphans.remove(hash) {
                 for p in &orphan.parents {
                     if p != parent_hash {
                         if let Some(set) = self.waiting_for.get_mut(p) {
                             set.remove(hash);
+                            if set.is_empty() {
+                                self.waiting_for.remove(p);
+                            }
                         }
                     }
                 }
@@ -136,6 +159,7 @@ impl OrphanManager {
 
     fn remove_orphan(&mut self, hash: &str) {
         if let Some(orphan) = self.orphans.remove(hash) {
+            self.pending_parents.remove(hash);
             for parent in &orphan.parents {
                 if let Some(set) = self.waiting_for.get_mut(parent) {
                     set.remove(hash);
@@ -193,9 +217,16 @@ mod tests {
         let mut mgr = OrphanManager::new();
         mgr.add("o1", vec!["p1".into(), "p2".into()], "data");
 
+        // First parent arrives — orphan should NOT be ready yet
         let ready = mgr.get_ready("p1");
+        assert_eq!(ready.len(), 0, "orphan should wait for all parents");
+        assert!(mgr.contains("o1"), "orphan should still be tracked");
 
+        // Second parent arrives — now orphan should be ready
+        let ready = mgr.get_ready("p2");
         assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].hash, "o1");
+        assert!(!mgr.contains("o1"));
     }
 
     #[test]
