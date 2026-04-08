@@ -51,7 +51,7 @@ impl Miner {
         let miner_reward = (reward * crate::config::consensus::consensus_params::ConsensusParams::MINER_PERCENT) / 100;
         let owner_reward = reward - miner_reward;
 
-        let hash = Self::coinbase_hash(&miner_address, timestamp, height);
+        let hash = Self::coinbase_hash(&miner_address, timestamp, height, miner_reward, owner_reward, total_fees);
 
         Transaction {
             hash,
@@ -68,12 +68,22 @@ impl Miner {
         }
     }
 
-    pub fn coinbase_hash(miner_address: &str, timestamp: u64, height: u64) -> String {
+    pub fn coinbase_hash(
+        miner_address: &str,
+        timestamp: u64,
+        height: u64,
+        miner_reward: u64,
+        dev_reward: u64,
+        total_fees: u64,
+    ) -> String {
         let mut h = Sha256::new();
         h.update(b"coinbase");
         h.update(miner_address.as_bytes());
         h.update(timestamp.to_le_bytes());
         h.update(height.to_le_bytes());
+        h.update(miner_reward.to_le_bytes());
+        h.update(dev_reward.to_le_bytes());
+        h.update(total_fees.to_le_bytes());
         hex::encode(h.finalize())
     }
 
@@ -191,15 +201,15 @@ mod tests {
 
     #[test]
     fn coinbase_hash_is_deterministic() {
-        let h1 = Miner::coinbase_hash("shadow1abc", 1735689600, 1);
-        let h2 = Miner::coinbase_hash("shadow1abc", 1735689600, 1);
+        let h1 = Miner::coinbase_hash("shadow1abc", 1735689600, 1, 950, 50, 0);
+        let h2 = Miner::coinbase_hash("shadow1abc", 1735689600, 1, 950, 50, 0);
         assert_eq!(h1, h2);
     }
 
     #[test]
     fn coinbase_hash_differs_by_height() {
-        let h1 = Miner::coinbase_hash("shadow1abc", 1735689600, 1);
-        let h2 = Miner::coinbase_hash("shadow1abc", 1735689600, 2);
+        let h1 = Miner::coinbase_hash("shadow1abc", 1735689600, 1, 950, 50, 0);
+        let h2 = Miner::coinbase_hash("shadow1abc", 1735689600, 2, 950, 50, 0);
         assert_ne!(h1, h2);
     }
 }

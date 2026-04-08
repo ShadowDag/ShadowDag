@@ -66,6 +66,14 @@ impl PowValidator {
             ));
         }
 
+        // 5b. Enforce maximum difficulty
+        if block.header.difficulty > MAX_DIFFICULTY {
+            return PowResult::fail(format!(
+                "difficulty {} exceeds MAX_DIFFICULTY {}",
+                block.header.difficulty, MAX_DIFFICULTY
+            ));
+        }
+
         // 6. Verify hash meets target (proper 256-bit numeric comparison)
         if block.header.difficulty > 0
             && !Self::hash_meets_target(&computed_hash, block.header.difficulty)
