@@ -6,8 +6,8 @@
 use serde::{Serialize, Deserialize};
 
 /// Transaction type for VM routing. Transfer transactions go through the
-/// UTXO layer; ContractCreate and ContractCall will be routed through
-/// ShadowVM execution in a future release.
+/// UTXO layer; ContractCreate and ContractCall are executed through
+/// ShadowVM v1 during block processing (see full_node.rs).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[derive(Default)]
 pub enum TxType {

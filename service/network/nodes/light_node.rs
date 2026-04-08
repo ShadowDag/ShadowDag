@@ -211,6 +211,8 @@ mod tests {
             selected_parent: None,
             utxo_commitment: None,
             extra_nonce: 0,
+            receipt_root: None,
+            state_root: None,
         }
     }
 

@@ -322,6 +322,8 @@ impl UtxoSet {
                 selected_parent: None,
                 utxo_commitment: None,
                 extra_nonce: 0,
+                receipt_root: None,
+                state_root: None,
             },
             body: crate::domain::block::block_body::BlockBody {
                 transactions: transactions.to_vec(),

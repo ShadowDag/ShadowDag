@@ -156,6 +156,7 @@ mod tests {
             merkle_root: "mr".into(), timestamp, nonce: 0,
             difficulty, height, blue_score: 0, selected_parent: None,
             utxo_commitment: None, extra_nonce: 0,
+            receipt_root: None, state_root: None,
         }
     }
 

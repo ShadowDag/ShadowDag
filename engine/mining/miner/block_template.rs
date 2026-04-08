@@ -120,6 +120,8 @@ impl BlockTemplateBuilder {
             selected_parent,
             utxo_commitment: None,
             extra_nonce:     0,
+            receipt_root:    None,
+            state_root:      None,
         };
 
         let mut all_txs = vec![coinbase];
@@ -181,6 +183,8 @@ impl BlockTemplateBuilder {
             selected_parent,
             utxo_commitment: None,
             extra_nonce:     0,
+            receipt_root:    None,
+            state_root:      None,
         };
 
         let mut all_txs = vec![coinbase];
