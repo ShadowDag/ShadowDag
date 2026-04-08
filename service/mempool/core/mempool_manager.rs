@@ -36,8 +36,7 @@ pub struct MempoolManager {
 
 impl MempoolManager {
     pub fn new(db: Arc<DB>) -> Result<Self, MempoolError> {
-        let peers_path = crate::config::node::node_config::NetworkMode::base_data_dir()
-            .join("peers");
+        let peers_path = crate::config::node::node_config::NetworkMode::Mainnet.peers_path();
         Self::new_with_peers_path(db, &peers_path.to_string_lossy())
     }
 

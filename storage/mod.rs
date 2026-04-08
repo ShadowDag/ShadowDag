@@ -6,10 +6,12 @@
 use crate::errors::StorageError;
 
 pub trait KeyValueStore: Send + Sync {
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError>;
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError>;
     fn delete(&self, key: &[u8]) -> Result<(), StorageError>;
-    fn exists(&self, key: &[u8]) -> bool { self.get(key).is_some() }
+    fn exists(&self, key: &[u8]) -> Result<bool, StorageError> {
+        self.get(key).map(|opt| opt.is_some())
+    }
 }
 
 use std::collections::HashMap;
@@ -32,8 +34,10 @@ impl MemoryStore {
 }
 
 impl KeyValueStore for MemoryStore {
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.data.read().ok()?.get(key).cloned()
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        let guard = self.data.read()
+            .map_err(|e| StorageError::LockPoisoned(e.to_string()))?;
+        Ok(guard.get(key).cloned())
     }
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
         self.data.write()
@@ -68,12 +72,12 @@ impl RocksStore {
 }
 
 impl KeyValueStore for RocksStore {
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
         match self.db.get(key) {
-            Ok(v) => v.map(|v| v.to_vec()),
+            Ok(v) => Ok(v.map(|v| v.to_vec())),
             Err(e) => {
                 crate::slog_error!("storage", "read_failed", error => &e.to_string());
-                None
+                Err(StorageError::ReadFailed(e.to_string()))
             }
         }
     }
@@ -125,7 +129,7 @@ mod tests {
     fn memory_store_put_get() {
         let store = MemoryStore::new();
         store.put(b"key", b"value").unwrap();
-        assert_eq!(store.get(b"key"), Some(b"value".to_vec()));
+        assert_eq!(store.get(b"key").unwrap(), Some(b"value".to_vec()));
     }
 
     #[test]
@@ -133,21 +137,21 @@ mod tests {
         let store = MemoryStore::new();
         store.put(b"k", b"v").unwrap();
         store.delete(b"k").unwrap();
-        assert_eq!(store.get(b"k"), None);
+        assert_eq!(store.get(b"k").unwrap(), None);
     }
 
     #[test]
     fn memory_store_exists() {
         let store = MemoryStore::new();
-        assert!(!store.exists(b"x"));
+        assert!(!store.exists(b"x").unwrap());
         store.put(b"x", b"1").unwrap();
-        assert!(store.exists(b"x"));
+        assert!(store.exists(b"x").unwrap());
     }
 
     #[test]
     fn storage_manager_memory_backend() {
         let mgr = StorageManager::memory();
         mgr.store.put(b"hello", b"world").unwrap();
-        assert_eq!(mgr.store.get(b"hello"), Some(b"world".to_vec()));
+        assert_eq!(mgr.store.get(b"hello").unwrap(), Some(b"world".to_vec()));
     }
 }

@@ -161,8 +161,8 @@ mod tests {
             utxo_x.add_utxo_str(key, (*owner).into(), *amount, (*addr).into());
             utxo_y.add_utxo_str(key, (*owner).into(), *amount, (*addr).into());
         }
-        utxo_x.spend_utxo_str("det_u2:0");
-        utxo_y.spend_utxo_str("det_u2:0");
+        utxo_x.spend_utxo_str("det_u2:0").unwrap();
+        utxo_y.spend_utxo_str("det_u2:0").unwrap();
         assert_eq!(compute_utxo_root(&utxo_x), compute_utxo_root(&utxo_y));
     }
 

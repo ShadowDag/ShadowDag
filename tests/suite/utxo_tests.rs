@@ -29,7 +29,7 @@ mod tests {
     fn spend_marks_utxo_as_spent() {
         let mut set = UtxoSet::new_empty();
         set.add_test_utxo("tx2:0", 100, "bob");
-        set.spend_utxo_str("tx2:0");
+        set.spend_utxo_str("tx2:0").unwrap();
         let utxo = set.get_utxo_str("tx2:0").unwrap();
         assert!(utxo.spent, "utxo should be marked as spent");
     }
@@ -38,7 +38,7 @@ mod tests {
     fn double_spend_detected_after_first_spend() {
         let mut set = UtxoSet::new_empty();
         set.add_test_utxo("tx3:0", 200, "carol");
-        set.spend_utxo_str("tx3:0");
+        set.spend_utxo_str("tx3:0").unwrap();
 
         let utxo = set.get_utxo_str("tx3:0").unwrap();
         assert!(utxo.spent, "Already-spent utxo must be detectable");
@@ -49,7 +49,7 @@ mod tests {
         let mut set = UtxoSet::new_empty();
         set.add_test_utxo("tx4:0", 300, "dave");
         set.add_test_utxo("tx4:1", 200, "dave");
-        set.spend_utxo_str("tx4:0");
+        set.spend_utxo_str("tx4:0").unwrap();
         let balance = set.get_balance("dave");
         assert_eq!(balance, 200, "Balance should exclude spent utxos");
     }
