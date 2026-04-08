@@ -62,9 +62,15 @@ mod tests {
     }
 
     #[test]
-    fn at_limit_outputs_passes() {
+    fn over_limit_outputs_rejected() {
         let tx_over = make_tx_with_n_outputs(MAX_TX_OUTPUTS + 1);
-        assert!(!validate_tx(&tx_over));
+        assert!(!validate_tx(&tx_over), "TX exceeding MAX_TX_OUTPUTS should be rejected");
+    }
+
+    #[test]
+    fn at_limit_outputs_passes() {
+        let tx_at = make_tx_with_n_outputs(MAX_TX_OUTPUTS);
+        assert!(validate_tx(&tx_at), "TX at exactly MAX_TX_OUTPUTS should pass");
     }
 
     #[test]

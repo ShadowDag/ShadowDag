@@ -36,18 +36,20 @@ pub struct ViewKey {
 
 impl ViewKey {
     /// Create from a hex-encoded 64-char key, or derive from string via HMAC.
+    ///
+    /// When the input is exactly 64 characters (looks like hex), we require
+    /// it to be valid hex decoding to exactly 32 bytes.  Malformed hex is
+    /// rejected instead of silently falling through to HMAC derivation.
     pub fn new(key: String) -> Result<Self, CryptoError> {
         let raw = if key.len() == 64 {
-            if let Ok(bytes) = hex::decode(&key) {
-                if bytes.len() == 32 {
+            match hex::decode(&key) {
+                Ok(bytes) if bytes.len() == 32 => {
                     let mut arr = [0u8; 32];
                     arr.copy_from_slice(&bytes);
                     arr
-                } else {
-                    Self::hmac_derive(key.as_bytes())
                 }
-            } else {
-                Self::hmac_derive(key.as_bytes())
+                Ok(_) => return Err(CryptoError::InvalidKey("hex key must be 32 bytes".into())),
+                Err(e) => return Err(CryptoError::InvalidKey(format!("malformed hex: {}", e))),
             }
         } else {
             Self::hmac_derive(key.as_bytes())
@@ -136,6 +138,9 @@ impl Drop for ViewKey {
     fn drop(&mut self) {
         // Zero out key material
         self.key_bytes = [0u8; 32];
+        self.key = String::new(); // Clear hex representation
+        // scalar is on the stack/register — can't fully zeroize Scalar in safe Rust
+        // but we clear the bytes representation above.
     }
 }
 

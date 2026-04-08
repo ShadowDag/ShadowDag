@@ -137,7 +137,7 @@ mod tests {
                     side: OrderSide::Buy, order_type: OrderType::Limit,
                     price: 50, amount: 100, filled: 0,
                     status: OrderStatus::Open, timestamp: 0, block_height: 0,
-                });
+                }).unwrap();
             }
             for i in 0..sell_count {
                 book.place_order(Order {
@@ -146,7 +146,7 @@ mod tests {
                     side: OrderSide::Sell, order_type: OrderType::Limit,
                     price: 100, amount: 100, filled: 0,
                     status: OrderStatus::Open, timestamp: 0, block_height: 0,
-                });
+                }).unwrap();
             }
             let (bids, asks) = book.depth();
             // Since buy at 50, sell at 100 — no crossing, all orders remain

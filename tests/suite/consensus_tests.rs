@@ -11,6 +11,7 @@ mod tests {
     use crate::domain::block::block_body::BlockBody;
     use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
     use crate::engine::dag::core::dag_manager::DagManager;
+    use crate::engine::consensus::validation::block_validator::BlockValidator;
     use crate::config::consensus::consensus_params::ConsensusParams;
 
     // ── helpers ──────────────────────────────────────────────────────────
@@ -101,9 +102,11 @@ mod tests {
         let _dag = tmp_dag("empty_hash");
         let mut block = genesis_block();
         block.header.hash = String::new();
-        // A block with empty hash: the dag may accept it at storage level,
-        // but the hash itself is invalid — test structural validation
         assert!(block.header.hash.is_empty(), "Hash should be empty for this test");
+
+        // Actually run the block through the validator
+        let result = BlockValidator::validate_network_layer(&block);
+        assert!(result.is_err(), "empty hash should be rejected by the validator");
     }
 
     // ── 3. Reject duplicate block ─────────────────────────────────────────
