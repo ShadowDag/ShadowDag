@@ -162,6 +162,9 @@ pub fn build_coinbase_at_height(
     h.update(miner_address.as_bytes());
     h.update(timestamp.to_le_bytes());
     h.update(height.to_le_bytes());
+    h.update(miner_reward.to_le_bytes());
+    h.update(dev_reward.to_le_bytes());
+    h.update(block_reward.to_le_bytes());
     let hash = hex::encode(h.finalize());
 
     Transaction::new_coinbase(

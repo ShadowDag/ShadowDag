@@ -152,6 +152,10 @@ impl DagManager {
 
         // GENESIS
         if block.header.height == 0 {
+            if !block.header.parents.is_empty() {
+                return Err(DagError::InvalidParent("genesis block must have no parents".into()));
+            }
+
             batch.put(key_exists(hash), b"1");
             batch.put(key_tip(hash), b"1");
 

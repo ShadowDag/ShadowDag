@@ -205,7 +205,7 @@ impl BlockTemplate {
         let en_hex  = encode_hex_u64(self.extra_nonce);
         format!(
             "{{\"id\":null,\"method\":\"mining.notify\",\
-             \"params\":[\"{}\",{},\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",[{}],{},true]}}\n",
+             \"params\":[\"{}\",{},\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",[{}],{}]}}\n",
             self.job_id, self.version, self.prev_hash, self.merkle_root,
             ts_hex, diff_hex, en_hex,
             parents_json, self.clean_jobs,
@@ -372,7 +372,22 @@ impl StratumServer {
         }
 
         let worker_name = &req.params[0];
+        let job_id = &req.params[1];
         let nonce_hex = &req.params[2];
+
+        // Validate job_id matches current template
+        {
+            let template = self.current_template.read().unwrap_or_else(|e| e.into_inner());
+            match template.as_ref() {
+                Some(t) if t.job_id != *job_id => {
+                    return StratumResponse::err(req.id, "Stale job_id");
+                }
+                None => {
+                    return StratumResponse::err(req.id, "No current job");
+                }
+                _ => {}
+            }
+        }
 
         // Find the submitting worker first to get their current difficulty
         let mut workers = self.workers.write().unwrap_or_else(|e| e.into_inner());

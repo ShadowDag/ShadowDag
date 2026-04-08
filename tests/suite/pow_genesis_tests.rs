@@ -73,22 +73,22 @@ mod pow_tests {
 
     #[test]
     fn coinbase_hash_deterministic() {
-        let h1 = Miner::coinbase_hash("shadow1miner", 1735689600, 5);
-        let h2 = Miner::coinbase_hash("shadow1miner", 1735689600, 5);
+        let h1 = Miner::coinbase_hash("shadow1miner", 1735689600, 5, 950, 50, 0);
+        let h2 = Miner::coinbase_hash("shadow1miner", 1735689600, 5, 950, 50, 0);
         assert_eq!(h1, h2);
     }
 
     #[test]
     fn coinbase_hash_unique_per_height() {
-        let h1 = Miner::coinbase_hash("shadow1miner", 1735689600, 5);
-        let h2 = Miner::coinbase_hash("shadow1miner", 1735689600, 6);
+        let h1 = Miner::coinbase_hash("shadow1miner", 1735689600, 5, 950, 50, 0);
+        let h2 = Miner::coinbase_hash("shadow1miner", 1735689600, 6, 950, 50, 0);
         assert_ne!(h1, h2);
     }
 
     #[test]
     fn coinbase_hash_unique_per_miner() {
-        let h1 = Miner::coinbase_hash("shadow1miner_a", 1735689600, 5);
-        let h2 = Miner::coinbase_hash("shadow1miner_b", 1735689600, 5);
+        let h1 = Miner::coinbase_hash("shadow1miner_a", 1735689600, 5, 950, 50, 0);
+        let h2 = Miner::coinbase_hash("shadow1miner_b", 1735689600, 5, 950, 50, 0);
         assert_ne!(h1, h2);
     }
 }

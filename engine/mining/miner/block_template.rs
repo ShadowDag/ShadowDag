@@ -239,15 +239,10 @@ impl BlockTemplateBuilder {
 
             if !tx.is_coinbase()
                 && !TxValidator::validate_tx(&tx, utxo_set) {
-                    let all_staged = tx.inputs.iter().all(|i| {
-                        match utxo_key(&i.txid, i.index) {
-                            Ok(k) => staged_utxos.contains_key(&k),
-                            Err(_) => false,
-                        }
-                    });
-                    if !all_staged {
-                        continue;
-                    }
+                    // TX failed full validation — reject it regardless of staged UTXO status.
+                    // Previously, TXs whose inputs were all in staged_utxos were accepted
+                    // even when signature/fee/ring checks failed. This bypassed consensus.
+                    continue;
                 }
 
             let mut skip = false;
@@ -320,8 +315,11 @@ impl BlockTemplateBuilder {
             }
         }
 
-        for (_, tx) in tx_map {
-            result.push(tx);
+        // Remaining TXs in tx_map have unresolved dependencies (cycles or missing
+        // parents within the batch). Drop them rather than appending unsorted,
+        // which would violate topological ordering guarantees.
+        if !tx_map.is_empty() {
+            slog_warn!("mining", "topological_sort_dropped_txs", count => tx_map.len());
         }
 
         result

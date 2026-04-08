@@ -123,6 +123,11 @@ impl GhostDag {
         let hash = block.hash.clone();
 
         if block.parents.is_empty() {
+            if block.height != 0 {
+                return Err(DagError::InvalidParent(
+                    "only genesis (height=0) may have no parents".into(),
+                ));
+            }
             self.store_genesis(&hash, &block)?;
             return Ok(GhostdagData {
                 blue_score: 0,
@@ -148,7 +153,7 @@ impl GhostDag {
         let blue_set = blue_set_diff.clone();
 
         let blue_score =
-            self.get_blue_score(&selected_parent) + merge_blues.len() as u64;
+            self.get_blue_score(&selected_parent) + merge_blues.len() as u64 + 1;
 
         let chain_height =
             self.get_chain_height(&selected_parent) + 1;
@@ -404,7 +409,10 @@ impl GhostDag {
         let mut tips: Vec<String> =
             self.get_tips_inner().into_iter().collect();
 
-        tips.sort_by_key(|t| std::cmp::Reverse(self.get_blue_score(t)));
+        tips.sort_by(|a, b| {
+            self.get_blue_score(b).cmp(&self.get_blue_score(a))
+                .then_with(|| a.cmp(b)) // deterministic tiebreak by hash
+        });
         tips
     }
 
