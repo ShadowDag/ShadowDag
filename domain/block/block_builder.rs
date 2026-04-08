@@ -9,6 +9,7 @@ use crate::domain::block::block_header::BlockHeader;
 use crate::domain::block::merkle_tree::MerkleTree;
 use crate::domain::transaction::transaction::Transaction;
 use crate::domain::traits::tx_pool::TxPool;
+use crate::config::consensus::consensus_params::ConsensusParams;
 
 pub struct BlockBuilder;
 
@@ -48,9 +49,19 @@ impl BlockBuilder {
         let mempool_txs: Vec<Transaction> =
             tx_pool.get_prioritized_txs(max_txs.saturating_sub(1));
 
-        // Coinbase first, then mempool transactions
+        // Coinbase first, then mempool transactions filtered by block gas budget
         let mut all_txs = vec![coinbase];
-        all_txs.extend(mempool_txs);
+        let mut block_gas_used: u64 = 0;
+        let max_block_gas = ConsensusParams::MAX_BLOCK_GAS;
+
+        for tx in mempool_txs {
+            let tx_gas = tx.gas_limit.unwrap_or(0);
+            if tx_gas > 0 && block_gas_used + tx_gas > max_block_gas {
+                break; // Block gas limit reached
+            }
+            block_gas_used += tx_gas;
+            all_txs.push(tx);
+        }
 
         #[allow(deprecated)]
         let merkle_root = {

@@ -374,6 +374,44 @@ impl Mempool {
             }
         }
 
+        // ── L1.7 Contract TX validation ────────────────────────────────
+        if tx.tx_type == TxType::ContractCreate {
+            // Must have deploy code
+            if tx.deploy_code.is_none() && tx.payload_hash.is_none() {
+                return false;
+            }
+            // Must have gas_limit
+            if tx.gas_limit.unwrap_or(0) == 0 {
+                return false;
+            }
+            // Intrinsic gas check: base cost + per-byte cost
+            let code_len = tx.deploy_code.as_ref().map(|c| c.len()).unwrap_or(0) as u64;
+            let intrinsic_gas = 32_000 + code_len * 200; // CREATE base + per-byte
+            if tx.gas_limit.unwrap_or(0) < intrinsic_gas {
+                return false;
+            }
+            // Must have sufficient fee to cover gas
+            let min_fee = tx.gas_limit.unwrap_or(0) / 1000; // 0.1% of gas as minimum fee
+            if tx.fee < min_fee.max(MIN_RELAY_FEE) {
+                return false;
+            }
+        }
+        if tx.tx_type == TxType::ContractCall {
+            // Must have target contract address
+            if tx.contract_address.is_none() {
+                return false;
+            }
+            // Must have gas_limit
+            if tx.gas_limit.unwrap_or(0) == 0 {
+                return false;
+            }
+            // Minimum fee
+            let min_fee = tx.gas_limit.unwrap_or(0) / 1000;
+            if tx.fee < min_fee.max(MIN_RELAY_FEE) {
+                return false;
+            }
+        }
+
         // ── L2 Structural: signature verification (prevents flood) ───
         if !tx.is_coinbase()
             && !TxValidator::verify_signatures(tx) {
