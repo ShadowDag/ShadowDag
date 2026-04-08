@@ -249,8 +249,10 @@ impl FinalityManager {
             self.close_epoch();
         }
 
-        // Check if checkpoint should be created
-        self.maybe_create_checkpoint(height, hash);
+        // Only create checkpoints for blue (canonical) blocks
+        if is_blue {
+            self.maybe_create_checkpoint(height, hash);
+        }
     }
 
     /// Close the current epoch, compute metrics, and adjust finality depth.
