@@ -93,6 +93,23 @@ pub struct AbiEvent {
     pub anonymous: bool,
 }
 
+impl AbiEvent {
+    /// Compute the canonical event signature: EventName(type1,type2,...).
+    pub fn signature(&self) -> String {
+        let params: Vec<String> = self.params.iter()
+            .map(|p| p.abi_type.name().to_string())
+            .collect();
+        format!("{}({})", self.name, params.join(","))
+    }
+}
+
+/// Decoded event with parameter names and values
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecodedEvent {
+    pub name: String,
+    pub params: Vec<(String, String)>,
+}
+
 /// Complete contract ABI
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContractAbi {
@@ -231,6 +248,66 @@ impl ContractAbi {
     /// Deserialize ABI from JSON
     pub fn from_json(json: &str) -> Result<Self, VmError> {
         serde_json::from_str(json).map_err(|e| VmError::ContractError(format!("ABI parse error: {}", e)))
+    }
+
+    /// Decode return data bytes according to a function's output types.
+    /// Returns a vector of (name, hex_value) pairs.
+    pub fn decode_return(&self, function_name: &str, data: &[u8]) -> Result<Vec<(String, String)>, String> {
+        let func = self.find_by_name(function_name)
+            .ok_or_else(|| format!("function '{}' not found", function_name))?;
+
+        let mut results = Vec::new();
+        let mut offset = 0;
+
+        for param in &func.outputs {
+            let size = Self::expected_arg_size(&param.abi_type);
+            match size {
+                Some(s) => {
+                    if offset + s > data.len() {
+                        return Err(format!("insufficient return data for param '{}'", param.name));
+                    }
+                    results.push((param.name.clone(), hex::encode(&data[offset..offset+s])));
+                    offset += s;
+                }
+                None => {
+                    // Variable-length: read until end
+                    results.push((param.name.clone(), hex::encode(&data[offset..])));
+                    break;
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Decode a log event using the ABI event definition.
+    /// Matches topic0 (event selector) to find the event, then decodes
+    /// indexed parameters from remaining topics and non-indexed from data.
+    pub fn decode_event(&self, topics: &[String], data: &[u8]) -> Result<DecodedEvent, String> {
+        if topics.is_empty() {
+            return Err("no topics in log entry".into());
+        }
+
+        // Find matching event by topic0 (selector)
+        let topic0 = &topics[0];
+        let event = self.events.iter()
+            .find(|e| {
+                let selector = hex::encode(&Self::compute_selector(&e.name, &e.params)[..]);
+                selector.starts_with(topic0) || topic0.starts_with(&selector)
+            })
+            .ok_or_else(|| format!("no matching event for topic0 '{}'", topic0))?;
+
+        Ok(DecodedEvent {
+            name: event.name.clone(),
+            params: event.params.iter().enumerate().map(|(i, p)| {
+                let value = if i + 1 < topics.len() {
+                    topics[i + 1].clone() // indexed params from topics
+                } else {
+                    hex::encode(data) // non-indexed from data
+                };
+                (p.name.clone(), value)
+            }).collect(),
+        })
     }
 }
 

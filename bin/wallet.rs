@@ -11,6 +11,10 @@
 //   shadowdag-wallet send <to> <amount>   # Send SDAG
 //   shadowdag-wallet info                 # Show wallet info
 //   shadowdag-wallet export               # Export keys
+//   shadowdag-wallet deploy <hex> [gas]   # Deploy contract
+//   shadowdag-wallet call <addr> <hex>    # Call contract
+//   shadowdag-wallet receipt <tx_hash>    # Get receipt
+//   shadowdag-wallet logs [address]       # Get contract logs
 // =============================================================================
 
 use std::io::{self, Write};
@@ -252,6 +256,10 @@ fn main() {
         "stealth"         => cmd_stealth(&args),
         "invisible"       => cmd_invisible(&args),
         "export"          => cmd_export(),
+        "deploy"          => cmd_deploy(&args),
+        "call"            => cmd_call(&args),
+        "receipt"         => cmd_receipt(&args),
+        "logs"            => cmd_logs(&args),
         "version" | "--version" | "-v" => println!("ShadowDAG Wallet v1.0.0"),
         "help" | "--help" | "-h" => print_help(),
         _ => print_help(),
@@ -606,6 +614,90 @@ fn cmd_export() {
     }
 }
 
+fn cmd_deploy(args: &[String]) {
+    let bytecode_hex = args.get(2).expect("Usage: wallet deploy <bytecode_hex> [gas_limit] [value]");
+    let gas_limit: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10_000_000);
+    let value: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    let bytecode = match hex::decode(bytecode_hex) {
+        Ok(b) => b,
+        Err(e) => { eprintln!("Invalid bytecode hex: {}", e); return; }
+    };
+
+    println!("Deploying contract...");
+    println!("  Bytecode size: {} bytes", bytecode.len());
+    println!("  Gas limit:     {}", gas_limit);
+    println!("  Value:         {} sats", value);
+
+    // Build TX
+    let mut wallet = match load_and_unlock_wallet() {
+        Ok(w) => w,
+        Err(e) => { eprintln!("Wallet error: {}", e); return; }
+    };
+
+    match wallet.build_deploy_tx(0, bytecode, value, gas_limit, 1000) {
+        Ok(tx) => {
+            println!("  TX hash:       {}", tx.hash);
+            println!("  TX type:       ContractCreate");
+            println!("  VM version:    1");
+            println!("\nTransaction built. Submit via RPC: deploy_contract");
+        }
+        Err(e) => eprintln!("Failed to build deploy TX: {}", e),
+    }
+}
+
+fn cmd_call(args: &[String]) {
+    let contract_addr = args.get(2).expect("Usage: wallet call <contract_address> <calldata_hex> [gas_limit] [value]");
+    let calldata_hex = args.get(3).expect("calldata_hex required");
+    let gas_limit: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10_000_000);
+    let value: u64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    let calldata = match hex::decode(calldata_hex) {
+        Ok(b) => b,
+        Err(e) => { eprintln!("Invalid calldata hex: {}", e); return; }
+    };
+
+    println!("Calling contract {}...", contract_addr);
+    println!("  Calldata:   {} bytes", calldata.len());
+    println!("  Gas limit:  {}", gas_limit);
+    println!("  Value:      {} sats", value);
+
+    let mut wallet = match load_and_unlock_wallet() {
+        Ok(w) => w,
+        Err(e) => { eprintln!("Wallet error: {}", e); return; }
+    };
+
+    match wallet.build_call_tx(0, contract_addr, calldata, value, gas_limit, 1000) {
+        Ok(tx) => {
+            println!("  TX hash:    {}", tx.hash);
+            println!("  TX type:    ContractCall");
+            println!("\nTransaction built. Submit via RPC: call_contract");
+        }
+        Err(e) => eprintln!("Failed to build call TX: {}", e),
+    }
+}
+
+fn cmd_receipt(args: &[String]) {
+    let tx_hash = args.get(2).expect("Usage: wallet receipt <tx_hash>");
+    println!("Fetching receipt for {}...", tx_hash);
+    println!("  Use RPC: get_transaction_receipt {}", tx_hash);
+    // In a full implementation, this would connect to the local RPC
+    // and fetch the receipt. For now, print instructions.
+    println!("\n  curl -X POST http://localhost:9332 \\");
+    println!("    -d '{{\"jsonrpc\":\"2.0\",\"method\":\"get_transaction_receipt\",\"params\":[\"{}\"],\"id\":1}}'", tx_hash);
+}
+
+fn cmd_logs(args: &[String]) {
+    let address = args.get(2).unwrap_or(&String::new()).clone();
+    println!("Fetching logs...");
+    if !address.is_empty() {
+        println!("  Address filter: {}", address);
+    }
+    println!("\n  Use RPC: get_logs with filter parameters");
+    println!("  curl -X POST http://localhost:9332 \\");
+    println!("    -d '{{\"jsonrpc\":\"2.0\",\"method\":\"get_logs\",\"params\":[\"{}\"],\"id\":1}}'", address);
+}
+
 fn print_help() {
     println!("ShadowDAG Wallet v1.0.0");
     println!();
@@ -620,6 +712,15 @@ fn print_help() {
     println!("  invisible [network]     Create invisible wallet (ghost mode)");
     println!("  export                  Export wallet keys as JSON");
     println!("  info                    Show wallet info");
+    println!();
+    println!("CONTRACT COMMANDS:");
+    println!("  deploy <bytecode_hex> [gas_limit] [value]");
+    println!("                          Deploy a smart contract");
+    println!("  call <contract_addr> <calldata_hex> [gas_limit] [value]");
+    println!("                          Call a smart contract function");
+    println!("  receipt <tx_hash>       Fetch a transaction receipt");
+    println!("  logs [address]          Fetch contract logs");
+    println!();
     println!("  help                    Show this help");
     println!();
     println!("ENVIRONMENT:");

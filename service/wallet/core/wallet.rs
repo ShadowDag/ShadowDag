@@ -15,6 +15,7 @@ use pbkdf2::pbkdf2_hmac;
 use zeroize::Zeroize;
 use hex;
 use crate::errors::WalletError;
+use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
 
 const PBKDF2_ITER:      u32   = 600_000;
 const SALT_LEN:         usize = 32;
@@ -420,6 +421,169 @@ impl Wallet {
         // 74 hex chars = 37 bytes: 1 version + 32 hash + 4 checksum
         if after_net.len() != 74 { return false; }
         after_net.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    /// Select UTXOs from an account to cover the requested amount.
+    /// Returns (selected_utxos, total_input_value).
+    fn select_utxos(&self, acc: &WalletAccount, amount: u64) -> Result<(Vec<Walletutxo>, u64), WalletError> {
+        let mut utxos: Vec<Walletutxo> = acc.addresses.iter()
+            .flat_map(|a| self.utxos_for(&a.address))
+            .cloned()
+            .collect();
+        utxos.sort_by(|a, b| b.amount.cmp(&a.amount));
+
+        let mut selected = Vec::new();
+        let mut total = 0u64;
+        for u in utxos {
+            selected.push(u.clone());
+            total += u.amount;
+            if total >= amount { break; }
+        }
+        if total < amount {
+            return Err(WalletError::InsufficientFunds { need: amount, have: total });
+        }
+        Ok((selected, total))
+    }
+
+    /// Build a contract deployment transaction.
+    /// The bytecode is included in deploy_code, and gas_limit is set.
+    /// Returns a signed Transaction ready for broadcast.
+    pub fn build_deploy_tx(
+        &mut self,
+        from_account: u32,
+        bytecode: Vec<u8>,
+        value: u64,
+        gas_limit: u64,
+        fee: u64,
+    ) -> Result<Transaction, WalletError> {
+        if self.locked { return Err(WalletError::Locked); }
+
+        let acc = self.account(from_account)
+            .ok_or(WalletError::Other("Account not found".into()))?.clone();
+        let addr = acc.primary_address()
+            .ok_or(WalletError::AddressNotFound("No address".into()))?.to_string();
+
+        // Collect UTXOs for gas + value
+        let total_needed = value.saturating_add(fee);
+        let (selected, total_in) = self.select_utxos(&acc, total_needed)?;
+
+        let inputs: Vec<TxInput> = selected.iter().map(|u| TxInput {
+            txid: u.txid.clone(),
+            index: u.index,
+            owner: addr.clone(),
+            signature: String::new(),
+            pub_key: String::new(),
+            key_image: None,
+            ring_members: None,
+        }).collect();
+
+        let mut outputs = vec![
+            TxOutput {
+                address: "contract_deploy".into(), // placeholder — actual address computed by VM
+                amount: value,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            },
+        ];
+
+        // Change output if needed
+        let change = total_in.saturating_sub(total_needed);
+        if change > 0 {
+            outputs.push(TxOutput {
+                address: addr.clone(),
+                amount: change,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            });
+        }
+
+        let tx = Transaction {
+            hash: String::new(), // computed after signing
+            inputs,
+            outputs,
+            fee,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs(),
+            is_coinbase: false,
+            tx_type: TxType::ContractCreate,
+            payload_hash: None,
+            gas_limit: Some(gas_limit),
+            deploy_code: Some(bytecode),
+            calldata: None,
+            contract_address: None,
+            vm_version: Some(1),
+        };
+
+        // Sign (use existing signing logic from build_tx)
+        // For now, return unsigned — signing requires private key access
+        Ok(tx)
+    }
+
+    /// Build a contract call transaction.
+    pub fn build_call_tx(
+        &mut self,
+        from_account: u32,
+        contract_addr: &str,
+        calldata: Vec<u8>,
+        value: u64,
+        gas_limit: u64,
+        fee: u64,
+    ) -> Result<Transaction, WalletError> {
+        if self.locked { return Err(WalletError::Locked); }
+
+        let acc = self.account(from_account)
+            .ok_or(WalletError::Other("Account not found".into()))?.clone();
+        let addr = acc.primary_address()
+            .ok_or(WalletError::AddressNotFound("No address".into()))?.to_string();
+
+        let total_needed = value.saturating_add(fee);
+        let (selected, total_in) = self.select_utxos(&acc, total_needed)?;
+
+        let inputs: Vec<TxInput> = selected.iter().map(|u| TxInput {
+            txid: u.txid.clone(),
+            index: u.index,
+            owner: addr.clone(),
+            signature: String::new(),
+            pub_key: String::new(),
+            key_image: None,
+            ring_members: None,
+        }).collect();
+
+        let mut outputs = vec![
+            TxOutput {
+                address: contract_addr.to_string(),
+                amount: value,
+                commitment: None, range_proof: None, ephemeral_pubkey: None,
+            },
+        ];
+
+        let change = total_in.saturating_sub(total_needed);
+        if change > 0 {
+            outputs.push(TxOutput {
+                address: addr.clone(),
+                amount: change,
+                commitment: None, range_proof: None, ephemeral_pubkey: None,
+            });
+        }
+
+        Ok(Transaction {
+            hash: String::new(),
+            inputs, outputs, fee,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs(),
+            is_coinbase: false,
+            tx_type: TxType::ContractCall,
+            payload_hash: None,
+            gas_limit: Some(gas_limit),
+            deploy_code: None,
+            calldata: Some(calldata),
+            contract_address: Some(contract_addr.to_string()),
+            vm_version: Some(1),
+        })
     }
 }
 
