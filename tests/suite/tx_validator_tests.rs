@@ -68,13 +68,16 @@ mod tests {
 
     #[test]
     fn free_validate_basic_valid_tx() {
-        let _tx = make_tx(
+        let mut tx = make_tx(
             "abc123",
             vec![],
             vec![make_output("addr1", 100)],
         );
-        // Note: validate_tx structural check does not verify hash integrity
+        // Mark as coinbase so it passes the "non-coinbase must have inputs" rule
+        tx.is_coinbase = true;
+        // validate_tx structural check does not verify hash integrity
         // so a coinbase with valid outputs should pass structural checks
+        assert!(validate_tx(&tx), "valid coinbase TX should pass free validation");
     }
 
     #[test]
