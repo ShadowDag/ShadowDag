@@ -16,35 +16,42 @@ impl VMContext {
         Self { storage }
     }
 
-    /// Write a key-value pair. Logs and ignores errors at this layer so that
-    /// callers (Executor, VM) that previously assumed infallible writes continue
-    /// to compile. The underlying `ContractStorage::set_state` now returns
-    /// `Result<(), StorageError>` for callers that need the error.
-    pub fn set(&self, key: &str, value: &str) {
-        if let Err(e) = self.storage.set_state(key, value) {
+    /// Write a key-value pair to storage.
+    ///
+    /// Returns `Result<(), StorageError>` so callers can handle failures.
+    /// On error, logs the failure before propagating.
+    pub fn set(&self, key: &str, value: &str) -> Result<(), StorageError> {
+        self.storage.set_state(key, value).inspect_err(|e| {
             slog_error!("runtime", "vm_context_set_failed", key => key, error => &e.to_string());
-        }
+        })
     }
 
     pub fn get(&self, key: &str) -> Option<String> {
         self.storage.get_state(key)
     }
 
-    /// Delete a key. Logs and ignores errors at this layer (see `set` rationale).
-    pub fn delete(&self, key: &str) {
-        if let Err(e) = self.storage.delete_state(key) {
+    /// Delete a key from storage.
+    ///
+    /// Returns `Result<(), StorageError>` so callers can handle failures.
+    /// On error, logs the failure before propagating.
+    pub fn delete(&self, key: &str) -> Result<(), StorageError> {
+        self.storage.delete_state(key).inspect_err(|e| {
             slog_error!("runtime", "vm_context_delete_failed", key => key, error => &e.to_string());
-        }
+        })
     }
 
-    /// Write with full error propagation for callers that need it.
+    /// Write with full error propagation.
+    /// DEPRECATED: use `set()` directly, which now returns Result.
+    #[deprecated(note = "use set() directly, which now returns Result")]
     pub fn set_checked(&self, key: &str, value: &str) -> Result<(), StorageError> {
-        self.storage.set_state(key, value)
+        self.set(key, value)
     }
 
-    /// Delete with full error propagation for callers that need it.
+    /// Delete with full error propagation.
+    /// DEPRECATED: use `delete()` directly, which now returns Result.
+    #[deprecated(note = "use delete() directly, which now returns Result")]
     pub fn delete_checked(&self, key: &str) -> Result<(), StorageError> {
-        self.storage.delete_state(key)
+        self.delete(key)
     }
 
     /// Get the DB path for creating sub-contexts

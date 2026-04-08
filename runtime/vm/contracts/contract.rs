@@ -55,7 +55,7 @@ impl Contract {
         let ctx     = VMContext::new(storage);
 
         let executor = Executor::new(ctx);
-        executor.execute(key, value);
+        executor.execute(key, value)?;
         Ok(())
     }
 }

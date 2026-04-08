@@ -319,6 +319,7 @@ pub mod runtime {
             pub mod opcodes;
             pub mod state_manager;
             pub mod u256;
+            pub mod v1_spec;
             pub mod vm;
             pub mod vm_context;
         }

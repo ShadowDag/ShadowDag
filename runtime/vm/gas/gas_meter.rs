@@ -10,9 +10,10 @@
 // insufficient, execution halts immediately with OutOfGas.
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Maximum gas refund as a fraction of gas_used.
-/// EIP-3529 reduced this from 50% to 20% in Ethereum.
-/// ShadowDAG uses 50% (pre-London behavior).
+/// Gas refund quotient for v1: refund capped at gas_used / 2 (50%).
+/// This is the pre-London (EIP-3529) behavior. For v2, consider reducing to
+/// 20% to align with modern Ethereum. This is a chain-level parameter
+/// defined in v1_spec::GAS_REFUND_QUOTIENT.
 const MAX_REFUND_QUOTIENT: u64 = 2;
 
 /// Tracks gas consumption during a single contract execution.

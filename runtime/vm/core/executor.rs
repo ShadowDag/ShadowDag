@@ -91,11 +91,11 @@ impl Executor {
 
                 // Also store bytecode and metadata via legacy path for backward compat
                 let code_key = format!("code:{}", contract_addr);
-                self.context.set(&code_key, &hex::encode(bytecode));
+                self.context.set(&code_key, &hex::encode(bytecode))?;
 
                 let meta_key = format!("meta:{}", contract_addr);
                 let meta = format!("deployer={},nonce={},size={}", deployer, nonce, bytecode.len());
-                self.context.set(&meta_key, &meta);
+                self.context.set(&meta_key, &meta)?;
 
                 ExecutionResult::Success { gas_used, return_data, logs }
             }
@@ -200,8 +200,8 @@ impl Executor {
     }
 
     /// Simple KV execute (legacy)
-    pub fn execute(&self, key: &str, value: &str) {
-        self.context.set(key, value);
+    pub fn execute(&self, key: &str, value: &str) -> Result<(), crate::errors::StorageError> {
+        self.context.set(key, value)
     }
 
     /// Check if a contract exists
@@ -217,48 +217,15 @@ impl Executor {
             .and_then(|hex_str| hex::decode(&hex_str).ok())
     }
 
-    /// Validate that bytecode does not contain unsupported opcodes.
+    /// Validate that bytecode contains only v1-spec opcodes.
     ///
-    /// This scan is PUSH-aware: when a PUSHn opcode is encountered the
-    /// following n data bytes are skipped so that embedded constants that
-    /// happen to equal an unsupported opcode value do not cause false
-    /// positives.
-    ///
-    /// ShadowVM PUSH opcodes and their data sizes:
-    ///   PUSH1  (0x10) -> 1 byte
-    ///   PUSH2  (0x11) -> 2 bytes
-    ///   PUSH4  (0x12) -> 4 bytes
-    ///   PUSH8  (0x13) -> 8 bytes
-    ///   PUSH16 (0x14) -> 16 bytes
-    ///   PUSH32 (0x15) -> 32 bytes
+    /// Delegates to `v1_spec::validate_v1_bytecode()` which is the single
+    /// source of truth for the v1 opcode set. The scan is PUSH-aware:
+    /// inline data bytes following PUSHn instructions are skipped so that
+    /// embedded constants are not mistaken for opcodes.
     fn validate_supported_opcodes(bytecode: &[u8]) -> Result<(), VmError> {
-        // All opcodes are now supported including CALL, CALLCODE,
-        // DELEGATECALL, STATICCALL, CREATE, CREATE2, and SELFDESTRUCT.
-        // These are implemented in execution_env.rs.
-        //
-        // We still walk the bytecode to validate structural integrity
-        // (no truncated PUSH operands) but no opcodes are blocked.
-
-        let mut i = 0;
-        while i < bytecode.len() {
-            let op = bytecode[i];
-
-            // PUSH1..PUSH32 (0x10..0x15): skip the inline data bytes
-            let push_size: usize = match op {
-                0x10 => 1,  // PUSH1
-                0x11 => 2,  // PUSH2
-                0x12 => 4,  // PUSH4
-                0x13 => 8,  // PUSH8
-                0x14 => 16, // PUSH16
-                0x15 => 32, // PUSH32
-                _ => 0,
-            };
-            if push_size > 0 {
-                i += 1 + push_size; // skip opcode + data
-                continue;
-            }
-
-            i += 1;
+        if let Err((_pos, byte)) = crate::runtime::vm::core::v1_spec::validate_v1_bytecode(bytecode) {
+            return Err(VmError::InvalidOpcode(byte));
         }
         Ok(())
     }
