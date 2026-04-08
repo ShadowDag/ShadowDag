@@ -31,8 +31,10 @@ impl PedersenCommitment {
 
         let h_point = Self::_h_point();
 
+        // Standard Pedersen: C = v*H + r*G
+        // H = value generator (nothing-up-my-sleeve), G = blinding generator (basepoint)
         let commitment: RistrettoPoint =
-            v * RISTRETTO_BASEPOINT_POINT + r * h_point;
+            v * h_point + r * RISTRETTO_BASEPOINT_POINT;
 
         let compressed     = commitment.compress();
         let commitment_hex = hex::encode(compressed.as_bytes());
@@ -61,8 +63,9 @@ impl PedersenCommitment {
 
         let r = Scalar::from_canonical_bytes(r_arr).unwrap();
 
+        // Standard Pedersen: C = v*H + r*G (must match commit_with_blinding)
         let h_point     = Self::_h_point();
-        let expected: RistrettoPoint = v * RISTRETTO_BASEPOINT_POINT + r * h_point;
+        let expected: RistrettoPoint = v * h_point + r * RISTRETTO_BASEPOINT_POINT;
         let expected_hex = hex::encode(expected.compress().as_bytes());
 
         

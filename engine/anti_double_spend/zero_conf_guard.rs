@@ -138,8 +138,17 @@ impl ZeroConfGuard {
         self.block_inputs.retain(|_, (_, h)| *h > cutoff);
     }
 
-    /// Is a TX safe (enough confirmations)?
-    pub fn is_safe(&self, _tx_hash: &str, confirmations: u64) -> bool {
+    /// Check if a TX has any active double-spend alerts.
+    pub fn has_alert(&self, tx_hash: &str) -> bool {
+        self.alerts.iter().any(|a| a.tx_hash_1 == tx_hash || a.tx_hash_2 == tx_hash)
+    }
+
+    /// Is a TX safe (enough confirmations and no active alerts)?
+    pub fn is_safe(&self, tx_hash: &str, confirmations: u64) -> bool {
+        // A TX with active conflict alerts is never considered safe
+        if self.has_alert(tx_hash) {
+            return false;
+        }
         confirmations >= SAFE_CONFIRMATIONS
     }
 
