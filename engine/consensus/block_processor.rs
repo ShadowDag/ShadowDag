@@ -160,26 +160,41 @@ impl BlockProcessor {
 
             if let Err(e) = utxo_set.apply_block(&block.body.transactions, height) {
 
-                // 🔥 rollback partial apply
+                let original_error = format!("apply failed at {}: {}", hash, e);
+
+                // rollback partial apply
+                let mut restore_failed = false;
+                let mut restore_err_msg = String::new();
                 for prev in applied.iter().rev() {
                     if let Some(b) = block_store.get_block(prev) {
                         #[allow(deprecated)]
                         if let Err(re) = utxo_set.rollback_block(&b.body.transactions) {
                             slog_error!("consensus", "restore_after_failed_reorg", error => re);
+                            restore_failed = true;
+                            restore_err_msg = format!("{}", re);
                         }
                     }
                 }
 
-                // 🔥 restore old chain
+                // restore old chain
                 for h in rollback_chain.iter().rev() {
                     if let Some(b) = block_store.get_block(h) {
                         if let Err(re) = utxo_set.apply_block(&b.body.transactions, b.header.height) {
-                            slog_error!("consensus", "restore_after_failed_reorg", error => re);
+                            slog_error!("consensus", "critical_restore_failed_during_reorg", error => re);
+                            restore_failed = true;
+                            restore_err_msg = format!("{}", re);
                         }
                     }
                 }
 
-                return Err(ConsensusError::ReorgRejected(format!("apply failed at {}: {}", hash, e)));
+                if restore_failed {
+                    return Err(ConsensusError::Other(format!(
+                        "CRITICAL: reorg failed ({}) AND restore also failed ({}). UTXO state may be inconsistent.",
+                        original_error, restore_err_msg
+                    )));
+                }
+
+                return Err(ConsensusError::ReorgRejected(original_error));
             }
 
             applied.push(hash.clone());

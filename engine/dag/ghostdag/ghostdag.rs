@@ -506,8 +506,13 @@ impl GhostDag {
     ) -> Result<(), DagError> {
         let mut batch = WriteBatch::default();
 
-        batch.put(format!("{}{}", PFX_BLOCK, hash), bincode::serialize(block).unwrap_or_default());
-        batch.put(format!("{}{}", PFX_PARENTS, hash), bincode::serialize(&block.parents).unwrap_or_default());
+        let block_data = bincode::serialize(block)
+            .map_err(|e| DagError::Storage(StorageError::Serialization(e.to_string())))?;
+        batch.put(format!("{}{}", PFX_BLOCK, hash), &block_data);
+
+        let parents_data = bincode::serialize(&block.parents)
+            .map_err(|e| DagError::Storage(StorageError::Serialization(e.to_string())))?;
+        batch.put(format!("{}{}", PFX_PARENTS, hash), &parents_data);
 
         for p in &block.parents {
             let mut children = self.get_children_inner(p);
@@ -516,11 +521,17 @@ impl GhostDag {
                 children.push(hash.to_string());
             }
 
-            batch.put(format!("{}{}", PFX_CHILDREN, p), bincode::serialize(&children).unwrap_or_default());
+            let children_data = bincode::serialize(&children)
+                .map_err(|e| DagError::Storage(StorageError::Serialization(e.to_string())))?;
+            batch.put(format!("{}{}", PFX_CHILDREN, p), &children_data);
         }
 
         batch.put(format!("{}{}", PFX_BLUE_SCORE, hash), blue_score.to_le_bytes());
-        batch.put(format!("{}{}", PFX_BLUE_SET, hash), bincode::serialize(blue_set).unwrap_or_default());
+
+        let blue_set_data = bincode::serialize(blue_set)
+            .map_err(|e| DagError::Storage(StorageError::Serialization(e.to_string())))?;
+        batch.put(format!("{}{}", PFX_BLUE_SET, hash), &blue_set_data);
+
         batch.put(format!("{}{}", PFX_CHAIN_HEIGHT, hash), chain_height.to_le_bytes());
         batch.put(format!("{}{}", PFX_SEL_PARENT, hash), sel_parent.as_bytes());
         batch.put(format!("{}{}", PFX_ORDER, hash), order_index.to_le_bytes());
@@ -536,9 +547,9 @@ impl GhostDag {
         // inconsistency if the process crashes between block persist and
         // tips update.
         if let Some(tips) = new_tips {
-            if let Ok(data) = bincode::serialize(&tips) {
-                batch.put(PFX_TIPS, data);
-            }
+            let tips_data = bincode::serialize(&tips)
+                .map_err(|e| DagError::Storage(StorageError::Serialization(e.to_string())))?;
+            batch.put(PFX_TIPS, &tips_data);
         }
 
         self.db.write(batch).map_err(|e| DagError::Storage(StorageError::WriteFailed(e.to_string())))?;

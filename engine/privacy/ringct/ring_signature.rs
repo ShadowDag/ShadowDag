@@ -299,16 +299,33 @@ impl RingSignature {
         Self::sign_with_key(&pk, tx, &[]).is_ok()
     }
 
-    /// Legacy: verify with derived key (for tests)
+    /// WARNING: This is a LEGACY placeholder that does NOT verify the actual
+    /// ring signature embedded in the transaction. It generates a new signature
+    /// and verifies that, which always passes.
+    ///
+    /// TODO: Replace with CLSAG verification from clsag.rs for production.
+    /// Until then, this function provides only structural checks, not
+    /// cryptographic ring signature verification.
     pub fn verify(tx: &Transaction) -> bool {
-        // Can't verify without the signature data
-        // This legacy API always creates and immediately verifies
-        let mut pk = [0u8; 32];
-        OsRng.fill_bytes(&mut pk);
-        match Self::sign_with_key(&pk, tx, &[]) {
-            Ok(sig) => Self::verify_signature(&sig),
-            Err(_) => false,
+        // Structural checks: for confidential inputs, verify that ring data
+        // EXISTS and is well-formed, rather than self-signing.
+        for input in &tx.inputs {
+            // Only enforce ring data on inputs that claim to be confidential
+            // (i.e., they have a key_image set, indicating privacy TX usage).
+            if input.key_image.is_some() || tx.tx_type == crate::domain::transaction::transaction::TxType::Confidential {
+                // Check key_image is present, non-empty, and valid 64 hex chars
+                match &input.key_image {
+                    Some(ki) if ki.len() == 64 && ki.chars().all(|c| c.is_ascii_hexdigit()) => {}
+                    _ => return false,
+                }
+                // Check ring_members is present and non-empty
+                match &input.ring_members {
+                    Some(members) if !members.is_empty() && members.len() >= MIN_RING_SIZE && members.len() <= MAX_RING_SIZE => {}
+                    _ => return false,
+                }
+            }
         }
+        true
     }
 
     /// Legacy: get key image string

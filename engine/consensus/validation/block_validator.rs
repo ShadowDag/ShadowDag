@@ -244,7 +244,7 @@ impl BlockValidator {
                 if !TxValidator::validate_structure_for_network(tx, network) {
                     return Err(ConsensusError::BlockValidation(format!("tx {} structural validation failed", i)));
                 }
-                if !TxValidator::verify_signatures(tx) {
+                if !TxValidator::verify_signatures_for_network(tx, network) {
                     return Err(ConsensusError::BlockValidation(format!("tx {} signature verification failed", i)));
                 }
                 // Ring signature verification for confidential (privacy) transactions
@@ -903,6 +903,12 @@ impl BlockValidator {
     /// Validate a swap transaction's payload.
     /// SwapTx must carry a payload_hash containing the HTLC secret hash (64 hex chars).
     /// The first output must lock funds to the HTLC address.
+    ///
+    /// TODO: The HTLC lock destination (first output address) should be validated
+    /// to ensure it encodes a valid HTLC script address. Currently only the
+    /// secret hash format is checked, not whether the output actually locks
+    /// funds to the correct HTLC address derived from the secret hash and
+    /// participants' public keys.
     fn validate_swap_tx(tx: &Transaction) -> Result<(), ConsensusError> {
         // 1. Must have payload_hash (HTLC secret hash)
         let secret_hash = tx.payload_hash.as_ref()
@@ -924,6 +930,12 @@ impl BlockValidator {
 
     /// Validate a DEX order transaction's payload.
     /// DexOrder must carry a payload_hash encoding the order parameters.
+    ///
+    /// TODO: The order schema (encoded in payload_hash) should be parsed and
+    /// validated to ensure it contains valid order fields (pair, side, price,
+    /// quantity, expiry). Currently only the hex format is checked, not
+    /// whether the decoded data represents a well-formed order that the DEX
+    /// engine can match.
     fn validate_dex_order_tx(tx: &Transaction) -> Result<(), ConsensusError> {
         // 1. Must have payload_hash (order data)
         let order_data = tx.payload_hash.as_ref()

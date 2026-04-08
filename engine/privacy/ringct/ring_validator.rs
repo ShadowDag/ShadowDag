@@ -44,11 +44,19 @@ impl RingValidator {
             }
         }
         // 6. Ring size validation (minimum mixin for privacy)
-        // Each input must have ring_members with at least MIN_RING_SIZE entries
+        // Each input must have ring_members with at least MIN_RING_SIZE entries.
+        // For confidential TXs, ring_members MUST be present (not None).
         const MIN_RING_SIZE: usize = 4;  // Minimum 4 decoys for meaningful privacy
         const MAX_RING_SIZE: usize = 64; // Cap to prevent DoS
         for input in &tx.inputs {
-            if let Some(ref members) = input.ring_members {
+            if tx.tx_type == crate::domain::transaction::transaction::TxType::Confidential {
+                match &input.ring_members {
+                    Some(members) if members.len() >= MIN_RING_SIZE && members.len() <= MAX_RING_SIZE => {}
+                    Some(_members) => return false, // Wrong size
+                    None => return false, // Missing for confidential TX
+                }
+            } else if let Some(ref members) = input.ring_members {
+                // Non-confidential with ring_members -- still validate size
                 if members.len() < MIN_RING_SIZE || members.len() > MAX_RING_SIZE {
                     return false;
                 }
