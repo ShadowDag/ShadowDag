@@ -306,6 +306,8 @@ pub mod runtime {
             pub mod contract_deployer;
             pub mod contract_package;
             pub mod contract_storage;
+            pub mod contract_verifier;
+            pub mod build_manifest;
             pub mod token_standard;
         }
         pub mod core {
