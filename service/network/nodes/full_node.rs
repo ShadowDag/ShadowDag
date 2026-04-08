@@ -22,6 +22,11 @@ use crate::engine::consensus::difficulty::retarget::{RetargetEngine, BlockTimeRe
 use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
 use crate::service::network::dos_guard::{DosGuard, DosVerdict, MsgType};
 use crate::errors::{NodeError, ConsensusError};
+use crate::domain::transaction::transaction::TxType;
+use crate::runtime::vm::core::executor::Executor;
+use crate::runtime::vm::core::vm_context::VMContext;
+use crate::runtime::vm::core::vm::ExecutionResult;
+use crate::runtime::vm::contracts::contract_storage::ContractStorage;
 use crate::{slog_info, slog_warn, slog_error};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -557,6 +562,13 @@ impl FullNode {
             }
 
             if let Some(block) = self.block_store.get_block(block_hash) {
+                // ── CONTRACT EXECUTION (before UTXO processing) ─────────
+                // Intercept ContractCreate and ContractCall transactions
+                // and execute them through the ShadowVM. Contract execution
+                // is best-effort: failures are logged but do not halt block
+                // processing (UTXO fees are still applied).
+                Self::execute_contract_transactions(&block);
+
                 match self.utxo_set.apply_block_dag_ordered(
                     &block.body.transactions,
                     block.header.height,
@@ -694,6 +706,129 @@ impl FullNode {
         }
 
         Ok(())
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // CONTRACT EXECUTION
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Execute contract transactions (ContractCreate, ContractCall) within a block.
+    ///
+    /// This is called during virtual chain recomputation, before UTXO processing.
+    /// Contract execution is best-effort: failures are logged but do not halt
+    /// block acceptance (the UTXO layer still processes fees).
+    ///
+    /// A temporary ContractStorage is opened per block for isolation. Each
+    /// contract TX creates its own Executor and runs through the ShadowVM.
+    fn execute_contract_transactions(block: &Block) {
+        // Use a temp directory for contract storage per block to avoid lock conflicts
+        let contract_db_path = std::env::temp_dir()
+            .join(format!("shadowdag_contracts_{}", block.header.hash));
+        let contract_db_str = match contract_db_path.to_str() {
+            Some(s) => s.to_string(),
+            None => return,
+        };
+
+        let storage = match ContractStorage::new(contract_db_str.as_str()) {
+            Ok(s) => s,
+            Err(e) => {
+                slog_warn!("node", "contract_storage_init_failed", error => &e.to_string());
+                return;
+            }
+        };
+        let ctx = VMContext::new(storage);
+        let executor = Executor::new(ctx);
+
+        for tx in &block.body.transactions {
+            match tx.tx_type {
+                TxType::ContractCreate => {
+                    // Decode bytecode from payload_hash
+                    let payload = match &tx.payload_hash {
+                        Some(ph) => match hex::decode(ph) {
+                            Ok(bytes) => bytes,
+                            Err(_) => continue,
+                        },
+                        None => continue,
+                    };
+
+                    let deployer = tx.inputs.first()
+                        .map(|i| i.owner.clone())
+                        .unwrap_or_default();
+                    let value = tx.outputs.first()
+                        .map(|o| o.amount)
+                        .unwrap_or(0);
+                    let gas_limit = 10_000_000u64; // Default gas limit for contract TXs
+
+                    match executor.deploy(
+                        &payload,
+                        &deployer,
+                        value,
+                        gas_limit,
+                        block.header.timestamp,
+                        &block.header.hash,
+                        0, // nonce
+                    ) {
+                        Ok((addr, ref result)) => {
+                            match result {
+                                ExecutionResult::Success { gas_used, .. } => {
+                                    slog_info!("node", "contract_deployed",
+                                        address => &addr,
+                                        gas_used => &gas_used.to_string());
+                                }
+                                _ => {
+                                    slog_warn!("node", "contract_deploy_execution_failed",
+                                        tx => &tx.hash, address => &addr);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            slog_warn!("node", "contract_deploy_failed",
+                                tx => &tx.hash, error => &e.to_string());
+                        }
+                    }
+                }
+                TxType::ContractCall => {
+                    let target = tx.outputs.first()
+                        .map(|o| o.address.clone())
+                        .unwrap_or_default();
+                    let calldata = match &tx.payload_hash {
+                        Some(ph) => match hex::decode(ph) {
+                            Ok(bytes) => bytes,
+                            Err(_) => continue,
+                        },
+                        None => continue,
+                    };
+                    let caller = tx.inputs.first()
+                        .map(|i| i.owner.clone())
+                        .unwrap_or_default();
+                    let value = tx.outputs.first()
+                        .map(|o| o.amount)
+                        .unwrap_or(0);
+                    let gas_limit = 10_000_000u64;
+
+                    let result = executor.call(
+                        &target,
+                        &calldata,
+                        &caller,
+                        value,
+                        gas_limit,
+                        block.header.timestamp,
+                        &block.header.hash,
+                    );
+                    match &result {
+                        ExecutionResult::Success { gas_used, .. } => {
+                            slog_info!("node", "contract_called",
+                                target => &target,
+                                gas_used => &gas_used.to_string());
+                        }
+                        _ => {
+                            slog_warn!("node", "contract_call_failed", tx => &tx.hash);
+                        }
+                    }
+                }
+                _ => {} // Normal UTXO processing continues in apply_block_dag_ordered
+            }
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════

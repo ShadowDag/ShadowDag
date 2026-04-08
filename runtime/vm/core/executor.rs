@@ -9,10 +9,11 @@
 use sha2::{Sha256, Digest};
 
 use crate::errors::VmError;
-use crate::runtime::vm::core::vm::{VM, ExecutionResult};
+use crate::runtime::vm::core::vm::ExecutionResult;
 use crate::runtime::vm::core::vm_context::VMContext;
-use crate::runtime::vm::contracts::contract_storage::ContractStorage;
-
+use crate::runtime::vm::core::execution_env::{
+    ExecutionEnvironment, BlockContext, CallContext, CallOutcome,
+};
 /// Default gas limit per contract execution
 pub const DEFAULT_GAS_LIMIT: u64 = 10_000_000;
 
@@ -29,6 +30,9 @@ impl Executor {
     }
 
     /// Deploy a new contract. Returns the contract address.
+    ///
+    /// Creates an ExecutionEnvironment, loads deployer state, runs the
+    /// constructor via execute_frame, and persists state on success.
     #[allow(clippy::too_many_arguments)]
     pub fn deploy(
         &self,
@@ -53,37 +57,66 @@ impl Executor {
         // Generate deterministic contract address using deployer + bytecode + nonce
         let contract_addr = Self::compute_contract_address(deployer, bytecode, nonce);
 
-        // Execute constructor FIRST (before storing anything)
-        // Reuse the existing DB handle to avoid RocksDB lock conflicts
-        let shared_db = self.context.storage().shared_db();
-        let storage = ContractStorage::new(shared_db)?;
-        let vm = VM::from_context(VMContext::new(storage));
-
-        let result = vm.execute_bytecode(
-            bytecode,
-            gas_limit,
-            deployer,
-            value,
+        // Create ExecutionEnvironment for reentrant execution
+        let mut env = ExecutionEnvironment::new(BlockContext {
             timestamp,
-            block_hash,
-            &contract_addr,
-            &[], // deploy has no input data
-        );
+            block_hash: block_hash.to_string(),
+        });
 
-        // Only store bytecode and metadata if constructor succeeded
-        if matches!(&result, ExecutionResult::Success { .. }) {
-            let code_key = format!("code:{}", contract_addr);
-            self.context.set(&code_key, &hex::encode(bytecode));
+        // Load deployer account from persistent storage
+        env.load_contract_from_storage(self.context.storage(), deployer);
 
-            let meta_key = format!("meta:{}", contract_addr);
-            let meta = format!("deployer={},nonce={},size={}", deployer, nonce, bytecode.len());
-            self.context.set(&meta_key, &meta);
-        }
+        // Set code for the new contract address so execute_frame can run it
+        env.state.set_code(&contract_addr, bytecode.to_vec())?;
+
+        // Build call context for constructor execution
+        let ctx = CallContext {
+            address: contract_addr.clone(),
+            code_address: contract_addr.clone(),
+            caller: deployer.to_string(),
+            value,
+            gas_limit,
+            calldata: vec![], // deploy has no input data
+            is_static: false,
+            depth: 0,
+        };
+
+        let outcome = env.execute_frame(&ctx);
+
+        // Persist state on success
+        let result = match outcome {
+            CallOutcome::Success { gas_used, return_data, logs } => {
+                // Persist all state changes (accounts, storage, code) to RocksDB
+                env.persist_to_storage(self.context.storage())?;
+
+                // Also store bytecode and metadata via legacy path for backward compat
+                let code_key = format!("code:{}", contract_addr);
+                self.context.set(&code_key, &hex::encode(bytecode));
+
+                let meta_key = format!("meta:{}", contract_addr);
+                let meta = format!("deployer={},nonce={},size={}", deployer, nonce, bytecode.len());
+                self.context.set(&meta_key, &meta);
+
+                ExecutionResult::Success { gas_used, return_data, logs }
+            }
+            CallOutcome::Revert { gas_used, return_data } => {
+                ExecutionResult::Revert {
+                    gas_used,
+                    reason: String::from_utf8_lossy(&return_data).to_string(),
+                }
+            }
+            CallOutcome::Failure { gas_used } => {
+                ExecutionResult::OutOfGas { gas_used }
+            }
+        };
 
         Ok((contract_addr, result))
     }
 
-    /// Execute a contract call
+    /// Execute a contract call.
+    ///
+    /// Creates an ExecutionEnvironment, loads contract + caller state,
+    /// runs via execute_frame, and persists state on success.
     #[allow(clippy::too_many_arguments)]
     pub fn call(
         &self,
@@ -95,7 +128,7 @@ impl Executor {
         timestamp:  u64,
         block_hash: &str,
     ) -> ExecutionResult {
-        // Load contract bytecode
+        // Load contract bytecode from storage
         let code_key = format!("code:{}", contract_addr);
         let bytecode_hex = match self.context.get(&code_key) {
             Some(hex) => hex,
@@ -113,27 +146,57 @@ impl Executor {
             },
         };
 
-        // Reuse the existing DB handle to avoid RocksDB lock conflicts
-        let shared_db = self.context.storage().shared_db();
-        let storage = match ContractStorage::new(shared_db) {
-            Ok(s) => s,
-            Err(e) => return ExecutionResult::Error {
-                gas_used: 0,
-                message: format!("Failed to init contract storage: {}", e),
-            },
-        };
-        let vm = VM::from_context(VMContext::new(storage));
-
-        vm.execute_bytecode(
-            &bytecode,
-            gas_limit,
-            caller,
-            value,
+        // Create ExecutionEnvironment for reentrant execution
+        let mut env = ExecutionEnvironment::new(BlockContext {
             timestamp,
-            block_hash,
-            contract_addr,
-            input_data,
-        )
+            block_hash: block_hash.to_string(),
+        });
+
+        // Load contract and caller accounts from persistent storage
+        env.load_contract_from_storage(self.context.storage(), contract_addr);
+        env.load_contract_from_storage(self.context.storage(), caller);
+
+        // Ensure contract code is loaded into the in-memory state
+        if env.state.get_code(contract_addr).is_empty() {
+            env.state.set_code(contract_addr, bytecode).ok();
+        }
+
+        // Build call context
+        let ctx = CallContext {
+            address: contract_addr.to_string(),
+            code_address: contract_addr.to_string(),
+            caller: caller.to_string(),
+            value,
+            gas_limit,
+            calldata: input_data.to_vec(),
+            is_static: false,
+            depth: 0,
+        };
+
+        let outcome = env.execute_frame(&ctx);
+
+        // Convert CallOutcome to ExecutionResult and persist on success
+        match outcome {
+            CallOutcome::Success { gas_used, return_data, logs } => {
+                // Persist all state changes to RocksDB
+                if let Err(e) = env.persist_to_storage(self.context.storage()) {
+                    return ExecutionResult::Error {
+                        gas_used,
+                        message: format!("State persistence failed: {}", e),
+                    };
+                }
+                ExecutionResult::Success { gas_used, return_data, logs }
+            }
+            CallOutcome::Revert { gas_used, return_data } => {
+                ExecutionResult::Revert {
+                    gas_used,
+                    reason: String::from_utf8_lossy(&return_data).to_string(),
+                }
+            }
+            CallOutcome::Failure { gas_used } => {
+                ExecutionResult::OutOfGas { gas_used }
+            }
+        }
     }
 
     /// Simple KV execute (legacy)
