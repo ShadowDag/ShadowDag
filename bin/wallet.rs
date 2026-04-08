@@ -26,7 +26,7 @@ use shadowdag::service::wallet::storage::wallet_db::WalletDB;
 use shadowdag::infrastructure::storage::rocksdb::utxo::utxo_store::UtxoStore;
 use shadowdag::domain::address::invisible_wallet::InvisibleWallet;
 use shadowdag::errors::WalletError;
-use shadowdag::{slog_warn, slog_error};
+use shadowdag::slog_error;
 
 const MAX_SDAG_SATS: u64 = 21_000_000_000 * 100_000_000; // 21B SDAG in satoshis
 
@@ -93,6 +93,12 @@ fn seed_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| default_wallet_dir());
     dir.join("seed.dat")
+}
+
+/// Determine the active network from the SHADOWDAG_NETWORK environment variable.
+/// Falls back to "mainnet" if unset.
+fn wallet_network() -> String {
+    std::env::var("SHADOWDAG_NETWORK").unwrap_or_else(|_| "mainnet".to_string())
 }
 
 /// Path to the UTXO database used by the node (read-only for balance queries).
@@ -177,7 +183,7 @@ fn load_and_unlock_wallet() -> Result<Wallet, WalletError> {
     // creating a fresh wallet, unlocking, and checking if we have a persisted
     // copy. Since WalletDB keys by address we need the address first.
     // Strategy: unlock a temp wallet to derive the address, then load from DB.
-    let mut temp = Wallet::new("mainnet");
+    let mut temp = Wallet::new(&wallet_network());
     if let Err(e) = temp.unlock(&enc_seed, &password) {
         // Rate limit after failed password attempt
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -277,7 +283,9 @@ fn cmd_new(args: &[String]) {
 
     // Persist the encrypted seed to disk
     if let Err(e) = save_encrypted_seed(&enc_seed) {
-        slog_warn!("wallet", "seed_save_failed", error => &e.to_string());
+        slog_error!("wallet", "seed_save_failed", error => &e.to_string());
+        eprintln!("FATAL: Could not save encrypted seed. Wallet NOT created.");
+        return;
     }
 
     // Persist wallet state via WalletDB
@@ -371,33 +379,42 @@ fn cmd_balance(args: &[String]) {
 }
 
 /// Validate a ShadowDAG address format.
-/// Valid formats: SD1... (mainnet), ST1... (testnet), SR1... (regtest)
-/// Type prefixes: SD1 (standard), SD1s (stealth), SD1c (contract), SD1m (multisig)
-/// Address = prefix (3 or 4 chars) + 40 hex chars
+///
+/// Address formats produced by `make_address()` (in wallet core):
+///   Standard:  prefix(2: "SD"/"ST"/"SR") + hex(version(1) + hash(32) + checksum(4))
+///              = 2-char prefix + 74 hex chars = 76 total
+///   Stealth:   4-char prefix ("SD1s"/"ST1s"/"SR1s") + 40 hex chars = 44 total
+///   Contract:  4-char prefix ("SD1c"/"ST1c"/"SR1c") + 40 hex chars = 44 total
+///   Multisig:  4-char prefix ("SD1m"/"ST1m"/"SR1m") + 40 hex chars = 44 total
+///
+/// Both standard and typed address formats are accepted.
 fn validate_address(addr: &str) -> Result<(), String> {
-    // Type prefixes: SD1 (standard), SD1s (stealth), SD1c (contract), SD1m (multisig)
-    // Network prefixes: SD1/ST1/SR1
-    let (prefix_len, valid_prefix) = if addr.starts_with("SD1s") || addr.starts_with("SD1c") || addr.starts_with("SD1m")
-        || addr.starts_with("ST1s") || addr.starts_with("ST1c") || addr.starts_with("ST1m")
-        || addr.starts_with("SR1s") || addr.starts_with("SR1c") || addr.starts_with("SR1m")
-    {
-        (4, true)
-    } else if addr.starts_with("SD1") || addr.starts_with("ST1") || addr.starts_with("SR1") {
-        (3, true)
-    } else {
-        (0, false)
-    };
-
-    if !valid_prefix {
-        return Err("Invalid address prefix (expected SD1/ST1/SR1)".to_string());
+    // Check network prefix (2 chars)
+    let valid_net = addr.starts_with("SD") || addr.starts_with("ST") || addr.starts_with("SR");
+    if !valid_net {
+        return Err("Invalid address prefix (expected SD/ST/SR)".to_string());
     }
 
-    let hex_part = &addr[prefix_len..];
-    if hex_part.len() != 40 {
-        return Err(format!("Address hex part must be 40 characters, got {}", hex_part.len()));
+    let after_net = &addr[2..];
+
+    // Typed addresses: "1s", "1c", "1m" after network prefix => 4-char prefix + 40 hex
+    if after_net.starts_with("1s") || after_net.starts_with("1c") || after_net.starts_with("1m") {
+        let hex_part = &after_net[2..];
+        if hex_part.len() != 40 {
+            return Err(format!("Typed address hex part must be 40 characters, got {}", hex_part.len()));
+        }
+        if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("Address contains invalid hex characters".into());
+        }
+        return Ok(());
     }
-    if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("Address contains invalid characters".into());
+
+    // Standard addresses: 2-char prefix + 74 hex (version + hash + checksum)
+    if after_net.len() != 74 {
+        return Err(format!("Standard address hex part must be 74 characters, got {}", after_net.len()));
+    }
+    if !after_net.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Address contains invalid hex characters".into());
     }
     Ok(())
 }
@@ -584,6 +601,7 @@ fn print_help() {
     println!("  help                    Show this help");
     println!();
     println!("ENVIRONMENT:");
+    println!("  SHADOWDAG_NETWORK       Network to use: mainnet, testnet, regtest (default: mainnet)");
     println!("  SHADOWDAG_WALLET_DB     Path to wallet database (default: ~/.shadowdag/wallet_db)");
     println!("  SHADOWDAG_WALLET_DIR    Path to wallet directory (default: ~/.shadowdag/)");
     println!("  SHADOWDAG_DB            Path to UTXO database (default: ~/.shadowdag/data/utxo)");

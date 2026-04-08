@@ -103,9 +103,24 @@ impl StealthKeys {
 
 pub struct StealthAddress;
 
+/// Compute the stealth address prefix for a given network.
+fn stealth_prefix(network: &str) -> &'static str {
+    match network {
+        "testnet" => "ST1s",
+        "regtest" => "SR1s",
+        _ => "SD1s",
+    }
+}
+
 impl StealthAddress {
     /// Quick one-time address from a base address (hash-based, for simple use).
+    /// Defaults to mainnet prefix. Use `generate_for_network` for other networks.
     pub fn generate(base_address: &str) -> String {
+        Self::generate_for_network(base_address, "mainnet")
+    }
+
+    /// Quick one-time address from a base address with explicit network selection.
+    pub fn generate_for_network(base_address: &str, network: &str) -> String {
         let mut entropy = [0u8; 32];
         OsRng.fill_bytes(&mut entropy);
 
@@ -115,10 +130,11 @@ impl StealthAddress {
         h.update(entropy);
         let hash = h.finalize();
 
-        format!("SD1s{}", hex::encode(&hash[..20]))
+        format!("{}{}", stealth_prefix(network), hex::encode(&hash[..20]))
     }
 
     /// Generate a stealth address using real ECDH on Ristretto.
+    /// Defaults to mainnet prefix. Use `generate_full_for_network` for other networks.
     ///
     /// The sender calls this with the recipient's published view and spend
     /// public keys. The returned `ephemeral_pubkey` must be included in the
@@ -126,6 +142,15 @@ impl StealthAddress {
     pub fn generate_full(
         recipient_view_pub:  &RistrettoPoint,
         recipient_spend_pub: &RistrettoPoint,
+    ) -> Result<StealthAddressResult, CryptoError> {
+        Self::generate_full_for_network(recipient_view_pub, recipient_spend_pub, "mainnet")
+    }
+
+    /// Generate a stealth address using real ECDH on Ristretto with explicit network.
+    pub fn generate_full_for_network(
+        recipient_view_pub:  &RistrettoPoint,
+        recipient_spend_pub: &RistrettoPoint,
+        network: &str,
     ) -> Result<StealthAddressResult, CryptoError> {
         // Step 1: ephemeral keypair  r, R = r*G
         let r = Scalar::random(&mut OsRng);
@@ -142,7 +167,8 @@ impl StealthAddress {
 
         // Step 5: address from compressed P
         let compressed = one_time_pub.compress();
-        let addr = format!("SD1s{}", hex::encode(&compressed.as_bytes()[..20]));
+        let prefix = stealth_prefix(network);
+        let addr = format!("{}{}", prefix, hex::encode(&compressed.as_bytes()[..20]));
 
         Ok(StealthAddressResult {
             one_time_address: addr,
@@ -152,6 +178,7 @@ impl StealthAddress {
     }
 
     /// Generate a stealth address with domain separation context.
+    /// Defaults to mainnet prefix. Use the `network` parameter variant for other networks.
     ///
     /// Like `generate_full`, but includes `tx_hash` and `output_index` in the
     /// hash derivation so that each output produces a unique one-time address
@@ -163,13 +190,27 @@ impl StealthAddress {
         tx_hash: &str,
         output_index: usize,
     ) -> Result<StealthAddressResult, CryptoError> {
+        Self::generate_full_with_context_for_network(
+            recipient_view_pub, recipient_spend_pub, tx_hash, output_index, "mainnet",
+        )
+    }
+
+    /// Generate a stealth address with domain separation context and explicit network.
+    pub fn generate_full_with_context_for_network(
+        recipient_view_pub:  &RistrettoPoint,
+        recipient_spend_pub: &RistrettoPoint,
+        tx_hash: &str,
+        output_index: usize,
+        network: &str,
+    ) -> Result<StealthAddressResult, CryptoError> {
         let r = Scalar::random(&mut OsRng);
         let big_r = r * g();
         let shared_secret = r * recipient_view_pub;
         let hs = derive_hash_scalar_with_context(&shared_secret, tx_hash, output_index)?;
         let one_time_pub = hs * g() + recipient_spend_pub;
         let compressed = one_time_pub.compress();
-        let addr = format!("SD1s{}", hex::encode(&compressed.as_bytes()[..20]));
+        let prefix = stealth_prefix(network);
+        let addr = format!("{}{}", prefix, hex::encode(&compressed.as_bytes()[..20]));
 
         Ok(StealthAddressResult {
             one_time_address: addr,
@@ -195,6 +236,7 @@ impl StealthAddress {
     }
 
     /// Check if a stealth address belongs to us (recipient scanning).
+    /// Defaults to mainnet prefix. Use `scan_for_network` for other networks.
     ///
     /// The recipient uses their view private scalar and the ephemeral R
     /// from the transaction to recompute the same shared secret.
@@ -204,12 +246,25 @@ impl StealthAddress {
         spend_public:     &RistrettoPoint,
         candidate_address: &str,
     ) -> Result<bool, CryptoError> {
+        Self::scan_for_network(ephemeral_pubkey, view_private, spend_public, candidate_address, "mainnet")
+    }
+
+    /// Check if a stealth address belongs to us with explicit network.
+    pub fn scan_for_network(
+        ephemeral_pubkey: &RistrettoPoint,
+        view_private:     &Scalar,
+        spend_public:     &RistrettoPoint,
+        candidate_address: &str,
+        network: &str,
+    ) -> Result<bool, CryptoError> {
         // ss = v * R  (same as sender's r * V because r*v*G == v*r*G)
         let shared_secret = view_private * ephemeral_pubkey;
         let hs = derive_hash_scalar(&shared_secret)?;
         let expected_pub = hs * g() + spend_public;
+        let prefix = stealth_prefix(network);
         let expected_addr = format!(
-            "SD1s{}",
+            "{}{}",
+            prefix,
             hex::encode(&expected_pub.compress().as_bytes()[..20])
         );
         Ok(expected_addr == candidate_address)

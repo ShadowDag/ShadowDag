@@ -108,7 +108,14 @@ impl KeyManager {
     }
 
     pub fn key_exists(&self, key_id: &str) -> bool {
-        matches!(self.db.get(key_id.as_bytes()), Ok(Some(_)))
+        match self.db.get(key_id.as_bytes()) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                crate::slog_error!("wallet", "key_exists_read_failed", error => &e.to_string());
+                false
+            }
+        }
     }
 
     fn random_bytes<const N: usize>() -> [u8; N] {
