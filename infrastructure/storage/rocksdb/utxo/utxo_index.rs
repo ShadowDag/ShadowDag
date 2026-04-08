@@ -33,10 +33,18 @@ impl UtxoIndex {
 
     pub fn get_owner(&self, key: &str) -> Option<String> {
         match self.db.get(key) {
-            Ok(Some(data)) => String::from_utf8(data.to_vec()).ok(),
+            Ok(Some(data)) => {
+                match String::from_utf8(data.to_vec()) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        slog_error!("index", "utxo_owner_corrupt_utf8", key => key, error => e);
+                        None
+                    }
+                }
+            }
             Ok(None) => None,
             Err(e) => {
-                slog_error!("storage", "utxo_index_read_error", key => key, error => e);
+                slog_error!("index", "utxo_owner_read_failed", key => key, error => e);
                 None
             }
         }

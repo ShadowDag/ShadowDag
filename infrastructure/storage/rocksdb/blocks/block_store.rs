@@ -245,6 +245,7 @@ impl BlockStore {
 
     /// Get ONE block hash at height (returns first found — use get_block_hashes_at_height
     /// for all blocks). Kept for backward compatibility.
+    #[deprecated(note = "Returns only first hash at height. Use get_block_hashes_at_height() for DAG")]
     pub fn get_block_hash_at_height(&self, height: u64) -> Option<String> {
         self.get_block_hashes_at_height(height).into_iter().next()
     }

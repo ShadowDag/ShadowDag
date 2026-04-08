@@ -912,6 +912,12 @@ impl RpcServer {
             // ── Utility ────────────────────────────────────────────────
             "getrpcmethods"      => Self::cmd_getrpcmethods(id),
 
+            // ── Admin ─────────────────────────────────────────────────
+            "stop" => {
+                slog_info!("rpc", "stop_requested");
+                RpcResponse::ok(id, json!({"status": "shutdown_initiated"}))
+            }
+
             _ => RpcResponse::err(id, ERR_METHOD_NOT_FOUND,
                                   format!("Method not found: {}", method)),
         }
@@ -964,6 +970,7 @@ impl RpcServer {
         match state.lock() {
             Ok(s) => {
                 let end_height = start_height.saturating_add(count_raw as u64);
+                #[allow(deprecated)] // TODO: migrate to get_block_hashes_at_height for DAG
                 let hashes: Vec<serde_json::Value> = (start_height..end_height)
                     .filter_map(|h| {
                         s.block_store.get_block_hash_at_height(h)
@@ -1979,6 +1986,7 @@ impl RpcServer {
 
     // ── Batch 5: Block queries ──────────────────────────────────────────
 
+    #[allow(deprecated)] // TODO: migrate to get_block_hashes_at_height for DAG
     fn cmd_getblockhash(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
         let height = params.first().and_then(|v| v.as_u64()).unwrap_or(0);
         match state.lock() {
