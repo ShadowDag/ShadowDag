@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::errors::{ConsensusError, StorageError};
+use crate::slog_error;
 
 // prefix
 const TIP_PREFIX: &[u8] = b"tip:";
@@ -62,9 +63,13 @@ impl ConsensusManagerStore {
 
     // ─────────────────────────────────────────
     // INTERNAL ACCESS (zero-copy)
+    // Returns Result<Option<R>> to distinguish:
+    //   Ok(Some(r)) — key found, mapped via f
+    //   Ok(None)    — key genuinely missing
+    //   Err(e)      — RocksDB I/O or corruption error
     // ─────────────────────────────────────────
     #[inline(always)]
-    fn with_value<F, R>(&self, key: &str, f: F) -> Option<R>
+    fn with_value<F, R>(&self, key: &str, f: F) -> Result<Option<R>, ConsensusError>
     where
         F: FnOnce(&[u8]) -> R,
     {
@@ -72,8 +77,12 @@ impl ConsensusManagerStore {
         Self::build_key(&mut buf, key);
 
         match self.db.get_pinned_opt(&*buf, &self.read_opts) {
-            Ok(Some(data)) => Some(f(&data)),
-            _ => None,
+            Ok(Some(data)) => Ok(Some(f(&data))),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                slog_error!("consensus", "consensus_mgr_read_failed", key => key, error => e);
+                Err(StorageError::ReadFailed(format!("consensus_manager read '{}': {}", key, e)).into())
+            }
         }
     }
 
@@ -81,37 +90,52 @@ impl ConsensusManagerStore {
     // STORE TIP
     // ─────────────────────────────────────────
     #[inline(always)]
-    pub fn store_tip(&self, key: &str, hash: &str) {
+    pub fn store_tip(&self, key: &str, hash: &str) -> Result<(), ConsensusError> {
         let mut buf = Vec::with_capacity(64);
         Self::build_key(&mut buf, key);
 
-        let _ = self.db.put_opt(&*buf, hash.as_bytes(), &self.write_opts);
+        if let Err(e) = self.db.put_opt(&*buf, hash.as_bytes(), &self.write_opts) {
+            slog_error!("consensus", "tip_write_failed", key => key, error => e);
+            return Err(StorageError::WriteFailed(format!("store_tip '{}': {}", key, e)).into());
+        }
+        Ok(())
     }
 
     // ─────────────────────────────────────────
     // STORE IF NOT EXISTS
+    // Returns Ok(true) if written, Ok(false) if already existed,
+    // Err on any I/O failure (read OR write).
     // ─────────────────────────────────────────
     #[inline(always)]
-    pub fn store_tip_if_absent(&self, key: &str, hash: &str) -> bool {
+    pub fn store_tip_if_absent(&self, key: &str, hash: &str) -> Result<bool, ConsensusError> {
         let mut buf = Vec::with_capacity(64);
         Self::build_key(&mut buf, key);
 
-        if matches!(
-            self.db.get_pinned_opt(&*buf, &self.read_opts),
-            Ok(Some(_))
-        ) {
-            return false;
+        match self.db.get_pinned_opt(&*buf, &self.read_opts) {
+            Ok(Some(_)) => Ok(false), // Already exists
+            Ok(None) => {
+                if let Err(e) = self.db.put_opt(&*buf, hash.as_bytes(), &self.write_opts) {
+                    slog_error!("consensus", "store_tip_write_failed", key => key, error => e);
+                    return Err(StorageError::WriteFailed(
+                        format!("store_tip_if_absent write '{}': {}", key, e)
+                    ).into());
+                }
+                Ok(true)
+            }
+            Err(e) => {
+                slog_error!("consensus", "store_tip_read_failed", key => key, error => e);
+                Err(StorageError::ReadFailed(
+                    format!("store_tip_if_absent read '{}': {}", key, e)
+                ).into())
+            }
         }
-
-        let _ = self.db.put_opt(&*buf, hash.as_bytes(), &self.write_opts);
-        true
     }
 
     // ─────────────────────────────────────────
     // STORE MULTIPLE
     // ─────────────────────────────────────────
     #[inline(always)]
-    pub fn store_tip_batch(&self, entries: &[(&str, &str)]) {
+    pub fn store_tip_batch(&self, entries: &[(&str, &str)]) -> Result<(), ConsensusError> {
         let mut batch = WriteBatch::default();
         let mut buf = Vec::with_capacity(64);
 
@@ -120,14 +144,18 @@ impl ConsensusManagerStore {
             batch.put(&*buf, hash.as_bytes());
         }
 
-        let _ = self.db.write_opt(batch, &self.write_opts);
+        if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
+            slog_error!("consensus", "tip_batch_write_failed", error => e);
+            return Err(StorageError::WriteFailed(format!("store_tip_batch: {}", e)).into());
+        }
+        Ok(())
     }
 
     // ─────────────────────────────────────────
     // DELETE MULTIPLE
     // ─────────────────────────────────────────
     #[inline(always)]
-    pub fn delete_tip_batch(&self, keys: &[&str]) {
+    pub fn delete_tip_batch(&self, keys: &[&str]) -> Result<(), ConsensusError> {
         let mut batch = WriteBatch::default();
         let mut buf = Vec::with_capacity(64);
 
@@ -136,24 +164,29 @@ impl ConsensusManagerStore {
             batch.delete(&*buf);
         }
 
-        let _ = self.db.write_opt(batch, &self.write_opts);
+        if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
+            slog_error!("consensus", "tip_batch_delete_failed", error => e);
+            return Err(StorageError::WriteFailed(format!("delete_tip_batch: {}", e)).into());
+        }
+        Ok(())
     }
 
     // ─────────────────────────────────────────
     // GET TIP (zero-copy path)
+    // Returns Err on storage failure (not None).
     // ─────────────────────────────────────────
     #[inline(always)]
-    pub fn get_tip(&self, key: &str) -> Option<String> {
+    pub fn get_tip(&self, key: &str) -> Result<Option<String>, ConsensusError> {
         self.with_value(key, |data| {
             std::str::from_utf8(data).ok().map(|s| s.to_owned())
-        }).flatten()
+        }).map(|opt| opt.flatten())
     }
 
     // ─────────────────────────────────────────
     // GET RAW (copy only when needed)
     // ─────────────────────────────────────────
     #[inline(always)]
-    pub fn get_tip_raw(&self, key: &str) -> Option<Vec<u8>> {
+    pub fn get_tip_raw(&self, key: &str) -> Result<Option<Vec<u8>>, ConsensusError> {
         self.with_value(key, |data| data.to_vec())
     }
 
@@ -161,19 +194,24 @@ impl ConsensusManagerStore {
     // DELETE TIP
     // ─────────────────────────────────────────
     #[inline(always)]
-    pub fn delete_tip(&self, key: &str) {
+    pub fn delete_tip(&self, key: &str) -> Result<(), ConsensusError> {
         let mut buf = Vec::with_capacity(64);
         Self::build_key(&mut buf, key);
 
-        let _ = self.db.delete_opt(&*buf, &self.write_opts);
+        if let Err(e) = self.db.delete_opt(&*buf, &self.write_opts) {
+            slog_error!("consensus", "tip_delete_failed", key => key, error => e);
+            return Err(StorageError::WriteFailed(format!("delete_tip '{}': {}", key, e)).into());
+        }
+        Ok(())
     }
 
     // ─────────────────────────────────────────
     // EXISTS (no copy)
+    // Returns Err on storage failure (not false).
     // ─────────────────────────────────────────
     #[inline(always)]
-    pub fn exists(&self, key: &str) -> bool {
-        self.with_value(key, |_| ()).is_some()
+    pub fn exists(&self, key: &str) -> Result<bool, ConsensusError> {
+        self.with_value(key, |_| ()).map(|opt| opt.is_some())
     }
 }
 
@@ -192,72 +230,72 @@ mod tests {
     #[test]
     fn store_and_get_tip() {
         let store = ConsensusManagerStore::new(&tmp_path()).unwrap();
-        store.store_tip("best", "hash_abc");
-        assert_eq!(store.get_tip("best"), Some("hash_abc".to_string()));
+        store.store_tip("best", "hash_abc").unwrap();
+        assert_eq!(store.get_tip("best").unwrap(), Some("hash_abc".to_string()));
     }
 
     #[test]
     fn get_unknown_returns_none() {
         let store = ConsensusManagerStore::new(&tmp_path()).unwrap();
-        assert_eq!(store.get_tip("nonexistent"), None);
+        assert_eq!(store.get_tip("nonexistent").unwrap(), None);
     }
 
     #[test]
     fn exists_check() {
         let store = ConsensusManagerStore::new(&tmp_path()).unwrap();
-        assert!(!store.exists("tip"));
-        store.store_tip("tip", "hash1");
-        assert!(store.exists("tip"));
+        assert!(!store.exists("tip").unwrap());
+        store.store_tip("tip", "hash1").unwrap();
+        assert!(store.exists("tip").unwrap());
     }
 
     #[test]
     fn delete_tip_removes() {
         let store = ConsensusManagerStore::new(&tmp_path()).unwrap();
-        store.store_tip("del", "hash");
-        assert!(store.exists("del"));
-        store.delete_tip("del");
-        assert!(!store.exists("del"));
+        store.store_tip("del", "hash").unwrap();
+        assert!(store.exists("del").unwrap());
+        store.delete_tip("del").unwrap();
+        assert!(!store.exists("del").unwrap());
     }
 
     #[test]
     fn store_tip_if_absent_only_first() {
         let store = ConsensusManagerStore::new(&tmp_path()).unwrap();
-        assert!(store.store_tip_if_absent("key", "first"));
-        assert!(!store.store_tip_if_absent("key", "second"));
-        assert_eq!(store.get_tip("key"), Some("first".to_string()));
+        assert!(store.store_tip_if_absent("key", "first").unwrap());
+        assert!(!store.store_tip_if_absent("key", "second").unwrap());
+        assert_eq!(store.get_tip("key").unwrap(), Some("first".to_string()));
     }
 
     #[test]
     fn overwrite_tip() {
         let store = ConsensusManagerStore::new(&tmp_path()).unwrap();
-        store.store_tip("t", "v1");
-        store.store_tip("t", "v2");
-        assert_eq!(store.get_tip("t"), Some("v2".to_string()));
+        store.store_tip("t", "v1").unwrap();
+        store.store_tip("t", "v2").unwrap();
+        assert_eq!(store.get_tip("t").unwrap(), Some("v2".to_string()));
     }
 
     #[test]
     fn store_tip_batch_writes_all() {
         let store = ConsensusManagerStore::new(&tmp_path()).unwrap();
-        store.store_tip_batch(&[("a", "h1"), ("b", "h2"), ("c", "h3")]);
-        assert_eq!(store.get_tip("a"), Some("h1".to_string()));
-        assert_eq!(store.get_tip("b"), Some("h2".to_string()));
-        assert_eq!(store.get_tip("c"), Some("h3".to_string()));
+        store.store_tip_batch(&[("a", "h1"), ("b", "h2"), ("c", "h3")]).unwrap();
+        assert_eq!(store.get_tip("a").unwrap(), Some("h1".to_string()));
+        assert_eq!(store.get_tip("b").unwrap(), Some("h2".to_string()));
+        assert_eq!(store.get_tip("c").unwrap(), Some("h3".to_string()));
     }
 
     #[test]
     fn delete_tip_batch_removes_all() {
         let store = ConsensusManagerStore::new(&tmp_path()).unwrap();
-        store.store_tip_batch(&[("x", "h1"), ("y", "h2")]);
-        store.delete_tip_batch(&["x", "y"]);
-        assert!(!store.exists("x"));
-        assert!(!store.exists("y"));
+        store.store_tip_batch(&[("x", "h1"), ("y", "h2")]).unwrap();
+        store.delete_tip_batch(&["x", "y"]).unwrap();
+        assert!(!store.exists("x").unwrap());
+        assert!(!store.exists("y").unwrap());
     }
 
     #[test]
     fn get_tip_raw_returns_bytes() {
         let store = ConsensusManagerStore::new(&tmp_path()).unwrap();
-        store.store_tip("raw", "data");
-        let raw = store.get_tip_raw("raw").unwrap();
+        store.store_tip("raw", "data").unwrap();
+        let raw = store.get_tip_raw("raw").unwrap().unwrap();
         assert_eq!(raw, b"data");
     }
 }
