@@ -84,6 +84,12 @@ impl GasMeter {
         GasResult::Ok(self.gas_limit - new_used)
     }
 
+    /// Return unused gas from a sub-call back to the caller.
+    /// Called when a child frame completes and has leftover gas.
+    pub fn return_gas(&mut self, amount: u64) {
+        self.gas_used = self.gas_used.saturating_sub(amount);
+    }
+
     /// Add to the gas refund counter (e.g. for SDELETE clearing storage)
     pub fn add_refund(&mut self, amount: u64) {
         self.gas_refund = self.gas_refund.saturating_add(amount);

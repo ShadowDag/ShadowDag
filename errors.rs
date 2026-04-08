@@ -195,6 +195,12 @@ pub enum VmError {
     #[error("[VM] invalid log topic: {0}")]
     InvalidLogTopic(String),
 
+    #[error("[VM] state modification in static call context: {0}")]
+    StaticCallViolation(String),
+
+    #[error("[VM] call depth exceeded maximum ({0})")]
+    CallDepthExceeded(usize),
+
     #[error("[VM] {0}")]
     Other(String),
 }

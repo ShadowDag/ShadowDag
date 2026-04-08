@@ -311,6 +311,7 @@ pub mod runtime {
             pub mod assembler;
             pub mod call_stack;
             pub mod event_log;
+            pub mod execution_env;
             pub mod execution_result;
             pub mod executor;
             pub mod journal;
