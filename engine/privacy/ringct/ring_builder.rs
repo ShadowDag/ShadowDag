@@ -158,7 +158,7 @@ impl RingBuilder {
 
     /// Build a ring using random decoys (legacy — prefer build_from_utxo_set)
     pub fn build_with_size(signer_pubkey: &[u8; 32], ring_size: usize) -> Vec<RingMember> {
-        let ring_size = ring_size.clamp(3, 64);
+        let ring_size = ring_size.clamp(4, 64);
         let mut ring = Vec::with_capacity(ring_size);
 
         // SECURITY: position is cryptographically random, NOT from timestamp
@@ -189,7 +189,7 @@ impl RingBuilder {
         utxo_pubkeys: &[[u8; 32]],
         ring_size: usize,
     ) -> Vec<RingMember> {
-        let ring_size = ring_size.clamp(3, 64);
+        let ring_size = ring_size.clamp(4, 64);
         let decoys_needed = ring_size - 1;
 
         // Filter out the signer from the UTXO set
@@ -282,7 +282,7 @@ impl RingBuilder {
     }
 
     pub fn validate_ring(ring: &[RingMember]) -> bool {
-        if ring.is_empty() || ring.len() < 3 {
+        if ring.is_empty() || ring.len() < 4 {
             return false;
         }
 
@@ -345,8 +345,8 @@ mod tests {
 
     #[test]
     fn too_small_ring_invalid() {
-        let ring = vec![RingMember::new([1u8; 32]), RingMember::new([2u8; 32])];
-        assert!(!RingBuilder::validate_ring(&ring));
+        let ring = vec![RingMember::new([1u8; 32]), RingMember::new([2u8; 32]), RingMember::new([3u8; 32])];
+        assert!(!RingBuilder::validate_ring(&ring)); // 3 < MIN_RING_SIZE (4)
     }
 
     #[test]

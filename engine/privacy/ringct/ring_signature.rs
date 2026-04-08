@@ -30,7 +30,7 @@ use curve25519_dalek::scalar::Scalar;
 use crate::domain::transaction::transaction::Transaction;
 use crate::errors::CryptoError;
 
-pub const MIN_RING_SIZE: usize = 3;
+pub const MIN_RING_SIZE: usize = 4; // Must match ring_validator
 pub const DEFAULT_RING_SIZE: usize = 11;
 pub const MAX_RING_SIZE: usize = 64;
 

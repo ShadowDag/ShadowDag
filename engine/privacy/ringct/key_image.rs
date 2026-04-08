@@ -15,6 +15,8 @@
 use sha2::{Sha256, Digest};
 use std::collections::HashSet;
 
+use crate::slog_error;
+
 /// Key image store for double-spend detection.
 /// Uses RocksDB for persistence — survives node restarts.
 /// Also has in-memory cache for fast lookups.
@@ -69,7 +71,8 @@ impl KeyImageStore {
         false
     }
 
-    /// Record a key image as spent (persists to DB, cache capped)
+    /// Record a key image as spent (persists to DB, cache capped).
+    /// Returns true only if BOTH cache insert AND db write succeed.
     pub fn mark_spent(&mut self, key_image: &str) -> bool {
         // Evict from cache if too large (DB remains authoritative)
         if self.cache.len() >= Self::MAX_CACHE {
@@ -81,7 +84,13 @@ impl KeyImageStore {
         if is_new {
             if let Some(ref db) = self.db {
                 let key = format!("ki:{}", key_image);
-                let _ = db.put(key.as_bytes(), b"1");
+                if let Err(e) = db.put(key.as_bytes(), b"1") {
+                    slog_error!("privacy", "key_image_persist_failed",
+                        key_image => key_image, error => &e.to_string());
+                    // Roll back cache — key image NOT safely persisted
+                    self.cache.remove(key_image);
+                    return false;
+                }
             }
         }
         is_new
