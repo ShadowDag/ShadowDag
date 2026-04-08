@@ -278,6 +278,7 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::vm::contracts::contract_storage::ContractStorage;
 
     fn make_executor() -> Executor {
         // Use unique path per test to avoid RocksDB lock conflicts.
