@@ -217,11 +217,11 @@ fn print_info() {
     println!("─────────────────────");
     println!("Max Supply       : 21,000,000,000 SDAG");
     println!("Block Time       : 1 second");
-    println!("Block Reward     : 10 SDAG (halves every 210M blocks)");
+    println!("Block Reward     : 10 SDAG (smooth decay: 0.38%/month, ~5.5yr half-life)");
     println!("Miner Share      : 95%");
     println!("Developer Share  : 5%");
-    println!("GHOSTDAG K       : 18");
-    println!("Max Parents      : 8");
+    println!("GHOSTDAG K       : 180");
+    println!("Max Parents      : 80");
     println!("Max Block Size   : 2 MB");
     println!("Mining Algorithm : ShadowHash (ASIC-resistant)");
     println!("Privacy          : CLSAG + Pedersen + Dandelion++ (native)");
