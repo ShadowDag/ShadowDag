@@ -255,12 +255,16 @@ impl HeaderSync {
     /// Header-first IBD mode: validate and store only headers first,
     /// then request block bodies on-demand. This dramatically reduces
     /// initial sync bandwidth and time.
+    ///
+    /// NOTE: `headers_validated` and `bodies_pending` are currently
+    /// **estimates** — actual per-header validation state and body
+    /// download progress are not yet tracked separately.
     pub fn header_first_sync_status(&self) -> HeaderSyncStatus {
-        let total = self.cache.len();
+        let total = self.header_count();
         HeaderSyncStatus {
             headers_synced:     total,
-            headers_validated:  total, // All cached headers are validated
-            bodies_pending:     0,     // Bodies fetched separately
+            headers_validated:  total, // TODO: track actual validation state separately
+            bodies_pending:     0,     // TODO: track block body download progress
             mode:               if total > 0 { SyncMode::HeaderFirst } else { SyncMode::Full },
         }
     }
@@ -272,12 +276,46 @@ impl HeaderSync {
         }
         let mut buf = Vec::with_capacity(HEADER_PREFIX.len() + hash.len());
         Self::make_key(hash, &mut buf);
-        matches!(self.db.get(&buf), Ok(Some(_)))
+        match self.db.get(&buf) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                slog_error!("dag", "header_exists_read_failed", hash => hash, error => e);
+                false
+            }
+        }
     }
 
-    /// Get header count in the store
+    /// Count actual persisted headers in DB, not just cached ones.
+    pub fn header_count_from_db(&self) -> usize {
+        let iter = self.db.iterator_opt(
+            IteratorMode::From(HEADER_PREFIX, Direction::Forward),
+            {
+                let mut opts = ReadOptions::default();
+                opts.set_prefix_same_as_start(true);
+                opts
+            },
+        );
+
+        let mut count = 0;
+        for item in iter {
+            match item {
+                Ok((key, _)) => {
+                    if !key.starts_with(HEADER_PREFIX) {
+                        break;
+                    }
+                    count += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        count
+    }
+
+    /// Get header count — uses the larger of DB count and cache count
+    /// to avoid underreporting when cache is only partially loaded.
     pub fn header_count(&self) -> usize {
-        self.cache.len()
+        self.header_count_from_db().max(self.cache.len())
     }
 }
 

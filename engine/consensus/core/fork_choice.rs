@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::errors::{ConsensusError, StorageError};
+use crate::slog_error;
 
 // prefix لعزل البيانات
 const CHOICE_PREFIX: &[u8] = b"choice:";
@@ -107,7 +108,9 @@ impl ForkChoiceStore {
     pub fn store_choice(&self, hash: &str, score: u64) {
         let key = Self::make_key(hash);
 
-        let _ = self.db.put_opt(key, score.to_be_bytes(), &self.write_opts);
+        if let Err(e) = self.db.put_opt(key, score.to_be_bytes(), &self.write_opts) {
+            slog_error!("consensus", "store_choice_failed", hash => hash, error => e);
+        }
     }
 
     // ─────────────────────────────────────────
@@ -122,7 +125,11 @@ impl ForkChoiceStore {
                 let arr: [u8; 8] = value.as_ref().try_into().ok()?;
                 Some(u64::from_be_bytes(arr))
             }
-            _ => None,
+            Ok(_) => None,
+            Err(e) => {
+                slog_error!("consensus", "fork_choice_read_failed", key => hash, error => e);
+                None
+            }
         }
     }
 
@@ -155,9 +162,14 @@ impl ForkChoiceStore {
     #[inline]
     pub fn exists(&self, hash: &str) -> bool {
         let key = Self::make_key(hash);
-        self.db.get_pinned_opt(key, &self.read_opts)
-            .map(|v| v.is_some())
-            .unwrap_or(false)
+        match self.db.get_pinned_opt(key, &self.read_opts) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                slog_error!("consensus", "fork_choice_exists_read_failed", key => hash, error => e);
+                false
+            }
+        }
     }
 
     // ─────────────────────────────────────────
@@ -166,7 +178,9 @@ impl ForkChoiceStore {
     #[inline]
     pub fn delete_choice(&self, hash: &str) {
         let key = Self::make_key(hash);
-        let _ = self.db.delete_opt(key, &self.write_opts);
+        if let Err(e) = self.db.delete_opt(key, &self.write_opts) {
+            slog_error!("consensus", "delete_choice_failed", hash => hash, error => e);
+        }
     }
 
     // ─────────────────────────────────────────
@@ -203,14 +217,18 @@ impl ForkChoiceStore {
             count += 1;
 
             if count >= DELETE_BATCH_SIZE {
-                let _ = self.db.write_opt(batch, &self.write_opts);
+                if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
+                    slog_error!("consensus", "fork_choice_clear_failed", error => e);
+                }
                 batch = WriteBatch::default();
                 count = 0;
             }
         }
 
         if count > 0 {
-            let _ = self.db.write_opt(batch, &self.write_opts);
+            if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
+                slog_error!("consensus", "fork_choice_clear_failed", error => e);
+            }
         }
     }
 
@@ -256,6 +274,7 @@ impl ForkChoiceStore {
         let mut batch = WriteBatch::default();
         let mut key = Vec::with_capacity(64);
         let mut count = 0;
+        let mut batch_num: usize = 0;
 
         for (hash, score) in entries {
             key.clear();
@@ -266,14 +285,19 @@ impl ForkChoiceStore {
             count += 1;
 
             if count >= WRITE_BATCH_SIZE {
-                let _ = self.db.write_opt(batch, &self.write_opts);
+                if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
+                    slog_error!("consensus", "fork_choice_batch_write_failed", batch => batch_num, error => e);
+                }
                 batch = WriteBatch::default();
                 count = 0;
+                batch_num += 1;
             }
         }
 
         if count > 0 {
-            let _ = self.db.write_opt(batch, &self.write_opts);
+            if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
+                slog_error!("consensus", "fork_choice_batch_write_failed", batch => batch_num, error => e);
+            }
         }
     }
 }
