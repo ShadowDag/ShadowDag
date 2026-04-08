@@ -317,8 +317,9 @@ pub const MAX_MEMORY_SIZE: usize = 1024 * 1024;
 /// Maximum contract bytecode size (24 KB)
 pub const MAX_CODE_SIZE: usize = 24 * 1024;
 
-/// Maximum call depth for nested CALL opcodes
-pub const MAX_CALL_DEPTH: usize = 256;
+/// Maximum call depth -- uses v1 spec value.
+/// DEPRECATED: use v1_spec::MAX_CALL_DEPTH instead.
+pub const MAX_CALL_DEPTH: usize = 1024;
 
 /// Gas cost per 32-byte word of memory expansion
 pub const MEMORY_GAS_PER_WORD: u64 = 3;
@@ -962,8 +963,8 @@ impl VM {
     }
 
     /// Simple KV execute (legacy compatibility)
-    pub fn execute(&self, key: &str, code: &str) {
-        self.context.set(key, code);
+    pub fn execute(&self, key: &str, code: &str) -> Result<(), crate::errors::StorageError> {
+        self.context.set(key, code)
     }
 
     /// Simple KV read (legacy compatibility)
