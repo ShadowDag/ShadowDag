@@ -296,8 +296,8 @@ impl DagTraversal {
             }
         }
 
-        let mut best = None;
-        let mut best_height = 0;
+        let mut best: Option<String> = None;
+        let mut best_height: u64 = 0;
 
         let mut stack = vec![b.to_string()];
         let mut visited_b = HashSet::new();
@@ -309,7 +309,14 @@ impl DagTraversal {
 
             if visited_a.contains(&h) {
                 if let Some(node) = self.nodes.get(&h) {
-                    if node.height >= best_height {
+                    // Deterministic tie-break: highest height wins,
+                    // then lowest hash (lexicographic) breaks ties.
+                    let dominated = match &best {
+                        None => true,
+                        Some(bh) => node.height > best_height
+                            || (node.height == best_height && h < *bh),
+                    };
+                    if dominated {
                         best_height = node.height;
                         best = Some(h.clone());
                     }
