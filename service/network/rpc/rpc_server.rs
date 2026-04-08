@@ -26,6 +26,11 @@ use crate::service::mempool::core::mempool::Mempool;
 use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::service::rpc::auth::RpcAuthManager;
 use crate::engine::dag::security::dag_shield::DagShield;
+use crate::runtime::vm::core::executor::Executor;
+use crate::runtime::vm::core::vm_context::VMContext;
+use crate::runtime::vm::core::vm::ExecutionResult;
+use crate::runtime::vm::contracts::contract_storage::ContractStorage;
+use crate::domain::transaction::tx_receipt::load_receipt;
 
 pub const RPC_PORT:    u16   = 9332;
 pub const RPC_VERSION: &str  = "2.0";
@@ -152,6 +157,8 @@ pub struct RpcState {
     pub network_name: String,
     pub p2p_port:     u16,
     pub rpc_port:     u16,
+    pub contract_storage: Option<Arc<ContractStorage>>,
+    pub receipt_db: Option<Arc<rocksdb::DB>>,
 }
 
 impl RpcState {
@@ -278,6 +285,8 @@ impl RpcState {
             network_name: NetworkParams::NETWORK_NAME.to_string(),
             p2p_port:     ConsensusParams::DEFAULT_P2P_PORT,
             rpc_port:     ConsensusParams::DEFAULT_RPC_PORT,
+            contract_storage: None,
+            receipt_db: None,
         })
     }
 
@@ -310,6 +319,8 @@ impl RpcState {
             network_name: NetworkParams::NETWORK_NAME.to_string(),
             p2p_port:     ConsensusParams::DEFAULT_P2P_PORT,
             rpc_port:     ConsensusParams::DEFAULT_RPC_PORT,
+            contract_storage: None,
+            receipt_db: None,
         })
     }
 
@@ -348,6 +359,7 @@ pub type SharedState = Arc<Mutex<RpcState>>;
 fn requires_auth(method: &str) -> bool {
     matches!(method,
         "sendrawtransaction" | "submitblock" | "stop"
+        | "deploy_contract" | "call_contract"
     )
 }
 
@@ -827,6 +839,15 @@ impl RpcServer {
             "getgasprice"        => Self::cmd_getgasprice(id, state),
             "getcodelength"      => Self::cmd_getcodelength(id),
             "getopcodes"         => Self::cmd_getopcodes(id),
+
+            // ── Contract RPC ─────────────────────────────────────────
+            "deploy_contract"        => Self::cmd_deploy_contract(params, id, state),
+            "call_contract"          => Self::cmd_call_contract(params, id, state),
+            "estimate_gas"           => Self::cmd_estimate_gas(params, id, state),
+            "get_transaction_receipt"=> Self::cmd_get_transaction_receipt(params, id, state),
+            "get_contract_code"      => Self::cmd_get_contract_code(params, id, state),
+            "get_storage_at"         => Self::cmd_get_storage_at(params, id, state),
+            "get_logs"               => Self::cmd_get_logs(params, id, state),
 
             // ── Batch 15a: Atomic Swap ─────────────────────────────────
             "getswapinfo"        => Self::cmd_getswapinfo(id),
@@ -3111,6 +3132,303 @@ impl RpcServer {
                 "system":      ["CREATE","SELFDESTRUCT","LOG","SIGNEXTEND"],
             },
         }))
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  CONTRACT RPC METHODS
+    // ═══════════════════════════════════════════════════════════════════
+
+    fn cmd_deploy_contract(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
+        let s = match state.lock() {
+            Ok(s) => s,
+            Err(_) => return RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        };
+
+        let bytecode_hex = match params.first().and_then(|v| v.as_str()) {
+            Some(h) => h,
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "bytecode_hex required"),
+        };
+        let deployer = match params.get(1).and_then(|v| v.as_str()) {
+            Some(d) => d,
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "deployer address required"),
+        };
+        let value = params.get(2).and_then(|v| v.as_u64()).unwrap_or(0);
+        let gas_limit = params.get(3).and_then(|v| v.as_u64()).unwrap_or(10_000_000);
+
+        let bytecode = match hex::decode(bytecode_hex) {
+            Ok(b) => b,
+            Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid bytecode hex"),
+        };
+
+        let cs = match &s.contract_storage {
+            Some(cs) => cs.clone(),
+            None => return RpcResponse::err(id, ERR_INTERNAL, "contract storage not available"),
+        };
+
+        let ctx = VMContext::new(
+            ContractStorage::new(cs.shared_db())
+                .unwrap_or_else(|_| panic!("ContractStorage init from shared DB"))
+        );
+        let executor = Executor::new(ctx);
+
+        match executor.deploy(&bytecode, deployer, value, gas_limit, 0, "", 0) {
+            Ok((addr, result)) => {
+                let gas_used = match &result {
+                    ExecutionResult::Success { gas_used, .. } => *gas_used,
+                    ExecutionResult::Revert { gas_used, .. } => *gas_used,
+                    ExecutionResult::OutOfGas { gas_used } => *gas_used,
+                    ExecutionResult::Error { gas_used, .. } => *gas_used,
+                };
+                let success = matches!(result, ExecutionResult::Success { .. });
+                RpcResponse::ok(id, json!({
+                    "address": addr,
+                    "success": success,
+                    "gas_used": gas_used,
+                }))
+            }
+            Err(e) => RpcResponse::err(id, ERR_INTERNAL, format!("deploy failed: {}", e)),
+        }
+    }
+
+    fn cmd_call_contract(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
+        let s = match state.lock() {
+            Ok(s) => s,
+            Err(_) => return RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        };
+
+        let contract_addr = match params.first().and_then(|v| v.as_str()) {
+            Some(a) => a,
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "contract_address required"),
+        };
+        let calldata_hex = match params.get(1).and_then(|v| v.as_str()) {
+            Some(h) => h,
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "calldata_hex required"),
+        };
+        let caller = match params.get(2).and_then(|v| v.as_str()) {
+            Some(c) => c,
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "caller address required"),
+        };
+        let value = params.get(3).and_then(|v| v.as_u64()).unwrap_or(0);
+        let gas_limit = params.get(4).and_then(|v| v.as_u64()).unwrap_or(10_000_000);
+
+        let calldata = match hex::decode(calldata_hex) {
+            Ok(b) => b,
+            Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid calldata hex"),
+        };
+
+        let cs = match &s.contract_storage {
+            Some(cs) => cs.clone(),
+            None => return RpcResponse::err(id, ERR_INTERNAL, "contract storage not available"),
+        };
+
+        let ctx = VMContext::new(
+            ContractStorage::new(cs.shared_db())
+                .unwrap_or_else(|_| panic!("ContractStorage init from shared DB"))
+        );
+        let executor = Executor::new(ctx);
+
+        let result = executor.call(contract_addr, &calldata, caller, value, gas_limit, 0, "");
+
+        let gas_used = match &result {
+            ExecutionResult::Success { gas_used, .. } => *gas_used,
+            ExecutionResult::Revert { gas_used, .. } => *gas_used,
+            ExecutionResult::OutOfGas { gas_used } => *gas_used,
+            ExecutionResult::Error { gas_used, .. } => *gas_used,
+        };
+        let success = matches!(result, ExecutionResult::Success { .. });
+        let return_data_hex = match &result {
+            ExecutionResult::Success { return_data, .. } => hex::encode(return_data),
+            _ => String::new(),
+        };
+
+        RpcResponse::ok(id, json!({
+            "success": success,
+            "gas_used": gas_used,
+            "return_data": return_data_hex,
+        }))
+    }
+
+    fn cmd_estimate_gas(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
+        let s = match state.lock() {
+            Ok(s) => s,
+            Err(_) => return RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        };
+
+        let contract_addr = match params.first().and_then(|v| v.as_str()) {
+            Some(a) => a,
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "contract_address required"),
+        };
+        let calldata_hex = match params.get(1).and_then(|v| v.as_str()) {
+            Some(h) => h,
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "calldata_hex required"),
+        };
+        let caller = match params.get(2).and_then(|v| v.as_str()) {
+            Some(c) => c,
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "caller address required"),
+        };
+        let value = params.get(3).and_then(|v| v.as_u64()).unwrap_or(0);
+
+        let calldata = match hex::decode(calldata_hex) {
+            Ok(b) => b,
+            Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid calldata hex"),
+        };
+
+        let cs = match &s.contract_storage {
+            Some(cs) => cs.clone(),
+            None => return RpcResponse::err(id, ERR_INTERNAL, "contract storage not available"),
+        };
+
+        // Use a fresh ContractStorage for estimation — changes are NOT persisted
+        let estimate_gas_limit: u64 = 100_000_000; // high ceiling for estimation
+        let ctx = VMContext::new(
+            ContractStorage::new(cs.shared_db())
+                .unwrap_or_else(|_| panic!("ContractStorage init from shared DB"))
+        );
+        let executor = Executor::new(ctx);
+
+        let result = executor.call(contract_addr, &calldata, caller, value, estimate_gas_limit, 0, "");
+
+        let gas_used = match &result {
+            ExecutionResult::Success { gas_used, .. } => *gas_used,
+            ExecutionResult::Revert { gas_used, .. } => *gas_used,
+            ExecutionResult::OutOfGas { gas_used } => *gas_used,
+            ExecutionResult::Error { gas_used, .. } => *gas_used,
+        };
+
+        RpcResponse::ok(id, json!({
+            "gas_used": gas_used,
+        }))
+    }
+
+    fn cmd_get_transaction_receipt(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
+        let s = match state.lock() {
+            Ok(s) => s,
+            Err(_) => return RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        };
+        let tx_hash = match params.first().and_then(|v| v.as_str()) {
+            Some(h) => h,
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "tx_hash required"),
+        };
+        // Try receipt DB
+        if let Some(ref db) = s.receipt_db {
+            if let Some(receipt) = load_receipt(db, tx_hash) {
+                return RpcResponse::ok(id, json!({
+                    "tx_hash": receipt.tx_hash,
+                    "status": format!("{:?}", receipt.status),
+                    "gas_used": receipt.gas_used,
+                    "contract_address": receipt.contract_addr,
+                    "execution_success": receipt.execution_success,
+                    "return_data": receipt.return_data,
+                    "revert_reason": receipt.revert_reason,
+                    "logs": receipt.logs.iter().map(|l| json!({
+                        "contract": l.contract,
+                        "topics": l.topics,
+                        "data": l.data,
+                        "log_index": l.log_index,
+                    })).collect::<Vec<_>>(),
+                    "vm_version": receipt.vm_version,
+                    "tx_index": receipt.tx_index,
+                    "block_height": receipt.block_height,
+                }));
+            }
+        }
+        RpcResponse::err(id, ERR_NOT_FOUND, "receipt not found")
+    }
+
+    fn cmd_get_contract_code(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
+        let s = match state.lock() {
+            Ok(s) => s,
+            Err(_) => return RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        };
+        let address = match params.first().and_then(|v| v.as_str()) {
+            Some(a) => a,
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "contract_address required"),
+        };
+        let cs = match &s.contract_storage {
+            Some(cs) => cs,
+            None => return RpcResponse::err(id, ERR_INTERNAL, "contract storage not available"),
+        };
+        let key = format!("code:{}", address);
+        match cs.get_state(&key) {
+            Some(code_hex) => RpcResponse::ok(id, json!({
+                "address": address,
+                "code": code_hex,
+            })),
+            None => RpcResponse::err(id, ERR_NOT_FOUND, "contract code not found"),
+        }
+    }
+
+    fn cmd_get_storage_at(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
+        let s = match state.lock() {
+            Ok(s) => s,
+            Err(_) => return RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        };
+        let address = match params.first().and_then(|v| v.as_str()) {
+            Some(a) => a,
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "contract_address required"),
+        };
+        let slot = match params.get(1).and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "slot required"),
+        };
+        let cs = match &s.contract_storage {
+            Some(cs) => cs,
+            None => return RpcResponse::err(id, ERR_INTERNAL, "contract storage not available"),
+        };
+        let key = format!("{}:slot:{}", address, slot);
+        let value = cs.get_state(&key).unwrap_or_default();
+        RpcResponse::ok(id, json!({
+            "address": address,
+            "slot": slot,
+            "value": value,
+        }))
+    }
+
+    fn cmd_get_logs(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
+        let s = match state.lock() {
+            Ok(s) => s,
+            Err(_) => return RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        };
+        // Accept either block_hash (string) or block_height (number)
+        let block_hash = if let Some(h) = params.first().and_then(|v| v.as_str()) {
+            Some(h.to_string())
+        } else if let Some(height) = params.first().and_then(|v| v.as_u64()) {
+            // Look up block hash by height
+            #[allow(deprecated)]
+            s.block_store.get_block_hash_at_height(height)
+        } else {
+            return RpcResponse::err(id, ERR_INVALID_PARAMS, "block_hash or block_height required");
+        };
+        let block_hash = match block_hash {
+            Some(h) => h,
+            None => return RpcResponse::err(id, ERR_NOT_FOUND, "block not found"),
+        };
+        // Get block to enumerate its transactions
+        let block = match s.block_store.get_block(&block_hash) {
+            Some(b) => b,
+            None => return RpcResponse::err(id, ERR_NOT_FOUND, "block not found"),
+        };
+        let receipt_db = match &s.receipt_db {
+            Some(db) => db,
+            None => return RpcResponse::err(id, ERR_INTERNAL, "receipt DB not available"),
+        };
+        let mut all_logs: Vec<Value> = Vec::new();
+        for tx in &block.body.transactions {
+            if let Some(receipt) = load_receipt(receipt_db, &tx.hash) {
+                for log in &receipt.logs {
+                    all_logs.push(json!({
+                        "tx_hash": receipt.tx_hash,
+                        "contract": log.contract,
+                        "topics": log.topics,
+                        "data": log.data,
+                        "log_index": log.log_index,
+                        "block_hash": block_hash,
+                        "block_height": block.header.height,
+                    }));
+                }
+            }
+        }
+        RpcResponse::ok(id, json!({ "logs": all_logs }))
     }
 }
 

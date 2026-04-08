@@ -51,6 +51,8 @@ impl ConsensusParams {
     pub const BLOCKS_PER_SECOND: u64   = 10;
 
     // ── Block Limits ───────────────────────────────────────────────────────
+    /// Maximum gas per block (sum of all tx gas_limits in one block)
+    pub const MAX_BLOCK_GAS: u64 = 100_000_000; // 100M gas per block
     pub const MAX_BLOCK_SIZE:    usize = 2 * 1024 * 1024; // 2 MB
     pub const MAX_BLOCK_TXS:     usize = 10_000;
     pub const MAX_TX_SIZE:       usize = 100 * 1024;      // 100 KB
