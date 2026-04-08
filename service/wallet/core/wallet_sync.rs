@@ -11,6 +11,11 @@ use crate::service::wallet::storage::wallet_db::WalletDB;
 use crate::service::wallet::core::wallet::Wallet;
 use crate::errors::WalletError;
 
+/// Wallet synchronization manager.
+///
+/// **Naming note:** `sync_wallet` is a misnomer -- it only loads local state,
+/// not actual chain synchronization. A future refactor should rename it to
+/// `load_wallet` or `load_local_wallet` and add real sync with block scanning.
 pub struct WalletSync {
     db:               WalletDB,
     last_sync_height: u64,
@@ -35,7 +40,13 @@ impl WalletSync {
     /// - Block scanning for relevant transactions
     /// - UTXO set querying for balance calculation
     /// - Confirmation depth tracking
+    #[deprecated(note = "Misleading name: does not sync with the network. Use load_local_wallet instead.")]
     pub fn sync_wallet(&self, address: &str) -> Result<Option<Wallet>, WalletError> {
+        self.load_local_wallet(address)
+    }
+
+    /// Load wallet state from the LOCAL database (renamed from sync_wallet).
+    pub fn load_local_wallet(&self, address: &str) -> Result<Option<Wallet>, WalletError> {
         self.db.get_wallet(address)
     }
 

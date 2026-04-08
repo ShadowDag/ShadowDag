@@ -296,17 +296,22 @@ impl Wallet {
 
         let acc = self.account(from_account)
             .ok_or(WalletError::Other("Account not found".to_string()))?.clone();
-        let primary = acc.primary_address().ok_or(WalletError::AddressNotFound("No address in account".to_string()))?;
+        if acc.addresses.is_empty() {
+            return Err(WalletError::AddressNotFound("No address in account".to_string()));
+        }
 
-        let avail_bal: u64 = self.utxos_for(primary).iter().map(|u| u.amount)
+        // Collect UTXOs from ALL account addresses, not just the primary one
+        let mut all_utxos: Vec<Walletutxo> = acc.addresses.iter()
+            .flat_map(|a| self.utxos_for(&a.address))
+            .cloned()
+            .collect();
+
+        let avail_bal: u64 = all_utxos.iter().map(|u| u.amount)
             .try_fold(0u64, |acc, u| acc.checked_add(u))
             .ok_or(WalletError::BalanceOverflow)?;
         if avail_bal < amount.saturating_add(fee) {
             return Err(WalletError::InsufficientFunds { need: amount + fee, have: avail_bal });
         }
-
-        let mut all_utxos: Vec<Walletutxo> = self.utxos_for(primary)
-            .into_iter().cloned().collect();
         all_utxos.sort_by(|a, b| b.amount.cmp(&a.amount));
 
         let mut selected  = Vec::new();
@@ -322,7 +327,11 @@ impl Wallet {
 
         let mut signed_inputs = Vec::new();
         for utxo in &selected {
-            let sk = derive_key(&seed, from_account, 0, false)?;
+            // Find which address owns this UTXO and derive the correct key
+            let wa = acc.addresses.iter()
+                .find(|a| a.address == utxo.address)
+                .ok_or(WalletError::AddressNotFound(utxo.address.clone()))?;
+            let sk = derive_key(&seed, wa.account, wa.index, wa.is_change)?;
             // FIXED: Use the SAME signing message format as TxValidator (TxHash::signing_message)
             // Format: SHA-256(CHAIN_ID || txid || index || to_address || amount || fee)
             let mut h = sha2::Sha256::new();
@@ -338,7 +347,7 @@ impl Wallet {
                 txid:      utxo.txid.clone(),
                 index:     utxo.index,
                 signature: hex::encode(sig.to_bytes()),
-                pub_key:   acc.addresses[0].public_key.clone(),
+                pub_key:   wa.public_key.clone(),
                 address:   utxo.address.clone(),
             });
         }
@@ -353,7 +362,7 @@ impl Wallet {
                 .unwrap_or(1);
             let change_addr = self.derive_change_address(from_account, next_idx)
                 .map(|a| a.address)
-                .unwrap_or_else(|_| primary.to_string());
+                .unwrap_or_else(|_| acc.primary_address().unwrap_or("").to_string());
             outputs.push(TxOut { address: change_addr, amount: change });
         }
 
@@ -370,6 +379,13 @@ impl Wallet {
         })
     }
 
+    /// Validate a ShadowDAG address.
+    ///
+    /// Address format produced by `make_address`:
+    ///   prefix (2 chars: "SD"/"ST"/"SR") + hex(version(1) + hash(32) + checksum(4))
+    ///   = prefix(2) + 74 hex chars = 76 total chars for standard addresses.
+    ///
+    /// Stealth addresses use a 4-char prefix ("SD1s"/"ST1s"/"SR1s") + 40 hex = 44 total.
     pub fn is_valid_address(&self, addr: &str) -> bool {
         let prefix = match self.network.as_str() {
             "testnet" => "ST",
@@ -377,10 +393,18 @@ impl Wallet {
             _          => "SD",
         };
         if !addr.starts_with(prefix) { return false; }
-        let rest = &addr[prefix.len()..];
-        // Must have version char + 40 hex chars (minimum)
-        if rest.len() < 41 { return false; }
-        rest[1..].chars().all(|c| c.is_ascii_hexdigit())
+        let after_net = &addr[prefix.len()..];
+
+        // Stealth addresses: prefix + "1s" + 40 hex = 4-char prefix total
+        if after_net.starts_with("1s") || after_net.starts_with("1c") || after_net.starts_with("1m") {
+            let hex_part = &after_net[2..];
+            return hex_part.len() == 40 && hex_part.chars().all(|c| c.is_ascii_hexdigit());
+        }
+
+        // Standard addresses: prefix(2) + 74 hex chars (version + hash + checksum)
+        // 74 hex chars = 37 bytes: 1 version + 32 hash + 4 checksum
+        if after_net.len() != 74 { return false; }
+        after_net.chars().all(|c| c.is_ascii_hexdigit())
     }
 }
 

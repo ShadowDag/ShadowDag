@@ -69,7 +69,13 @@ impl RocksStore {
 
 impl KeyValueStore for RocksStore {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.db.get(key).ok().flatten().map(|v| v.to_vec())
+        match self.db.get(key) {
+            Ok(v) => v.map(|d| d.to_vec()),
+            Err(e) => {
+                crate::slog_error!("storage", "rocks_store_read_failed", error => &e.to_string());
+                None
+            }
+        }
     }
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
         self.db.put(key, value).map_err(StorageError::from)
