@@ -12,6 +12,7 @@ pub const MSG_FLOOD_THRESHOLD:     u64   = 500;
 pub const BLOCK_FLOOD_THRESHOLD:   u64   = 20;
 pub const BAN_SCORE_THRESHOLD:     u64   = 100;
 pub const BAN_DURATION_SECS:       u64   = 86_400;
+pub const IDLE_ENTRY_EXPIRY_SECS:  u64   = 3_600;
 
 #[derive(Debug, Clone)]
 pub struct IpStats {
@@ -22,10 +23,15 @@ pub struct IpStats {
     pub ban_score:        u64,
     pub ban_expiry:       u64,
     pub window_start:     Instant,
+    pub last_seen:        u64,
 }
 
 impl Default for IpStats {
     fn default() -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         Self {
             connections:  0,
             msg_count:    0,
@@ -34,6 +40,7 @@ impl Default for IpStats {
             ban_score:    0,
             ban_expiry:   0,
             window_start: Instant::now(),
+            last_seen:    now,
         }
     }
 }
@@ -72,7 +79,12 @@ impl DosProtection {
     }
 
     fn entry(&mut self, ip: &str) -> &mut IpStats {
-        self.ip_stats.entry(ip.to_string()).or_default()
+        let stats = self.ip_stats.entry(ip.to_string()).or_default();
+        stats.last_seen = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        stats
     }
 
     pub fn allow_connection(&mut self, ip: &str) -> bool {
@@ -175,8 +187,22 @@ impl DosProtection {
                 stats.ban_score  = 0;
             }
         }
-        // Remove entries that are no longer banned and have no active score
-        self.ip_stats.retain(|_, s| s.ban_score > 0 || s.ban_expiry > 0 || s.connections > 0);
+        // Remove entries that are no longer banned and have no active connections,
+        // AND also remove idle entries (ban_score=0, no connections, last_seen older
+        // than IDLE_ENTRY_EXPIRY_SECS) to prevent unbounded memory growth.
+        self.ip_stats.retain(|_, s| {
+            // Keep if actively banned or has a ban score
+            if s.ban_score > 0 || s.ban_expiry > 0 {
+                return true;
+            }
+            // Keep if there are active connections
+            if s.connections > 0 {
+                return true;
+            }
+            // Remove if idle for longer than the expiry threshold
+            let idle_duration = now.saturating_sub(s.last_seen);
+            idle_duration < IDLE_ENTRY_EXPIRY_SECS
+        });
     }
 
     pub fn ip_count(&self) -> usize {

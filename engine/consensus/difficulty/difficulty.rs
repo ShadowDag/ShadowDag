@@ -12,9 +12,12 @@ impl Difficulty {
     pub const MAX_DIFFICULTY: u64 = u64::MAX / 2; // Same as retarget.rs
 
     // Per-shard block rate. Each shard targets 1 block/second (1000ms interval).
-    // The network-wide rate is BPS = shards * TARGET_BLOCKS_PER_SECOND (e.g., 10 shards = 10 BPS).
+    // For the network-wide rate, see NETWORK_BPS below.
     // Difficulty adjustment uses TARGET_BLOCK_INTERVAL_MS, not this constant directly.
     pub const TARGET_BLOCKS_PER_SECOND: u64 = 1; // 1 block/sec per shard
+
+    /// Network-wide BPS = 10 (10 shards x 1 BPS each). Must match ConsensusParams::BLOCKS_PER_SECOND.
+    pub const NETWORK_BPS: u64 = 10;
     pub const TARGET_BLOCK_INTERVAL_MS: u64 = 1_000; // 1 second per block
 
     // 🔥 tuning

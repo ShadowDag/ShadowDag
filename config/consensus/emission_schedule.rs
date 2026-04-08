@@ -112,7 +112,14 @@ impl EmissionSchedule {
         let reward = reward as u64;
         if reward < MIN_REWARD { return 0; }
 
-        reward
+        // MAX_SUPPLY enforcement: if total emission has reached the cap, stop rewarding
+        let max_supply = crate::config::consensus::consensus_params::ConsensusParams::MAX_SUPPLY;
+        let emitted = if height == 0 { 0 } else { Self::total_emitted_at_bps(height - 1, bps) };
+        if emitted >= max_supply {
+            return 0;
+        }
+        let remaining = max_supply - emitted;
+        reward.min(remaining)
     }
 
     /// Estimate total cumulative emission up to a given height.

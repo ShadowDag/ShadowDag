@@ -90,6 +90,7 @@ pub struct HealthChecker {
     start_time:     Instant,
     status:         std::sync::RwLock<HealthStatus>,
     block_height:   AtomicU64,
+    dag_tips:       AtomicU64,
     peer_count:     AtomicU64,
     mempool_size:   AtomicU64,
     total_blocks:   AtomicU64,
@@ -104,6 +105,7 @@ impl HealthChecker {
             start_time:   Instant::now(),
             status:       std::sync::RwLock::new(HealthStatus::Starting),
             block_height: AtomicU64::new(0),
+            dag_tips:     AtomicU64::new(0),
             peer_count:   AtomicU64::new(0),
             mempool_size: AtomicU64::new(0),
             total_blocks: AtomicU64::new(0),
@@ -126,6 +128,7 @@ impl HealthChecker {
     }
 
     pub fn update_block_height(&self, h: u64) { self.block_height.store(h, Ordering::Relaxed); }
+    pub fn update_dag_tips(&self, t: u64)     { self.dag_tips.store(t, Ordering::Relaxed); }
     pub fn update_peer_count(&self, c: u64)   { self.peer_count.store(c, Ordering::Relaxed); }
     pub fn update_mempool_size(&self, s: u64)  { self.mempool_size.store(s, Ordering::Relaxed); }
     pub fn on_block(&self, tx_count: u64) {
@@ -157,20 +160,53 @@ impl HealthChecker {
         let bps = if uptime > 0 { total_blocks as f64 / uptime as f64 } else { 0.0 };
         let tps = if uptime > 0 { total_txs as f64 / uptime as f64 } else { 0.0 };
 
+        // Best-effort process memory query — returns 0 if unavailable.
+        let memory_used_mb = Self::process_memory_mb();
+
         SystemMetrics {
             uptime_secs:    uptime,
             block_height:   self.block_height.load(Ordering::Relaxed),
-            dag_tips:       0, // TODO(#59): placeholder — wire TipManager.tip_count() when daemon feeds real data
+            dag_tips:       self.dag_tips.load(Ordering::Relaxed), // fed by daemon via update_dag_tips()
             peer_count:     self.peer_count.load(Ordering::Relaxed),
             mempool_size:   self.mempool_size.load(Ordering::Relaxed),
             blocks_per_sec: bps,
             txs_per_sec:    tps,
-            db_size_bytes:  0, // TODO(#59): placeholder — wire RocksDB size estimation when daemon feeds real data
-            memory_used_mb: 0, // TODO(#59): placeholder — wire OS memory query when daemon feeds real data
-            sync_progress:  if self.is_synced.load(Ordering::Relaxed) { 1.0 } else { 0.5 }, // TODO(#59): placeholder — compute from header chain progress
+            db_size_bytes:  0, // TODO(#59): stub — wire RocksDB's GetApproximateSizes or live_files_metadata when DB handle is plumbed in
+            memory_used_mb, // best-effort from /proc/self/statm or platform equivalent
+            sync_progress:  if self.is_synced.load(Ordering::Relaxed) { 1.0 } else { 0.5 }, // TODO(#59): stub — compute from header chain progress
             is_synced:      self.is_synced.load(Ordering::Relaxed),
             version:        env!("CARGO_PKG_VERSION").to_string(),
             network:        self.network.clone(),
+        }
+    }
+
+    /// Best-effort process RSS (Resident Set Size) in megabytes.
+    /// Returns 0 when the metric is unavailable on the current platform.
+    fn process_memory_mb() -> u64 {
+        // Linux / most Unix: read RSS from /proc/self/statm (page count)
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+                // Fields: size resident shared text lib data dt (all in pages)
+                if let Some(rss_pages) = statm.split_whitespace().nth(1) {
+                    if let Ok(pages) = rss_pages.parse::<u64>() {
+                        let page_size = 4096u64; // common default
+                        return (pages * page_size) / (1024 * 1024);
+                    }
+                }
+            }
+            0
+        }
+        // Windows: use GetProcessMemoryInfo via winapi-style FFI
+        #[cfg(target_os = "windows")]
+        {
+            // TODO(#59): stub — implement via windows-sys GetProcessMemoryInfo
+            0
+        }
+        // macOS / other: not yet implemented
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            0
         }
     }
 

@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::errors::StorageError;
+use crate::slog_error;
 use crate::slog_warn;
 
 /// How many blocks' worth of TX hashes to keep.
@@ -103,8 +104,16 @@ impl ConfirmedTxStore {
         let mut removed = Vec::new();
 
         let iter = self.db.prefix_iterator(&prefix);
-        for item in iter.flatten() {
-            let (key, _) = item;
+        let mut iter_errors: u64 = 0;
+        for item in iter {
+            let (key, _) = match item {
+                Ok(kv) => kv,
+                Err(e) => {
+                    iter_errors += 1;
+                    slog_error!("consensus", "unconfirm_iter_error", reason => &e.to_string(), height => &height.to_string());
+                    continue;
+                }
+            };
             if !key.starts_with(&prefix) {
                 break;
             }
@@ -139,6 +148,10 @@ impl ConfirmedTxStore {
             batch.delete(&*key);
         }
 
+        if iter_errors > 0 {
+            slog_warn!("consensus", "unconfirm_partial_operation", errors => &iter_errors.to_string(), height => &height.to_string());
+        }
+
         self.db
             .write_opt(batch, &self.write_opts)
             .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
@@ -171,8 +184,16 @@ impl ConfirmedTxStore {
 
         // Iterate btx: entries from the beginning
         let iter = self.db.prefix_iterator(PFX_BTX);
-        for item in iter.flatten() {
-            let (key, _) = item;
+        let mut iter_errors: u64 = 0;
+        for item in iter {
+            let (key, _) = match item {
+                Ok(kv) => kv,
+                Err(e) => {
+                    iter_errors += 1;
+                    slog_error!("consensus", "prune_iter_error", reason => &e.to_string(), min_height => &min_height.to_string());
+                    continue;
+                }
+            };
             if !key.starts_with(PFX_BTX) {
                 break;
             }
@@ -229,6 +250,10 @@ impl ConfirmedTxStore {
                     .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
                 batch = WriteBatch::default();
             }
+        }
+
+        if iter_errors > 0 {
+            slog_warn!("consensus", "prune_partial_operation", errors => &iter_errors.to_string(), min_height => &min_height.to_string());
         }
 
         if count % 10_000 != 0 {

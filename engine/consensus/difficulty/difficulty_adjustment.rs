@@ -17,7 +17,7 @@ use crate::slog_error;
 /// against block height must use RETARGET_BLOCK_INTERVAL, which is BPS-scaled.
 pub const RETARGET_INTERVAL: u64 = 120;
 /// Retarget interval scaled by BPS. At 10 BPS, 120 seconds = 1200 blocks.
-pub const RETARGET_BLOCK_INTERVAL: u64 = RETARGET_INTERVAL * 10; // 10 BPS default
+pub const RETARGET_BLOCK_INTERVAL: u64 = RETARGET_INTERVAL * crate::config::consensus::consensus_params::ConsensusParams::BLOCKS_PER_SECOND;
 pub const ADJUSTMENT_FACTOR_MAX: u64 = 4;
 pub const TARGET_BLOCK_TIME_SECS: u64 = 1;
 

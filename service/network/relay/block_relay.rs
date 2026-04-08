@@ -110,7 +110,8 @@ impl BlockRelay {
             return false;
         }
 
-        if let Err(_e) = self.db.put(key.as_bytes(), b"1") {
+        if let Err(e) = self.db.put(key.as_bytes(), b"1") {
+            slog_warn!("relay", "receive_block_put_error", hash => &block.header.hash, error => e);
         }
 
         if block.header.height == 0 || block.header.parents.is_empty() {
@@ -157,7 +158,8 @@ impl BlockRelay {
                 return;
             }
             let key = format!("orphan:block:{}", entry.block.header.hash);
-            if let Err(_e) = self.db.put(key.as_bytes(), &data) {
+            if let Err(e) = self.db.put(key.as_bytes(), &data) {
+                slog_warn!("relay", "orphan_pool_put_error", hash => &entry.block.header.hash, error => e);
             }
         }
     }
@@ -171,13 +173,24 @@ impl BlockRelay {
 
         let mut resolved = Vec::new();
         let mut queue = vec![parent_hash.to_string()];
+        // Track blocks resolved in this call so cascading resolution works
+        // without writing premature "known" markers to the DB. The caller
+        // is responsible for marking blocks as known AFTER validation via
+        // mark_block_known().
+        let mut resolved_hashes = std::collections::HashSet::<String>::new();
 
         // Iterative BFS: each resolved block may unlock further orphans
         // whose other parents were already known.
         while let Some(current_parent) = queue.pop() {
             let all_orphans: Vec<OrphanEntry> = self.db
                 .prefix_iterator(PFX_ORPHAN)
-                .filter_map(|r| r.ok())
+                .filter_map(|r| match r {
+                    Ok(kv) => Some(kv),
+                    Err(e) => {
+                        slog_warn!("relay", "orphan_iter_read_error", error => e);
+                        None
+                    }
+                })
                 .filter(|(_, v)| v.len() <= MAX_ORPHAN_ENTRY_SIZE)
                 .filter_map(|(_, v)| bincode::deserialize::<OrphanEntry>(&v).ok())
                 .collect();
@@ -188,16 +201,21 @@ impl BlockRelay {
                 }
 
                 let all_known = entry.block.header.parents.iter().all(|p| {
-                    self.is_block_known(p)
+                    resolved_hashes.contains(p) || self.is_block_known(p)
                 });
 
                 if all_known {
                     let orphan_key = format!("orphan:block:{}", entry.block.header.hash);
-                    let _ = self.db.delete(orphan_key.as_bytes());
+                    if let Err(e) = self.db.delete(orphan_key.as_bytes()) {
+                        slog_warn!("relay", "orphan_delete_error", hash => &entry.block.header.hash, error => e);
+                    }
 
-                    // Mark this block as known so downstream orphans can resolve
-                    let relay_key = format!("relay:block:{}", entry.block.header.hash);
-                    let _ = self.db.put(relay_key.as_bytes(), b"1");
+                    // Do NOT write relay:block:{hash}=1 here — the block has
+                    // not been validated yet. The caller must call
+                    // mark_block_known() after successful validation.
+
+                    // Track locally for cascading BFS
+                    resolved_hashes.insert(entry.block.header.hash.clone());
 
                     // Enqueue so orphans waiting on THIS block get checked next
                     queue.push(entry.block.header.hash.clone());
@@ -209,6 +227,15 @@ impl BlockRelay {
         resolved
     }
 
+    /// Mark a block as known in the relay DB. Callers should invoke this
+    /// AFTER the block has been fully validated, not before.
+    pub fn mark_block_known(&self, hash: &str) {
+        let relay_key = format!("relay:block:{}", hash);
+        if let Err(e) = self.db.put(relay_key.as_bytes(), b"1") {
+            slog_error!("relay", "mark_block_known_error", hash => hash, error => e);
+        }
+    }
+
     pub fn is_orphan(&self, hash: &str) -> bool {
         let key = format!("orphan:block:{}", hash);
         matches!(self.db.get(key.as_bytes()), Ok(Some(_)))
@@ -217,7 +244,13 @@ impl BlockRelay {
     pub fn orphan_count(&self) -> usize {
         self.db
             .prefix_iterator(PFX_ORPHAN)
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(kv) => Some(kv),
+                Err(e) => {
+                    slog_warn!("relay", "orphan_count_iter_error", error => e);
+                    None
+                }
+            })
             .count()
     }
 
@@ -226,7 +259,13 @@ impl BlockRelay {
 
         let stale_keys: Vec<Vec<u8>> = self.db
             .prefix_iterator(PFX_ORPHAN)
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(kv) => Some(kv),
+                Err(e) => {
+                    slog_warn!("relay", "prune_orphans_iter_error", error => e);
+                    None
+                }
+            })
             .filter(|(_, v)| {
                 bincode::deserialize::<OrphanEntry>(v)
                     .map(|e| e.received_at < cutoff)
@@ -236,29 +275,46 @@ impl BlockRelay {
             .collect();
 
         let pruned = stale_keys.len();
-        for k in stale_keys {
-            let _ = self.db.delete(&k);
+        for k in &stale_keys {
+            if let Err(e) = self.db.delete(k) {
+                slog_warn!("relay", "prune_orphan_delete_error", error => e);
+            }
         }
 
         if pruned > 0 {
+            log::debug!("[BlockRelay] Pruned {} stale orphans", pruned);
         }
     }
 
     pub fn clear_orphan_pool(&self) {
         let keys: Vec<Vec<u8>> = self.db
             .prefix_iterator(PFX_ORPHAN)
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(kv) => Some(kv),
+                Err(e) => {
+                    slog_warn!("relay", "clear_orphan_pool_iter_error", error => e);
+                    None
+                }
+            })
             .map(|(k, _)| k.to_vec())
             .collect();
-        for k in keys {
-            let _ = self.db.delete(&k);
+        for k in &keys {
+            if let Err(e) = self.db.delete(k) {
+                slog_warn!("relay", "clear_orphan_pool_delete_error", error => e);
+            }
         }
     }
 
     fn evict_oldest_orphan(&self) {
         let oldest: Option<(u64, Vec<u8>)> = self.db
             .prefix_iterator(PFX_ORPHAN)
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(kv) => Some(kv),
+                Err(e) => {
+                    slog_warn!("relay", "evict_oldest_orphan_iter_error", error => e);
+                    None
+                }
+            })
             .filter_map(|(k, v)| {
                 bincode::deserialize::<OrphanEntry>(&v)
                     .ok()
@@ -267,7 +323,9 @@ impl BlockRelay {
             .min_by_key(|(ts, _)| *ts);
 
         if let Some((_, k)) = oldest {
-            let _ = self.db.delete(&k);
+            if let Err(e) = self.db.delete(&k) {
+                slog_warn!("relay", "evict_oldest_orphan_delete_error", error => e);
+            }
         }
     }
 

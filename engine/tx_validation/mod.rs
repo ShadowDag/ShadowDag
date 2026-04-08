@@ -60,6 +60,8 @@ pub enum TxValidationError {
     InvalidCommitmentBalance,
     EmptyKeyImage,
     RingSizeTooSmall(usize),
+    KeyImageCountMismatch { expected: usize, actual: usize },
+    RingSizeCountMismatch { expected: usize, actual: usize },
     FeeBelowMinimum(u64),
     DuplicateInput(String),
 }
@@ -96,7 +98,9 @@ impl TxValidationError {
             | TxValidationError::InvalidRangeProof
             | TxValidationError::InvalidCommitmentBalance
             | TxValidationError::EmptyKeyImage
-            | TxValidationError::RingSizeTooSmall(_) => ValidationLayer::Privacy,
+            | TxValidationError::RingSizeTooSmall(_)
+            | TxValidationError::KeyImageCountMismatch { .. }
+            | TxValidationError::RingSizeCountMismatch { .. } => ValidationLayer::Privacy,
         }
     }
 
@@ -128,6 +132,8 @@ impl std::fmt::Display for TxValidationError {
             TxValidationError::InvalidCommitmentBalance => write!(f, "commitment balance mismatch"),
             TxValidationError::EmptyKeyImage           => write!(f, "empty key image in confidential tx"),
             TxValidationError::RingSizeTooSmall(n)     => write!(f, "ring size {} below minimum 3", n),
+            TxValidationError::KeyImageCountMismatch { expected, actual } => write!(f, "key_images count {} != input count {}", actual, expected),
+            TxValidationError::RingSizeCountMismatch { expected, actual } => write!(f, "ring_sizes count {} != input count {}", actual, expected),
         }
     }
 }
@@ -233,6 +239,24 @@ impl TxValidationPipeline {
     pub fn validate_privacy(tx: &TxValidationInput) -> TxValidationResult {
         if !tx.has_privacy_proof {
             return Ok(());
+        }
+
+        // 0. key_images and ring_sizes vectors must match input_count exactly.
+        //    Without this check, a confidential TX with input_count > 0 but
+        //    empty key_images=[] and ring_sizes=[] would pass all loop checks
+        //    vacuously.
+        let input_count = tx.input_count;
+        if tx.key_images.len() != input_count {
+            return Err(TxValidationError::KeyImageCountMismatch {
+                expected: input_count,
+                actual: tx.key_images.len(),
+            });
+        }
+        if tx.ring_sizes.len() != input_count {
+            return Err(TxValidationError::RingSizeCountMismatch {
+                expected: input_count,
+                actual: tx.ring_sizes.len(),
+            });
         }
 
         // 1. Every input must have a non-empty key image
@@ -417,7 +441,9 @@ mod tests {
     #[test]
     fn confidential_tx_duplicate_key_image_fails() {
         let mut tx = confidential_tx();
+        tx.input_count = 2;
         tx.key_images = vec!["ki_same".into(), "ki_same".into()];
+        tx.ring_sizes = vec![11, 11];
         assert_eq!(
             TxValidationPipeline::validate_privacy(&tx),
             Err(TxValidationError::DuplicateKeyImage("ki_same".into()))
@@ -458,5 +484,30 @@ mod tests {
     fn transparent_tx_skips_privacy_checks() {
         let tx = valid_tx(); // has_privacy_proof = false
         assert!(TxValidationPipeline::validate_privacy(&tx).is_ok());
+    }
+
+    #[test]
+    fn confidential_tx_empty_key_images_with_inputs_fails() {
+        // Regression: input_count > 0 with empty key_images should not pass vacuously
+        let mut tx = confidential_tx();
+        tx.input_count = 2;
+        tx.key_images = vec![];
+        tx.ring_sizes = vec![];
+        assert_eq!(
+            TxValidationPipeline::validate_privacy(&tx),
+            Err(TxValidationError::KeyImageCountMismatch { expected: 2, actual: 0 })
+        );
+    }
+
+    #[test]
+    fn confidential_tx_ring_sizes_count_mismatch_fails() {
+        let mut tx = confidential_tx();
+        tx.input_count = 2;
+        tx.key_images = vec!["ki_1".into(), "ki_2".into()];
+        tx.ring_sizes = vec![11]; // only 1 ring size for 2 inputs
+        assert_eq!(
+            TxValidationPipeline::validate_privacy(&tx),
+            Err(TxValidationError::RingSizeCountMismatch { expected: 2, actual: 1 })
+        );
     }
 }

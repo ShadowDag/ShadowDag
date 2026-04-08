@@ -272,9 +272,18 @@ impl UtxoStore {
 
         let mut batch = rocksdb::WriteBatch::default();
         let mut count = 0usize;
+        let mut iter_errors = 0usize;
 
         let iter = self.db.iterator(IteratorMode::Start);
-        for (k, v) in iter.flatten() {
+        for item in iter {
+            let (k, v) = match item {
+                Ok(kv) => kv,
+                Err(e) => {
+                    slog_error!("storage", "utxo_clear_all_iter_error", error => e);
+                    iter_errors += 1;
+                    continue;
+                }
+            };
             let is_utxo_prefix = UTXO_PREFIXES.iter().any(|p| k.starts_with(p));
             let is_utxo_entry = k.len() == 36 && bincode::deserialize::<Utxo>(&v).is_ok();
 
@@ -282,6 +291,10 @@ impl UtxoStore {
                 batch.delete(&k);
                 count += 1;
             }
+        }
+
+        if iter_errors > 0 {
+            slog_error!("storage", "utxo_clear_all_iter_errors_total", errors => iter_errors);
         }
 
         if count > 0 {
@@ -298,9 +311,18 @@ impl UtxoStore {
     pub fn prune_spent(&self) -> Result<u64, StorageError> {
         let mut batch = WriteBatch::default();
         let mut count = 0u64;
+        let mut iter_errors = 0usize;
 
         let iter = self.db.iterator(IteratorMode::Start);
-        for (k, v) in iter.flatten() {
+        for item in iter {
+            let (k, v) = match item {
+                Ok(kv) => kv,
+                Err(e) => {
+                    slog_error!("storage", "utxo_prune_spent_iter_error", error => e);
+                    iter_errors += 1;
+                    continue;
+                }
+            };
             if k.len() != 36 {
                 continue;
             }
@@ -316,6 +338,11 @@ impl UtxoStore {
                 }
             }
         }
+
+        if iter_errors > 0 {
+            slog_error!("storage", "utxo_prune_spent_iter_errors_total", errors => iter_errors);
+        }
+
         if !count.is_multiple_of(10_000) {
             self.db.write(batch).map_err(StorageError::RocksDb)?;
         }
@@ -372,7 +399,13 @@ impl crate::domain::traits::utxo_backend::UtxoBackend for UtxoStore {
     }
 
     fn get_raw(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.db.get(key).ok().flatten().map(|v| v.to_vec())
+        match self.db.get(key) {
+            Ok(v) => v.map(|v| v.to_vec()),
+            Err(e) => {
+                slog_error!("storage", "utxo_get_raw_failed", error => e);
+                None
+            }
+        }
     }
 
     fn put_raw(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {

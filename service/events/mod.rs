@@ -6,8 +6,11 @@
 pub mod pubsub;
 
 use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::slog_error;
 
 #[derive(Debug, Clone)]
 pub enum NodeEvent {
@@ -125,13 +128,21 @@ impl EventBus {
 
         if let Some(callbacks) = self.subscribers.get(name) {
             for cb in callbacks {
-                cb(&event);
+                if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
+                    cb(&event);
+                })) {
+                    slog_error!("events", "callback_panicked", event => name, error => format!("{:?}", e));
+                }
             }
         }
 
         if let Some(callbacks) = self.subscribers.get("all") {
             for cb in callbacks {
-                cb(&event);
+                if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
+                    cb(&event);
+                })) {
+                    slog_error!("events", "callback_panicked", event => "all", error => format!("{:?}", e));
+                }
             }
         }
     }

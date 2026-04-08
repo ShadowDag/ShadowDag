@@ -101,8 +101,8 @@ impl RpcAuthManager {
         if mgr.users.is_empty() {
             // First run — generate and persist admin
             let password = generate_random_password();
-            slog_warn!("rpc", "first_run_admin_created", username => "admin", password => &password);
-            slog_warn!("rpc", "first_run_admin_notice", note => "Save this password — it will not be shown again");
+            slog_warn!("rpc", "first_run_admin_created", username => "admin");
+            slog_warn!("rpc", "first_run_admin_notice", note => "Default admin password was generated — retrieve it from the secure config or reset it");
             mgr.add_user("admin", &password, AuthRole::Admin);
         } else {
             slog_info!("rpc", "users_loaded_from_db", count => mgr.users.len());
@@ -143,7 +143,14 @@ impl RpcAuthManager {
         };
         let prefix = b"rpc:user:";
         let iter = db.prefix_iterator(prefix);
-        for (k, v) in iter.flatten() {
+        for item in iter {
+            let (k, v) = match item {
+                Ok(kv) => kv,
+                Err(e) => {
+                    slog_error!("rpc", "db_iterator_error", error => e);
+                    continue;
+                }
+            };
             let key_str = String::from_utf8_lossy(&k);
             if !key_str.starts_with("rpc:user:") { break; }
             let username = key_str.trim_start_matches("rpc:user:").to_string();

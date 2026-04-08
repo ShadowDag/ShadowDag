@@ -225,6 +225,8 @@ pub struct GrpcServer {
     running:  Arc<AtomicBool>,
     stats:    Arc<GrpcStats>,
     handlers: Arc<RwLock<HashMap<u8, HandlerFn>>>,
+    /// Holds the bound address so stop() can connect to unblock accept().
+    bound_addr: std::sync::Mutex<Option<std::net::SocketAddr>>,
 }
 
 impl GrpcServer {
@@ -234,6 +236,7 @@ impl GrpcServer {
             running:  Arc::new(AtomicBool::new(false)),
             stats:    Arc::new(GrpcStats::new()),
             handlers: Arc::new(RwLock::new(HashMap::new())),
+            bound_addr: std::sync::Mutex::new(None),
         }
     }
 
@@ -343,12 +346,12 @@ impl GrpcServer {
                 }
             };
 
-            // Write response back
+            // Write response back — only count bytes AFTER successful write
             let resp_bytes = response.to_bytes();
-            stats.bytes_sent.fetch_add(resp_bytes.len() as u64, Ordering::Relaxed);
             if stream.write_all(&resp_bytes).is_err() {
                 break;
             }
+            stats.bytes_sent.fetch_add(resp_bytes.len() as u64, Ordering::Relaxed);
 
             stats.bytes_received.fetch_add((4 + msg_len) as u64, Ordering::Relaxed);
         }
@@ -370,6 +373,19 @@ impl GrpcServer {
 
         // Only set running to true AFTER successful bind
         self.running.store(true, Ordering::Relaxed);
+
+        // Store bound address so stop() can send a dummy connection to unblock accept()
+        if let Ok(local_addr) = listener.local_addr() {
+            if let Ok(mut bound) = self.bound_addr.lock() {
+                *bound = Some(local_addr);
+            }
+        }
+
+        // Set a non-blocking accept timeout so we periodically re-check the running flag.
+        // Without this, listener.incoming() blocks indefinitely and stop() cannot
+        // break the accept loop (known limitation of std TcpListener).
+        let _ = listener.set_nonblocking(false);
+        let _ = listener.set_ttl(30);
 
         for stream in listener.incoming() {
             if !self.running.load(Ordering::Relaxed) { break; }
@@ -397,6 +413,24 @@ impl GrpcServer {
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
+
+        // Unblock the accept loop: connect briefly to the listener so it
+        // wakes up, checks `running`, and exits. This is the standard
+        // workaround for std TcpListener lacking a shutdown API.
+        if let Ok(bound) = self.bound_addr.lock() {
+            if let Some(addr) = *bound {
+                // Use 127.0.0.1 with the bound port to reach the listener
+                let loopback = std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    addr.port(),
+                );
+                let _ = TcpStream::connect_timeout(
+                    &loopback,
+                    std::time::Duration::from_millis(100),
+                );
+            }
+        }
+
         slog_info!("rpc", "grpc_server_stopped", stats => &self.stats.summary());
     }
 

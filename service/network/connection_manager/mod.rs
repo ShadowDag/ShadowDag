@@ -159,6 +159,12 @@ impl ConnectionManager {
     }
 
     pub fn accept_connection(&mut self, address: &str) -> Result<u64, NetworkError> {
+        // Reject self-connections on inbound too (mirrors open_connection check)
+        if self.is_self(address) {
+            return Err(NetworkError::ConnectionFailed(
+                format!("Rejected inbound self-connection from {}", address)
+            ));
+        }
         if self.is_banned(address) {
             return Err(NetworkError::PeerBanned(address.to_string()));
         }
@@ -267,6 +273,13 @@ mod tests {
     fn reject_self_connection() {
         let mut mgr = mgr();
         assert!(mgr.open_connection("0.0.0.0:9333").is_err());
+    }
+
+    #[test]
+    fn reject_inbound_self_connection() {
+        let mut mgr = mgr();
+        assert!(mgr.accept_connection("0.0.0.0:9333").is_err(),
+            "Inbound self-connection must be rejected");
     }
 
     #[test]

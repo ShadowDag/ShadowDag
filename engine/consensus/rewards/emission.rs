@@ -18,7 +18,7 @@ impl Emission {
 
         // MAX_SUPPLY enforcement
         let max_supply = crate::config::consensus::consensus_params::ConsensusParams::MAX_SUPPLY;
-        let emitted = EmissionSchedule::total_emitted(height);
+        let emitted = if height == 0 { 0 } else { EmissionSchedule::total_emitted(height - 1) };
         if emitted >= max_supply {
             return 0; // Cap reached
         }
@@ -30,6 +30,8 @@ impl Emission {
     /// Uses the EmissionSchedule's efficient era-based calculation.
     /// Does NOT precompute a giant Vec — uses O(1) math per era.
     pub fn total_supply(height: u64) -> u64 {
-        EmissionSchedule::total_emitted(height)
+        let raw = EmissionSchedule::total_emitted(height);
+        let max_supply = crate::config::consensus::consensus_params::ConsensusParams::MAX_SUPPLY;
+        raw.min(max_supply)
     }
 }

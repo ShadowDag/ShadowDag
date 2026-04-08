@@ -143,7 +143,13 @@ impl PendingMultisig {
         }
     }
 
-    /// Add a partial signature from a signer
+    /// Add a partial signature from a signer.
+    ///
+    /// TODO: This is a placeholder. Real Ed25519 signature verification is needed
+    /// before production. Currently only validates that the signer is authorized,
+    /// the signature is not a duplicate, and the signature has the expected length
+    /// (64 bytes = 128 hex chars). Cryptographic verification of the signature
+    /// against the signer's public key and the transaction hash is NOT performed.
     pub fn add_signature(&mut self, pubkey: &str, signature: &str) -> Result<(), WalletError> {
         // Verify signer is authorized
         if !self.config.is_signer(pubkey) {
@@ -158,6 +164,13 @@ impl PendingMultisig {
         // Check if already have enough
         if self.is_complete() {
             return Err(WalletError::Other("Already have enough signatures".to_string()));
+        }
+
+        // Basic format validation: Ed25519 signatures are 64 bytes = 128 hex chars
+        if signature.len() != 128 || !signature.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(WalletError::Other(
+                "Invalid signature format: expected 128 hex characters (64 bytes Ed25519)".to_string(),
+            ));
         }
 
         self.signatures.push(PartialSignature {
@@ -184,7 +197,13 @@ impl PendingMultisig {
         now_secs().saturating_sub(self.created_at) > SIG_TIMEOUT_SECS
     }
 
-    /// Get aggregated signature (when complete)
+    /// Get aggregated signature (when complete).
+    ///
+    /// TODO: This is a placeholder that hashes partial signatures together.
+    /// Real Ed25519 multi-signature aggregation (e.g., MuSig2 or similar)
+    /// must be implemented before production use. The current approach does
+    /// NOT provide cryptographic security.
+    #[deprecated(note = "Placeholder: uses SHA-256 hash, not real Ed25519 signature aggregation. Needs real crypto before production.")]
     pub fn aggregate_signatures(&self) -> Option<String> {
         if !self.is_complete() { return None; }
 
@@ -298,6 +317,11 @@ mod tests {
         (0..n).map(|i| format!("pubkey_{:02}", i)).collect()
     }
 
+    /// Generate a valid 128-hex-char fake signature for testing
+    fn fake_sig(id: u8) -> String {
+        format!("{:0>128}", format!("{:02x}", id))
+    }
+
     #[test]
     fn create_2_of_3() {
         let config = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap();
@@ -326,34 +350,36 @@ mod tests {
         assert!(!pending.is_complete());
         assert_eq!(pending.remaining(), 2);
 
-        pending.add_signature("pubkey_00", "sig_0").unwrap();
+        pending.add_signature("pubkey_00", &fake_sig(0)).unwrap();
         assert_eq!(pending.remaining(), 1);
 
-        pending.add_signature("pubkey_01", "sig_1").unwrap();
+        pending.add_signature("pubkey_01", &fake_sig(1)).unwrap();
         assert!(pending.is_complete());
-        assert!(pending.aggregate_signatures().is_some());
+        #[allow(deprecated)]
+        let agg = pending.aggregate_signatures();
+        assert!(agg.is_some());
     }
 
     #[test]
     fn duplicate_signature_rejected() {
         let config = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap();
         let mut pending = PendingMultisig::new("tx1".into(), config, vec![]);
-        pending.add_signature("pubkey_00", "sig_0").unwrap();
-        assert!(pending.add_signature("pubkey_00", "sig_again").is_err());
+        pending.add_signature("pubkey_00", &fake_sig(0)).unwrap();
+        assert!(pending.add_signature("pubkey_00", &fake_sig(99)).is_err());
     }
 
     #[test]
     fn unauthorized_signer_rejected() {
         let config = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap();
         let mut pending = PendingMultisig::new("tx1".into(), config, vec![]);
-        assert!(pending.add_signature("unknown_key", "sig").is_err());
+        assert!(pending.add_signature("unknown_key", &fake_sig(0)).is_err());
     }
 
     #[test]
     fn pending_signers_tracked() {
         let config = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap();
         let mut pending = PendingMultisig::new("tx1".into(), config, vec![]);
-        pending.add_signature("pubkey_00", "sig_0").unwrap();
+        pending.add_signature("pubkey_00", &fake_sig(0)).unwrap();
 
         let remaining = pending.pending_signers();
         assert_eq!(remaining.len(), 2);
@@ -367,11 +393,13 @@ mod tests {
         let addr = mgr.register(config);
 
         mgr.initiate("tx1".into(), &addr, vec![1, 2, 3]).unwrap();
-        assert!(!mgr.sign("tx1", "pubkey_00", "sig0").unwrap());
-        assert!(mgr.sign("tx1", "pubkey_01", "sig1").unwrap()); // Complete!
+        assert!(!mgr.sign("tx1", "pubkey_00", &fake_sig(0)).unwrap());
+        assert!(mgr.sign("tx1", "pubkey_01", &fake_sig(1)).unwrap()); // Complete!
 
         let completed = mgr.get_completed("tx1").unwrap();
-        assert!(completed.aggregate_signatures().is_some());
+        #[allow(deprecated)]
+        let agg = completed.aggregate_signatures();
+        assert!(agg.is_some());
     }
 
     #[test]
