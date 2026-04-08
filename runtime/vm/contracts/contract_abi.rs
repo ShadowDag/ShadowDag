@@ -12,6 +12,7 @@
 use serde::{Serialize, Deserialize};
 use sha2::{Sha256, Digest};
 use crate::errors::VmError;
+use crate::slog_error;
 
 /// ABI parameter types
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -155,7 +156,14 @@ impl ContractAbi {
         self.functions.iter().find(|f| f.name == name)
     }
 
-    /// Encode a function call to bytecode-compatible format
+    /// Encode a function call to bytecode-compatible format.
+    ///
+    /// **Note:** This is a simplified encoding that concatenates the 4-byte
+    /// selector with raw argument bytes. It does NOT implement the full
+    /// Ethereum ABI encoding spec (no 32-byte padding, no dynamic offsets).
+    /// Each argument is validated against its declared ABI type's expected
+    /// size. For variable-length types (String, Bytes, Array) any non-empty
+    /// value is accepted.
     pub fn encode_call(&self, function_name: &str, args: &[Vec<u8>]) -> Result<Vec<u8>, VmError> {
         let func = self.find_by_name(function_name)
             .ok_or_else(|| VmError::ContractError(format!("Function '{}' not found in ABI", function_name)))?;
@@ -164,12 +172,40 @@ impl ContractAbi {
             return Err(VmError::ContractError(format!("Expected {} args, got {}", func.inputs.len(), args.len())));
         }
 
-        let mut encoded = Vec::with_capacity(4 + args.len() * 8);
+        // Validate each argument matches its declared ABI type's expected size
+        for (i, (arg, param)) in args.iter().zip(func.inputs.iter()).enumerate() {
+            let expected = Self::expected_arg_size(&param.abi_type);
+            if let Some(size) = expected {
+                if arg.len() != size {
+                    return Err(VmError::ContractError(format!(
+                        "Argument '{}' (index {}) expected {} bytes for type {}, got {}",
+                        param.name, i, size, param.abi_type.name(), arg.len()
+                    )));
+                }
+            }
+            // Variable-length types (String, Bytes, Array): any non-empty length is valid
+        }
+
+        let mut encoded = Vec::with_capacity(4 + args.iter().map(|a| a.len()).sum::<usize>());
         encoded.extend_from_slice(&func.selector);
         for arg in args {
             encoded.extend_from_slice(arg);
         }
         Ok(encoded)
+    }
+
+    /// Return the expected byte size for fixed-size ABI types, or None for
+    /// variable-length types.
+    fn expected_arg_size(abi_type: &AbiType) -> Option<usize> {
+        match abi_type {
+            AbiType::Uint64  => Some(8),
+            AbiType::Int64   => Some(8),
+            AbiType::Bool    => Some(1),
+            AbiType::Address => None, // addresses are variable-length strings in ShadowDAG
+            AbiType::String  => None,
+            AbiType::Bytes   => None,
+            AbiType::Array(_) => None,
+        }
     }
 
     /// Decode function selector from call data
@@ -178,9 +214,18 @@ impl ContractAbi {
         Some([data[0], data[1], data[2], data[3]])
     }
 
-    /// Serialize ABI to JSON
+    /// Serialize ABI to JSON.
+    ///
+    /// Logs a structured error if serialization fails rather than silently
+    /// returning an empty string.
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap_or_default()
+        match serde_json::to_string_pretty(self) {
+            Ok(s) => s,
+            Err(e) => {
+                slog_error!("vm", "abi_to_json_failed", error => &e.to_string());
+                String::new()
+            }
+        }
     }
 
     /// Deserialize ABI from JSON

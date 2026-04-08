@@ -156,10 +156,18 @@ impl Executor {
 
     /// Validate that bytecode does not contain unsupported opcodes.
     ///
-    /// This is a simple byte-level scan -- it may match data bytes that happen
-    /// to equal an opcode value. For production, a proper disassembler would be
-    /// needed. But this prevents obvious cases of deploying contracts that use
-    /// unimplemented inter-contract calls or self-destruct.
+    /// This scan is PUSH-aware: when a PUSHn opcode is encountered the
+    /// following n data bytes are skipped so that embedded constants that
+    /// happen to equal an unsupported opcode value do not cause false
+    /// positives.
+    ///
+    /// ShadowVM PUSH opcodes and their data sizes:
+    ///   PUSH1  (0x10) -> 1 byte
+    ///   PUSH2  (0x11) -> 2 bytes
+    ///   PUSH4  (0x12) -> 4 bytes
+    ///   PUSH8  (0x13) -> 8 bytes
+    ///   PUSH16 (0x14) -> 16 bytes
+    ///   PUSH32 (0x15) -> 32 bytes
     fn validate_supported_opcodes(bytecode: &[u8]) -> Result<(), VmError> {
         use crate::runtime::vm::core::opcodes::OpCode;
         let unsupported: &[(u8, &str)] = &[
@@ -171,14 +179,35 @@ impl Executor {
             (OpCode::CREATE2 as u8, "CREATE2"),
             (OpCode::SELFDESTRUCT as u8, "SELFDESTRUCT"),
         ];
-        for &byte in bytecode {
-            for &(op, name) in unsupported {
-                if byte == op {
+
+        let mut i = 0;
+        while i < bytecode.len() {
+            let op = bytecode[i];
+
+            // PUSH1..PUSH32 (0x10..0x15): skip the inline data bytes
+            let push_size: usize = match op {
+                0x10 => 1,  // PUSH1
+                0x11 => 2,  // PUSH2
+                0x12 => 4,  // PUSH4
+                0x13 => 8,  // PUSH8
+                0x14 => 16, // PUSH16
+                0x15 => 32, // PUSH32
+                _ => 0,
+            };
+            if push_size > 0 {
+                i += 1 + push_size; // skip opcode + data
+                continue;
+            }
+
+            // Check if this opcode is unsupported
+            for &(unsup, name) in unsupported {
+                if op == unsup {
                     return Err(VmError::ContractError(format!(
-                        "Bytecode contains unsupported opcode {} (0x{:02x})", name, op
+                        "Bytecode contains unsupported opcode {} (0x{:02x})", name, unsup
                     )));
                 }
             }
+            i += 1;
         }
         Ok(())
     }

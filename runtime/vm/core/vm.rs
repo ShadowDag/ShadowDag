@@ -31,6 +31,7 @@
 use sha2::{Sha256, Digest};
 
 use crate::errors::VmError;
+use crate::slog_warn;
 use crate::runtime::vm::core::u256::U256;
 use crate::runtime::vm::core::vm_context::VMContext;
 use crate::runtime::vm::contracts::contract_storage::{ContractStorage, PendingBatch};
@@ -579,15 +580,38 @@ impl VM {
                             // backward compatibility. Both paths produce identical
                             // U256 values regardless of input format.
                             if let Some(hex_str) = s.strip_prefix("0x") {
-                                U256::from_hex(hex_str).unwrap_or(U256::ZERO)
+                                match U256::from_hex(hex_str) {
+                                    Some(v) => v,
+                                    None => {
+                                        slog_warn!("vm", "sload_malformed_storage",
+                                            key => &key, error => "invalid hex after 0x prefix");
+                                        U256::ZERO
+                                    }
+                                }
                             } else if s.starts_with("0x") {
-                                U256::from_hex(&s).unwrap_or(U256::ZERO)
+                                match U256::from_hex(&s) {
+                                    Some(v) => v,
+                                    None => {
+                                        slog_warn!("vm", "sload_malformed_storage",
+                                            key => &key, error => "invalid hex value");
+                                        U256::ZERO
+                                    }
+                                }
                             } else {
                                 // Strict decimal parsing: only digits, no signs
                                 if s.bytes().all(|b| b.is_ascii_digit()) && !s.is_empty() {
-                                    s.parse::<u64>().map(U256::from_u64).unwrap_or(U256::ZERO)
+                                    match s.parse::<u64>() {
+                                        Ok(n) => U256::from_u64(n),
+                                        Err(e) => {
+                                            slog_warn!("vm", "sload_malformed_storage",
+                                                key => &key, error => &e.to_string());
+                                            U256::ZERO
+                                        }
+                                    }
                                 } else {
-                                    U256::ZERO // garbage → zero (deterministic)
+                                    slog_warn!("vm", "sload_malformed_storage",
+                                        key => &key, error => "non-numeric non-hex value");
+                                    U256::ZERO
                                 }
                             }
                         })
@@ -652,10 +676,18 @@ impl VM {
                 OpCode::BALANCE    => {
                     let addr = match Self::pop1(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
                     let addr_key = format!("balance:{}", addr.as_u64());
-                    let bal = self.context.get(&addr_key)
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    stack.push(U256::from_u64(bal));
+                    let bal = match self.context.get(&addr_key) {
+                        Some(val) => match val.parse::<u64>() {
+                            Ok(b) => U256::from_u64(b),
+                            Err(e) => {
+                                slog_warn!("vm", "balance_parse_failed",
+                                    address => &addr_key, error => &e.to_string());
+                                U256::ZERO
+                            }
+                        },
+                        None => U256::ZERO,
+                    };
+                    stack.push(bal);
                 }
 
                 // -- FLOW CONTROL --

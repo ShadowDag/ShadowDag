@@ -51,7 +51,7 @@ pub struct ContractDeployer;
 impl ContractDeployer {
     /// CREATE: deploy contract with nonce-based address
     ///
-    /// address = hex(SHA-256("ShadowDAG_CREATE" || deployer || nonce))[0..40]
+    /// address = "SD1c" || hex(SHA-256("ShadowDAG_CREATE" || deployer || nonce))[0..40]
     pub fn create(
         deployer: &str,
         nonce: u64,
@@ -71,7 +71,7 @@ impl ContractDeployer {
         Digest::update(&mut h, deployer.as_bytes());
         Digest::update(&mut h, nonce.to_le_bytes());
         let hash = Digest::finalize(h);
-        let address = format!("SD{}", hex::encode(&hash[..20]));
+        let address = format!("SD1c{}", hex::encode(&hash[..20]));
 
         // Calculate gas
         let gas = CREATE_BASE_GAS
@@ -88,7 +88,7 @@ impl ContractDeployer {
 
     /// CREATE2: deploy contract with deterministic address
     ///
-    /// address = hex(SHA-256(0xFF || deployer || salt || SHA-256(init_code)))[0..40]
+    /// address = "SD1c" || hex(SHA-256(0xFF || deployer || salt || SHA-256(init_code)))[0..40]
     pub fn create2(
         deployer: &str,
         salt: [u8; 32],
@@ -113,7 +113,7 @@ impl ContractDeployer {
         Digest::update(&mut h, salt);
         Digest::update(&mut h, code_hash);
         let hash = Digest::finalize(h);
-        let address = format!("SD{}", hex::encode(&hash[..20]));
+        let address = format!("SD1c{}", hex::encode(&hash[..20]));
 
         let gas = CREATE2_BASE_GAS
             .saturating_add((init_code.len() as u64).saturating_mul(CODE_DEPOSIT_GAS_PER_BYTE));
@@ -143,7 +143,7 @@ impl ContractDeployer {
         Digest::update(&mut h, salt);
         Digest::update(&mut h, code_hash);
         let hash = Digest::finalize(h);
-        format!("SD{}", hex::encode(&hash[..20]))
+        format!("SD1c{}", hex::encode(&hash[..20]))
     }
 
     /// Validate runtime code after init execution
@@ -209,9 +209,9 @@ mod tests {
     }
 
     #[test]
-    fn address_starts_with_sd() {
+    fn address_starts_with_sd1c() {
         let r = ContractDeployer::create("test", 0, &[0x00]).unwrap();
-        assert!(r.address.starts_with("SD"));
+        assert!(r.address.starts_with("SD1c"));
     }
 
     #[test]
