@@ -10,6 +10,7 @@ use rocksdb::{
 };
 
 use dashmap::DashSet;
+use hex;
 use rayon::ThreadPool;
 use rayon::ThreadPoolBuilder;
 
@@ -118,19 +119,29 @@ impl DagSync {
     /// RECEIVE BLOCK (ULTIMATE VERSION)
     //////////////////////////////////////////////////////////////
     pub fn receive_block(&self, block: Block) {
-        let hash_bytes = block.header.hash.as_bytes();
-
-        if hash_bytes.len() != 32 {
+        // Fix #3: Hashes are 64-char hex strings, not 32 raw bytes.
+        // Validate length and decode hex to get 32-byte hash for cache/DB keys.
+        if block.header.hash.len() != 64 {
+            slog_warn!("dag", "dag_sync_invalid_hash_len", len => block.header.hash.len());
             return;
         }
 
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(hash_bytes);
+        let hash: [u8; 32] = match hex::decode(&block.header.hash) {
+            Ok(bytes) if bytes.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                arr
+            }
+            _ => {
+                slog_warn!("dag", "dag_sync_invalid_hash_hex");
+                return;
+            }
+        };
 
         //////////////////////////////////////////////////////////////
-        // CACHE FIRST
+        // CACHE CHECK (don't insert yet — Fix #4: insert after success)
         //////////////////////////////////////////////////////////////
-        if !self.seen_cache.insert(hash) {
+        if self.seen_cache.contains(&hash) {
             return;
         }
 
@@ -142,7 +153,10 @@ impl DagSync {
             None => { slog_error!("dag", "dag_sync_no_cf_read"); return; }
         };
         match self.db.get_cf_opt(cf, hash, &self.read_opts) {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) => {
+                self.seen_cache.insert(hash); // already processed, cache it
+                return;
+            }
             Ok(None) => {}
             Err(_) => return,
         }
@@ -215,6 +229,10 @@ impl DagSync {
         // we can't send a reference to self across thread boundaries.
         if let Err(e) = node.process_block(&block_clone) {
             slog_warn!("dag", "dag_sync_block_rejected", error => e);
+            // Fix #4: Don't cache on failure — block may be retried
+        } else {
+            // Fix #4: Only insert into seen_cache AFTER successful processing
+            self.seen_cache.insert(hash);
         }
         self.inflight.fetch_sub(1, Ordering::Release);
     }

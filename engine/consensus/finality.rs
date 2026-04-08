@@ -25,7 +25,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
-use crate::{slog_info, slog_warn};
+use crate::{slog_info, slog_warn, slog_error};
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -239,9 +239,9 @@ impl FinalityManager {
         if is_blue {
             self.epoch_blue_count += 1;
         }
-        self.epoch_width_sum += dag_width_at_height;
         if self.epoch_seen_heights.insert(height) {
             self.epoch_height_count += 1;
+            self.epoch_width_sum += dag_width_at_height; // Only count width once per height
         }
 
         // Check if epoch boundary reached
@@ -360,7 +360,10 @@ impl FinalityManager {
         if let Some(db) = &self.db {
             let mut key = PFX_CHECKPOINT.to_vec();
             key.extend_from_slice(&height.to_be_bytes());
-            let _ = db.put(&key, hash.as_bytes());
+            if let Err(e) = db.put(&key, hash.as_bytes()) {
+                slog_error!("finality", "checkpoint_persist_failed", height => height, error => e);
+                return; // Don't add to memory if not persisted
+            }
         }
 
         slog_info!("finality", "auto_checkpoint_created",

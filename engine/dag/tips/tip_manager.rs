@@ -164,12 +164,15 @@ impl TipManager {
     pub fn add_tip(&self, info: TipInfo) -> Result<(), StorageError> {
         let mut tips = self.tips.write().unwrap_or_else(|e| e.into_inner());
 
-        // If at capacity, evict the lowest blue-score tip
+        // Persist new tip FIRST (before evicting old) so that if persist
+        // fails, we haven't lost the evicted tip.
+        self.persist_tip(&info)?;
+
+        // NOW safe to evict (new tip is persisted)
         if tips.len() >= self.max_tips {
             self.evict_lowest_score(&mut tips)?;
         }
 
-        self.persist_tip(&info)?;
         tips.insert(info.hash.clone(), info);
         Ok(())
     }
@@ -186,26 +189,27 @@ impl TipManager {
         let mut tips = self.tips.write().unwrap_or_else(|e| e.into_inner());
         let mut batch = WriteBatch::default();
 
-        // Remove parents from tips FIRST (they now have a child),
-        // so the eviction check below sees the correct tip count.
+        // Build batch: delete parents, add new tip
         for parent in parents {
             batch.delete(key_tip(parent));
-            tips.remove(parent);
         }
 
-        // Add new block as tip
         let info = TipInfo::new(block_hash.to_string(), blue_score, height, timestamp);
-        if tips.len() >= self.max_tips {
-            self.evict_lowest_score(&mut tips)?;
-        }
-
         let data = bincode::serialize(&info)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
         batch.put(key_tip(block_hash), data);
 
-        // Write batch to DB; on failure, in-memory state is already updated
-        // but will be corrected on next recover_from_db() at restart.
+        // Write batch to DB FIRST — if this fails, memory stays consistent
         self.db.write(batch).map_err(StorageError::RocksDb)?;
+
+        // DB write succeeded — NOW update in-memory state
+        for parent in parents {
+            tips.remove(parent);
+        }
+
+        if tips.len() >= self.max_tips {
+            self.evict_lowest_score(&mut tips)?;
+        }
 
         tips.insert(block_hash.to_string(), info);
         Ok(())
