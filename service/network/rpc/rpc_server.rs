@@ -166,22 +166,37 @@ impl RpcState {
     ///
     /// `data_dir` — directory to write the `rpc_password` file into.
     /// When `None`, falls back to the current working directory (legacy behaviour).
-    fn load_or_create_admin_password(db: &Arc<DB>, data_dir: Option<&std::path::Path>) -> String {
+    fn load_or_create_admin_password(db: &Arc<DB>, data_dir: Option<&std::path::Path>) -> Result<String, NetworkError> {
         let key = b"rpc:admin_password";
-        // Try to load existing password
-        if let Ok(Some(data)) = db.get(key) {
-            if let Ok(pw) = String::from_utf8(data.to_vec()) {
-                if !pw.is_empty() {
-                    slog_info!("rpc", "admin_credentials_loaded");
-                    return pw;
+        // Try to load existing password — handle read errors explicitly
+        match db.get(key) {
+            Ok(Some(data)) => {
+                if let Ok(pw) = String::from_utf8(data.to_vec()) {
+                    if !pw.is_empty() {
+                        slog_info!("rpc", "admin_credentials_loaded");
+                        return Ok(pw);
+                    }
                 }
+                // Stored value was empty or invalid UTF-8 — fall through to generate
+            }
+            Ok(None) => {
+                // Genuinely first run — fall through to generate a new password
+            }
+            Err(e) => {
+                slog_error!("rpc", "admin_password_read_failed", error => e);
+                // Do NOT generate a new password on read failure — the DB may
+                // already contain a valid password that we simply cannot read.
+                return Err(NetworkError::Other(
+                    format!("Failed to read admin password from DB: {}", e)
+                ));
             }
         }
         // First run: generate and persist
         let password = Self::generate_admin_password();
-        if let Err(e) = db.put(key, password.as_bytes()) {
-            slog_warn!("rpc", "admin_password_persist_failed", error => e);
-        }
+        db.put(key, password.as_bytes()).map_err(|e| {
+            slog_error!("rpc", "admin_password_persist_failed", error => e);
+            NetworkError::Other(format!("Failed to persist admin password to DB: {}", e))
+        })?;
         let masked = format!("{}...", &password[..4.min(password.len())]);
         slog_warn!("rpc", "first_run_admin_password_generated", hint => &masked);
         // SECURITY: Never log the full password to stderr/stdout (captured by
@@ -228,7 +243,7 @@ impl RpcState {
             eprintln!("║  WARNING: Could not determine data dir for password ║");
             eprintln!("╚══════════════════════════════════════════════════════╝");
         }
-        password
+        Ok(password)
     }
 
     pub fn new(db: Arc<DB>) -> Result<Self, NetworkError> {
@@ -236,7 +251,7 @@ impl RpcState {
         // First run: generate + store. Subsequent runs: load from DB.
         // NOTE: no data_dir available here — falls back to cwd for password file.
         slog_warn!("rpc", "rpc_new_without_data_dir", note => "admin password will use cwd — prefer new_for_network with explicit data_dir");
-        let admin_password = Self::load_or_create_admin_password(&db, None);
+        let admin_password = Self::load_or_create_admin_password(&db, None)?;
         let block_store = BlockStore::new(db.clone())
             .map_err(NetworkError::Storage)?;
         // NO fallback — RPC MUST use the same UTXO state as the node.
@@ -271,7 +286,7 @@ impl RpcState {
             None => PeerManager::new_default()
                 .map_err(|e| NetworkError::Other(format!("PeerManager init failed: {}", e)))?,
         };
-        let admin_password = Self::load_or_create_admin_password(&db, data_dir);
+        let admin_password = Self::load_or_create_admin_password(&db, data_dir)?;
         let block_store = BlockStore::new(db.clone())
             .map_err(NetworkError::Storage)?;
         let store = Arc::new(UtxoStore::new(db.clone())

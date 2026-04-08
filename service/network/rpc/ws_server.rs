@@ -91,17 +91,37 @@ impl WsServer {
         }
     }
 
-    /// Get a new broadcast receiver for events
+    /// Get a new broadcast receiver for events.
+    ///
+    /// **Important:** The broadcast channel delivers ALL events to every
+    /// receiver. Callers MUST use [`should_deliver`] to filter events
+    /// according to the connection's registered subscriptions before
+    /// forwarding them to the client.
     pub fn subscribe_events(&self) -> broadcast::Receiver<WsEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Check whether an event should be delivered to a specific connection,
+    /// based on that connection's registered subscription types.
+    ///
+    /// Connection handlers should call this for every event received from
+    /// the broadcast channel and drop events that return `false`.
+    pub fn should_deliver(&self, conn_id: u64, event_type: SubscriptionType) -> bool {
+        self.subscriptions.lock()
+            .map(|subs| {
+                subs.get(&conn_id)
+                    .map(|conn_subs| conn_subs.iter().any(|s| s.sub_type == event_type))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
     }
 
     /// Publish an event to subscribers of the given type.
     ///
     /// Because `broadcast::Sender` delivers to ALL receivers, per-connection
-    /// filtering must be done on the receive side. However, we short-circuit
-    /// here when **no** connection has subscribed to `event_type` at all,
-    /// avoiding unnecessary broadcast traffic.
+    /// filtering must be done on the receive side using [`should_deliver`].
+    /// This method short-circuits when **no** connection has subscribed to
+    /// `event_type` at all, avoiding unnecessary broadcast traffic.
     pub fn publish(&self, event_type: SubscriptionType, payload: String) {
         // Only send if at least one connection has subscribed to this event type
         let has_subscribers = self.subscriptions.lock()
@@ -281,6 +301,26 @@ mod tests {
             }
             Err(_) => panic!("Should have received event"),
         }
+    }
+
+    #[test]
+    fn should_deliver_filters_by_subscription() {
+        let server = WsServer::new(18787);
+        // conn 1 subscribes only to NewBlock
+        server.add_subscription(1, SubscriptionType::NewBlock);
+        // conn 2 subscribes only to NewTransaction
+        server.add_subscription(2, SubscriptionType::NewTransaction);
+
+        // conn 1 should receive NewBlock but NOT NewTransaction
+        assert!(server.should_deliver(1, SubscriptionType::NewBlock));
+        assert!(!server.should_deliver(1, SubscriptionType::NewTransaction));
+
+        // conn 2 should receive NewTransaction but NOT NewBlock
+        assert!(server.should_deliver(2, SubscriptionType::NewTransaction));
+        assert!(!server.should_deliver(2, SubscriptionType::NewBlock));
+
+        // Unknown conn should not receive anything
+        assert!(!server.should_deliver(99, SubscriptionType::NewBlock));
     }
 
     #[test]

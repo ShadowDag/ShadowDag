@@ -301,16 +301,30 @@ fn drain_targeted_for(peer_id: &str) -> Vec<P2PMessage> {
 /// Each peer tracks its own `last_outbound_seq` to ensure ALL peers
 /// receive ALL broadcast messages (not just the first to drain).
 /// Also prunes old messages that all peers have had time to read.
-fn drain_outbound_since(since: u64) -> (Vec<P2PMessage>, u64) {
+fn drain_outbound_since(since: u64) -> (Vec<(u64, P2PMessage)>, u64) {
     let mut q = OUTBOUND_MSGS.lock();
-    let new_msgs: Vec<P2PMessage> = q.1.iter()
+    let new_msgs: Vec<(u64, P2PMessage)> = q.1.iter()
         .filter(|(seq, _)| *seq > since)
-        .map(|(_, msg)| msg.clone())
+        .map(|(seq, msg)| (*seq, msg.clone()))
         .collect();
     let max_seq = q.0;
-    // Prune: keep only the last 2000 messages to bound memory
+    // WARNING: This truncation does not consider the slowest peer's
+    // last_outbound_seq. Slow peers whose last_outbound_seq falls within
+    // the truncated range will permanently miss those broadcast messages.
+    // A proper fix would track all active sessions' last_outbound_seq and
+    // only trim messages that ALL peers have acknowledged.
     if q.1.len() > 2000 {
         let drain_to = q.1.len() - 1000;
+        // Log which sequence range is being discarded so operators can
+        // identify peers that may have missed messages.
+        let oldest_discarded = q.1.first().map(|(s, _)| *s).unwrap_or(0);
+        let newest_discarded = q.1.get(drain_to.saturating_sub(1)).map(|(s, _)| *s).unwrap_or(0);
+        slog_warn!("p2p", "outbound_queue_truncation",
+            discarded_count => drain_to,
+            oldest_seq => oldest_discarded,
+            newest_seq => newest_discarded,
+            note => "slow peers with last_outbound_seq in this range will miss messages"
+        );
         q.1.drain(..drain_to);
     }
     (new_msgs, max_seq)
@@ -857,34 +871,47 @@ impl P2P {
         session: &mut ConnectionSession,
         magic: [u8; 4],
     ) {
-        let (outbound, new_seq) = drain_outbound_since(session.last_outbound_seq);
-        // Only advance sequence after ALL broadcast messages are successfully sent.
-        // If a write fails, the sequence stays at the last successful point so
-        // unsent messages will be retried on the next flush (drain_outbound_since
-        // reads from the shared queue without removing, so they remain available).
-        let mut all_sent = true;
-        for out_msg in &outbound {
+        let (outbound, _new_seq) = drain_outbound_since(session.last_outbound_seq);
+        // Track the last successfully sent sequence number.
+        // If a write fails mid-way, we only advance to the last message
+        // that was actually delivered, so unsent messages will be retried
+        // on the next flush (drain_outbound_since reads from the shared
+        // queue without removing, so they remain available).
+        let old_seq = session.last_outbound_seq;
+        let mut last_successful_seq = old_seq;
+        for (seq, out_msg) in &outbound {
             match Self::write_message(writer, out_msg, magic) {
                 Ok(bytes) => {
                     session.record_bytes_sent(bytes);
+                    last_successful_seq = *seq;
                 }
                 Err(we) => {
-                    // Don't advance sequence — message will be retried
-                    slog_warn!("p2p", "outbound_write_failed", addr => peer_str, error => &we.to_string());
-                    all_sent = false;
+                    // Don't advance past this point — failed and subsequent
+                    // messages will be retried on the next flush.
+                    slog_warn!("p2p", "outbound_write_failed", addr => peer_str,
+                        error => &we.to_string(),
+                        sent_up_to_seq => last_successful_seq,
+                        failed_seq => *seq
+                    );
                     break; // Stop sending more to this peer
                 }
             }
         }
-        if all_sent {
-            session.last_outbound_seq = new_seq;
-        }
+        // Only update to the last sequence that was actually sent successfully.
+        session.last_outbound_seq = last_successful_seq;
+
         let targeted = drain_targeted_for(peer_str);
-        for t_msg in &targeted {
-            match Self::write_message(writer, t_msg, magic) {
+        for t_msg in targeted {
+            match Self::write_message(writer, &t_msg, magic) {
                 Ok(bytes) => session.record_bytes_sent(bytes),
                 Err(we) => {
                     slog_error!("p2p", "write_error_targeted", addr => peer_str, error => &we.to_string());
+                    // Re-queue the undelivered targeted message so it is not
+                    // permanently lost. The next flush cycle will retry delivery.
+                    {
+                        let mut q = TARGETED_MSGS.lock();
+                        q.push((peer_str.to_string(), t_msg));
+                    }
                     return;
                 }
             }

@@ -26,8 +26,11 @@ impl AddressBook {
         Ok(Self { db })
     }
 
-    pub fn add_address(&self, name: &str, address: &str) {
-        if let Err(_e) = self.db.put(name, address) { slog_error!("wallet", "db_put_error", error => &_e.to_string()); }
+    pub fn add_address(&self, name: &str, address: &str) -> Result<(), crate::errors::StorageError> {
+        self.db.put(name, address).map_err(|e| {
+            slog_error!("wallet", "db_put_error", error => &e.to_string());
+            crate::errors::StorageError::WriteFailed(format!("add_address '{}': {}", name, e))
+        })
     }
 
     pub fn get_address(&self, name: &str) -> Result<Option<String>, WalletError> {

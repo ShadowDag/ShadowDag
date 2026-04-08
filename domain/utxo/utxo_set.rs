@@ -161,6 +161,8 @@ impl UtxoSet {
         if store_ok {
             if let Err(e) = self.store.put_raw(&meta_key, &created_height.to_le_bytes()) {
                 slog_error!("utxo", "coinbase_height_write_failed", error => &e.to_string());
+                // cb_height write failed — don't add to cache; coinbase without maturity metadata is unsafe
+                return;
             }
             let mut cache = self.cache.write();
             if cache.len() >= MAX_CACHE_SIZE {
@@ -198,10 +200,14 @@ impl UtxoSet {
     }
 
     pub fn spend_utxo(&self, key: &UtxoKey) {
-        if let Some(u) = self.cache.write().get_mut(key) {
-            u.spent = true; // 🔥 cache update
+        // Store write FIRST — only mark cache spent on success
+        if let Err(e) = self.store.spend_utxo(key) {
+            slog_error!("utxo", "spend_utxo_store_failed", key => &key.to_string(), error => &e.to_string());
+            return;
         }
-        let _ = self.store.spend_utxo(key);
+        if let Some(u) = self.cache.write().get_mut(key) {
+            u.spent = true;
+        }
     }
 
     pub fn spend_utxo_checked(&self, key: &UtxoKey, current_height: u64) -> Result<(), StorageError> {
@@ -297,15 +303,15 @@ impl UtxoSet {
     pub fn apply_block_full(&self, block: &Block, block_height: u64) -> Result<(), StorageError> {
         // Unified validation — ONE place for all UTXO validation logic
         UtxoValidator::validate_block_utxos(block, self, block_height)?;
-        self.apply_block_write(&block.body.transactions, block_height)
+        self.apply_block_write(&block.body.transactions, block_height, &block.header.hash)
     }
 
-    pub fn apply_block(&self, transactions: &[Transaction], block_height: u64) -> Result<(), StorageError> {
+    pub fn apply_block(&self, transactions: &[Transaction], block_height: u64, block_hash: &str) -> Result<(), StorageError> {
         // Build a temporary Block for the unified validator
         let block = Block {
             header: crate::domain::block::block_header::BlockHeader {
                 version: 0,
-                hash: String::new(),
+                hash: block_hash.to_string(),
                 parents: Vec::new(),
                 merkle_root: String::new(),
                 timestamp: 0,
@@ -324,7 +330,7 @@ impl UtxoSet {
 
         // Unified validation — ONE place for all UTXO validation logic
         UtxoValidator::validate_block_utxos(&block, self, block_height)?;
-        self.apply_block_write(transactions, block_height)
+        self.apply_block_write(transactions, block_height, block_hash)
     }
 
     /// Internal: perform the UTXO write after validation has passed.
@@ -1018,16 +1024,11 @@ impl UtxoSet {
             .and_then(|data| String::from_utf8(data).ok())
     }
 
-    /// Backward-compatible wrapper: derives a deterministic block_hash from
-    /// the first transaction's hash (coinbase). This ensures undo/commitment
-    /// keys are always unique per block, never empty.
-    pub fn apply_block_write(&self, transactions: &[Transaction], block_height: u64) -> Result<(), StorageError> {
+    /// Apply a block's UTXO changes with the actual block hash for undo/commitment keys.
+    pub fn apply_block_write(&self, transactions: &[Transaction], block_height: u64, block_hash: &str) -> Result<(), StorageError> {
         if transactions.is_empty() {
             return Err(StorageError::Other("cannot apply empty transaction list".into()));
         }
-        let block_hash = transactions.first()
-            .map(|tx| tx.hash.as_str())
-            .unwrap_or("unknown");
         self.apply_block_write_with_commitment(transactions, block_height, block_hash).map(|_| ())
     }
 

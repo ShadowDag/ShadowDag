@@ -158,7 +158,7 @@ impl BlockProcessor {
 
             let height = block.header.height;
 
-            if let Err(e) = utxo_set.apply_block(&block.body.transactions, height) {
+            if let Err(e) = utxo_set.apply_block(&block.body.transactions, height, &block.header.hash) {
 
                 let original_error = format!("apply failed at {}: {}", hash, e);
 
@@ -179,7 +179,7 @@ impl BlockProcessor {
                 // restore old chain
                 for h in rollback_chain.iter().rev() {
                     if let Some(b) = block_store.get_block(h) {
-                        if let Err(re) = utxo_set.apply_block(&b.body.transactions, b.header.height) {
+                        if let Err(re) = utxo_set.apply_block(&b.body.transactions, b.header.height, &b.header.hash) {
                             slog_error!("consensus", "critical_restore_failed_during_reorg", error => re);
                             restore_failed = true;
                             restore_err_msg = format!("{}", re);

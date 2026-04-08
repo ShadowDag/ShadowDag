@@ -7,6 +7,7 @@ use std::sync::Arc;
 use rocksdb::DB;
 
 use crate::errors::MempoolError;
+use crate::slog_warn;
 use crate::runtime::event_bus::event_bus::EventBus; // ✅ إضافة
 
 use crate::domain::transaction::transaction::Transaction;
@@ -141,7 +142,13 @@ impl MempoolManager {
     fn promote_orphans(&mut self, parent_txid: &str) {
         let promoted = self.orphan_pool.promote(parent_txid);
         for tx in promoted {
-            let _result = self.tx_pool.add_transaction(&tx, &self.utxo_set);
+            let result = self.tx_pool.add_transaction(&tx, &self.utxo_set);
+            if result != TxPoolResult::Accepted {
+                slog_warn!("mempool", "orphan_readd_after_promote_fail",
+                    txid => &tx.hash, result => &format!("{:?}", result));
+                // Re-insert into orphan pool so it's not permanently lost
+                self.orphan_pool.add(tx, self.current_height);
+            }
         }
     }
 }

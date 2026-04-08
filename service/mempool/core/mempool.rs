@@ -77,13 +77,23 @@ impl Mempool {
                 buf.copy_from_slice(&v[..8]);
                 u64::from_le_bytes(buf)
             }
-            _ => 0,
+            Ok(_) => 0,
+            Err(e) => {
+                let key_str = String::from_utf8_lossy(key);
+                slog_error!("mempool", "meta_get_u64_read_failed",
+                    key => &key_str.to_string(), error => &e.to_string());
+                0
+            }
         }
     }
 
     #[inline]
     fn meta_set_u64(&self, key: &[u8], val: u64) {
-        let _ = self.db.put(key, val.to_le_bytes());
+        if let Err(e) = self.db.put(key, val.to_le_bytes()) {
+            let key_str = String::from_utf8_lossy(key);
+            slog_error!("mempool", "meta_set_u64_write_failed",
+                key => &key_str.to_string(), error => &e.to_string());
+        }
     }
 
     /// Increment a metadata counter by `delta`.
@@ -955,12 +965,19 @@ impl Mempool {
     }
 
     pub fn flush(&self) {
-        let all_keys: Vec<Vec<u8>> = self.db
+        // Only delete keys with mempool-specific prefixes to avoid
+        // destroying non-mempool data in a shared DB.
+        const MEMPOOL_PREFIXES: &[&[u8]] = &[
+            b"tx:", b"fee:", b"inp:", b"dep:", b"rdep:", b"sender:", b"_meta:",
+        ];
+
+        let mempool_keys: Vec<Vec<u8>> = self.db
             .iterator(rocksdb::IteratorMode::Start)
             .filter_map(|r| r.ok())
+            .filter(|(k, _)| MEMPOOL_PREFIXES.iter().any(|pfx| k.starts_with(pfx)))
             .map(|(k, _)| k.to_vec())
             .collect();
-        for k in &all_keys {
+        for k in &mempool_keys {
             let _ = self.db.delete(k);
         }
         // Reset metadata counters

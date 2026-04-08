@@ -6,6 +6,7 @@
 use std::collections::{HashSet, HashMap};
 use crate::service::mempool::core::mempool::Mempool;
 use crate::domain::transaction::transaction::Transaction;
+use crate::slog_warn;
 use crate::domain::utxo::utxo_key::UtxoKey;
 use crate::domain::utxo::utxo_set::UtxoSet;
 use crate::domain::transaction::tx_validator::TxValidator;
@@ -122,9 +123,13 @@ impl TxPool {
             for orphan in orphans {
                 if UtxoValidator::validate(&orphan, utxo_set)
                     && TxValidator::validate_tx(&orphan, utxo_set) {
-                    let _ = self.mempool.add_transaction(&orphan);
-                    self.mark_spent(&orphan);
-                    self.seen_hashes.insert(orphan.hash.clone());
+                    if self.mempool.add_transaction(&orphan) {
+                        self.mark_spent(&orphan);
+                        self.seen_hashes.insert(orphan.hash.clone());
+                    } else {
+                        slog_warn!("mempool", "orphan_promotion_failed",
+                            txid => &orphan.hash);
+                    }
                 }
             }
         }

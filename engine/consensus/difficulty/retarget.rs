@@ -120,6 +120,13 @@ impl RetargetEngine {
             }
         }
 
+        // Update blue_score_window_start to match the current window front
+        if let Some(front) = self.short_window.front() {
+            if front.blue_score > 0 {
+                self.blue_score_window_start = front.blue_score;
+            }
+        }
+
         self.long_window.push_back(rec);
         while self.long_window.len() > effective_long {
             self.long_window.pop_front();

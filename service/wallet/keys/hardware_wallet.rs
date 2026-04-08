@@ -56,9 +56,12 @@ impl HardwareWalletManager {
         self.devices.iter().find(|d| d.device_id == device_id)
     }
 
-    /// STUB: Hardware wallet integration is not yet implemented.
-    /// Returns Err with a user-facing message to confirm on device.
-    /// TODO: Implement actual USB HID communication with Ledger/Trezor.
+    /// NOT IMPLEMENTED -- returns Err. Requires USB/HID integration.
+    ///
+    /// This is a stub for future hardware wallet support. When implemented,
+    /// it will communicate with Ledger/Trezor devices over USB HID to
+    /// retrieve the public key at the given derivation path.
+    #[allow(unused)]
     pub fn get_public_key(&self, device_id: &str, _derivation_path: &str) -> Result<Vec<u8>, WalletError> {
         match self.get_device(device_id) {
             Some(_d) if _d.connected => {
@@ -69,9 +72,12 @@ impl HardwareWalletManager {
         }
     }
 
-    /// STUB: Hardware wallet integration is not yet implemented.
-    /// Returns Err with a user-facing message to confirm on device.
-    /// TODO: Implement actual USB HID communication with Ledger/Trezor.
+    /// NOT IMPLEMENTED -- returns Err. Requires USB/HID integration.
+    ///
+    /// This is a stub for future hardware wallet support. When implemented,
+    /// it will communicate with Ledger/Trezor devices over USB HID to
+    /// sign a transaction hash on the device (with user confirmation on screen).
+    #[allow(unused)]
     pub fn sign_transaction(
         &self,
         device_id: &str,

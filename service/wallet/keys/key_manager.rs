@@ -107,13 +107,15 @@ impl KeyManager {
             .map_err(|e| WalletError::Other(format!("DB delete error: {}", e)))
     }
 
-    pub fn key_exists(&self, key_id: &str) -> bool {
+    pub fn key_exists(&self, key_id: &str) -> Result<bool, crate::errors::StorageError> {
         match self.db.get(key_id.as_bytes()) {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
             Err(e) => {
                 crate::slog_error!("wallet", "key_exists_read_failed", error => &e.to_string());
-                false
+                Err(crate::errors::StorageError::ReadFailed(
+                    format!("key_exists '{}': {}", key_id, e),
+                ))
             }
         }
     }

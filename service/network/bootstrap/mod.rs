@@ -20,10 +20,24 @@ impl BootstrapManager {
         }
     }
 
+    /// Bootstrap the node by resolving seed addresses to active peers.
+    ///
+    /// TODO(#bootstrap): DNS resolution is not yet implemented. This method
+    /// currently returns the raw seed list unchanged. When implemented, it
+    /// should resolve each seed hostname via DNS (with `DNS_LOOKUP_TIMEOUT_SECS`
+    /// timeout), deduplicate results, and cap at `MAX_SEEDS_PER_QUERY`.
     pub fn bootstrap(network: &NetworkMode) -> Vec<String> {
         let seeds = Self::seeds_for(network);
+
+        // TODO(#bootstrap): Implement DNS resolution for each seed.
+        // For each seed, perform a DNS lookup (A/AAAA records), collect
+        // the resolved socket addresses, and return those instead of
+        // the raw seed strings. Until then, return seeds as-is.
         for _seed in &seeds {
+            // Placeholder: DNS resolution would happen here.
+            // e.g. resolve(_seed, DNS_LOOKUP_TIMEOUT_SECS)
         }
+
         seeds.iter().map(|s| s.to_string()).collect()
     }
 
