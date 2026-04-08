@@ -127,6 +127,40 @@ impl ContractDeployer {
         })
     }
 
+    /// Compute CREATE address from deployer and nonce (no validation).
+    /// Used by ExecutionEnvironment for inline CREATE opcode.
+    ///
+    /// hash = SHA-256("ShadowDAG_CREATE" || deployer || nonce_le_bytes)
+    /// address = "SD1c" + hex(hash[0..20])
+    pub fn compute_create_address(deployer: &str, nonce: u64) -> String {
+        let mut h = <Sha256 as Digest>::new();
+        Digest::update(&mut h, b"ShadowDAG_CREATE");
+        Digest::update(&mut h, deployer.as_bytes());
+        Digest::update(&mut h, nonce.to_le_bytes());
+        let hash = Digest::finalize(h);
+        format!("SD1c{}", hex::encode(&hash[..20]))
+    }
+
+    /// Compute CREATE2 address from deployer, salt, and init code (no validation).
+    /// Used by ExecutionEnvironment for inline CREATE2 opcode.
+    ///
+    /// code_hash = SHA-256(init_code)
+    /// hash = SHA-256(0xFF || deployer || salt || code_hash)
+    /// address = "SD1c" + hex(hash[0..20])
+    pub fn compute_create2_address(deployer: &str, salt: &[u8], init_code: &[u8]) -> String {
+        let mut code_hasher = <Sha256 as Digest>::new();
+        Digest::update(&mut code_hasher, init_code);
+        let code_hash = Digest::finalize(code_hasher);
+
+        let mut h = <Sha256 as Digest>::new();
+        Digest::update(&mut h, [0xFF]);
+        Digest::update(&mut h, deployer.as_bytes());
+        Digest::update(&mut h, salt);
+        Digest::update(&mut h, code_hash);
+        let hash = Digest::finalize(h);
+        format!("SD1c{}", hex::encode(&hash[..20]))
+    }
+
     /// Predict CREATE2 address without deploying
     pub fn predict_create2_address(
         deployer: &str,

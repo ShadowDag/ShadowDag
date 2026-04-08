@@ -229,6 +229,22 @@ impl StateManager {
             .unwrap_or_default()
     }
 
+    /// Destroy a contract account (SELFDESTRUCT).
+    /// Records the full account state in the journal for rollback.
+    pub fn destroy_account(&mut self, address: &str) -> Result<(), VmError> {
+        if let Some(account) = self.accounts.remove(address) {
+            self.journal.push(StateChange::AccountDestroyed {
+                address: address.to_string(),
+                account,
+            });
+            // Also clear storage
+            self.storage.remove(address);
+            Ok(())
+        } else {
+            Err(VmError::Other(format!("cannot destroy non-existent account: {}", address)))
+        }
+    }
+
     // ─── Storage Operations ──────────────────────────────────────────
 
     /// Read from contract storage

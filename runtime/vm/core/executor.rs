@@ -169,16 +169,12 @@ impl Executor {
     ///   PUSH16 (0x14) -> 16 bytes
     ///   PUSH32 (0x15) -> 32 bytes
     fn validate_supported_opcodes(bytecode: &[u8]) -> Result<(), VmError> {
-        use crate::runtime::vm::core::opcodes::OpCode;
-        let unsupported: &[(u8, &str)] = &[
-            (OpCode::CALL as u8, "CALL"),
-            (OpCode::CALLCODE as u8, "CALLCODE"),
-            (OpCode::DELEGATECALL as u8, "DELEGATECALL"),
-            (OpCode::STATICCALL as u8, "STATICCALL"),
-            (OpCode::CREATE as u8, "CREATE"),
-            (OpCode::CREATE2 as u8, "CREATE2"),
-            (OpCode::SELFDESTRUCT as u8, "SELFDESTRUCT"),
-        ];
+        // All opcodes are now supported including CALL, CALLCODE,
+        // DELEGATECALL, STATICCALL, CREATE, CREATE2, and SELFDESTRUCT.
+        // These are implemented in execution_env.rs.
+        //
+        // We still walk the bytecode to validate structural integrity
+        // (no truncated PUSH operands) but no opcodes are blocked.
 
         let mut i = 0;
         while i < bytecode.len() {
@@ -199,14 +195,6 @@ impl Executor {
                 continue;
             }
 
-            // Check if this opcode is unsupported
-            for &(unsup, name) in unsupported {
-                if op == unsup {
-                    return Err(VmError::ContractError(format!(
-                        "Bytecode contains unsupported opcode {} (0x{:02x})", name, unsup
-                    )));
-                }
-            }
             i += 1;
         }
         Ok(())
