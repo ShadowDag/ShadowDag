@@ -86,9 +86,13 @@ mod tests {
 
     #[test]
     fn localhost_uses_port_29333() {
-        for seed in BootstrapNodes::localhost() {
-            assert!(seed.starts_with("127.0.0.1"),
-                "localhost seed '{}' must be loopback", seed);
+        let seeds = BootstrapNodes::localhost();
+        assert!(seeds.iter().any(|s| s.contains(":29333")),
+            "localhost seeds must include port 29333");
+        assert!(seeds.iter().any(|s| s.contains(":29334")),
+            "localhost seeds must include port 29334");
+        for seed in &seeds {
+            assert!(seed.starts_with("127.0.0.1:"), "seed must be localhost, got: {}", seed);
         }
     }
 

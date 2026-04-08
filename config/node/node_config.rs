@@ -283,21 +283,21 @@ impl NodeConfig {
         Ok(())
     }
 
-    pub fn blocks_path(&self)   -> std::path::PathBuf { self.network.blocks_path() }
-    pub fn peers_path(&self)    -> std::path::PathBuf { self.network.peers_path() }
-    pub fn utxo_path(&self)     -> std::path::PathBuf { self.network.utxo_path() }
-    pub fn mempool_path(&self)  -> std::path::PathBuf { self.network.mempool_path() }
-    pub fn dag_path(&self)      -> std::path::PathBuf { self.network.dag_path() }
-    pub fn snapshot_path(&self) -> std::path::PathBuf { self.network.snapshot_path() }
-    pub fn dsp_path(&self)      -> std::path::PathBuf { self.network.dsp_path() }
-    pub fn runtime_path(&self)  -> std::path::PathBuf { self.network.data_dir().join("runtime") }
+    pub fn blocks_path(&self)   -> std::path::PathBuf { self.data_dir.join("blocks") }
+    pub fn peers_path(&self)    -> std::path::PathBuf { self.data_dir.join("peers") }
+    pub fn utxo_path(&self)     -> std::path::PathBuf { self.data_dir.join("utxo") }
+    pub fn mempool_path(&self)  -> std::path::PathBuf { self.data_dir.join("mempool") }
+    pub fn dag_path(&self)      -> std::path::PathBuf { self.data_dir.join("dag") }
+    pub fn snapshot_path(&self) -> std::path::PathBuf { self.data_dir.join("snapshots") }
+    pub fn dsp_path(&self)      -> std::path::PathBuf { self.data_dir.join("dsp") }
+    pub fn runtime_path(&self)  -> std::path::PathBuf { self.data_dir.join("runtime") }
 
-    pub fn peers_path_str(&self)    -> String { self.network.peers_path().to_string_lossy().into_owned() }
-    pub fn mempool_path_str(&self)  -> String { self.network.mempool_path().to_string_lossy().into_owned() }
-    pub fn blocks_path_str(&self)   -> String { self.network.blocks_path().to_string_lossy().into_owned() }
-    pub fn dag_path_str(&self)      -> String { self.network.dag_path().to_string_lossy().into_owned() }
-    pub fn snapshot_path_str(&self) -> String { self.network.snapshot_path().to_string_lossy().into_owned() }
-    pub fn dsp_path_str(&self)      -> String { self.network.dsp_path().to_string_lossy().into_owned() }
+    pub fn peers_path_str(&self)    -> String { self.peers_path().to_string_lossy().into_owned() }
+    pub fn mempool_path_str(&self)  -> String { self.mempool_path().to_string_lossy().into_owned() }
+    pub fn blocks_path_str(&self)   -> String { self.blocks_path().to_string_lossy().into_owned() }
+    pub fn dag_path_str(&self)      -> String { self.dag_path().to_string_lossy().into_owned() }
+    pub fn snapshot_path_str(&self) -> String { self.snapshot_path().to_string_lossy().into_owned() }
+    pub fn dsp_path_str(&self)      -> String { self.dsp_path().to_string_lossy().into_owned() }
 }
 
 #[cfg(test)]

@@ -89,6 +89,24 @@ pub struct StratumResponse {
     pub error:  Option<String>,
 }
 
+/// Escape a string for safe inclusion in a JSON string value.
+/// Handles double-quotes, backslashes, and control characters.
+fn escape_json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {},
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 impl StratumResponse {
     pub fn ok(id: u64, result: &str) -> Self {
         Self { id, result: Some(result.to_string()), error: None }
@@ -98,7 +116,7 @@ impl StratumResponse {
     }
     pub fn to_json(&self) -> String {
         if let Some(ref e) = self.error {
-            format!("{{\"id\":{},\"result\":null,\"error\":\"{}\"}}\n", self.id, e)
+            format!("{{\"id\":{},\"result\":null,\"error\":\"{}\"}}\n", self.id, escape_json_str(e))
         } else {
             format!("{{\"id\":{},\"result\":{},\"error\":null}}\n", self.id,
                 self.result.as_deref().unwrap_or("true"))
@@ -322,7 +340,13 @@ impl StratumServer {
 
             StratumMethod::Authorize => {
                 let worker_name = req.params.first().cloned().unwrap_or_default();
-                let address = worker_name.split('.').next().unwrap_or("unknown").to_string();
+                if worker_name.is_empty() {
+                    return StratumResponse::err(req.id, "worker name required");
+                }
+                let address = worker_name.split('.').next().unwrap_or_default().to_string();
+                if address.is_empty() || address.len() < 10 {
+                    return StratumResponse::err(req.id, "invalid mining address");
+                }
 
                 // Retrieve the worker_id that was assigned during Subscribe for
                 // this connection. This eliminates the race where concurrent
@@ -702,17 +726,49 @@ impl PayoutCalculator {
             return HashMap::new();
         }
 
-        workers.values().map(|w| {
+        let mut payouts: HashMap<String, u64> = HashMap::new();
+        for w in workers.values() {
             let payout = (distributable as u128 * w.shares_accepted as u128 / total_shares as u128) as u64;
-            (w.address.clone(), payout)
-        }).collect()
+            *payouts.entry(w.address.clone()).or_insert(0) += payout;
+        }
+        payouts
     }
 
-    /// Calculate payouts using PPLNS (last N shares window)
-    pub fn calculate_pplns(workers: &HashMap<u64, Worker>, block_reward: u64, pool_fee_pct: u64, _window_size: u64) -> HashMap<String, u64> {
-        // PPLNS uses the same proportional logic but only considers
-        // shares within the last N shares window
-        Self::calculate_pps(workers, block_reward, pool_fee_pct)
+    /// Calculate payouts using PPLNS (last N shares window).
+    ///
+    /// Only counts up to `window_size` most-recent shares across all workers,
+    /// distributing the block reward proportionally among those shares.
+    /// Workers whose `shares_accepted` exceeds their share of the window are
+    /// capped so the total does not exceed `window_size`.
+    pub fn calculate_pplns(workers: &HashMap<u64, Worker>, block_reward: u64, pool_fee_pct: u64, window_size: u64) -> HashMap<String, u64> {
+        let pool_fee = block_reward * pool_fee_pct / 100;
+        let distributable = block_reward - pool_fee;
+
+        let total_shares: u64 = match workers.values()
+            .try_fold(0u64, |acc, w| acc.checked_add(w.shares_accepted))
+        {
+            Some(s) => s,
+            None => return HashMap::new(),
+        };
+        if total_shares == 0 {
+            return HashMap::new();
+        }
+
+        // Only consider the last `window_size` shares. If total shares
+        // exceed the window, scale each worker's shares proportionally so
+        // the effective total equals window_size.
+        let effective_window = window_size.min(total_shares);
+
+        let mut payouts: HashMap<String, u64> = HashMap::new();
+        for w in workers.values() {
+            // Scale each worker's shares into the window
+            let windowed_shares = (w.shares_accepted as u128 * effective_window as u128
+                / total_shares as u128) as u64;
+            let payout = (distributable as u128 * windowed_shares as u128
+                / effective_window as u128) as u64;
+            *payouts.entry(w.address.clone()).or_insert(0) += payout;
+        }
+        payouts
     }
 }
 
