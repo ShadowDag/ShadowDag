@@ -30,14 +30,22 @@ impl TxIndex {
     }
 
     pub fn get_tx_block(&self, txid: &str) -> Option<String> {
-        match self.db.get(txid).unwrap_or(None) {
-            Some(data) => {
-                Some(String::from_utf8(data.to_vec()).ok()?)
+        match self.db.get(txid) {
+            Ok(Some(data)) => {
+                match String::from_utf8(data.to_vec()) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        slog_error!("storage", "tx_index_utf8_error", txid => txid, error => e);
+                        None
+                    }
+                }
             }
-
-            None => None
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("storage", "tx_index_read_error", txid => txid, error => e);
+                None
+            }
         }
-
     }
 
 }

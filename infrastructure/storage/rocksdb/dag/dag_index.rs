@@ -23,6 +23,13 @@ impl DagIndex {
         Ok(Self { db })
     }
 
+    /// Index a block hash at a given height.
+    ///
+    /// **Concurrency note:** This performs a read-modify-write without
+    /// locking. It is safe only under the single-writer assumption
+    /// (one thread indexes blocks at a time). Concurrent calls for the
+    /// same height may lose an insertion. A dedup check prevents
+    /// duplicates when the same block is re-indexed.
     pub fn index_block(&self, hash: &str, height: u64) {
         let key = format!("height:{}", height);
         let mut hashes = self.get_hashes_at_height(height);
@@ -57,10 +64,15 @@ impl DagIndex {
                 } else if let Ok(s) = String::from_utf8(data.to_vec()) {
                     vec![s]
                 } else {
+                    slog_error!("storage", "dag_index_deserialize_failed", height => height);
                     vec![]
                 }
             }
-            _ => vec![],
+            Ok(None) => vec![],
+            Err(e) => {
+                slog_error!("storage", "dag_index_read_failed", height => height, error => e);
+                vec![]
+            }
         }
     }
 }
