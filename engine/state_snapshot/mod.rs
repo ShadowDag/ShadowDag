@@ -172,12 +172,25 @@ impl SnapshotManager {
     pub fn list_snapshots(&self) -> Vec<SnapshotMetadata> {
         let db = self.lock_db();
         let prefix = b"snap:meta:";
-        let mut metas: Vec<SnapshotMetadata> = db
-            .iterator(IteratorMode::Start)
-            .filter_map(|r| r.ok())
-            .filter(|(k, _)| k.starts_with(prefix))
-            .filter_map(|(_, v)| bincode::deserialize::<SnapshotMetadata>(&v).ok())
-            .collect();
+        let mut metas: Vec<SnapshotMetadata> = Vec::new();
+        for item in db.iterator(IteratorMode::Start) {
+            match item {
+                Ok((k, v)) => {
+                    if !k.starts_with(prefix) { continue; }
+                    match bincode::deserialize::<SnapshotMetadata>(&v) {
+                        Ok(m) => metas.push(m),
+                        Err(e) => {
+                            log::error!("[Snapshot] failed to deserialize metadata: {}", e);
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("[Snapshot] DB iterator read failed: {}", e);
+                    continue;
+                }
+            }
+        }
         metas.sort_by(|a, b| b.block_height.cmp(&a.block_height));
         metas
     }
@@ -189,8 +202,21 @@ impl SnapshotManager {
     pub fn get_chunk(&self, height: u64, chunk_index: u64) -> Option<SnapshotChunk> {
         let db = self.lock_db();
         let key = format!("snap:chunk:{}:{}", height, chunk_index);
-        let data = db.get(key.as_bytes()).ok()??;
-        bincode::deserialize(&data).ok()
+        let data = match db.get(key.as_bytes()) {
+            Ok(Some(d)) => d,
+            Ok(None) => return None,
+            Err(e) => {
+                log::error!("[Snapshot] DB read failed for chunk {}:{}: {}", height, chunk_index, e);
+                return None;
+            }
+        };
+        match bincode::deserialize(&data) {
+            Ok(chunk) => Some(chunk),
+            Err(e) => {
+                log::error!("[Snapshot] failed to deserialize chunk {}:{}: {}", height, chunk_index, e);
+                None
+            }
+        }
     }
 
     pub fn begin_download(&self, meta: SnapshotMetadata) {
@@ -204,6 +230,15 @@ impl SnapshotManager {
             return Err(StorageError::Other(format!("Chunk {} hash mismatch", chunk.chunk_index)));
         }
 
+        // Check active download FIRST — avoid writing to DB if no download is in progress
+        {
+            let prog = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+            if prog.is_none() {
+                return Err(StorageError::Other("No active download".to_string()));
+            }
+        }
+
+        // THEN write chunk to DB
         {
             let db = self.lock_db();
             let key = format!("snap:dl:chunk:{}", chunk.chunk_index);
@@ -234,6 +269,20 @@ impl SnapshotManager {
             }
         };
 
+        // Validate snapshot version
+        if meta.version != SNAPSHOT_VERSION {
+            return Err(StorageError::Other(format!(
+                "snapshot version {} != expected {}", meta.version, SNAPSHOT_VERSION
+            )));
+        }
+
+        // Validate network matches
+        if meta.network != self.network {
+            return Err(StorageError::Other(format!(
+                "snapshot network '{}' != expected '{}'", meta.network, self.network
+            )));
+        }
+
         if meta.chunk_count > MAX_SNAPSHOT_CHUNKS {
             return Err(StorageError::Other(format!(
                 "chunk_count {} exceeds maximum {}", meta.chunk_count, MAX_SNAPSHOT_CHUNKS
@@ -254,6 +303,20 @@ impl SnapshotManager {
         let root = self.compute_merkle_root(&all_entries);
         if root != meta.merkle_root {
             return Err(StorageError::Other(format!("Merkle root mismatch: got {} expected {}", root, meta.merkle_root)));
+        }
+
+        // Clear existing UTXO state before applying snapshot.
+        // This prevents stale UTXOs from persisting after snapshot restore.
+        {
+            let mut clear_batch = WriteBatch::default();
+            let iter = db.iterator(IteratorMode::Start);
+            for (k, _) in iter.flatten() {
+                // UTXO entries use 36-byte binary keys (UtxoKey format)
+                if k.len() == 36 {
+                    clear_batch.delete(&k);
+                }
+            }
+            db.write(clear_batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         }
 
         let mut batch = WriteBatch::default();
@@ -301,7 +364,9 @@ impl SnapshotManager {
                 batch.delete(ck.as_bytes());
             }
         }
-        let _ = db.write(batch);
+        if let Err(e) = db.write(batch) {
+            log::error!("[Snapshot] prune_old_snapshots write failed: {}", e);
+        }
     }
 
     fn compute_merkle_root(&self, utxos: &[UtxoSnapshotEntry]) -> String {
@@ -312,6 +377,8 @@ impl SnapshotManager {
             hasher.update(u.index.to_le_bytes());
             hasher.update(u.amount.to_le_bytes());
             hasher.update(u.address.as_bytes());
+            hasher.update(u.height.to_le_bytes());
+            hasher.update([if u.is_coinbase { 1u8 } else { 0u8 }]);
         }
         hex::encode(hasher.finalize())
     }
