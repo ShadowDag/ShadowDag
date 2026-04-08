@@ -8,7 +8,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::engine::consensus::difficulty::difficulty::Difficulty;
-use crate::engine::consensus::difficulty::difficulty_window::DifficultyWindow;
 use crate::errors::{ConsensusError, StorageError};
 use crate::slog_error;
 
@@ -143,7 +142,7 @@ impl DifficultyAdjustment {
     // ─────────────────────────────────────────
     pub fn recalculate_difficulty(
         &self,
-        height: u64,
+        _height: u64,
         window_timestamps: &[u64],
     ) -> u64 {
         let current = self.get_difficulty();
@@ -179,8 +178,9 @@ impl DifficultyAdjustment {
 
         let actual_timespan = high.saturating_sub(low).max(1);
 
-        let window_size = DifficultyWindow::sample_size(height);
-        let expected_timespan = window_size.saturating_mul(self.target_block_time);
+        // Use actual window size, not the fixed sample_size constant
+        let trimmed_len = (high_idx - low_idx) as u64;
+        let expected_timespan = trimmed_len.max(1).saturating_mul(self.target_block_time);
 
         // Anti-timewarp clamping:
         // min = max(expected/4, target_block_time) — prevents artificially

@@ -105,10 +105,17 @@ impl BlockProcessor {
         // reversing confirmed transactions.
         let old_score = ghostdag.get_blue_score(old_tip);
         let new_score = ghostdag.get_blue_score(new_tip);
-        if new_score <= old_score {
+        if new_score < old_score {
             return Err(ConsensusError::ReorgRejected(format!(
-                "new tip blue_score {} <= old tip blue_score {} — refusing weaker chain",
+                "new tip blue_score {} < old tip blue_score {} — refusing weaker chain",
                 new_score, old_score
+            )));
+        }
+        // Equal score: apply deterministic tie-break (lower hash wins)
+        if new_score == old_score && new_tip >= old_tip {
+            return Err(ConsensusError::ReorgRejected(format!(
+                "new tip blue_score {} == old tip {} but hash {} >= {} — tie lost",
+                new_score, old_score, &new_tip[..16.min(new_tip.len())], &old_tip[..16.min(old_tip.len())]
             )));
         }
 

@@ -80,7 +80,8 @@ impl<'a> BlockContext<'a> {
     /// Without this, miners can backdate blocks to manipulate difficulty.
     pub fn validate_timestamp_causality(&self, parent_timestamps: &[u64]) -> bool {
         if parent_timestamps.is_empty() {
-            return true; // Genesis block
+            // Only genesis (height 0) is allowed to have no parents
+            return self.block.header.height == 0;
         }
         let max_parent_ts = parent_timestamps.iter().copied().max().unwrap_or(0);
         self.block.header.timestamp >= max_parent_ts
