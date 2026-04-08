@@ -238,6 +238,26 @@ impl BlockValidator {
             )));
         }
 
+        // Receipt root verification (for blocks with contract TXs)
+        if let Some(ref claimed_root) = block.header.receipt_root {
+            // Re-execution and full comparison is done at the UTXO/execution layer.
+            // Here we only verify the format is valid (64 hex chars = SHA-256).
+            if claimed_root.len() != 64 || !claimed_root.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(ConsensusError::BlockValidation(
+                    "invalid receipt_root format (must be 64 hex chars)".into()
+                ));
+            }
+        }
+
+        // State root format verification (for blocks with contract state changes)
+        if let Some(ref claimed_root) = block.header.state_root {
+            if claimed_root.len() != 64 || !claimed_root.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(ConsensusError::BlockValidation(
+                    "invalid state_root format (must be 64 hex chars)".into()
+                ));
+            }
+        }
+
         // Per-TX structure + signature verification
         for (i, tx) in block.body.transactions.iter().enumerate() {
             if !tx.is_coinbase() {
@@ -1069,6 +1089,8 @@ mod tests {
                 selected_parent:  None,
                 utxo_commitment:  None,
                 extra_nonce:      0,
+                receipt_root:     None,
+                state_root:       None,
             },
             body: BlockBody { transactions: txs },
         }

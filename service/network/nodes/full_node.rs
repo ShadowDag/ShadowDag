@@ -23,10 +23,9 @@ use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
 use crate::service::network::dos_guard::{DosGuard, DosVerdict, MsgType};
 use crate::errors::{NodeError, ConsensusError};
 use crate::domain::transaction::transaction::TxType;
-use crate::domain::transaction::tx_receipt::TxReceipt;
-use crate::runtime::vm::core::executor::Executor;
-use crate::runtime::vm::core::vm_context::VMContext;
+use crate::domain::transaction::tx_receipt::{TxReceipt, ReceiptStore, compute_receipt_root};
 use crate::runtime::vm::core::vm::ExecutionResult;
+use crate::runtime::vm::core::execution_env::{ExecutionEnvironment, BlockContext, CallContext, CallOutcome};
 use crate::runtime::vm::contracts::contract_storage::ContractStorage;
 use crate::{slog_info, slog_warn, slog_error};
 
@@ -101,6 +100,8 @@ pub struct FullNode {
     peer_block_timestamps: Mutex<HashMap<String, Vec<u64>>>,
     /// Per-peer DoS guard: rate limits, bans, oversized message rejection
     dos_guard: DosGuard,
+    /// Receipt store for contract execution receipts
+    pub receipt_store: ReceiptStore,
 }
 
 impl FullNode {
@@ -160,6 +161,7 @@ impl FullNode {
             orphan_count_by_peer: Mutex::new(HashMap::new()),
             peer_block_timestamps: Mutex::new(HashMap::new()),
             dos_guard: DosGuard::new(),
+            receipt_store: ReceiptStore::new(100_000),
         }
     }
 
@@ -564,12 +566,29 @@ impl FullNode {
 
             if let Some(block) = self.block_store.get_block(block_hash) {
                 // ── CONTRACT EXECUTION (before UTXO processing) ─────────
-                // Intercept ContractCreate and ContractCall transactions
-                // and execute them through the ShadowVM. Contract execution
-                // is best-effort: failures are logged but do not halt block
-                // processing (UTXO fees are still applied).
-                Self::execute_contract_transactions(&block);
+                // Open contract storage for this block's execution.
+                // Uses a temp directory per block to avoid lock conflicts.
+                let contract_db_path = std::env::temp_dir()
+                    .join(format!("shadowdag_contracts_{}", block.header.hash));
+                let contract_db_str = contract_db_path.to_str()
+                    .unwrap_or("shadowdag_contracts_fallback")
+                    .to_string();
 
+                let contract_storage = ContractStorage::new(&contract_db_str).ok();
+
+                // Execute contracts through shared ExecutionEnvironment.
+                // Does NOT persist state — persistence is deferred until UTXO succeeds.
+                let (receipts, receipt_root, state_root, env) = if let Some(ref cs) = contract_storage {
+                    Self::execute_contract_transactions(&block, cs)
+                } else {
+                    slog_warn!("node", "contract_storage_init_failed", block => block_hash);
+                    (vec![], None, None, ExecutionEnvironment::new(BlockContext {
+                        timestamp: block.header.timestamp,
+                        block_hash: block.header.hash.clone(),
+                    }))
+                };
+
+                // ── UTXO APPLICATION ──────────────────────────────────────
                 match self.utxo_set.apply_block_dag_ordered(
                     &block.body.transactions,
                     block.header.height,
@@ -577,6 +596,29 @@ impl FullNode {
                 ) {
                     Ok((_applied, _skipped, applied_fees)) => {
                         applied_new.push(block_hash.clone());
+
+                        // UTXO succeeded → persist contract state atomically
+                        if let Some(ref cs) = contract_storage {
+                            if let Err(e) = env.persist_to_storage(cs) {
+                                slog_error!("node", "contract_persist_failed",
+                                    block => block_hash, error => &format!("{}", e));
+                            }
+                        }
+
+                        // Store receipts in receipt store
+                        for r in &receipts {
+                            self.receipt_store.track(r.clone());
+                        }
+
+                        // Update block header receipt_root and state_root in store
+                        // (block is already saved; we update the header fields)
+                        if receipt_root.is_some() || state_root.is_some() {
+                            if let Some(mut stored_block) = self.block_store.get_block(block_hash) {
+                                stored_block.header.receipt_root = receipt_root;
+                                stored_block.header.state_root = state_root;
+                                self.block_store.save_block(&stored_block);
+                            }
+                        }
 
                         // POST-EXECUTION COINBASE VALIDATION
                         //
@@ -626,6 +668,9 @@ impl FullNode {
                         }
                     }
                     Err(e) => {
+                        // UTXO failed → discard contract state (don't persist)
+                        slog_error!("node", "utxo_apply_failed",
+                            block => block_hash, error => &format!("{}", e));
                         // Rollback partially-applied new chain
                         for hash in applied_new.iter().rev() {
                             let _ = self.utxo_set.rollback_block_undo(hash);
@@ -715,34 +760,68 @@ impl FullNode {
 
     /// Execute contract transactions (ContractCreate, ContractCall) within a block.
     ///
-    /// This is called during virtual chain recomputation, before UTXO processing.
-    /// Contract execution is best-effort: failures are logged but do not halt
-    /// block acceptance (the UTXO layer still processes fees).
+    /// Uses a SINGLE shared ExecutionEnvironment across all TXs in the block
+    /// so contract state is visible between TXs. Does NOT persist state
+    /// internally — the caller must persist via env.persist_to_storage()
+    /// only after UTXO application succeeds (atomic pipeline).
     ///
-    /// A temporary ContractStorage is opened per block for isolation. Each
-    /// contract TX creates its own Executor and runs through the ShadowVM.
-    fn execute_contract_transactions(block: &Block) {
-        // Use a temp directory for contract storage per block to avoid lock conflicts
-        let contract_db_path = std::env::temp_dir()
-            .join(format!("shadowdag_contracts_{}", block.header.hash));
-        let contract_db_str = match contract_db_path.to_str() {
-            Some(s) => s.to_string(),
-            None => return,
-        };
+    /// Returns (receipts, receipt_root, state_root, env):
+    ///   - receipts: TxReceipt for each TX in the block
+    ///   - receipt_root: SHA-256 of sorted receipt data (None if no contract TXs)
+    ///   - state_root: StateManager root hash (None if no contract TXs)
+    ///   - env: the ExecutionEnvironment (caller persists on UTXO success)
+    fn execute_contract_transactions(
+        block: &Block,
+        contract_storage: &ContractStorage,
+    ) -> (Vec<TxReceipt>, Option<String>, Option<String>, ExecutionEnvironment) {
+        let mut env = ExecutionEnvironment::new(BlockContext {
+            timestamp: block.header.timestamp,
+            block_hash: block.header.hash.clone(),
+        });
 
-        let storage = match ContractStorage::new(contract_db_str.as_str()) {
-            Ok(s) => s,
-            Err(e) => {
-                slog_warn!("node", "contract_storage_init_failed", error => &e.to_string());
-                return;
+        let mut receipts = Vec::with_capacity(block.body.transactions.len());
+        let mut has_contract_txs = false;
+
+        // Pre-load referenced contracts from storage
+        for tx in &block.body.transactions {
+            match tx.tx_type {
+                TxType::ContractCreate => {
+                    let deployer = tx.inputs.first()
+                        .map(|i| i.owner.clone())
+                        .unwrap_or_default();
+                    env.load_contract_from_storage(contract_storage, &deployer);
+                }
+                TxType::ContractCall => {
+                    let target = tx.contract_address.clone().unwrap_or_else(|| {
+                        tx.outputs.first()
+                            .map(|o| o.address.clone())
+                            .unwrap_or_default()
+                    });
+                    env.load_contract_from_storage(contract_storage, &target);
+                    let caller = tx.inputs.first()
+                        .map(|i| i.owner.clone())
+                        .unwrap_or_default();
+                    env.load_contract_from_storage(contract_storage, &caller);
+
+                    // Load contract code into in-memory state
+                    if let Some(code_hex) = contract_storage.get_state(&format!("code:{}", target)) {
+                        if let Ok(code) = hex::decode(&code_hex) {
+                            if env.state.get_code(&target).is_empty() {
+                                env.state.set_code(&target, code).ok();
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
-        };
-        let ctx = VMContext::new(storage);
-        let executor = Executor::new(ctx);
+        }
 
+        // Execute each TX in block order through the shared environment
         for (tx_index, tx) in block.body.transactions.iter().enumerate() {
             match tx.tx_type {
                 TxType::ContractCreate => {
+                    has_contract_txs = true;
+
                     // Read bytecode from tx.deploy_code (canonical), fall back to payload_hash (legacy)
                     let payload = if let Some(ref code) = tx.deploy_code {
                         code.clone()
@@ -750,9 +829,24 @@ impl FullNode {
                         match &tx.payload_hash {
                             Some(ph) => match hex::decode(ph) {
                                 Ok(bytes) => bytes,
-                                Err(_) => continue,
+                                Err(_) => {
+                                    // Empty receipt for unparseable TX
+                                    receipts.push(TxReceipt::from_execution(
+                                        &tx.hash,
+                                        &ExecutionResult::Error { gas_used: 0, message: "invalid deploy payload".into() },
+                                        &block.header.hash, block.header.height, tx_index as u32,
+                                    ));
+                                    continue;
+                                },
                             },
-                            None => continue,
+                            None => {
+                                receipts.push(TxReceipt::from_execution(
+                                    &tx.hash,
+                                    &ExecutionResult::Error { gas_used: 0, message: "missing deploy payload".into() },
+                                    &block.header.hash, block.header.height, tx_index as u32,
+                                ));
+                                continue;
+                            },
                         }
                     };
 
@@ -762,61 +856,97 @@ impl FullNode {
                     let value = tx.outputs.first()
                         .map(|o| o.amount)
                         .unwrap_or(0);
-                    // Read gas_limit from tx field, fall back to default
                     let gas_limit = tx.gas_limit.unwrap_or(10_000_000u64);
 
-                    match executor.deploy(
-                        &payload,
-                        &deployer,
+                    // Generate deterministic contract address
+                    let contract_addr = {
+                        use sha2::{Sha256, Digest};
+                        let mut hasher = Sha256::new();
+                        hasher.update(deployer.as_bytes());
+                        hasher.update(&payload);
+                        hasher.update(0u64.to_le_bytes()); // nonce
+                        hex::encode(hasher.finalize())[..40].to_string()
+                    };
+
+                    // Set code for new contract so execute_frame can run it
+                    env.state.set_code(&contract_addr, payload.to_vec()).ok();
+
+                    let call_ctx = CallContext {
+                        address: contract_addr.clone(),
+                        code_address: contract_addr.clone(),
+                        caller: deployer.clone(),
                         value,
                         gas_limit,
-                        block.header.timestamp,
-                        &block.header.hash,
-                        0, // nonce
-                    ) {
-                        Ok((addr, ref result)) => {
-                            let mut _receipt = TxReceipt::from_execution(
-                                &tx.hash, result, &block.header.hash,
-                                block.header.height, tx_index as u32,
-                            );
-                            _receipt.contract_addr = Some(addr.clone());
-                            match result {
-                                ExecutionResult::Success { gas_used, .. } => {
-                                    slog_info!("node", "contract_deployed",
-                                        address => &addr,
-                                        gas_used => &gas_used.to_string(),
-                                        receipt_success => "true");
-                                }
-                                _ => {
-                                    slog_warn!("node", "contract_deploy_execution_failed",
-                                        tx => &tx.hash, address => &addr,
-                                        receipt_success => "false");
-                                }
-                            }
+                        calldata: vec![],
+                        is_static: false,
+                        depth: 0,
+                    };
+
+                    let outcome = env.execute_frame(&call_ctx);
+                    let exec_result = match outcome {
+                        CallOutcome::Success { gas_used, return_data, logs } => {
+                            ExecutionResult::Success { gas_used, return_data, logs }
                         }
-                        Err(e) => {
-                            slog_warn!("node", "contract_deploy_failed",
-                                tx => &tx.hash, error => &e.to_string());
+                        CallOutcome::Revert { gas_used, return_data } => {
+                            ExecutionResult::Revert { gas_used, reason: String::from_utf8_lossy(&return_data).to_string() }
+                        }
+                        CallOutcome::Failure { gas_used } => {
+                            ExecutionResult::OutOfGas { gas_used }
+                        }
+                    };
+
+                    let mut receipt = TxReceipt::from_execution(
+                        &tx.hash, &exec_result, &block.header.hash,
+                        block.header.height, tx_index as u32,
+                    );
+                    receipt.contract_addr = Some(contract_addr.clone());
+
+                    match &exec_result {
+                        ExecutionResult::Success { gas_used, .. } => {
+                            slog_info!("node", "contract_deployed",
+                                address => &contract_addr,
+                                gas_used => &gas_used.to_string(),
+                                receipt_success => "true");
+                        }
+                        _ => {
+                            slog_warn!("node", "contract_deploy_execution_failed",
+                                tx => &tx.hash, address => &contract_addr,
+                                receipt_success => "false");
                         }
                     }
+                    receipts.push(receipt);
                 }
                 TxType::ContractCall => {
-                    // Read target from tx.contract_address (canonical), fall back to first output (legacy)
+                    has_contract_txs = true;
+
                     let target = tx.contract_address.clone().unwrap_or_else(|| {
                         tx.outputs.first()
                             .map(|o| o.address.clone())
                             .unwrap_or_default()
                     });
-                    // Read calldata from tx.calldata (canonical), fall back to payload_hash (legacy)
                     let calldata = if let Some(ref cd) = tx.calldata {
                         cd.clone()
                     } else {
                         match &tx.payload_hash {
                             Some(ph) => match hex::decode(ph) {
                                 Ok(bytes) => bytes,
-                                Err(_) => continue,
+                                Err(_) => {
+                                    receipts.push(TxReceipt::from_execution(
+                                        &tx.hash,
+                                        &ExecutionResult::Error { gas_used: 0, message: "invalid calldata".into() },
+                                        &block.header.hash, block.header.height, tx_index as u32,
+                                    ));
+                                    continue;
+                                },
                             },
-                            None => continue,
+                            None => {
+                                receipts.push(TxReceipt::from_execution(
+                                    &tx.hash,
+                                    &ExecutionResult::Error { gas_used: 0, message: "missing calldata".into() },
+                                    &block.header.hash, block.header.height, tx_index as u32,
+                                ));
+                                continue;
+                            },
                         }
                     };
                     let caller = tx.inputs.first()
@@ -825,41 +955,73 @@ impl FullNode {
                     let value = tx.outputs.first()
                         .map(|o| o.amount)
                         .unwrap_or(0);
-                    // Read gas_limit from tx field, fall back to default
                     let gas_limit = tx.gas_limit.unwrap_or(10_000_000u64);
 
-                    let result = executor.call(
-                        &target,
-                        &calldata,
-                        &caller,
+                    let call_ctx = CallContext {
+                        address: target.clone(),
+                        code_address: target.clone(),
+                        caller: caller.clone(),
                         value,
                         gas_limit,
-                        block.header.timestamp,
-                        &block.header.hash,
-                    );
+                        calldata,
+                        is_static: false,
+                        depth: 0,
+                    };
 
-                    let _receipt = TxReceipt::from_execution(
-                        &tx.hash, &result, &block.header.hash,
+                    let outcome = env.execute_frame(&call_ctx);
+                    let exec_result = match outcome {
+                        CallOutcome::Success { gas_used, return_data, logs } => {
+                            ExecutionResult::Success { gas_used, return_data, logs }
+                        }
+                        CallOutcome::Revert { gas_used, return_data } => {
+                            ExecutionResult::Revert { gas_used, reason: String::from_utf8_lossy(&return_data).to_string() }
+                        }
+                        CallOutcome::Failure { gas_used } => {
+                            ExecutionResult::OutOfGas { gas_used }
+                        }
+                    };
+
+                    let receipt = TxReceipt::from_execution(
+                        &tx.hash, &exec_result, &block.header.hash,
                         block.header.height, tx_index as u32,
                     );
 
-                    match &result {
+                    match &exec_result {
                         ExecutionResult::Success { gas_used, .. } => {
                             slog_info!("node", "contract_called",
                                 target => &target,
                                 gas_used => &gas_used.to_string(),
-                                receipt_success => &_receipt.execution_success.to_string());
+                                receipt_success => &receipt.execution_success.to_string());
                         }
                         _ => {
                             slog_warn!("node", "contract_call_failed",
                                 tx => &tx.hash,
-                                receipt_success => &_receipt.execution_success.to_string());
+                                receipt_success => &receipt.execution_success.to_string());
                         }
                     }
+                    receipts.push(receipt);
                 }
-                _ => {} // Normal UTXO processing continues in apply_block_dag_ordered
+                _ => {
+                    // Non-contract TXs get empty receipts for receipt root computation
+                    receipts.push(TxReceipt::from_execution(
+                        &tx.hash,
+                        &ExecutionResult::Success { gas_used: 0, return_data: vec![], logs: vec![] },
+                        &block.header.hash, block.header.height, tx_index as u32,
+                    ));
+                }
             }
         }
+
+        // Compute receipt_root and state_root only if there were contract TXs
+        let (receipt_root, state_root) = if has_contract_txs {
+            let rr = compute_receipt_root(&receipts);
+            let sr = env.state.state_root();
+            (Some(rr), Some(sr))
+        } else {
+            (None, None)
+        };
+
+        (receipts, receipt_root, state_root, env)
     }
 
     // ═══════════════════════════════════════════════════════════════════

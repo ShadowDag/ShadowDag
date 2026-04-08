@@ -418,6 +418,8 @@ mod tests {
             selected_parent: Some("p1".to_string()),
             utxo_commitment: None,
             extra_nonce: 0,
+            receipt_root: None,
+            state_root: None,
         }
     }
 

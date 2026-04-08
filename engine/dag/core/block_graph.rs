@@ -694,6 +694,7 @@ mod tests {
                 merkle_root: "mr".into(), timestamp: 1000, nonce: 0,
                 difficulty: 1, height: 0, blue_score: 0, selected_parent: None,
                 utxo_commitment: None, extra_nonce: 0,
+                receipt_root: None, state_root: None,
             },
             body: BlockBody { transactions: vec![] },
         }

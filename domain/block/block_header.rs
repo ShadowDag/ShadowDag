@@ -33,6 +33,18 @@ pub struct BlockHeader {
     /// At extreme hashrates (>10 EH/s), this prevents template exhaustion.
     #[serde(default)]
     pub extra_nonce:      u64,
+
+    /// Merkle root of all transaction execution receipts in this block.
+    /// SHA-256 of concatenated (tx_hash, execution_success, gas_used) for each tx.
+    /// None for blocks with no contract transactions.
+    #[serde(default)]
+    pub receipt_root: Option<String>,
+
+    /// Root hash of the contract state after executing this block.
+    /// Commits the entire contract storage state to the block header.
+    /// None for blocks with no contract state changes.
+    #[serde(default)]
+    pub state_root: Option<String>,
 }
 
 impl BlockHeader {
@@ -60,6 +72,8 @@ impl BlockHeader {
             selected_parent: None,
             utxo_commitment: None,
             extra_nonce:     0,
+            receipt_root:    None,
+            state_root:      None,
         }
     }
 }

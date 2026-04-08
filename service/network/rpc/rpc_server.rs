@@ -1308,6 +1308,8 @@ impl RpcServer {
                 selected_parent: None,
                 utxo_commitment: None,
                 extra_nonce,
+                receipt_root: None,
+                state_root: None,
             },
             body: BlockBody { transactions },
         };

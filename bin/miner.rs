@@ -293,6 +293,8 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
                 selected_parent: Some(prev_hash),
                 utxo_commitment: None,
                 extra_nonce: 0,
+                receipt_root: None,
+                state_root: None,
             },
             body: BlockBody {
                 transactions: vec![coinbase],

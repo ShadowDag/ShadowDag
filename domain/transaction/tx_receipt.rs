@@ -320,6 +320,19 @@ impl ReceiptStore {
     }
 }
 
+/// Compute a deterministic receipt root from a list of receipts.
+/// SHA-256 of concatenated (tx_hash | execution_success_byte | gas_used_le_bytes) for each receipt.
+pub fn compute_receipt_root(receipts: &[TxReceipt]) -> String {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    for r in receipts {
+        hasher.update(r.tx_hash.as_bytes());
+        hasher.update([if r.execution_success { 1u8 } else { 0u8 }]);
+        hasher.update(r.gas_used.to_le_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
