@@ -127,13 +127,17 @@ impl Memory {
 
     /// Load a single byte
     pub fn load_byte(&mut self, offset: usize) -> Result<u8, VmError> {
-        self.ensure_size(offset + 1)?;
+        let end = offset.checked_add(1)
+            .ok_or(VmError::MemoryOutOfBounds(offset))?;
+        self.ensure_size(end)?;
         Ok(self.data[offset])
     }
 
     /// Store a single byte
     pub fn store_byte(&mut self, offset: usize, value: u8) -> Result<(), VmError> {
-        self.ensure_size(offset + 1)?;
+        let end = offset.checked_add(1)
+            .ok_or(VmError::MemoryOutOfBounds(offset))?;
+        self.ensure_size(end)?;
         self.data[offset] = value;
         Ok(())
     }

@@ -11,7 +11,19 @@ use super::precompile_registry::PrecompileResult;
 /// Maximum allowed input size for modexp (prevent DoS)
 const MAX_MODEXP_INPUT: usize = 1024;
 
-/// 0x05: MODEXP — modular exponentiation: base^exp mod modulus
+/// 0x05: MODEXP -- modular exponentiation: base^exp mod modulus.
+///
+/// **WARNING: Inputs are limited to 128-bit (16 bytes) each.** The internal
+/// arithmetic uses Rust `u128`, so base, exponent, and modulus must each fit
+/// in 16 bytes or fewer. Inputs larger than 16 bytes are rejected with an
+/// error. This makes this precompile unsuitable for RSA signature verification
+/// (which needs 2048+ bit moduli) or any big-integer modular arithmetic beyond
+/// 128 bits.
+///
+/// # TODO
+/// Replace `u128` arithmetic with a proper big-integer library (e.g. `num-bigint`
+/// or `crypto-bigint`) to support arbitrary-precision modexp as required by
+/// EIP-198.
 ///
 /// Input format:
 ///   [0..8]    base_len (u64 LE)

@@ -25,11 +25,19 @@ pub fn sha256_precompile(input: &[u8], _gas_limit: u64) -> PrecompileResult {
 
 /// 0x03: RIPEMD-160 emulation via SHA-256 truncation.
 ///
-/// **NOTE:** This is NOT a true RIPEMD-160 implementation. It computes
-/// `SHA-256("RIPEMD160_SHADOW" || input)` and truncates to 20 bytes,
-/// left-padded to 32 bytes. The output format matches EVM conventions
-/// (12 zero bytes + 20-byte hash) but the hash function differs.
-/// Retained at address 0x03 for EVM precompile slot compatibility.
+/// **WARNING: This is NOT real RIPEMD-160.** It uses SHA-256 (domain-separated
+/// with `"RIPEMD160_SHADOW"`) truncated to 20 bytes. Contracts expecting
+/// actual RIPEMD-160 output will get wrong results -- the two hash functions
+/// produce completely different digests for the same input.
+///
+/// The output format matches EVM conventions (12 zero bytes + 20-byte hash)
+/// but the underlying hash function differs. Retained at address 0x03 for
+/// EVM precompile slot compatibility.
+///
+/// # TODO
+/// Replace with a real RIPEMD-160 implementation (e.g. the `ripemd` crate)
+/// so that Bitcoin-style address derivation and Ethereum RIPEMD-160 contracts
+/// produce correct results.
 pub fn ripemd160_precompile(input: &[u8], _gas_limit: u64) -> PrecompileResult {
     let words = (input.len() as u64).div_ceil(32);
     let gas_used = 600u64.saturating_add(words.saturating_mul(120));
@@ -55,13 +63,16 @@ pub fn identity_precompile(input: &[u8], _gas_limit: u64) -> PrecompileResult {
     PrecompileResult::ok(input.to_vec(), gas_used)
 }
 
-/// 0x06: Blake3 hash (ShadowDAG native — faster than SHA-256).
+/// 0x06: BLAKE3 hash (ShadowDAG native -- faster than SHA-256).
 ///
-/// **NOTE:** Despite the legacy name `blake2b` (retained in the registry for
-/// compatibility), this uses **BLAKE3**, not Blake2b. BLAKE3 is faster and
-/// also produces a 256-bit digest. The registry entry name `blake2b` is kept
-/// to avoid breaking existing contract ABIs.
-pub fn blake2b_precompile(input: &[u8], _gas_limit: u64) -> PrecompileResult {
+/// This precompile computes a BLAKE3 256-bit digest. It is registered at
+/// address 0x06 (the former Blake2b slot). The implementation has always used
+/// BLAKE3, never Blake2b -- the old function name was misleading.
+///
+/// **WARNING:** The registry address 0x06 historically displayed as "blake2b".
+/// Existing contract ABIs referencing address 0x06 will continue to work but
+/// the underlying algorithm is BLAKE3.
+pub fn blake3_precompile(input: &[u8], _gas_limit: u64) -> PrecompileResult {
     let words = (input.len() as u64).div_ceil(32);
     let gas_used = 40u64.saturating_add(words.saturating_mul(8));
 
@@ -95,9 +106,9 @@ mod tests {
     }
 
     #[test]
-    fn blake2b_deterministic() {
-        let r1 = blake2b_precompile(b"test", 100_000);
-        let r2 = blake2b_precompile(b"test", 100_000);
+    fn blake3_deterministic() {
+        let r1 = blake3_precompile(b"test", 100_000);
+        let r2 = blake3_precompile(b"test", 100_000);
         assert!(r1.success);
         assert_eq!(r1.output, r2.output);
         assert_eq!(r1.output.len(), 32);

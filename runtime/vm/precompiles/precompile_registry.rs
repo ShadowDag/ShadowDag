@@ -55,9 +55,10 @@ impl PrecompileRegistry {
     pub fn new() -> Self {
         let mut contracts = BTreeMap::new();
 
-        // 0x01: ECRECOVER — recover public key from signature
+        // 0x01: Ed25519 signature verification with address derivation.
+        // WARNING: NOT standard secp256k1 ecrecover -- requires pubkey as input.
         contracts.insert(0x01, PrecompileEntry {
-            name: "ecrecover",
+            name: "ed25519_verify_and_derive (not ecrecover)",
             address: 0x01,
             base_gas: 3000,
             per_word_gas: 0,
@@ -73,9 +74,10 @@ impl PrecompileRegistry {
             func: super::hash_precompiles::sha256_precompile,
         });
 
-        // 0x03: RIPEMD160 — RIPEMD-160 hash
+        // 0x03: SHA-256-truncated-to-20-bytes (NOT real RIPEMD-160).
+        // WARNING: Produces different output than actual RIPEMD-160.
         contracts.insert(0x03, PrecompileEntry {
-            name: "ripemd160",
+            name: "ripemd160 (SHA-256 truncation, not real RIPEMD-160)",
             address: 0x03,
             base_gas: 600,
             per_word_gas: 120,
@@ -91,22 +93,26 @@ impl PrecompileRegistry {
             func: super::hash_precompiles::identity_precompile,
         });
 
-        // 0x05: MODEXP — modular exponentiation (for RSA, etc.)
+        // 0x05: MODEXP -- modular exponentiation (128-bit inputs only).
+        // WARNING: Limited to 16-byte (128-bit) base/exp/mod. Not suitable
+        // for RSA or any big-integer operations requiring larger values.
         contracts.insert(0x05, PrecompileEntry {
-            name: "modexp",
+            name: "modexp (128-bit limit)",
             address: 0x05,
             base_gas: 200,
             per_word_gas: 0, // Gas is computed dynamically
             func: super::math_precompiles::modexp_precompile,
         });
 
-        // 0x06: BLAKE2B — Blake2b-256 hash (ShadowDAG specific)
+        // 0x06: BLAKE3 hash (ShadowDAG native).
+        // WARNING: Address 0x06 was historically labeled "blake2b" but the
+        // implementation has always used BLAKE3. The name is now corrected.
         contracts.insert(0x06, PrecompileEntry {
-            name: "blake2b",
+            name: "blake3",
             address: 0x06,
             base_gas: 40,
             per_word_gas: 8,
-            func: super::hash_precompiles::blake2b_precompile,
+            func: super::hash_precompiles::blake3_precompile,
         });
 
         // 0x07: SHA3 — SHA3-256 (Keccak)
@@ -127,9 +133,10 @@ impl PrecompileRegistry {
             func: super::crypto_precompiles::ed25519_verify,
         });
 
-        // 0x09: PEDERSEN_COMMIT — Pedersen commitment (for privacy contracts)
+        // 0x09: SHA-256 based commitment (NOT a real Pedersen commitment).
+        // WARNING: No homomorphic properties. See crypto_precompiles.rs doc.
         contracts.insert(0x09, PrecompileEntry {
-            name: "pedersen_commit",
+            name: "sha256_commitment (not Pedersen)",
             address: 0x09,
             base_gas: 5000,
             per_word_gas: 0,
@@ -195,7 +202,7 @@ mod tests {
         assert!(reg.is_precompile(0x03)); // ripemd160
         assert!(reg.is_precompile(0x04)); // identity
         assert!(reg.is_precompile(0x05)); // modexp
-        assert!(reg.is_precompile(0x06)); // blake2b
+        assert!(reg.is_precompile(0x06)); // blake3
         assert!(reg.is_precompile(0x07)); // sha3
         assert!(reg.is_precompile(0x08)); // ed25519_verify
         assert!(reg.is_precompile(0x09)); // pedersen_commit

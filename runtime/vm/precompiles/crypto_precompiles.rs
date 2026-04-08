@@ -16,12 +16,22 @@ const GAS_ECRECOVER: u64 = 3_000;
 const GAS_ED25519_VERIFY: u64 = 2_000;
 const GAS_PEDERSEN_COMMIT: u64 = 5_000;
 
-/// 0x01: Ed25519 signature verification and address recovery.
+/// 0x01: Signature verification with address derivation (Ed25519).
 ///
-/// **NOTE:** Despite the legacy name `ecrecover` (retained in the registry for
-/// EVM tooling compatibility at address 0x01), this is an **Ed25519 verify +
-/// address derivation**, NOT secp256k1 ECDSA recovery. ShadowDAG uses Ed25519
-/// as its native signature scheme.
+/// **WARNING: This is NOT standard Ethereum `ecrecover`.** Standard ecrecover
+/// recovers a secp256k1 public key from an ECDSA signature (v, r, s) without
+/// requiring the public key as input. This function instead takes the public
+/// key explicitly, verifies an Ed25519 signature, and derives an address via
+/// SHA-256(pubkey). It does NOT perform any key recovery.
+///
+/// The function name `ecrecover` is retained solely for EVM precompile slot
+/// compatibility at address 0x01. Callers must provide the public key -- the
+/// signature alone is not sufficient.
+///
+/// # TODO
+/// Implement real secp256k1 ECDSA recovery (using the `k256` or `secp256k1`
+/// crate) so that contracts ported from Ethereum get correct behavior at
+/// address 0x01.
 ///
 /// Input format (128 bytes):
 ///   [0..32]   message hash
@@ -111,12 +121,18 @@ pub fn ed25519_verify(input: &[u8], _gas_limit: u64) -> PrecompileResult {
     }
 }
 
-/// 0x09: Hash-based commitment (domain-separated SHA-256).
+/// 0x09: SHA-256 based commitment (domain-separated).
 ///
-/// **NOTE:** This is a SHA-256 domain-separated hash commitment, NOT a
-/// Pedersen commitment on an elliptic curve. The name `pedersen_commit` is
-/// retained for registry/ABI compatibility. For actual Pedersen commitments
-/// with homomorphic properties, use the privacy layer
+/// **WARNING: This is NOT a real Pedersen commitment.** A true Pedersen
+/// commitment uses elliptic curve points (C = v*G + r*H) and has homomorphic
+/// properties (commitments can be added: C1 + C2 commits to v1 + v2). This
+/// implementation is a plain SHA-256 hash and has NONE of those properties.
+/// Contracts relying on homomorphic addition of commitments will silently
+/// produce incorrect results.
+///
+/// The function name `pedersen_commit` is retained for registry/ABI
+/// compatibility at address 0x09. For actual Pedersen commitments with
+/// homomorphic properties, use the privacy layer
 /// (`engine/privacy/confidential/pedersen_commitment.rs`).
 ///
 /// Input format (40 bytes):

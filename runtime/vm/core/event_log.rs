@@ -111,6 +111,15 @@ impl EventCollector {
             return Err(VmError::Other(format!("log data too large: {} bytes (max {})", data.len(), MAX_LOG_DATA)));
         }
 
+        // Validate topic format: each must be 64 hex chars (32 bytes)
+        for (i, topic) in topics.iter().enumerate() {
+            if topic.len() != 64 || !topic.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(VmError::InvalidLogTopic(format!(
+                    "topic {} must be 64 hex chars (32 bytes), got {} chars", i, topic.len()
+                )));
+            }
+        }
+
         let entry = LogEntry {
             address: self.contract_address.clone(),
             topics,
@@ -203,9 +212,11 @@ mod tests {
     #[test]
     fn log2_with_topics() {
         let mut ec = EventCollector::new("0xC".into(), "0xT".into(), 50);
-        ec.log2("Transfer", "0xFrom", b"data").unwrap();
+        let topic0 = "a".repeat(64); // valid 64-char hex
+        let topic1 = "b".repeat(64);
+        ec.log2(&topic0, &topic1, b"data").unwrap();
         assert_eq!(ec.logs()[0].topics.len(), 2);
-        assert_eq!(ec.logs()[0].topics[0], "Transfer");
+        assert_eq!(ec.logs()[0].topics[0], topic0);
     }
 
     #[test]
@@ -214,7 +225,8 @@ mod tests {
         let g0 = ec.log0(b"x").unwrap();
 
         let mut ec2 = EventCollector::new("a".into(), "t".into(), 1);
-        let g1 = ec2.log1("topic", b"x").unwrap();
+        let topic = "c".repeat(64); // valid 64-char hex
+        let g1 = ec2.log1(&topic, b"x").unwrap();
 
         assert!(g1 > g0);
         assert_eq!(g1 - g0, LOG_TOPIC_GAS);

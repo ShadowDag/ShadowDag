@@ -192,6 +192,9 @@ pub enum VmError {
     #[error("[VM] code size exceeds limit: {size} > {limit}")]
     CodeTooLarge { size: usize, limit: usize },
 
+    #[error("[VM] invalid log topic: {0}")]
+    InvalidLogTopic(String),
+
     #[error("[VM] {0}")]
     Other(String),
 }
