@@ -129,14 +129,17 @@ impl DosProtection {
     }
 
     pub fn report_invalid_block(&mut self, ip: &str) {
+        self.entry(ip).invalid_count += 1;
         self.add_ban_score(ip, 20);
     }
 
     pub fn report_invalid_tx(&mut self, ip: &str) {
+        self.entry(ip).invalid_count += 1;
         self.add_ban_score(ip, 5);
     }
 
     pub fn report_malformed(&mut self, ip: &str) {
+        self.entry(ip).invalid_count += 1;
         self.add_ban_score(ip, 50);
     }
 
@@ -172,9 +175,15 @@ impl DosProtection {
                 stats.ban_score  = 0;
             }
         }
+        // Remove entries that are no longer banned and have no active score
+        self.ip_stats.retain(|_, s| s.ban_score > 0 || s.ban_expiry > 0 || s.connections > 0);
     }
 
-    pub fn ip_count(&self) -> usize { self.ip_stats.len() }
+    pub fn ip_count(&self) -> usize {
+        self.ip_stats.values()
+            .filter(|s| s.ban_score > 0 || s.ban_expiry > 0 || s.connections > 0)
+            .count()
+    }
 }
 
 #[cfg(test)]

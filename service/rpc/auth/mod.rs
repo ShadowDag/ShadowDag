@@ -3,7 +3,7 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::{slog_info, slog_warn};
+use crate::{slog_info, slog_warn, slog_error};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -116,8 +116,8 @@ impl RpcAuthManager {
         mgr
     }
 
-    /// Persist a user to RocksDB
-    fn persist_user(&self, user: &AuthUser) {
+    /// Persist a user to RocksDB. Returns true on success or if no DB configured.
+    fn persist_user(&self, user: &AuthUser) -> bool {
         if let Some(db) = &self.db {
             let key = format!("rpc:user:{}", user.username);
             // Store as: role_byte + password_hash
@@ -127,8 +127,12 @@ impl RpcAuthManager {
                 AuthRole::Miner    => 2u8,
             };
             let value = format!("{}:{}", role_byte, user.password_hash);
-            let _ = db.put(key.as_bytes(), value.as_bytes());
+            if let Err(e) = db.put(key.as_bytes(), value.as_bytes()) {
+                slog_error!("rpc", "persist_user_failed", user => &user.username, error => e);
+                return false;
+            }
         }
+        true
     }
 
     /// Load all users from RocksDB
@@ -149,7 +153,11 @@ impl RpcAuthManager {
                 let role = match parts[0] {
                     "0" => AuthRole::Admin,
                     "1" => AuthRole::ReadOnly,
-                    _   => AuthRole::Miner,
+                    "2" => AuthRole::Miner,
+                    _ => {
+                        slog_warn!("rpc", "unknown_auth_role_in_db", role => parts[0], user => &username);
+                        continue; // Skip corrupt entries instead of granting access
+                    }
                 };
                 self.users.insert(username.clone(), AuthUser {
                     username,
@@ -168,14 +176,18 @@ impl RpcAuthManager {
             password_hash: hash,
             role,
         };
-        self.persist_user(&user);
-        self.users.insert(username.to_string(), user);
+        if self.persist_user(&user) {
+            self.users.insert(username.to_string(), user);
+        }
     }
 
     pub fn remove_user(&mut self, username: &str) -> bool {
         if let Some(db) = &self.db {
             let key = format!("rpc:user:{}", username);
-            let _ = db.delete(key.as_bytes());
+            if let Err(e) = db.delete(key.as_bytes()) {
+                slog_error!("rpc", "remove_user_failed", user => username, error => e);
+                return false;
+            }
         }
         self.users.remove(username).is_some()
     }
@@ -185,6 +197,11 @@ impl RpcAuthManager {
     }
 
     pub fn login(&mut self, username: &str, password: &str) -> Result<String, NetworkError> {
+        // Check user exists BEFORE creating an attempts entry (avoids memory leak from nonexistent usernames)
+        let user = self.users.get(username)
+            .ok_or_else(|| NetworkError::Other("Invalid credentials".to_string()))?;
+        let user = user.clone();
+
         let attempts = self.attempts.entry(username.to_string()).or_default();
         if attempts.locked_until > now_secs() {
             return Err(NetworkError::Other(format!(
@@ -192,9 +209,6 @@ impl RpcAuthManager {
                 attempts.locked_until
             )));
         }
-
-        let user = self.users.get(username)
-            .ok_or_else(|| NetworkError::Other("Invalid credentials".to_string()))?;
 
         if !verify_password(password, &user.password_hash) {
             let a = self.attempts.entry(username.to_string()).or_default();

@@ -35,7 +35,7 @@ mod tests {
             "id":      1,
         });
         let resp_str = server.handle(&req.to_string());
-        serde_json::from_str(&resp_str).unwrap_or(json!({}))
+        serde_json::from_str::<Value>(&resp_str).expect("RPC response must be valid JSON")
     }
 
     #[test]
