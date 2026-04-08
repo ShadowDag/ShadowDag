@@ -14,10 +14,33 @@
 use rocksdb::{DB, Options, WriteBatch};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use serde::{Serialize, Deserialize};
 
 use crate::errors::{VmError, StorageError};
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
 use crate::slog_error;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONTRACT UNDO DATA — block-level rollback support for reorg safety
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Block-level contract undo data for reorg rollback.
+///
+/// Captures every state mutation made during a block's contract execution
+/// so that the changes can be reversed if the block is orphaned by a reorg.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractUndoData {
+    /// Storage keys that were modified: (key, old_value or None if key was new)
+    pub modified_keys: Vec<(String, Option<String>)>,
+    /// Accounts created in this block
+    pub created_accounts: Vec<String>,
+    /// Accounts destroyed in this block (with full serialized account data for restore)
+    pub destroyed_accounts: Vec<(String, String)>,
+    /// Receipt root computed for this block
+    pub receipt_root: Option<String>,
+    /// State root computed for this block
+    pub state_root: Option<String>,
+}
 
 /// Buffered state changes awaiting atomic commit
 pub struct PendingBatch {
@@ -167,5 +190,100 @@ impl ContractStorage {
     /// Get the underlying DB handle for sharing with sub-contexts
     pub fn shared_db(&self) -> Arc<DB> {
         Arc::clone(&self.db)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // UNDO DATA — block-level rollback for reorg safety
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Save undo data for a block so its contract state changes can be rolled back.
+    pub fn save_undo(&self, block_hash: &str, undo: &ContractUndoData) -> Result<(), StorageError> {
+        let key = format!("contract:undo:{}", block_hash);
+        let data = bincode::serialize(undo)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        self.db.put(key.as_bytes(), &data)
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))
+    }
+
+    /// Load undo data for a block.
+    pub fn load_undo(&self, block_hash: &str) -> Option<ContractUndoData> {
+        let key = format!("contract:undo:{}", block_hash);
+        match self.db.get(key.as_bytes()) {
+            Ok(Some(data)) => bincode::deserialize(&data).ok(),
+            _ => None,
+        }
+    }
+
+    /// Check whether undo data exists for a block.
+    pub fn has_undo_data(&self, block_hash: &str) -> bool {
+        let key = format!("contract:undo:{}", block_hash);
+        matches!(self.db.get(key.as_bytes()), Ok(Some(_)))
+    }
+
+    /// Rollback a block's contract state changes using its saved undo data.
+    ///
+    /// Restores modified keys to their pre-block values, removes accounts
+    /// created during the block, and reinstates accounts destroyed during it.
+    /// The undo record itself is deleted after successful rollback.
+    pub fn rollback_block(&self, block_hash: &str) -> Result<(), StorageError> {
+        let undo = self.load_undo(block_hash)
+            .ok_or_else(|| StorageError::KeyNotFound(
+                format!("no contract undo for {}", block_hash)
+            ))?;
+
+        let mut batch = WriteBatch::default();
+
+        // Restore modified keys to their old values
+        for (key, old_value) in &undo.modified_keys {
+            let db_key = format!("contract:{}", key);
+            match old_value {
+                Some(val) => batch.put(db_key.as_bytes(), val.as_bytes()),
+                None => batch.delete(db_key.as_bytes()), // key was new — delete it
+            }
+        }
+
+        // Restore destroyed accounts
+        for (addr, account_data) in &undo.destroyed_accounts {
+            let db_key = format!("contract:account:{}", addr);
+            batch.put(db_key.as_bytes(), account_data.as_bytes());
+        }
+
+        // Remove accounts created during this block
+        for addr in &undo.created_accounts {
+            let db_key = format!("contract:account:{}", addr);
+            batch.delete(db_key.as_bytes());
+            let code_key = format!("contract:code:{}", addr);
+            batch.delete(code_key.as_bytes());
+        }
+
+        // Delete the undo record itself
+        let undo_key = format!("contract:undo:{}", block_hash);
+        batch.delete(undo_key.as_bytes());
+
+        self.db.write(batch)
+            .map_err(|e| StorageError::WriteFailed(
+                format!("contract rollback failed: {}", e)
+            ))
+    }
+
+    /// Prune undo data for finalized blocks (no longer needed for rollback).
+    /// Returns the number of entries pruned.
+    pub fn prune_finalized_undo_data(&self, block_hashes: &[String]) -> usize {
+        let mut batch = WriteBatch::default();
+        let mut count = 0;
+        for hash in block_hashes {
+            let key = format!("contract:undo:{}", hash);
+            if matches!(self.db.get(key.as_bytes()), Ok(Some(_))) {
+                batch.delete(key.as_bytes());
+                count += 1;
+            }
+        }
+        if count > 0 {
+            if let Err(e) = self.db.write(batch) {
+                slog_error!("runtime", "contract_undo_prune_failed", error => &e.to_string());
+                return 0;
+            }
+        }
+        count
     }
 }

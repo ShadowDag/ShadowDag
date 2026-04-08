@@ -87,6 +87,8 @@ pub struct FullNode {
     pub dag_manager: Arc<DagManager>,
     pub ghostdag: Arc<GhostDag>,
     pub network: NetworkMode,
+    /// Persistent contract state DB (opened from ~/.shadowdag/<network>/contracts/)
+    pub contract_storage: Arc<ContractStorage>,
     pub retarget: Mutex<RetargetEngine>,
     /// Orphan pool: blocks whose parents haven't arrived yet.
     /// Key: block hash, Value: (block, timestamp received).
@@ -111,6 +113,7 @@ impl FullNode {
         dag_manager: Arc<DagManager>,
         ghostdag: Arc<GhostDag>,
         network: NetworkMode,
+        contract_storage: Arc<ContractStorage>,
     ) -> Self {
         // Start retarget with the genesis difficulty for this network,
         // NOT MIN_DIFFICULTY. This ensures the first blocks after genesis
@@ -149,12 +152,24 @@ impl FullNode {
             set_dag_tips(initial_tips);
         }
 
+        // ── Startup recovery: verify contract state_root ──────────
+        if let Some(best_hash) = block_store.get_best_hash() {
+            if let Some(best_block) = block_store.get_block(&best_hash) {
+                if let Some(ref expected_root) = best_block.header.state_root {
+                    slog_info!("node", "contract_state_check",
+                        expected => expected_root,
+                        note => "full state verification requires replay from last checkpoint");
+                }
+            }
+        }
+
         Self {
             block_store,
             utxo_set,
             dag_manager,
             ghostdag,
             network,
+            contract_storage,
             retarget: Mutex::new(retarget),
             orphan_pool: Mutex::new(HashMap::new()),
             orphan_by_parent: Mutex::new(HashMap::new()),
@@ -543,6 +558,11 @@ impl FullNode {
                     slog_error!("node", "rollback_failed", block => &cursor, error => &format!("{}", e));
                     NodeError::BlockRejected(format!("rollback failed for {}: {}", cursor, e))
                 })?;
+                // Contract state rollback (best-effort — missing undo data is non-fatal)
+                if let Err(e) = self.contract_storage.rollback_block(&cursor) {
+                    slog_warn!("node", "contract_rollback_skipped",
+                        block => &cursor, error => &format!("{}", e));
+                }
                 rollback_count += 1;
                 // Walk to parent via selected_parent
                 cursor = self.block_store.get_block(&cursor)
@@ -566,27 +586,10 @@ impl FullNode {
 
             if let Some(block) = self.block_store.get_block(block_hash) {
                 // ── CONTRACT EXECUTION (before UTXO processing) ─────────
-                // Open contract storage for this block's execution.
-                // Uses a temp directory per block to avoid lock conflicts.
-                let contract_db_path = std::env::temp_dir()
-                    .join(format!("shadowdag_contracts_{}", block.header.hash));
-                let contract_db_str = contract_db_path.to_str()
-                    .unwrap_or("shadowdag_contracts_fallback")
-                    .to_string();
-
-                let contract_storage = ContractStorage::new(&contract_db_str).ok();
-
-                // Execute contracts through shared ExecutionEnvironment.
-                // Does NOT persist state — persistence is deferred until UTXO succeeds.
-                let (receipts, receipt_root, state_root, env) = if let Some(ref cs) = contract_storage {
-                    Self::execute_contract_transactions(&block, cs)
-                } else {
-                    slog_warn!("node", "contract_storage_init_failed", block => block_hash);
-                    (vec![], None, None, ExecutionEnvironment::new(BlockContext {
-                        timestamp: block.header.timestamp,
-                        block_hash: block.header.hash.clone(),
-                    }))
-                };
+                // Uses the persistent contract storage (not temp_dir).
+                // State is persisted with undo data after UTXO succeeds.
+                let (receipts, receipt_root, state_root, env) =
+                    Self::execute_contract_transactions(&block, &self.contract_storage);
 
                 // ── UTXO APPLICATION ──────────────────────────────────────
                 match self.utxo_set.apply_block_dag_ordered(
@@ -597,18 +600,32 @@ impl FullNode {
                     Ok((_applied, _skipped, applied_fees)) => {
                         applied_new.push(block_hash.clone());
 
-                        // UTXO succeeded → persist contract state atomically
-                        if let Some(ref cs) = contract_storage {
-                            if let Err(e) = env.persist_to_storage(cs) {
-                                slog_error!("node", "contract_persist_failed",
+                        // UTXO succeeded → persist contract state with undo data
+                        match env.persist_with_undo(&self.contract_storage, block_hash) {
+                            Ok(mut undo) => {
+                                // Attach receipt_root and state_root to undo data
+                                undo.receipt_root = receipt_root.clone();
+                                undo.state_root = state_root.clone();
+                                // Save updated undo with roots
+                                if let Err(e) = self.contract_storage.save_undo(block_hash, &undo) {
+                                    slog_error!("node", "contract_undo_save_failed",
+                                        block => block_hash, error => &format!("{}", e));
+                                }
+                            }
+                            Err(e) => {
+                                slog_error!("node", "contract_persist_with_undo_failed",
                                     block => block_hash, error => &format!("{}", e));
                             }
                         }
 
-                        // Store receipts in receipt store
+                        // Store receipts in receipt store (in-memory)
                         for r in &receipts {
                             self.receipt_store.track(r.clone());
                         }
+
+                        // Persist receipts to DB
+                        use crate::domain::transaction::tx_receipt::persist_receipts_batch;
+                        persist_receipts_batch(self.contract_storage.shared_db().as_ref(), &receipts);
 
                         // Update block header receipt_root and state_root in store
                         // (block is already saved; we update the header fields)
@@ -629,9 +646,10 @@ impl FullNode {
                         let expected_reward = EmissionSchedule::block_reward(block.header.height);
                         let expected_total = expected_reward.checked_add(applied_fees)
                     .ok_or_else(|| {
-                        // Rollback partially-applied new chain
+                        // Rollback partially-applied new chain (UTXO + contract)
                         for hash in applied_new.iter().rev() {
                             let _ = self.utxo_set.rollback_block_undo(hash);
+                            let _ = self.contract_storage.rollback_block(hash);
                         }
                         NodeError::Consensus(ConsensusError::BlockValidation("reward + fees overflow".into()))
                     })?;
@@ -644,9 +662,10 @@ impl FullNode {
                                     Some(t) => t,
                                     None => {
                                         slog_error!("node", "coinbase_output_overflow", block => block_hash);
-                                        // Rollback partially-applied new chain
+                                        // Rollback partially-applied new chain (UTXO + contract)
                                         for hash in applied_new.iter().rev() {
                                             let _ = self.utxo_set.rollback_block_undo(hash);
+                                            let _ = self.contract_storage.rollback_block(hash);
                                         }
                                         return Err(NodeError::BlockRejected(format!(
                                             "coinbase output overflow in {}", block_hash
@@ -655,9 +674,10 @@ impl FullNode {
                                 };
                                 if actual_total != expected_total {
                                     slog_error!("node", "coinbase_mismatch", block => block_hash, actual => &actual_total.to_string(), expected => &expected_total.to_string());
-                                    // Rollback partially-applied new chain
+                                    // Rollback partially-applied new chain (UTXO + contract)
                                     for hash in applied_new.iter().rev() {
                                         let _ = self.utxo_set.rollback_block_undo(hash);
+                                        let _ = self.contract_storage.rollback_block(hash);
                                     }
                                     return Err(NodeError::BlockRejected(format!(
                                         "coinbase mismatch in {}: actual={}, expected={}",
@@ -668,12 +688,13 @@ impl FullNode {
                         }
                     }
                     Err(e) => {
-                        // UTXO failed → discard contract state (don't persist)
+                        // UTXO failed → rollback contract state too
                         slog_error!("node", "utxo_apply_failed",
                             block => block_hash, error => &format!("{}", e));
-                        // Rollback partially-applied new chain
+                        // Rollback partially-applied new chain (UTXO + contract)
                         for hash in applied_new.iter().rev() {
                             let _ = self.utxo_set.rollback_block_undo(hash);
+                            let _ = self.contract_storage.rollback_block(hash);
                         }
                         return Err(NodeError::BlockRejected(format!(
                             "apply_block_dag_ordered failed for {}: {}", block_hash, e
@@ -681,9 +702,10 @@ impl FullNode {
                     }
                 }
             } else {
-                // Missing block in store — rollback partially-applied new chain
+                // Missing block in store — rollback partially-applied new chain (UTXO + contract)
                 for hash in applied_new.iter().rev() {
                     let _ = self.utxo_set.rollback_block_undo(hash);
+                    let _ = self.contract_storage.rollback_block(hash);
                 }
                 return Err(NodeError::BlockRejected(format!(
                     "block {} missing from store during virtual chain apply", block_hash
@@ -730,12 +752,13 @@ impl FullNode {
                 if tip_height > FINALITY_DEPTH {
                     let finality_height = tip_height - FINALITY_DEPTH;
                     // Collect block hashes at or below finality height
-                    // that still have undo data (batch prune them)
+                    // that still have undo data (UTXO or contract — batch prune them)
                     let mut to_prune: Vec<String> = Vec::new();
                     for hash in &new_chain {
                         if let Some(b) = self.block_store.get_block(hash) {
                             if b.header.height <= finality_height
-                                && self.utxo_set.has_undo_data(hash)
+                                && (self.utxo_set.has_undo_data(hash)
+                                    || self.contract_storage.has_undo_data(hash))
                             {
                                 to_prune.push(hash.clone());
                             }
@@ -743,8 +766,12 @@ impl FullNode {
                     }
                     if !to_prune.is_empty() {
                         let pruned = self.utxo_set.prune_finalized_undo_data(&to_prune);
-                        if pruned > 0 {
-                            slog_info!("node", "pruned_undo_entries", count => &pruned.to_string(), finality_height => &finality_height.to_string());
+                        let contract_pruned = self.contract_storage.prune_finalized_undo_data(&to_prune);
+                        if pruned > 0 || contract_pruned > 0 {
+                            slog_info!("node", "pruned_undo_entries",
+                                utxo_count => &pruned.to_string(),
+                                contract_count => &contract_pruned.to_string(),
+                                finality_height => &finality_height.to_string());
                         }
                     }
                 }
@@ -762,14 +789,14 @@ impl FullNode {
     ///
     /// Uses a SINGLE shared ExecutionEnvironment across all TXs in the block
     /// so contract state is visible between TXs. Does NOT persist state
-    /// internally — the caller must persist via env.persist_to_storage()
+    /// internally — the caller must persist via env.persist_with_undo()
     /// only after UTXO application succeeds (atomic pipeline).
     ///
     /// Returns (receipts, receipt_root, state_root, env):
     ///   - receipts: TxReceipt for each TX in the block
     ///   - receipt_root: SHA-256 of sorted receipt data (None if no contract TXs)
     ///   - state_root: StateManager root hash (None if no contract TXs)
-    ///   - env: the ExecutionEnvironment (caller persists on UTXO success)
+    ///   - env: the ExecutionEnvironment (caller persists with undo on UTXO success)
     fn execute_contract_transactions(
         block: &Block,
         contract_storage: &ContractStorage,
