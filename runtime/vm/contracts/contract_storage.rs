@@ -15,7 +15,7 @@ use rocksdb::{DB, Options, WriteBatch};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::errors::VmError;
+use crate::errors::{VmError, StorageError};
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
 use crate::slog_error;
 
@@ -88,31 +88,53 @@ impl ContractStorage {
         Ok(Self { db, path: path_str })
     }
 
-    /// Direct put (for non-batched operations like deployment metadata)
-    pub fn set_state(&self, key: &str, value: &str) {
+    /// Direct put (for non-batched operations like deployment metadata).
+    ///
+    /// Returns `Err(StorageError::WriteFailed)` if the underlying DB write fails.
+    pub fn set_state(&self, key: &str, value: &str) -> Result<(), StorageError> {
         let db_key = format!("contract:{}", key);
-        if let Err(e) = self.db.put(db_key.as_bytes(), value.as_bytes()) {
-            slog_error!("runtime", "contract_storage_put_error", error => &e.to_string());
-        }
+        self.db.put(db_key.as_bytes(), value.as_bytes())
+            .map_err(|e| {
+                slog_error!("runtime", "contract_storage_put_error", error => &e.to_string());
+                StorageError::WriteFailed(e.to_string())
+            })?;
+        Ok(())
     }
 
-    /// Direct get
+    /// Direct get.
+    ///
+    /// Returns `None` only for genuine absence (key not found).
+    /// Logs errors for read failures and UTF-8 corruption rather than
+    /// silently conflating them with missing keys.
     pub fn get_state(&self, key: &str) -> Option<String> {
         let db_key = format!("contract:{}", key);
         match self.db.get(db_key.as_bytes()) {
-            Ok(Some(data)) => String::from_utf8(data.to_vec()).ok(),
+            Ok(Some(data)) => match String::from_utf8(data.to_vec()) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    slog_error!("runtime", "contract_state_utf8_corruption", key => key, error => &e.to_string());
+                    None
+                }
+            },
             Ok(None) => None,
             Err(e) => {
-                slog_error!("runtime", "contract_storage_get_error", key => key, error => &e.to_string());
+                slog_error!("runtime", "contract_state_read_failed", key => key, error => &e.to_string());
                 None
             }
         }
     }
 
-    /// Direct delete
-    pub fn delete_state(&self, key: &str) {
+    /// Direct delete.
+    ///
+    /// Returns `Err(StorageError::WriteFailed)` if the underlying DB delete fails.
+    pub fn delete_state(&self, key: &str) -> Result<(), StorageError> {
         let db_key = format!("contract:{}", key);
-        let _ = self.db.delete(db_key.as_bytes());
+        self.db.delete(db_key.as_bytes())
+            .map_err(|e| {
+                slog_error!("runtime", "contract_delete_state_failed", key => key, error => &e.to_string());
+                StorageError::WriteFailed(e.to_string())
+            })?;
+        Ok(())
     }
 
     /// Atomically commit a PendingBatch using RocksDB WriteBatch.
