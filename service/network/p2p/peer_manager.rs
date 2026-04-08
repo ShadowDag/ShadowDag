@@ -88,6 +88,7 @@ pub struct PeerManager {
     db:           Arc<Mutex<DB>>,
     addr_cache:   Arc<Mutex<Vec<String>>>,
     _network_path: String,
+    network:      crate::config::node::node_config::NetworkMode,
 }
 
 impl PeerManager {
@@ -137,11 +138,18 @@ impl PeerManager {
             db:           Arc::new(Mutex::new(db)),
             addr_cache:   Arc::new(Mutex::new(Vec::new())),
             _network_path: path.to_string(),
+            network:      crate::config::node::node_config::NetworkMode::Mainnet,
         })
     }
 
     pub fn new(path: &str) -> Option<Self> {
-        Self::open(path).ok()
+        match Self::open(path) {
+            Ok(mgr) => Some(mgr),
+            Err(e) => {
+                slog_error!("p2p", "peer_manager_open_failed", path => path, error => &e.to_string());
+                None
+            }
+        }
     }
 
     pub fn new_default() -> Result<Self, NetworkError> {
@@ -201,7 +209,10 @@ impl PeerManager {
     }
 
     pub fn add_peer(&self, addr: &str) -> Result<(), NetworkError> {
-        self.add_peer_record(PeerRecord::new(addr, 9333))
+        let port = addr.rsplit(':').next()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(9333);
+        self.add_peer_record(PeerRecord::new(addr, port))
     }
 
     pub fn add_peer_record(&self, record: PeerRecord) -> Result<(), NetworkError> {
@@ -673,8 +684,7 @@ impl PeerManager {
     }
 
     pub fn bootstrap(&self) {
-        use crate::config::node::node_config::NetworkMode;
-        self.bootstrap_for_network(&NetworkMode::Mainnet);
+        self.bootstrap_for_network(&self.network);
     }
 
     pub fn bootstrap_with_seeds(&self, seeds: &[&str]) {

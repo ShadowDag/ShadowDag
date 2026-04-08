@@ -102,7 +102,7 @@ impl BlockValidationResult {
             match change {
                 UtxoChange::Spend { key } => {
                     if let Ok(k) = utxo_key(&key.txid, key.index) {
-                        utxo_set.spend_utxo(&k);
+                        let _ = utxo_set.spend_utxo(&k);
                     }
                 }
                 UtxoChange::Create { key, address, amount } => {

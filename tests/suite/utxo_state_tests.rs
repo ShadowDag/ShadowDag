@@ -43,7 +43,7 @@ mod tests {
     fn spend_utxo_marks_it_spent() {
         let store = tmp_utxo_set("spend");
         store.add_utxo_str("txhash_0002:0", "owner_b".into(), 3_000, "shadow1addr_b".into());
-        store.spend_utxo_str("txhash_0002:0");
+        store.spend_utxo_str("txhash_0002:0").unwrap();
 
         let utxo = store.get_utxo_str("txhash_0002:0");
         assert!(utxo.is_some());
@@ -85,7 +85,7 @@ mod tests {
     fn exists_spendable_returns_false_for_spent_utxo() {
         let store = tmp_utxo_set("spendable_spent");
         store.add_utxo_str("txhash_0006:0", "owner_f".into(), 2_000, "shadow1addr_f".into());
-        store.spend_utxo_str("txhash_0006:0");
+        store.spend_utxo_str("txhash_0006:0").unwrap();
         assert!(!store.exists_spendable_str("txhash_0006:0", 100));
     }
 
@@ -143,7 +143,7 @@ mod tests {
         let addr = "shadow1balance_spent_addr".to_string();
         store.add_utxo_str("bb00000000000000000000000000000000000000000000000000000000000001:0", "owner".into(), 5_000, addr.clone());
         store.add_utxo_str("bb00000000000000000000000000000000000000000000000000000000000002:0", "owner".into(), 3_000, addr.clone());
-        store.spend_utxo_str("bb00000000000000000000000000000000000000000000000000000000000001:0");
+        store.spend_utxo_str("bb00000000000000000000000000000000000000000000000000000000000001:0").unwrap();
 
         let balance = store.get_balance(&addr);
         assert_eq!(balance, 3_000, "Spent utxos must not count towards balance");
@@ -192,7 +192,7 @@ mod tests {
             let store = UtxoStore::new(path.as_str()).expect("open failed");
             let utxo_set = UtxoSet::new(Arc::new(store));
             utxo_set.add_utxo_str("sp_tx:0", "owner_sp".into(), 7_000, "shadow1sp".into());
-            utxo_set.spend_utxo_str("sp_tx:0");
+            utxo_set.spend_utxo_str("sp_tx:0").unwrap();
         }
 
         {
@@ -236,7 +236,7 @@ mod tests {
         let store = tmp_utxo_set("zero_after_spend");
         let addr = "shadow1all_spent".to_string();
         store.add_utxo_str("zas_tx_001:0", "owner".into(), 2_000, addr.clone());
-        store.spend_utxo_str("zas_tx_001:0");
+        store.spend_utxo_str("zas_tx_001:0").unwrap();
         assert_eq!(store.get_balance(&addr), 0);
     }
 }

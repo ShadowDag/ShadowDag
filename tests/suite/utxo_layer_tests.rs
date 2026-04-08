@@ -31,7 +31,7 @@ mod utxo_set_tests {
     fn spend_marks_as_spent() {
         let mut m = new_mock();
         m.add_test_utxo("tx3:0", 200, "shadow1carol");
-        m.spend_utxo_str("tx3:0");
+        m.spend_utxo_str("tx3:0").unwrap();
         assert!(!m.exists_str("tx3:0"), "Spent utxo must not exist as unspent");
     }
 
@@ -48,7 +48,7 @@ mod utxo_set_tests {
         let mut m = new_mock();
         m.add_test_utxo("tx5:0", 300, "shadow1eve");
         m.add_test_utxo("tx5:1", 700, "shadow1eve");
-        m.spend_utxo_str("tx5:0");
+        m.spend_utxo_str("tx5:0").unwrap();
         assert_eq!(m.get_balance("shadow1eve"), 700);
     }
 }

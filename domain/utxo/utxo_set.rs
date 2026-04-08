@@ -199,15 +199,16 @@ impl UtxoSet {
         res
     }
 
-    pub fn spend_utxo(&self, key: &UtxoKey) {
+    pub fn spend_utxo(&self, key: &UtxoKey) -> Result<(), StorageError> {
         // Store write FIRST — only mark cache spent on success
         if let Err(e) = self.store.spend_utxo(key) {
             slog_error!("utxo", "spend_utxo_store_failed", key => &key.to_string(), error => &e.to_string());
-            return;
+            return Err(e);
         }
         if let Some(u) = self.cache.write().get_mut(key) {
             u.spent = true;
         }
+        Ok(())
     }
 
     pub fn spend_utxo_checked(&self, key: &UtxoKey, current_height: u64) -> Result<(), StorageError> {
@@ -229,8 +230,7 @@ impl UtxoSet {
             }
         }
 
-        self.spend_utxo(key); // 🔥 reuse
-        Ok(())
+        self.spend_utxo(key) // propagate error from spend_utxo
     }
 
     pub fn exists_spendable(&self, key: &UtxoKey, current_height: u64) -> bool {
@@ -1245,8 +1245,8 @@ impl UtxoSet {
 
     /// spend_utxo by string key — convenience for tests.
     #[cfg(test)]
-    pub fn spend_utxo_str(&self, key: &str) {
-        self.spend_utxo(&Self::parse_utxo_key(key));
+    pub fn spend_utxo_str(&self, key: &str) -> Result<(), StorageError> {
+        self.spend_utxo(&Self::parse_utxo_key(key))
     }
 
     /// spend_utxo_checked by string key — convenience for tests.

@@ -129,7 +129,7 @@ mod tests {
         {
             let store = UtxoSet::new(Arc::new(UtxoStore::new(path).expect("open failed")));
             store.add_utxo_str("rec_spent_tx:0", "owner_s".into(), 5_000, "shadow1spent".into());
-            store.spend_utxo_str("rec_spent_tx:0");
+            store.spend_utxo_str("rec_spent_tx:0").unwrap();
         }
         {
             let store = UtxoSet::new(Arc::new(UtxoStore::new(path).expect("open failed")));

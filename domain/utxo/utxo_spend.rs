@@ -31,7 +31,9 @@ impl UtxoSpend {
                 Ok(k) => k,
                 Err(_) => return false,
             };
-            utxo_set.spend_utxo(&key);
+            if utxo_set.spend_utxo(&key).is_err() {
+                return false;
+            }
         }
 
         for (index, output) in tx.outputs.iter().enumerate() {
@@ -105,7 +107,7 @@ impl UtxoSpend {
             // 1. Remove all outputs created by this transaction (mark as spent)
             for (idx, _output) in tx.outputs.iter().enumerate() {
                 if let Ok(key) = utxo_key(&tx.hash, idx as u32) {
-                    utxo_set.spend_utxo(&key);
+                    let _ = utxo_set.spend_utxo(&key);
                 }
             }
 

@@ -114,7 +114,7 @@ mod tests {
             tx_type: TxType::Transfer,
             payload_hash: None,
         };
-        store.spend_utxo_str("rb_tx1:0");
+        store.spend_utxo_str("rb_tx1:0").unwrap();
         assert!(store.get_utxo_str("rb_tx1:0").unwrap().spent);
         #[allow(deprecated)]
         let _result = store.rollback_block(&[spend_tx]);
@@ -126,7 +126,7 @@ mod tests {
         let store = tmp_utxo("snapshot");
         let n = 20usize;
         for i in 0..n { store.add_utxo_str(&format!("snap_tx_{:010}:0", i), "owner".into(), (i as u64 + 1) * 500, "shadow1snap".into()); }
-        for i in 0..(n / 2) { store.spend_utxo_str(&format!("snap_tx_{:010}:0", i)); }
+        for i in 0..(n / 2) { store.spend_utxo_str(&format!("snap_tx_{:010}:0", i)).unwrap(); }
         // export_all returns only UNSPENT UTXOs
         let all = store.export_all();
         assert_eq!(all.len(), n / 2);
@@ -191,7 +191,7 @@ mod tests {
         let addr = "shadow1many".to_string();
         let n = 100usize;
         for i in 0..n { store.add_utxo_str(&format!("many_tx_{:020}:0", i), "owner".into(), 1_000, addr.clone()); }
-        for i in (0..n).step_by(2) { store.spend_utxo_str(&format!("many_tx_{:020}:0", i)); }
+        for i in (0..n).step_by(2) { store.spend_utxo_str(&format!("many_tx_{:020}:0", i)).unwrap(); }
         assert_eq!(store.get_balance(&addr), (n / 2) as u64 * 1_000);
     }
 
