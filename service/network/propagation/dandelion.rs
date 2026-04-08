@@ -118,6 +118,17 @@ impl DandelionRelay {
         if self.stem_pool.len() >= MAX_STEM_PENDING {
             self.flush_expired();
         }
+        // Hard cap: if STILL over limit after expiry, force-fluff oldest entries
+        if self.stem_pool.len() >= MAX_STEM_PENDING {
+            let excess = self.stem_pool.len() - MAX_STEM_PENDING + 1;
+            let oldest_keys: Vec<String> = self.stem_pool.keys()
+                .take(excess)
+                .cloned()
+                .collect();
+            for key in oldest_keys {
+                self.stem_pool.remove(&key);
+            }
+        }
 
         // If this TX was received in stem phase from another node
         if let Some(_peer) = from_peer {

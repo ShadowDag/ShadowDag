@@ -42,24 +42,42 @@ pub const MAX_CONNECTIONS: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum GrpcMethod {
+    /// Stub: not yet implemented -- returns error when called.
     GetBlock         = 0x01,
+    /// Stub: not yet implemented -- returns error when called.
     GetBlockByHash   = 0x02,
+    /// Stub: not yet implemented -- returns error when called.
     GetBlockCount    = 0x03,
+    /// Implemented: returns node info (name, version, network, features).
     GetInfo          = 0x04,
+    /// Stub: not yet implemented -- returns error when called.
     SendTransaction  = 0x05,
+    /// Stub: not yet implemented -- returns error when called.
     GetBalance       = 0x06,
+    /// Stub: not yet implemented -- returns error when called.
     GetMempool       = 0x07,
+    /// Stub: not yet implemented -- returns error when called.
     GetPeers         = 0x08,
+    /// Stub: not yet implemented -- returns error when called.
     GetDagInfo       = 0x09,
+    /// Stub: not yet implemented -- returns error when called.
     GetTips          = 0x0A,
+    /// Stub: not yet implemented -- returns error when called.
     GetUtxo          = 0x0B,
+    /// Stub: not yet implemented -- returns error when called.
     Subscribe        = 0x0C,
+    /// Implemented: returns BPS (blocks per second) configuration info.
     GetBpsInfo       = 0x0D,
+    /// Implemented: returns emission schedule info.
     GetEmission      = 0x0E,
+    /// Stub: not yet implemented -- returns error when called.
     GetContractState = 0x0F,
     // ShadowDAG exclusive
+    /// Stub: not yet implemented -- returns error when called.
     GetPrivacyStats  = 0x10,
+    /// Stub: not yet implemented -- returns error when called.
     GetShadowPool    = 0x11,
+    /// Stub: not yet implemented -- returns error when called.
     GetVmGas         = 0x12,
     Unknown          = 0xFF,
 }
@@ -270,7 +288,7 @@ impl GrpcServer {
             }
             None => {
                 self.stats.total_errors.fetch_add(1, Ordering::Relaxed);
-                GrpcResponse::err(req_id, &format!("No handler for {}", method.name()))
+                GrpcResponse::err(req_id, &format!("Method {:?} ({}) is not yet implemented", method, method.name()))
             }
         }
     }
@@ -320,7 +338,7 @@ impl GrpcServer {
                     }
                     None => {
                         stats.total_errors.fetch_add(1, Ordering::Relaxed);
-                        GrpcResponse::err(req.req_id, &format!("No handler for {:?}", req.method))
+                        GrpcResponse::err(req.req_id, &format!("Method {:?} ({}) is not yet implemented", req.method, req.method.name()))
                     }
                 }
             };
@@ -449,7 +467,7 @@ mod tests {
         let server = GrpcServer::new(17777);
         let resp = server.handle_raw(0x01, &[], 1);
         assert!(!resp.success);
-        assert!(resp.error.unwrap().contains("No handler"));
+        assert!(resp.error.unwrap().contains("is not yet implemented"));
     }
 
     #[test]

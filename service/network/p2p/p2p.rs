@@ -358,6 +358,13 @@ pub enum P2PMessage {
     Ping { nonce: u64 },
     Pong { nonce: u64 },
     Reject { reason: String },
+
+    /// Privacy-layer shadow transaction (CommandId::ShadowTx = 0x20).
+    ShadowTx { data: Vec<u8> },
+    /// Privacy-layer onion-routed transaction (CommandId::OnionTx = 0x21).
+    OnionTx { data: Vec<u8> },
+    /// Request mempool contents (CommandId::GetMempool = 0x30).
+    GetMempool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -851,15 +858,26 @@ impl P2P {
         magic: [u8; 4],
     ) {
         let (outbound, new_seq) = drain_outbound_since(session.last_outbound_seq);
-        session.last_outbound_seq = new_seq;
+        // Only advance sequence after ALL broadcast messages are successfully sent.
+        // If a write fails, the sequence stays at the last successful point so
+        // unsent messages will be retried on the next flush (drain_outbound_since
+        // reads from the shared queue without removing, so they remain available).
+        let mut all_sent = true;
         for out_msg in &outbound {
             match Self::write_message(writer, out_msg, magic) {
-                Ok(bytes) => session.record_bytes_sent(bytes),
+                Ok(bytes) => {
+                    session.record_bytes_sent(bytes);
+                }
                 Err(we) => {
-                    slog_error!("p2p", "write_error", addr => peer_str, error => &we.to_string());
-                    return;
+                    // Don't advance sequence — message will be retried
+                    slog_warn!("p2p", "outbound_write_failed", addr => peer_str, error => &we.to_string());
+                    all_sent = false;
+                    break; // Stop sending more to this peer
                 }
             }
+        }
+        if all_sent {
+            session.last_outbound_seq = new_seq;
         }
         let targeted = drain_targeted_for(peer_str);
         for t_msg in &targeted {
@@ -926,6 +944,9 @@ impl P2P {
             P2PMessage::Reject { .. }          => CommandId::Reject,
             P2PMessage::PuzzleChallenge { .. } => CommandId::PuzzleChallenge,
             P2PMessage::PuzzleSolution { .. }  => CommandId::PuzzleSolution,
+            P2PMessage::ShadowTx { .. }        => CommandId::ShadowTx,
+            P2PMessage::OnionTx { .. }         => CommandId::OnionTx,
+            P2PMessage::GetMempool             => CommandId::GetMempool,
         }
     }
 
@@ -1310,6 +1331,11 @@ impl P2P {
                     return Ok(());
                 }
                 slog_warn!("p2p", "rejected_by_peer", addr => peer, reason => reason.as_str());
+            }
+
+            // ── ShadowTx / OnionTx / GetMempool: not yet implemented ───
+            P2PMessage::ShadowTx { .. } | P2PMessage::OnionTx { .. } | P2PMessage::GetMempool => {
+                slog_warn!("p2p", "unsupported_message", addr => peer, cmd => &format!("{:?}", Self::msg_to_command_id(&msg)));
             }
         }
         Ok(())
