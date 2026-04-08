@@ -29,9 +29,13 @@ impl WalletDB {
     }
 
     pub fn save_wallet(&self, wallet: &Wallet) -> Result<(), WalletError> {
+        let key = wallet.address();
+        if key.is_empty() || key == "__no_address__" {
+            return Err(WalletError::Other("cannot save wallet with empty address".into()));
+        }
         let data = bincode::serialize(wallet)
             .map_err(|e| WalletError::Other(format!("serialize failed: {}", e)))?;
-        self.db.put(wallet.address(), data)
+        self.db.put(&key, data)
             .map_err(|e| WalletError::Other(format!("db put failed: {}", e)))?;
         Ok(())
     }

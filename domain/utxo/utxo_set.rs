@@ -17,6 +17,7 @@ use crate::domain::utxo::utxo_validator::UtxoValidator;
 use crate::domain::traits::utxo_backend::{UtxoBackend, BatchWrite};
 use crate::errors::StorageError;
 use crate::slog_warn;
+use crate::slog_error;
 
 /// Coinbase maturity — MUST match ConsensusParams::COINBASE_MATURITY.
 /// At 10 BPS, 1000 blocks = 100 seconds = safe against DAG reorgs.
@@ -158,7 +159,9 @@ impl UtxoSet {
         meta_key.extend_from_slice(key.as_bytes());
 
         if store_ok {
-            let _ = self.store.put_raw(&meta_key, &created_height.to_le_bytes());
+            if let Err(e) = self.store.put_raw(&meta_key, &created_height.to_le_bytes()) {
+                slog_error!("utxo", "coinbase_height_write_failed", error => &e.to_string());
+            }
             let mut cache = self.cache.write();
             if cache.len() >= MAX_CACHE_SIZE {
                 let mut keys: Vec<UtxoKey> = cache.keys().copied().collect();
@@ -179,7 +182,13 @@ impl UtxoSet {
             return Some(u.clone());
         }
 
-        let res = self.store.get_utxo(key).ok().flatten();
+        let res = match self.store.get_utxo(key) {
+            Ok(v) => v,
+            Err(e) => {
+                slog_error!("utxo", "get_utxo_store_error", key => &key.to_string(), error => &e.to_string());
+                None
+            }
+        };
 
         if let Some(ref u) = res {
             self.cache.write().insert(*key, u.clone());
@@ -236,11 +245,23 @@ impl UtxoSet {
     }
 
     pub fn get_balance(&self, address: &str) -> u64 {
-        self.store.get_balance(address).unwrap_or(0)
+        match self.store.get_balance(address) {
+            Ok(bal) => bal,
+            Err(e) => {
+                slog_error!("utxo", "get_balance_store_error", address => address, error => &e.to_string());
+                0
+            }
+        }
     }
 
     pub fn export_all(&self) -> Vec<(UtxoKey, Utxo)> {
-        self.store.export_all().unwrap_or_else(|_| Vec::new())
+        match self.store.export_all() {
+            Ok(v) => v,
+            Err(e) => {
+                slog_error!("utxo", "export_all_store_error", error => &e.to_string());
+                Vec::new()
+            }
+        }
     }
 
     /// Count unspent UTXOs in the backing store.
@@ -877,15 +898,11 @@ impl UtxoSet {
         //    Using string.as_bytes() directly would produce ~70 UTF-8 bytes
         //    — a DIFFERENT key than the 36-byte binary original → data loss.
         for (key_str, original_utxo) in &undo.spent_utxos {
-            // #27 — reject zero-amount UTXO restorations during rollback
-            if original_utxo.amount == 0 {
-                slog_warn!("utxo", "rejecting_zero_amount_restoration", key => key_str);
-                continue;
-            }
-            // #28 — reject empty-address UTXO restorations during rollback
-            if original_utxo.address.is_empty() {
-                slog_warn!("utxo", "rejecting_empty_address_restoration", key => key_str);
-                continue;
+            if original_utxo.amount == 0 || original_utxo.address.is_empty() {
+                return Err(StorageError::Other(format!(
+                    "corrupt undo data at {}: amount={}, address='{}'",
+                    key_str, original_utxo.amount, original_utxo.address
+                )));
             }
             let data = bincode::serialize(original_utxo)
                 .map_err(|e| StorageError::Serialization(format!("rollback: restored UTXO {}: {}", key_str, e)))?;
@@ -1005,6 +1022,9 @@ impl UtxoSet {
     /// the first transaction's hash (coinbase). This ensures undo/commitment
     /// keys are always unique per block, never empty.
     pub fn apply_block_write(&self, transactions: &[Transaction], block_height: u64) -> Result<(), StorageError> {
+        if transactions.is_empty() {
+            return Err(StorageError::Other("cannot apply empty transaction list".into()));
+        }
         let block_hash = transactions.first()
             .map(|tx| tx.hash.as_str())
             .unwrap_or("unknown");
@@ -1016,8 +1036,12 @@ impl UtxoSet {
     /// This legacy method attempts to reverse a block by inspecting current UTXO
     /// state, which can fail with intra-block dependencies or stale state.
     /// The undo-based rollback is deterministic and always correct.
-    #[deprecated(note = "Use rollback_block_undo(block_hash) — undo-based rollback is consensus-safe")]
+    ///
+    /// WARNING: This method is NOT consensus-safe and WILL be removed in a
+    /// future release. All callers must migrate to rollback_block_undo().
+    #[deprecated(note = "UNSAFE: Use rollback_block_undo(block_hash) — this method is NOT consensus-safe and will be removed")]
     pub fn rollback_block(&self, transactions: &[Transaction]) -> Result<(), StorageError> {
+        slog_warn!("utxo", "deprecated_rollback_block_called", note => "migrate to rollback_block_undo()");
         let mut ops: Vec<BatchWrite> = Vec::new();
 
         // Stage cache mutations — DO NOT apply until DB write succeeds.

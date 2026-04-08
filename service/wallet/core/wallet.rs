@@ -167,7 +167,7 @@ impl Wallet {
         self.state.accounts
             .first()
             .and_then(|a| a.primary_address())
-            .unwrap_or("")
+            .unwrap_or("__no_address__")
             .to_string()
     }
 
@@ -179,7 +179,7 @@ impl Wallet {
         let signing_key = derive_key(seed, index, 0, false)?;
         let verifying:   VerifyingKey = signing_key.verifying_key();
         let pub_hex = hex::encode(verifying.as_bytes());
-        let address = make_address(&pub_hex, &self.network);
+        let address = make_address(&pub_hex, &self.network)?;
 
         let wa = WalletAddress {
             address:    address.clone(),
@@ -200,11 +200,10 @@ impl Wallet {
             created_at: unix_now(),
         };
 
-        if let Some(pos) = self.state.accounts.iter().position(|a| a.index == index) {
-            self.state.accounts[pos] = acc.clone();
-        } else {
-            self.state.accounts.push(acc.clone());
+        if self.state.accounts.iter().any(|a| a.index == index) {
+            return Err(WalletError::Other(format!("account {} already exists", index)));
         }
+        self.state.accounts.push(acc.clone());
         Ok(acc)
     }
 
@@ -214,7 +213,7 @@ impl Wallet {
         let sk   = derive_key(seed, account, addr_index, true)?;
         let vk: VerifyingKey = sk.verifying_key();
         let pub_hex = hex::encode(vk.as_bytes());
-        let address = make_address(&pub_hex, &self.network);
+        let address = make_address(&pub_hex, &self.network)?;
 
         let wa = WalletAddress {
             address: address.clone(),
@@ -226,11 +225,12 @@ impl Wallet {
             created_at: unix_now(),
         };
 
-        if let Some(acc) = self.state.accounts.iter_mut().find(|a| a.index == account) {
-            // Dedup: don't add if an address with the same index and is_change already exists
-            if !acc.addresses.iter().any(|a| a.is_change && a.index == addr_index) {
-                acc.addresses.push(wa.clone());
-            }
+        let acc = self.state.accounts.iter_mut()
+            .find(|a| a.index == account)
+            .ok_or_else(|| WalletError::Other(format!("account {} not found", account)))?;
+        // Dedup: don't add if an address with the same index and is_change already exists
+        if !acc.addresses.iter().any(|a| a.is_change && a.index == addr_index) {
+            acc.addresses.push(wa.clone());
         }
         Ok(wa)
     }
@@ -242,9 +242,15 @@ impl Wallet {
     }
 
     pub fn total_balance(&self) -> u64 {
-        self.state.accounts.iter()
+        match self.state.accounts.iter()
             .try_fold(0u64, |acc, a| acc.checked_add(a.balance))
-            .unwrap_or(u64::MAX)
+        {
+            Some(total) => total,
+            None => {
+                eprintln!("[WARN] wallet total_balance overflow — account balances exceed u64::MAX");
+                u64::MAX
+            }
+        }
     }
 
     pub fn utxos_for(&self, address: &str) -> Vec<&Walletutxo> {
@@ -360,9 +366,12 @@ impl Wallet {
                 .max()
                 .map(|x| x + 1)
                 .unwrap_or(1);
-            let change_addr = self.derive_change_address(from_account, next_idx)
-                .map(|a| a.address)
-                .unwrap_or_else(|_| acc.primary_address().unwrap_or("").to_string());
+            let change_addr = match self.derive_change_address(from_account, next_idx) {
+                Ok(wa) => wa.address,
+                Err(_) => {
+                    return Err(WalletError::Other("cannot derive change address".into()));
+                }
+            };
             outputs.push(TxOut { address: change_addr, amount: change });
         }
 
@@ -453,8 +462,14 @@ fn derive_key(seed: &[u8], account: u32, index: u32, change: bool) -> Result<Sig
     Ok(SigningKey::from_bytes(&key))
 }
 
-fn make_address(pub_hex: &str, network: &str) -> String {
-    let pub_bytes = hex::decode(pub_hex).unwrap_or_default();
+fn make_address(pub_hex: &str, network: &str) -> Result<String, WalletError> {
+    let pub_bytes = hex::decode(pub_hex)
+        .map_err(|e| WalletError::Other(format!("invalid public key hex: {}", e)))?;
+    if pub_bytes.len() != 32 {
+        return Err(WalletError::Other(format!(
+            "public key must be 32 bytes, got {}", pub_bytes.len()
+        )));
+    }
     let hash      = Sha3_256::digest(&pub_bytes);
     let version   = match network { "testnet" => 0x01u8, "regtest" => 0x02, _ => 0x00 };
     let mut payload = vec![version];
@@ -462,7 +477,7 @@ fn make_address(pub_hex: &str, network: &str) -> String {
     let cs = &Sha3_256::digest(Sha3_256::digest(&payload))[..CHECKSUM_BYTES];
     payload.extend_from_slice(cs);
     let prefix = match network { "testnet" => "ST", "regtest" => "SR", _ => "SD" };
-    format!("{}{}", prefix, hex::encode(&payload))
+    Ok(format!("{}{}", prefix, hex::encode(&payload)))
 }
 
 fn compute_txid(inputs: &[SignedInput], outputs: &[TxOut], fee: u64) -> String {
