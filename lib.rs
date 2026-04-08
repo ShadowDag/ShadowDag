@@ -317,6 +317,7 @@ pub mod runtime {
             pub mod event_log;
             pub mod execution_env;
             pub mod execution_result;
+            pub mod execution_trace;
             pub mod executor;
             pub mod journal;
             pub mod memory;
@@ -331,6 +332,9 @@ pub mod runtime {
         pub mod gas {
             pub mod gas_meter;
             pub mod gas_rules;
+        }
+        pub mod testing {
+            pub mod test_runner;
         }
         pub mod precompiles {
             pub mod precompile_registry;

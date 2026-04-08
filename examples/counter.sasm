@@ -1,0 +1,20 @@
+;; Counter -- increment/read counter
+;; @fn increment():uint64
+;; @fn get():uint64
+;;
+;; @test increment
+;; @test increment_twice
+
+; Load current counter from slot 0
+PUSH1 0
+SLOAD
+
+; Increment by 1
+PUSH1 1
+ADD
+
+; Store back
+PUSH1 0
+SSTORE
+
+STOP

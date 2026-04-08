@@ -16,6 +16,8 @@ use shadowdag::runtime::vm::contracts::contract_abi::{ContractAbi, AbiParam, Abi
 use shadowdag::runtime::vm::contracts::contract_package::ContractPackage;
 use shadowdag::runtime::vm::contracts::build_manifest::BuildManifest;
 use shadowdag::runtime::vm::core::v1_spec;
+use shadowdag::runtime::vm::testing::test_runner::{TestRunner, TestCase};
+use shadowdag::runtime::vm::core::execution_trace::ExecutionTrace;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -26,6 +28,8 @@ fn main() {
         "disassemble" | "dis" => cmd_disassemble(&args),
         "verify"      => cmd_verify(&args),
         "info"        => cmd_info(&args),
+        "test"        => cmd_test(&args),
+        "trace"       => cmd_trace(&args),
         "help" | "--help" | "-h" => print_help(),
         _ => { eprintln!("Unknown command: {}", command); print_help(); process::exit(1); }
     }
@@ -210,6 +214,140 @@ fn cmd_info(args: &[String]) {
     }
 }
 
+fn cmd_test(args: &[String]) {
+    let source_path = match args.get(2) {
+        Some(p) => p.clone(),
+        None => { eprintln!("Usage: shadowasm test <source.sasm>"); process::exit(1); }
+    };
+
+    // Read and assemble the contract
+    let source = match fs::read_to_string(&source_path) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("Failed to read {}: {}", source_path, e); process::exit(1); }
+    };
+
+    let bytecode = match Assembler::assemble(&source) {
+        Ok(b) => b,
+        Err(e) => { eprintln!("Assembly error: {}", e); process::exit(1); }
+    };
+
+    // Parse test cases from source comments
+    // Format: ;; @test <name> [calldata_hex] [expect:success|revert] [gas:<max>]
+    let tests = parse_tests_from_source(&source);
+
+    if tests.is_empty() {
+        println!("No tests found in {}. Add ;; @test annotations.", source_path);
+        println!("Example: ;; @test store_value 00000000000000000000000000000000000000000000000000000000000000ff");
+        return;
+    }
+
+    // Run tests
+    let mut runner = TestRunner::new();
+    runner.fund_account("test_caller", 1_000_000_000);
+    runner.deploy_bytecode(bytecode, "test_caller").unwrap();
+
+    println!("Running {} tests from {}...\n", tests.len(), source_path);
+
+    for test in &tests {
+        runner.run_test(test);
+    }
+
+    runner.print_summary();
+
+    let failed = runner.results().iter().filter(|r| !r.passed).count();
+    if failed > 0 {
+        process::exit(1);
+    }
+}
+
+fn parse_tests_from_source(source: &str) -> Vec<TestCase> {
+    let mut tests = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(";; @test ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.is_empty() { continue; }
+
+            let name = parts[0].to_string();
+            let calldata = parts.get(1)
+                .and_then(|h| hex::decode(h).ok())
+                .unwrap_or_default();
+
+            let mut expect_revert = false;
+            let mut max_gas = None;
+
+            for p in &parts[2..] {
+                if *p == "expect:revert" { expect_revert = true; }
+                if let Some(g) = p.strip_prefix("gas:") {
+                    max_gas = g.parse().ok();
+                }
+            }
+
+            tests.push(TestCase {
+                name,
+                calldata,
+                expect_success: !expect_revert,
+                expect_revert,
+                max_gas,
+                ..Default::default()
+            });
+        }
+    }
+    tests
+}
+
+fn cmd_trace(args: &[String]) {
+    let source_or_hex = match args.get(2) {
+        Some(p) => p,
+        None => { eprintln!("Usage: shadowasm trace <source.sasm|bytecode_hex> [calldata_hex]"); process::exit(1); }
+    };
+    let calldata = args.get(3)
+        .and_then(|h| hex::decode(h).ok())
+        .unwrap_or_default();
+
+    // Get bytecode
+    let bytecode = if source_or_hex.ends_with(".sasm") {
+        let source = fs::read_to_string(source_or_hex).unwrap_or_else(|e| {
+            eprintln!("Failed to read: {}", e); process::exit(1);
+        });
+        Assembler::assemble(&source).unwrap_or_else(|e| {
+            eprintln!("Assembly error: {}", e); process::exit(1);
+        })
+    } else if source_or_hex.ends_with(".json") {
+        let json = fs::read_to_string(source_or_hex).unwrap_or_default();
+        ContractPackage::from_json(&json).map(|p| p.bytecode).unwrap_or_else(|e| {
+            eprintln!("Invalid package: {}", e); process::exit(1);
+        })
+    } else {
+        hex::decode(source_or_hex).unwrap_or_else(|e| {
+            eprintln!("Invalid hex: {}", e); process::exit(1);
+        })
+    };
+
+    // Execute and trace
+    let mut runner = TestRunner::new();
+    runner.fund_account("tracer", 1_000_000_000);
+    runner.deploy_bytecode(bytecode, "tracer").unwrap();
+
+    let result = runner.run_test(&TestCase {
+        name: "trace".into(),
+        calldata,
+        ..Default::default()
+    });
+
+    // Build trace from result
+    let mut trace = ExecutionTrace::new(runner.contract_addr(), "tracer", 0, 10_000_000);
+    trace.gas_used = result.gas_used;
+    trace.success = result.passed;
+
+    println!("{}", trace.format_pretty());
+    println!("Gas used: {}", result.gas_used);
+    println!("Status:   {}", if result.passed { "SUCCESS" } else { "FAILED" });
+    if let Some(ref msg) = result.message {
+        println!("Message:  {}", msg);
+    }
+}
+
 /// Parse ABI annotations from source comments.
 /// Format: ;; @fn transfer(uint64,address):bool
 ///         ;; @event Transfer(address,address,uint64)
@@ -268,11 +406,16 @@ fn print_help() {
     println!("  shadowasm disassemble <hex_or_package.json>");
     println!("  shadowasm verify <package.json>");
     println!("  shadowasm info <package.json>");
+    println!("  shadowasm test <source.sasm>");
+    println!("  shadowasm trace <source.sasm|bytecode_hex> [calldata_hex]");
     println!("  shadowasm help");
     println!();
     println!("ABI Annotations (in .sasm source comments):");
     println!("  ;; @fn transfer(uint64,address):bool");
     println!("  ;; @event Transfer(address,address,uint64)");
+    println!();
+    println!("Test Annotations (in .sasm source comments):");
+    println!("  ;; @test <name> [calldata_hex] [expect:revert] [gas:<max>]");
     println!();
     println!("Build output:");
     println!("  <name>.pkg.json       -- Contract package (bytecode + ABI + hashes)");
