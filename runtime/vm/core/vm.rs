@@ -113,10 +113,15 @@ pub enum OpCode {
     LOG         = 0xA0, // Emit log event
 
     // -- System --
-    CALL        = 0xB0, // Call another contract
-    RETURN      = 0xB1, // Return data and stop
-    REVERT      = 0xB2, // Revert all changes and stop
-    SELFDESTRUCT = 0xB3, // Destroy contract
+    CALL         = 0xB0, // Call another contract
+    CALLCODE     = 0xB1, // Call with caller's storage
+    DELEGATECALL = 0xB2, // Delegate call (caller + value preserved)
+    STATICCALL   = 0xB3, // Read-only call (no state changes)
+    CREATE       = 0xB4, // Create new contract
+    CREATE2      = 0xB5, // Deterministic CREATE
+    RETURN       = 0xB6, // Return data and stop
+    REVERT       = 0xB7, // Revert all changes and stop
+    SELFDESTRUCT = 0xB8, // Destroy contract
 
     // -- Invalid --
     INVALID     = 0xFF, // Invalid opcode (always fails)
@@ -146,8 +151,9 @@ impl OpCode {
             0x80 => OpCode::JUMP, 0x81 => OpCode::JUMPI, 0x82 => OpCode::JUMPDEST,
             0x90 => OpCode::MLOAD, 0x91 => OpCode::MSTORE,
             0xA0 => OpCode::LOG,
-            0xB0 => OpCode::CALL, 0xB1 => OpCode::RETURN, 0xB2 => OpCode::REVERT,
-            0xB3 => OpCode::SELFDESTRUCT,
+            0xB0 => OpCode::CALL, 0xB1 => OpCode::CALLCODE, 0xB2 => OpCode::DELEGATECALL,
+            0xB3 => OpCode::STATICCALL, 0xB4 => OpCode::CREATE, 0xB5 => OpCode::CREATE2,
+            0xB6 => OpCode::RETURN, 0xB7 => OpCode::REVERT, 0xB8 => OpCode::SELFDESTRUCT,
             _    => OpCode::INVALID,
         }
     }
@@ -195,10 +201,14 @@ impl OpCode {
             OpCode::LOG => 375,
 
             // Calls (700 gas)
-            OpCode::CALL => 700,
+            OpCode::CALL | OpCode::CALLCODE | OpCode::DELEGATECALL |
+            OpCode::STATICCALL => 700,
 
-            // Return / Revert (0 gas -- already paid for execution)
-            OpCode::RETURN | OpCode::REVERT => 0,
+            // Return / Revert (1 gas -- prevents free infinite loops)
+            OpCode::RETURN | OpCode::REVERT => 1,
+
+            // Contract creation (32000 gas)
+            OpCode::CREATE | OpCode::CREATE2 => 32_000,
 
             // Storage write (5000 gas)
             OpCode::SSTORE => 5_000,
@@ -810,10 +820,51 @@ impl VM {
                     };
                 }
 
-                OpCode::CALL | OpCode::SELFDESTRUCT => {
-                    // Simplified: these would need full implementation
+                // -- STUBS: opcodes recognized but not yet fully implemented --
+                // Gas is already charged above via gas.consume(cost).
+                // These return a typed VM error identifying the specific opcode.
+
+                // CALL: inter-contract call. Stub -- requires full message-call
+                // frame implementation (value transfer, gas stipend, call depth).
+                OpCode::CALL => {
                     pending.discard();
-                    return Self::err(gas.gas_used(), "Not implemented in this version");
+                    return Self::err(gas.gas_used(), "CALL opcode not yet implemented");
+                }
+                // CALLCODE: like CALL but executes callee code in caller's storage.
+                // Stub -- requires full message-call frame implementation.
+                OpCode::CALLCODE => {
+                    pending.discard();
+                    return Self::err(gas.gas_used(), "CALLCODE opcode not yet implemented");
+                }
+                // DELEGATECALL: like CALLCODE but preserves caller and value.
+                // Stub -- requires full message-call frame implementation.
+                OpCode::DELEGATECALL => {
+                    pending.discard();
+                    return Self::err(gas.gas_used(), "DELEGATECALL opcode not yet implemented");
+                }
+                // STATICCALL: read-only call (no state changes allowed).
+                // Stub -- requires full message-call frame implementation.
+                OpCode::STATICCALL => {
+                    pending.discard();
+                    return Self::err(gas.gas_used(), "STATICCALL opcode not yet implemented");
+                }
+                // CREATE: deploy a new contract. Stub -- requires contract
+                // deployment logic (init code execution, address derivation).
+                OpCode::CREATE => {
+                    pending.discard();
+                    return Self::err(gas.gas_used(), "CREATE opcode not yet implemented");
+                }
+                // CREATE2: deterministic contract deployment. Stub -- requires
+                // contract deployment with salt-based address derivation.
+                OpCode::CREATE2 => {
+                    pending.discard();
+                    return Self::err(gas.gas_used(), "CREATE2 opcode not yet implemented");
+                }
+                // SELFDESTRUCT: destroy the contract and transfer remaining balance.
+                // Stub -- requires balance transfer and account cleanup.
+                OpCode::SELFDESTRUCT => {
+                    pending.discard();
+                    return Self::err(gas.gas_used(), "SELFDESTRUCT opcode not yet implemented");
                 }
 
                 OpCode::INVALID => {

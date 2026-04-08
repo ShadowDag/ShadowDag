@@ -149,7 +149,7 @@ impl StateJournal {
             }
         }
 
-        self.checkpoints.truncate(id + 1);
+        self.checkpoints.truncate(id);
         if self.depth > 0 { self.depth -= 1; }
         reverted
     }
@@ -319,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn revert_preserves_target_checkpoint() {
+    fn revert_removes_target_checkpoint() {
         let mut j = StateJournal::new();
         j.record(JournalEntry::StorageWrite {
             contract: "c".into(), slot: "0".into(), old_value: None,
@@ -329,16 +329,16 @@ mod tests {
             contract: "c".into(), slot: "1".into(), old_value: None,
         });
 
-        // Revert the nested call
+        // Revert the nested call — the failed savepoint is removed
         j.revert_to_checkpoint(cp);
         assert_eq!(j.entry_count(), 1); // only slot 0
 
-        // The checkpoint itself must still exist so it can be reverted to again
-        assert_eq!(j.checkpoint_count(), 1, "target checkpoint must be preserved after revert");
+        // The reverted checkpoint must be removed after rollback
+        assert_eq!(j.checkpoint_count(), 0, "reverted checkpoint must be removed after rollback");
     }
 
     #[test]
-    fn revert_removes_only_deeper_checkpoints() {
+    fn revert_removes_target_and_deeper_checkpoints() {
         let mut j = StateJournal::new();
         let cp0 = j.checkpoint(0).unwrap(); // depth 0 → 1
         j.record(JournalEntry::StorageWrite {
@@ -353,14 +353,14 @@ mod tests {
             contract: "c".into(), slot: "2".into(), old_value: None,
         });
 
-        // Revert to cp1 — should remove cp2 but keep cp0 and cp1
+        // Revert to cp1 — should remove cp1 and cp2, keep only cp0
         j.revert_to_checkpoint(cp1);
-        assert_eq!(j.checkpoint_count(), 2, "cp0 and cp1 must remain");
+        assert_eq!(j.checkpoint_count(), 1, "only cp0 must remain");
         assert_eq!(j.entry_count(), 1); // only slot 0 (before cp1)
 
-        // Revert to cp0 — should keep cp0
+        // Revert to cp0 — should remove cp0
         j.revert_to_checkpoint(cp0);
-        assert_eq!(j.checkpoint_count(), 1, "cp0 must remain");
+        assert_eq!(j.checkpoint_count(), 0, "no checkpoints must remain");
         assert_eq!(j.entry_count(), 0);
     }
 }
