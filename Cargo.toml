@@ -47,6 +47,10 @@ path = "bin/mine_genesis.rs"
 name = "shadowdag-loadtest"
 path = "bin/loadtest.rs"
 
+[[bin]]
+name = "shadowasm"
+path = "bin/shadowasm.rs"
+
 [dependencies]
 # ─── Database ─────────────────────────────────────────────────────────────────
 rocksdb            = "0.21"
