@@ -15,6 +15,7 @@ use crate::engine::privacy::confidential::pedersen_commitment::PedersenCommitmen
 use crate::engine::privacy::confidential::bulletproofs::{Bulletproof, BulletproofResult};
 use crate::engine::privacy::confidential::pedersen::RealPedersenCommitment;
 use crate::engine::privacy::confidential::range_proof::{self, RangeProof};
+use crate::errors::CryptoError;
 
 /// Result of making a transaction confidential
 pub struct ConfidentialResult {
@@ -34,23 +35,36 @@ impl ConfidentialTx {
         }).collect()
     }
 
-    /// Hide amounts and return a single confidential result (for first output)
-    pub fn hide_and_prove(tx: &Transaction) -> ConfidentialResult {
-        let amount = tx.outputs.first().map(|o| o.amount).unwrap_or(0);
+    /// Hide amounts and return a single confidential result (for first output).
+    ///
+    /// Returns an error when the transaction has no outputs.
+    pub fn hide_and_prove(tx: &Transaction) -> Result<ConfidentialResult, CryptoError> {
+        if tx.outputs.is_empty() {
+            return Err(CryptoError::Other(
+                "cannot create confidential proof for TX with no outputs".into(),
+            ));
+        }
+
+        let amount = tx.outputs[0].amount;
 
         let proof = Bulletproof::prove(amount);
         let commitment_hex = proof.commitment_hex.clone();
         let range_proof_ok = proof.is_valid;
 
-        ConfidentialResult {
+        Ok(ConfidentialResult {
             commitment_hex,
             range_proof_ok,
             tx_hash: tx.hash.clone(),
             proof: Some(proof),
-        }
+        })
     }
 
-    /// Verify a confidential transaction result
+    /// Verify a confidential transaction result.
+    ///
+    /// NOTE: `tx_hash` binding (i.e. ensuring the proof is bound to a specific
+    /// transaction) is performed at a higher layer (block validation / consensus).
+    /// This function only checks the cryptographic validity of the commitment
+    /// and range proof.
     pub fn verify_confidential(result: &ConfidentialResult) -> bool {
         if result.commitment_hex.is_empty() { return false; }
         if !result.range_proof_ok { return false; }
@@ -140,7 +154,7 @@ mod tests {
     #[test]
     fn hide_and_prove_valid() {
         let tx = make_tx(5000);
-        let result = ConfidentialTx::hide_and_prove(&tx);
+        let result = ConfidentialTx::hide_and_prove(&tx).unwrap();
         assert!(result.range_proof_ok);
         assert!(!result.commitment_hex.is_empty());
     }
@@ -148,7 +162,7 @@ mod tests {
     #[test]
     fn verify_confidential_passes() {
         let tx = make_tx(1000);
-        let result = ConfidentialTx::hide_and_prove(&tx);
+        let result = ConfidentialTx::hide_and_prove(&tx).unwrap();
         assert!(ConfidentialTx::verify_confidential(&result));
     }
 

@@ -187,7 +187,7 @@ mod tests {
             price: 100, amount: 0, filled: 0,
             status: OrderStatus::Open, timestamp: 0, block_height: 0,
         };
-        let trades = book.place_order(order);
+        let trades = book.place_order(order).unwrap();
         assert!(trades.is_empty());
     }
 

@@ -67,14 +67,14 @@ mod tests {
                 side: OrderSide::Sell, order_type: OrderType::Limit,
                 price: sell_price, amount, filled: 0,
                 status: OrderStatus::Open, timestamp: 0, block_height: 0,
-            });
+            }).unwrap();
             let trades = book.place_order(Order {
                 id: "b1".into(), owner: "o".into(),
                 pair: TradingPair::new("A", "B"),
                 side: OrderSide::Buy, order_type: OrderType::Limit,
                 price: buy_price, amount, filled: 0,
                 status: OrderStatus::Open, timestamp: 0, block_height: 0,
-            });
+            }).unwrap();
 
             if buy_price < sell_price {
                 prop_assert!(trades.is_empty(), "No match when buy < sell price");

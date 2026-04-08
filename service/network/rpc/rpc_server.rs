@@ -2379,7 +2379,7 @@ impl RpcServer {
             "secret_size_bits": SECRET_SIZE * 8,
             "default_initiator_timeout_sec": DEFAULT_INITIATOR_TIMEOUT,
             "default_participant_timeout_sec": DEFAULT_PARTICIPANT_TIMEOUT,
-            "min_timeout_sec": MIN_TIMEOUT,
+            "min_timeout_blocks": MIN_TIMEOUT_BLOCKS,
             "supported_chains": AtomicSwap::supported_chains(),
         }))
     }

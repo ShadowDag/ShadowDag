@@ -83,8 +83,21 @@ impl StealthScanner {
 
         // P = hs*G + S
         let expected_pub = hs * RISTRETTO_BASEPOINT_POINT + spend_pub;
+
+        // Derive the network prefix from the candidate address instead of
+        // hardcoding "SD1s".  The scanner already filters for SD1s/ST1s/SR1s
+        // in scan_transaction, so we know the prefix is one of those three.
+        let prefix = if candidate_address.starts_with("ST1s") {
+            "ST1s"
+        } else if candidate_address.starts_with("SR1s") {
+            "SR1s"
+        } else {
+            "SD1s"
+        };
+
         let expected_addr = format!(
-            "SD1s{}",
+            "{}{}",
+            prefix,
             hex::encode(&expected_pub.compress().as_bytes()[..20])
         );
 

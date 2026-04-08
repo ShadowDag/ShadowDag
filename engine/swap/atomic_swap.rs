@@ -22,10 +22,14 @@
 use sha2::{Sha256, Digest};
 use serde::{Serialize, Deserialize};
 
-/// HTLC lock duration constants
-pub const DEFAULT_INITIATOR_TIMEOUT: u64 = 86400;    // 24 hours
-pub const DEFAULT_PARTICIPANT_TIMEOUT: u64 = 43200;   // 12 hours
-pub const MIN_TIMEOUT: u64 = 3600;                     // 1 hour minimum
+/// HTLC lock duration constants (all values are in BLOCKS, not seconds).
+pub const DEFAULT_INITIATOR_TIMEOUT: u64 = 86400;    // 24 hours worth of blocks
+pub const DEFAULT_PARTICIPANT_TIMEOUT: u64 = 43200;   // 12 hours worth of blocks
+
+/// Minimum timeout in BLOCKS (not seconds).
+/// At 10 BPS, 36 000 blocks = 1 hour. Adjust if semantics should be time-based.
+pub const MIN_TIMEOUT_BLOCKS: u64 = 36_000;
+
 pub const SECRET_SIZE: usize = 32;                     // 256-bit secret
 
 /// Atomic swap state
@@ -98,7 +102,7 @@ impl AtomicSwap {
             recipient:      recipient.to_string(),
             sender:         sender.to_string(),
             amount,
-            timeout_height: current_height + timeout_blocks.max(MIN_TIMEOUT),
+            timeout_height: current_height + timeout_blocks.max(MIN_TIMEOUT_BLOCKS),
             state:          SwapState::Initiated,
             secret:         None,
             chain:          "SDAG".to_string(),
@@ -106,8 +110,14 @@ impl AtomicSwap {
         }
     }
 
-    /// Redeem an HTLC by providing the secret
-    pub fn redeem(htlc: &mut HTLC, secret: &[u8]) -> bool {
+    /// Redeem an HTLC by providing the secret.
+    ///
+    /// After timeout, the HTLC should only be refundable, not redeemable.
+    pub fn redeem(htlc: &mut HTLC, secret: &[u8], current_height: u64) -> bool {
+        // After timeout, only refund is allowed
+        if current_height > htlc.timeout_height {
+            return false;
+        }
         // Verify the secret matches the hash
         let computed_hash = Self::hash_secret(secret);
         if computed_hash != htlc.secret_hash {
@@ -181,8 +191,8 @@ mod tests {
         // Can't refund before timeout
         assert!(!AtomicSwap::refund(&mut htlc, 100));
 
-        // Redeem with correct secret
-        assert!(AtomicSwap::redeem(&mut htlc, &secret));
+        // Redeem with correct secret (before timeout)
+        assert!(AtomicSwap::redeem(&mut htlc, &secret, 100));
         assert_eq!(htlc.state, SwapState::Redeemed);
         assert!(htlc.secret.is_some());
     }
@@ -193,7 +203,7 @@ mod tests {
         let hash = AtomicSwap::hash_secret(&secret);
         let mut htlc = AtomicSwap::initiate(&hash, "SD1a", "SD1b", 500, 0, 86400);
 
-        assert!(!AtomicSwap::redeem(&mut htlc, &[0u8; 32]));
+        assert!(!AtomicSwap::redeem(&mut htlc, &[0u8; 32], 0));
         assert_eq!(htlc.state, SwapState::Initiated); // State unchanged
     }
 
@@ -213,7 +223,7 @@ mod tests {
         let hash = AtomicSwap::hash_secret(&secret);
         let mut htlc = AtomicSwap::initiate(&hash, "SD1a", "SD1b", 500, 0, 100);
 
-        AtomicSwap::redeem(&mut htlc, &secret);
+        AtomicSwap::redeem(&mut htlc, &secret, 0);
         assert!(!AtomicSwap::refund(&mut htlc, 999999));
     }
 
