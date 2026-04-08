@@ -225,6 +225,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         assert!(scanner.scan_transaction(&tx).is_empty());
     }
@@ -241,6 +242,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         assert!(scanner.scan_transaction(&tx).is_empty());
     }

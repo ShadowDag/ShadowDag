@@ -15,6 +15,8 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::runtime::vm::core::vm::ExecutionResult;
+
 /// Transaction lifecycle status
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TxStatus {
@@ -71,13 +73,26 @@ pub struct TxReceipt {
     pub output_count:   usize,
     /// Total output value
     pub total_value:    u64,
+    /// Whether execution succeeded (true) or reverted/failed (false)
+    pub execution_success: bool,
+    /// Return data from contract execution (hex-encoded)
+    pub return_data: Option<String>,
+    /// Revert reason if execution failed
+    pub revert_reason: Option<String>,
+    /// VM version used for execution
+    pub vm_version: u8,
+    /// Block-level transaction index
+    pub tx_index: Option<u32>,
+    /// Block height where this TX was included
+    pub block_height: Option<u64>,
 }
 
 /// Log entry in a receipt (from contract execution)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReceiptLog {
     pub contract:  String,
-    pub data:      String,
+    pub topics:    Vec<String>,    // 0-4 indexed topics
+    pub data:      String,         // Non-indexed data (hex)
     pub log_index: usize,
 }
 
@@ -95,6 +110,71 @@ impl TxReceipt {
             updated_at:    now,
             output_count,
             total_value,
+            execution_success: false,
+            return_data:       None,
+            revert_reason:     None,
+            vm_version:        0,
+            tx_index:          None,
+            block_height:      None,
+        }
+    }
+
+    /// Construct a receipt from a contract execution result.
+    pub fn from_execution(
+        tx_hash: &str,
+        outcome: &ExecutionResult,
+        block_hash: &str,
+        block_height: u64,
+        tx_index: u32,
+    ) -> Self {
+        let now = now_secs();
+        let (execution_success, gas_used, logs, return_data, revert_reason) = match outcome {
+            ExecutionResult::Success { gas_used, return_data, logs } => {
+                let receipt_logs: Vec<ReceiptLog> = logs.iter().enumerate().map(|(i, log)| {
+                    ReceiptLog {
+                        contract: log.contract.clone(),
+                        topics: log.topics.iter().map(|t| {
+                            let h = t.to_hex();
+                            // Pad to 64 hex chars (32 bytes)
+                            format!("{:0>64}", h)
+                        }).collect(),
+                        data: hex::encode(&log.data),
+                        log_index: i,
+                    }
+                }).collect();
+                (true, *gas_used, receipt_logs, Some(hex::encode(return_data)), None)
+            }
+            ExecutionResult::Revert { gas_used, reason } => {
+                (false, *gas_used, vec![], None, Some(reason.clone()))
+            }
+            ExecutionResult::OutOfGas { gas_used } => {
+                (false, *gas_used, vec![], None, Some("out of gas".to_string()))
+            }
+            ExecutionResult::Error { gas_used, message } => {
+                (false, *gas_used, vec![], None, Some(message.clone()))
+            }
+        };
+
+        Self {
+            tx_hash: tx_hash.to_string(),
+            status: TxStatus::InBlock {
+                block_hash: block_hash.to_string(),
+                block_height,
+            },
+            fee: 0,
+            gas_used,
+            contract_addr: None,
+            logs,
+            submitted_at: now,
+            updated_at: now,
+            output_count: 0,
+            total_value: 0,
+            execution_success,
+            return_data,
+            revert_reason,
+            vm_version: 1,
+            tx_index: Some(tx_index),
+            block_height: Some(block_height),
         }
     }
 

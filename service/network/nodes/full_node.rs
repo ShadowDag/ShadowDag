@@ -23,6 +23,7 @@ use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
 use crate::service::network::dos_guard::{DosGuard, DosVerdict, MsgType};
 use crate::errors::{NodeError, ConsensusError};
 use crate::domain::transaction::transaction::TxType;
+use crate::domain::transaction::tx_receipt::TxReceipt;
 use crate::runtime::vm::core::executor::Executor;
 use crate::runtime::vm::core::vm_context::VMContext;
 use crate::runtime::vm::core::vm::ExecutionResult;
@@ -739,16 +740,20 @@ impl FullNode {
         let ctx = VMContext::new(storage);
         let executor = Executor::new(ctx);
 
-        for tx in &block.body.transactions {
+        for (tx_index, tx) in block.body.transactions.iter().enumerate() {
             match tx.tx_type {
                 TxType::ContractCreate => {
-                    // Decode bytecode from payload_hash
-                    let payload = match &tx.payload_hash {
-                        Some(ph) => match hex::decode(ph) {
-                            Ok(bytes) => bytes,
-                            Err(_) => continue,
-                        },
-                        None => continue,
+                    // Read bytecode from tx.deploy_code (canonical), fall back to payload_hash (legacy)
+                    let payload = if let Some(ref code) = tx.deploy_code {
+                        code.clone()
+                    } else {
+                        match &tx.payload_hash {
+                            Some(ph) => match hex::decode(ph) {
+                                Ok(bytes) => bytes,
+                                Err(_) => continue,
+                            },
+                            None => continue,
+                        }
                     };
 
                     let deployer = tx.inputs.first()
@@ -757,7 +762,8 @@ impl FullNode {
                     let value = tx.outputs.first()
                         .map(|o| o.amount)
                         .unwrap_or(0);
-                    let gas_limit = 10_000_000u64; // Default gas limit for contract TXs
+                    // Read gas_limit from tx field, fall back to default
+                    let gas_limit = tx.gas_limit.unwrap_or(10_000_000u64);
 
                     match executor.deploy(
                         &payload,
@@ -769,15 +775,22 @@ impl FullNode {
                         0, // nonce
                     ) {
                         Ok((addr, ref result)) => {
+                            let mut _receipt = TxReceipt::from_execution(
+                                &tx.hash, result, &block.header.hash,
+                                block.header.height, tx_index as u32,
+                            );
+                            _receipt.contract_addr = Some(addr.clone());
                             match result {
                                 ExecutionResult::Success { gas_used, .. } => {
                                     slog_info!("node", "contract_deployed",
                                         address => &addr,
-                                        gas_used => &gas_used.to_string());
+                                        gas_used => &gas_used.to_string(),
+                                        receipt_success => "true");
                                 }
                                 _ => {
                                     slog_warn!("node", "contract_deploy_execution_failed",
-                                        tx => &tx.hash, address => &addr);
+                                        tx => &tx.hash, address => &addr,
+                                        receipt_success => "false");
                                 }
                             }
                         }
@@ -788,15 +801,23 @@ impl FullNode {
                     }
                 }
                 TxType::ContractCall => {
-                    let target = tx.outputs.first()
-                        .map(|o| o.address.clone())
-                        .unwrap_or_default();
-                    let calldata = match &tx.payload_hash {
-                        Some(ph) => match hex::decode(ph) {
-                            Ok(bytes) => bytes,
-                            Err(_) => continue,
-                        },
-                        None => continue,
+                    // Read target from tx.contract_address (canonical), fall back to first output (legacy)
+                    let target = tx.contract_address.clone().unwrap_or_else(|| {
+                        tx.outputs.first()
+                            .map(|o| o.address.clone())
+                            .unwrap_or_default()
+                    });
+                    // Read calldata from tx.calldata (canonical), fall back to payload_hash (legacy)
+                    let calldata = if let Some(ref cd) = tx.calldata {
+                        cd.clone()
+                    } else {
+                        match &tx.payload_hash {
+                            Some(ph) => match hex::decode(ph) {
+                                Ok(bytes) => bytes,
+                                Err(_) => continue,
+                            },
+                            None => continue,
+                        }
                     };
                     let caller = tx.inputs.first()
                         .map(|i| i.owner.clone())
@@ -804,7 +825,8 @@ impl FullNode {
                     let value = tx.outputs.first()
                         .map(|o| o.amount)
                         .unwrap_or(0);
-                    let gas_limit = 10_000_000u64;
+                    // Read gas_limit from tx field, fall back to default
+                    let gas_limit = tx.gas_limit.unwrap_or(10_000_000u64);
 
                     let result = executor.call(
                         &target,
@@ -815,14 +837,23 @@ impl FullNode {
                         block.header.timestamp,
                         &block.header.hash,
                     );
+
+                    let _receipt = TxReceipt::from_execution(
+                        &tx.hash, &result, &block.header.hash,
+                        block.header.height, tx_index as u32,
+                    );
+
                     match &result {
                         ExecutionResult::Success { gas_used, .. } => {
                             slog_info!("node", "contract_called",
                                 target => &target,
-                                gas_used => &gas_used.to_string());
+                                gas_used => &gas_used.to_string(),
+                                receipt_success => &_receipt.execution_success.to_string());
                         }
                         _ => {
-                            slog_warn!("node", "contract_call_failed", tx => &tx.hash);
+                            slog_warn!("node", "contract_call_failed",
+                                tx => &tx.hash,
+                                receipt_success => &_receipt.execution_success.to_string());
                         }
                     }
                 }

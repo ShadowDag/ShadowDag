@@ -32,6 +32,7 @@ mod tx_hash_tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         }
     }
 
@@ -78,6 +79,7 @@ mod tx_hash_tests {
             is_coinbase: true,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         assert!(cb.is_coinbase());
     }
@@ -98,6 +100,7 @@ mod decoy_tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         }
     }
 

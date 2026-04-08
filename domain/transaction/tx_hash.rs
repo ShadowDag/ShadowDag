@@ -149,6 +149,7 @@ mod tests {
             is_coinbase: false,
             tx_type:   TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         tx.hash = TxHash::hash(&tx);
         tx
@@ -180,6 +181,7 @@ mod tests {
             is_coinbase: false,
             tx_type:   TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         tx2_inner.hash = TxHash::hash(&tx2_inner);
         assert_ne!(TxHash::hash(&tx1), TxHash::hash(&tx2_inner));
@@ -260,8 +262,8 @@ mod tests {
             TxInput { txid: "tx_aaa".into(), index: 0, owner: "alice".into(), signature: String::new(), pub_key: String::new(), key_image: None, ring_members: None },
         ];
         let outputs = vec![TxOutput { address: "bob".into(), amount: 100, commitment: None, range_proof: None, ephemeral_pubkey: None }];
-        let tx_a = Transaction { hash: String::new(), inputs: inputs_a, outputs: outputs.clone(), fee: 1, timestamp: 1_000, is_coinbase: false, tx_type: TxType::Transfer, payload_hash: None };
-        let tx_b = Transaction { hash: String::new(), inputs: inputs_b, outputs, fee: 1, timestamp: 1_000, is_coinbase: false, tx_type: TxType::Transfer, payload_hash: None };
+        let tx_a = Transaction { hash: String::new(), inputs: inputs_a, outputs: outputs.clone(), fee: 1, timestamp: 1_000, is_coinbase: false, tx_type: TxType::Transfer, payload_hash: None, ..Default::default() };
+        let tx_b = Transaction { hash: String::new(), inputs: inputs_b, outputs, fee: 1, timestamp: 1_000, is_coinbase: false, tx_type: TxType::Transfer, payload_hash: None, ..Default::default() };
         assert_eq!(TxHash::hash(&tx_a), TxHash::hash(&tx_b), "Input order must not affect transaction hash");
     }
 }

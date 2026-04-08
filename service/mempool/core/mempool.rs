@@ -1346,6 +1346,7 @@ mod tests {
             is_coinbase: true,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         }
     }
 
@@ -1367,6 +1368,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         }
     }
 
@@ -1488,6 +1490,7 @@ mod cpfp_tests {
             is_coinbase: true,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         }
     }
 
@@ -1509,6 +1512,7 @@ mod cpfp_tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         }
     }
 
@@ -1657,6 +1661,7 @@ mod policy_tests {
             outputs: vec![TxOutput { address: "a".into(), amount: 1_000, commitment: None, range_proof: None, ephemeral_pubkey: None }],
             fee, timestamp: ts(), is_coinbase: true,
             tx_type: TxType::Transfer, payload_hash: None,
+            ..Default::default()
         }
     }
 
@@ -1876,6 +1881,7 @@ mod orphan_tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         }
     }
 

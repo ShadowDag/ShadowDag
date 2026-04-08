@@ -54,6 +54,9 @@ impl Executor {
         // Reject bytecode containing unimplemented opcodes
         Self::validate_supported_opcodes(bytecode)?;
 
+        // VM version check: only v1 is currently supported
+        let vm_version = crate::runtime::vm::core::v1_spec::VERSION;
+
         // Generate deterministic contract address using deployer + bytecode + nonce
         let contract_addr = Self::compute_contract_address(deployer, bytecode, nonce);
 
@@ -86,16 +89,14 @@ impl Executor {
         // Persist state on success
         let result = match outcome {
             CallOutcome::Success { gas_used, return_data, logs } => {
-                // Persist all state changes (accounts, storage, code) to RocksDB
+                // Persist all state changes (accounts, storage, code) to RocksDB.
+                // persist_to_storage writes account:{addr} and code:{addr} which
+                // are the canonical keys. No legacy dual-write needed.
                 env.persist_to_storage(self.context.storage())?;
 
-                // Also store bytecode and metadata via legacy path for backward compat
-                let code_key = format!("code:{}", contract_addr);
-                self.context.set(&code_key, &hex::encode(bytecode))?;
-
-                let meta_key = format!("meta:{}", contract_addr);
-                let meta = format!("deployer={},nonce={},size={}", deployer, nonce, bytecode.len());
-                self.context.set(&meta_key, &meta)?;
+                // Store VM version in contract metadata
+                let vm_key = format!("vm_version:{}", contract_addr);
+                self.context.set(&vm_key, &vm_version.to_string())?;
 
                 ExecutionResult::Success { gas_used, return_data, logs }
             }

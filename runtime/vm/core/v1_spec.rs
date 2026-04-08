@@ -11,6 +11,9 @@
 // at deploy time by validate_v1_bytecode().
 // =============================================================================
 
+/// VM version identifier for v1.
+pub const VERSION: u8 = 1;
+
 /// V1 Opcodes -- the complete set supported in ShadowVM v1.
 /// Each entry: (byte_value, name, gas_cost, stack_pop, stack_push)
 pub const V1_OPCODES: &[(u8, &str, u64, usize, usize)] = &[

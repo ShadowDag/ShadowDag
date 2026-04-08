@@ -50,6 +50,7 @@ mod tests {
                 fee: 0, timestamp: ConsensusParams::GENESIS_TIMESTAMP, is_coinbase: true,
                 tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
             }]},
         }
     }
@@ -84,6 +85,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         pool.add_transaction(&tx);
         let second = pool.add_transaction(&tx);
@@ -110,6 +112,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         let valid = TxValidator::verify_signatures(&tx);
         assert!(!valid, "Malformed signature must fail verification");
@@ -135,6 +138,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         assert!(!TxValidator::verify_signatures(&tx), "Short signature must be rejected");
     }
@@ -159,6 +163,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         assert!(!TxValidator::verify_signatures(&tx), "Empty signature must be rejected");
     }
@@ -183,6 +188,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         assert!(!TxValidator::verify_signatures(&tx), "Empty public key must be rejected");
     }

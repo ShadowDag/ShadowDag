@@ -182,6 +182,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         }
     }
 
@@ -320,6 +321,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         let existing = vec![make_mempool_tx("old", 5_000)];
         // confirmed_keys() only contains "prev:0", so the second input is unconfirmed
@@ -349,6 +351,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         let existing = vec![make_mempool_tx("old", 5_000)];
         let result = RbfEngine::evaluate(&tx, &existing, &keys);

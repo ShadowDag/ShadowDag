@@ -60,6 +60,7 @@ mod tests {
                 fee: 0, timestamp: GENESIS_TIMESTAMP, is_coinbase: true,
                 tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
             }]},
         }
     }
@@ -71,6 +72,7 @@ mod tests {
             fee: 1, timestamp: GENESIS_TIMESTAMP + i as u64, is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         tx.hash = TxHash::hash(&tx);
         tx
@@ -113,6 +115,7 @@ mod tests {
             fee: 1, timestamp: GENESIS_TIMESTAMP + 1, is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         store.spend_utxo_str("rb_tx1:0").unwrap();
         assert!(store.get_utxo_str("rb_tx1:0").unwrap().spent);
@@ -168,6 +171,7 @@ mod tests {
                         fee: 0, timestamp: GENESIS_TIMESTAMP + i as u64, is_coinbase: true,
                         tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
                     }]},
                 };
                 dag.add_block_validated(&block, true).unwrap();

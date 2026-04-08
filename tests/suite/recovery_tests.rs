@@ -32,6 +32,7 @@ mod tests {
                 fee: 0, timestamp: ConsensusParams::GENESIS_TIMESTAMP, is_coinbase: true,
                 tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
             }]},
         }
     }
@@ -50,6 +51,7 @@ mod tests {
                 fee: 0, timestamp: ts, is_coinbase: true,
                 tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
             }]},
         }
     }
@@ -61,6 +63,7 @@ mod tests {
             fee: 1, timestamp: 1_735_689_600 + i as u64, is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         tx.hash = TxHash::hash(&tx);
         tx

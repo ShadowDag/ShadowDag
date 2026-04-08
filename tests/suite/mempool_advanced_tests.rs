@@ -48,6 +48,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         }
     }
 
@@ -203,6 +204,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         let tx2 = Transaction {
             hash:      "conflict_tx_002".to_string(),
@@ -213,6 +215,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
 
         let r1 = pool.add_transaction_test(&tx1);
@@ -244,6 +247,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         pool.add_orphan(&orphan);
         assert!(
