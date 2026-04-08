@@ -63,9 +63,17 @@ impl DiskMonitor {
         }
     }
 
-    /// Check if it's safe to write (not in critical state)
+    /// Check if it's safe to write (not in critical state).
+    /// Returns `true` with a warning when disk space cannot be determined.
     pub fn can_write(data_dir: &str) -> bool {
-        !Self::check(data_dir).is_critical()
+        match Self::check(data_dir) {
+            DiskStatus::Critical { .. } => false,
+            DiskStatus::Unknown => {
+                slog_warn!("storage", "disk_space_unknown", path => data_dir);
+                true // Allow but warn -- cannot determine free space
+            }
+            _ => true,
+        }
     }
 
     /// Get free space in bytes (platform-specific)

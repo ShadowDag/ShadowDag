@@ -20,6 +20,7 @@ use std::sync::Arc;
 use sha2::{Sha256, Digest};
 
 use crate::errors::StorageError;
+use crate::slog_error;
 
 /// Prefix for contract state keys
 const PFX_STATE:    &str = "state:";
@@ -53,7 +54,14 @@ impl StateStore {
     /// Get a state value for a contract
     pub fn get(&self, contract: &str, key: &str) -> Option<Vec<u8>> {
         let db_key = format!("{}{}/{}", PFX_STATE, contract, key);
-        self.db.get(db_key.as_bytes()).unwrap_or(None).map(|v| v.to_vec())
+        match self.db.get(db_key.as_bytes()) {
+            Ok(Some(v)) => Some(v.to_vec()),
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("storage", "state_read_error", contract => contract, key => key, error => e);
+                None
+            }
+        }
     }
 
     /// Delete a state key
@@ -123,8 +131,22 @@ impl StateStore {
     /// Get the state root at a given height
     pub fn get_state_root(&self, height: u64) -> Option<String> {
         let key = format!("{}{}", PFX_ROOT, height);
-        self.db.get(key.as_bytes()).unwrap_or(None)
-            .map(|v| String::from_utf8(v.to_vec()).unwrap_or_default())
+        match self.db.get(key.as_bytes()) {
+            Ok(Some(v)) => {
+                match String::from_utf8(v.to_vec()) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        slog_error!("storage", "state_root_utf8_error", height => height, error => e);
+                        None
+                    }
+                }
+            }
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("storage", "state_root_read_error", height => height, error => e);
+                None
+            }
+        }
     }
 
     /// Get all keys for a contract

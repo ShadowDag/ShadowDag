@@ -7,6 +7,7 @@ use rocksdb::{DB, Options, WriteBatch};
 use std::path::Path;
 use crate::domain::transaction::transaction::Transaction;
 use crate::errors::StorageError;
+use crate::slog_error;
 
 pub struct TxStore {
     db: DB,
@@ -57,7 +58,8 @@ impl TxStore {
         match self.db.get(hash.as_bytes()) {
             Ok(Some(_)) => true,
             Ok(None)    => false,
-            Err(_e)      => {
+            Err(e)      => {
+                slog_error!("storage", "tx_exists_read_error", hash => hash, error => e);
                 false
             }
         }
@@ -68,14 +70,16 @@ impl TxStore {
         for tx in txs {
             match bincode::serialize(tx) {
                 Ok(data) => batch.put(tx.hash.as_bytes(), &data),
-                Err(_e) => {
+                Err(e) => {
+                    slog_error!("storage", "tx_batch_serialize_error", hash => tx.hash, error => e);
                     return false;
                 }
             }
         }
         match self.db.write(batch) {
             Ok(_)  => true,
-            Err(_e) => {
+            Err(e) => {
+                slog_error!("storage", "tx_batch_write_error", error => e);
                 false
             }
         }
@@ -84,7 +88,8 @@ impl TxStore {
     pub fn delete_tx(&self, hash: &str) -> bool {
         match self.db.delete(hash.as_bytes()) {
             Ok(_)  => true,
-            Err(_e) => {
+            Err(e) => {
+                slog_error!("storage", "tx_delete_error", hash => hash, error => e);
                 false
             }
         }

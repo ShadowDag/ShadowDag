@@ -107,8 +107,11 @@ impl NodeDB {
         Ok(Self { db: Arc::new(db) })
     }
 
+    /// Probe whether a DB already exists at `path` and open it.
+    /// Unlike `new()`, this will NOT create a database if none exists.
     pub fn try_open(path: &str) -> Result<Self, StorageError> {
-        let opts = Self::safe_options(path);
+        let mut opts = Self::safe_options(path);
+        opts.create_if_missing(false);
         DB::open(&opts, Path::new(path))
             .map(|db| Self { db: Arc::new(db) })
             .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })
@@ -219,9 +222,20 @@ mod tests {
     }
 
     #[test]
-    fn try_open_succeeds_on_valid_path() {
+    fn try_open_fails_on_nonexistent_path() {
         let result = NodeDB::try_open(&tmp_path());
-        assert!(result.is_ok());
+        assert!(result.is_err(), "try_open should fail when DB does not exist");
+    }
+
+    #[test]
+    fn try_open_succeeds_on_existing_db() {
+        let path = tmp_path();
+        // Create the DB first
+        let _db = NodeDB::new(&path).unwrap();
+        drop(_db);
+        // Now try_open should succeed
+        let result = NodeDB::try_open(&path);
+        assert!(result.is_ok(), "try_open should succeed when DB already exists");
     }
 
     #[test]

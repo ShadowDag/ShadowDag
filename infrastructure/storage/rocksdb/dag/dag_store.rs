@@ -47,7 +47,15 @@ impl DagStore {
 
     pub fn get_node(&self, hash: &str) -> Option<DagNode> {
         match self.db.get(hash) {
-            Ok(Some(data)) => bincode::deserialize(&data).ok(),
+            Ok(Some(data)) => {
+                match bincode::deserialize(&data) {
+                    Ok(node) => Some(node),
+                    Err(e) => {
+                        slog_error!("storage", "dag_node_deserialize_error", hash => hash, error => e);
+                        None
+                    }
+                }
+            }
             Ok(None) => None,
             Err(e) => {
                 slog_error!("storage", "dag_node_read_error", hash => hash, error => e);

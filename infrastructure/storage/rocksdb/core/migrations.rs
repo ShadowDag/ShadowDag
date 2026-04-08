@@ -14,7 +14,7 @@ use rocksdb::DB;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::errors::StorageError;
-use crate::slog_info;
+use crate::{slog_info, slog_error};
 
 /// Current database schema version
 pub const CURRENT_DB_VERSION: u32 = 6;
@@ -70,15 +70,15 @@ impl MigrationManager {
     pub fn migrate(db: &DB) -> MigrationResult {
         let current = Self::get_version(db);
 
-        if current >= CURRENT_DB_VERSION {
-            return MigrationResult::AlreadyUpToDate;
-        }
-
         if current > CURRENT_DB_VERSION {
             return MigrationResult::Error(format!(
                 "DB version {} is newer than software version {}",
                 current, CURRENT_DB_VERSION
             ));
+        }
+
+        if current == CURRENT_DB_VERSION {
+            return MigrationResult::AlreadyUpToDate;
         }
 
         let mut applied = 0;
@@ -109,15 +109,19 @@ impl MigrationManager {
         }
     }
 
-    /// Apply a specific migration version
+    /// Apply a specific migration version.
+    ///
+    /// All current migrations are schema-only: they declare a new key prefix
+    /// or index that is lazily created on first use by the owning subsystem.
+    /// No data transformation is performed at migration time.
     fn apply_migration(_db: &DB, version: u32) -> Result<(), StorageError> {
         match version {
-            1 => { /* v1: Initial schema — no action needed */ Ok(()) }
-            2 => { /* v2: Add UTXO address index prefix */ Ok(()) }
-            3 => { /* v3: Add DAG blue score index */ Ok(()) }
-            4 => { /* v4: Add contract state prefix */ Ok(()) }
-            5 => { /* v5: Add BPS configuration */ Ok(()) }
-            6 => { /* v6: Add pruning metadata */ Ok(()) }
+            1 => Ok(()), // Schema: initial DB layout — no data migration needed
+            2 => Ok(()), // Schema: UTXO address index — created on first use by UtxoStore
+            3 => Ok(()), // Schema: DAG blue score index — populated by GhostDag on block insert
+            4 => Ok(()), // Schema: contract state prefix — created on first contract deploy
+            5 => Ok(()), // Schema: BPS configuration key — written on first config update
+            6 => Ok(()), // Schema: pruning metadata + UTXO commitments — populated by pruning manager
             _ => Err(StorageError::Migration(format!("Unknown migration version: {}", version))),
         }
     }
@@ -139,7 +143,9 @@ impl MigrationManager {
     fn log_migration(db: &DB, version: u32) {
         let key = format!("{}{}", MIGRATION_LOG_PREFIX, version);
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let _ = db.put(key.as_bytes(), ts.to_le_bytes());
+        if let Err(e) = db.put(key.as_bytes(), ts.to_le_bytes()) {
+            slog_error!("storage", "migration_log_write_failed", version => version, error => e);
+        }
     }
 
     /// Get all applied migrations
