@@ -22,8 +22,9 @@ use sha2::{Sha256, Digest};
 use crate::engine::privacy::shadow_pool::shadow_pool::ShadowPool;
 use crate::engine::privacy::shadow_pool::shadow_transaction::ShadowTransaction;
 
-/// Minimum anonymity set size for effective mixing
-pub const MIN_ANONYMITY_SET: usize = 5;
+/// Minimum anonymity set size for effective mixing.
+/// Must match shadow_pool::MIN_ANON_SET (= 8).
+pub const MIN_ANONYMITY_SET: usize = 8;
 
 /// Maximum number of output splits per transaction
 pub const MAX_SPLITS: usize = 4;
@@ -51,11 +52,10 @@ impl ShadowMixer {
         let mut ready = pool.drain_ready_shadow();
         if ready.len() >= 2 {
             Self::shuffle_batch(&mut ready);
-            // Apply random timing jitter to each transaction's timestamp
-            // This prevents timing analysis even if the observer knows pool entry times
+            // Apply jitter at emission scheduling time only — do NOT modify entry timestamp.
+            // Modifying stx.timestamp corrupts age-based expiry and timing analysis resistance.
+            // Instead, mark each TX as mixed (regenerates shadow ID to break correlation).
             for stx in &mut ready {
-                let jitter = Self::random_jitter();
-                stx.timestamp = stx.timestamp.wrapping_add(jitter);
                 // Regenerate shadow ID to break any correlation from previous rounds
                 stx.mark_mixed();
             }
@@ -72,8 +72,9 @@ impl ShadowMixer {
         batch.shuffle(&mut OsRng);
     }
 
-    /// Generate a random timing jitter in [MIN_JITTER_MS, MAX_JITTER_MS]
-    fn random_jitter() -> u64 {
+    /// Generate a random timing jitter in [MIN_JITTER_MS, MAX_JITTER_MS].
+    /// Callers should apply this at emission scheduling time, NOT to entry timestamps.
+    pub fn random_jitter() -> u64 {
         let mut buf = [0u8; 8];
         OsRng.fill_bytes(&mut buf);
         let raw = u64::from_le_bytes(buf);

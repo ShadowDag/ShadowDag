@@ -99,7 +99,8 @@ impl ShadowTransaction {
             hash: decoy_hash.clone(),
             inputs: vec![],
             outputs: vec![TxOutput {
-                address: format!("SD1decoy{}", &decoy_hash[..16]),
+                // Decoy addresses use network-neutral format (filtered before relay)
+                address: format!("DECOY{:0>40}", &decoy_hash[..40]),
                 amount: 0,
                 commitment: None,
                 range_proof: None,

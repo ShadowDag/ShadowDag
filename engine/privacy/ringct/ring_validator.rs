@@ -11,6 +11,10 @@ pub struct RingValidator;
 impl RingValidator {
     pub fn validate(tx: &Transaction) -> bool {
         // 1. Ring signature verification
+        // TODO: Migrate to CLSAG verification (clsag.rs) for production privacy.
+        // Current RingSignature::verify is LEGACY/DEPRECATED in ring_signature.rs.
+        // The real CLSAG implementation lives in: engine/privacy/ringct/clsag.rs
+        // and uses curve25519-dalek Ristretto points with real elliptic curve math.
         if !RingSignature::verify(tx) {
             return false;
         }

@@ -21,17 +21,18 @@ pub enum PrivacyLevel {
     High,
     /// Maximum: 8 hops, long delay, extra decoys
     Maximum,
-    /// Express: 1 hop, instant (minimal privacy, fast confirmation)
+    /// Express: minimum hops, instant (minimal privacy, fast confirmation)
     Express,
 }
 
 impl PrivacyLevel {
     pub fn hops(&self) -> u8 {
+        use crate::engine::privacy::shadow_pool::shadow_pool::MIN_RELAY_HOPS;
         match self {
             PrivacyLevel::Standard => 3,
             PrivacyLevel::High     => 5,
             PrivacyLevel::Maximum  => 8,
-            PrivacyLevel::Express  => 1,
+            PrivacyLevel::Express  => MIN_RELAY_HOPS, // Was 1, but minimum is 2
         }
     }
 
@@ -144,6 +145,6 @@ mod tests {
         assert_eq!(PrivacyLevel::Standard.hops(), 3);
         assert_eq!(PrivacyLevel::High.hops(), 5);
         assert_eq!(PrivacyLevel::Maximum.hops(), 8);
-        assert_eq!(PrivacyLevel::Express.hops(), 1);
+        assert_eq!(PrivacyLevel::Express.hops(), 2); // MIN_RELAY_HOPS
     }
 }

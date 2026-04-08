@@ -56,8 +56,8 @@ pub const MAX_RELAY_HOPS: u8 = 5;
 /// Minimum relay hops (enforced — cannot be bypassed)
 pub const MIN_RELAY_HOPS: u8 = 2;
 
-/// Mixing round duration in seconds
-const MIX_ROUND_DURATION: u64 = 60; // 1-minute rounds
+/// Mixing round duration in milliseconds (timestamps are in millis)
+const MIX_ROUND_DURATION: u64 = 60_000; // 1 minute in milliseconds
 
 /// Normalize timestamp to mixing round boundary to prevent timing correlation
 fn normalize_timestamp(ts: u64) -> u64 {
@@ -677,7 +677,7 @@ mod tests {
         let txs = pool.drain_ready();
         // drain_ready filters decoys — all returned TXs should be real
         for tx in &txs {
-            assert!(!tx.hash.starts_with("SD1decoy"),
+            assert!(!tx.hash.starts_with("DECOY"),
                 "drain_ready should not return decoy transactions");
         }
     }
