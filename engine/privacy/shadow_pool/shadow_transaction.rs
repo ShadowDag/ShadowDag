@@ -111,6 +111,7 @@ impl ShadowTransaction {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
 
         let shadow_id = Self::generate_shadow_id(&decoy_hash, decoy_ts);
@@ -188,6 +189,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         }
     }
 

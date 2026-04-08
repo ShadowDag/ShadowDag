@@ -352,13 +352,13 @@ mod tests {
             hash: "bb".repeat(32),
             inputs: vec![], outputs: vec![TxOutput { address: "x".into(), amount: 1, commitment: None, range_proof: None, ephemeral_pubkey: None }],
             fee: 0, timestamp: 0, is_coinbase: false, tx_type: TxType::Transfer,
-            payload_hash: None,
+            payload_hash: None, ..Default::default()
         };
         let tx_b = Transaction {
             hash: "aa".repeat(32),
             inputs: vec![], outputs: vec![TxOutput { address: "y".into(), amount: 2, commitment: None, range_proof: None, ephemeral_pubkey: None }],
             fee: 0, timestamp: 0, is_coinbase: false, tx_type: TxType::Transfer,
-            payload_hash: None,
+            payload_hash: None, ..Default::default()
         };
 
         let parents = vec!["dd".repeat(32)];

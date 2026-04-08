@@ -76,6 +76,15 @@ impl ConsensusParams {
     /// Smart contracts: ShadowVM with U256 stack, 90+ opcodes, and gas metering.
     /// Full EVM-compatible execution environment with ASIC-resistant PoW security.
     pub const SMART_CONTRACTS_ENABLED: bool = true;
+
+    // ── VM Versioning ─────────────────────────────────────────────────────
+    /// Active VM version for this chain.
+    /// Contracts deployed with a different vm_version are rejected.
+    /// Future upgrades (v2, v3) will use fork-height activation.
+    pub const VM_VERSION: u8 = 1;
+
+    /// Block height at which VM v1 activates (genesis for v1).
+    pub const VM_V1_ACTIVATION_HEIGHT: u64 = 0;
 }
 
 /// Runtime-configurable consensus parameters derived from BPS engine.

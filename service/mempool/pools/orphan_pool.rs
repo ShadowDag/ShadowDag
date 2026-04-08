@@ -131,6 +131,7 @@ mod tests {
             is_coinbase: false,
             tx_type: Default::default(),
             payload_hash: None,
+            ..Default::default()
         }
     }
 

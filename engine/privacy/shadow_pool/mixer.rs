@@ -131,6 +131,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         ShadowTransaction::new(tx, 1000).with_delay(MixDelay::Instant)
     }

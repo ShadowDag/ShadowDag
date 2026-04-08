@@ -749,56 +749,120 @@ impl TxValidator {
     }
 
     /// Validate ContractCreate transaction payload fields.
-    /// The payload_hash must contain a non-zero hex-encoded bytecode hash.
-    /// Inputs must be present (to cover gas + value).
+    /// Requires deploy_code, gas_limit, and vm_version.
+    /// Falls back to payload_hash for legacy support.
     pub fn validate_contract_create_payload(tx: &Transaction) -> Result<(), ConsensusError> {
         if tx.tx_type != TxType::ContractCreate {
             return Ok(()); // Not a contract create, skip
         }
-        // Must have payload_hash (bytecode hash)
-        let ph = match &tx.payload_hash {
-            Some(h) => h,
-            None => return Err(ConsensusError::BlockValidation(
-                "contract create requires bytecode payload".into()
+
+        // gas_limit is required and must be > 0
+        match tx.gas_limit {
+            Some(gl) if gl > 0 => {}
+            Some(_) => return Err(ConsensusError::BlockValidation(
+                "contract create requires gas_limit > 0".into()
             )),
-        };
-        if ph.is_empty() || ph == &"0".repeat(64) {
-            return Err(ConsensusError::BlockValidation(
-                "contract create requires non-zero bytecode payload".into()
-            ));
+            None => return Err(ConsensusError::BlockValidation(
+                "contract create requires gas_limit".into()
+            )),
         }
-        // Inputs must cover gas + value
-        // (fee/amount validation is handled by the general UTXO checks)
+
+        // vm_version must be Some(1) for v1 chain
+        match tx.vm_version {
+            Some(1) => {}
+            Some(v) => return Err(ConsensusError::BlockValidation(
+                format!("contract create vm_version {} unsupported (expected 1)", v)
+            )),
+            None => return Err(ConsensusError::BlockValidation(
+                "contract create requires vm_version".into()
+            )),
+        }
+
+        // deploy_code is required and must be non-empty
+        match &tx.deploy_code {
+            Some(code) if !code.is_empty() => {}
+            Some(_) => return Err(ConsensusError::BlockValidation(
+                "contract create requires non-empty deploy_code".into()
+            )),
+            None => {
+                // Fall back to legacy payload_hash for backward compatibility
+                let ph = match &tx.payload_hash {
+                    Some(h) => h,
+                    None => return Err(ConsensusError::BlockValidation(
+                        "contract create requires deploy_code or bytecode payload".into()
+                    )),
+                };
+                if ph.is_empty() || ph == &"0".repeat(64) {
+                    return Err(ConsensusError::BlockValidation(
+                        "contract create requires non-zero bytecode payload".into()
+                    ));
+                }
+            }
+        }
+
         Ok(())
     }
 
     /// Validate ContractCall transaction payload fields.
-    /// The payload_hash must contain a non-zero hex-encoded calldata hash.
-    /// The first output address must be a contract address (SD1c prefix).
+    /// Requires contract_address (SD1c prefix), gas_limit, and vm_version.
+    /// Falls back to payload_hash and first output for legacy support.
     pub fn validate_contract_call_payload(tx: &Transaction) -> Result<(), ConsensusError> {
         if tx.tx_type != TxType::ContractCall {
             return Ok(()); // Not a contract call, skip
         }
-        // Must have payload_hash (function selector + calldata hash)
-        let ph = match &tx.payload_hash {
-            Some(h) => h,
-            None => return Err(ConsensusError::BlockValidation(
-                "contract call requires calldata payload".into()
+
+        // gas_limit is required and must be > 0
+        match tx.gas_limit {
+            Some(gl) if gl > 0 => {}
+            Some(_) => return Err(ConsensusError::BlockValidation(
+                "contract call requires gas_limit > 0".into()
             )),
-        };
-        if ph.is_empty() || ph == &"0".repeat(64) {
-            return Err(ConsensusError::BlockValidation(
-                "contract call requires non-zero calldata payload".into()
-            ));
+            None => return Err(ConsensusError::BlockValidation(
+                "contract call requires gas_limit".into()
+            )),
         }
-        // First output address must be a contract address (SD1c prefix)
-        if let Some(output) = tx.outputs.first() {
-            if !output.address.starts_with("SD1c") {
-                return Err(ConsensusError::BlockValidation(
-                    "contract call target must be SD1c address".into()
-                ));
+
+        // vm_version must be Some(1) for v1 chain
+        match tx.vm_version {
+            Some(1) => {}
+            Some(v) => return Err(ConsensusError::BlockValidation(
+                format!("contract call vm_version {} unsupported (expected 1)", v)
+            )),
+            None => return Err(ConsensusError::BlockValidation(
+                "contract call requires vm_version".into()
+            )),
+        }
+
+        // contract_address is required and must start with SD1c
+        match &tx.contract_address {
+            Some(addr) if addr.starts_with("SD1c") => {}
+            Some(addr) => return Err(ConsensusError::BlockValidation(
+                format!("contract call target {} must start with SD1c", addr)
+            )),
+            None => {
+                // Fall back to legacy first-output check
+                if let Some(output) = tx.outputs.first() {
+                    if !output.address.starts_with("SD1c") {
+                        return Err(ConsensusError::BlockValidation(
+                            "contract call target must be SD1c address".into()
+                        ));
+                    }
+                }
+                // Also require legacy payload_hash
+                let ph = match &tx.payload_hash {
+                    Some(h) => h,
+                    None => return Err(ConsensusError::BlockValidation(
+                        "contract call requires calldata or contract_address".into()
+                    )),
+                };
+                if ph.is_empty() || ph == &"0".repeat(64) {
+                    return Err(ConsensusError::BlockValidation(
+                        "contract call requires non-zero calldata payload".into()
+                    ));
+                }
             }
         }
+
         Ok(())
     }
 }

@@ -23,6 +23,7 @@ mod tests {
             is_coinbase: true,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         }
     }
 
@@ -37,6 +38,7 @@ mod tests {
             is_coinbase: true,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         tx.hash = TxHash::hash(&tx);
         tx
@@ -68,6 +70,7 @@ mod tests {
             is_coinbase: true,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         assert!(!validate_tx(&tx));
     }
@@ -156,6 +159,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         tx.hash = TxHash::hash(&tx);
         assert!(!validate_tx(&tx), "TX with > MAX_TX_INPUTS must be rejected");
@@ -176,6 +180,7 @@ mod tests {
             is_coinbase: true,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         tx.hash = TxHash::hash(&tx);
         assert!(!validate_tx(&tx), "TX with > MAX_TX_OUTPUTS must be rejected");
@@ -204,6 +209,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         assert!(!tx.is_coinbase());
     }
@@ -223,6 +229,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         assert_eq!(tx.total_output(), 3_000);
     }
@@ -250,6 +257,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         // validate_tx (no utxo set) does structural check; verify len > MAX_TX_INPUTS is fine
         // The duplicate detection requires TxValidator::validate_tx with utxoSet
@@ -339,6 +347,7 @@ mod tests {
             is_coinbase: true,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         assert!(!validate_tx(&tx), "Oversized tx must be rejected");
     }

@@ -104,6 +104,11 @@ pub fn build_transaction_with_anchor(
         is_coinbase: false,
         tx_type: TxType::Transfer,
         payload_hash: anchor_block_hash.clone(),
+        gas_limit: None,
+        deploy_code: None,
+        calldata: None,
+        contract_address: None,
+        vm_version: None,
     };
 
     let signing_msg = TxValidator::build_signing_message(&temp_tx);
@@ -129,6 +134,11 @@ pub fn build_transaction_with_anchor(
         is_coinbase: false,
         tx_type: TxType::Transfer,
         payload_hash: anchor_block_hash,
+        gas_limit: None,
+        deploy_code: None,
+        calldata: None,
+        contract_address: None,
+        vm_version: None,
     };
 
     Ok(final_tx)

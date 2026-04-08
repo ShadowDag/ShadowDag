@@ -50,6 +50,7 @@ mod tests {
                 fee: 0, timestamp: GENESIS_TIMESTAMP, is_coinbase: true,
                 tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
             }]},
         }
     }
@@ -73,6 +74,7 @@ mod tests {
                     fee: 0, timestamp: ts, is_coinbase: true,
                     tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
                 }]},
             };
             blocks.push(block.clone());
@@ -130,6 +132,7 @@ mod tests {
             fee: 3, timestamp: 1_735_689_600, is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         let hashes: Vec<String> = (0..100).map(|_| TxHash::hash(&tx)).collect();
         let first = &hashes[0];
@@ -144,6 +147,7 @@ mod tests {
             fee: 0, timestamp: GENESIS_TIMESTAMP, is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         assert_eq!(TxHash::hash(&tx), TxHash::hash(&tx));
     }
@@ -182,6 +186,7 @@ mod tests {
             fee: 1, timestamp: GENESIS_TIMESTAMP, is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         assert_eq!(TxHash::signing_message(&tx), TxHash::signing_message(&tx));
     }

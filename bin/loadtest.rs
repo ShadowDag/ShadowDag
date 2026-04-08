@@ -263,6 +263,7 @@ fn generate_test_tx_invalid(from: &str, to: &str, seq: u64) -> Transaction {
         is_coinbase: false,
         tx_type: shadowdag::domain::transaction::transaction::TxType::Transfer,
         payload_hash: None,
+        ..Default::default()
     }
 }
 

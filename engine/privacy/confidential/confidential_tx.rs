@@ -148,6 +148,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         }
     }
 
@@ -181,6 +182,7 @@ mod tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         let proofs = ConfidentialTx::hide_amount(&tx);
         assert_eq!(proofs.len(), 3);

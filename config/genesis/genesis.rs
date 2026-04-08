@@ -205,6 +205,7 @@ fn build_coinbase(p: &GenesisParams) -> Transaction {
         is_coinbase: true,
         tx_type: TxType::Transfer,
         payload_hash: None,
+        ..Default::default()
     }
 }
 

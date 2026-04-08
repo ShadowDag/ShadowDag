@@ -36,6 +36,7 @@ mod tests {
             is_coinbase: true,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         tx.hash = TxHash::hash(&tx);
         tx
@@ -73,6 +74,7 @@ mod tests {
                 fee: 0, timestamp: ConsensusParams::GENESIS_TIMESTAMP, is_coinbase: true,
                 tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
             }]},
         }
     }
@@ -98,6 +100,7 @@ mod tests {
                 fee: MIN_TX_FEE, timestamp: 1_735_689_600 + i as u64, is_coinbase: false,
                 tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
             }).collect();
         let start = Instant::now();
         let _hashes: Vec<String> = txs.iter().map(TxHash::hash).collect();
@@ -168,6 +171,7 @@ mod tests {
                     fee: 0, timestamp: ConsensusParams::GENESIS_TIMESTAMP + i as u64, is_coinbase: true,
                     tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
                 }]},
             };
             dag.add_block_validated(&block, true).unwrap();

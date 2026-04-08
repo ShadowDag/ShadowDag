@@ -76,6 +76,7 @@ mod utxo_validator_tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         }
     }
 
@@ -87,6 +88,7 @@ mod utxo_validator_tests {
             fee: 0, timestamp: 0, is_coinbase: true,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
         let _mock = UtxoSet::new_empty();
 
@@ -126,6 +128,7 @@ mod utxo_validator_tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
 
         use std::collections::HashSet;
@@ -159,6 +162,7 @@ mod utxo_spend_tests {
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         }
     }
 

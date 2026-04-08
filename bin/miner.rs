@@ -168,6 +168,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
             is_coinbase: true,
             tx_type: TxType::Transfer,
             payload_hash: None,
+            ..Default::default()
         };
 
         // Use DAG tips from template as parents (not just prev_hash)

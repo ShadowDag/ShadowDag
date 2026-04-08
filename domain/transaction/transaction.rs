@@ -65,7 +65,7 @@ pub struct TxOutput {
     pub ephemeral_pubkey: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Transaction {
     pub hash:        String,
     pub inputs:      Vec<TxInput>,
@@ -83,6 +83,21 @@ pub struct Transaction {
     /// None for backward compatibility with legacy TXs and coinbase.
     #[serde(default)]
     pub payload_hash: Option<String>,
+    /// Gas limit for contract execution (ContractCreate/ContractCall only)
+    #[serde(default)]
+    pub gas_limit: Option<u64>,
+    /// Contract bytecode for deployment (ContractCreate only)
+    #[serde(default)]
+    pub deploy_code: Option<Vec<u8>>,
+    /// Calldata for contract invocation (ContractCall only)
+    #[serde(default)]
+    pub calldata: Option<Vec<u8>>,
+    /// Target contract address (ContractCall only)
+    #[serde(default)]
+    pub contract_address: Option<String>,
+    /// VM version this transaction targets (must match chain's active VM version)
+    #[serde(default)]
+    pub vm_version: Option<u8>,
 }
 
 impl Transaction {
@@ -93,7 +108,12 @@ impl Transaction {
         fee:       u64,
         timestamp: u64,
     ) -> Self {
-        Self { hash, inputs, outputs, fee, timestamp, is_coinbase: false, tx_type: TxType::Transfer, payload_hash: None }
+        Self {
+            hash, inputs, outputs, fee, timestamp,
+            is_coinbase: false, tx_type: TxType::Transfer, payload_hash: None,
+            gas_limit: None, deploy_code: None, calldata: None,
+            contract_address: None, vm_version: None,
+        }
     }
 
     pub fn new_coinbase(
@@ -102,7 +122,12 @@ impl Transaction {
         fee:     u64,
         timestamp: u64,
     ) -> Self {
-        Self { hash, inputs: vec![], outputs, fee, timestamp, is_coinbase: true, tx_type: TxType::Transfer, payload_hash: None }
+        Self {
+            hash, inputs: vec![], outputs, fee, timestamp,
+            is_coinbase: true, tx_type: TxType::Transfer, payload_hash: None,
+            gas_limit: None, deploy_code: None, calldata: None,
+            contract_address: None, vm_version: None,
+        }
     }
 
     pub fn is_coinbase(&self) -> bool {
@@ -266,6 +291,65 @@ impl Transaction {
                 let ph_bytes = ph.as_bytes();
                 buf.extend_from_slice(&(ph_bytes.len() as u32).to_le_bytes());
                 buf.extend_from_slice(ph_bytes);
+            }
+            None => {
+                buf.push(0x00);
+            }
+        }
+
+        // 6. gas_limit (contract TX field)
+        match self.gas_limit {
+            Some(gl) => {
+                buf.push(0x01);
+                buf.extend_from_slice(&gl.to_le_bytes());
+            }
+            None => {
+                buf.push(0x00);
+            }
+        }
+
+        // 7. deploy_code (ContractCreate bytecode)
+        match &self.deploy_code {
+            Some(code) => {
+                buf.push(0x01);
+                buf.extend_from_slice(&(code.len() as u32).to_le_bytes());
+                buf.extend_from_slice(code);
+            }
+            None => {
+                buf.push(0x00);
+            }
+        }
+
+        // 8. calldata (ContractCall input data)
+        match &self.calldata {
+            Some(cd) => {
+                buf.push(0x01);
+                buf.extend_from_slice(&(cd.len() as u32).to_le_bytes());
+                buf.extend_from_slice(cd);
+            }
+            None => {
+                buf.push(0x00);
+            }
+        }
+
+        // 9. contract_address (ContractCall target)
+        match &self.contract_address {
+            Some(ca) => {
+                buf.push(0x01);
+                let ca_bytes = ca.as_bytes();
+                buf.extend_from_slice(&(ca_bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(ca_bytes);
+            }
+            None => {
+                buf.push(0x00);
+            }
+        }
+
+        // 10. vm_version
+        match self.vm_version {
+            Some(v) => {
+                buf.push(0x01);
+                buf.push(v);
             }
             None => {
                 buf.push(0x00);
