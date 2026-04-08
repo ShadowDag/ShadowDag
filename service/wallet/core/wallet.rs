@@ -340,8 +340,14 @@ impl Wallet {
             let sk = derive_key(&seed, wa.account, wa.index, wa.is_change)?;
             // FIXED: Use the SAME signing message format as TxValidator (TxHash::signing_message)
             // Format: SHA-256(CHAIN_ID || txid || index || to_address || amount || fee)
+            let chain_id = match self.network.as_str() {
+                "mainnet" => 0xDA0C_0001u32,
+                "testnet" => 0xDA0C_0002u32,
+                "regtest" => 0xDA0C_0003u32,
+                _ => 0xDA0C_0001u32, // fallback to mainnet
+            };
             let mut h = sha2::Sha256::new();
-            sha2::Digest::update(&mut h, 0xDA0C_0001u32.to_le_bytes()); // Chain ID
+            sha2::Digest::update(&mut h, chain_id.to_le_bytes()); // Chain ID
             sha2::Digest::update(&mut h, utxo.txid.as_bytes());
             sha2::Digest::update(&mut h, utxo.index.to_le_bytes());
             sha2::Digest::update(&mut h, to_address.as_bytes());

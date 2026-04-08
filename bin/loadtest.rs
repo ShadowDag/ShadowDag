@@ -84,7 +84,7 @@ fn main() {
         let from_idx = tx_count as usize % wallets.len();
         let to_idx = (tx_count as usize + 1) % wallets.len();
 
-        let tx = generate_test_tx(
+        let tx = generate_test_tx_invalid(
             &wallets[from_idx].address,
             &wallets[to_idx].address,
             tx_count,
@@ -182,7 +182,14 @@ fn rpc_submit_tx(addr: &str, tx: &Transaction, id: u64, token: &str) -> Result<S
                 let trimmed = line.trim();
                 if trimmed.is_empty() { break; }
                 if trimmed.len() > 15 && trimmed[..15].eq_ignore_ascii_case("content-length:") {
-                    content_length = trimmed[15..].trim().parse().unwrap_or(0);
+                    let cl_str = trimmed[15..].trim();
+                    content_length = match cl_str.parse() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            eprintln!("[loadtest] Warning: invalid Content-Length '{}', reading up to 65536", cl_str);
+                            65536
+                        }
+                    };
                 }
             }
             Err(e) => return Err(NetworkError::Other(format!("read header: {}", e))),
@@ -213,7 +220,13 @@ fn rpc_submit_tx(addr: &str, tx: &Transaction, id: u64, token: &str) -> Result<S
     Ok(response)
 }
 
-fn generate_test_tx(from: &str, to: &str, seq: u64) -> Transaction {
+/// Generate a deliberately INVALID test transaction for load testing.
+/// These transactions will be REJECTED by validators — this measures
+/// the rejection throughput path, not acceptance throughput.
+/// Fields like "loadtest_sig" and "loadtest_pk" are fake placeholders
+/// that will fail signature verification.
+/// TODO: generate cryptographically valid transactions for acceptance testing.
+fn generate_test_tx_invalid(from: &str, to: &str, seq: u64) -> Transaction {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -262,13 +275,18 @@ fn parse_flag_opt(args: &[String], name: &str) -> Option<String> {
         if arg == name {
             return match args.get(i + 1) {
                 Some(val) if !val.starts_with("--") => Some(val.clone()),
-                _ => None,
+                _ => {
+                    eprintln!("[loadtest] Error: {} requires a value (e.g. {}=VALUE)", name, name);
+                    std::process::exit(1);
+                }
             };
         }
         if let Some(val) = arg.strip_prefix(&format!("{}=", name)) {
-            if !val.is_empty() {
-                return Some(val.to_string());
+            if val.is_empty() {
+                eprintln!("[loadtest] Error: {} requires a non-empty value", name);
+                std::process::exit(1);
             }
+            return Some(val.to_string());
         }
     }
     None
