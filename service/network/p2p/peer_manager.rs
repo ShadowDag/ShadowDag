@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use crate::errors::NetworkError;
-use crate::slog_warn;
+use crate::{slog_warn, slog_error};
 use crate::service::network::dos_guard::BanCategory;
 
 pub const BAN_DURATION_SECS:        u64   = 86_400;
@@ -262,9 +262,15 @@ impl PeerManager {
     }
 
     pub fn get_peer(&self, addr: &str) -> Option<PeerRecord> {
-        let db   = self.lock_db();
-        let data = db.get(format!("{}{}", PFX_PEER, addr).as_bytes()).ok()??;
-        bincode::deserialize(&data).ok()
+        let db = self.lock_db();
+        match db.get(format!("{}{}", PFX_PEER, addr).as_bytes()) {
+            Ok(Some(data)) => bincode::deserialize(&data).ok(),
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("p2p", "peer_manager_read_failed", op => "get_peer", error => &e.to_string());
+                None
+            }
+        }
     }
 
     pub fn update_peer_height(&self, addr: &str, height: u64) {
@@ -279,7 +285,9 @@ impl PeerManager {
                 }
             }
         }
-        let _ = db.write(batch);
+        if let Err(e) = db.write(batch) {
+            slog_error!("p2p", "peer_manager_write_failed", op => "update_peer_height", error => &e.to_string());
+        }
     }
 
     pub fn update_peer_latency(&self, addr: &str, latency_ms: u64) {
@@ -294,7 +302,9 @@ impl PeerManager {
                 }
             }
         }
-        let _ = db.write(batch);
+        if let Err(e) = db.write(batch) {
+            slog_error!("p2p", "peer_manager_write_failed", op => "update_peer_latency", error => &e.to_string());
+        }
     }
 
     pub fn touch_peer(&self, addr: &str) {
@@ -311,7 +321,9 @@ impl PeerManager {
                 }
             }
         }
-        let _ = db.write(batch);
+        if let Err(e) = db.write(batch) {
+            slog_error!("p2p", "peer_manager_write_failed", op => "touch_peer", error => &e.to_string());
+        }
     }
 
     pub fn get_peers(&self) -> Vec<String> {
@@ -361,7 +373,9 @@ impl PeerManager {
         let mut batch = WriteBatch::default();
         batch.put(format!("{}{}", PFX_BAN, addr).as_bytes(), until.to_le_bytes());
         batch.put(format!("{}{}", PFX_BAN_COUNT, addr).as_bytes(), ban_count.to_le_bytes());
-        let _ = db.write(batch);
+        if let Err(e) = db.write(batch) {
+            slog_error!("p2p", "peer_manager_write_failed", op => "ban_peer", error => &e.to_string());
+        }
     }
 
     /// Ban with category-aware escalating duration.
@@ -379,7 +393,9 @@ impl PeerManager {
         batch.put(format!("{}{}", PFX_BAN, addr).as_bytes(), until.to_le_bytes());
         batch.put(format!("{}{}", PFX_BAN_COUNT, addr).as_bytes(), new_count.to_le_bytes());
         batch.put(format!("{}{}", PFX_BAN_CAT, addr).as_bytes(), [category as u8]);
-        let _ = db.write(batch);
+        if let Err(e) = db.write(batch) {
+            slog_error!("p2p", "peer_manager_write_failed", op => "ban_peer_categorized", error => &e.to_string());
+        }
         slog_warn!("p2p", "peer_banned", addr => addr, duration_secs => duration, ban_count => new_count, category => &format!("{:?}", category), reason => reason);
     }
 
@@ -500,13 +516,17 @@ impl PeerManager {
                 batch.put(&key, new_score.to_le_bytes());
             }
         }
-        let _ = db.write(batch);
+        if let Err(e) = db.write(batch) {
+            slog_error!("p2p", "peer_manager_write_failed", op => "decay_penalties", error => &e.to_string());
+        }
     }
 
     pub fn store_addr(&self, addr: &str) {
         let db = self.lock_db();
-        let _  = db.put(format!("{}{}", PFX_ADDR, addr).as_bytes(),
-                        unix_now().to_le_bytes());
+        if let Err(e) = db.put(format!("{}{}", PFX_ADDR, addr).as_bytes(),
+                               unix_now().to_le_bytes()) {
+            slog_error!("p2p", "peer_manager_write_failed", op => "store_addr", error => &e.to_string());
+        }
         drop(db);
         self.evict_addr_cache_if_full();
         let mut cache = self.addr_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -522,7 +542,9 @@ impl PeerManager {
         for addr in addrs {
             batch.put(format!("{}{}", PFX_ADDR, addr).as_bytes(), now);
         }
-        let _ = db.write(batch);
+        if let Err(e) = db.write(batch) {
+            slog_error!("p2p", "peer_manager_write_failed", op => "add_addr_batch", error => &e.to_string());
+        }
     }
 
     pub fn get_addr_list(&self) -> Vec<String> {
@@ -559,11 +581,19 @@ impl PeerManager {
 
     fn conn_count_for_ip(&self, ip: &str) -> u32 {
         let db = self.lock_db();
-        db.get(format!("{}{}", PFX_CONN_COUNT, ip).as_bytes())
-            .ok()
-            .flatten()
-            .and_then(|d| d.get(..4).and_then(|s| s.try_into().ok()).map(u32::from_le_bytes))
-            .unwrap_or(0)
+        match db.get(format!("{}{}", PFX_CONN_COUNT, ip).as_bytes()) {
+            Ok(Some(data)) => {
+                data.get(..4)
+                    .and_then(|s| s.try_into().ok())
+                    .map(u32::from_le_bytes)
+                    .unwrap_or(0)
+            }
+            Ok(None) => 0,
+            Err(e) => {
+                slog_error!("p2p", "peer_manager_read_failed", op => "conn_count_for_ip", error => &e.to_string());
+                0
+            }
+        }
     }
 
     pub fn has_enough_peers(&self, min: usize) -> bool {
@@ -572,11 +602,19 @@ impl PeerManager {
 
     pub fn get_peer_height(&self, addr: &str) -> u64 {
         let db = self.lock_db();
-        db.get(format!("{}{}", PFX_HEIGHT, addr).as_bytes())
-            .ok()
-            .flatten()
-            .and_then(|d| d.get(..8).and_then(|s| s.try_into().ok()).map(u64::from_le_bytes))
-            .unwrap_or(0)
+        match db.get(format!("{}{}", PFX_HEIGHT, addr).as_bytes()) {
+            Ok(Some(data)) => {
+                data.get(..8)
+                    .and_then(|s| s.try_into().ok())
+                    .map(u64::from_le_bytes)
+                    .unwrap_or(0)
+            }
+            Ok(None) => 0,
+            Err(e) => {
+                slog_error!("p2p", "peer_manager_read_failed", op => "get_peer_height", error => &e.to_string());
+                0
+            }
+        }
     }
 
     /// Read the stored latency for a peer (stored separately from PeerRecord).
