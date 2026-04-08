@@ -1440,4 +1440,446 @@ mod tests {
         assert!(matches!(result, CallOutcome::Success { .. }));
         assert!(env.destroyed_contracts.contains("contract"));
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  Integration tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn deploy_and_call_contract() {
+        // Deploy: code that stores calldata[0..32] into slot 0, then STOPs
+        // PUSH1 0 (offset), CALLDATALOAD, PUSH1 0 (slot), SSTORE, STOP
+        let runtime_code: Vec<u8> = vec![
+            0x10, 0,    // PUSH1 0 (offset)
+            0xC0,       // CALLDATALOAD
+            0x10, 0,    // PUSH1 0 (slot)
+            0x51,       // SSTORE  (stores calldata[0..32] at slot 0)
+            0x00,       // STOP
+        ];
+
+        let mut env = make_env();
+        env.state.set_code("contract1", runtime_code).unwrap();
+
+        // Call with calldata = [0,0,0,...,42] (U256 value 42)
+        let mut calldata = vec![0u8; 32];
+        calldata[31] = 42; // big-endian: value = 42
+
+        let ctx = CallContext {
+            address: "contract1".into(),
+            code_address: "contract1".into(),
+            caller: "user1".into(),
+            value: 0,
+            gas_limit: 1_000_000,
+            calldata,
+            is_static: false,
+            depth: 0,
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(matches!(result, CallOutcome::Success { .. }), "Contract call should succeed");
+
+        // Verify storage was written
+        let stored = env.state.storage_load("contract1", "slot:0");
+        assert!(stored.is_some(), "Slot 0 should have a value");
+    }
+
+    #[test]
+    fn contract_a_calls_contract_b() {
+        let mut env = make_env();
+        env.state.set_balance("user", 10000).unwrap();
+
+        // Contract B: just stores CALLVALUE into slot 0, then STOP
+        // CALLVALUE, PUSH1 0, SSTORE, STOP
+        let code_b: Vec<u8> = vec![0x71, 0x10, 0, 0x51, 0x00];
+        env.state.set_code("contract_b", code_b).unwrap();
+
+        // Contract A: CALLs contract B with value=50
+        // Stack for CALL: gas, addr, value, argsOffset, argsLen, retOffset, retLen
+        // We push in reverse order so the first pop is gas:
+        // PUSH1 0 (retLen), PUSH1 0 (retOffset), PUSH1 0 (argsLen), PUSH1 0 (argsOffset),
+        // PUSH1 50 (value), PUSH1 addr, PUSH4 gas, CALL, STOP
+        //
+        // Set up contract B also at address "0b" so we can push a small numeric address
+        env.state.set_code("0b", vec![0x71, 0x10, 0, 0x51, 0x00]).unwrap();
+
+        let code_a: Vec<u8> = vec![
+            0x10, 0,     // PUSH1 0 (retLen)
+            0x10, 0,     // PUSH1 0 (retOffset)
+            0x10, 0,     // PUSH1 0 (argsLen)
+            0x10, 0,     // PUSH1 0 (argsOffset)
+            0x10, 50,    // PUSH1 50 (value)
+            0x10, 0x0b,  // PUSH1 0x0b (target addr)
+            0x12, 0x00, 0x00, 0xC3, 0x50, // PUSH4 50000 (gas)
+            0xB0,        // CALL
+            0x00,        // STOP
+        ];
+        env.state.set_code("contract_a", code_a).unwrap();
+        env.state.set_balance("contract_a", 1000).unwrap();
+
+        let ctx = CallContext {
+            address: "contract_a".into(),
+            code_address: "contract_a".into(),
+            caller: "user".into(),
+            value: 0,
+            gas_limit: 1_000_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(matches!(result, CallOutcome::Success { .. }), "A calling B should succeed");
+    }
+
+    #[test]
+    fn staticcall_prevents_sstore_in_nested_call() {
+        let mut env = make_env();
+
+        // Target contract tries SSTORE -- should fail under STATICCALL
+        env.state.set_code("target", vec![0x10, 1, 0x10, 0, 0x51, 0x00]).unwrap();
+
+        let ctx = CallContext {
+            address: "target".into(),
+            code_address: "target".into(),
+            caller: "user".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: true,
+            depth: 0,
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(matches!(result, CallOutcome::Failure { .. }), "SSTORE in static context must fail");
+
+        // Verify no storage was written
+        assert!(env.state.storage_load("target", "slot:0").is_none());
+    }
+
+    #[test]
+    fn delegatecall_writes_to_callers_storage() {
+        let mut env = make_env();
+
+        // Library code: stores value 42 in slot 0, then STOP
+        // PUSH1 42, PUSH1 0, SSTORE, STOP
+        env.state.set_code("library", vec![0x10, 42, 0x10, 0, 0x51, 0x00]).unwrap();
+
+        // Execute via DELEGATECALL context: address="caller_contract" but code_address="library"
+        let ctx = CallContext {
+            address: "caller_contract".into(),     // storage context
+            code_address: "library".into(),        // code source
+            caller: "user".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(matches!(result, CallOutcome::Success { .. }));
+
+        // Storage written to CALLER's contract, not library's
+        assert!(env.state.storage_load("caller_contract", "slot:0").is_some(),
+            "Storage should be in caller_contract");
+        assert!(env.state.storage_load("library", "slot:0").is_none(),
+            "Library storage should be untouched");
+    }
+
+    #[test]
+    fn revert_discards_all_state() {
+        let mut env = make_env();
+
+        // Contract: SSTORE(slot=0, val=99), then REVERT
+        // PUSH1 99, PUSH1 0, SSTORE, PUSH1 0, PUSH1 0, REVERT
+        let code: Vec<u8> = vec![
+            0x10, 99,   // PUSH1 99
+            0x10, 0,    // PUSH1 0
+            0x51,       // SSTORE
+            0x10, 0,    // PUSH1 0 (size)
+            0x10, 0,    // PUSH1 0 (offset)
+            0xB7,       // REVERT
+        ];
+        env.state.set_code("contract", code).unwrap();
+
+        let ctx = CallContext {
+            address: "contract".into(),
+            code_address: "contract".into(),
+            caller: "user".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(matches!(result, CallOutcome::Revert { .. }));
+
+        // Storage should NOT have the value (reverted)
+        assert!(env.state.storage_load("contract", "slot:0").is_none(),
+            "REVERT should discard SSTORE");
+    }
+
+    #[test]
+    fn calldatasize_returns_correct_length() {
+        let mut env = make_env();
+        // CALLDATASIZE, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
+        let code: Vec<u8> = vec![
+            0xC1,       // CALLDATASIZE
+            0x10, 0,    // PUSH1 0
+            0x91,       // MSTORE
+            0x10, 32,   // PUSH1 32
+            0x10, 0,    // PUSH1 0
+            0xB6,       // RETURN
+        ];
+        env.state.set_code("c", code).unwrap();
+
+        let ctx = CallContext {
+            address: "c".into(), code_address: "c".into(),
+            caller: "u".into(), value: 0, gas_limit: 100_000,
+            calldata: vec![1, 2, 3, 4, 5], // 5 bytes
+            is_static: false, depth: 0,
+        };
+        let result = env.execute_frame(&ctx);
+        match result {
+            CallOutcome::Success { return_data, .. } => {
+                assert_eq!(return_data.len(), 32);
+                // Last byte should be 5 (calldata length)
+                assert_eq!(return_data[31], 5);
+            }
+            _ => panic!("Expected success"),
+        }
+    }
+
+    #[test]
+    fn return_data_from_memory() {
+        let mut env = make_env();
+        // Store 0xDEAD in memory[0..32], then RETURN(offset=30, size=2)
+        // PUSH2 0xDEAD, PUSH1 0, MSTORE, PUSH1 2, PUSH1 30, RETURN
+        let code: Vec<u8> = vec![
+            0x11, 0xDE, 0xAD, // PUSH2 0xDEAD
+            0x10, 0,           // PUSH1 0
+            0x91,              // MSTORE
+            0x10, 2,           // PUSH1 2 (size)
+            0x10, 30,          // PUSH1 30 (offset)
+            0xB6,              // RETURN
+        ];
+        env.state.set_code("c", code).unwrap();
+        let ctx = CallContext {
+            address: "c".into(), code_address: "c".into(),
+            caller: "u".into(), value: 0, gas_limit: 100_000,
+            calldata: vec![], is_static: false, depth: 0,
+        };
+        let result = env.execute_frame(&ctx);
+        match result {
+            CallOutcome::Success { return_data, .. } => {
+                assert_eq!(return_data.len(), 2);
+                assert_eq!(return_data, vec![0xDE, 0xAD]);
+            }
+            _ => panic!("Expected success with return data"),
+        }
+    }
+
+    #[test]
+    fn out_of_gas_returns_failure() {
+        let mut env = make_env();
+        // Infinite loop: JUMPDEST, PUSH1 0, JUMP
+        let code: Vec<u8> = vec![
+            0x82,      // JUMPDEST at position 0
+            0x10, 0,   // PUSH1 0
+            0x80,      // JUMP back to 0
+        ];
+        env.state.set_code("c", code).unwrap();
+        let ctx = CallContext {
+            address: "c".into(), code_address: "c".into(),
+            caller: "u".into(), value: 0,
+            gas_limit: 100, // Very low gas
+            calldata: vec![], is_static: false, depth: 0,
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(matches!(result, CallOutcome::Failure { .. }), "Should run out of gas");
+    }
+
+    #[test]
+    fn storage_persists_across_calls() {
+        let mut env = make_env();
+
+        // First call: store value 77 in slot 5
+        // PUSH1 77, PUSH1 5, SSTORE, STOP
+        let code: Vec<u8> = vec![0x10, 77, 0x10, 5, 0x51, 0x00];
+        env.state.set_code("c", code).unwrap();
+
+        let ctx = CallContext {
+            address: "c".into(), code_address: "c".into(),
+            caller: "u".into(), value: 0, gas_limit: 100_000,
+            calldata: vec![], is_static: false, depth: 0,
+        };
+        env.execute_frame(&ctx);
+
+        // Second call: load slot 5, store it in slot 6
+        // PUSH1 5, SLOAD, PUSH1 6, SSTORE, STOP
+        let code2: Vec<u8> = vec![0x10, 5, 0x50, 0x10, 6, 0x51, 0x00];
+        env.state.set_code("c", code2).unwrap();
+
+        let ctx2 = CallContext {
+            address: "c".into(), code_address: "c".into(),
+            caller: "u".into(), value: 0, gas_limit: 100_000,
+            calldata: vec![], is_static: false, depth: 0,
+        };
+        let result = env.execute_frame(&ctx2);
+        assert!(matches!(result, CallOutcome::Success { .. }));
+
+        // Verify slot 6 has the value copied from slot 5
+        let val = env.state.storage_load("c", "slot:6");
+        assert!(val.is_some(), "Slot 6 should have value copied from slot 5");
+    }
+
+    #[test]
+    fn codesize_returns_correct_value() {
+        let mut env = make_env();
+        // CODESIZE, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
+        let code: Vec<u8> = vec![
+            0xC3,       // CODESIZE
+            0x10, 0,    // PUSH1 0
+            0x91,       // MSTORE
+            0x10, 32,   // PUSH1 32 (size)
+            0x10, 0,    // PUSH1 0 (offset)
+            0xB6,       // RETURN
+        ];
+        let code_len = code.len(); // 9 bytes
+        env.state.set_code("c", code).unwrap();
+        let ctx = CallContext {
+            address: "c".into(), code_address: "c".into(),
+            caller: "u".into(), value: 0, gas_limit: 100_000,
+            calldata: vec![], is_static: false, depth: 0,
+        };
+        let result = env.execute_frame(&ctx);
+        match result {
+            CallOutcome::Success { return_data, .. } => {
+                assert_eq!(return_data.len(), 32);
+                assert_eq!(return_data[31], code_len as u8, "CODESIZE should equal code length");
+            }
+            _ => panic!("Expected success"),
+        }
+    }
+
+    #[test]
+    fn log_emits_event_entry() {
+        let mut env = make_env();
+        // PUSH1 0xFF, LOG0, STOP
+        let code: Vec<u8> = vec![
+            0x10, 0xFF, // PUSH1 0xFF (data value)
+            0xA0,       // LOG0
+            0x00,       // STOP
+        ];
+        env.state.set_code("c", code).unwrap();
+        let ctx = CallContext {
+            address: "c".into(), code_address: "c".into(),
+            caller: "u".into(), value: 0, gas_limit: 100_000,
+            calldata: vec![], is_static: false, depth: 0,
+        };
+        let result = env.execute_frame(&ctx);
+        match result {
+            CallOutcome::Success { logs, .. } => {
+                assert!(!logs.is_empty(), "Should have at least one log entry");
+                assert_eq!(logs[0].contract, "c");
+            }
+            _ => panic!("Expected success with logs"),
+        }
+    }
+
+    #[test]
+    fn dup2_duplicates_second_element() {
+        let mut env = make_env();
+        // PUSH1 10, PUSH1 20, DUP2 (should dup 10), PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
+        let code: Vec<u8> = vec![
+            0x10, 10,   // PUSH1 10  (bottom)
+            0x10, 20,   // PUSH1 20  (top)
+            0xD0,       // DUP2 (duplicate 10)
+            0x10, 0,    // PUSH1 0
+            0x91,       // MSTORE
+            0x10, 32,   // PUSH1 32
+            0x10, 0,    // PUSH1 0
+            0xB6,       // RETURN
+        ];
+        env.state.set_code("c", code).unwrap();
+        let ctx = CallContext {
+            address: "c".into(), code_address: "c".into(),
+            caller: "u".into(), value: 0, gas_limit: 100_000,
+            calldata: vec![], is_static: false, depth: 0,
+        };
+        let result = env.execute_frame(&ctx);
+        match result {
+            CallOutcome::Success { return_data, .. } => {
+                assert_eq!(return_data[31], 10, "DUP2 should duplicate second element (10)");
+            }
+            _ => panic!("Expected success"),
+        }
+    }
+
+    #[test]
+    fn selfdestruct_not_same_tx_only_transfers() {
+        let mut env = make_env();
+        env.state.set_balance("contract", 500).unwrap();
+        env.state.set_balance("beneficiary", 100).unwrap();
+        // NOT in created_in_tx -- so EIP-6780 means only transfer, no destroy
+
+        let code: Vec<u8> = vec![
+            0x10, 0x01, // PUSH1 1 (beneficiary addr as small number)
+            0xB8,       // SELFDESTRUCT
+        ];
+        env.state.set_code("contract", code).unwrap();
+        let ctx = CallContext {
+            address: "contract".into(), code_address: "contract".into(),
+            caller: "user".into(), value: 0, gas_limit: 100_000,
+            calldata: vec![], is_static: false, depth: 0,
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(matches!(result, CallOutcome::Success { .. }));
+        // Contract should NOT be in destroyed set (EIP-6780)
+        assert!(!env.destroyed_contracts.contains("contract"),
+            "Contract not created in this tx should NOT be destroyed");
+    }
+
+    #[test]
+    fn call_with_insufficient_balance_fails() {
+        let mut env = make_env();
+        env.state.set_balance("sender", 10).unwrap(); // Only 10
+        env.state.set_code("target", vec![0x00]).unwrap(); // STOP
+
+        // Try to send 1000 (more than balance)
+        let ctx = CallContext {
+            address: "target".into(), code_address: "target".into(),
+            caller: "sender".into(), value: 1000, gas_limit: 100_000,
+            calldata: vec![], is_static: false, depth: 0,
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(matches!(result, CallOutcome::Failure { .. }), "Insufficient balance should fail");
+    }
+
+    #[test]
+    fn gas_opcode_returns_remaining() {
+        let mut env = make_env();
+        // GAS, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
+        let code: Vec<u8> = vec![
+            0x03,       // GAS
+            0x10, 0,    // PUSH1 0
+            0x91,       // MSTORE
+            0x10, 32,   // PUSH1 32
+            0x10, 0,    // PUSH1 0
+            0xB6,       // RETURN
+        ];
+        env.state.set_code("c", code).unwrap();
+        let ctx = CallContext {
+            address: "c".into(), code_address: "c".into(),
+            caller: "u".into(), value: 0, gas_limit: 100_000,
+            calldata: vec![], is_static: false, depth: 0,
+        };
+        let result = env.execute_frame(&ctx);
+        match result {
+            CallOutcome::Success { return_data, .. } => {
+                // Gas should be a non-zero value less than 100_000
+                let gas_val = return_data.iter().fold(0u64, |acc, &b| acc * 256 + b as u64);
+                assert!(gas_val > 0 && gas_val < 100_000,
+                    "GAS should return remaining gas, got {}", gas_val);
+            }
+            _ => panic!("Expected success"),
+        }
+    }
 }
