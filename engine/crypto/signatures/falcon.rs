@@ -13,6 +13,7 @@ use rocksdb::{
 };
 
 use std::path::Path;
+use crate::slog_error;
 
 // ─────────────────────────────────────────
 // PREFIX
@@ -158,24 +159,34 @@ impl FalconStore {
 
     pub fn store_signature_raw(&self, key: &str, sig: &[u8]) {
         Self::with_key(SIG_PREFIX, key, |k| {
-            let _ = self.db.put_opt(k, sig, &self.write_opts);
+            if let Err(e) = self.db.put_opt(k, sig, &self.write_opts) {
+                slog_error!("crypto", "falcon_store_sig_failed", error => e);
+            }
         });
     }
 
     pub fn get_signature_raw(&self, key: &str) -> Option<Vec<u8>> {
         Self::with_key(SIG_PREFIX, key, |k| {
-            self.db.get_pinned_opt(k, &self.read_opts)
-                .ok()
-                .flatten()
-                .map(|v| v.to_vec())
+            match self.db.get_pinned_opt(k, &self.read_opts) {
+                Ok(Some(v)) => Some(v.to_vec()),
+                Ok(None) => None,
+                Err(e) => {
+                    slog_error!("crypto", "falcon_read_sig_failed", error => e);
+                    None
+                }
+            }
         })
     }
 
     pub fn signature_exists(&self, key: &str) -> bool {
         Self::with_key(SIG_PREFIX, key, |k| {
-            self.db.get_pinned_opt(k, &self.read_opts)
-                .map(|v| v.is_some())
-                .unwrap_or(false)
+            match self.db.get_pinned_opt(k, &self.read_opts) {
+                Ok(v) => v.is_some(),
+                Err(e) => {
+                    slog_error!("crypto", "falcon_sig_exists_failed", error => e);
+                    false
+                }
+            }
         })
     }
 
@@ -184,13 +195,21 @@ impl FalconStore {
 
         self.db.multi_get(db_keys)
             .into_iter()
-            .map(|r| r.ok().flatten().map(|v| v.to_vec()))
+            .map(|r| match r {
+                Ok(opt) => opt.map(|v| v.to_vec()),
+                Err(e) => {
+                    slog_error!("crypto", "falcon_multi_read_sig_failed", error => e);
+                    None
+                }
+            })
             .collect()
     }
 
     pub fn delete_signature(&self, key: &str) {
         Self::with_key(SIG_PREFIX, key, |k| {
-            let _ = self.db.delete_opt(k, &self.write_opts);
+            if let Err(e) = self.db.delete_opt(k, &self.write_opts) {
+                slog_error!("crypto", "falcon_delete_sig_failed", error => e);
+            }
         });
     }
 
@@ -200,24 +219,34 @@ impl FalconStore {
 
     pub fn store_public_key_raw(&self, key: &str, pk: &[u8]) {
         Self::with_key(PK_PREFIX, key, |k| {
-            let _ = self.db.put_opt(k, pk, &self.write_opts);
+            if let Err(e) = self.db.put_opt(k, pk, &self.write_opts) {
+                slog_error!("crypto", "falcon_store_pk_failed", error => e);
+            }
         });
     }
 
     pub fn get_public_key_raw(&self, key: &str) -> Option<Vec<u8>> {
         Self::with_key(PK_PREFIX, key, |k| {
-            self.db.get_pinned_opt(k, &self.read_opts)
-                .ok()
-                .flatten()
-                .map(|v| v.to_vec())
+            match self.db.get_pinned_opt(k, &self.read_opts) {
+                Ok(Some(v)) => Some(v.to_vec()),
+                Ok(None) => None,
+                Err(e) => {
+                    slog_error!("crypto", "falcon_read_pk_failed", error => e);
+                    None
+                }
+            }
         })
     }
 
     pub fn public_key_exists(&self, key: &str) -> bool {
         Self::with_key(PK_PREFIX, key, |k| {
-            self.db.get_pinned_opt(k, &self.read_opts)
-                .map(|v| v.is_some())
-                .unwrap_or(false)
+            match self.db.get_pinned_opt(k, &self.read_opts) {
+                Ok(v) => v.is_some(),
+                Err(e) => {
+                    slog_error!("crypto", "falcon_pk_exists_failed", error => e);
+                    false
+                }
+            }
         })
     }
 
@@ -229,7 +258,9 @@ impl FalconStore {
         let iter = self.db.prefix_iterator(SIG_PREFIX);
         for (k, _) in iter.flatten() {
             if !k.starts_with(SIG_PREFIX) { break; }
-            let _ = self.db.delete(&*k);
+            if let Err(e) = self.db.delete(&*k) {
+                slog_error!("crypto", "falcon_clear_sig_failed", error => e);
+            }
         }
     }
 
@@ -237,7 +268,9 @@ impl FalconStore {
         let iter = self.db.prefix_iterator(PK_PREFIX);
         for (k, _) in iter.flatten() {
             if !k.starts_with(PK_PREFIX) { break; }
-            let _ = self.db.delete(&*k);
+            if let Err(e) = self.db.delete(&*k) {
+                slog_error!("crypto", "falcon_clear_pk_failed", error => e);
+            }
         }
     }
 }
