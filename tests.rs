@@ -62,3 +62,7 @@ pub mod proptest_security;
 pub mod proptest_safety;
 #[path = "tests/suite/edge_case_tests.rs"]
 pub mod edge_case_tests;
+
+// ── Contract lifecycle E2E tests ─────────────────────────────────────
+#[path = "tests/suite/contract_e2e_tests.rs"]
+pub mod contract_e2e_tests;

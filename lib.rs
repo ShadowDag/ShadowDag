@@ -435,6 +435,7 @@ pub mod indexes {
     pub mod utxo_index;
     pub mod tx_index;
     pub mod explorer;
+    pub mod receipt_index;
 }
 
 pub mod cache {
