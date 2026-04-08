@@ -112,11 +112,25 @@ impl ConfirmedTxStore {
             // Extract tx_hash from key
             let tx_hash_bytes = &key[prefix.len()..];
             if let Ok(tx_hash) = std::str::from_utf8(tx_hash_bytes) {
-                // Delete ctx:tx_hash entry
+                // Only delete ctx:tx_hash if the stored height matches the one being unconfirmed.
+                // If another confirmation superseded this one, leave the ctx entry intact.
                 let mut ctx_key = Vec::with_capacity(PFX_CTX.len() + tx_hash.len());
                 ctx_key.extend_from_slice(PFX_CTX);
                 ctx_key.extend_from_slice(tx_hash.as_bytes());
-                batch.delete(&ctx_key);
+
+                let should_delete = match self.db.get_pinned_opt(&ctx_key, &self.read_opts) {
+                    Ok(Some(stored)) if stored.len() >= 8 => {
+                        let stored_height = u64::from_be_bytes(
+                            stored[..8].try_into().unwrap_or([0; 8]),
+                        );
+                        stored_height == height
+                    }
+                    _ => false,
+                };
+
+                if should_delete {
+                    batch.delete(&ctx_key);
+                }
 
                 removed.push(tx_hash.to_string());
             }
@@ -182,13 +196,27 @@ impl ConfirmedTxStore {
                 break; // Keys are ordered by height (BE), so we're done
             }
 
-            // Extract tx_hash and delete ctx entry
+            // Extract tx_hash and delete ctx entry only if stored height matches
             if key.len() > PFX_BTX.len() + 9 {
                 let tx_hash_bytes = &key[PFX_BTX.len() + 9..]; // skip height + ':'
                 let mut ctx_key = Vec::with_capacity(PFX_CTX.len() + tx_hash_bytes.len());
                 ctx_key.extend_from_slice(PFX_CTX);
                 ctx_key.extend_from_slice(tx_hash_bytes);
-                batch.delete(&ctx_key);
+
+                let should_delete = match self.db.get_pinned_opt(&ctx_key, &self.read_opts) {
+                    Ok(Some(stored)) if stored.len() >= 8 => {
+                        let stored_height = u64::from_be_bytes(
+                            stored[..8].try_into().unwrap_or([0; 8]),
+                        );
+                        // Only delete if the ctx entry still points to this (old) height
+                        stored_height == height
+                    }
+                    _ => false,
+                };
+
+                if should_delete {
+                    batch.delete(&ctx_key);
+                }
             }
 
             batch.delete(&*key);

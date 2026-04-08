@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
 use crate::errors::StorageError;
-use crate::{slog_warn, slog_error};
+use crate::slog_error;
 
 pub const LOCK_TTL_SECS:    u64 = 10_800;
 pub const MAX_LOCKS_PER_TX: usize = 50;
@@ -102,11 +102,20 @@ impl DoubleSpendProtector {
         match Self::new(&dsp_path.to_string_lossy()) {
             Ok(dsp) => Ok(dsp),
             Err(e) => {
-                slog_warn!("consensus", "dsp_store_open_failed", error => &e.to_string());
-                let fallback = std::env::temp_dir().join(format!("shadowdag_dsp_{}", std::process::id()));
-                Self::new(&fallback.to_string_lossy()).inspect_err(|e2| {
-                    slog_error!("consensus", "dsp_fallback_failed", error => &e2.to_string());
-                })
+                slog_error!("consensus", "dsp_store_open_failed", error => &e.to_string());
+
+                // In production, fail fast — silent temp-dir fallback masks data loss
+                #[cfg(not(test))]
+                return Err(e);
+
+                // In tests, fall back to temp dir so unit tests don't need real data dirs
+                #[cfg(test)]
+                {
+                    let fallback = std::env::temp_dir().join(format!("shadowdag_dsp_{}", std::process::id()));
+                    Self::new(&fallback.to_string_lossy()).inspect_err(|e2| {
+                        slog_error!("consensus", "dsp_fallback_failed", error => &e2.to_string());
+                    })
+                }
             }
         }
     }
@@ -263,19 +272,33 @@ impl DoubleSpendProtector {
 
         Self::build_key(&mut key, PFX_SPENT, &suffix);
 
-        if let Ok(Some(_)) = self.db.get_opt(&key, &self.read_opts) {
-            return SpendStatus::ConfirmedSpent;
+        match self.db.get_opt(&key, &self.read_opts) {
+            Ok(Some(_)) => return SpendStatus::ConfirmedSpent,
+            Ok(None) => {} // not spent — continue to lock check
+            Err(e) => {
+                // Conservative: treat read error as locked to prevent double-spend
+                slog_error!("dsp", "can_spend_spent_read_failed", error => &e.to_string());
+                return SpendStatus::LockedInMempool("DB_ERROR".into());
+            }
         }
 
         Self::build_key(&mut key, PFX_LOCK, &suffix);
 
-        if let Ok(Some(data)) = self.db.get_opt(&key, &self.read_opts) {
-            if let Ok(rec) = bincode::deserialize::<LockRecord>(&data) {
-                if !rec.is_expired(now) {
-                    return SpendStatus::LockedInMempool(
-                        String::from_utf8_lossy(&rec.locked_by).to_string()
-                    );
+        match self.db.get_opt(&key, &self.read_opts) {
+            Ok(Some(data)) => {
+                if let Ok(rec) = bincode::deserialize::<LockRecord>(&data) {
+                    if !rec.is_expired(now) {
+                        return SpendStatus::LockedInMempool(
+                            String::from_utf8_lossy(&rec.locked_by).to_string()
+                        );
+                    }
                 }
+            }
+            Ok(None) => {} // no lock — free
+            Err(e) => {
+                // Conservative: treat read error as locked to prevent double-spend
+                slog_error!("dsp", "can_spend_lock_read_failed", error => &e.to_string());
+                return SpendStatus::LockedInMempool("DB_ERROR".into());
             }
         }
 
@@ -324,7 +347,10 @@ impl DoubleSpendProtector {
         }
 
         if count > 0 {
-            let _ = self.db.write(batch);
+            if let Err(e) = self.db.write(batch) {
+                slog_error!("dsp", "evict_locks_write_failed", error => &e.to_string());
+                return 0; // Nothing was actually evicted
+            }
         }
 
         count

@@ -184,8 +184,8 @@ impl Bulletproof {
             + 32                      // challenge
             + 32;                     // value binding
 
-        if proof.proof_bytes.len() < expected_size {
-            return false;
+        if proof.proof_bytes.len() != expected_size {
+            return false; // Reject both undersized AND oversized proofs
         }
 
         // Extract bit commitments
@@ -332,9 +332,25 @@ impl Bulletproof {
         AggregatedProof { proofs, total_valid, aggregate_hash }
     }
 
-    /// Verify all proofs in a batch
+    /// Verify all proofs in a batch, including the aggregate hash.
+    ///
+    /// The aggregate hash binds all individual proofs together, preventing
+    /// an attacker from substituting individual proofs within a batch.
     pub fn verify_batch(batch: &AggregatedProof) -> bool {
         if batch.proofs.is_empty() { return false; }
+
+        // Recompute aggregate hash and verify it matches
+        let mut h = Sha256::new();
+        h.update(b"ShadowDAG_BatchProof_v2");
+        for p in &batch.proofs {
+            h.update(&p.proof_bytes);
+        }
+        let expected_hash = hex::encode(h.finalize());
+
+        if expected_hash != batch.aggregate_hash {
+            return false; // Batch was tampered with — proof substitution detected
+        }
+
         batch.proofs.iter().all(Self::verify_range_proof)
     }
 
