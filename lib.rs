@@ -304,6 +304,7 @@ pub mod runtime {
             pub mod contract;
             pub mod contract_abi;
             pub mod contract_deployer;
+            pub mod contract_package;
             pub mod contract_storage;
             pub mod token_standard;
         }
