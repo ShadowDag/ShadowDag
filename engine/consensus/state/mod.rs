@@ -77,6 +77,10 @@ impl ConsensusState {
     /// Automatically recovers all state from DB — the caller does NOT need
     /// to call `recover_from_db()` separately. This prevents the bug where
     /// someone forgets to call recovery and the node runs with empty state.
+    ///
+    /// Panics if recovery encounters corruption (iterator errors, unreadable
+    /// chain state). A node with partially recovered consensus state is
+    /// dangerous — it's safer to crash than to run with gaps.
     pub fn new_with_db(db: Arc<rocksdb::DB>) -> Self {
         let mut s = Self {
             block_data: HashMap::new(),
@@ -85,7 +89,14 @@ impl ConsensusState {
             chain_path_cache: Vec::new(),
             db: Some(db),
         };
-        s.recover_from_db();
+        if let Err(e) = s.recover_from_db() {
+            slog_error!("consensus", "fatal_recovery_failure", error => e);
+            panic!(
+                "ConsensusState recovery failed: {}. \
+                 Node cannot start with corrupt or partial consensus state.",
+                e
+            );
+        }
         slog_info!("consensus", "state_recovered", blocks => s.block_data.len(), tip => s.chain.selected_tip, blue_score => s.chain.best_blue_score);
         let issues = s.verify_consistency();
         if !issues.is_empty() {
@@ -96,12 +107,19 @@ impl ConsensusState {
 
     pub fn init_with_genesis(&mut self, genesis_hash: &str) {
         let data = BlockConsensusData::genesis(genesis_hash);
-        self.persist_block_data(&data);
+        // Persist block data FIRST — don't update memory if DB write fails
+        if let Err(e) = self.persist_block_data(&data) {
+            slog_error!("consensus", "genesis_persist_failed", error => e);
+            return;
+        }
         self.block_data.insert(genesis_hash.to_string(), data);
         self.chain.selected_tip = genesis_hash.to_string();
         self.chain.best_blue_score = 0;
         self.chain.best_height = 0;
-        self.persist_chain_state();
+        if let Err(e) = self.persist_chain_state() {
+            slog_error!("consensus", "genesis_chain_persist_failed", error => e);
+            // Block data already persisted — chain state will be rebuilt on recovery
+        }
         self.chain_path_cache.clear();
         self.chain_path_cache.push(genesis_hash.to_string());
     }
@@ -120,26 +138,41 @@ impl ConsensusState {
         let should_update = data.blue_score > self.chain.best_blue_score
             || (data.blue_score == self.chain.best_blue_score
                 && hash < self.chain.selected_tip);
+
+        // Persist block data to DB FIRST — if this fails, no memory mutation occurs
+        self.persist_block_data(&data)?;
+
         if data.is_chain_block && should_update {
+            // Save old chain state for rollback on persist failure
+            let old_tip = self.chain.selected_tip.clone();
+            let old_score = self.chain.best_blue_score;
+            let old_height = self.chain.best_height;
+
             self.chain.selected_tip = hash.clone();
             self.chain.best_blue_score = data.blue_score;
             self.chain.best_height = data.height;
-            self.chain_path_cache.clear(); // 🔹 إعادة بناء cache لاحقًا عند الطلب
+
+            if let Err(e) = self.persist_chain_state() {
+                // Rollback memory to stay consistent with DB
+                self.chain.selected_tip = old_tip;
+                self.chain.best_blue_score = old_score;
+                self.chain.best_height = old_height;
+                return Err(e);
+            }
+
+            self.chain_path_cache.clear(); // 🔹 rebuild cache lazily on next access
         }
 
-        // Index all blocks colored blue by this block
+        // Memory updates ONLY after all DB writes succeeded
         for blue_hash in &data.blue_set {
             self.blue_blocks.insert(blue_hash.clone());
         }
-
-        self.persist_block_data(&data);
-        self.persist_chain_state();
         self.block_data.insert(hash, data);
         Ok(())
     }
 
     /// Persist a single block's consensus data to RocksDB.
-    fn persist_block_data(&self, data: &BlockConsensusData) {
+    fn persist_block_data(&self, data: &BlockConsensusData) -> Result<(), ConsensusError> {
         if let Some(db) = &self.db {
             let key = format!("{}{}", CS_PREFIX, data.hash);
             // Serialize as: blue_score|height|is_chain|selected_parent|blue_set|red_set
@@ -156,12 +189,18 @@ impl ConsensusState {
             );
             if let Err(e) = db.put(key.as_bytes(), val.as_bytes()) {
                 slog_error!("consensus", "persist_block_data_failed", error => e);
+                return Err(ConsensusError::Storage(
+                    crate::errors::StorageError::WriteFailed(e.to_string()),
+                ));
             }
         }
+        Ok(())
     }
 
     /// Persist the chain state to RocksDB.
-    fn persist_chain_state(&self) {
+    /// Returns Err if the write fails — callers MUST handle this to avoid
+    /// divergence between in-memory state and on-disk state.
+    fn persist_chain_state(&self) -> Result<(), ConsensusError> {
         if let Some(db) = &self.db {
             let val = format!(
                 "{}|{}|{}|{}",
@@ -172,52 +211,88 @@ impl ConsensusState {
             );
             if let Err(e) = db.put(CS_CHAIN_KEY.as_bytes(), val.as_bytes()) {
                 slog_error!("consensus", "persist_chain_state_failed", error => e);
+                return Err(ConsensusError::Storage(
+                    crate::errors::StorageError::WriteFailed(
+                        format!("persist_chain_state: {}", e)
+                    ),
+                ));
             }
         }
+        Ok(())
     }
 
     /// Recover the full consensus state from RocksDB on startup.
     /// Loads all block data and chain state from the database into the
     /// in-memory HashMap cache.
-    pub fn recover_from_db(&mut self) {
+    ///
+    /// Returns Err if:
+    /// - Chain state key exists but is unreadable (I/O error)
+    /// - Any block data iterator errors occur (corrupt/incomplete DB)
+    ///
+    /// A node with partially recovered state is dangerous — callers should
+    /// treat Err as fatal and refuse to start.
+    pub fn recover_from_db(&mut self) -> Result<(), ConsensusError> {
         let db = match &self.db {
             Some(db) => db.clone(),
-            None => return,
+            None => return Ok(()),
         };
 
-        // Recover chain state
-        if let Ok(Some(data)) = db.get(CS_CHAIN_KEY.as_bytes()) {
-            if let Ok(val) = String::from_utf8(data.to_vec()) {
-                let parts: Vec<&str> = val.splitn(4, '|').collect();
-                if parts.len() == 4 {
-                    self.chain.selected_tip = parts[0].to_string();
-                    self.chain.best_blue_score = match parts[1].parse() {
-                        Ok(v) => v,
-                        Err(e) => {
-                            slog_error!("consensus", "corrupted_best_blue_score", value => parts[1], error => e);
-                            0
-                        }
-                    };
-                    self.chain.best_height = match parts[2].parse() {
-                        Ok(v) => v,
-                        Err(e) => {
-                            slog_error!("consensus", "corrupted_best_height", value => parts[2], error => e);
-                            0
-                        }
-                    };
-                    self.chain.finality_point = if parts[3].is_empty() {
-                        None
-                    } else {
-                        Some(parts[3].to_string())
-                    };
+        // ── Recover chain state ─────────────────────────────────────────
+        match db.get(CS_CHAIN_KEY.as_bytes()) {
+            Ok(Some(data)) => {
+                if let Ok(val) = String::from_utf8(data.to_vec()) {
+                    let parts: Vec<&str> = val.splitn(4, '|').collect();
+                    if parts.len() == 4 {
+                        self.chain.selected_tip = parts[0].to_string();
+                        self.chain.best_blue_score = match parts[1].parse() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                slog_error!("consensus", "corrupted_best_blue_score", value => parts[1], error => e);
+                                0
+                            }
+                        };
+                        self.chain.best_height = match parts[2].parse() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                slog_error!("consensus", "corrupted_best_height", value => parts[2], error => e);
+                                0
+                            }
+                        };
+                        self.chain.finality_point = if parts[3].is_empty() {
+                            None
+                        } else {
+                            Some(parts[3].to_string())
+                        };
+                    }
                 }
+            }
+            Ok(None) => {
+                // No chain state in DB — fresh node, nothing to recover
+            }
+            Err(e) => {
+                slog_error!("consensus", "recovery_chain_state_failed", error => e);
+                return Err(ConsensusError::Storage(
+                    crate::errors::StorageError::ReadFailed(
+                        format!("chain state recovery: {}", e)
+                    ),
+                ));
             }
         }
 
-        // Recover block data by iterating prefix
+        // ── Recover block data by iterating prefix ───────────────────────
         let prefix = CS_PREFIX.as_bytes();
         let iter = db.prefix_iterator(prefix);
-        for (key, value) in iter.flatten() {
+        let mut iter_errors: u32 = 0;
+
+        for item in iter {
+            let (key, value) = match item {
+                Ok(kv) => kv,
+                Err(e) => {
+                    slog_error!("consensus", "recovery_iter_error", error => e);
+                    iter_errors += 1;
+                    continue;
+                }
+            };
             let key_str = match std::str::from_utf8(&key) {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -268,6 +343,19 @@ impl ConsensusState {
             }
         }
 
+        // Any iterator errors mean the DB is corrupt or partially readable.
+        // Refuse to continue with a gap-filled state.
+        if iter_errors > 0 {
+            return Err(ConsensusError::Storage(
+                crate::errors::StorageError::ReadFailed(
+                    format!(
+                        "recovery encountered {} iterator errors — consensus state may be corrupt",
+                        iter_errors
+                    )
+                ),
+            ));
+        }
+
         // Rebuild blue_blocks index from recovered data
         self.blue_blocks.clear();
         for data in self.block_data.values() {
@@ -277,6 +365,7 @@ impl ConsensusState {
         }
 
         self.chain_path_cache.clear();
+        Ok(())
     }
 
     pub fn get(&self, hash: &str) -> Option<&BlockConsensusData> {
@@ -328,7 +417,7 @@ impl ConsensusState {
     /// Callers should use `FinalityManager::current_depth()` for the dynamic depth
     /// instead of the static `FINALITY_DEPTH` constant.
     /// Blocks at or below the finality point are considered irreversible.
-    /// Returns the new finality point hash if updated.
+    /// Returns the new finality point hash if updated, None if unchanged or on error.
     pub fn update_finality(&mut self, depth: u64) -> Option<String> {
         let path = self.selected_chain_path();
         if path.len() as u64 > depth + 1 {
@@ -344,9 +433,15 @@ impl ConsensusState {
                 }
             }
             let changed = self.chain.finality_point.as_ref() != Some(&new_fp);
+            let old_fp = self.chain.finality_point.clone();
             self.chain.finality_point = Some(new_fp.clone());
             if changed {
-                self.persist_chain_state();
+                if let Err(e) = self.persist_chain_state() {
+                    // Rollback: restore old finality point to keep memory/DB consistent
+                    self.chain.finality_point = old_fp;
+                    slog_error!("consensus", "finality_persist_failed", error => e);
+                    return None;
+                }
             }
             Some(new_fp)
         } else {
@@ -372,7 +467,13 @@ impl ConsensusState {
         let fp_height = self.block_data.get(fp).map(|d| d.height).unwrap_or(0);
         let block_height = self.block_data.get(block_hash).map(|d| d.height).unwrap_or(u64::MAX);
 
-        block_height <= fp_height
+        // Must be at or below finality height AND on the selected chain
+        if block_height > fp_height {
+            return false;
+        }
+
+        // Check if block is an ancestor of the finality point (on selected chain)
+        self.chain_path_cache.contains(&block_hash.to_string())
     }
 
     /// Get the finality point height (0 if no finality point set).

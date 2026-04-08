@@ -13,10 +13,14 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use crate::errors::{ConsensusError, StorageError};
+use crate::{slog_error, slog_warn};
 
 // prefixes
 const PFX_STATE: &[u8] = b"s:";
 const DELETE_BATCH_SIZE: usize = 1000;
+
+/// Key-value pair from a RocksDB scan (owned copies of key and value bytes).
+pub type KvPair = (Vec<u8>, Vec<u8>);
 
 pub struct ConsensusStore {
     db: Arc<DB>,
@@ -112,53 +116,69 @@ impl ConsensusStore {
 
     // ─────────────────────────────────────────
     // GET STRING
+    // Returns Err on I/O failure (not None).
     // ─────────────────────────────────────────
-    pub fn get_state(&self, key: &str) -> Option<String> {
-        self.db
-            .get_pinned(Self::build_key(PFX_STATE, key))
-            .ok()
-            .flatten()
-            .and_then(|v| std::str::from_utf8(&v).ok().map(|s| s.to_owned()))
+    pub fn get_state(&self, key: &str) -> Result<Option<String>, ConsensusError> {
+        match self.db.get_pinned(Self::build_key(PFX_STATE, key)) {
+            Ok(Some(v)) => Ok(std::str::from_utf8(&v).ok().map(|s| s.to_owned())),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                slog_error!("consensus", "state_read_failed", key => key, error => e);
+                Err(StorageError::ReadFailed(format!("get_state '{}': {}", key, e)).into())
+            }
+        }
     }
 
     // ─────────────────────────────────────────
     // GET RAW
+    // Returns Err on I/O failure (not None).
     // ─────────────────────────────────────────
-    pub fn get_raw(&self, key: &str) -> Option<Vec<u8>> {
-        self.db
-            .get_pinned(Self::build_key(PFX_STATE, key))
-            .ok()
-            .flatten()
-            .map(|v| v.to_vec())
+    pub fn get_raw(&self, key: &str) -> Result<Option<Vec<u8>>, ConsensusError> {
+        match self.db.get_pinned(Self::build_key(PFX_STATE, key)) {
+            Ok(Some(v)) => Ok(Some(v.to_vec())),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                slog_error!("consensus", "state_read_failed", key => key, error => e);
+                Err(StorageError::ReadFailed(format!("get_raw '{}': {}", key, e)).into())
+            }
+        }
     }
 
     // ─────────────────────────────────────────
     // MULTI GET
+    // Returns Err on first I/O failure — partial results are never returned.
     // ─────────────────────────────────────────
-    pub fn multi_get(&self, keys: &[&str]) -> Vec<Option<Vec<u8>>> {
+    pub fn multi_get(&self, keys: &[&str]) -> Result<Vec<Option<Vec<u8>>>, ConsensusError> {
         let mut results = Vec::with_capacity(keys.len());
 
         for k in keys {
-            let val = self.db
-                .get_pinned(Self::build_key(PFX_STATE, k))
-                .ok()
-                .flatten()
-                .map(|v| v.to_vec());
+            let val = match self.db.get_pinned(Self::build_key(PFX_STATE, k)) {
+                Ok(Some(v)) => Some(v.to_vec()),
+                Ok(None) => None,
+                Err(e) => {
+                    slog_error!("consensus", "state_read_failed", key => *k, error => e);
+                    return Err(StorageError::ReadFailed(format!("multi_get '{}': {}", k, e)).into());
+                }
+            };
 
             results.push(val);
         }
 
-        results
+        Ok(results)
     }
 
     // ─────────────────────────────────────────
     // EXISTS
+    // Returns Err on I/O failure (not false).
     // ─────────────────────────────────────────
-    pub fn exists(&self, key: &str) -> bool {
-        self.db
-            .get_pinned(Self::build_key(PFX_STATE, key))
-            .map(|v| v.is_some())
-            .unwrap_or(false)
+    pub fn exists(&self, key: &str) -> Result<bool, ConsensusError> {
+        match self.db.get_pinned(Self::build_key(PFX_STATE, key)) {
+            Ok(v) => Ok(v.is_some()),
+            Err(e) => {
+                slog_error!("consensus", "state_read_failed", key => key, error => e);
+                Err(StorageError::ReadFailed(format!("exists '{}': {}", key, e)).into())
+            }
+        }
     }
 
     // ─────────────────────────────────────────
@@ -214,19 +234,25 @@ impl ConsensusStore {
 
         let mut batch = WriteBatch::default();
         let mut count = 0;
+        let mut had_error = false;
 
         for item in iter {
-            let (k, _) = match item {
-                Ok(kv) => kv,
-                Err(_) => break,
-            };
-            batch.delete(k);
-            count += 1;
+            match item {
+                Ok((k, _)) => {
+                    batch.delete(&k);
+                    count += 1;
 
-            if count >= DELETE_BATCH_SIZE {
-                self.db.write_opt(batch, &self.write_opts).map_err(StorageError::RocksDb)?;
-                batch = WriteBatch::default();
-                count = 0;
+                    if count >= DELETE_BATCH_SIZE {
+                        self.db.write_opt(batch, &self.write_opts).map_err(StorageError::RocksDb)?;
+                        batch = WriteBatch::default();
+                        count = 0;
+                    }
+                }
+                Err(e) => {
+                    slog_error!("consensus", "clear_prefix_iter_error", error => e);
+                    had_error = true;
+                    break;
+                }
             }
         }
 
@@ -234,17 +260,22 @@ impl ConsensusStore {
             self.db.write_opt(batch, &self.write_opts).map_err(StorageError::RocksDb)?;
         }
 
+        if had_error {
+            return Err(StorageError::ReadFailed("iterator error during clear_prefix".into()).into());
+        }
+
         Ok(())
     }
 
     // ─────────────────────────────────────────
     // SCAN FROM
+    // Returns Err on iterator failure — partial results are never returned.
     // ─────────────────────────────────────────
     pub fn scan_from(
         &self,
         start_key: Option<&str>,
         limit: usize,
-    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+    ) -> Result<Vec<KvPair>, ConsensusError> {
 
         let start = match start_key {
             Some(k) => Self::build_key(PFX_STATE, k),
@@ -267,11 +298,17 @@ impl ConsensusStore {
             if n >= limit { break; }
             match item {
                 Ok((k, v)) => results.push((k.to_vec(), v.to_vec())),
-                _ => break,
+                Err(e) => {
+                    slog_error!("consensus", "scan_from_iter_error",
+                        error => e, results_so_far => results.len());
+                    return Err(StorageError::ReadFailed(
+                        format!("scan_from iterator error after {} results: {}", results.len(), e)
+                    ).into());
+                }
             }
         }
 
-        results
+        Ok(results)
     }
 
     // ─────────────────────────────────────────
@@ -291,11 +328,16 @@ impl ConsensusStore {
 
     // ─────────────────────────────────────────
     // DB SIZE
+    // Returns None on property read failure (logged) instead of fake 0.
     // ─────────────────────────────────────────
-    pub fn size_estimate(&self) -> u64 {
-        self.db.property_int_value("rocksdb.estimate-live-data-size")
-            .unwrap_or(Some(0))
-            .unwrap_or(0)
+    pub fn size_estimate(&self) -> Option<u64> {
+        match self.db.property_int_value("rocksdb.estimate-live-data-size") {
+            Ok(val) => val,
+            Err(e) => {
+                slog_warn!("consensus", "size_estimate_failed", error => e);
+                None
+            }
+        }
     }
 }
 
@@ -315,46 +357,46 @@ mod tests {
     fn set_and_get_state() {
         let store = ConsensusStore::new(&tmp_path()).unwrap();
         store.set_state("best_hash", "abc123").unwrap();
-        assert_eq!(store.get_state("best_hash"), Some("abc123".to_string()));
+        assert_eq!(store.get_state("best_hash").unwrap(), Some("abc123".to_string()));
     }
 
     #[test]
     fn get_unknown_returns_none() {
         let store = ConsensusStore::new(&tmp_path()).unwrap();
-        assert_eq!(store.get_state("nonexistent"), None);
+        assert_eq!(store.get_state("nonexistent").unwrap(), None);
     }
 
     #[test]
     fn exists_check() {
         let store = ConsensusStore::new(&tmp_path()).unwrap();
-        assert!(!store.exists("tip"));
+        assert!(!store.exists("tip").unwrap());
         store.set_state("tip", "hash1").unwrap();
-        assert!(store.exists("tip"));
+        assert!(store.exists("tip").unwrap());
     }
 
     #[test]
     fn delete_state_removes() {
         let store = ConsensusStore::new(&tmp_path()).unwrap();
         store.set_state("key", "val").unwrap();
-        assert!(store.exists("key"));
+        assert!(store.exists("key").unwrap());
         store.delete_state("key").unwrap();
-        assert!(!store.exists("key"));
+        assert!(!store.exists("key").unwrap());
     }
 
     #[test]
     fn overwrite_updates_value() {
         let store = ConsensusStore::new(&tmp_path()).unwrap();
         store.set_state("k", "v1").unwrap();
-        assert_eq!(store.get_state("k"), Some("v1".to_string()));
+        assert_eq!(store.get_state("k").unwrap(), Some("v1".to_string()));
         store.set_state("k", "v2").unwrap();
-        assert_eq!(store.get_state("k"), Some("v2".to_string()));
+        assert_eq!(store.get_state("k").unwrap(), Some("v2".to_string()));
     }
 
     #[test]
     fn get_raw_returns_bytes() {
         let store = ConsensusStore::new(&tmp_path()).unwrap();
         store.set_state("raw_key", "hello").unwrap();
-        let raw = store.get_raw("raw_key").unwrap();
+        let raw = store.get_raw("raw_key").unwrap().unwrap();
         assert_eq!(raw, b"hello");
     }
 
@@ -363,7 +405,7 @@ mod tests {
         let store = ConsensusStore::new(&tmp_path()).unwrap();
         store.set_state("a", "1").unwrap();
         store.set_state("b", "2").unwrap();
-        let results = store.multi_get(&["a", "b", "c"]);
+        let results = store.multi_get(&["a", "b", "c"]).unwrap();
         assert_eq!(results[0], Some(b"1".to_vec()));
         assert_eq!(results[1], Some(b"2".to_vec()));
         assert_eq!(results[2], None);
@@ -377,9 +419,9 @@ mod tests {
             &[("new1", "v1"), ("new2", "v2")],
             &["old"],
         ).unwrap();
-        assert_eq!(store.get_state("new1"), Some("v1".to_string()));
-        assert_eq!(store.get_state("new2"), Some("v2".to_string()));
-        assert!(!store.exists("old"));
+        assert_eq!(store.get_state("new1").unwrap(), Some("v1".to_string()));
+        assert_eq!(store.get_state("new2").unwrap(), Some("v2".to_string()));
+        assert!(!store.exists("old").unwrap());
     }
 
     #[test]
@@ -388,8 +430,8 @@ mod tests {
         store.set_state("x", "1").unwrap();
         store.set_state("y", "2").unwrap();
         store.clear_prefix().unwrap();
-        assert!(!store.exists("x"));
-        assert!(!store.exists("y"));
+        assert!(!store.exists("x").unwrap());
+        assert!(!store.exists("y").unwrap());
     }
 
     #[test]
@@ -398,7 +440,7 @@ mod tests {
         store.set_state("a", "1").unwrap();
         store.set_state("b", "2").unwrap();
         store.set_state("c", "3").unwrap();
-        let results = store.scan_from(None, 10);
+        let results = store.scan_from(None, 10).unwrap();
         assert!(results.len() >= 3);
     }
 
@@ -410,9 +452,9 @@ mod tests {
     }
 
     #[test]
-    fn size_estimate_non_negative() {
+    fn size_estimate_returns_value() {
         let store = ConsensusStore::new(&tmp_path()).unwrap();
-        // Just verify it doesn't panic
-        let _ = store.size_estimate();
+        // Fresh DB — property should be readable (possibly None or Some(0))
+        let _size = store.size_estimate();
     }
 }
