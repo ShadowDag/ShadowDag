@@ -111,6 +111,13 @@ impl DaemonNode {
                 .map_err(|e| NodeError::Init(format!("Failed to init mempool: {}", e)))?
         ));
 
+        // Open persistent contract storage (from ~/.shadowdag/<network>/contracts/)
+        let contract_storage = Arc::new(
+            crate::runtime::vm::contracts::contract_storage::ContractStorage::new(
+                cfg.contract_path().to_str().unwrap_or("contracts")
+            ).map_err(|e| NodeError::Init(format!("[daemon] contract storage init failed: {}", e)))?
+        );
+
         // Create the unified block processing engine
         let full_node = Arc::new(FullNode::new(
             block_store.clone(),
@@ -118,6 +125,7 @@ impl DaemonNode {
             dag.clone(),
             ghostdag.clone(),
             cfg.network.clone(),
+            contract_storage,
         ));
 
         // Initialize persistent indexes with shared DB (auto-recovers from disk)

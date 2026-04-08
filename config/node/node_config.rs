@@ -131,6 +131,8 @@ impl NetworkMode {
     pub fn wallet_path(&self)   -> PathBuf { self.data_dir().join("wallet") }
     pub fn snapshot_path(&self) -> PathBuf { self.data_dir().join("snapshots") }
     pub fn dsp_path(&self)      -> PathBuf { self.data_dir().join("dsp") }
+    pub fn contract_path(&self) -> PathBuf { self.data_dir().join("contracts") }
+    pub fn receipt_path(&self)  -> PathBuf { self.data_dir().join("receipts") }
 
     /// Returns the genesis block hash for this network by computing it
     /// from the actual genesis block definition.
@@ -172,6 +174,8 @@ impl NetworkMode {
         std::fs::create_dir_all(self.wallet_path())?;
         std::fs::create_dir_all(self.snapshot_path())?;
         std::fs::create_dir_all(self.dsp_path())?;
+        std::fs::create_dir_all(self.contract_path())?;
+        std::fs::create_dir_all(self.receipt_path())?;
         Ok(())
     }
 }
@@ -280,6 +284,8 @@ impl NodeConfig {
         std::fs::create_dir_all(self.data_dir.join("snapshots"))?;
         std::fs::create_dir_all(self.data_dir.join("dsp"))?;
         std::fs::create_dir_all(self.data_dir.join("runtime"))?;
+        std::fs::create_dir_all(self.data_dir.join("contracts"))?;
+        std::fs::create_dir_all(self.data_dir.join("receipts"))?;
         Ok(())
     }
 
@@ -291,6 +297,8 @@ impl NodeConfig {
     pub fn snapshot_path(&self) -> std::path::PathBuf { self.data_dir.join("snapshots") }
     pub fn dsp_path(&self)      -> std::path::PathBuf { self.data_dir.join("dsp") }
     pub fn runtime_path(&self)  -> std::path::PathBuf { self.data_dir.join("runtime") }
+    pub fn contract_path(&self) -> std::path::PathBuf { self.data_dir.join("contracts") }
+    pub fn receipt_path(&self)  -> std::path::PathBuf { self.data_dir.join("receipts") }
 
     pub fn peers_path_str(&self)    -> String { self.peers_path().to_string_lossy().into_owned() }
     pub fn mempool_path_str(&self)  -> String { self.mempool_path().to_string_lossy().into_owned() }

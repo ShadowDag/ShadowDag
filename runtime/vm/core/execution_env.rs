@@ -142,6 +142,81 @@ impl ExecutionEnvironment {
         Ok(())
     }
 
+    /// Persist state changes AND build undo data for rollback.
+    ///
+    /// Captures the previous value of every key touched during this block
+    /// before overwriting it, so that `ContractStorage::rollback_block()`
+    /// can reverse the mutations during a reorg.
+    ///
+    /// Returns the undo data; the caller is responsible for saving it
+    /// (which this method also does via `storage.save_undo()`).
+    pub fn persist_with_undo(
+        &self,
+        storage: &ContractStorage,
+        block_hash: &str,
+    ) -> Result<crate::runtime::vm::contracts::contract_storage::ContractUndoData, VmError> {
+        use crate::runtime::vm::contracts::contract_storage::ContractUndoData;
+
+        let mut modified_keys = Vec::new();
+        let mut created_accounts = Vec::new();
+        let mut destroyed_accounts = Vec::new();
+
+        // Capture undo data BEFORE writing — accounts
+        for (addr, account) in self.state.iter_accounts() {
+            let account_key = format!("account:{}", addr);
+            let old_val = storage.get_state(&account_key);
+
+            if old_val.is_none() {
+                created_accounts.push(addr.clone());
+            }
+
+            // Save new account state
+            let meta = format!("{}|{}|{}", account.balance, account.nonce, account.code_hash);
+            modified_keys.push((account_key.clone(), old_val));
+            storage.set_state(&account_key, &meta).map_err(VmError::Storage)?;
+
+            // Save code
+            if !account.code.is_empty() {
+                let code_key = format!("code:{}", addr);
+                let old_code = storage.get_state(&code_key);
+                modified_keys.push((code_key.clone(), old_code));
+                storage.set_state(&code_key, &hex::encode(&account.code))
+                    .map_err(VmError::Storage)?;
+            }
+        }
+
+        // Capture undo data BEFORE writing — storage slots
+        for (addr, slots) in self.state.iter_storage() {
+            for (key, value) in slots {
+                let full_key = format!("{}:{}", addr, key);
+                let old_val = storage.get_state(&full_key);
+                modified_keys.push((full_key.clone(), old_val));
+                storage.set_state(&full_key, value).map_err(VmError::Storage)?;
+            }
+        }
+
+        // Handle destroyed accounts — capture their data before removal
+        for addr in &self.destroyed_contracts {
+            let account_key = format!("account:{}", addr);
+            if let Some(old_data) = storage.get_state(&account_key) {
+                destroyed_accounts.push((addr.clone(), old_data));
+            }
+        }
+
+        let undo = ContractUndoData {
+            modified_keys,
+            created_accounts,
+            destroyed_accounts,
+            receipt_root: None, // Set by caller after receipt computation
+            state_root: None,   // Set by caller after state root computation
+        };
+
+        // Save undo data atomically alongside the state changes
+        storage.save_undo(block_hash, &undo).map_err(VmError::Storage)?;
+
+        Ok(undo)
+    }
+
     /// Load a contract's state from ContractStorage into the in-memory StateManager.
     pub fn load_contract_from_storage(&mut self, storage: &ContractStorage, addr: &str) {
         // Load account metadata

@@ -333,6 +333,64 @@ pub fn compute_receipt_root(receipts: &[TxReceipt]) -> String {
     hex::encode(hasher.finalize())
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// PERSISTENT RECEIPT STORAGE — DB-backed receipt persistence
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Save a receipt to persistent storage (RocksDB).
+pub fn persist_receipt(db: &rocksdb::DB, receipt: &TxReceipt) {
+    let key = format!("receipt:{}", receipt.tx_hash);
+    if let Ok(data) = bincode::serialize(receipt) {
+        if let Err(e) = db.put(key.as_bytes(), &data) {
+            crate::slog_error!("receipt", "receipt_persist_failed",
+                tx => &receipt.tx_hash, error => &e.to_string());
+        }
+    }
+}
+
+/// Load a receipt from persistent storage.
+pub fn load_receipt(db: &rocksdb::DB, tx_hash: &str) -> Option<TxReceipt> {
+    let key = format!("receipt:{}", tx_hash);
+    match db.get(key.as_bytes()) {
+        Ok(Some(data)) => bincode::deserialize(&data).ok(),
+        _ => None,
+    }
+}
+
+/// Persist multiple receipts in a batch write (more efficient for block-level writes).
+pub fn persist_receipts_batch(db: &rocksdb::DB, receipts: &[TxReceipt]) {
+    if receipts.is_empty() {
+        return;
+    }
+    let mut batch = rocksdb::WriteBatch::default();
+    for receipt in receipts {
+        let key = format!("receipt:{}", receipt.tx_hash);
+        if let Ok(data) = bincode::serialize(receipt) {
+            batch.put(key.as_bytes(), &data);
+        }
+    }
+    if let Err(e) = db.write(batch) {
+        crate::slog_error!("receipt", "receipt_batch_persist_failed",
+            count => &receipts.len().to_string(), error => &e.to_string());
+    }
+}
+
+/// Delete receipts for a block's transactions (used during reorg rollback).
+pub fn delete_receipts_for_block(db: &rocksdb::DB, tx_hashes: &[String]) {
+    if tx_hashes.is_empty() {
+        return;
+    }
+    let mut batch = rocksdb::WriteBatch::default();
+    for tx_hash in tx_hashes {
+        let key = format!("receipt:{}", tx_hash);
+        batch.delete(key.as_bytes());
+    }
+    if let Err(e) = db.write(batch) {
+        crate::slog_error!("receipt", "receipt_delete_failed",
+            count => &tx_hashes.len().to_string(), error => &e.to_string());
+    }
+}
+
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
