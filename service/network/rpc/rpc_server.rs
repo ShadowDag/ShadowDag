@@ -30,6 +30,8 @@ use crate::runtime::vm::core::executor::Executor;
 use crate::runtime::vm::core::vm_context::VMContext;
 use crate::runtime::vm::core::vm::ExecutionResult;
 use crate::runtime::vm::contracts::contract_storage::ContractStorage;
+use crate::runtime::vm::contracts::contract_verifier::ContractVerifier;
+use crate::runtime::vm::contracts::contract_package::ContractPackage;
 use crate::domain::transaction::tx_receipt::load_receipt;
 
 pub const RPC_PORT:    u16   = 9332;
@@ -848,6 +850,8 @@ impl RpcServer {
             "get_contract_code"      => Self::cmd_get_contract_code(params, id, state),
             "get_storage_at"         => Self::cmd_get_storage_at(params, id, state),
             "get_logs"               => Self::cmd_get_logs(params, id, state),
+            "verify_contract"        => Self::cmd_verify_contract(params, id, state),
+            "get_contract_info"      => Self::cmd_get_contract_info(params, id, state),
 
             // ── Batch 15a: Atomic Swap ─────────────────────────────────
             "getswapinfo"        => Self::cmd_getswapinfo(id),
@@ -3429,6 +3433,98 @@ impl RpcServer {
             }
         }
         RpcResponse::ok(id, json!({ "logs": all_logs }))
+    }
+
+    fn cmd_verify_contract(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
+        let s = match state.lock() {
+            Ok(s) => s,
+            Err(_) => return RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        };
+        let address = match params.first().and_then(|v| v.as_str()) {
+            Some(a) => a,
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "address required"),
+        };
+        let package_json = match params.get(1).and_then(|v| v.as_str()) {
+            Some(j) => j,
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "package JSON required"),
+        };
+
+        let package = match ContractPackage::from_json(package_json) {
+            Ok(p) => p,
+            Err(e) => return RpcResponse::err(id, ERR_INVALID_PARAMS, format!("invalid package: {}", e)),
+        };
+
+        let cs = match &s.contract_storage {
+            Some(cs) => cs.clone(),
+            None => return RpcResponse::err(id, ERR_INTERNAL, "contract storage not available"),
+        };
+
+        let storage = ContractStorage::new(cs.shared_db())
+            .unwrap_or_else(|_| panic!("ContractStorage init from shared DB"));
+        let result = ContractVerifier::verify(&storage, address, &package);
+
+        if result.verified {
+            ContractVerifier::save_verification(&storage, &result, &package).ok();
+        }
+
+        RpcResponse::ok(id, json!({
+            "verified": result.verified,
+            "bytecode_match": result.bytecode_match,
+            "vm_version_match": result.vm_version_match,
+            "contract_name": result.contract_name,
+            "deployed_bytecode_hash": result.deployed_bytecode_hash,
+            "package_bytecode_hash": result.package_bytecode_hash,
+            "code_size": result.deployed_code_size,
+            "error": result.error,
+        }))
+    }
+
+    fn cmd_get_contract_info(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
+        let s = match state.lock() {
+            Ok(s) => s,
+            Err(_) => return RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        };
+        let address = match params.first().and_then(|v| v.as_str()) {
+            Some(a) => a,
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "address required"),
+        };
+
+        let cs = match &s.contract_storage {
+            Some(cs) => cs.clone(),
+            None => return RpcResponse::err(id, ERR_INTERNAL, "contract storage not available"),
+        };
+        let storage = ContractStorage::new(cs.shared_db())
+            .unwrap_or_else(|_| panic!("ContractStorage init from shared DB"));
+
+        // Check verification
+        let verification = ContractVerifier::get_verification(&storage, address);
+        let verified = verification.is_some();
+
+        // Get code size
+        let code_size = storage.get_state(&format!("code:{}", address))
+            .and_then(|h| hex::decode(&h).ok())
+            .map(|c| c.len())
+            .unwrap_or(0);
+
+        let vm_ver = storage.get_state(&format!("vm_version:{}", address))
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(0);
+
+        let mut resp = json!({
+            "address": address,
+            "exists": code_size > 0,
+            "verified": verified,
+            "code_size": code_size,
+            "vm_version": vm_ver,
+        });
+
+        if let Some(meta) = verification {
+            resp["name"] = json!(meta.name);
+            resp["bytecode_hash"] = json!(meta.bytecode_hash);
+            resp["has_abi"] = json!(!meta.abi_json.is_empty());
+        }
+
+        RpcResponse::ok(id, resp)
     }
 }
 

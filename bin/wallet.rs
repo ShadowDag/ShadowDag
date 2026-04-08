@@ -12,7 +12,9 @@
 //   shadowdag-wallet info                 # Show wallet info
 //   shadowdag-wallet export               # Export keys
 //   shadowdag-wallet deploy <hex> [gas]   # Deploy contract
+//   shadowdag-wallet deploy-package <pkg> # Deploy from package
 //   shadowdag-wallet call <addr> <hex>    # Call contract
+//   shadowdag-wallet verify <addr> <pkg>  # Verify contract
 //   shadowdag-wallet receipt <tx_hash>    # Get receipt
 //   shadowdag-wallet logs [address]       # Get contract logs
 // =============================================================================
@@ -30,6 +32,7 @@ use shadowdag::service::wallet::storage::wallet_db::WalletDB;
 use shadowdag::infrastructure::storage::rocksdb::utxo::utxo_store::UtxoStore;
 use shadowdag::config::node::node_config::NetworkMode;
 use shadowdag::domain::address::invisible_wallet::InvisibleWallet;
+use shadowdag::runtime::vm::contracts::contract_package::ContractPackage;
 use shadowdag::errors::WalletError;
 use shadowdag::slog_error;
 
@@ -257,9 +260,11 @@ fn main() {
         "invisible"       => cmd_invisible(&args),
         "export"          => cmd_export(),
         "deploy"          => cmd_deploy(&args),
+        "deploy-package"  => cmd_deploy_package(&args),
         "call"            => cmd_call(&args),
         "receipt"         => cmd_receipt(&args),
         "logs"            => cmd_logs(&args),
+        "verify"          => cmd_verify(&args),
         "version" | "--version" | "-v" => println!("ShadowDAG Wallet v1.0.0"),
         "help" | "--help" | "-h" => print_help(),
         _ => print_help(),
@@ -698,6 +703,72 @@ fn cmd_logs(args: &[String]) {
     println!("    -d '{{\"jsonrpc\":\"2.0\",\"method\":\"get_logs\",\"params\":[\"{}\"],\"id\":1}}'", address);
 }
 
+fn cmd_deploy_package(args: &[String]) {
+    let package_path = args.get(2).expect("Usage: wallet deploy-package <package.json> [gas_limit]");
+    let gas_limit: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    let json = match std::fs::read_to_string(package_path) {
+        Ok(j) => j,
+        Err(e) => { eprintln!("Failed to read {}: {}", package_path, e); return; }
+    };
+
+    let package = match ContractPackage::from_json(&json) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("Invalid package: {}", e); return; }
+    };
+
+    if !package.verify() {
+        eprintln!("ERROR: package bytecode hash mismatch -- artifact may be tampered");
+        return;
+    }
+
+    let effective_gas = if gas_limit > 0 { gas_limit } else { package.estimated_deploy_gas() };
+
+    println!("Deploying contract from package: {}", package.name);
+    println!("  Bytecode:    {} bytes (hash: {}...)", package.code_size(), &package.bytecode_hash[..16]);
+    println!("  VM version:  {}", package.vm_version);
+    println!("  Gas limit:   {} ({})", effective_gas, if gas_limit > 0 { "custom" } else { "estimated" });
+    println!("  Verified:    bytecode integrity OK");
+
+    let mut wallet = match load_and_unlock_wallet() {
+        Ok(w) => w,
+        Err(e) => { eprintln!("Wallet error: {}", e); return; }
+    };
+
+    match wallet.build_deploy_tx(0, package.bytecode.clone(), 0, effective_gas, 1000) {
+        Ok(_tx) => {
+            println!("\n  TX type:     ContractCreate");
+            println!("  TX built successfully");
+            println!("\n  After deployment, verify with:");
+            println!("    wallet verify <contract_address> {}", package_path);
+        }
+        Err(e) => eprintln!("Failed: {}", e),
+    }
+}
+
+fn cmd_verify(args: &[String]) {
+    let address = args.get(2).expect("Usage: wallet verify <contract_address> <package.json>");
+    let package_path = args.get(3).expect("package.json path required");
+
+    let json = match std::fs::read_to_string(package_path) {
+        Ok(j) => j,
+        Err(e) => { eprintln!("Failed to read {}: {}", package_path, e); return; }
+    };
+
+    let package = match ContractPackage::from_json(&json) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("Invalid package: {}", e); return; }
+    };
+
+    println!("Verifying contract {} against {}...", address, package_path);
+    println!("  Package name:     {}", package.name);
+    println!("  Package hash:     {}...", &package.bytecode_hash[..16]);
+    println!("  VM version:       {}", package.vm_version);
+    println!("\n  Use RPC: verify_contract {} '{}'", address, json.replace('\n', ""));
+    println!("\n  curl -X POST http://localhost:9332 \\");
+    println!("    -d '{{\"jsonrpc\":\"2.0\",\"method\":\"verify_contract\",\"params\":[\"{}\",<package_json>],\"id\":1}}'", address);
+}
+
 fn print_help() {
     println!("ShadowDAG Wallet v1.0.0");
     println!();
@@ -716,8 +787,12 @@ fn print_help() {
     println!("CONTRACT COMMANDS:");
     println!("  deploy <bytecode_hex> [gas_limit] [value]");
     println!("                          Deploy a smart contract");
+    println!("  deploy-package <package.json> [gas_limit]");
+    println!("                          Deploy from a ContractPackage artifact");
     println!("  call <contract_addr> <calldata_hex> [gas_limit] [value]");
     println!("                          Call a smart contract function");
+    println!("  verify <contract_addr> <package.json>");
+    println!("                          Verify deployed contract against a package");
     println!("  receipt <tx_hash>       Fetch a transaction receipt");
     println!("  logs [address]          Fetch contract logs");
     println!();

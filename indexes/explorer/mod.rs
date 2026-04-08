@@ -4,6 +4,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use std::collections::VecDeque;
+use serde::{Serialize, Deserialize};
 
 pub const MAX_RECENT_BLOCKS: usize = 100;
 pub const MAX_RECENT_TXS:    usize = 500;
@@ -44,6 +45,22 @@ pub struct NetworkStats {
     pub total_supply:     u64,
     pub dag_tips:         Vec<String>,
     pub block_rate_bps:   f64,
+}
+
+/// Contract information for the explorer page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractExplorerInfo {
+    pub address: String,
+    pub verified: bool,
+    pub name: Option<String>,
+    pub code_size: usize,
+    pub vm_version: u8,
+    pub abi: Option<String>,  // JSON
+    pub methods: Vec<String>,
+    pub events: Vec<String>,
+    pub bytecode_hash: String,
+    pub created_at_block: Option<u64>,
+    pub creator: Option<String>,
 }
 
 /// Explorer index that maintains a sliding window of the most recent blocks
@@ -159,6 +176,26 @@ impl ExplorerIndex {
 
     pub fn cached_blocks(&self) -> usize { self.recent_blocks.len() }
     pub fn cached_txs(&self)    -> usize { self.recent_txs.len() }
+
+    /// Get contract information for the explorer.
+    /// Returns verification status, ABI, methods, events, and metadata.
+    pub fn get_contract_info(&self, address: &str) -> Option<ContractExplorerInfo> {
+        // This would query ContractStorage and verification data
+        // For now, return a struct that the explorer API can serve
+        Some(ContractExplorerInfo {
+            address: address.to_string(),
+            verified: false, // Updated when verification data is loaded
+            name: None,
+            code_size: 0,
+            vm_version: 1,
+            abi: None,
+            methods: vec![],
+            events: vec![],
+            bytecode_hash: String::new(),
+            created_at_block: None,
+            creator: None,
+        })
+    }
 }
 
 #[cfg(test)]
