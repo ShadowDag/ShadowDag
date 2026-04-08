@@ -142,7 +142,9 @@ impl OrderBook {
                 // Match against asks (lowest first)
                 let mut matched_prices = Vec::new();
                 for (&ask_price, ask_orders) in self.asks.iter_mut() {
-                    if ask_price > order.price { break; }
+                    if order.order_type != OrderType::Market && ask_price > order.price {
+                        break; // Limit orders respect price ceiling
+                    }
                     for ask in ask_orders.iter_mut() {
                         if remaining.remaining() == 0 { break; }
                         let fill = remaining.remaining().min(ask.remaining());
@@ -183,7 +185,9 @@ impl OrderBook {
                 // Match against bids (highest first)
                 let mut matched_prices = Vec::new();
                 for (&bid_price, bid_orders) in self.bids.iter_mut().rev() {
-                    if bid_price < order.price { break; }
+                    if order.order_type != OrderType::Market && bid_price < order.price {
+                        break; // Limit orders respect price floor
+                    }
                     for bid in bid_orders.iter_mut() {
                         if remaining.remaining() == 0 { break; }
                         let fill = remaining.remaining().min(bid.remaining());

@@ -458,13 +458,23 @@ impl Mempool {
                 .map(|t| self.build_rbf_info(&t))
                 .collect();
 
-            // Build confirmed UTXO keys from the TX's inputs
-            // (RBF rule: new TX must not introduce new unconfirmed inputs)
+            // Build confirmed UTXO keys: only include inputs whose parent TX
+            // is NOT in the mempool (i.e., the UTXO is confirmed on-chain).
+            // Previously this used all of tx.inputs, which was circular —
+            // it treated every input the new TX spends as "confirmed",
+            // effectively disabling RBF Rule 5 (no new unconfirmed inputs).
             let confirmed_keys: std::collections::HashSet<String> = tx.inputs.iter()
                 .filter_map(|inp| {
-                    crate::domain::utxo::utxo_set::utxo_key(&inp.txid, inp.index)
+                    let key = crate::domain::utxo::utxo_set::utxo_key(&inp.txid, inp.index)
                         .ok()
-                        .map(|k| k.to_string())
+                        .map(|k| k.to_string())?;
+                    // If the parent TX exists in the mempool, the input is unconfirmed
+                    let parent_key = format!("tx:{}", inp.txid);
+                    if matches!(self.db.get(parent_key.as_bytes()), Ok(Some(_))) {
+                        None // unconfirmed — parent is still in mempool
+                    } else {
+                        Some(key) // confirmed — parent not in mempool
+                    }
                 })
                 .collect();
 

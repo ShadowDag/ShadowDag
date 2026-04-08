@@ -921,6 +921,14 @@ impl BlockValidator {
         if tx.outputs.is_empty() {
             return Err(ConsensusError::BlockValidation("SwapTx must have at least one output".into()));
         }
+        // 3b. First output must lock funds to an HTLC address (P2SH prefix "SD1h")
+        if let Some(first_output) = tx.outputs.first() {
+            if !first_output.address.starts_with(crate::domain::address::address::P2SH_PREFIX) {
+                return Err(ConsensusError::BlockValidation(
+                    "SwapTx first output must lock funds to HTLC address (SD1h prefix)".into()
+                ));
+            }
+        }
         // 4. Must not be coinbase
         if tx.is_coinbase {
             return Err(ConsensusError::BlockValidation("SwapTx cannot be coinbase".into()));

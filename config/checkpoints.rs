@@ -26,10 +26,32 @@ impl Checkpoints {
         ]
     }
 
+    /// Check if a block hash is valid at the given height against HARDCODED
+    /// checkpoints only.  For validation that also considers dynamic
+    /// (auto-generated) checkpoints stored in RocksDB, use
+    /// [`is_valid_with_dynamic`](Self::is_valid_with_dynamic).
     pub fn is_valid(height: u64, hash: &str) -> bool {
         for cp in Self::all() {
             if cp.height == height {
                 return cp.hash.eq_ignore_ascii_case(hash);
+            }
+        }
+        true
+    }
+
+    /// Check if a block hash is valid at the given height against BOTH
+    /// hardcoded and dynamic (auto-generated) checkpoints from RocksDB.
+    pub fn is_valid_with_dynamic(height: u64, hash: &str, db: &rocksdb::DB) -> bool {
+        // Check hardcoded first
+        for cp in Self::all() {
+            if cp.height == height && !cp.hash.eq_ignore_ascii_case(hash) {
+                return false;
+            }
+        }
+        // Check dynamic checkpoints from DB
+        for cp in Self::all_with_dynamic(db) {
+            if cp.height == height && !cp.hash.eq_ignore_ascii_case(hash) {
+                return false;
             }
         }
         true

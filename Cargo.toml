@@ -12,7 +12,7 @@ edition = "2021"
 description = "ShadowDAG — Hybrid BlockDAG Privacy Coin with BlockDAG + Privacy + GPU Mining"
 authors = ["ShadowDAG Team"]
 license = "MIT"
-repository = "https://github.com/shadowdag/shadowdag"
+repository = "https://github.com/ShadowDag/ShadowDag"
 keywords = ["blockchain", "dag", "privacy", "mining", "cryptocurrency"]
 categories = ["cryptography::cryptocurrencies"]
 

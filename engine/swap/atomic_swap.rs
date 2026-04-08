@@ -114,8 +114,8 @@ impl AtomicSwap {
     ///
     /// After timeout, the HTLC should only be refundable, not redeemable.
     pub fn redeem(htlc: &mut HTLC, secret: &[u8], current_height: u64) -> bool {
-        // After timeout, only refund is allowed
-        if current_height > htlc.timeout_height {
+        // At or after timeout, only refund is allowed
+        if current_height >= htlc.timeout_height {
             return false;
         }
         // Verify the secret matches the hash
@@ -133,6 +133,9 @@ impl AtomicSwap {
 
     /// Refund an HTLC after timeout
     pub fn refund(htlc: &mut HTLC, current_height: u64) -> bool {
+        if htlc.state == SwapState::Refunded {
+            return false; // Already refunded
+        }
         if current_height < htlc.timeout_height {
             return false; // Not expired yet
         }
