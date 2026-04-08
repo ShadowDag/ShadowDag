@@ -208,6 +208,20 @@ impl Transaction {
             } else {
                 buf.push(0x00); // marker: no key_image
             }
+
+            // ring_members: commit the decoy set to the txid so changing
+            // ring members invalidates the hash (prevents decoy-set mutation).
+            if let Some(ref members) = inp.ring_members {
+                buf.push(0x01); // has ring_members
+                buf.extend_from_slice(&(members.len() as u32).to_le_bytes());
+                for m in members {
+                    let m_bytes = m.as_bytes();
+                    buf.extend_from_slice(&(m_bytes.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(m_bytes);
+                }
+            } else {
+                buf.push(0x00);
+            }
         }
 
         // 4. outputs — in original order (order matters for output indices)

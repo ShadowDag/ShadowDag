@@ -561,9 +561,16 @@ impl TxValidator {
     }
 
     pub fn verify_signatures(tx: &Transaction) -> bool {
+        Self::verify_signatures_for_network(tx, &NetworkMode::Mainnet)
+    }
+
+    /// Network-aware signature verification -- uses the correct chain_id for
+    /// the signing message so that testnet/regtest signatures are verified
+    /// against the right message.
+    pub fn verify_signatures_for_network(tx: &Transaction, network: &NetworkMode) -> bool {
         if tx.inputs.is_empty() { return true; }
 
-        let msg = TxHash::signing_message(tx);
+        let msg = TxHash::signing_message_for_network(tx, network);
 
         for input in &tx.inputs {
             if input.signature.is_empty() { return false; }
