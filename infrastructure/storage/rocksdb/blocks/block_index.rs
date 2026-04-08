@@ -30,19 +30,22 @@ impl BlockIndex {
     }
 
     pub fn get_height(&self, hash: &str) -> Option<u64> {
-        match self.db.get(hash).unwrap_or(None) {
-            Some(bytes) => {
+        match self.db.get(hash) {
+            Ok(Some(bytes)) => {
+                if bytes.len() < 8 {
+                    slog_error!("storage", "block_index_corrupt_height", hash => hash, len => bytes.len());
+                    return None;
+                }
                 let mut arr = [0u8; 8];
-                arr.copy_from_slice(&bytes);
-
+                arr.copy_from_slice(&bytes[..8]);
                 Some(u64::from_be_bytes(arr))
-
             }
-
-            None => None
-
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("storage", "block_index_read_failed", hash => hash, error => e);
+                None
+            }
         }
-
     }
 
 }

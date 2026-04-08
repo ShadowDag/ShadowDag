@@ -160,16 +160,16 @@ impl HealthChecker {
         SystemMetrics {
             uptime_secs:    uptime,
             block_height:   self.block_height.load(Ordering::Relaxed),
-            dag_tips:       0, // Would be set by TipManager
+            dag_tips:       0, // TODO(#59): placeholder — wire TipManager.tip_count() when daemon feeds real data
             peer_count:     self.peer_count.load(Ordering::Relaxed),
             mempool_size:   self.mempool_size.load(Ordering::Relaxed),
             blocks_per_sec: bps,
             txs_per_sec:    tps,
-            db_size_bytes:  0, // Would query RocksDB
-            memory_used_mb: 0, // Would query OS
-            sync_progress:  if self.is_synced.load(Ordering::Relaxed) { 1.0 } else { 0.5 },
+            db_size_bytes:  0, // TODO(#59): placeholder — wire RocksDB size estimation when daemon feeds real data
+            memory_used_mb: 0, // TODO(#59): placeholder — wire OS memory query when daemon feeds real data
+            sync_progress:  if self.is_synced.load(Ordering::Relaxed) { 1.0 } else { 0.5 }, // TODO(#59): placeholder — compute from header chain progress
             is_synced:      self.is_synced.load(Ordering::Relaxed),
-            version:        "1.0.0".to_string(),
+            version:        env!("CARGO_PKG_VERSION").to_string(),
             network:        self.network.clone(),
         }
     }

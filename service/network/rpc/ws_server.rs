@@ -96,8 +96,24 @@ impl WsServer {
         self.event_tx.subscribe()
     }
 
-    /// Publish an event to all subscribers
+    /// Publish an event to subscribers of the given type.
+    ///
+    /// Because `broadcast::Sender` delivers to ALL receivers, per-connection
+    /// filtering must be done on the receive side. However, we short-circuit
+    /// here when **no** connection has subscribed to `event_type` at all,
+    /// avoiding unnecessary broadcast traffic.
     pub fn publish(&self, event_type: SubscriptionType, payload: String) {
+        // Only send if at least one connection has subscribed to this event type
+        let has_subscribers = self.subscriptions.lock()
+            .map(|subs| subs.values().any(|conn_subs|
+                conn_subs.iter().any(|s| s.sub_type == event_type)
+            ))
+            .unwrap_or(false);
+
+        if !has_subscribers {
+            return; // No subscribers for this event type — skip broadcast
+        }
+
         let event = WsEvent { event_type, payload };
         if let Err(_e) = self.event_tx.send(event) {
             slog_warn!("rpc", "ws_event_dropped", event_type => format!("{:?}", event_type));
