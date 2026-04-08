@@ -328,6 +328,9 @@ pub enum NodeError {
     #[error("[Node] peer banned: {peer} — {reason}")]
     PeerBanned { peer: String, reason: String },
 
+    #[error("[Node] recovery failed: {0}")]
+    Recovery(String),
+
     #[error("[Node] {0}")]
     Other(String),
 }

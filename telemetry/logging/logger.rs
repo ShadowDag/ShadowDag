@@ -5,8 +5,6 @@
 
 use rocksdb::{DB, Options};
 use std::path::Path;
-use crate::slog_error;
-
 pub struct Logger {
     db: DB,
 
@@ -28,20 +26,20 @@ impl Logger {
     }
 
     pub fn log(&self, id: &str, message: &str) {
-        if let Err(_e) = self.db.put(id, message) { slog_error!("metrics", "logger_db_put_error", error => &_e.to_string()); }
-
+        if let Err(e) = self.db.put(id, message) {
+            eprintln!("[TELEMETRY] log write failed: {}", e);
+        }
     }
 
     pub fn get_log(&self, id: &str) -> Option<String> {
-        match self.db.get(id).unwrap_or(None) {
-            Some(data) => {
-                Some(String::from_utf8(data.to_vec()).ok()?)
+        match self.db.get(id) {
+            Ok(Some(v)) => String::from_utf8(v.to_vec()).ok(),
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("[TELEMETRY] log read failed: {}", e);
+                None
             }
-
-            None => None
-
         }
-
     }
 
 }

@@ -76,9 +76,23 @@ impl PrometheusExporter {
             slog_info!("metrics", "prometheus_server_started", addr => &addr);
             slog_info!("metrics", "prometheus_endpoints", routes => "/metrics, /health, /debug");
 
-            for stream in listener.incoming().flatten() {
+            for stream_result in listener.incoming() {
+                let stream = match stream_result {
+                    Ok(s) => s,
+                    Err(e) => {
+                        slog_error!("metrics", "prometheus_accept_failed", error => e.to_string());
+                        continue;
+                    }
+                };
+
                 let mut buf = [0u8; 2048];
-                let n = std::io::Read::read(&mut &stream, &mut buf).unwrap_or(0);
+                let n = match std::io::Read::read(&mut &stream, &mut buf) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        slog_error!("metrics", "prometheus_read_failed", error => e.to_string());
+                        continue;
+                    }
+                };
                 let request = String::from_utf8_lossy(&buf[..n]);
 
                 let (content_type, body) = if request.contains("GET /debug") {
@@ -111,8 +125,13 @@ impl PrometheusExporter {
                 );
 
                 let mut writer = std::io::BufWriter::new(&stream);
-                let _ = writer.write_all(response.as_bytes());
-                let _ = writer.flush();
+                if let Err(e) = writer.write_all(response.as_bytes()) {
+                    slog_error!("metrics", "prometheus_write_failed", error => e.to_string());
+                    continue;
+                }
+                if let Err(e) = writer.flush() {
+                    slog_error!("metrics", "prometheus_flush_failed", error => e.to_string());
+                }
             }
         });
     }

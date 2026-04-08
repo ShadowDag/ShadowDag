@@ -193,7 +193,11 @@ impl DaemonNode {
         // ── P2P ──────────────────────────────────────────────────
         let mut p2p = P2P::new_with_config(&self.cfg)?;
         p2p.peers.bootstrap_for_network(&self.cfg.network);
-        let _ = p2p.peers.discover_peers();
+        let discovered = p2p.peers.discover_peers();
+        if discovered.is_empty() {
+            slog_warn!("daemon", "peer_discovery_returned_empty",
+                note => "no peers found — node may be isolated until inbound connections arrive");
+        }
         slog_info!("daemon", "p2p_bootstrapped", peers => p2p.peers.count());
 
         // ── RPC ──────────────────────────────────────────────────
@@ -553,13 +557,13 @@ impl DaemonNode {
     /// but orphaned entries from a corrupted prior state will remain until
     /// a full re-index (--reindex) is performed.
     fn rebuild_dag(&self) -> Result<(), NodeError> {
+        slog_warn!("daemon", "dag_rebuild_stale_entries_warning",
+            message => "DagManager has no clear_all() — stale/orphaned entries from prior state will persist. \
+                        Run with --reindex for a fully clean rebuild.");
         slog_info!("daemon", "dag_rebuild_start");
         let blocks = self.block_store.get_all_blocks_sorted_by_height();
         let total = blocks.len() as u64;
         let mut failed = 0u64;
-        // Strict threshold: allow at most 1% failures or 10 blocks, whichever is smaller.
-        // Recovery is a safety operation — partial results are dangerous.
-        let max_failures = (total / 100).clamp(1, 10);
         for block in &blocks {
             // Use validated=true since these blocks were already accepted
             if let Err(e) = self.dag.add_block_validated(block, true) {
@@ -569,16 +573,12 @@ impl DaemonNode {
                     height => block.header.height,
                     error => e
                 );
-                if failed > max_failures {
-                    return Err(NodeError::Init(format!(
-                        "DAG rebuild aborted: {} failures exceeds threshold {} (of {} blocks)",
-                        failed, max_failures, total
-                    )));
-                }
             }
         }
         if failed > 0 {
-            slog_warn!("daemon", "dag_rebuild_partial_failure", failed => failed);
+            return Err(NodeError::Recovery(format!(
+                "DAG rebuild had {} failures out of {} blocks — partial state is dangerous", failed, total
+            )));
         }
         slog_info!("daemon", "dag_rebuilt", total => total, failed => failed);
         Ok(())
@@ -593,9 +593,6 @@ impl DaemonNode {
         let blocks = self.block_store.get_all_blocks_sorted_by_height();
         let total = blocks.len() as u64;
         let mut failed = 0u64;
-        // Strict threshold: allow at most 1% failures or 10 blocks, whichever is smaller.
-        // Recovery is a safety operation — partial results are dangerous.
-        let max_failures = (total / 100).clamp(1, 10);
         for block in &blocks {
             let dag_block = crate::engine::dag::ghostdag::ghostdag::DagBlock {
                 hash: block.header.hash.clone(),
@@ -618,12 +615,6 @@ impl DaemonNode {
                         height => block.header.height,
                         error => msg
                     );
-                    if failed > max_failures {
-                        return Err(NodeError::Init(format!(
-                            "GHOSTDAG rebuild aborted: {} failures exceeds threshold {} (of {} blocks)",
-                            failed, max_failures, total
-                        )));
-                    }
                 }
                 Ok(Err(e)) => {
                     failed += 1;
@@ -632,18 +623,14 @@ impl DaemonNode {
                         height => block.header.height,
                         error => e.to_string()
                     );
-                    if failed > max_failures {
-                        return Err(NodeError::Init(format!(
-                            "GHOSTDAG rebuild aborted: {} failures exceeds threshold {} (of {} blocks)",
-                            failed, max_failures, total
-                        )));
-                    }
                 }
                 Ok(Ok(_)) => {}
             }
         }
         if failed > 0 {
-            slog_warn!("daemon", "ghostdag_rebuild_partial_failure", failed => failed);
+            return Err(NodeError::Recovery(format!(
+                "GHOSTDAG rebuild had {} failures out of {} blocks — partial state is dangerous", failed, total
+            )));
         }
 
         // Re-derive best tip using the canonical GHOSTDAG selection rule.

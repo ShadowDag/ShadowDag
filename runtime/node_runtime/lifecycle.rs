@@ -147,7 +147,7 @@ impl Lifecycle {
 /// Install a real Ctrl+C (SIGINT) handler that triggers graceful shutdown.
 /// This is NOT a polling loop — it intercepts the actual OS signal.
 fn install_ctrlc_handler() {
-    let _ = std::thread::Builder::new()
+    if let Err(e) = std::thread::Builder::new()
         .name("signal-handler".to_string())
         .spawn(|| {
             // We use a cross-platform approach:
@@ -224,7 +224,10 @@ fn install_ctrlc_handler() {
 
             // Trigger graceful shutdown
             Lifecycle::on_stop();
-        });
+        }) {
+        slog_error!("lifecycle", "signal_handler_spawn_failed", error => e);
+        // Continue startup but warn that graceful shutdown won't work
+    }
 }
 
 /// Install a panic hook that attempts graceful shutdown on unrecoverable errors.

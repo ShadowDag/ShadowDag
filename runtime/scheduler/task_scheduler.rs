@@ -18,23 +18,21 @@ impl TaskScheduler {
 
     }
 
-    pub fn schedule(&self, task_id: &str, payload: &str) {
+    pub fn schedule(&self, task_id: &str, payload: &str) -> Result<(), rocksdb::Error> {
         let key = format!("task:{}", task_id);
-        if let Err(_e) = self.db.put(key.as_bytes(), payload.as_bytes()) { slog_error!("runtime", "task_scheduler_db_put_error", error => &_e.to_string()); }
-
+        self.db.put(key.as_bytes(), payload.as_bytes())
     }
 
     pub fn get_task(&self, task_id: &str) -> Option<String> {
         let key = format!("task:{}", task_id);
-        match self.db.get(key.as_bytes()).unwrap_or(None) {
-            Some(data) => {
-                Some(String::from_utf8(data.to_vec()).ok()?)
+        match self.db.get(key.as_bytes()) {
+            Ok(Some(data)) => String::from_utf8(data.to_vec()).ok(),
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("runtime", "get_task_read_failed", error => &e.to_string());
+                None
             }
-
-            None => None
-
         }
-
     }
 
 }

@@ -38,8 +38,10 @@ impl EventBus {
     /// Publish an event — persists to DB and broadcasts to all subscribers
     pub fn publish(&self, event_id: &str, payload: &str) {
         let key = format!("event:{}", event_id);
-        if let Err(_e) = self.db.put(key.as_bytes(), payload.as_bytes()) {
-            slog_error!("runtime", "event_bus_db_put_error", error => &_e.to_string());
+        if let Err(e) = self.db.put(key.as_bytes(), payload.as_bytes()) {
+            slog_error!("runtime", "event_persist_failed_but_broadcast",
+                error => &e.to_string(),
+                note => "event delivered to real-time subscribers but NOT persisted to history");
         }
         // Broadcast to real-time subscribers (ignore send errors — no subscribers is OK)
         let _ = self.broadcast_tx.send(BusEvent {
@@ -60,9 +62,13 @@ impl EventBus {
 
     pub fn get_event(&self, event_id: &str) -> Option<String> {
         let key = format!("event:{}", event_id);
-        match self.db.get(key.as_bytes()).unwrap_or(None) {
-            Some(data) => Some(String::from_utf8(data.to_vec()).ok()?),
-            None => None,
+        match self.db.get(key.as_bytes()) {
+            Ok(Some(data)) => String::from_utf8(data.to_vec()).ok(),
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("runtime", "get_event_read_failed", error => &e.to_string());
+                None
+            }
         }
     }
 }

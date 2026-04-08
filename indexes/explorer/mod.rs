@@ -90,21 +90,25 @@ impl ExplorerIndex {
             self.stats.best_blue_score = block.blue_score;
         }
 
-        self.update_block_rate(&block);
-
         self.recent_blocks.push_front(block);
         if self.recent_blocks.len() > MAX_RECENT_BLOCKS {
             self.recent_blocks.pop_back();
         }
+
+        // Update block rate AFTER push_front so the new block is counted
+        if let Some(newest) = self.recent_blocks.front() {
+            let newest_ts = newest.timestamp;
+            self.update_block_rate_with_ts(newest_ts);
+        }
     }
 
-    fn update_block_rate(&mut self, new_block: &ExplorerBlock) {
+    fn update_block_rate_with_ts(&mut self, newest_timestamp: u64) {
         if self.recent_blocks.len() >= 2 {
             let oldest = match self.recent_blocks.back() {
                 Some(b) => b,
                 None => return,
             };
-            let time_span = new_block.timestamp.saturating_sub(oldest.timestamp);
+            let time_span = newest_timestamp.saturating_sub(oldest.timestamp);
             if time_span > 0 {
                 // Number of intervals = count - 1 (fence-post correction)
                 let count = self.recent_blocks.len() as f64;
