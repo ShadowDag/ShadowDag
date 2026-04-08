@@ -52,10 +52,14 @@ fn main() {
 fn run_miner(args: &[String]) -> Result<(), NodeError> {
     // Parse flags
     let miner_address = match parse_flag_opt(args, "--address") {
-        Some(addr) => addr,
-        None => {
+        Ok(Some(addr)) => addr,
+        Ok(None) => {
             eprintln!("ERROR: --address is required. Mining rewards need a destination.");
             eprintln!("Usage: shadowdag-miner --address=SD1your_address_here");
+            std::process::exit(1);
+        }
+        Err(msg) => {
+            eprintln!("Error: {}", msg);
             std::process::exit(1);
         }
     };
@@ -531,24 +535,36 @@ fn print_help() {
 }
 
 fn parse_flag(args: &[String], name: &str, default: &str) -> String {
-    parse_flag_opt(args, name).unwrap_or_else(|| default.to_string())
+    match parse_flag_opt(args, name) {
+        Ok(Some(val)) => val,
+        Ok(None) => default.to_string(), // flag not present at all — use default
+        Err(msg) => {
+            eprintln!("Error: {}", msg);
+            std::process::exit(1);
+        }
+    }
 }
 
-fn parse_flag_opt(args: &[String], name: &str) -> Option<String> {
+/// Parse an optional CLI flag. Returns:
+/// - Ok(Some(value)) if flag is present with a value
+/// - Ok(None) if flag is not present at all
+/// - Err if flag is present but missing its value
+fn parse_flag_opt(args: &[String], name: &str) -> Result<Option<String>, String> {
     for (i, arg) in args.iter().enumerate() {
         if arg == name {
             return match args.get(i + 1) {
-                Some(val) if !val.starts_with("--") => Some(val.clone()),
-                _ => None,
+                Some(val) if !val.starts_with("--") => Ok(Some(val.clone())),
+                _ => Err(format!("{} requires a value", name)),
             };
         }
         if let Some(val) = arg.strip_prefix(&format!("{}=", name)) {
-            if !val.is_empty() {
-                return Some(val.to_string());
+            if val.is_empty() {
+                return Err(format!("{} requires a non-empty value", name));
             }
+            return Ok(Some(val.to_string()));
         }
     }
-    None
+    Ok(None)
 }
 
 fn has_flag(args: &[String], name: &str) -> bool {

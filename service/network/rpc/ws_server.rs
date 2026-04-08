@@ -292,6 +292,9 @@ mod tests {
         let server = WsServer::new(18787);
         let mut rx = server.subscribe_events();
 
+        // Register a subscription so publish() doesn't short-circuit
+        server.add_subscription(1, SubscriptionType::NewBlock);
+
         server.notify_new_block("abc123", 100, 5);
 
         match rx.try_recv() {

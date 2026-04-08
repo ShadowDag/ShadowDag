@@ -262,8 +262,11 @@ fn print_help() {
 fn parse_flag(args: &[String], name: &str, default: &str) -> String {
     match parse_flag_opt(args, name) {
         Ok(Some(val)) => val,
-        Ok(None) => default.to_string(),
-        Err(_) => default.to_string(), // parse_config handles errors for critical flags
+        Ok(None) => default.to_string(), // flag not present at all — use default
+        Err(_) => {
+            eprintln!("Error: {} requires a value", name);
+            std::process::exit(1);
+        }
     }
 }
 

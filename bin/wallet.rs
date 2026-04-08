@@ -83,17 +83,25 @@ fn default_wallet_dir() -> PathBuf {
 }
 
 /// Path to the wallet database (RocksDB-backed via WalletDB).
+/// Network-aware: stores data under ~/.shadowdag/<network>/wallet_db
 fn wallet_db_path() -> String {
-    std::env::var("SHADOWDAG_WALLET_DB")
-        .unwrap_or_else(|_| default_wallet_dir().join("wallet_db").to_string_lossy().to_string())
+    if let Ok(custom) = std::env::var("SHADOWDAG_WALLET_DB") {
+        return custom;
+    }
+    let base = default_wallet_dir();
+    let net = wallet_network();
+    format!("{}/{}/wallet_db", base.display(), net)
 }
 
 /// Path to the encrypted seed file.
+/// Network-aware: stores seed under ~/.shadowdag/<network>/seed.dat
 fn seed_path() -> PathBuf {
-    let dir = std::env::var("SHADOWDAG_WALLET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| default_wallet_dir());
-    dir.join("seed.dat")
+    if let Ok(custom) = std::env::var("SHADOWDAG_WALLET_DIR") {
+        return PathBuf::from(custom).join("seed.dat");
+    }
+    let base = default_wallet_dir();
+    let net = wallet_network();
+    base.join(net).join("seed.dat")
 }
 
 /// Determine the active network from the SHADOWDAG_NETWORK environment variable.
@@ -215,9 +223,10 @@ fn load_and_unlock_wallet() -> Result<Wallet, WalletError> {
             Ok(persisted)
         }
         Ok(None) => {
-            // First time loading -- just save and return
-            db.save_wallet(&temp)?;
-            Ok(temp)
+            // Don't silently create a new wallet — warn the user
+            eprintln!("Warning: no wallet found for address {} (network: {})", addr, wallet_network());
+            eprintln!("If you created this wallet on a different network, set SHADOWDAG_NETWORK accordingly.");
+            Err(WalletError::Other("wallet not found for current network".into()))
         }
         Err(e) => Err(e),
     };

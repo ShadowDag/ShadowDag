@@ -25,7 +25,7 @@ use crate::service::network::p2p::connection_puzzle::{ConnectionPuzzle, Challeng
 use crate::service::network::p2p::peer_diversity::PeerIdentity;
 use crate::service::network::p2p::protocol::{
     self, WireHeader, CommandId, ProtocolSession, VersionPayload,
-    WIRE_HEADER_SIZE, CHAIN_ID, DEFAULT_BPS, MAX_MESSAGE_SIZE,
+    WIRE_HEADER_SIZE, DEFAULT_BPS, MAX_MESSAGE_SIZE,
     validate_header, validate_payload_checksum, validate_payload_size,
     validate_inv_items, validate_addr_list, validate_headers_list, validate_hash_hex,
     validate_reject, build_version_payload,
@@ -1114,7 +1114,7 @@ impl P2P {
                     timestamp,
                     user_agent: user_agent.clone(),
                     bps:      if bps == 0 { DEFAULT_BPS } else { bps },  // backward compat
-                    chain_id: if chain_id == 0 { CHAIN_ID } else { chain_id },
+                    chain_id, // Don't normalize — let protocol layer enforce strict check
                     services: if services == 0 { protocol::SERVICE_NODE_NETWORK } else { services },
                     nonce,
                 };

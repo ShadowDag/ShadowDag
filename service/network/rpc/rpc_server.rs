@@ -17,6 +17,7 @@ use rocksdb::DB;
 use crate::{slog_info, slog_warn, slog_error};
 use crate::errors::NetworkError;
 use crate::config::consensus::consensus_params::ConsensusParams;
+use crate::config::network::network_params::NetworkParams;
 use crate::domain::transaction::transaction::Transaction;
 use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
 use crate::infrastructure::storage::rocksdb::utxo::utxo_store::UtxoStore;
@@ -274,7 +275,7 @@ impl RpcState {
             best_height:  0,
             best_hash:    String::new(),
             node_version: format!("ShadowDAG/{}", env!("CARGO_PKG_VERSION")),
-            network_name: "shadowdag-mainnet".to_string(),
+            network_name: NetworkParams::NETWORK_NAME.to_string(),
             p2p_port:     ConsensusParams::DEFAULT_P2P_PORT,
             rpc_port:     ConsensusParams::DEFAULT_RPC_PORT,
         })
@@ -306,7 +307,7 @@ impl RpcState {
             best_height:  0,
             best_hash:    String::new(),
             node_version: format!("ShadowDAG/{}", env!("CARGO_PKG_VERSION")),
-            network_name: "shadowdag-mainnet".to_string(),
+            network_name: NetworkParams::NETWORK_NAME.to_string(),
             p2p_port:     ConsensusParams::DEFAULT_P2P_PORT,
             rpc_port:     ConsensusParams::DEFAULT_RPC_PORT,
         })
