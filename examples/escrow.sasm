@@ -1,0 +1,19 @@
+;; Escrow -- hold funds until release
+;; @fn deposit():bool
+;; @fn release(address):bool
+;; @event Deposit(address,uint64)
+;; @event Release(address,uint64)
+;;
+;; @test deposit_stores_value
+
+; Store caller as depositor at slot 0
+CALLER
+PUSH1 0
+SSTORE
+
+; Store value at slot 1
+CALLVALUE
+PUSH1 1
+SSTORE
+
+STOP

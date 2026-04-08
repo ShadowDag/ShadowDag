@@ -1,0 +1,22 @@
+;; SRC-20 Token -- basic fungible token
+;; @fn transfer(uint64,address):bool
+;; @fn balance_of(address):uint64
+;; @event Transfer(address,address,uint64)
+;;
+;; @test init
+;; @test store_value 000000000000000000000000000000000000000000000000000000000000002a
+
+; Store initial supply at slot 0
+PUSH1 0xFF        ; initial supply = 255
+PUSH1 0           ; slot 0
+SSTORE
+
+; Read calldata selector (first 4 bytes)
+PUSH1 0
+CALLDATALOAD
+
+; Store it at slot 1 for debugging
+PUSH1 1
+SSTORE
+
+STOP
