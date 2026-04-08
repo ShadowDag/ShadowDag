@@ -10,6 +10,8 @@ use rocksdb::{
 };
 use std::path::Path;
 use crate::errors::StorageError;
+use crate::slog_error;
+use crate::slog_warn;
 
 use crate::domain::block::block::Block;
 use crate::engine::mining::algorithms::shadowhash::shadow_hash as algo_shadow_hash;
@@ -157,7 +159,7 @@ impl ShadowHashStore {
     pub fn get_hash(&self, key: &str) -> Result<Option<String>, StorageError> {
         Self::with_key(key, |k| {
             match self.db.get_pinned_opt(k, &self.read_opts) {
-                Ok(Some(v)) => Ok(Some(Self::slice_to_string(&v))),
+                Ok(Some(v)) => Ok(Self::slice_to_string(&v)),
                 Ok(None) => Ok(None),
                 Err(e) => Err(StorageError::Other(format!("get_hash: {}", e))),
             }
@@ -201,9 +203,9 @@ impl ShadowHashStore {
 
         for res in results {
             match res {
-                Ok(Some(v)) => out.push(Some(Self::slice_to_string(&v))),
+                Ok(Some(v)) => out.push(Self::slice_to_string(&v)),
                 Ok(None) => out.push(None),
-                Err(e) => return Err(StorageError::Other(format!("get_many: {}", e))), // 🔥 مهم
+                Err(e) => return Err(StorageError::Other(format!("get_many: {}", e))),
             }
         }
 
@@ -262,10 +264,22 @@ impl ShadowHashStore {
     // HELPER
     // ─────────────────────────────────────────
     #[inline(always)]
-    fn slice_to_string(slice: &[u8]) -> String {
+    fn slice_to_string(slice: &[u8]) -> Option<String> {
         if slice.is_empty() {
-            return String::new();
+            return None;
         }
-        String::from_utf8_lossy(slice).to_string()
+        match std::str::from_utf8(slice) {
+            Ok(s) if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) => {
+                Some(s.to_string())
+            }
+            Ok(s) => {
+                slog_warn!("crypto", "invalid_hash_format", len => s.len());
+                None
+            }
+            Err(e) => {
+                slog_error!("crypto", "corrupt_hash_in_db", error => e);
+                None
+            }
+        }
     }
 }

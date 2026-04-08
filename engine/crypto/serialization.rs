@@ -3,7 +3,7 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput};
+use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
 use crate::domain::block::block::Block;
 use crate::domain::block::block_header::BlockHeader;
 
@@ -63,24 +63,76 @@ impl Serializer {
     pub fn serialize_tx_input(buf: &mut Vec<u8>, input: &TxInput) {
         Self::write_str(buf, &input.txid);
         Self::write_u32(buf, input.index);
+        Self::write_str(buf, &input.owner);
+        Self::write_str(buf, &input.pub_key);
+        if let Some(ref ki) = input.key_image {
+            buf.push(0x01);
+            Self::write_str(buf, ki);
+        } else {
+            buf.push(0x00);
+        }
     }
 
     #[inline(always)]
     pub fn serialize_tx_output(buf: &mut Vec<u8>, output: &TxOutput) {
         Self::write_str(buf, &output.address);
         Self::write_u64(buf, output.amount);
+        if let Some(ref c) = output.commitment {
+            buf.push(0x01);
+            Self::write_str(buf, c);
+        } else {
+            buf.push(0x00);
+        }
+        if let Some(ref rp) = output.range_proof {
+            buf.push(0x01);
+            Self::write_str(buf, rp);
+        } else {
+            buf.push(0x00);
+        }
+        if let Some(ref epk) = output.ephemeral_pubkey {
+            buf.push(0x01);
+            Self::write_str(buf, epk);
+        } else {
+            buf.push(0x00);
+        }
     }
 
     #[inline(always)]
     fn hash_tx_input(hasher: &mut impl sha2::Digest, input: &TxInput) {
         Self::hash_str(hasher, &input.txid);
         Self::hash_u32(hasher, input.index);
+        Self::hash_str(hasher, &input.owner);
+        Self::hash_str(hasher, &input.pub_key);
+        if let Some(ref ki) = input.key_image {
+            hasher.update([0x01]);
+            Self::hash_str(hasher, ki);
+        } else {
+            hasher.update([0x00]);
+        }
     }
 
     #[inline(always)]
     fn hash_tx_output(hasher: &mut impl sha2::Digest, output: &TxOutput) {
         Self::hash_str(hasher, &output.address);
         Self::hash_u64(hasher, output.amount);
+        if let Some(ref c) = output.commitment {
+            hasher.update([0x01]);
+            Self::hash_str(hasher, c);
+        } else {
+            hasher.update([0x00]);
+        }
+        if let Some(ref rp) = output.range_proof {
+            hasher.update([0x01]);
+            Self::hash_str(hasher, rp);
+        } else {
+            hasher.update([0x00]);
+        }
+        if let Some(ref epk) = output.ephemeral_pubkey {
+            hasher.update([0x01]);
+            Self::hash_str(hasher, epk);
+        } else {
+            hasher.update([0x00]);
+        }
     }
 
     // ─────────────────────────────────────────
@@ -110,10 +162,37 @@ impl Serializer {
     }
 
     #[inline(always)]
+    fn tx_type_byte(tx_type: &TxType) -> u8 {
+        match tx_type {
+            TxType::Transfer       => 0x00,
+            TxType::Confidential   => 0x01,
+            TxType::ContractCreate => 0x02,
+            TxType::ContractCall   => 0x03,
+            TxType::AtomicSwap     => 0x04,
+            TxType::MultiSig       => 0x05,
+            TxType::TokenTransfer  => 0x06,
+            TxType::SwapTx         => 0x07,
+            TxType::DexOrder       => 0x08,
+        }
+    }
+
+    #[inline(always)]
     pub fn serialize_transaction_into(buf: &mut Vec<u8>, tx: &Transaction) {
         Self::write_u32(buf, 2);
         Self::write_u64(buf, tx.timestamp);
         Self::write_u64(buf, tx.fee);
+
+        // tx_type discriminant
+        buf.push(Self::tx_type_byte(&tx.tx_type));
+        // is_coinbase flag
+        buf.push(if tx.is_coinbase { 0x01 } else { 0x00 });
+        // payload_hash if present
+        if let Some(ref ph) = tx.payload_hash {
+            buf.push(0x01);
+            Self::write_str(buf, ph);
+        } else {
+            buf.push(0x00);
+        }
 
         let sorted = Self::sorted_input_indices(&tx.inputs);
         Self::write_u32(buf, tx.inputs.len() as u32);
@@ -171,6 +250,14 @@ impl Serializer {
                 Self::write_str(buf, sp);
             }
         }
+
+        Self::write_u64(buf, header.extra_nonce);
+        if let Some(ref uc) = header.utxo_commitment {
+            buf.push(0x01);
+            Self::write_str(buf, uc);
+        } else {
+            buf.push(0x00);
+        }
     }
 
     // ─────────────────────────────────────────
@@ -213,6 +300,18 @@ impl Serializer {
         Self::hash_u32(&mut h, 2);
         Self::hash_u64(&mut h, tx.timestamp);
         Self::hash_u64(&mut h, tx.fee);
+
+        // tx_type discriminant
+        h.update([Self::tx_type_byte(&tx.tx_type)]);
+        // is_coinbase flag
+        h.update([if tx.is_coinbase { 0x01 } else { 0x00 }]);
+        // payload_hash if present
+        if let Some(ref ph) = tx.payload_hash {
+            h.update([0x01]);
+            Self::hash_str(&mut h, ph);
+        } else {
+            h.update([0x00]);
+        }
 
         let sorted = Self::sorted_input_indices(&tx.inputs);
         Self::hash_u32(&mut h, tx.inputs.len() as u32);
@@ -257,6 +356,14 @@ impl Serializer {
                 h.update([1]);
                 Self::hash_str(&mut h, sp);
             }
+        }
+
+        Self::hash_u64(&mut h, header.extra_nonce);
+        if let Some(ref uc) = header.utxo_commitment {
+            h.update([0x01]);
+            Self::hash_str(&mut h, uc);
+        } else {
+            h.update([0x00]);
         }
 
         hex::encode(h.finalize())

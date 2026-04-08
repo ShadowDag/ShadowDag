@@ -11,6 +11,7 @@ use rocksdb::{
 };
 
 use std::path::Path;
+use crate::slog_error;
 
 // ─────────────────────────────────────────
 // PREFIX
@@ -90,14 +91,18 @@ impl Ed25519Store {
     #[inline(always)]
     pub fn store_signature(&self, key: &str, signature: &str) {
         Self::with_key(key, |k| {
-            let _ = self.db.put_opt(k, signature.as_bytes(), &self.write_opts);
+            if let Err(e) = self.db.put_opt(k, signature.as_bytes(), &self.write_opts) {
+                slog_error!("crypto", "ed25519_store_failed", error => e);
+            }
         });
     }
 
     #[inline(always)]
     pub fn store_signature_raw(&self, key: &str, sig: &[u8]) {
         Self::with_key(key, |k| {
-            let _ = self.db.put_opt(k, sig, &self.write_opts);
+            if let Err(e) = self.db.put_opt(k, sig, &self.write_opts) {
+                slog_error!("crypto", "ed25519_store_raw_failed", error => e);
+            }
         });
     }
 
@@ -109,10 +114,14 @@ impl Ed25519Store {
     #[must_use]
     pub fn get_signature(&self, key: &str) -> Option<String> {
         Self::with_key(key, |k| {
-            self.db.get_pinned_opt(k, &self.read_opts)
-                .ok()
-                .flatten()
-                .and_then(|v| std::str::from_utf8(&v).ok().map(|s| s.to_string()))
+            match self.db.get_pinned_opt(k, &self.read_opts) {
+                Ok(Some(v)) => std::str::from_utf8(&v).ok().map(|s| s.to_string()),
+                Ok(None) => None,
+                Err(e) => {
+                    slog_error!("crypto", "ed25519_read_failed", error => e);
+                    None
+                }
+            }
         })
     }
 
@@ -120,10 +129,14 @@ impl Ed25519Store {
     #[must_use]
     pub fn get_signature_raw(&self, key: &str) -> Option<Vec<u8>> {
         Self::with_key(key, |k| {
-            self.db.get_pinned_opt(k, &self.read_opts)
-                .ok()
-                .flatten()
-                .map(|v| v.to_vec())
+            match self.db.get_pinned_opt(k, &self.read_opts) {
+                Ok(Some(v)) => Some(v.to_vec()),
+                Ok(None) => None,
+                Err(e) => {
+                    slog_error!("crypto", "ed25519_read_raw_failed", error => e);
+                    None
+                }
+            }
         })
     }
 
@@ -142,7 +155,13 @@ impl Ed25519Store {
 
         self.db.multi_get(db_keys)
             .into_iter()
-            .map(|res| res.ok().flatten().map(|v| v.to_vec()))
+            .map(|res| match res {
+                Ok(opt) => opt.map(|v| v.to_vec()),
+                Err(e) => {
+                    slog_error!("crypto", "ed25519_multi_read_failed", error => e);
+                    None
+                }
+            })
             .collect()
     }
 
@@ -153,9 +172,13 @@ impl Ed25519Store {
     #[inline(always)]
     pub fn signature_exists(&self, key: &str) -> bool {
         Self::with_key(key, |k| {
-            self.db.get_pinned_opt(k, &self.read_opts)
-                .map(|v| v.is_some())
-                .unwrap_or(false)
+            match self.db.get_pinned_opt(k, &self.read_opts) {
+                Ok(v) => v.is_some(),
+                Err(e) => {
+                    slog_error!("crypto", "ed25519_exists_failed", error => e);
+                    false
+                }
+            }
         })
     }
 
@@ -166,7 +189,9 @@ impl Ed25519Store {
     #[inline(always)]
     pub fn delete_signature(&self, key: &str) {
         Self::with_key(key, |k| {
-            let _ = self.db.delete_opt(k, &self.write_opts);
+            if let Err(e) = self.db.delete_opt(k, &self.write_opts) {
+                slog_error!("crypto", "ed25519_delete_failed", error => e);
+            }
         });
     }
 
@@ -180,7 +205,9 @@ impl Ed25519Store {
             });
         }
 
-        let _ = self.db.write_opt(batch, &self.write_opts);
+        if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
+            slog_error!("crypto", "ed25519_delete_batch_failed", error => e);
+        }
     }
 
     // ─────────────────────────────────────────
@@ -207,6 +234,8 @@ impl Ed25519Store {
             batch.delete(&*k);
         }
 
-        let _ = self.db.write_opt(batch, &self.write_opts);
+        if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
+            slog_error!("crypto", "ed25519_clear_failed", error => e);
+        }
     }
 }
