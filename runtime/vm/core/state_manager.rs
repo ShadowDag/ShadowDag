@@ -409,6 +409,18 @@ impl StateManager {
     pub fn account_count(&self) -> usize {
         self.accounts.len()
     }
+
+    /// Iterate over all accounts (address -> Account).
+    /// Used by ExecutionEnvironment::persist_to_storage to flush state to RocksDB.
+    pub fn iter_accounts(&self) -> impl Iterator<Item = (&String, &Account)> {
+        self.accounts.iter()
+    }
+
+    /// Iterate over all storage slots (address -> key -> value map).
+    /// Used by ExecutionEnvironment::persist_to_storage to flush storage to RocksDB.
+    pub fn iter_storage(&self) -> impl Iterator<Item = (&String, &BTreeMap<String, String>)> {
+        self.storage.iter()
+    }
 }
 
 #[cfg(test)]

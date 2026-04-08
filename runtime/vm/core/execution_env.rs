@@ -39,6 +39,7 @@ macro_rules! pop2 {
 use std::collections::HashSet;
 use sha2::{Sha256, Digest};
 
+use crate::errors::VmError;
 use crate::runtime::vm::core::u256::U256;
 use crate::runtime::vm::core::state_manager::StateManager;
 use crate::runtime::vm::core::vm::{
@@ -47,6 +48,8 @@ use crate::runtime::vm::core::vm::{
 };
 use crate::runtime::vm::gas::gas_meter::{GasMeter, GasResult};
 use crate::runtime::vm::contracts::contract_deployer::ContractDeployer;
+use crate::runtime::vm::precompiles::precompile_registry::PrecompileRegistry;
+use crate::runtime::vm::contracts::contract_storage::ContractStorage;
 
 /// Maximum call depth for nested calls
 pub const MAX_CALL_DEPTH: usize = 1024;
@@ -112,6 +115,55 @@ impl ExecutionEnvironment {
             destroyed_contracts: HashSet::new(),
             created_in_tx: HashSet::new(),
             last_return_data: Vec::new(),
+        }
+    }
+
+    /// Persist all state changes to ContractStorage (RocksDB).
+    /// Called after top-level execution succeeds.
+    pub fn persist_to_storage(&self, storage: &ContractStorage) -> Result<(), VmError> {
+        for (addr, account) in self.state.iter_accounts() {
+            // Persist account metadata (balance|nonce|code_hash)
+            let meta = format!("{}|{}|{}", account.balance, account.nonce, account.code_hash);
+            storage.set_state(&format!("account:{}", addr), &meta)
+                .map_err(VmError::Storage)?;
+            // Persist code if contract
+            if !account.code.is_empty() {
+                storage.set_state(&format!("code:{}", addr), &hex::encode(&account.code))
+                    .map_err(VmError::Storage)?;
+            }
+        }
+        // Persist storage slots
+        for (addr, slots) in self.state.iter_storage() {
+            for (key, value) in slots {
+                storage.set_state(&format!("{}:{}", addr, key), value)
+                    .map_err(VmError::Storage)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Load a contract's state from ContractStorage into the in-memory StateManager.
+    pub fn load_contract_from_storage(&mut self, storage: &ContractStorage, addr: &str) {
+        // Load account metadata
+        if let Some(meta) = storage.get_state(&format!("account:{}", addr)) {
+            let parts: Vec<&str> = meta.splitn(3, '|').collect();
+            if parts.len() == 3 {
+                let balance: u64 = parts[0].parse().unwrap_or(0);
+                let nonce: u64 = parts[1].parse().unwrap_or(0);
+                // Create account in StateManager
+                self.state.get_or_create_account(addr);
+                self.state.set_balance(addr, balance).ok();
+                // Set nonce by incrementing
+                for _ in 0..nonce {
+                    self.state.increment_nonce(addr).ok();
+                }
+            }
+        }
+        // Load code
+        if let Some(code_hex) = storage.get_state(&format!("code:{}", addr)) {
+            if let Ok(code) = hex::decode(&code_hex) {
+                self.state.set_code(addr, code).ok();
+            }
         }
     }
 
@@ -426,6 +478,7 @@ impl ExecutionEnvironment {
                     let data_val = pop1!(stack, gas, snapshot, self);
                     logs.push(LogEntry {
                         contract: ctx.address.clone(),
+                        topics: Vec::new(),
                         data: data_val.to_hex().into_bytes(),
                     });
                 }
@@ -511,6 +564,27 @@ impl ExecutionEnvironment {
                     };
 
                     let target_addr = addr.to_hex().to_string();
+
+                    // Check for precompile (addresses 0x01-0x09)
+                    if let Some(precompile_id) = is_precompile_addr(&target_addr) {
+                        let registry = PrecompileRegistry::new();
+                        let result = registry.execute(precompile_id as u64, &calldata, child_gas);
+                        if result.success {
+                            gas.return_gas(child_gas.saturating_sub(result.gas_used));
+                            self.last_return_data = result.output.clone();
+                            if ret_len > 0 && !result.output.is_empty() {
+                                let copy_len = ret_len.min(result.output.len());
+                                while memory.len() < ret_offset + copy_len { memory.push(0); }
+                                memory[ret_offset..ret_offset + copy_len].copy_from_slice(&result.output[..copy_len]);
+                            }
+                            stack.push(U256::ONE);
+                        } else {
+                            self.last_return_data.clear();
+                            stack.push(U256::ZERO);
+                        }
+                        pc += 1; continue;
+                    }
+
                     let child_ctx = CallContext {
                         address: target_addr.clone(),
                         code_address: target_addr,
@@ -574,6 +648,27 @@ impl ExecutionEnvironment {
                     } else { Vec::new() };
 
                     let target_addr = addr.to_hex().to_string();
+
+                    // Check for precompile (addresses 0x01-0x09)
+                    if let Some(precompile_id) = is_precompile_addr(&target_addr) {
+                        let registry = PrecompileRegistry::new();
+                        let result = registry.execute(precompile_id as u64, &calldata, child_gas);
+                        if result.success {
+                            gas.return_gas(child_gas.saturating_sub(result.gas_used));
+                            self.last_return_data = result.output.clone();
+                            if ret_len > 0 && !result.output.is_empty() {
+                                let copy_len = ret_len.min(result.output.len());
+                                while memory.len() < ret_offset + copy_len { memory.push(0); }
+                                memory[ret_offset..ret_offset + copy_len].copy_from_slice(&result.output[..copy_len]);
+                            }
+                            stack.push(U256::ONE);
+                        } else {
+                            self.last_return_data.clear();
+                            stack.push(U256::ZERO);
+                        }
+                        pc += 1; continue;
+                    }
+
                     let child_ctx = CallContext {
                         address: target_addr.clone(),
                         code_address: target_addr,
@@ -952,6 +1047,197 @@ impl ExecutionEnvironment {
                     };
                 }
 
+                // ── Context (extended) ───────────────────────
+                OpCode::ADDRESS => {
+                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    stack.push(U256::from_hex(&hex::encode(ctx.address.as_bytes())).unwrap_or(U256::ZERO));
+                }
+                OpCode::PC => {
+                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    stack.push(U256::from_u64(pc as u64));
+                }
+                OpCode::GAS => {
+                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    stack.push(U256::from_u64(gas.gas_remaining()));
+                }
+                OpCode::GASLIMIT => {
+                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    stack.push(U256::from_u64(ctx.gas_limit));
+                }
+
+                // ── Memory (extended) ───────────────────────
+                OpCode::MSTORE8 => {
+                    let (offset_val, val) = pop2!(stack, gas, snapshot, self);
+                    let offset = offset_val.as_u64() as usize;
+                    if offset + 1 > MAX_MEMORY_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                    }
+                    while memory.len() <= offset { memory.push(0); }
+                    memory[offset] = (val.as_u64() & 0xFF) as u8;
+                }
+                OpCode::MSIZE => {
+                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    // Round up to nearest multiple of 32
+                    let size = memory.len().div_ceil(32) * 32;
+                    stack.push(U256::from_u64(size as u64));
+                }
+
+                // ── Logging (with topics) ───────────────────
+                OpCode::LOG1 | OpCode::LOG2 | OpCode::LOG3 | OpCode::LOG4 => {
+                    if ctx.is_static {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                    }
+                    let num_topics = match op {
+                        OpCode::LOG1 => 1usize,
+                        OpCode::LOG2 => 2,
+                        OpCode::LOG3 => 3,
+                        OpCode::LOG4 => 4,
+                        _ => unreachable!(),
+                    };
+                    // Need offset + length + num_topics items on stack
+                    if stack.len() < 2 + num_topics {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                    }
+                    let offset = stack.pop().unwrap().as_u64() as usize;
+                    let length = stack.pop().unwrap().as_u64() as usize;
+                    let mut topics = Vec::with_capacity(num_topics);
+                    for _ in 0..num_topics {
+                        topics.push(stack.pop().unwrap());
+                    }
+                    // Read data from memory
+                    let data = if length > 0 && offset + length <= memory.len() {
+                        memory[offset..offset + length].to_vec()
+                    } else if length == 0 {
+                        Vec::new()
+                    } else {
+                        // Extend memory if needed
+                        while memory.len() < offset + length { memory.push(0); }
+                        memory[offset..offset + length].to_vec()
+                    };
+                    logs.push(LogEntry {
+                        contract: ctx.address.clone(),
+                        topics,
+                        data,
+                    });
+                }
+
+                // ── Call data ───────────────────────────────
+                OpCode::CALLDATALOAD => {
+                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    let mut buf = [0u8; 32];
+                    for (i, byte) in buf.iter_mut().enumerate() {
+                        if offset + i < ctx.calldata.len() {
+                            *byte = ctx.calldata[offset + i];
+                        }
+                    }
+                    stack.push(U256::from_be_bytes(&buf));
+                }
+                OpCode::CALLDATASIZE => {
+                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    stack.push(U256::from_u64(ctx.calldata.len() as u64));
+                }
+                OpCode::CALLDATACOPY => {
+                    if stack.len() < 3 { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    let dest = stack.pop().unwrap().as_u64() as usize;
+                    let offset = stack.pop().unwrap().as_u64() as usize;
+                    let length = stack.pop().unwrap().as_u64() as usize;
+                    if length > 0 {
+                        if dest + length > MAX_MEMORY_SIZE {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        }
+                        while memory.len() < dest + length { memory.push(0); }
+                        for i in 0..length {
+                            memory[dest + i] = if offset + i < ctx.calldata.len() { ctx.calldata[offset + i] } else { 0 };
+                        }
+                    }
+                }
+                OpCode::CODESIZE => {
+                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    stack.push(U256::from_u64(code.len() as u64));
+                }
+                OpCode::CODECOPY => {
+                    if stack.len() < 3 { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    let dest = stack.pop().unwrap().as_u64() as usize;
+                    let offset = stack.pop().unwrap().as_u64() as usize;
+                    let length = stack.pop().unwrap().as_u64() as usize;
+                    if length > 0 {
+                        if dest + length > MAX_MEMORY_SIZE {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        }
+                        while memory.len() < dest + length { memory.push(0); }
+                        for i in 0..length {
+                            memory[dest + i] = if offset + i < code.len() { code[offset + i] } else { 0 };
+                        }
+                    }
+                }
+                OpCode::EXTCODESIZE => {
+                    let addr_val = pop1!(stack, gas, snapshot, self);
+                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    let addr_hex = addr_val.to_hex();
+                    let ext_code = self.state.get_code(&addr_hex);
+                    stack.push(U256::from_u64(ext_code.len() as u64));
+                }
+                OpCode::RETURNDATASIZE => {
+                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    stack.push(U256::from_u64(self.last_return_data.len() as u64));
+                }
+                OpCode::RETURNDATACOPY => {
+                    if stack.len() < 3 { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    let dest = stack.pop().unwrap().as_u64() as usize;
+                    let offset = stack.pop().unwrap().as_u64() as usize;
+                    let length = stack.pop().unwrap().as_u64() as usize;
+                    if length > 0 {
+                        // Bounds check against return data (EIP-211)
+                        if offset + length > self.last_return_data.len() {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        }
+                        if dest + length > MAX_MEMORY_SIZE {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        }
+                        while memory.len() < dest + length { memory.push(0); }
+                        memory[dest..dest + length].copy_from_slice(&self.last_return_data[offset..offset + length]);
+                    }
+                }
+
+                // ── Extended stack (DUP2-DUP8, SWAP2-SWAP4) ─
+                OpCode::DUP2 | OpCode::DUP3 | OpCode::DUP4 | OpCode::DUP5 |
+                OpCode::DUP6 | OpCode::DUP7 | OpCode::DUP8 => {
+                    let n = match op {
+                        OpCode::DUP2 => 2usize,
+                        OpCode::DUP3 => 3,
+                        OpCode::DUP4 => 4,
+                        OpCode::DUP5 => 5,
+                        OpCode::DUP6 => 6,
+                        OpCode::DUP7 => 7,
+                        OpCode::DUP8 => 8,
+                        _ => unreachable!(),
+                    };
+                    if stack.len() < n { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    let idx = stack.len() - n;
+                    let val = stack[idx];
+                    stack.push(val);
+                }
+                OpCode::SWAP2 | OpCode::SWAP3 | OpCode::SWAP4 => {
+                    let n = match op {
+                        OpCode::SWAP2 => 3usize, // swap top with 3rd from top
+                        OpCode::SWAP3 => 4,       // swap top with 4th from top
+                        OpCode::SWAP4 => 5,       // swap top with 5th from top
+                        _ => unreachable!(),
+                    };
+                    if stack.len() < n { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    let len = stack.len();
+                    stack.swap(len - 1, len - n);
+                }
+
                 OpCode::INVALID => {
                     self.state.rollback(snapshot).ok();
                     return CallOutcome::Failure { gas_used: gas.gas_used() };
@@ -974,6 +1260,23 @@ impl ExecutionEnvironment {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
+
+/// Check if a hex address string maps to a precompile (0x01-0x09).
+/// Precompile addresses are the low addresses: "0000...01" through "0000...09".
+fn is_precompile_addr(addr: &str) -> Option<u8> {
+    let trimmed = addr.trim_start_matches('0');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() <= 2 {
+        if let Ok(n) = u8::from_str_radix(trimmed, 16) {
+            if (1..=9).contains(&n) {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
 
 /// Parse a storage value to U256 (deterministic: hex > decimal > zero)
 fn parse_storage_value(s: &str) -> U256 {

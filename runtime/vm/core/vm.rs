@@ -100,6 +100,12 @@ pub enum OpCode {
     BLOCKHASH   = 0x73, // Push current block hash
     BALANCE     = 0x74, // Push balance of address
 
+    // -- Context (extended) --
+    PC          = 0x02, // Program counter
+    GAS         = 0x03, // Remaining gas
+    GASLIMIT    = 0x04, // Gas limit
+    ADDRESS     = 0x7A, // Current contract address
+
     // -- Flow Control --
     JUMP        = 0x80, // Unconditional jump
     JUMPI       = 0x81, // Conditional jump (jump if top != 0)
@@ -108,9 +114,15 @@ pub enum OpCode {
     // -- Memory --
     MLOAD       = 0x90, // Load from memory
     MSTORE      = 0x91, // Store to memory
+    MSTORE8     = 0x92, // Store single byte to memory
+    MSIZE       = 0x93, // Current memory size (rounded to 32)
 
     // -- Logging --
-    LOG         = 0xA0, // Emit log event
+    LOG         = 0xA0, // Emit log event (0 topics)
+    LOG1        = 0xA1, // Emit log event (1 topic)
+    LOG2        = 0xA2, // Emit log event (2 topics)
+    LOG3        = 0xA3, // Emit log event (3 topics)
+    LOG4        = 0xA4, // Emit log event (4 topics)
 
     // -- System --
     CALL         = 0xB0, // Call another contract
@@ -123,6 +135,28 @@ pub enum OpCode {
     REVERT       = 0xB7, // Revert all changes and stop
     SELFDESTRUCT = 0xB8, // Destroy contract
 
+    // -- Call data --
+    CALLDATALOAD   = 0xC0, // Load 32 bytes from calldata
+    CALLDATASIZE   = 0xC1, // Push calldata length
+    CALLDATACOPY   = 0xC2, // Copy calldata to memory
+    CODESIZE       = 0xC3, // Push current code length
+    CODECOPY       = 0xC4, // Copy code to memory
+    EXTCODESIZE    = 0xC5, // Push external contract code size
+    RETURNDATASIZE = 0xC6, // Push last return data length
+    RETURNDATACOPY = 0xC7, // Copy return data to memory
+
+    // -- Extended stack --
+    DUP2  = 0xD0, // Duplicate 2nd from top
+    DUP3  = 0xD1, // Duplicate 3rd from top
+    DUP4  = 0xD2, // Duplicate 4th from top
+    DUP5  = 0xD3, // Duplicate 5th from top
+    DUP6  = 0xD4, // Duplicate 6th from top
+    DUP7  = 0xD5, // Duplicate 7th from top
+    DUP8  = 0xD6, // Duplicate 8th from top
+    SWAP2 = 0xD7, // Swap top with 3rd from top
+    SWAP3 = 0xD8, // Swap top with 4th from top
+    SWAP4 = 0xD9, // Swap top with 5th from top
+
     // -- Invalid --
     INVALID     = 0xFF, // Invalid opcode (always fails)
 }
@@ -131,6 +165,7 @@ impl OpCode {
     pub fn from_byte(b: u8) -> Self {
         match b {
             0x00 => OpCode::STOP, 0x01 => OpCode::NOP,
+            0x02 => OpCode::PC, 0x03 => OpCode::GAS, 0x04 => OpCode::GASLIMIT,
             0x10 => OpCode::PUSH1, 0x11 => OpCode::PUSH2,
             0x12 => OpCode::PUSH4, 0x13 => OpCode::PUSH8,
             0x14 => OpCode::PUSH16, 0x15 => OpCode::PUSH32,
@@ -147,13 +182,24 @@ impl OpCode {
             0x60 => OpCode::SHA256, 0x61 => OpCode::KECCAK,
             0x70 => OpCode::CALLER, 0x71 => OpCode::CALLVALUE,
             0x72 => OpCode::TIMESTAMP, 0x73 => OpCode::BLOCKHASH,
-            0x74 => OpCode::BALANCE,
+            0x74 => OpCode::BALANCE, 0x7A => OpCode::ADDRESS,
             0x80 => OpCode::JUMP, 0x81 => OpCode::JUMPI, 0x82 => OpCode::JUMPDEST,
             0x90 => OpCode::MLOAD, 0x91 => OpCode::MSTORE,
+            0x92 => OpCode::MSTORE8, 0x93 => OpCode::MSIZE,
             0xA0 => OpCode::LOG,
+            0xA1 => OpCode::LOG1, 0xA2 => OpCode::LOG2,
+            0xA3 => OpCode::LOG3, 0xA4 => OpCode::LOG4,
             0xB0 => OpCode::CALL, 0xB1 => OpCode::CALLCODE, 0xB2 => OpCode::DELEGATECALL,
             0xB3 => OpCode::STATICCALL, 0xB4 => OpCode::CREATE, 0xB5 => OpCode::CREATE2,
             0xB6 => OpCode::RETURN, 0xB7 => OpCode::REVERT, 0xB8 => OpCode::SELFDESTRUCT,
+            0xC0 => OpCode::CALLDATALOAD, 0xC1 => OpCode::CALLDATASIZE,
+            0xC2 => OpCode::CALLDATACOPY, 0xC3 => OpCode::CODESIZE,
+            0xC4 => OpCode::CODECOPY, 0xC5 => OpCode::EXTCODESIZE,
+            0xC6 => OpCode::RETURNDATASIZE, 0xC7 => OpCode::RETURNDATACOPY,
+            0xD0 => OpCode::DUP2, 0xD1 => OpCode::DUP3, 0xD2 => OpCode::DUP4,
+            0xD3 => OpCode::DUP5, 0xD4 => OpCode::DUP6, 0xD5 => OpCode::DUP7,
+            0xD6 => OpCode::DUP8,
+            0xD7 => OpCode::SWAP2, 0xD8 => OpCode::SWAP3, 0xD9 => OpCode::SWAP4,
             _    => OpCode::INVALID,
         }
     }
@@ -169,15 +215,22 @@ impl OpCode {
 
             // Very cheap (2 gas) -- stack ops and context reads
             OpCode::NOP | OpCode::POP | OpCode::DUP | OpCode::SWAP |
+            OpCode::DUP2 | OpCode::DUP3 | OpCode::DUP4 | OpCode::DUP5 |
+            OpCode::DUP6 | OpCode::DUP7 | OpCode::DUP8 |
+            OpCode::SWAP2 | OpCode::SWAP3 | OpCode::SWAP4 |
             OpCode::CALLER | OpCode::CALLVALUE | OpCode::TIMESTAMP |
-            OpCode::BLOCKHASH | OpCode::BALANCE => 2,
+            OpCode::BLOCKHASH | OpCode::BALANCE | OpCode::ADDRESS |
+            OpCode::PC | OpCode::GAS | OpCode::GASLIMIT => 2,
 
-            // Cheap (3 gas) -- push, simple arithmetic, comparison, bitwise, memory
+            // Cheap (3 gas) -- push, simple arithmetic, comparison, bitwise, memory, calldata
             OpCode::PUSH1 | OpCode::PUSH2 | OpCode::PUSH4 | OpCode::PUSH8 |
             OpCode::PUSH16 | OpCode::PUSH32 |
             OpCode::ADD | OpCode::SUB | OpCode::EQ | OpCode::LT | OpCode::GT |
             OpCode::ISZERO | OpCode::AND | OpCode::OR | OpCode::XOR | OpCode::NOT |
-            OpCode::MLOAD | OpCode::MSTORE => 3,
+            OpCode::MLOAD | OpCode::MSTORE | OpCode::MSTORE8 | OpCode::MSIZE |
+            OpCode::CALLDATALOAD | OpCode::CALLDATASIZE | OpCode::CALLDATACOPY |
+            OpCode::CODESIZE | OpCode::CODECOPY | OpCode::RETURNDATASIZE |
+            OpCode::RETURNDATACOPY => 3,
 
             // Medium (5 gas) -- mul, div, mod, shifts
             OpCode::MUL | OpCode::DIV | OpCode::MOD | OpCode::SHL | OpCode::SHR => 5,
@@ -194,11 +247,18 @@ impl OpCode {
             // Expensive (50 gas)
             OpCode::EXP => 50,
 
+            // External code query (100 gas)
+            OpCode::EXTCODESIZE => 100,
+
             // Storage read (200 gas)
             OpCode::SLOAD => 200,
 
-            // Logging (375 gas)
+            // Logging (375-750 gas, scales with topics)
             OpCode::LOG => 375,
+            OpCode::LOG1 => 375 + 375,  // base + 1 topic
+            OpCode::LOG2 => 375 + 750,  // base + 2 topics
+            OpCode::LOG3 => 375 + 1125, // base + 3 topics
+            OpCode::LOG4 => 375 + 1500, // base + 4 topics
 
             // Calls (700 gas)
             OpCode::CALL | OpCode::CALLCODE | OpCode::DELEGATECALL |
@@ -240,6 +300,7 @@ pub enum ExecutionResult {
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub contract: String,
+    pub topics:   Vec<U256>,
     pub data:     Vec<u8>,
 }
 
@@ -779,6 +840,7 @@ impl VM {
                     let val = match Self::pop1(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
                     logs.push(LogEntry {
                         contract: contract_addr.to_string(),
+                        topics: Vec::new(),
                         data: val.to_be_bytes().to_vec(),
                     });
                 }
@@ -870,6 +932,12 @@ impl VM {
                 OpCode::INVALID => {
                     pending.discard();
                     return Self::err(gas.gas_used(), "Invalid opcode");
+                }
+
+                // Extended opcodes (handled in ExecutionEnvironment)
+                _ => {
+                    pending.discard();
+                    return Self::err(gas.gas_used(), &format!("Opcode {:?} only supported in ExecutionEnvironment", op));
                 }
             }
 

@@ -193,6 +193,10 @@ impl TxValidator {
         // payload_hash format validation (if present)
         if Self::validate_payload_hash_format(tx).is_err() { return false; }
 
+        // Contract-specific payload validation
+        if Self::validate_contract_create_payload(tx).is_err() { return false; }
+        if Self::validate_contract_call_payload(tx).is_err() { return false; }
+
         // Check for duplicate inputs within same tx
         let mut seen: HashSet<UtxoKey> = HashSet::with_capacity(tx.inputs.len());
         for input in &tx.inputs {
@@ -230,6 +234,9 @@ impl TxValidator {
         if Self::validate_tx_timestamp(tx).is_err() { return false; }
         // Payload hash format
         if Self::validate_payload_hash_format(tx).is_err() { return false; }
+        // Contract-specific payload validation
+        if Self::validate_contract_create_payload(tx).is_err() { return false; }
+        if Self::validate_contract_call_payload(tx).is_err() { return false; }
         // Ring signature for confidential TXs
         if tx.is_confidential() && !RingValidator::validate(tx) { return false; }
 
@@ -319,6 +326,14 @@ impl TxValidator {
 
         // [9] payload_hash format validation
         if let Err(reason) = Self::validate_payload_hash_format(tx) {
+            return Err(StorageError::Other(format!("tx {}: {}", tx.hash, reason)));
+        }
+
+        // [10] Contract-specific payload validation
+        if let Err(reason) = Self::validate_contract_create_payload(tx) {
+            return Err(StorageError::Other(format!("tx {}: {}", tx.hash, reason)));
+        }
+        if let Err(reason) = Self::validate_contract_call_payload(tx) {
             return Err(StorageError::Other(format!("tx {}: {}", tx.hash, reason)));
         }
 
@@ -729,6 +744,60 @@ impl TxValidator {
         }
         if !data.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(ConsensusError::BlockValidation("DexOrder payload_hash contains non-hex chars".into()));
+        }
+        Ok(())
+    }
+
+    /// Validate ContractCreate transaction payload fields.
+    /// The payload_hash must contain a non-zero hex-encoded bytecode hash.
+    /// Inputs must be present (to cover gas + value).
+    pub fn validate_contract_create_payload(tx: &Transaction) -> Result<(), ConsensusError> {
+        if tx.tx_type != TxType::ContractCreate {
+            return Ok(()); // Not a contract create, skip
+        }
+        // Must have payload_hash (bytecode hash)
+        let ph = match &tx.payload_hash {
+            Some(h) => h,
+            None => return Err(ConsensusError::BlockValidation(
+                "contract create requires bytecode payload".into()
+            )),
+        };
+        if ph.is_empty() || ph == &"0".repeat(64) {
+            return Err(ConsensusError::BlockValidation(
+                "contract create requires non-zero bytecode payload".into()
+            ));
+        }
+        // Inputs must cover gas + value
+        // (fee/amount validation is handled by the general UTXO checks)
+        Ok(())
+    }
+
+    /// Validate ContractCall transaction payload fields.
+    /// The payload_hash must contain a non-zero hex-encoded calldata hash.
+    /// The first output address must be a contract address (SD1c prefix).
+    pub fn validate_contract_call_payload(tx: &Transaction) -> Result<(), ConsensusError> {
+        if tx.tx_type != TxType::ContractCall {
+            return Ok(()); // Not a contract call, skip
+        }
+        // Must have payload_hash (function selector + calldata hash)
+        let ph = match &tx.payload_hash {
+            Some(h) => h,
+            None => return Err(ConsensusError::BlockValidation(
+                "contract call requires calldata payload".into()
+            )),
+        };
+        if ph.is_empty() || ph == &"0".repeat(64) {
+            return Err(ConsensusError::BlockValidation(
+                "contract call requires non-zero calldata payload".into()
+            ));
+        }
+        // First output address must be a contract address (SD1c prefix)
+        if let Some(output) = tx.outputs.first() {
+            if !output.address.starts_with("SD1c") {
+                return Err(ConsensusError::BlockValidation(
+                    "contract call target must be SD1c address".into()
+                ));
+            }
         }
         Ok(())
     }
