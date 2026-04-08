@@ -51,8 +51,14 @@ fn main() {
 
 fn run_miner(args: &[String]) -> Result<(), NodeError> {
     // Parse flags
-    let miner_address = parse_flag(args, "--address",
-        "SD1ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00");
+    let miner_address = match parse_flag_opt(args, "--address") {
+        Some(addr) => addr,
+        None => {
+            eprintln!("ERROR: --address is required. Mining rewards need a destination.");
+            eprintln!("Usage: shadowdag-miner --address=SD1your_address_here");
+            std::process::exit(1);
+        }
+    };
     let network_str = parse_flag(args, "--network", "mainnet");
     let network: NetworkMode = network_str.parse().map_err(|_| {
         NodeError::Init(format!("invalid --network '{}'. Use: mainnet, testnet, or regtest", network_str))
@@ -423,7 +429,13 @@ fn rpc_get_template(addr: &str) -> Option<BlockTemplate> {
 fn rpc_submit_block(addr: &str, block: &Block) -> SubmitResult {
     // Serialize transactions via serde so the RPC server can reconstruct them.
     // Without transactions, DagShield rejects the block ("empty block body").
-    let txs_json = serde_json::to_value(&block.body.transactions).unwrap_or_default();
+    let txs_json = match serde_json::to_value(&block.body.transactions) {
+        Ok(v) => v,
+        Err(e) => {
+            slog_error!("miner", "tx_serialization_failed", error => e);
+            return SubmitResult::Rejected(format!("TX serialization failed: {}", e));
+        }
+    };
     let block_obj = serde_json::json!({
         "hash":         block.header.hash,
         "height":       block.header.height,
@@ -437,7 +449,13 @@ fn rpc_submit_block(addr: &str, block: &Block) -> SubmitResult {
         "transactions": txs_json,
     });
 
-    let block_str = serde_json::to_string(&block_obj).unwrap_or_default();
+    let block_str = match serde_json::to_string(&block_obj) {
+        Ok(s) => s,
+        Err(e) => {
+            slog_error!("miner", "block_serialization_failed", error => e);
+            return SubmitResult::Rejected(format!("block serialization failed: {}", e));
+        }
+    };
     let params = format!(r#""{}""#, block_str.replace('"', r#"\""#));
     match rpc_call(addr, "submitblock", &params) {
         Some(response) => {
@@ -513,11 +531,24 @@ fn print_help() {
 }
 
 fn parse_flag(args: &[String], name: &str, default: &str) -> String {
+    parse_flag_opt(args, name).unwrap_or_else(|| default.to_string())
+}
+
+fn parse_flag_opt(args: &[String], name: &str) -> Option<String> {
     for (i, arg) in args.iter().enumerate() {
-        if arg == name { return args.get(i + 1).cloned().unwrap_or(default.to_string()); }
-        if let Some(val) = arg.strip_prefix(&format!("{}=", name)) { return val.to_string(); }
+        if arg == name {
+            return match args.get(i + 1) {
+                Some(val) if !val.starts_with("--") => Some(val.clone()),
+                _ => None,
+            };
+        }
+        if let Some(val) = arg.strip_prefix(&format!("{}=", name)) {
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
     }
-    default.to_string()
+    None
 }
 
 fn has_flag(args: &[String], name: &str) -> bool {

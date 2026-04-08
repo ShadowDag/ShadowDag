@@ -24,6 +24,7 @@ static UNLOCK_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 use shadowdag::service::wallet::core::wallet::{Wallet, EncryptedSeed};
 use shadowdag::service::wallet::storage::wallet_db::WalletDB;
 use shadowdag::infrastructure::storage::rocksdb::utxo::utxo_store::UtxoStore;
+use shadowdag::config::node::node_config::NetworkMode;
 use shadowdag::domain::address::invisible_wallet::InvisibleWallet;
 use shadowdag::errors::WalletError;
 use shadowdag::slog_error;
@@ -102,9 +103,14 @@ fn wallet_network() -> String {
 }
 
 /// Path to the UTXO database used by the node (read-only for balance queries).
+/// Uses the same network-aware directory structure as the node:
+///   ~/.shadowdag/<network>/utxo
 fn utxo_db_path() -> String {
-    std::env::var("SHADOWDAG_DB")
-        .unwrap_or_else(|_| default_wallet_dir().join("data").join("utxo").to_string_lossy().to_string())
+    if let Ok(custom) = std::env::var("SHADOWDAG_DB") {
+        return custom;
+    }
+    let net: NetworkMode = wallet_network().parse().unwrap_or(NetworkMode::Mainnet);
+    net.utxo_path().to_string_lossy().into_owned()
 }
 
 fn save_encrypted_seed(enc: &EncryptedSeed) -> Result<(), WalletError> {
@@ -249,6 +255,13 @@ fn main() {
 
 fn cmd_new(args: &[String]) {
     let network = args.get(2).map(|s| s.as_str()).unwrap_or("mainnet");
+
+    // Warn if the specified network doesn't match the SHADOWDAG_NETWORK env var
+    let env_network = wallet_network();
+    if network != env_network {
+        eprintln!("NOTE: Creating wallet for '{}' but SHADOWDAG_NETWORK='{}'",
+                  network, env_network);
+    }
 
     println!("======================================================");
     println!("     S H A D O W D A G  --  New Wallet");

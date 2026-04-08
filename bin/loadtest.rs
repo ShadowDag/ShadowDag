@@ -35,7 +35,7 @@ fn main() {
 
     let target_tps: u64 = parse_flag(&args, "--tps", "100").parse().unwrap_or(100);
     let duration_sec: u64 = parse_flag(&args, "--duration", "30").parse().unwrap_or(30);
-    let num_wallets: usize = parse_flag(&args, "--wallets", "10").parse().unwrap_or(10);
+    let num_wallets: usize = parse_flag(&args, "--wallets", "10").parse().unwrap_or(10).max(1);
     let rpc_addr = parse_flag(&args, "--rpc", "127.0.0.1:9332");
     let rpc_token = parse_flag(&args, "--rpc-token", "");
 
@@ -196,7 +196,13 @@ fn rpc_submit_tx(addr: &str, tx: &Transaction, id: u64, token: &str) -> Result<S
         String::from_utf8(buf).map_err(|e| NetworkError::Other(format!("utf8: {}", e)))?
     } else {
         let mut buf = vec![0u8; 65536];
-        let n = std::io::Read::read(&mut reader, &mut buf).unwrap_or(0);
+        let n = match std::io::Read::read(&mut reader, &mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                slog_warn!("loadtest", "response_read_failed", error => e);
+                return Err(NetworkError::Other(format!("read failed: {}", e)));
+            }
+        };
         String::from_utf8(buf[..n].to_vec()).map_err(|e| NetworkError::Other(format!("utf8: {}", e)))?
     };
 
@@ -248,11 +254,24 @@ fn generate_test_tx(from: &str, to: &str, seq: u64) -> Transaction {
 }
 
 fn parse_flag(args: &[String], name: &str, default: &str) -> String {
+    parse_flag_opt(args, name).unwrap_or_else(|| default.to_string())
+}
+
+fn parse_flag_opt(args: &[String], name: &str) -> Option<String> {
     for (i, arg) in args.iter().enumerate() {
-        if arg == name { return args.get(i + 1).cloned().unwrap_or(default.to_string()); }
-        if let Some(val) = arg.strip_prefix(&format!("{}=", name)) { return val.to_string(); }
+        if arg == name {
+            return match args.get(i + 1) {
+                Some(val) if !val.starts_with("--") => Some(val.clone()),
+                _ => None,
+            };
+        }
+        if let Some(val) = arg.strip_prefix(&format!("{}=", name)) {
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
     }
-    default.to_string()
+    None
 }
 
 fn has_flag(args: &[String], name: &str) -> bool {
