@@ -70,9 +70,9 @@ impl RocksStore {
 impl KeyValueStore for RocksStore {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         match self.db.get(key) {
-            Ok(v) => v.map(|d| d.to_vec()),
+            Ok(v) => v.map(|v| v.to_vec()),
             Err(e) => {
-                crate::slog_error!("storage", "rocks_store_read_failed", error => &e.to_string());
+                crate::slog_error!("storage", "read_failed", error => &e.to_string());
                 None
             }
         }

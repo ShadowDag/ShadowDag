@@ -33,19 +33,18 @@ impl Metrics {
     }
 
     pub fn get_metric(&self, name: &str) -> Option<u64> {
-        match self.db.get(name).unwrap_or(None) {
-            Some(bytes) => {
-                let mut arr = [0u8; 8];
-                arr.copy_from_slice(&bytes);
-
-                Some(u64::from_be_bytes(arr))
-
+        let bytes = match self.db.get(name) {
+            Ok(Some(v)) => v,
+            Ok(None) => return None,
+            Err(e) => {
+                slog_error!("metrics", "get_metric_read_failed", error => e.to_string());
+                return None;
             }
-
-            None => None
-
-        }
-
+        };
+        if bytes.len() != 8 { return None; }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&bytes);
+        Some(u64::from_be_bytes(arr))
     }
 
 }

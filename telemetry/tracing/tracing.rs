@@ -5,8 +5,6 @@
 
 use rocksdb::{DB, Options};
 use std::path::Path;
-use crate::slog_error;
-
 pub struct Tracing {
     db: DB,
 
@@ -28,20 +26,20 @@ impl Tracing {
     }
 
     pub fn trace(&self, event_id: &str, payload: &str) {
-        if let Err(_e) = self.db.put(event_id, payload) { slog_error!("tracing", "db_put_error", error => &_e.to_string()); }
-
+        if let Err(e) = self.db.put(event_id, payload) {
+            eprintln!("[TELEMETRY] trace write failed: {}", e);
+        }
     }
 
     pub fn get_trace(&self, event_id: &str) -> Option<String> {
-        match self.db.get(event_id).unwrap_or(None) {
-            Some(data) => {
-                Some(String::from_utf8(data.to_vec()).ok()?)
+        match self.db.get(event_id) {
+            Ok(Some(v)) => String::from_utf8(v.to_vec()).ok(),
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("[TELEMETRY] trace read failed: {}", e);
+                None
             }
-
-            None => None
-
         }
-
     }
 
 }

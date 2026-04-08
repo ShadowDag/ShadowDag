@@ -69,10 +69,13 @@ pub fn generate_address(public_key_hex: &str, network: &str) -> String {
         "mainnet" => "SD1",
         "testnet" => "ST1",
         "regtest" => "SR1",
-        other => panic!("Unknown network '{}' — expected mainnet/testnet/regtest", other),
+        _other => return format!("ERROR: unknown network '{}'", _other),
     };
 
-    let pk_bytes = hex::decode(public_key_hex).unwrap_or_default();
+    let pk_bytes = match hex::decode(public_key_hex) {
+        Ok(b) if b.len() == 32 => b,
+        _ => return "ERROR: invalid public key hex (must be 64 hex chars / 32 bytes)".to_string(),
+    };
     let mut h = Sha256::new();
     h.update(b"ShadowDAG_Addr_v1");
     h.update(&pk_bytes);

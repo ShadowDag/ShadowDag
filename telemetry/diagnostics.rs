@@ -37,8 +37,9 @@ fn hooks() -> &'static Mutex<BTreeMap<&'static str, DiagnosticHook>> {
 /// });
 /// ```
 pub fn register(name: &'static str, hook: impl Fn() -> String + Send + Sync + 'static) {
-    if let Ok(mut map) = hooks().lock() {
-        map.insert(name, Box::new(hook));
+    match hooks().lock() {
+        Ok(mut map) => { map.insert(name, Box::new(hook)); }
+        Err(e) => { crate::slog_error!("diagnostics", "hook_register_lock_failed", error => e.to_string()); }
     }
 }
 
@@ -67,12 +68,15 @@ pub fn collect() -> String {
 
     let mut subsystems = Vec::new();
 
-    if let Ok(map) = hooks().lock() {
-        for (name, hook) in map.iter() {
-            let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook))
-                .unwrap_or_else(|_| format!("\"<panic in {} diagnostic hook>\"", name));
-            subsystems.push(format!("\"{}\":{}", name, output));
+    match hooks().lock() {
+        Ok(map) => {
+            for (name, hook) in map.iter() {
+                let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook))
+                    .unwrap_or_else(|_| format!("\"<panic in {} diagnostic hook>\"", name));
+                subsystems.push(format!("\"{}\":{}", name, output));
+            }
         }
+        Err(e) => { crate::slog_error!("diagnostics", "collect_lock_failed", error => e.to_string()); }
     }
 
     // Metrics snapshot
@@ -102,14 +106,17 @@ pub fn dump_pretty() -> String {
     lines.push(format!("═══ ShadowDAG Diagnostics ═══  timestamp={}", now));
     lines.push(String::new());
 
-    if let Ok(map) = hooks().lock() {
-        for (name, hook) in map.iter() {
-            lines.push(format!("── {} ──", name));
-            let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook))
-                .unwrap_or_else(|_| format!("<panic in {} hook>", name));
-            lines.push(output);
-            lines.push(String::new());
+    match hooks().lock() {
+        Ok(map) => {
+            for (name, hook) in map.iter() {
+                lines.push(format!("── {} ──", name));
+                let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook))
+                    .unwrap_or_else(|_| format!("<panic in {} hook>", name));
+                lines.push(output);
+                lines.push(String::new());
+            }
         }
+        Err(e) => { crate::slog_error!("diagnostics", "dump_pretty_lock_failed", error => e.to_string()); }
     }
 
     // Metrics
@@ -138,7 +145,13 @@ pub fn dump_pretty() -> String {
 
 /// Number of registered diagnostic hooks.
 pub fn hook_count() -> usize {
-    hooks().lock().map(|m| m.len()).unwrap_or(0)
+    match hooks().lock() {
+        Ok(m) => m.len(),
+        Err(e) => {
+            crate::slog_error!("diagnostics", "hook_count_lock_failed", error => e.to_string());
+            0
+        }
+    }
 }
 
 #[cfg(test)]

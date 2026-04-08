@@ -128,29 +128,36 @@ impl UtxoIndex {
         format!("{}{}", ADDR_PREFIX, addr).into_bytes()
     }
 
-    fn write_record_to_db(&self, utxo: &UtxoRecord) {
-        let utxo_key = match utxo.key() {
-            Ok(k) => k,
-            Err(e) => { slog_error!("index", "bad_utxo_key", error => &e.to_string()); return; }
-        };
+    fn write_record_to_db(&self, utxo: &UtxoRecord) -> Result<(), String> {
+        let utxo_key = utxo.key()
+            .map_err(|e| {
+                let msg = format!("bad_utxo_key: {}", e);
+                slog_error!("index", "bad_utxo_key", error => &msg);
+                msg
+            })?;
         let key = Self::db_key(&utxo_key);
-        let val = match serde_json::to_vec(utxo) {
-            Ok(v) => v,
-            Err(e) => {
-                slog_error!("index", "utxo_index_serialize_error", error => &e.to_string());
-                return;
-            }
-        };
-        if let Err(e) = self.db.put(&key, &val) {
-            slog_error!("index", "utxo_index_db_put_error", error => &e.to_string());
-        }
+        let val = serde_json::to_vec(utxo)
+            .map_err(|e| {
+                let msg = format!("serialize: {}", e);
+                slog_error!("index", "utxo_index_serialize_error", error => &msg);
+                msg
+            })?;
+        self.db.put(&key, &val)
+            .map_err(|e| {
+                let msg = format!("db_put: {}", e);
+                slog_error!("index", "utxo_index_db_put_error", error => &msg);
+                msg
+            })
     }
 
-    fn delete_record_from_db(&self, utxo_key: &str) {
+    fn delete_record_from_db(&self, utxo_key: &str) -> Result<(), String> {
         let key = Self::db_key(utxo_key);
-        if let Err(e) = self.db.delete(&key) {
-            slog_error!("index", "utxo_index_db_delete_error", error => &e.to_string());
-        }
+        self.db.delete(&key)
+            .map_err(|e| {
+                let msg = format!("db_delete: {}", e);
+                slog_error!("index", "utxo_index_db_delete_error", error => &msg);
+                msg
+            })
     }
 
     /// Persist the addr -> keys set to DB.
@@ -182,15 +189,18 @@ impl UtxoIndex {
 
     // ── public API ───────────────────────────────────────────
 
-    pub fn insert(&mut self, utxo: UtxoRecord) {
+    pub fn insert(&mut self, utxo: UtxoRecord) -> bool {
         let key = match utxo.key() {
             Ok(k) => k,
-            Err(e) => { slog_error!("index", "insert_bad_utxo_key", error => &e.to_string()); return; }
+            Err(e) => { slog_error!("index", "insert_bad_utxo_key", error => &e.to_string()); return false; }
         };
         let addr = utxo.address.clone();
 
-        // Persist to RocksDB first
-        self.write_record_to_db(&utxo);
+        // Persist to RocksDB first — don't update memory if DB write fails
+        if let Err(e) = self.write_record_to_db(&utxo) {
+            slog_error!("index", "utxo_insert_persist_failed", error => &e);
+            return false;
+        }
 
         self.addr_index
             .entry(addr.clone())
@@ -200,6 +210,7 @@ impl UtxoIndex {
 
         self.utxos.insert(key, utxo);
         self.total_utxos += 1;
+        true
     }
 
     pub fn mark_spent(&mut self, key: &str) -> bool {
@@ -207,9 +218,18 @@ impl UtxoIndex {
         if let Some(utxo) = self.utxos.get_mut(key) {
             if !utxo.is_spent {
                 utxo.is_spent = true;
-                self.spent_utxos += 1;
                 let cloned = utxo.clone();
-                self.write_record_to_db(&cloned);
+                // Release mutable borrow before calling write_record_to_db
+                let _ = utxo;
+                if let Err(e) = self.write_record_to_db(&cloned) {
+                    // Revert in-memory change on DB failure
+                    if let Some(u) = self.utxos.get_mut(key) {
+                        u.is_spent = false;
+                    }
+                    slog_error!("index", "utxo_mark_spent_persist_failed", error => &e);
+                    return false;
+                }
+                self.spent_utxos += 1;
                 return true;
             }
             return false;
@@ -218,8 +238,11 @@ impl UtxoIndex {
         if let Some(mut utxo) = self.load_record_from_db(key) {
             if !utxo.is_spent {
                 utxo.is_spent = true;
+                if let Err(e) = self.write_record_to_db(&utxo) {
+                    slog_error!("index", "utxo_mark_spent_persist_failed", error => &e);
+                    return false;
+                }
                 self.spent_utxos += 1;
-                self.write_record_to_db(&utxo);
                 self.utxos.insert(key.to_string(), utxo);
                 return true;
             }
@@ -228,8 +251,11 @@ impl UtxoIndex {
     }
 
     pub fn remove(&mut self, key: &str) -> bool {
-        // Remove from DB regardless
-        self.delete_record_from_db(key);
+        // Delete from DB first — don't update memory if DB delete fails
+        if let Err(e) = self.delete_record_from_db(key) {
+            slog_error!("index", "utxo_remove_persist_failed", error => &e);
+            return false;
+        }
 
         if let Some(utxo) = self.utxos.remove(key) {
             if let Some(set) = self.addr_index.get_mut(&utxo.address) {
@@ -247,8 +273,17 @@ impl UtxoIndex {
         }
         // Even if not in cache, check DB
         if let Some(utxo) = self.load_record_from_db(key) {
-            self.delete_record_from_db(key);
-            // Clean addr set in DB
+            if let Err(e) = self.delete_record_from_db(key) {
+                slog_error!("index", "utxo_remove_db_fallback_failed", error => &e);
+                return false;
+            }
+            // Remove from addr_index BEFORE writing the addr set to DB
+            if let Some(set) = self.addr_index.get_mut(&utxo.address) {
+                set.remove(key);
+                if set.is_empty() {
+                    self.addr_index.remove(&utxo.address);
+                }
+            }
             self.write_addr_set_to_db(&utxo.address);
             self.total_utxos = self.total_utxos.saturating_sub(1);
             if utxo.is_spent {
@@ -270,7 +305,18 @@ impl UtxoIndex {
             return self.utxos.get(key);
         }
         if let Some(rec) = self.load_record_from_db(key) {
+            let addr = rec.address.clone();
+            let is_spent = rec.is_spent;
+            // Update addr_index so balance/utxos_for_address work correctly
+            self.addr_index
+                .entry(addr)
+                .or_default()
+                .insert(key.to_string());
             self.utxos.insert(key.to_string(), rec);
+            self.total_utxos += 1;
+            if is_spent {
+                self.spent_utxos += 1;
+            }
             return self.utxos.get(key);
         }
         None

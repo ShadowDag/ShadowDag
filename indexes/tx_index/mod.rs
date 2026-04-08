@@ -133,25 +133,30 @@ impl TxIndex {
         format!("{}{}", BLOCK_PREFIX, block_hash).into_bytes()
     }
 
-    fn write_record_to_db(&self, record: &TxRecord) {
+    fn write_record_to_db(&self, record: &TxRecord) -> Result<(), String> {
         let key = Self::db_key(&record.hash);
-        let val = match serde_json::to_vec(record) {
-            Ok(v) => v,
-            Err(e) => {
-                slog_error!("index", "tx_index_serialize_error", error => &e.to_string());
-                return;
-            }
-        };
-        if let Err(e) = self.db.put(&key, &val) {
-            slog_error!("index", "tx_index_db_put_error", error => &e.to_string());
-        }
+        let val = serde_json::to_vec(record)
+            .map_err(|e| {
+                let msg = format!("serialize: {}", e);
+                slog_error!("index", "tx_index_serialize_error", error => &msg);
+                msg
+            })?;
+        self.db.put(&key, &val)
+            .map_err(|e| {
+                let msg = format!("db_put: {}", e);
+                slog_error!("index", "tx_index_db_put_error", error => &msg);
+                msg
+            })
     }
 
-    fn delete_record_from_db(&self, hash: &str) {
+    fn delete_record_from_db(&self, hash: &str) -> Result<(), String> {
         let key = Self::db_key(hash);
-        if let Err(e) = self.db.delete(&key) {
-            slog_error!("index", "tx_index_db_delete_error", error => &e.to_string());
-        }
+        self.db.delete(&key)
+            .map_err(|e| {
+                let msg = format!("db_delete: {}", e);
+                slog_error!("index", "tx_index_db_delete_error", error => &msg);
+                msg
+            })
     }
 
     fn write_block_map_to_db(&self, block_hash: &str) {
@@ -175,19 +180,32 @@ impl TxIndex {
     fn load_record_from_db(&self, hash: &str) -> Option<TxRecord> {
         let key = Self::db_key(hash);
         match self.db.get(&key) {
-            Ok(Some(data)) => serde_json::from_slice(&data).ok(),
-            _ => None,
+            Ok(Some(data)) => match serde_json::from_slice(&data) {
+                Ok(rec) => Some(rec),
+                Err(e) => {
+                    slog_error!("index", "tx_index_deserialize_error", hash => hash, error => &e.to_string());
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("index", "tx_index_db_get_error", hash => hash, error => &e.to_string());
+                None
+            }
         }
     }
 
     // ── public API ───────────────────────────────────────────
 
-    pub fn insert(&mut self, record: TxRecord) {
+    pub fn insert(&mut self, record: TxRecord) -> bool {
         let block_hash = record.block_hash.clone();
         let hash       = record.hash.clone();
 
-        // Persist to RocksDB first
-        self.write_record_to_db(&record);
+        // Persist to RocksDB first — don't update memory if DB write fails
+        if let Err(e) = self.write_record_to_db(&record) {
+            slog_error!("index", "tx_insert_persist_failed", error => &e);
+            return false;
+        }
 
         self.records.insert(hash.clone(), record);
         self.block_tx_map
@@ -197,6 +215,7 @@ impl TxIndex {
         self.write_block_map_to_db(&block_hash);
 
         self.total_indexed += 1;
+        true
     }
 
     pub fn get(&self, hash: &str) -> Option<&TxRecord> {
@@ -220,7 +239,14 @@ impl TxIndex {
             return true;
         }
         let db_key = Self::db_key(hash);
-        matches!(self.db.get(&db_key), Ok(Some(_)))
+        match self.db.get(&db_key) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                slog_error!("index", "tx_index_contains_db_error", hash => hash, error => &e.to_string());
+                false
+            }
+        }
     }
 
     pub fn txs_in_block(&self, block_hash: &str) -> Vec<&TxRecord> {
@@ -232,8 +258,11 @@ impl TxIndex {
     }
 
     pub fn remove(&mut self, hash: &str) -> bool {
-        // Always delete from DB
-        self.delete_record_from_db(hash);
+        // Delete from DB first — don't update memory if DB delete fails
+        if let Err(e) = self.delete_record_from_db(hash) {
+            slog_error!("index", "tx_remove_persist_failed", error => &e);
+            return false;
+        }
 
         if let Some(rec) = self.records.remove(hash) {
             if let Some(list) = self.block_tx_map.get_mut(&rec.block_hash) {
@@ -245,7 +274,10 @@ impl TxIndex {
         }
         // Check DB even if not in cache
         if let Some(rec) = self.load_record_from_db(hash) {
-            self.delete_record_from_db(hash);
+            if let Err(e) = self.delete_record_from_db(hash) {
+                slog_error!("index", "tx_remove_db_fallback_failed", error => &e);
+                return false;
+            }
             self.write_block_map_to_db(&rec.block_hash);
             self.total_indexed = self.total_indexed.saturating_sub(1);
             return true;
@@ -255,16 +287,20 @@ impl TxIndex {
 
     pub fn rollback_block(&mut self, block_hash: &str) -> usize {
         let hashes = self.block_tx_map.remove(block_hash).unwrap_or_default();
-        let count  = hashes.len();
+        let mut rolled = 0usize;
         for h in &hashes {
+            if let Err(e) = self.delete_record_from_db(h) {
+                slog_error!("index", "tx_rollback_delete_failed", hash => h, error => &e);
+                continue;
+            }
             self.records.remove(h);
-            self.delete_record_from_db(h);
+            rolled += 1;
         }
-        self.total_indexed = self.total_indexed.saturating_sub(count as u64);
+        self.total_indexed = self.total_indexed.saturating_sub(rolled as u64);
         // Remove block map entry from DB
         let db_key = Self::db_block_key(block_hash);
         let _ = self.db.delete(&db_key);
-        count
+        rolled
     }
 
     pub fn count(&self) -> usize         { self.records.len() }
@@ -284,10 +320,15 @@ impl TxIndex {
         self.block_tx_map.clear();
         self.total_indexed = 0;
 
+        let mut error_count = 0u64;
         for item in iter {
             let (key, value) = match item {
                 Ok(kv) => kv,
-                Err(_) => continue,
+                Err(e) => {
+                    error_count += 1;
+                    slog_error!("index", "tx_recover_iter_error", error => &e.to_string());
+                    continue;
+                }
             };
 
             // Skip block-map keys
@@ -298,16 +339,25 @@ impl TxIndex {
                 break;
             }
 
-            if let Ok(rec) = serde_json::from_slice::<TxRecord>(&value) {
-                let hash = rec.hash.clone();
-                let block_hash = rec.block_hash.clone();
-                self.block_tx_map
-                    .entry(block_hash)
-                    .or_default()
-                    .push(hash.clone());
-                self.records.insert(hash, rec);
-                self.total_indexed += 1;
+            match serde_json::from_slice::<TxRecord>(&value) {
+                Ok(rec) => {
+                    let hash = rec.hash.clone();
+                    let block_hash = rec.block_hash.clone();
+                    self.block_tx_map
+                        .entry(block_hash)
+                        .or_default()
+                        .push(hash.clone());
+                    self.records.insert(hash, rec);
+                    self.total_indexed += 1;
+                }
+                Err(e) => {
+                    error_count += 1;
+                    slog_error!("index", "tx_recover_deserialize_error", error => &e.to_string());
+                }
             }
+        }
+        if error_count > 0 {
+            slog_warn!("index", "tx_recover_completed_with_errors", errors => &error_count.to_string(), recovered => &self.total_indexed.to_string());
         }
     }
 }

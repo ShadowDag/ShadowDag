@@ -125,19 +125,15 @@ impl LogEvent {
         s.push_str(",\"level\":\"");
         s.push_str(self.level.as_str());
         s.push_str("\",\"sub\":\"");
-        s.push_str(self.subsystem);
+        s.push_str(&escape_json(self.subsystem));
         s.push_str("\",\"event\":\"");
-        s.push_str(self.event);
+        s.push_str(&escape_json(self.event));
         s.push('"');
         for (k, v) in &self.fields {
             s.push_str(",\"");
-            s.push_str(k);
+            s.push_str(&escape_json(k));
             s.push_str("\":\"");
-            // Escape quotes in value
-            for c in v.chars() {
-                if c == '"' { s.push('\\'); }
-                s.push(c);
-            }
+            s.push_str(&escape_json(v));
             s.push('"');
         }
         s.push('}');
@@ -183,6 +179,24 @@ impl LogEvent {
         }
         s
     }
+}
+
+// ── JSON escape helper ──────────────────────────────────────────────────
+
+fn escape_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => { /* skip control characters */ }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 // ── Global logger state ─────────────────────────────────────────────────
