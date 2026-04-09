@@ -88,7 +88,11 @@ impl BlockStore {
         let key = format!("{}utxo_commit:{}", BLK_PREFIX, block_hash);
         match self.db.get(key.as_bytes()) {
             Ok(Some(data)) => String::from_utf8(data.to_vec()).ok(),
-            _ => None,
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("storage", "utxo_commitment_read_error", block_hash => block_hash, error => e);
+                None
+            }
         }
     }
 
@@ -131,7 +135,11 @@ impl BlockStore {
     pub fn get_best_hash(&self) -> Option<String> {
         match self.db.get(BLK_BEST_HASH) {
             Ok(Some(data)) => String::from_utf8(data.to_vec()).ok(),
-            _ => None,
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("storage", "best_hash_read_error", error => e);
+                None
+            }
         }
     }
 
@@ -139,8 +147,15 @@ impl BlockStore {
         let mut blocks: Vec<Block> = Vec::new();
         let prefix = BLK_PREFIX.as_bytes();
         let iter = self.db.prefix_iterator(prefix);
-        for (k, v) in iter.flatten() {
-            let key_str = String::from_utf8(k.to_vec()).unwrap_or_default();
+        for item in iter {
+            let (k, v) = match item {
+                Ok(kv) => kv,
+                Err(e) => {
+                    slog_error!("storage", "recent_blocks_iter_error", error => e);
+                    continue;
+                }
+            };
+            let key_str = String::from_utf8_lossy(&k).to_string();
             // Skip metadata keys (best_hash, height index, h2h index, utxo_commit)
             if !key_str.starts_with(BLK_PREFIX) { break; }
             if key_str == "blk:best_hash" { continue; }

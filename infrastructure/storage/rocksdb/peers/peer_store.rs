@@ -47,7 +47,8 @@ impl PeerStore {
             Ok(db) => {
                 Some(Self { db })
             }
-            Err(_e) => {
+            Err(e) => {
+                slog_error!("storage", "peer_store_open_failed", path => path, error => e);
                 None
             }
         }
@@ -146,7 +147,13 @@ impl PeerStore {
                 let expiry = decode_u64(&v);
                 now_secs() < expiry
             }
-            _ => false,
+            Ok(None) => false,
+            Err(e) => {
+                // FAIL-CLOSED: treat DB error as banned — safer than letting
+                // a potentially banned peer through due to a transient read failure.
+                slog_error!("p2p", "ban_check_read_failed", addr => address, error => e);
+                true
+            }
         }
     }
 
@@ -198,7 +205,8 @@ impl PeerStore {
         }
 
         if added > 0 {
-            if let Err(_e) = self.db.write(batch) {
+            if let Err(e) = self.db.write(batch) {
+                slog_error!("p2p", "peer_batch_write_failed", count => added, error => e);
             }
         }
     }
