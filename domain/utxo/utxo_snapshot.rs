@@ -280,7 +280,8 @@ mod tests {
         let result = UtxoSnapshot::apply(&entries, &utxo_set);
         assert!(result.is_err(), "apply must return Err when entries have malformed keys");
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("2/3 entries have invalid keys"), "should report 2 out of 3 invalid keys, got: {}", err_msg);
+        assert!(err_msg.contains("2/3 entries failed validation"),
+            "should report 2 out of 3 failed validation, got: {}", err_msg);
     }
 
     #[test]

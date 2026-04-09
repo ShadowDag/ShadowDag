@@ -63,11 +63,11 @@ impl BlockBuilder {
             all_txs.push(tx);
         }
 
-        #[allow(deprecated)]
-        let merkle_root = {
-            let tx_hashes: Vec<String> = all_txs.iter().map(|tx| tx.hash.clone()).collect();
-            MerkleTree::calculate_root(tx_hashes)
-        };
+        let merkle_root = MerkleTree::build(
+            &all_txs,
+            height,
+            &parents,
+        );
 
         let selected_parent = parents.first().cloned();
 
@@ -91,5 +91,71 @@ impl BlockBuilder {
         let body = BlockBody { transactions: all_txs };
 
         Ok(Block { header, body })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
+    use crate::domain::utxo::utxo_set::UtxoSet;
+
+    /// Empty TxPool that always returns no transactions.
+    struct EmptyPool;
+
+    impl TxPool for EmptyPool {
+        fn get_transaction(&self, _hash: &str) -> Option<Transaction> { None }
+        fn has_transaction(&self, _hash: &str) -> bool { false }
+        fn count(&self) -> usize { 0 }
+        fn get_prioritized_txs(&self, _limit: usize) -> Vec<Transaction> { vec![] }
+        fn get_transactions_for_block(&self, _utxo: &UtxoSet, _max: usize) -> Vec<Transaction> { vec![] }
+    }
+
+    fn make_coinbase(hash: &str) -> Transaction {
+        Transaction::new_coinbase(
+            hash.to_string(),
+            vec![TxOutput::new("miner".into(), 5000)],
+            0,
+            1735689600,
+        )
+    }
+
+    #[test]
+    fn empty_blocks_at_different_heights_have_different_merkle_roots() {
+        let pool = EmptyPool;
+        let coinbase = make_coinbase("aa".repeat(32).as_str());
+        let parents = vec!["bb".repeat(32)];
+
+        let block1 = BlockBuilder::build_block(
+            1, 10, parents.clone(), coinbase.clone(), &pool, 100, 1, 1735689600
+        ).expect("build height=10");
+
+        let block2 = BlockBuilder::build_block(
+            1, 20, parents, coinbase, &pool, 100, 1, 1735689600
+        ).expect("build height=20");
+
+        assert_ne!(
+            block1.header.merkle_root, block2.header.merkle_root,
+            "Blocks at different heights must have different merkle roots (MerkleTree::build includes height)"
+        );
+    }
+
+    #[test]
+    fn empty_blocks_with_different_parents_have_different_merkle_roots() {
+        let pool = EmptyPool;
+        let coinbase = make_coinbase("aa".repeat(32).as_str());
+
+        let block1 = BlockBuilder::build_block(
+            1, 10, vec!["parent_a".repeat(8)], coinbase.clone(), &pool, 100, 1, 1735689600
+        ).expect("build parent_a");
+
+        let block2 = BlockBuilder::build_block(
+            1, 10, vec!["parent_b".repeat(8)], coinbase, &pool, 100, 1, 1735689600
+        ).expect("build parent_b");
+
+        assert_ne!(
+            block1.header.merkle_root, block2.header.merkle_root,
+            "Blocks with different parents must have different merkle roots"
+        );
     }
 }
