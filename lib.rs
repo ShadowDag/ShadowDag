@@ -340,6 +340,8 @@ pub mod runtime {
         pub mod testing {
             pub mod test_runner;
             pub mod script_runner;
+            pub mod invariant_checker;
+            pub mod observability;
         }
         pub mod precompiles {
             pub mod precompile_registry;

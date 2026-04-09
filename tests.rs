@@ -70,3 +70,9 @@ pub mod contract_e2e_tests;
 // ── Multi-node determinism tests ────────────────────────────────────
 #[path = "tests/suite/multi_node_tests.rs"]
 pub mod multi_node_tests;
+
+// ── Soak, chaos, and adversarial tests ─────────────────────────────
+#[path = "tests/suite/soak_tests.rs"]
+pub mod soak_tests;
+#[path = "tests/suite/chaos_tests.rs"]
+pub mod chaos_tests;
