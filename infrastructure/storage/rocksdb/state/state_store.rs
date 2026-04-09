@@ -89,7 +89,14 @@ impl StateStore {
 
         let mut hashes: Vec<Vec<u8>> = Vec::new();
 
-        for (k, v) in iter.flatten() {
+        for item in iter {
+            let (k, v) = match item {
+                Ok(kv) => kv,
+                Err(e) => {
+                    slog_error!("storage", "state_root_iter_error", error => e);
+                    continue;
+                }
+            };
             let k_str = String::from_utf8_lossy(&k);
             if !k_str.starts_with(PFX_STATE) { break; }
 
@@ -155,11 +162,23 @@ impl StateStore {
         let iter = self.db.prefix_iterator(prefix.as_bytes());
 
         let mut keys = Vec::new();
-        for (k, _) in iter.flatten() {
+        let mut iter_errors = 0usize;
+        for item in iter {
+            let (k, _) = match item {
+                Ok(kv) => kv,
+                Err(e) => {
+                    slog_error!("storage", "contract_keys_iter_error", contract => contract, error => e);
+                    iter_errors += 1;
+                    continue;
+                }
+            };
             let k_str = String::from_utf8_lossy(&k).to_string();
             if !k_str.starts_with(&prefix) { break; }
             let key = k_str[prefix.len()..].to_string();
             keys.push(key);
+        }
+        if iter_errors > 0 {
+            slog_error!("storage", "contract_keys_partial", contract => contract, errors => iter_errors);
         }
         keys
     }
