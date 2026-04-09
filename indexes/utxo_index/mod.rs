@@ -251,47 +251,44 @@ impl UtxoIndex {
     }
 
     pub fn remove(&mut self, key: &str) -> bool {
-        // Delete from DB first — don't update memory if DB delete fails
+        // Load from cache or DB FIRST (before deleting from DB).
+        // The old code deleted from DB first, then tried to fallback-load
+        // from DB for cache-miss cases — but the load always failed because
+        // the record was just deleted.
+        let utxo = if let Some(u) = self.utxos.remove(key) {
+            Some(u)
+        } else {
+            // Not in cache — load from DB BEFORE we delete it
+            self.load_record_from_db(key)
+        };
+
+        // Now delete from DB
         if let Err(e) = self.delete_record_from_db(key) {
             slog_error!("index", "utxo_remove_persist_failed", error => &e);
+            // If we already removed from cache, re-insert
+            if let Some(ref u) = utxo {
+                self.utxos.insert(key.to_string(), u.clone());
+            }
             return false;
         }
 
-        if let Some(utxo) = self.utxos.remove(key) {
-            if let Some(set) = self.addr_index.get_mut(&utxo.address) {
+        // Update addr_index and counters from loaded record
+        if let Some(ref u) = utxo {
+            if let Some(set) = self.addr_index.get_mut(&u.address) {
                 set.remove(key);
                 if set.is_empty() {
-                    self.addr_index.remove(&utxo.address);
+                    self.addr_index.remove(&u.address);
                 }
             }
-            self.write_addr_set_to_db(&utxo.address);
+            self.write_addr_set_to_db(&u.address);
             self.total_utxos = self.total_utxos.saturating_sub(1);
-            if utxo.is_spent {
+            if u.is_spent {
                 self.spent_utxos = self.spent_utxos.saturating_sub(1);
             }
-            return true;
+            true
+        } else {
+            false // Not found anywhere
         }
-        // Even if not in cache, check DB
-        if let Some(utxo) = self.load_record_from_db(key) {
-            if let Err(e) = self.delete_record_from_db(key) {
-                slog_error!("index", "utxo_remove_db_fallback_failed", error => &e);
-                return false;
-            }
-            // Remove from addr_index BEFORE writing the addr set to DB
-            if let Some(set) = self.addr_index.get_mut(&utxo.address) {
-                set.remove(key);
-                if set.is_empty() {
-                    self.addr_index.remove(&utxo.address);
-                }
-            }
-            self.write_addr_set_to_db(&utxo.address);
-            self.total_utxos = self.total_utxos.saturating_sub(1);
-            if utxo.is_spent {
-                self.spent_utxos = self.spent_utxos.saturating_sub(1);
-            }
-            return true;
-        }
-        false
     }
 
     pub fn get(&self, key: &str) -> Option<&UtxoRecord> {
