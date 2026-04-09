@@ -24,9 +24,15 @@ impl TxIndex {
         Ok(Self { db })
     }
 
+    /// Index a transaction by its hash.
+    ///
+    /// WARNING: Returns () even on write failure (logs error only).
+    /// Callers should check the transaction is queryable after indexing
+    /// if correctness is critical.
     pub fn index_tx(&self, txid: &str, block_hash: &str) {
-        if let Err(e) = self.db.put(txid, block_hash) { slog_error!("storage", "tx_index_put_error", error => e); }
-
+        if let Err(e) = self.db.put(txid, block_hash) {
+            slog_error!("storage", "tx_index_put_error", txid => txid, error => e);
+        }
     }
 
     pub fn get_tx_block(&self, txid: &str) -> Option<String> {
@@ -42,7 +48,8 @@ impl TxIndex {
             }
             Ok(None) => None,
             Err(e) => {
-                slog_error!("storage", "tx_index_read_error", txid => txid, error => e);
+                slog_error!("storage", "tx_block_read_error_returns_none",
+                    txid => txid, error => e);
                 None
             }
         }

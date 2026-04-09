@@ -44,7 +44,9 @@ impl UtxoIndex {
             }
             Ok(None) => None,
             Err(e) => {
-                slog_error!("index", "utxo_owner_read_failed", key => key, error => e);
+                slog_error!("storage", "utxo_owner_read_error_returns_none",
+                    key => key, error => e,
+                    note => "returning None but key may exist — this is a false negative");
                 None
             }
         }

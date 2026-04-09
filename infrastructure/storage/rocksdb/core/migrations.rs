@@ -14,7 +14,7 @@ use rocksdb::DB;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::errors::StorageError;
-use crate::{slog_info, slog_error};
+use crate::{slog_info, slog_warn, slog_error};
 
 /// Current database schema version
 pub const CURRENT_DB_VERSION: u32 = 6;
@@ -51,7 +51,16 @@ impl MigrationManager {
                 arr.copy_from_slice(&data[..4]);
                 u32::from_le_bytes(arr)
             }
-            _ => 0, // No version = fresh database
+            Ok(Some(data)) => {
+                slog_error!("storage", "schema_version_corrupt", len => data.len());
+                0 // Corrupt but logged
+            }
+            Ok(None) => 0, // Genuinely new DB
+            Err(e) => {
+                slog_error!("storage", "schema_version_read_failed", error => e,
+                    note => "returning 0 may trigger unnecessary migrations");
+                0
+            }
         }
     }
 
@@ -165,7 +174,11 @@ impl MigrationManager {
                     let mut arr = [0u8; 8];
                     arr.copy_from_slice(&data[..8]);
                     u64::from_le_bytes(arr)
-                } else { 0 }
+                } else {
+                    slog_warn!("storage", "migration_history_corrupt_entry",
+                        version => version, len => data.len());
+                    0
+                }
             });
             history.push(Migration {
                 version,
