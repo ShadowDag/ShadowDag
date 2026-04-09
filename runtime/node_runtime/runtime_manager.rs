@@ -20,7 +20,7 @@ impl RuntimeManager {
     /// تشغيل runtime
     pub fn start(&self) {
         self.set_state("runtime:status", "running");
-        self.set_state("runtime:version", "0.1.0");
+        self.set_state("runtime:version", env!("CARGO_PKG_VERSION"));
     }
 
     /// ايقاف runtime

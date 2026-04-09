@@ -46,8 +46,10 @@ impl Lifecycle {
         // Install panic hook for emergency shutdown
         install_panic_hook();
 
-        // Install Ctrl+C handler
-        install_ctrlc_handler();
+        // Signal handling is owned by daemon/mod.rs via ctrlc::set_handler().
+        // Lifecycle::on_start() does NOT install its own handler to prevent
+        // dual-handler races during shutdown. When running outside the daemon
+        // (e.g., tests), callers should register their own shutdown mechanism.
     }
 
     /// Called when the node stops gracefully.
@@ -146,6 +148,12 @@ impl Lifecycle {
 
 /// Install a real Ctrl+C (SIGINT) handler that triggers graceful shutdown.
 /// This is NOT a polling loop — it intercepts the actual OS signal.
+///
+/// NOTE: This function is no longer called from `on_start()`.
+/// Signal handling is now centralized in `daemon/mod.rs` via `ctrlc::set_handler()`
+/// to prevent dual-handler races during shutdown. Kept for standalone usage
+/// (e.g., tools or test binaries that run outside the daemon).
+#[allow(dead_code)]
 fn install_ctrlc_handler() {
     if let Err(e) = std::thread::Builder::new()
         .name("signal-handler".to_string())

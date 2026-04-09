@@ -33,6 +33,10 @@ use crate::{slog_info, slog_warn, slog_error};
 // Global next difficulty — written by FullNode after each block accepted,
 // read by RPC getblocktemplate so miners always use the correct difficulty.
 // ═══════════════════════════════════════════════════════════════════════════
+/// WARNING: Global per-process. Assumes single FullNode instance.
+/// If running multiple nodes in one process (e.g., tests), these
+/// will leak state between instances. For multi-instance safety,
+/// move to FullNode struct fields.
 static NEXT_DIFFICULTY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
 
 /// Get the next expected difficulty for mining (called by RPC getblocktemplate).
@@ -49,6 +53,10 @@ fn set_next_difficulty(diff: u64) {
 // Global DAG tips — written by FullNode after each block accepted,
 // read by RPC getblocktemplate so miners reference correct parents.
 // ═══════════════════════════════════════════════════════════════════════════
+/// WARNING: Global per-process. Assumes single FullNode instance.
+/// If running multiple nodes in one process (e.g., tests), these
+/// will leak state between instances. For multi-instance safety,
+/// move to FullNode struct fields.
 static DAG_TIPS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 /// Get current DAG tips (blocks with no children) for mining.
@@ -60,6 +68,18 @@ pub fn get_dag_tips() -> Vec<String> {
 fn set_dag_tips(tips: Vec<String>) {
     if let Ok(mut t) = DAG_TIPS.lock() {
         *t = tips;
+    }
+}
+
+/// Reset global mining template state. ONLY for testing.
+/// Clears NEXT_DIFFICULTY back to 0 and empties DAG_TIPS so that
+/// tests running multiple FullNode instances in one process don't
+/// observe stale state from a previous test.
+#[cfg(test)]
+pub fn reset_mining_globals() {
+    NEXT_DIFFICULTY.store(0, Ordering::Relaxed);
+    if let Ok(mut tips) = DAG_TIPS.lock() {
+        tips.clear();
     }
 }
 
@@ -357,8 +377,15 @@ impl FullNode {
             height: block.header.height,
             timestamp: block.header.timestamp,
         };
-        let _ghostdag_data = self.ghostdag.add_block(dag_block)
-            .map_err(|e| NodeError::BlockRejected(format!("GHOSTDAG failed: {}", e)))?;
+        if let Err(e) = self.ghostdag.add_block(dag_block) {
+            // Cleanup: remove from BlockStore since GHOSTDAG rejected
+            let _ = self.block_store.delete_block(&block.header.hash);
+            // Note: DAG manager doesn't support remove, so log the inconsistency
+            slog_error!("node", "ghostdag_add_failed_cleanup",
+                hash => &block.header.hash, error => &e.to_string(),
+                note => "block removed from BlockStore; DAG entry may be stale until reindex");
+            return Err(NodeError::BlockRejected(format!("GHOSTDAG: {}", e)));
+        }
 
         // ═══════════════════════════════════════════════════════════════
         // PHASE 3: RECOMPUTE VIRTUAL CHAIN (GHOSTDAG-ordered execution)
@@ -434,8 +461,15 @@ impl FullNode {
             height: block.header.height,
             timestamp: block.header.timestamp,
         };
-        let _ghostdag_data = self.ghostdag.add_block(dag_block)
-            .map_err(|e| NodeError::BlockRejected(format!("GHOSTDAG failed: {}", e)))?;
+        if let Err(e) = self.ghostdag.add_block(dag_block) {
+            // Cleanup: remove from BlockStore since GHOSTDAG rejected
+            let _ = self.block_store.delete_block(&block.header.hash);
+            // Note: DAG manager doesn't support remove, so log the inconsistency
+            slog_error!("node", "ghostdag_add_failed_cleanup",
+                hash => &block.header.hash, error => &e.to_string(),
+                note => "block removed from BlockStore; DAG entry may be stale until reindex");
+            return Err(NodeError::BlockRejected(format!("GHOSTDAG: {}", e)));
+        }
 
         if let Err(e) = self.recompute_virtual_chain() {
             // Best-effort cleanup: DAG/GHOSTDAG don't support remove, but
@@ -1329,8 +1363,14 @@ impl FullNode {
             height: block.header.height,
             timestamp: block.header.timestamp,
         };
-        let _ghostdag_data = self.ghostdag.add_block(dag_block)
-            .map_err(|e| NodeError::BlockRejected(format!("GHOSTDAG failed: {}", e)))?;
+        if let Err(e) = self.ghostdag.add_block(dag_block) {
+            // Cleanup: remove from BlockStore since GHOSTDAG rejected
+            let _ = self.block_store.delete_block(&block.header.hash);
+            slog_error!("node", "ghostdag_add_failed_cleanup",
+                hash => &block.header.hash, error => &e.to_string(),
+                note => "block removed from BlockStore; DAG entry may be stale until reindex");
+            return Err(NodeError::BlockRejected(format!("GHOSTDAG: {}", e)));
+        }
 
         // UTXO write + commitment ATOMICALLY (validation already passed in Phase 1)
         let _commitment = self.utxo_set.apply_block_write_with_commitment(
