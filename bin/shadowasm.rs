@@ -253,7 +253,13 @@ fn cmd_test(args: &[String]) {
     // Run tests
     let mut runner = TestRunner::new();
     runner.fund_account("test_caller", 1_000_000_000);
-    runner.deploy_bytecode(bytecode, "test_caller").unwrap();
+    match runner.deploy_bytecode(bytecode, "test_caller") {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("Deploy failed: {}", e);
+            process::exit(1);
+        }
+    }
 
     println!("Running {} tests from {}...\n", tests.len(), source_path);
 
@@ -336,7 +342,13 @@ fn cmd_trace(args: &[String]) {
     // Execute and trace
     let mut runner = TestRunner::new();
     runner.fund_account("tracer", 1_000_000_000);
-    runner.deploy_bytecode(bytecode, "tracer").unwrap();
+    match runner.deploy_bytecode(bytecode, "tracer") {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("Deploy failed: {}", e);
+            process::exit(1);
+        }
+    }
 
     let result = runner.run_test(&TestCase {
         name: "trace".into(),

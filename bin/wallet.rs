@@ -620,7 +620,10 @@ fn cmd_export() {
 }
 
 fn cmd_deploy(args: &[String]) {
-    let bytecode_hex = args.get(2).expect("Usage: wallet deploy <bytecode_hex> [gas_limit] [value]");
+    let bytecode_hex = match args.get(2) {
+        Some(v) => v,
+        None => { eprintln!("Usage: wallet deploy <bytecode_hex> [gas_limit] [value]"); return; }
+    };
     let gas_limit: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10_000_000);
     let value: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
 
@@ -652,8 +655,14 @@ fn cmd_deploy(args: &[String]) {
 }
 
 fn cmd_call(args: &[String]) {
-    let contract_addr = args.get(2).expect("Usage: wallet call <contract_address> <calldata_hex> [gas_limit] [value]");
-    let calldata_hex = args.get(3).expect("calldata_hex required");
+    let contract_addr = match args.get(2) {
+        Some(v) => v,
+        None => { eprintln!("Usage: wallet call <contract_address> <calldata_hex> [gas_limit] [value]"); return; }
+    };
+    let calldata_hex = match args.get(3) {
+        Some(v) => v,
+        None => { eprintln!("Usage: wallet call <contract_address> <calldata_hex> [gas_limit] [value]"); return; }
+    };
     let gas_limit: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10_000_000);
     let value: u64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
 
@@ -683,7 +692,10 @@ fn cmd_call(args: &[String]) {
 }
 
 fn cmd_receipt(args: &[String]) {
-    let tx_hash = args.get(2).expect("Usage: wallet receipt <tx_hash>");
+    let tx_hash = match args.get(2) {
+        Some(v) => v,
+        None => { eprintln!("Usage: wallet receipt <tx_hash>"); return; }
+    };
     println!("Fetching receipt for {}...", tx_hash);
     println!("  Use RPC: get_transaction_receipt {}", tx_hash);
     // In a full implementation, this would connect to the local RPC
@@ -704,7 +716,10 @@ fn cmd_logs(args: &[String]) {
 }
 
 fn cmd_deploy_package(args: &[String]) {
-    let package_path = args.get(2).expect("Usage: wallet deploy-package <package.json> [gas_limit]");
+    let package_path = match args.get(2) {
+        Some(v) => v,
+        None => { eprintln!("Usage: wallet deploy-package <package.json> [gas_limit]"); return; }
+    };
     let gas_limit: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let json = match std::fs::read_to_string(package_path) {
@@ -747,8 +762,14 @@ fn cmd_deploy_package(args: &[String]) {
 }
 
 fn cmd_verify(args: &[String]) {
-    let address = args.get(2).expect("Usage: wallet verify <contract_address> <package.json>");
-    let package_path = args.get(3).expect("package.json path required");
+    let address = match args.get(2) {
+        Some(v) => v,
+        None => { eprintln!("Usage: wallet verify <contract_address> <package.json>"); return; }
+    };
+    let package_path = match args.get(3) {
+        Some(v) => v,
+        None => { eprintln!("Usage: wallet verify <contract_address> <package.json>"); return; }
+    };
 
     let json = match std::fs::read_to_string(package_path) {
         Ok(j) => j,

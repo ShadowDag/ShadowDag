@@ -247,12 +247,18 @@ Reward:   10 SDAG (9.5 miner + 0.5 developer)
 Message:  "ShadowDAG/Genesis/2026-01-01/Privacy-is-a-right-not-a-privilege"
 ```
 
-## CI/CD
+## CI Pipeline
 
-GitHub Actions runs on every push/PR:
-- `cargo check --all-targets`
-- `cargo test --lib --bins`
-- `cargo clippy -- -D warnings`
+6 parallel jobs on every push/PR:
+
+| Job | Command |
+|-----|---------|
+| Check | `cargo check --all-targets` |
+| Unit Tests | `cargo test --lib --bins` |
+| Integration Tests | `cargo test --test shadowdag` |
+| VM Contract Tests | `cargo test --lib -- execution_env v1_spec contract_e2e ...` |
+| Clippy | `cargo clippy --all-targets -- -D warnings` |
+| shadowasm Check | `shadowasm build --check` on sample |
 
 ## License
 
