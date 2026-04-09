@@ -631,9 +631,34 @@ impl FullNode {
                         // (block is already saved; we update the header fields)
                         if receipt_root.is_some() || state_root.is_some() {
                             if let Some(mut stored_block) = self.block_store.get_block(block_hash) {
-                                stored_block.header.receipt_root = receipt_root;
-                                stored_block.header.state_root = state_root;
+                                stored_block.header.receipt_root = receipt_root.clone();
+                                stored_block.header.state_root = state_root.clone();
                                 self.block_store.save_block(&stored_block);
+                            }
+                        }
+
+                        // ── OBSERVABILITY + INVARIANT CHECK ──────────────────
+                        // Record VM metrics for monitoring dashboards and
+                        // run a quick invariant check on receipt/state roots.
+                        {
+                            use crate::runtime::vm::testing::observability::VM_METRICS;
+                            use crate::runtime::vm::testing::invariant_checker::InvariantChecker;
+
+                            VM_METRICS.record_block();
+
+                            let has_contract_txs = block.body.transactions.iter()
+                                .any(|tx| matches!(tx.tx_type, TxType::ContractCreate | TxType::ContractCall));
+                            if has_contract_txs {
+                                VM_METRICS.record_call();
+                            }
+
+                            // Quick invariant check: verify receipt_root and state_root
+                            if let (Some(ref rr), Some(ref sr)) = (&receipt_root, &state_root) {
+                                if !InvariantChecker::quick_check(Some(rr), Some(sr), &receipts, &env) {
+                                    slog_error!("node", "INVARIANT_VIOLATION",
+                                        block => block_hash, height => &block.header.height.to_string());
+                                    VM_METRICS.record_violation();
+                                }
                             }
                         }
 

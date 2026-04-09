@@ -81,6 +81,18 @@ pub const REGTEST_GENESIS_HASH:  &str =
 // ═══════════════════════════════════════════════════════════════════════════
 //                      TESTNET GENESIS CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// Testnet genesis parameters — chain_id 0xDA0C_0002.
+//
+// Key differences from mainnet:
+//   - Lower difficulty (4096 vs 8192) for faster initial block production
+//   - Separate timestamp (2025-01-02) to guarantee a distinct genesis hash
+//   - ST1-prefixed addresses to prevent accidental cross-network spending
+//   - Same reward/split (10 SDAG, 95/5) to match mainnet economic model
+//
+// Hardcoded PoW: nonce 11242, hash 000e9dbf... (mined with ShadowHash).
+// Re-mine with `mine-genesis --network testnet` after changing any constant.
+// ═══════════════════════════════════════════════════════════════════════════
 
 pub const TESTNET_TIMESTAMP:     u64 = 1_735_776_000; // 2025-01-02 00:00:00 UTC
 pub const TESTNET_DIFFICULTY:    u64 = 4096;
