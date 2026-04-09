@@ -64,23 +64,77 @@ impl DiskMonitor {
     }
 
     /// Check if it's safe to write (not in critical state).
-    /// Returns `true` with a warning when disk space cannot be determined.
+    /// When disk space cannot be determined, probes writability directly.
     pub fn can_write(data_dir: &str) -> bool {
         match Self::check(data_dir) {
             DiskStatus::Critical { .. } => false,
             DiskStatus::Unknown => {
-                slog_warn!("storage", "disk_space_unknown", path => data_dir);
-                true // Allow but warn -- cannot determine free space
+                // Unknown free space -- probe writability directly
+                let probe_path = format!("{}/.disk_probe_{}", data_dir, std::process::id());
+                let writable = std::fs::write(&probe_path, b"probe").is_ok();
+                let _ = std::fs::remove_file(&probe_path);
+                if !writable {
+                    slog_warn!("storage", "disk_write_probe_failed", path => data_dir);
+                }
+                writable
             }
             _ => true,
         }
     }
 
-    /// Get free space in bytes (platform-specific)
-    fn get_free_space(_path: &str) -> Option<u64> {
-        // Platform-specific implementation needed
-        // Return None (unknown) instead of fake value
-        None
+    /// Get free space in bytes (platform-specific).
+    ///
+    /// Returns `None` when the platform API is unavailable; callers must
+    /// fall back to a write-probe (see `can_write`).
+    fn get_free_space(path: &str) -> Option<u64> {
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            let c_path = match CString::new(path) {
+                Ok(p) => p,
+                Err(_) => return None,
+            };
+            unsafe {
+                let mut stat: libc::statvfs = std::mem::zeroed();
+                if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+                    return Some(stat.f_bavail as u64 * stat.f_frsize as u64);
+                }
+            }
+            None
+        }
+
+        #[cfg(windows)]
+        {
+            use std::ffi::OsStr;
+            use std::os::windows::ffi::OsStrExt;
+
+            extern "system" {
+                fn GetDiskFreeSpaceExW(
+                    lpDirectoryName: *const u16,
+                    lpFreeBytesAvailableToCaller: *mut u64,
+                    lpTotalNumberOfBytes: *mut u64,
+                    lpTotalNumberOfFreeBytes: *mut u64,
+                ) -> i32;
+            }
+
+            let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
+            let mut free_available: u64 = 0;
+            let mut total: u64 = 0;
+            let mut total_free: u64 = 0;
+            let ret = unsafe {
+                GetDiskFreeSpaceExW(wide.as_ptr(), &mut free_available, &mut total, &mut total_free)
+            };
+            if ret != 0 {
+                return Some(free_available);
+            }
+            None
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = path;
+            None
+        }
     }
 }
 

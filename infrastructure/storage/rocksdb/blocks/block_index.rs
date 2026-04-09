@@ -24,9 +24,12 @@ impl BlockIndex {
         Ok(Self { db })
     }
 
-    pub fn set_height(&self, hash: &str, height: u64) {
-        if let Err(e) = self.db.put(hash, height.to_be_bytes()) { slog_error!("storage", "block_index_put_error", error => e); }
-
+    pub fn set_height(&self, hash: &str, height: u64) -> Result<(), StorageError> {
+        self.db.put(hash, height.to_be_bytes())
+            .map_err(|e| {
+                slog_error!("storage", "height_index_write_failed", hash => hash, error => &e);
+                StorageError::WriteFailed(e.to_string())
+            })
     }
 
     pub fn get_height(&self, hash: &str) -> Option<u64> {

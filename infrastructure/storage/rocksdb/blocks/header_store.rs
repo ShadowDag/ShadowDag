@@ -25,25 +25,25 @@ impl HeaderStore {
         Ok(Self { db })
     }
 
-    pub fn save_header(&self, header: &BlockHeader) {
-        let data = bincode::serialize(header).unwrap_or_default();
-
-        if let Err(e) = self.db.put(&header.hash, data) { slog_error!("storage", "header_put_error", error => e); }
-
+    pub fn save_header(&self, header: &BlockHeader) -> Result<(), StorageError> {
+        let data = bincode::serialize(header)
+            .map_err(|e| StorageError::Serialization(format!("header serialize: {}", e)))?;
+        if data.is_empty() {
+            return Err(StorageError::Serialization("header serialized to empty bytes".into()));
+        }
+        self.db.put(&header.hash, &data)
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
     pub fn get_header(&self, hash: &str) -> Option<BlockHeader> {
-        match self.db.get(hash).unwrap_or(None) {
-            Some(data) => {
-                let header: BlockHeader =
-                    bincode::deserialize(&data).ok()?;
-
-                Some(header)
+        match self.db.get(hash.as_bytes()) {
+            Ok(Some(data)) => bincode::deserialize(&data).ok(),
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("storage", "header_read_failed", hash => hash, error => e);
+                None
             }
-
-            None => None
         }
-
     }
 
 }

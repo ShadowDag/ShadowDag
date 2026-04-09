@@ -20,7 +20,8 @@ impl TxStore {
         opts.set_write_buffer_size(32 * 1024 * 1024);
         match DB::open(&opts, Path::new(path)) {
             Ok(db) => Some(Self { db }),
-            Err(_e) => {
+            Err(e) => {
+                slog_error!("storage", "tx_store_open_failed", path => path, error => e);
                 None
             }
         }
