@@ -3,6 +3,15 @@
 //! Provides high-level functions for deploying, calling, and querying
 //! contracts through the ShadowDAG RPC interface.
 //!
+//! # Status: STUB — HTTP transport not yet connected
+//!
+//! This SDK defines the complete API surface for ShadowDAG contract interaction.
+//! All method signatures and types are finalized, but the HTTP transport layer
+//! is not yet implemented. Methods currently return SdkError::Other explaining
+//! the transport gap.
+//!
+//! To connect: implement rpc_call() using reqwest, hyper, or ureq HTTP client.
+//!
 //! # Example
 //! ```no_run
 //! use shadowdag::sdk::shadowdag_sdk::ShadowDagSdk;
@@ -16,7 +25,11 @@
 use serde::{Serialize, Deserialize};
 use serde_json::{json, Value};
 
-/// SDK client for ShadowDAG node interaction.
+/// ShadowDAG SDK client.
+///
+/// **STATUS: API defined, transport not connected.**
+/// All public methods are typed and documented, but rpc_call()
+/// needs an HTTP client implementation to function.
 pub struct ShadowDagSdk {
     rpc_url: String,
     auth_token: Option<String>,

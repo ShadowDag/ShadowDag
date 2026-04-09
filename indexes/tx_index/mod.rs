@@ -258,31 +258,38 @@ impl TxIndex {
     }
 
     pub fn remove(&mut self, hash: &str) -> bool {
-        // Delete from DB first — don't update memory if DB delete fails
+        // Load from cache or DB FIRST (before deleting from DB).
+        // The old code deleted from DB first, then tried to fallback-load
+        // from DB for cache-miss cases — but the load always failed because
+        // the record was just deleted.
+        let record = if let Some(r) = self.records.remove(hash) {
+            Some(r)
+        } else {
+            // Not in cache — load from DB BEFORE we delete it
+            self.load_record_from_db(hash)
+        };
+
+        // Now delete from DB
         if let Err(e) = self.delete_record_from_db(hash) {
             slog_error!("index", "tx_remove_persist_failed", error => &e);
+            // If we already removed from cache, re-insert
+            if let Some(ref r) = record {
+                self.records.insert(hash.to_string(), r.clone());
+            }
             return false;
         }
 
-        if let Some(rec) = self.records.remove(hash) {
-            if let Some(list) = self.block_tx_map.get_mut(&rec.block_hash) {
+        // Update in-memory state from the loaded record
+        if let Some(ref r) = record {
+            if let Some(list) = self.block_tx_map.get_mut(&r.block_hash) {
                 list.retain(|h| h != hash);
             }
-            self.write_block_map_to_db(&rec.block_hash);
+            self.write_block_map_to_db(&r.block_hash);
             self.total_indexed = self.total_indexed.saturating_sub(1);
-            return true;
+            true
+        } else {
+            false // Not found anywhere
         }
-        // Check DB even if not in cache
-        if let Some(rec) = self.load_record_from_db(hash) {
-            if let Err(e) = self.delete_record_from_db(hash) {
-                slog_error!("index", "tx_remove_db_fallback_failed", error => &e);
-                return false;
-            }
-            self.write_block_map_to_db(&rec.block_hash);
-            self.total_indexed = self.total_indexed.saturating_sub(1);
-            return true;
-        }
-        false
     }
 
     pub fn rollback_block(&mut self, block_hash: &str) -> usize {
