@@ -4,19 +4,63 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::domain::transaction::transaction::Transaction;
+#[allow(deprecated)]
 use crate::engine::privacy::ringct::ring_signature::RingSignature;
 
+/// Validates ring signature aspects of a transaction.
+///
+/// # Privacy wiring status
+///
+/// **Current state (legacy):** Uses `RingSignature::verify()` which only
+/// performs structural checks (key_image format, ring_members presence/size).
+/// This does NOT verify actual cryptographic ring signatures.
+///
+/// **Target state:** Should use `crate::engine::privacy::ringct::clsag::verify()`
+/// which implements real CLSAG (Compact Linkable Spontaneous Anonymous Group)
+/// ring signatures using curve25519-dalek Ristretto points.
+///
+/// **Migration path:**
+///   1. `TxInput` must carry serialized `CLSAGSignature` data (c0, s[], key_image
+///      as compressed Ristretto points) instead of bare hex strings
+///   2. `ring_members` must be deserialized into `Vec<RistrettoPoint>`
+///   3. Each input's CLSAG signature is verified via `clsag::verify(message, ring, sig)`
+///   4. Once wired, `RingSignature::verify()` can be removed entirely
 pub struct RingValidator;
 
 impl RingValidator {
+    #[allow(deprecated)]
     pub fn validate(tx: &Transaction) -> bool {
-        // 1. Ring signature verification
-        // TODO: Migrate to CLSAG verification (clsag.rs) for production privacy.
-        // Current RingSignature::verify is LEGACY/DEPRECATED in ring_signature.rs.
-        // The real CLSAG implementation lives in: engine/privacy/ringct/clsag.rs
-        // and uses curve25519-dalek Ristretto points with real elliptic curve math.
-        if !RingSignature::verify(tx) {
+        // 1. Ring signature structural checks (LEGACY)
+        //
+        // WARNING: RingSignature::verify() is DEPRECATED — it only checks that
+        // key_image and ring_members fields are present and well-formed. It does
+        // NOT perform cryptographic ring signature verification.
+        //
+        // TODO(privacy): Wire CLSAG verification here. Requires:
+        //   - Deserialize each input's signature bytes into clsag::CLSAGSignature
+        //   - Deserialize ring_members from hex strings into RistrettoPoints
+        //   - Call clsag::verify(tx_message, &ring_points, &clsag_sig) per input
+        //   - See engine/privacy/ringct/clsag.rs for the real implementation
+        //
+        // The CLSAG module (clsag.rs) is fully implemented and tested. The gap is
+        // that Transaction/TxInput currently stores ring data as hex strings, not
+        // as the typed crypto structures that clsag::verify() expects.
+        #[allow(deprecated)]
+        let structural_ok = RingSignature::verify(tx);
+        if !structural_ok {
             return false;
+        }
+
+        // Log warning that we are using the legacy path (no real crypto verification).
+        // This ensures operators are aware during testnet that ring sigs are not
+        // cryptographically verified yet.
+        if tx.tx_type == crate::domain::transaction::transaction::TxType::Confidential {
+            eprintln!(
+                "[WARN] ring_validator: using LEGACY structural-only ring signature check \
+                 for confidential TX {}. CLSAG cryptographic verification is not yet wired. \
+                 See engine/privacy/ringct/clsag.rs for the real implementation.",
+                tx.hash,
+            );
         }
         // 2. Non-empty outputs
         if tx.outputs.is_empty() {

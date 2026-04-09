@@ -300,12 +300,25 @@ impl RingSignature {
     }
 
     /// WARNING: This is a LEGACY placeholder that does NOT verify the actual
-    /// ring signature embedded in the transaction. It generates a new signature
-    /// and verifies that, which always passes.
+    /// ring signature embedded in the transaction. It only performs structural
+    /// checks (key_image format, ring_members presence/size).
     ///
-    /// TODO: Replace with CLSAG verification from clsag.rs for production.
-    /// Until then, this function provides only structural checks, not
-    /// cryptographic ring signature verification.
+    /// The real CLSAG verification lives in:
+    ///   `crate::engine::privacy::ringct::clsag::verify(message, ring, sig)`
+    /// which uses curve25519-dalek Ristretto points and proper elliptic curve
+    /// ring signature math.
+    ///
+    /// Migration path:
+    ///   1. Transaction inputs need to carry `CLSAGSignature` data (c0, s[], key_image)
+    ///   2. ring_validator should deserialize and call `clsag::verify()`
+    ///   3. This function can then be removed entirely
+    #[deprecated(
+        since = "1.0.0",
+        note = "LEGACY structural-only check. Use CLSAG verification via \
+                crate::engine::privacy::ringct::clsag::verify() for real \
+                ring signature cryptography. See ring_validator.rs for the \
+                migration path."
+    )]
     pub fn verify(tx: &Transaction) -> bool {
         // Structural checks: for confidential inputs, verify that ring data
         // EXISTS and is well-formed, rather than self-signing.

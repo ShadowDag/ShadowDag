@@ -57,6 +57,13 @@ pub struct Bulletproof;
 impl Bulletproof {
     /// Generate a range proof for an amount.
     /// Proves: 0 < amount < 2^64 without revealing the amount.
+    #[deprecated(
+        since = "1.0.0",
+        note = "LEGACY hash-based simulation. For production, use \
+                RealPedersenCommitment::commit_random() + range_proof::prove() \
+                from engine/privacy/confidential/{pedersen.rs, range_proof.rs}. \
+                See ConfidentialTx::create_confidential_output_real() for the wired path."
+    )]
     pub fn prove(amount: u64) -> BulletproofResult {
         Self::prove_with_bits(amount, RANGE_BITS)
     }
@@ -172,6 +179,14 @@ impl Bulletproof {
     ///   2. Each bit is binary (0 or 1) via sigma-protocol verification
     ///   3. The value binding ties the bit decomposition to the Pedersen commitment
     ///      (prevents proving a range for a different value than committed)
+    #[deprecated(
+        since = "1.0.0",
+        note = "LEGACY hash-based simulation. For production, use \
+                range_proof::verify(commitment, proof) from \
+                engine/privacy/confidential/range_proof.rs which uses \
+                real Borromean ring signatures on Ristretto points. \
+                See ConfidentialTx::verify_confidential_real() for the wired path."
+    )]
     pub fn verify_range_proof(proof: &BulletproofResult) -> bool {
         // Basic structure checks
         if proof.proof_bytes.is_empty() { return false; }
@@ -302,6 +317,7 @@ impl Bulletproof {
     }
 
     /// Verify with a specific amount (for the commitment owner who knows the blinding factor)
+    #[allow(deprecated)]
     pub fn verify_with_amount(proof: &BulletproofResult, amount: u64) -> bool {
         if !Self::verify_range_proof(proof) { return false; }
 
@@ -314,6 +330,7 @@ impl Bulletproof {
     }
 
     /// Generate aggregated proofs for multiple outputs
+    #[allow(deprecated)]
     pub fn prove_batch(amounts: &[u64]) -> AggregatedProof {
         let proofs: Vec<BulletproofResult> = amounts.iter()
             .map(|&a| Self::prove(a))
@@ -351,6 +368,7 @@ impl Bulletproof {
             return false; // Batch was tampered with — proof substitution detected
         }
 
+        #[allow(deprecated)]
         batch.proofs.iter().all(Self::verify_range_proof)
     }
 
@@ -361,6 +379,7 @@ impl Bulletproof {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
