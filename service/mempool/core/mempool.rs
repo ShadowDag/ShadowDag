@@ -52,7 +52,7 @@ pub struct Mempool {
 // Internal metadata helpers (atomic counters via RocksDB)
 // ─────────────────────────────────────────────────────────
 impl Mempool {
-    /// Iterate the fee index backward (lowest fee first) and return up to
+    /// Iterate the fee index backward (lowest fee_rate first) and return up to
     /// `limit` tx hashes. Uses RocksDB's reverse seek so only `limit` entries
     /// are read — O(limit) instead of O(n) for the full prefix scan + reverse.
     fn fee_index_lowest(&self, limit: usize) -> Vec<String> {
@@ -247,18 +247,18 @@ impl Mempool {
             .unwrap_or(0.0)
     }
 
-    /// Minimum fee in the pool (the lowest-fee TX). Returns 0 if pool is empty.
-    /// The fee index is sorted ascending by `u64::MAX - fee`, so the *last*
-    /// entry is the lowest fee.
+    /// Minimum fee rate in the pool (the lowest fee-rate TX). Returns 0 if pool is empty.
+    /// The fee index is sorted ascending by `u64::MAX - fee_rate`, so the *last*
+    /// entry is the lowest fee rate.
     pub fn pool_min_fee(&self) -> u64 {
-        // Reverse-seek to the last fee-index key (lowest fee) in O(1)
+        // Reverse-seek to the last fee-index key (lowest fee_rate) in O(1)
         let past_end = b"fee;";
         let mut iter = self.db.iterator(
             rocksdb::IteratorMode::From(past_end, rocksdb::Direction::Reverse),
         );
         match iter.next() {
             Some(Ok((k, _))) if k.starts_with(PFX_FEE) => {
-                // Key format: "fee:{inverted_fee:020}:{hash}"
+                // Key format: "fee:{inverted_fee_rate:020}:{hash}"
                 if let Ok(s) = String::from_utf8(k.to_vec()) {
                     let parts: Vec<&str> = s.splitn(3, ':').collect();
                     if parts.len() >= 2 {
@@ -313,7 +313,9 @@ impl Mempool {
             Ok(data) => batch.put(tx_key.as_bytes(), &data),
             Err(_) => return false,
         }
-        let fee_key = format!("fee:{:020}:{}", u64::MAX - tx.fee, tx.hash);
+        let tx_size = tx.canonical_bytes().len().max(1) as u64;
+        let fee_rate = tx.fee / tx_size;
+        let fee_key = format!("fee:{:020}:{}", u64::MAX - fee_rate, tx.hash);
         batch.put(fee_key.as_bytes(), tx.hash.as_bytes());
         // Build conflict + dependency indexes (same as production)
         for input in &tx.inputs {
@@ -324,7 +326,7 @@ impl Mempool {
             let parent_key = format!("tx:{}", input.txid);
             if matches!(self.db.get(parent_key.as_bytes()), Ok(Some(_))) {
                 batch.put(format!("dep:{}:{}", tx.hash, input.txid).as_bytes(), b"1");
-                batch.put(format!("rdep:{}:{}", input.txid, tx.hash).as_bytes(), b"1");
+                batch.put(format!("rdep:{}:{}:{}", input.txid, input.index, tx.hash).as_bytes(), b"1");
             }
         }
         self.db.write(batch).is_ok()
@@ -536,7 +538,9 @@ impl Mempool {
         let mut batch = WriteBatch::default();
         batch.put(tx_key.as_bytes(), &data);
 
-        let fee_key = format!("fee:{:020}:{}", u64::MAX - tx.fee, tx.hash);
+        let tx_size = tx.canonical_bytes().len().max(1) as u64;
+        let fee_rate = tx.fee / tx_size;
+        let fee_key = format!("fee:{:020}:{}", u64::MAX - fee_rate, tx.hash);
         batch.put(fee_key.as_bytes(), tx.hash.as_bytes());
 
         for input in &tx.inputs {
@@ -550,7 +554,7 @@ impl Mempool {
                 let dep_fwd = format!("dep:{}:{}", tx.hash, input.txid);
                 batch.put(dep_fwd.as_bytes(), b"1");
 
-                let dep_rev = format!("rdep:{}:{}", input.txid, tx.hash);
+                let dep_rev = format!("rdep:{}:{}:{}", input.txid, input.index, tx.hash);
                 batch.put(dep_rev.as_bytes(), b"1");
             }
         }
@@ -593,8 +597,10 @@ impl Mempool {
                 return true;
             }
             // Check reverse dependency conflicts: if a pool tx created an output
-            // that this tx depends on, and another pool tx also spends it
-            let rdep_prefix = format!("rdep:{}:", input.txid);
+            // that this tx depends on, and another pool tx also spends it.
+            // Include the output index so two children spending DIFFERENT
+            // outputs of the same parent are not falsely flagged as conflicts.
+            let rdep_prefix = format!("rdep:{}:{}:", input.txid, input.index);
             let rdep_bytes = rdep_prefix.as_bytes().to_vec();
             let has_rdep_conflict = self.db
                 .prefix_iterator(rdep_prefix.as_bytes())
@@ -645,8 +651,14 @@ impl Mempool {
             .filter_map(|r| r.ok())
             .take_while(|(k, _)| k.starts_with(&prefix_bytes))
             .filter_map(|(k, _)| {
+                // Key format: "rdep:{parent_txid}:{output_index}:{child_txid}"
+                // After stripping "rdep:{parent_txid}:", remainder is "{output_index}:{child_txid}"
                 String::from_utf8(k.to_vec()).ok()
                     .and_then(|s| s.strip_prefix(&prefix).map(|p| p.to_string()))
+                    .and_then(|remainder| {
+                        // Split on first ':' to separate output_index from child_txid
+                        remainder.split_once(':').map(|(_, child)| child.to_string())
+                    })
             })
             .collect()
     }
@@ -1487,7 +1499,9 @@ mod tests {
         if let Ok(data) = bincode::serialize(&old_tx) {
             let _ = mp.db.put(format!("tx:{}", old_hash).as_bytes(), &data);
             // Also insert fee index entry (required by evict_expired scan)
-            let fee_key = format!("fee:{:020}:{}", u64::MAX - old_tx.fee, old_hash);
+            let tx_size = old_tx.canonical_bytes().len().max(1) as u64;
+            let fee_rate = old_tx.fee / tx_size;
+            let fee_key = format!("fee:{:020}:{}", u64::MAX - fee_rate, old_hash);
             let _ = mp.db.put(fee_key.as_bytes(), old_hash.as_bytes());
         }
 

@@ -124,8 +124,10 @@ impl MempoolIndex {
     }
 
     pub fn min_fee_rate(&self) -> f64 {
+        if self.entries.is_empty() {
+            return 0.0; // No transactions → no minimum fee rate
+        }
         self.entries.values().map(|e| e.fee_rate).fold(f64::MAX, f64::min)
-            .min(f64::MAX)
     }
 
     pub fn max_fee_rate(&self) -> f64 {
