@@ -66,7 +66,10 @@ impl BlockCache {
 
     pub fn insert(&self, hash: &str, height: u64, raw_data: Vec<u8>) {
         let mut inner = self.inner.write();
-        if inner.entries.contains_key(hash) {
+        if let Some(existing) = inner.entries.get_mut(hash) {
+            // Update existing entry with potentially newer data
+            existing.height = height;
+            existing.raw_data = raw_data;
             inner.touch(hash);
             return;
         }
@@ -120,6 +123,9 @@ impl BlockCache {
         let mut inner = self.inner.write();
         inner.entries.clear();
         inner.lru_queue.clear();
+        // Reset hit/miss counters so stats reflect post-clear state
+        inner.hits = 0;
+        inner.misses = 0;
     }
 
     pub fn size(&self)      -> usize { self.inner.read().entries.len() }
