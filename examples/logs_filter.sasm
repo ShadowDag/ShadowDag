@@ -1,0 +1,16 @@
+;; Log Filtering Example
+;; Demonstrates: emitting events and filtering
+;;
+;; @deploy Logger
+;; @fn emit_event():bool
+;; @event DataStored(uint64)
+
+;; @test emit_and_filter
+
+; Store value and emit log
+PUSH1 42
+PUSH1 0
+SSTORE
+PUSH1 42
+LOG0
+STOP

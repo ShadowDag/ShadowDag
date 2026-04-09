@@ -11,6 +11,10 @@ pub mod errors;
 
 pub mod daemon;
 
+pub mod sdk {
+    pub mod shadowdag_sdk;
+}
+
 pub mod config {
     pub mod consensus {
         pub mod consensus_params;

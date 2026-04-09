@@ -66,3 +66,7 @@ pub mod edge_case_tests;
 // ── Contract lifecycle E2E tests ─────────────────────────────────────
 #[path = "tests/suite/contract_e2e_tests.rs"]
 pub mod contract_e2e_tests;
+
+// ── Multi-node determinism tests ────────────────────────────────────
+#[path = "tests/suite/multi_node_tests.rs"]
+pub mod multi_node_tests;
