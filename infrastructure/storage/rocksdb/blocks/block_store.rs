@@ -37,8 +37,15 @@ impl BlockStore {
         let hash = &block.header.hash;
         let block_key = format!("{}{}", BLK_PREFIX, hash);
         // Check if block already exists — don't overwrite
-        if self.db.get_pinned(block_key.as_bytes()).ok().flatten().is_some() {
-            return false; // Already exists — don't overwrite
+        match self.db.get_pinned(block_key.as_bytes()) {
+            Ok(Some(_)) => {
+                return false; // Already exists — don't overwrite
+            }
+            Ok(None) => {} // Not a duplicate — proceed
+            Err(e) => {
+                slog_error!("storage", "block_store_dup_check_failed", error => e);
+                // Treat read error as "proceed with caution" — don't silently skip
+            }
         }
         match bincode::serialize(block) {
             Ok(data) => {
