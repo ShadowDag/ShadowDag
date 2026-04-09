@@ -139,11 +139,13 @@ impl DagShield {
         if block.header.timestamp > now + MAX_FUTURE_TIMESTAMP_SECS {
             return Err(ShieldRejection::minor("future timestamp"));
         }
-        // Allow genesis-era timestamps (height 0..1), but reject obviously fake old ones
-        if block.header.height > 1 && block.header.timestamp + 3600 < now {
-            // More than 1 hour old — likely stale or manipulated
-            return Err(ShieldRejection::minor("stale block timestamp"));
-        }
+        // NOTE: We intentionally do NOT reject old timestamps here.
+        // During Initial Block Download (IBD), all historical blocks are
+        // legitimately old. Timestamp validation for new blocks happens in
+        // L2 (validate_structural_layer → validate_timestamp) which uses
+        // MAX_PAST_BLOCK_SECS relative to parent timestamps, not wall clock.
+        // The future-timestamp check above is safe because future blocks
+        // are never valid regardless of sync mode.
         Ok(())
     }
 

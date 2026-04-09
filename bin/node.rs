@@ -194,7 +194,7 @@ fn run(args: &[String]) -> Result<(), BootError> {
 
 /// Phase 1: Parse CLI flags into NodeConfig.
 fn parse_config(args: &[String]) -> Result<NodeConfig, BootError> {
-    let network_mode = parse_flag(args, "--network", "mainnet");
+    let network_mode = parse_flag(args, "--network", "mainnet")?;
     let network: NetworkMode = network_mode.parse().map_err(|_| {
         BootError::InvalidArg(format!(
             "--network '{}' is not valid. Use: mainnet, testnet, or regtest", network_mode
@@ -242,7 +242,7 @@ fn print_info() {
 }
 
 fn print_genesis(args: &[String]) {
-    let network = parse_flag(args, "--network", "mainnet");
+    let network = parse_flag(args, "--network", "mainnet").unwrap_or_else(|_| "mainnet".into());
     let mode: NetworkMode = match network.parse() {
         Ok(m)  => m,
         Err(_) => {
@@ -273,14 +273,11 @@ fn print_help() {
     println!("  --devnet                             Start in DevNet mode (regtest + instant mining + faucet)");
 }
 
-fn parse_flag(args: &[String], name: &str, default: &str) -> String {
+fn parse_flag(args: &[String], name: &str, default: &str) -> Result<String, BootError> {
     match parse_flag_opt(args, name) {
-        Ok(Some(val)) => val,
-        Ok(None) => default.to_string(), // flag not present at all — use default
-        Err(_) => {
-            eprintln!("Error: {} requires a value", name);
-            std::process::exit(1);
-        }
+        Ok(Some(val)) => Ok(val),
+        Ok(None) => Ok(default.to_string()), // flag not present — use default
+        Err(_) => Err(BootError::InvalidArg(format!("{} requires a value", name))),
     }
 }
 
