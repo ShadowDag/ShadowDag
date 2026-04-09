@@ -153,7 +153,14 @@ impl MigrationManager {
         let mut history = Vec::new();
         for version in 1..=CURRENT_DB_VERSION {
             let key = format!("{}{}", MIGRATION_LOG_PREFIX, version);
-            let applied_at = db.get(key.as_bytes()).ok().flatten().map(|data| {
+            let applied_at = match db.get(key.as_bytes()) {
+                Ok(Some(data)) => Some(data),
+                Ok(None) => None,
+                Err(e) => {
+                    slog_error!("storage", "migration_check_read_failed", version => version, error => e);
+                    None
+                }
+            }.map(|data| {
                 if data.len() >= 8 {
                     let mut arr = [0u8; 8];
                     arr.copy_from_slice(&data[..8]);

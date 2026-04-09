@@ -514,7 +514,10 @@ impl StratumServer {
                     let err_resp = format!(
                         "{{\"id\":null,\"result\":null,\"error\":\"Parse error: {}\"}}\n", e
                     );
-                    writer.write_all(err_resp.as_bytes()).ok();
+                    if let Err(e) = writer.write_all(err_resp.as_bytes()) {
+                        slog_error!("stratum", "worker_write_failed", error => e);
+                        break; // Connection dead — stop trying to write
+                    }
                     continue;
                 }
             };
@@ -533,7 +536,10 @@ impl StratumServer {
                     .unwrap_or_else(|e| e.into_inner()).as_ref()
                 {
                     let notify = template.to_notify_json();
-                    writer.write_all(notify.as_bytes()).ok();
+                    if let Err(e) = writer.write_all(notify.as_bytes()) {
+                        slog_error!("stratum", "worker_write_failed", error => e);
+                        break; // Connection dead — stop trying to write
+                    }
                 }
             }
         }

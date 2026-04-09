@@ -41,7 +41,10 @@ impl Metrics {
                 return None;
             }
         };
-        if bytes.len() != 8 { return None; }
+        if bytes.len() != 8 {
+            eprintln!("[METRICS] get_metric '{}': expected 8 bytes, got {} — possible data corruption", name, bytes.len());
+            return None;
+        }
         let mut arr = [0u8; 8];
         arr.copy_from_slice(&bytes);
         Some(u64::from_be_bytes(arr))

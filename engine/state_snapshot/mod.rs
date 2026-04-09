@@ -233,8 +233,16 @@ impl SnapshotManager {
         // Check active download FIRST — avoid writing to DB if no download is in progress
         {
             let prog = self.progress.lock().unwrap_or_else(|e| e.into_inner());
-            if prog.is_none() {
-                return Err(StorageError::Other("No active download".to_string()));
+            match prog.as_ref() {
+                None => return Err(StorageError::Other("No active download".to_string())),
+                Some(p) => {
+                    if chunk.chunk_index >= p.meta.chunk_count {
+                        return Err(StorageError::Other(format!(
+                            "chunk index {} exceeds total chunks {}",
+                            chunk.chunk_index, p.meta.chunk_count
+                        )));
+                    }
+                }
             }
         }
 
