@@ -39,7 +39,7 @@ fn main() {
         print_help(); return;
     }
     if has_flag(&args, "--version") || has_flag(&args, "-v") {
-        println!("ShadowDAG Miner v1.1.0"); return;
+        println!("ShadowDAG Miner v1.0.0"); return;
     }
 
     if let Err(e) = run_miner(&args) {
@@ -519,7 +519,7 @@ fn extract_json_str_array(json: &str, key: &str) -> Option<Vec<String>> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn print_help() {
-    println!("ShadowDAG Miner v1.1.0");
+    println!("ShadowDAG Miner v1.0.0");
     println!();
     println!("USAGE:");
     println!("  shadowdag-miner [OPTIONS]");
