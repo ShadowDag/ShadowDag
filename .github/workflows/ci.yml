@@ -20,14 +20,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
 
-  test:
-    name: Tests
+  test-lib:
+    name: Unit Tests (lib + bins)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --lib --bins
+
+  test-integration:
+    name: Integration Tests (tests/suite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --test shadowdag
+
+  test-vm:
+    name: VM Contract Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --lib -- execution_env v1_spec contract_e2e receipt_index multi_node soak chaos invariant_checker observability
 
   clippy:
     name: Clippy
@@ -39,3 +57,13 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
+
+  shadowasm-check:
+    name: shadowasm Build Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bin shadowasm
+      - run: echo "PUSH1 42\nSTOP" > /tmp/test.sasm && ./target/release/shadowasm build /tmp/test.sasm --check
