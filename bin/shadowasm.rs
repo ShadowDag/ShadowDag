@@ -30,6 +30,7 @@ fn main() {
         "info"        => cmd_info(&args),
         "test"        => cmd_test(&args),
         "trace"       => cmd_trace(&args),
+        "script"      => cmd_script(&args),
         "help" | "--help" | "-h" => print_help(),
         _ => { eprintln!("Unknown command: {}", command); print_help(); process::exit(1); }
     }
@@ -398,6 +399,139 @@ fn parse_abi_from_source(source: &str, name: &str) -> ContractAbi {
     abi
 }
 
+fn cmd_script(args: &[String]) {
+    let source_path = match args.get(2) {
+        Some(p) => p,
+        None => { eprintln!("Usage: shadowasm script <source.sasm> [--network <name>] [--broadcast]"); process::exit(1); }
+    };
+
+    let mut network = "local".to_string();
+    let mut broadcast = false;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--network" => { network = args.get(i+1).cloned().unwrap_or(network); i += 2; }
+            "--broadcast" => { broadcast = true; i += 1; }
+            _ => i += 1,
+        }
+    }
+
+    let source = match fs::read_to_string(source_path) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("Failed to read {}: {}", source_path, e); process::exit(1); }
+    };
+
+    // Parse script actions from source
+    let actions = parse_script_actions(&source);
+    if actions.is_empty() {
+        println!("No script actions found. Use ;; @deploy and ;; @call annotations.");
+        return;
+    }
+
+    println!("Running script {} on {}...", source_path, network);
+    if broadcast {
+        println!("  Mode: BROADCAST (changes will be submitted to network)");
+    } else {
+        println!("  Mode: DRY-RUN (local execution only)");
+    }
+
+    use shadowdag::runtime::vm::testing::script_runner::*;
+    
+
+    let mut runner = ScriptRunner::new(&network, "script_deployer");
+    runner.fund_deployer(1_000_000_000_000);
+
+    let results = runner.execute(&actions);
+    runner.print_summary();
+
+    // Save manifest
+    let manifest_path = source_path.replace(".sasm", ".deployment.json");
+    if let Ok(json) = runner.manifest().to_json() {
+        if let Err(e) = fs::write(&manifest_path, json) {
+            eprintln!("Failed to write manifest: {}", e);
+        } else {
+            println!("\n  Manifest saved: {}", manifest_path);
+        }
+    }
+
+    let failed = results.iter().any(|r| !r.success);
+    if failed { process::exit(1); }
+}
+
+fn parse_script_actions(source: &str) -> Vec<shadowdag::runtime::vm::testing::script_runner::ScriptAction> {
+    use shadowdag::runtime::vm::testing::script_runner::ScriptAction;
+    use shadowdag::runtime::vm::contracts::contract_abi::ContractAbi;
+    use shadowdag::runtime::vm::core::assembler::Assembler;
+
+    let mut actions = Vec::new();
+    let mut current_deploy_name: Option<String> = None;
+    let mut current_source = String::new();
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+
+        if let Some(rest) = trimmed.strip_prefix(";; @deploy ") {
+            // Flush previous deploy
+            if let Some(ref name) = current_deploy_name {
+                if let Ok(bytecode) = Assembler::assemble(&current_source) {
+                    actions.push(ScriptAction::Deploy {
+                        name: name.clone(),
+                        bytecode,
+                        value: 0,
+                        gas_limit: 10_000_000,
+                        abi: ContractAbi::new(name),
+                    });
+                }
+                current_source.clear();
+            }
+            current_deploy_name = Some(rest.trim().to_string());
+        } else if let Some(rest) = trimmed.strip_prefix(";; @call ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if let Some(contract_name) = parts.first() {
+                let calldata = parts.get(1)
+                    .and_then(|h| hex::decode(h).ok())
+                    .unwrap_or_default();
+                actions.push(ScriptAction::Call {
+                    contract_name: contract_name.to_string(),
+                    calldata,
+                    value: 0,
+                    gas_limit: 10_000_000,
+                });
+            }
+        } else if let Some(rest) = trimmed.strip_prefix(";; @fund ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Ok(amount) = parts[1].parse::<u64>() {
+                    actions.push(ScriptAction::Fund {
+                        address: parts[0].to_string(),
+                        amount,
+                    });
+                }
+            }
+        } else if let Some(rest) = trimmed.strip_prefix(";; @log ") {
+            actions.push(ScriptAction::Log { message: rest.to_string() });
+        } else if current_deploy_name.is_some() && !trimmed.starts_with(";;") {
+            current_source.push_str(line);
+            current_source.push('\n');
+        }
+    }
+
+    // Flush last deploy
+    if let Some(ref name) = current_deploy_name {
+        if let Ok(bytecode) = Assembler::assemble(&current_source) {
+            actions.push(ScriptAction::Deploy {
+                name: name.clone(),
+                bytecode,
+                value: 0,
+                gas_limit: 10_000_000,
+                abi: ContractAbi::new(name),
+            });
+        }
+    }
+
+    actions
+}
+
 fn print_help() {
     println!("shadowasm -- ShadowVM Assembler & Build Tool");
     println!();
@@ -408,6 +542,7 @@ fn print_help() {
     println!("  shadowasm info <package.json>");
     println!("  shadowasm test <source.sasm>");
     println!("  shadowasm trace <source.sasm|bytecode_hex> [calldata_hex]");
+    println!("  shadowasm script <source.sasm> [--network <name>] [--broadcast]");
     println!("  shadowasm help");
     println!();
     println!("ABI Annotations (in .sasm source comments):");
@@ -417,7 +552,14 @@ fn print_help() {
     println!("Test Annotations (in .sasm source comments):");
     println!("  ;; @test <name> [calldata_hex] [expect:revert] [gas:<max>]");
     println!();
+    println!("Script Annotations (in .sasm deployment scripts):");
+    println!("  ;; @deploy <ContractName>    -- Deploy the following assembly as a contract");
+    println!("  ;; @call <ContractName> [hex] -- Call a deployed contract with optional calldata");
+    println!("  ;; @fund <address> <amount>  -- Fund an address with balance");
+    println!("  ;; @log <message>            -- Print a log message during script execution");
+    println!();
     println!("Build output:");
-    println!("  <name>.pkg.json       -- Contract package (bytecode + ABI + hashes)");
-    println!("  <name>.manifest.json  -- Build manifest (compiler + source hashes)");
+    println!("  <name>.pkg.json             -- Contract package (bytecode + ABI + hashes)");
+    println!("  <name>.manifest.json        -- Build manifest (compiler + source hashes)");
+    println!("  <name>.deployment.json      -- Deployment manifest (addresses + network info)");
 }
