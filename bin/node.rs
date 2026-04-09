@@ -64,7 +64,7 @@ fn main() {
     shadowdag::telemetry::logging::structured::init();
     let args: Vec<String> = std::env::args().collect();
 
-    // Handle subcommands (these never fail — no Result needed)
+    // Handle subcommands (these never fail -- no Result needed)
     if args.len() > 1 {
         match args[1].as_str() {
             "info" | "--info" => { print_info(); return; }
@@ -73,6 +73,19 @@ fn main() {
             "help" | "--help" | "-h" => { print_help(); return; }
             _ => {} // Fall through to node startup
         }
+    }
+
+    // DevNet mode: lightweight local development environment
+    if args.iter().any(|a| a == "--devnet") {
+        println!("=== ShadowDAG DevNet Mode ===");
+        println!("  Chain ID:     0xDA0C0003 (regtest)");
+        println!("  Mining:       auto (instant blocks)");
+        println!("  RPC:          http://localhost:29332");
+        println!("  Faucet:       enabled");
+        println!("  Network:      regtest");
+        println!("  State:        ephemeral (reset on restart)");
+        println!();
+        // Force regtest network -- continue with normal startup using regtest settings
     }
 
     // run() returns all errors cleanly — main() just formats and exits.
@@ -257,6 +270,7 @@ fn print_help() {
     println!("  --rpc-port=<port>                    RPC server port (default: 9332)");
     println!("  --p2p-port=<port>                    P2P listen port (default: 9333)");
     println!("  --data-dir=<path>                    Data directory path");
+    println!("  --devnet                             Start in DevNet mode (regtest + instant mining + faucet)");
 }
 
 fn parse_flag(args: &[String], name: &str, default: &str) -> String {

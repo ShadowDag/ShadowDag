@@ -18,6 +18,12 @@ pub struct DeploymentManifest {
     pub contracts: BTreeMap<String, DeployedContract>,
     /// Manifest format version
     pub version: u8,
+    /// Chain ID for this network deployment
+    pub chain_id: u32,
+    /// RPC URL for this network
+    pub rpc_url: String,
+    /// Migration version (incremented on each deployment run)
+    pub migration_version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,7 +54,23 @@ impl DeploymentManifest {
             network: network.to_string(),
             contracts: BTreeMap::new(),
             version: 1,
+            chain_id: match network {
+                "mainnet" => 0xDA0C_0001,
+                "testnet" => 0xDA0C_0002,
+                "regtest" | "local" => 0xDA0C_0003,
+                _ => 0,
+            },
+            rpc_url: match network {
+                "mainnet" => "http://localhost:9332".into(),
+                "testnet" => "http://localhost:19332".into(),
+                _ => "http://localhost:29332".into(),
+            },
+            migration_version: 0,
         }
+    }
+
+    pub fn increment_migration(&mut self) {
+        self.migration_version += 1;
     }
 
     pub fn add_deployment(&mut self, contract: DeployedContract) {
@@ -89,6 +111,10 @@ mod tests {
     #[test]
     fn manifest_create_and_query() {
         let mut m = DeploymentManifest::new("testnet");
+        assert_eq!(m.chain_id, 0xDA0C_0002);
+        assert_eq!(m.rpc_url, "http://localhost:19332");
+        assert_eq!(m.migration_version, 0);
+
         m.add_deployment(DeployedContract {
             name: "MyToken".into(),
             address: "SD1c_abc123".into(),
@@ -104,6 +130,30 @@ mod tests {
         assert!(m.is_deployed("MyToken"));
         assert_eq!(m.get_address("MyToken"), Some("SD1c_abc123"));
         assert!(!m.is_deployed("Other"));
+    }
+
+    #[test]
+    fn manifest_chain_ids() {
+        let mainnet = DeploymentManifest::new("mainnet");
+        assert_eq!(mainnet.chain_id, 0xDA0C_0001);
+        assert_eq!(mainnet.rpc_url, "http://localhost:9332");
+
+        let local = DeploymentManifest::new("local");
+        assert_eq!(local.chain_id, 0xDA0C_0003);
+        assert_eq!(local.rpc_url, "http://localhost:29332");
+
+        let regtest = DeploymentManifest::new("regtest");
+        assert_eq!(regtest.chain_id, 0xDA0C_0003);
+    }
+
+    #[test]
+    fn manifest_increment_migration() {
+        let mut m = DeploymentManifest::new("local");
+        assert_eq!(m.migration_version, 0);
+        m.increment_migration();
+        assert_eq!(m.migration_version, 1);
+        m.increment_migration();
+        assert_eq!(m.migration_version, 2);
     }
 
     #[test]
@@ -125,5 +175,8 @@ mod tests {
         let loaded = DeploymentManifest::from_json(&json).unwrap();
         assert_eq!(loaded.network, "mainnet");
         assert_eq!(loaded.contracts.len(), 1);
+        assert_eq!(loaded.chain_id, 0xDA0C_0001);
+        assert_eq!(loaded.rpc_url, "http://localhost:9332");
+        assert_eq!(loaded.migration_version, 0);
     }
 }
