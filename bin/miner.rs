@@ -56,11 +56,11 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         Ok(None) => {
             eprintln!("ERROR: --address is required. Mining rewards need a destination.");
             eprintln!("Usage: shadowdag-miner --address=SD1your_address_here");
-            std::process::exit(1);
+            return Err(NodeError::Init("--address is required".into()));
         }
         Err(msg) => {
             eprintln!("Error: {}", msg);
-            std::process::exit(1);
+            return Err(NodeError::Init(msg));
         }
     };
     let network_str = parse_flag(args, "--network", "mainnet");
@@ -93,7 +93,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
     }
 
     println!("╔══════════════════════════════════════════════╗");
-    println!("║     S H A D O W D A G  —  Miner v1.1         ║");
+    println!("║     S H A D O W D A G  —  Miner v1.0.0       ║");
     println!("║     Multi-Threaded ShadowHash Mining           ║");
     println!("╚══════════════════════════════════════════════╝");
     slog_info!("miner", "config",

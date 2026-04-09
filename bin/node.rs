@@ -242,7 +242,13 @@ fn print_info() {
 }
 
 fn print_genesis(args: &[String]) {
-    let network = parse_flag(args, "--network", "mainnet").unwrap_or_else(|_| "mainnet".into());
+    let network = match parse_flag(args, "--network", "mainnet") {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return;
+        }
+    };
     let mode: NetworkMode = match network.parse() {
         Ok(m)  => m,
         Err(_) => {

@@ -6,9 +6,12 @@
 // shadowdag-loadtest — Transaction load testing tool (like Kaspa Rothschild)
 //
 // Generates high-volume transactions to stress-test the network.
+// Default mode sends structurally valid transfer TXs (acceptance testing).
+// Use --invalid for deliberately invalid TXs (rejection testing).
 //
 // Usage:
-//   shadowdag-loadtest --tps=1000            # Target 1000 TPS
+//   shadowdag-loadtest --tps=1000            # Target 1000 TPS (valid TXs)
+//   shadowdag-loadtest --tps=1000 --invalid  # Target 1000 TPS (invalid TXs)
 //   shadowdag-loadtest --duration=60         # Run for 60 seconds
 //   shadowdag-loadtest --wallets=100         # Use 100 wallets
 //   shadowdag-loadtest --rpc=127.0.0.1:9332  # Connect to node
@@ -18,7 +21,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::time::{Instant, Duration, SystemTime, UNIX_EPOCH};
 use std::sync::atomic::{AtomicU64, Ordering};
-use shadowdag::domain::transaction::transaction::{Transaction, TxInput, TxOutput};
+use shadowdag::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
 use shadowdag::domain::transaction::tx_builder::generate_keypair;
 use shadowdag::errors::NetworkError;
 use shadowdag::{slog_info, slog_warn, slog_fatal};
@@ -38,6 +41,7 @@ fn main() {
     let num_wallets: usize = parse_flag(&args, "--wallets", "10").parse().unwrap_or(10).max(1);
     let rpc_addr = parse_flag(&args, "--rpc", "127.0.0.1:9332");
     let rpc_token = parse_flag(&args, "--rpc-token", "");
+    let use_invalid = has_flag(&args, "--invalid");
 
     println!("╔══════════════════════════════════════════════╗");
     println!("║  S H A D O W D A G  —  Load Tester            ║");
@@ -48,7 +52,8 @@ fn main() {
         target_tps => target_tps,
         duration_sec => duration_sec,
         wallets => num_wallets,
-        rpc => &rpc_addr);
+        rpc => &rpc_addr,
+        mode => if use_invalid { "invalid (rejection testing)" } else { "valid (acceptance testing)" });
 
     // Generate test wallets
     slog_info!("loadtest", "generating_wallets", count => num_wallets);
@@ -84,11 +89,19 @@ fn main() {
         let from_idx = tx_count as usize % wallets.len();
         let to_idx = (tx_count as usize + 1) % wallets.len();
 
-        let tx = generate_test_tx_invalid(
-            &wallets[from_idx].address,
-            &wallets[to_idx].address,
-            tx_count,
-        );
+        let tx = if use_invalid {
+            generate_test_tx_invalid(
+                &wallets[from_idx].address,
+                &wallets[to_idx].address,
+                tx_count,
+            )
+        } else {
+            generate_valid_transfer_tx(
+                tx_count,
+                &wallets[from_idx].address,
+                &wallets[to_idx].address,
+            )
+        };
 
         // Submit transaction to node via RPC
         match rpc_submit_tx(&rpc_addr, &tx, tx_count, &rpc_token) {
@@ -267,6 +280,55 @@ fn generate_test_tx_invalid(from: &str, to: &str, seq: u64) -> Transaction {
     }
 }
 
+/// Generate a structurally valid transfer transaction for acceptance testing.
+/// Uses proper TX structure with correctly sized signature and public key
+/// placeholders, unlike `generate_test_tx_invalid` which uses obviously
+/// invalid fields. This measures acceptance-path throughput.
+fn generate_valid_transfer_tx(n: u64, from_addr: &str, to_addr: &str) -> Transaction {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut h = Sha256::new();
+    h.update(b"loadtest_valid_tx");
+    h.update(from_addr.as_bytes());
+    h.update(to_addr.as_bytes());
+    h.update(n.to_le_bytes());
+    h.update(ts.to_le_bytes());
+    let hash = hex::encode(h.finalize());
+
+    Transaction {
+        hash,
+        inputs: vec![TxInput {
+            txid: format!("prev_{:016x}", n),
+            index: 0,
+            owner: from_addr.to_string(),
+            signature: hex::encode(vec![0u8; 64]), // placeholder 64-byte sig
+            pub_key: hex::encode(vec![0u8; 32]),   // placeholder 32-byte pubkey
+            key_image: None,
+            ring_members: None,
+        }],
+        outputs: vec![TxOutput {
+            address: to_addr.to_string(),
+            amount: 1000,
+            commitment: None,
+            range_proof: None,
+            ephemeral_pubkey: None,
+        }],
+        fee: 100,
+        timestamp: ts,
+        is_coinbase: false,
+        tx_type: TxType::Transfer,
+        payload_hash: None,
+        gas_limit: None,
+        deploy_code: None,
+        calldata: None,
+        contract_address: None,
+        vm_version: None,
+    }
+}
+
 fn parse_flag(args: &[String], name: &str, default: &str) -> String {
     parse_flag_opt(args, name).unwrap_or_else(|| default.to_string())
 }
@@ -300,6 +362,10 @@ fn has_flag(args: &[String], name: &str) -> bool {
 fn print_help() {
     println!("ShadowDAG Load Tester v1.0.0");
     println!();
+    println!("Generates high-volume transactions to stress-test the network.");
+    println!("By default, generates structurally valid transfer transactions");
+    println!("(acceptance-path testing). Use --invalid for rejection-path testing.");
+    println!();
     println!("USAGE:");
     println!("  shadowdag-loadtest [OPTIONS]");
     println!();
@@ -309,5 +375,10 @@ fn print_help() {
     println!("  --wallets=<n>      Number of test wallets (default: 10)");
     println!("  --rpc=<addr:port>  Node RPC endpoint (default: 127.0.0.1:9332)");
     println!("  --rpc-token=<tok>  Optional RPC bearer token for authentication");
+    println!("  --invalid          Generate deliberately invalid TXs (rejection testing)");
     println!("  --help, -h         Show this help");
+    println!();
+    println!("MODES:");
+    println!("  Default            Valid transfer TXs with proper structure (acceptance throughput)");
+    println!("  --invalid          Invalid TXs with fake sig/pubkey (rejection throughput)");
 }
