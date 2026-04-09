@@ -1,7 +1,7 @@
 //! shadowasm -- ShadowVM assembler and build tool.
 //!
 //! Usage:
-//!   shadowasm build <source.sasm> [-o output.json] [--name <name>]
+//!   shadowasm build <source.sasm> [-o output.json] [--name <name>] [--check]
 //!   shadowasm disassemble <bytecode_hex>
 //!   shadowasm verify <package.json>
 //!   shadowasm info <package.json>
@@ -46,6 +46,7 @@ fn cmd_build(args: &[String]) {
     let mut output_path = source_path.replace(".sasm", ".pkg.json");
     let mut contract_name = source_path.replace(".sasm", "")
         .rsplit('/').next().unwrap_or("contract").to_string();
+    let mut check_only = false;
 
     let mut i = 3;
     while i < args.len() {
@@ -58,6 +59,7 @@ fn cmd_build(args: &[String]) {
                 contract_name = args.get(i + 1).cloned().unwrap_or(contract_name);
                 i += 2;
             }
+            "--check" => { check_only = true; i += 1; }
             _ => i += 1,
         }
     }
@@ -79,6 +81,12 @@ fn cmd_build(args: &[String]) {
     if let Err((pos, byte)) = v1_spec::validate_v1_bytecode(&bytecode) {
         eprintln!("ERROR: Non-v1 opcode 0x{:02X} at position {}", byte, pos);
         process::exit(1);
+    }
+
+    // --check: validate only, don't write output files
+    if check_only {
+        println!("  \u{2713} Build check passed ({} bytes, {} gas est.)", bytecode.len(), 32_000 + bytecode.len() as u64 * 200);
+        return;
     }
 
     // Parse ABI from comments
@@ -412,6 +420,7 @@ fn cmd_script(args: &[String]) {
         match args[i].as_str() {
             "--network" => { network = args.get(i+1).cloned().unwrap_or(network); i += 2; }
             "--broadcast" => { broadcast = true; i += 1; }
+            "--dry-run" => { broadcast = false; i += 1; } // Explicit dry-run (default behavior)
             _ => i += 1,
         }
     }
@@ -536,14 +545,18 @@ fn print_help() {
     println!("shadowasm -- ShadowVM Assembler & Build Tool");
     println!();
     println!("Usage:");
-    println!("  shadowasm build <source.sasm> [-o output.json] [--name <name>]");
+    println!("  shadowasm build <source.sasm> [-o output.json] [--name <name>] [--check]");
     println!("  shadowasm disassemble <hex_or_package.json>");
     println!("  shadowasm verify <package.json>");
     println!("  shadowasm info <package.json>");
     println!("  shadowasm test <source.sasm>");
     println!("  shadowasm trace <source.sasm|bytecode_hex> [calldata_hex]");
-    println!("  shadowasm script <source.sasm> [--network <name>] [--broadcast]");
+    println!("  shadowasm script <source.sasm> [--network <name>] [--broadcast] [--dry-run]");
     println!("  shadowasm help");
+    println!();
+    println!("Build Flags:");
+    println!("  --check              Validate only — assemble + V1 check, no output files (CI mode)");
+    println!("  --dry-run            Script dry-run — local execution only, no broadcast (default)");
     println!();
     println!("ABI Annotations (in .sasm source comments):");
     println!("  ;; @fn transfer(uint64,address):bool");

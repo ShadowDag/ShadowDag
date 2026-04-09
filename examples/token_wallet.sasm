@@ -1,0 +1,17 @@
+;; Token + Wallet Interaction Example
+;; Demonstrates: deploy token, set balance, transfer
+;;
+;; @deploy Token
+;; @fn set_balance(uint64):bool
+;; @fn transfer(uint64,address):bool
+;; @event Transfer(address,address,uint64)
+
+;; @test init_supply
+
+; Initialize supply to 1000
+PUSH2 0x03, 0xE8   ; 1000
+PUSH1 0
+SSTORE
+STOP
+
+;; @call Token

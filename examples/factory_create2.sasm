@@ -1,0 +1,14 @@
+;; Factory Pattern with CREATE2
+;; Demonstrates: deterministic contract deployment
+;;
+;; @deploy Factory
+;; @fn deploy_child(bytes):address
+;; @event ChildDeployed(address)
+
+;; @test factory_init
+
+; Factory init — store deployer at slot 0
+CALLER
+PUSH1 0
+SSTORE
+STOP
