@@ -176,15 +176,29 @@ impl NodeDB {
         })
     }
 
+    /// Read a value from the database.
+    ///
+    /// Returns None for both "key not found" AND "read error" (logged).
+    /// Callers that need to distinguish should use `get_result()` instead.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         match self.db.get(key) {
             Ok(Some(value)) => Some(value.to_vec()),
             Ok(None) => None,
             Err(e) => {
-                slog_error!("storage", "read_error", error => e);
+                slog_error!("storage", "db_read_failed_returns_none", error => e);
                 None
             }
         }
+    }
+
+    /// Read with full error propagation.
+    pub fn get_result(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        self.db.get(key)
+            .map(|v| v.map(|d| d.to_vec()))
+            .map_err(|e| {
+                slog_error!("storage", "db_read_failed", error => e);
+                StorageError::ReadFailed(e.to_string())
+            })
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<(), StorageError> {

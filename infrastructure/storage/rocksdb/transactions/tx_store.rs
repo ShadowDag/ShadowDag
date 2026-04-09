@@ -60,8 +60,9 @@ impl TxStore {
             Ok(Some(_)) => true,
             Ok(None)    => false,
             Err(e)      => {
-                slog_error!("storage", "tx_exists_read_error", hash => hash, error => e);
-                false
+                slog_error!("storage", "tx_exists_read_failed_may_be_false_negative",
+                    hash => hash, error => e);
+                false // TODO: Consider Result<bool> return type
             }
         }
     }
