@@ -13,7 +13,7 @@ use crate::domain::utxo::utxo_key::UtxoKey;
 use crate::domain::utxo::utxo_set::utxo_key;
 use crate::errors::StorageError;
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
-use crate::{slog_info, slog_error};
+use crate::{slog_info, slog_warn, slog_error};
 
 #[derive(Clone)]
 pub struct UtxoStore {
@@ -229,11 +229,16 @@ impl UtxoStore {
     pub fn count_utxos(&self) -> usize {
         let iter = self.db.iterator(IteratorMode::Start);
         let mut count = 0;
+        let mut iter_errors = 0usize;
 
         for item in iter {
             let (k, v) = match item {
                 Ok(pair) => pair,
-                Err(_) => continue,
+                Err(e) => {
+                    slog_warn!("storage", "utxo_count_iter_error", error => e);
+                    iter_errors += 1;
+                    continue;
+                }
             };
 
             if k.len() != 36 {
@@ -245,6 +250,10 @@ impl UtxoStore {
                     count += 1;
                 }
             }
+        }
+
+        if iter_errors > 0 {
+            slog_error!("storage", "utxo_count_iter_errors_total", errors => iter_errors, counted => count);
         }
 
         count

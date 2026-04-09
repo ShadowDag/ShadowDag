@@ -24,6 +24,14 @@ impl BlockIndex {
         Ok(Self { db })
     }
 
+    /// Persist a block-hash to height mapping in the index.
+    ///
+    /// Returns `Err(StorageError::WriteFailed)` if the RocksDB write fails.
+    /// The error is also logged via `slog_error` before being returned so that
+    /// callers who discard the `Result` still leave a trace in the log.
+    /// Callers in the consensus pipeline MUST propagate this error to abort
+    /// block processing; silently ignoring it would leave the height index
+    /// inconsistent with the header store.
     pub fn set_height(&self, hash: &str, height: u64) -> Result<(), StorageError> {
         self.db.put(hash, height.to_be_bytes())
             .map_err(|e| {

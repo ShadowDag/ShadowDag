@@ -37,7 +37,15 @@ impl HeaderStore {
 
     pub fn get_header(&self, hash: &str) -> Option<BlockHeader> {
         match self.db.get(hash.as_bytes()) {
-            Ok(Some(data)) => bincode::deserialize(&data).ok(),
+            Ok(Some(data)) => {
+                match bincode::deserialize(&data) {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        slog_error!("storage", "header_deserialize_failed", hash => hash, error => e);
+                        None
+                    }
+                }
+            }
             Ok(None) => None,
             Err(e) => {
                 slog_error!("storage", "header_read_failed", hash => hash, error => e);
