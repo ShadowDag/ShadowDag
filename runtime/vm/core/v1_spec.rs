@@ -136,6 +136,38 @@ pub fn is_v1_opcode(byte: u8) -> bool {
     V1_OPCODES.iter().any(|(b, _, _, _, _)| *b == byte)
 }
 
+/// Resolve a v1 mnemonic (case-insensitive) to its on-the-wire byte
+/// value. Returns `None` for any name that the v1 spec does not
+/// declare.
+///
+/// This is the SINGLE SOURCE OF TRUTH the assembler must consult
+/// when emitting a non-PUSH opcode. Hand-coded byte literals in the
+/// assembler historically drifted away from `V1_OPCODES` (e.g.
+/// `JUMPDEST` was emitted as `0x05` instead of `0x82`, `EQ` as
+/// `0x34` instead of `0x30`, …); routing every mnemonic through
+/// this function makes such drift impossible by construction.
+///
+/// Names are matched case-insensitively against the entries in
+/// `V1_OPCODES`. Aliases that the spec does NOT define (for
+/// example `BLAKE3`, `ORIGIN`, `NEQ`, `MIN`, `MAX`, `BLOCKHEIGHT`)
+/// are intentionally NOT resolved here, so the assembler will
+/// reject them with an "unknown mnemonic" error rather than emit a
+/// byte the live VM would interpret as something else.
+pub fn byte_for_mnemonic(mnemonic: &str) -> Option<u8> {
+    V1_OPCODES.iter()
+        .find(|(_, name, _, _, _)| name.eq_ignore_ascii_case(mnemonic))
+        .map(|(byte, _, _, _, _)| *byte)
+}
+
+/// Look up the gas cost for a v1 opcode mnemonic. Returns `None` for
+/// unknown names. Mostly useful for tooling and tests; the live VM
+/// uses `vm::OpCode::gas_cost()` directly.
+pub fn gas_cost_for_mnemonic(mnemonic: &str) -> Option<u64> {
+    V1_OPCODES.iter()
+        .find(|(_, name, _, _, _)| name.eq_ignore_ascii_case(mnemonic))
+        .map(|(_, _, gas, _, _)| *gas)
+}
+
 /// Validate that bytecode contains ONLY v1 opcodes.
 /// Returns Ok(()) if valid, Err with the first invalid opcode byte and position.
 pub fn validate_v1_bytecode(bytecode: &[u8]) -> Result<(), (usize, u8)> {
@@ -278,5 +310,44 @@ mod tests {
         let cost_100 = memory_expansion_cost(0, 100);
         // Quadratic: cost(100) > 100 * cost(1) due to n^2/512 term
         assert!(cost_100 > 100 * cost_1);
+    }
+
+    #[test]
+    fn byte_for_mnemonic_resolves_known_v1_opcodes() {
+        // The handful of opcodes that historically drifted in the
+        // assembler — these MUST resolve to the v1 byte values.
+        assert_eq!(byte_for_mnemonic("STOP"),     Some(0x00));
+        assert_eq!(byte_for_mnemonic("JUMPDEST"), Some(0x82));
+        assert_eq!(byte_for_mnemonic("MOD"),      Some(0x24));
+        assert_eq!(byte_for_mnemonic("EXP"),      Some(0x25));
+        assert_eq!(byte_for_mnemonic("EQ"),       Some(0x30));
+        assert_eq!(byte_for_mnemonic("LT"),       Some(0x31));
+        assert_eq!(byte_for_mnemonic("GT"),       Some(0x32));
+        assert_eq!(byte_for_mnemonic("REVERT"),   Some(0xB7));
+        assert_eq!(byte_for_mnemonic("PUSH1"),    Some(0x10));
+    }
+
+    #[test]
+    fn byte_for_mnemonic_is_case_insensitive() {
+        assert_eq!(byte_for_mnemonic("stop"),     Some(0x00));
+        assert_eq!(byte_for_mnemonic("Stop"),     Some(0x00));
+        assert_eq!(byte_for_mnemonic("jumpdest"), Some(0x82));
+    }
+
+    #[test]
+    fn byte_for_mnemonic_rejects_non_v1_names() {
+        // Names that exist in the parallel core::opcodes::OpCode enum
+        // but NOT in v1 — the assembler must refuse to emit bytes for
+        // these instead of silently mapping them to the wrong opcode.
+        assert_eq!(byte_for_mnemonic("BLAKE3"),      None);
+        assert_eq!(byte_for_mnemonic("SHA3"),        None);
+        assert_eq!(byte_for_mnemonic("ORIGIN"),      None);
+        assert_eq!(byte_for_mnemonic("BLOCKHEIGHT"), None);
+        assert_eq!(byte_for_mnemonic("CHAINID"),     None);
+        assert_eq!(byte_for_mnemonic("NEQ"),         None);
+        assert_eq!(byte_for_mnemonic("MIN"),         None);
+        assert_eq!(byte_for_mnemonic("MAX"),         None);
+        assert_eq!(byte_for_mnemonic("DEBUG"),       None);
+        assert_eq!(byte_for_mnemonic("not_an_op"),   None);
     }
 }

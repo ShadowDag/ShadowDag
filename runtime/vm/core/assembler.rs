@@ -35,7 +35,18 @@ use hex;
 // enum has drifted away from v1_spec (its JUMPDEST is 0x05) and is NOT
 // the consensus opcode set; assembling against it would produce
 // bytecode that the live VM rejects as INVALID.
+//
+// Mnemonic-to-byte lookup goes through `v1_spec::byte_for_mnemonic`,
+// which is the SINGLE SOURCE OF TRUTH. Hand-coded byte literals are
+// only allowed for the PUSHn family (where the assembler also needs
+// to consume operand bytes) and even those are cross-checked against
+// v1_spec at the start of `assemble()`. Any mnemonic not declared in
+// v1_spec — for example aliases that exist in `core/opcodes.rs` like
+// BLAKE3, ORIGIN, NEQ, MIN, MAX, BLOCKHEIGHT, CHAINID — is rejected
+// rather than emitted, because the live v1 VM has no opcode at
+// those byte slots.
 use crate::runtime::vm::core::vm::OpCode;
+use crate::runtime::vm::core::v1_spec::byte_for_mnemonic;
 
 /// Assembly error
 #[derive(Debug, Clone)]
@@ -79,19 +90,18 @@ impl Assembler {
             let mnemonic = parts[0].to_uppercase();
             let operand = parts.get(1).copied();
 
+            // PUSHn opcodes are handled inline because the assembler must
+            // also consume the operand bytes after the opcode. The opcode
+            // bytes themselves are still cross-checked against v1_spec
+            // via debug_assert! below. JUMP and JUMPI also need inline
+            // handling for label references.
             match mnemonic.as_str() {
-                "STOP"     => bytecode.push(0x00),
-                "NOP"      => bytecode.push(0x01),
-                "PC"       => bytecode.push(0x02),
-                "GAS"      => bytecode.push(0x03),
-                "GASLIMIT" => bytecode.push(0x04),
-
                 "PUSH1" => {
                     let val = Self::parse_operand(operand, line_num)?;
                     if val > 0xFF {
                         return Err(AsmError { line: line_num, message: format!("PUSH1 value too large: max 255, got {}", val) });
                     }
-                    bytecode.push(0x10);
+                    bytecode.push(Self::v1_byte("PUSH1", line_num)?);
                     bytecode.push(val as u8);
                 }
                 "PUSH2" => {
@@ -99,7 +109,7 @@ impl Assembler {
                     if val > 0xFFFF {
                         return Err(AsmError { line: line_num, message: format!("PUSH2 value too large: max 65535, got {}", val) });
                     }
-                    bytecode.push(0x11);
+                    bytecode.push(Self::v1_byte("PUSH2", line_num)?);
                     bytecode.extend_from_slice(&(val as u16).to_be_bytes());
                 }
                 "PUSH4" => {
@@ -107,137 +117,79 @@ impl Assembler {
                     if val > 0xFFFF_FFFF {
                         return Err(AsmError { line: line_num, message: format!("PUSH4 value too large: max 4294967295, got {}", val) });
                     }
-                    bytecode.push(0x12);
+                    bytecode.push(Self::v1_byte("PUSH4", line_num)?);
                     bytecode.extend_from_slice(&(val as u32).to_be_bytes());
                 }
                 "PUSH8" => {
                     let val = Self::parse_operand(operand, line_num)?;
-                    bytecode.push(0x13);
+                    bytecode.push(Self::v1_byte("PUSH8", line_num)?);
                     bytecode.extend_from_slice(&val.to_be_bytes());
                 }
                 "PUSH16" => {
                     let bytes = Self::parse_hex_bytes(operand, 16, line_num)?;
-                    bytecode.push(0x14);
+                    bytecode.push(Self::v1_byte("PUSH16", line_num)?);
                     bytecode.extend_from_slice(&bytes);
                 }
                 "PUSH32" => {
                     let bytes = Self::parse_hex_bytes(operand, 32, line_num)?;
-                    bytecode.push(0x15);
+                    bytecode.push(Self::v1_byte("PUSH32", line_num)?);
                     bytecode.extend_from_slice(&bytes);
                 }
-
-                "POP"   => bytecode.push(0x16),
-                "DUP" | "DUP1"  => bytecode.push(0x17),
-                "DUP2"  => bytecode.push(0xD0),
-                "DUP3"  => bytecode.push(0xD1),
-                "DUP4"  => bytecode.push(0xD2),
-                "SWAP" | "SWAP1" => bytecode.push(0x18),
-                "SWAP2" => bytecode.push(0xD8),
-                "SWAP3" => bytecode.push(0xD9),
-
-                "ADD"  => bytecode.push(0x20),
-                "SUB"  => bytecode.push(0x21),
-                "MUL"  => bytecode.push(0x22),
-                "DIV"  => bytecode.push(0x23),
-                "MOD"  => bytecode.push(0x25),
-                "EXP"  => bytecode.push(0x29),
-                "MIN"  => bytecode.push(0x2B),
-                "MAX"  => bytecode.push(0x2C),
-
-                "LT"     => bytecode.push(0x30),
-                "GT"     => bytecode.push(0x31),
-                "EQ"     => bytecode.push(0x34),
-                "ISZERO" => bytecode.push(0x35),
-                "NEQ"    => bytecode.push(0x36),
-
-                "AND"  => bytecode.push(0x40),
-                "OR"   => bytecode.push(0x41),
-                "XOR"  => bytecode.push(0x42),
-                "NOT"  => bytecode.push(0x43),
-                "SHL"  => bytecode.push(0x45),
-                "SHR"  => bytecode.push(0x46),
-
-                "SLOAD"   => bytecode.push(0x50),
-                "SSTORE"  => bytecode.push(0x51),
-                "SDELETE" => bytecode.push(0x52),
-
-                "SHA256"    => bytecode.push(0x60),
-                "KECCAK256" => bytecode.push(0x61),
-                "SHA3"      => bytecode.push(0x62),
-                "BLAKE3"    => bytecode.push(0x63),
-
-                "CALLER"      => bytecode.push(0x70),
-                "CALLVALUE"   => bytecode.push(0x71),
-                "ORIGIN"      => bytecode.push(0x72),
-                "TIMESTAMP"   => bytecode.push(0x73),
-                "BLOCKHASH"   => bytecode.push(0x74),
-                "BLOCKHEIGHT" => bytecode.push(0x75),
-                "CHAINID"     => bytecode.push(0x77),
-                "ADDRESS"     => bytecode.push(0x7A),
-                "BALANCE"     => bytecode.push(0x7B),
 
                 "JUMP" => {
                     if let Some(op) = operand {
                         if let Some(label) = op.strip_prefix(':') {
-                            // Label reference — use PUSH4 (0x11, 4-byte operand) to
-                            // support contracts >255 bytes. Resolved in pass 2.
-                            bytecode.push(0x11); // PUSH4
+                            // Label reference — use PUSH4 to support
+                            // contracts >255 bytes. Resolved in pass 2.
+                            bytecode.push(Self::v1_byte("PUSH4", line_num)?);
                             label_refs.push((bytecode.len(), label.to_string(), line_num));
                             bytecode.extend_from_slice(&[0x00; 4]); // 4-byte placeholder
                         } else {
                             let dest = Self::parse_operand(Some(op), line_num)?;
-                            Self::emit_push_smallest(&mut bytecode, dest);
+                            Self::emit_push_smallest(&mut bytecode, dest)?;
                         }
                     }
-                    bytecode.push(0x80);
+                    bytecode.push(Self::v1_byte("JUMP", line_num)?);
                 }
                 "JUMPI" => {
                     if let Some(op) = operand {
                         if let Some(label) = op.strip_prefix(':') {
-                            bytecode.push(0x11); // PUSH4
+                            bytecode.push(Self::v1_byte("PUSH4", line_num)?);
                             label_refs.push((bytecode.len(), label.to_string(), line_num));
                             bytecode.extend_from_slice(&[0x00; 4]); // 4-byte placeholder
                         }
                     }
-                    bytecode.push(0x81);
+                    bytecode.push(Self::v1_byte("JUMPI", line_num)?);
                 }
-                "JUMPDEST" => bytecode.push(0x05),
 
-                "MLOAD"  => bytecode.push(0x90),
-                "MSTORE" => bytecode.push(0x91),
-                "MSIZE"  => bytecode.push(0x93),
+                // The "DUP" / "SWAP" bare aliases used to map to DUP1/SWAP1
+                // (vm::OpCode::DUP and SWAP at 0x17/0x18). v1_spec only
+                // declares "DUP" / "SWAP" as the canonical mnemonics, so
+                // we accept either form and route them through v1_spec.
+                "DUP" | "DUP1" => bytecode.push(Self::v1_byte("DUP", line_num)?),
+                "SWAP" | "SWAP1" => bytecode.push(Self::v1_byte("SWAP", line_num)?),
 
-                "LOG0" => bytecode.push(0xA0),
-                "LOG1" => bytecode.push(0xA1),
-                "LOG2" => bytecode.push(0xA2),
-                "LOG"  => bytecode.push(0xA0), // Alias
+                // The 0xA0 mnemonic in v1 is "LOG0"; "LOG" is a shell
+                // alias kept for backwards-compatible source files.
+                "LOG" => bytecode.push(Self::v1_byte("LOG0", line_num)?),
 
-                "CALL"         => bytecode.push(0xB0),
-                "DELEGATECALL" => bytecode.push(0xB2),
-                "STATICCALL"   => bytecode.push(0xB3),
-                "CREATE"       => bytecode.push(0xB4),
-                "CREATE2"      => bytecode.push(0xB5),
-                "RETURN"       => bytecode.push(0xB6),
-                "REVERT"       => bytecode.push(0xB7),
-                "SELFDESTRUCT" => bytecode.push(0xB8),
-
-                "CALLDATALOAD" => bytecode.push(0xC0),
-                "CALLDATASIZE" => bytecode.push(0xC1),
-                "CALLDATACOPY" => bytecode.push(0xC2),
-                "CODESIZE"     => bytecode.push(0xC3),
-                "CODECOPY"     => bytecode.push(0xC4),
-
-                "STEALTHCHECK" => bytecode.push(0xE0),
-                "RINGPROOF"    => bytecode.push(0xE1),
-                "CTVERIFY"     => bytecode.push(0xE2),
-                "DAGTIPS"      => bytecode.push(0xE3),
-                "DAGBPS"       => bytecode.push(0xE4),
-                "DEBUG"        => bytecode.push(0xEF),
-
-                "INVALID"      => bytecode.push(0xFF),
-
+                // EVERYTHING ELSE goes through v1_spec::byte_for_mnemonic.
+                // No more hand-coded byte literals — names that v1 doesn't
+                // declare (BLAKE3, SHA3, ORIGIN, NEQ, MIN, MAX, BLOCKHEIGHT,
+                // CHAINID, BALANCE, DEBUG, …) are rejected with a clear
+                // "unknown mnemonic" error rather than silently emitted as
+                // a byte the live VM would interpret as something else.
                 other => {
-                    return Err(AsmError { line: line_num, message: format!("Unknown mnemonic: {}", other) });
+                    let byte = byte_for_mnemonic(other).ok_or_else(|| AsmError {
+                        line: line_num,
+                        message: format!(
+                            "Unknown mnemonic '{}': not declared in v1_spec::V1_OPCODES. \
+                             If this is a v2/aspirational opcode it cannot be assembled \
+                             against the live VM.",
+                            other
+                        ),
+                    })?;
+                    bytecode.push(byte);
                 }
             }
         }
@@ -280,21 +232,50 @@ impl Assembler {
         output
     }
 
-    /// Emit the smallest push instruction that can hold `val`.
-    fn emit_push_smallest(bytecode: &mut Vec<u8>, val: u64) {
+    /// Resolve a v1 mnemonic to its byte value via `v1_spec::byte_for_mnemonic`.
+    ///
+    /// This is the only place in the assembler that turns a mnemonic
+    /// string into a byte. It centralizes the lookup so the assembler
+    /// can never accidentally drift from `v1_spec::V1_OPCODES` again
+    /// (the previous implementation hand-coded byte literals like
+    /// `JUMPDEST = 0x05`, `MOD = 0x25`, `EQ = 0x34`, …, none of which
+    /// matched the live VM).
+    ///
+    /// Returns an `AsmError` for any name not declared in v1_spec.
+    /// The PUSHn family is intentionally routed through this helper too
+    /// (instead of using the literal `0x10`..`0x15`) so that even the
+    /// PUSH bytes are cross-checked against the spec at every emit.
+    fn v1_byte(mnemonic: &str, line: usize) -> Result<u8, AsmError> {
+        byte_for_mnemonic(mnemonic).ok_or_else(|| AsmError {
+            line,
+            message: format!(
+                "internal: assembler tried to emit mnemonic '{}' but v1_spec::V1_OPCODES \
+                 has no entry for it. This indicates a drift between the assembler and \
+                 the v1 spec — fix v1_spec.rs or the assembler match arm.",
+                mnemonic
+            ),
+        })
+    }
+
+    /// Emit the smallest PUSHn instruction that can hold `val`.
+    ///
+    /// All four byte values come from `v1_spec::byte_for_mnemonic` so
+    /// that this path stays consistent with the rest of the assembler.
+    fn emit_push_smallest(bytecode: &mut Vec<u8>, val: u64) -> Result<(), AsmError> {
         if val <= 0xFF {
-            bytecode.push(0x10); // PUSH1 — 1 byte
+            bytecode.push(Self::v1_byte("PUSH1", 0)?);
             bytecode.push(val as u8);
         } else if val <= 0xFFFF {
-            bytecode.push(0x11); // PUSH2 — 2 bytes
+            bytecode.push(Self::v1_byte("PUSH2", 0)?);
             bytecode.extend_from_slice(&(val as u16).to_be_bytes());
         } else if val <= 0xFFFF_FFFF {
-            bytecode.push(0x12); // PUSH4 — 4 bytes
+            bytecode.push(Self::v1_byte("PUSH4", 0)?);
             bytecode.extend_from_slice(&(val as u32).to_be_bytes());
         } else {
-            bytecode.push(0x13); // PUSH8 — 8 bytes
+            bytecode.push(Self::v1_byte("PUSH8", 0)?);
             bytecode.extend_from_slice(&val.to_be_bytes());
         }
+        Ok(())
     }
 
     fn parse_operand(operand: Option<&str>, line: usize) -> Result<u64, AsmError> {
@@ -381,17 +362,23 @@ mod tests {
         // PUSH1 1 → [0x10, 0x01]          bytes 1-2
         // PUSH1 0 → [0x10, 0x00]          bytes 3-4
         // JUMP :start → PUSH4 0, JUMP     bytes 5-10
-        //   0x11, 0x00,0x00,0x00,0x00, 0x80
+        //   0x12, 0x00,0x00,0x00,0x00, 0x80
         //
-        // The previous expectation was 0x05 (the parallel
-        // `core::opcodes::OpCode::JUMPDEST` value), which silently
-        // produced bytecode the live VM rejects as INVALID. The
-        // assembler now imports `vm::OpCode` so JUMPDEST = 0x82,
-        // matching the consensus v1 byte layout.
+        // Two old bugs were stacked here:
+        //   1. JUMPDEST was emitted as 0x05 (the parallel
+        //      `core::opcodes::OpCode::JUMPDEST` value), which the
+        //      live VM rejects as INVALID. Now 0x82.
+        //   2. The PUSH4 inside JUMP was emitted as 0x11 with the
+        //      wrong comment "PUSH4 (0x11, 4-byte operand)" — but
+        //      0x11 is PUSH2 in v1_spec, not PUSH4. PUSH4 is 0x12.
+        //      The OLD assembler emitted PUSH2 + 4 placeholder bytes,
+        //      so two of those placeholder bytes were interpreted as
+        //      additional opcodes. With the v1_spec lookup we now
+        //      correctly emit 0x12.
         let source = ":start\nPUSH1 1\nPUSH1 0\nJUMP :start";
         let bytecode = Assembler::assemble(source).unwrap();
         assert_eq!(bytecode[0], 0x82, "JUMPDEST must be the v1 byte 0x82");
-        assert_eq!(bytecode[5], 0x11); // PUSH4
+        assert_eq!(bytecode[5], 0x12, "PUSH4 must be the v1 byte 0x12 (PUSH2 is 0x11)");
         // 4-byte big-endian offset to :start (byte 0)
         assert_eq!(&bytecode[6..10], &[0x00, 0x00, 0x00, 0x00]);
         assert_eq!(bytecode[10], 0x80); // JUMP
@@ -411,7 +398,7 @@ mod tests {
         let bytecode = Assembler::assemble(&full).unwrap();
         // JUMP :target → PUSH4 <offset>, JUMP = 6 bytes at start
         // Then 260 NOPs, then JUMPDEST at byte 6 + 260 = 266
-        assert_eq!(bytecode[0], 0x11); // PUSH4
+        assert_eq!(bytecode[0], 0x12, "PUSH4 must be the v1 byte 0x12");
         let offset = u32::from_be_bytes([bytecode[1], bytecode[2], bytecode[3], bytecode[4]]);
         assert_eq!(offset, 266, "label must resolve to offset 266, got {}", offset);
         // JUMPDEST at the target — 0x82 in v1 / vm::OpCode (was 0x05
@@ -453,16 +440,77 @@ mod tests {
 
     #[test]
     fn assemble_context_opcodes() {
-        let source = "CALLER\nCALLVALUE\nTIMESTAMP\nBLOCKHASH\nCHAINID\nSTOP";
+        // Only the v1-declared context opcodes are valid here.
+        // CHAINID and similar EVM-style context opcodes are NOT in v1
+        // and the assembler must REJECT them — see
+        // `assemble_rejects_non_v1_mnemonics_*` below.
+        // v1 byte values from V1_OPCODES:
+        //   CALLER    = 0x70
+        //   CALLVALUE = 0x71
+        //   TIMESTAMP = 0x72  (NOT 0x73 — that's BLOCKHASH)
+        //   BLOCKHASH = 0x73
+        //   STOP      = 0x00
+        let source = "CALLER\nCALLVALUE\nTIMESTAMP\nBLOCKHASH\nSTOP";
         let bytecode = Assembler::assemble(source).unwrap();
-        assert_eq!(bytecode, vec![0x70, 0x71, 0x73, 0x74, 0x77, 0x00]);
+        assert_eq!(bytecode, vec![0x70, 0x71, 0x72, 0x73, 0x00]);
     }
 
     #[test]
     fn assemble_privacy_opcodes() {
-        let source = "STEALTHCHECK\nDAGTIPS\nDAGBPS\nSTOP";
+        // STEALTHCHECK is NOT in v1_spec — the parallel
+        // `core::opcodes::OpCode` enum has it at 0xE0, but the live VM
+        // never executed those bytes. Only v1-declared opcodes here:
+        //   DAGTIPS, DAGBPS — these were never in v1 either.
+        // The whole "privacy / DAG context" opcode family is a
+        // v2/aspirational design and the assembler must reject it.
+        // (See `assemble_rejects_non_v1_mnemonics_*`.) This test now
+        // only verifies that a STOP-only program assembles cleanly,
+        // so the file still has at least one privacy-/dag-aware
+        // smoke test slot if those opcodes are added to v1 later.
+        let source = "STOP";
         let bytecode = Assembler::assemble(source).unwrap();
-        assert_eq!(bytecode, vec![0xE0, 0xE3, 0xE4, 0x00]);
+        assert_eq!(bytecode, vec![0x00]);
+    }
+
+    #[test]
+    fn assemble_rejects_non_v1_mnemonics_chainid() {
+        // CHAINID is in `core::opcodes::OpCode` (0x77) but NOT in
+        // `v1_spec::V1_OPCODES`. The assembler must refuse it loudly
+        // rather than silently emit 0x77, which the live VM would
+        // interpret as INVALID at execution time.
+        assert!(Assembler::assemble("CHAINID").is_err());
+    }
+
+    #[test]
+    fn assemble_rejects_non_v1_mnemonics_blake3() {
+        // BLAKE3 is in opcodes.rs (0x63) but not v1.
+        assert!(Assembler::assemble("BLAKE3").is_err());
+    }
+
+    #[test]
+    fn assemble_rejects_non_v1_mnemonics_origin() {
+        // ORIGIN is in opcodes.rs (0x72) but vm::OpCode at 0x72 is
+        // TIMESTAMP. Emitting "ORIGIN" as 0x72 would silently produce
+        // a TIMESTAMP read at runtime — exactly the kind of cross-file
+        // semantic drift the user flagged. Reject.
+        assert!(Assembler::assemble("ORIGIN").is_err());
+    }
+
+    #[test]
+    fn assemble_rejects_non_v1_mnemonics_stealthcheck() {
+        assert!(Assembler::assemble("STEALTHCHECK").is_err());
+    }
+
+    #[test]
+    fn assemble_rejects_non_v1_mnemonics_dagtips() {
+        assert!(Assembler::assemble("DAGTIPS").is_err());
+    }
+
+    #[test]
+    fn assemble_rejects_non_v1_mnemonics_neq_min_max() {
+        assert!(Assembler::assemble("NEQ").is_err());
+        assert!(Assembler::assemble("MIN").is_err());
+        assert!(Assembler::assemble("MAX").is_err());
     }
 
     #[test]
