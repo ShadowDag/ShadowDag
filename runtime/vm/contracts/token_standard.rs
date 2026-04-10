@@ -246,7 +246,17 @@ impl SRC20Token {
         Ok(())
     }
 
-    /// Burn tokens (from caller's own balance)
+    /// Burn tokens (from caller's own balance).
+    ///
+    /// Fails closed on supply-underflow: the old implementation used
+    /// `self.info.total_supply.saturating_sub(amount)`, which silently
+    /// clipped `total_supply` to `0` if the aggregate balance had
+    /// drifted below the reported supply for any reason. That turned
+    /// an accounting invariant break — i.e. "this token's books don't
+    /// balance" — into a normal successful burn, hiding the bug from
+    /// everyone. The new code uses `checked_sub` and returns an
+    /// explicit `ContractError("supply invariant broken …")` so the
+    /// caller sees the corruption instead of burning over it.
     pub fn burn(&mut self, caller: &str, amount: u64) -> Result<(), VmError> {
         if !self.info.burnable {
             return Err(VmError::ContractError("Token is not burnable".to_string()));
@@ -257,8 +267,23 @@ impl SRC20Token {
             return Err(VmError::ContractError(format!("Cannot burn {} — only has {}", amount, balance)));
         }
 
+        // Checked supply subtraction. If this underflows, the token's
+        // internal bookkeeping is broken (individual balances add up to
+        // MORE than the recorded total_supply), which is a bug the
+        // token contract should surface, not silently swallow.
+        let new_supply = self.info.total_supply.checked_sub(amount).ok_or_else(|| {
+            VmError::ContractError(format!(
+                "supply invariant broken: cannot burn {} because total_supply \
+                 ({}) is smaller than the caller's balance ({}). This indicates \
+                 the internal accounting has drifted and the token is in an \
+                 inconsistent state — the burn is refused so the corruption \
+                 is not compounded.",
+                amount, self.info.total_supply, balance
+            ))
+        })?;
+
         self.balances.insert(caller.to_string(), balance - amount);
-        self.info.total_supply = self.info.total_supply.saturating_sub(amount);
+        self.info.total_supply = new_supply;
 
         self.events.push(TransferEvent {
             from:   caller.to_string(),
@@ -287,10 +312,35 @@ impl SRC20Token {
         Ok(())
     }
 
-    /// Transfer ownership
+    /// Transfer ownership to `new_owner`.
+    ///
+    /// Refuses an empty `new_owner` string — a zero-length owner
+    /// would permanently break every future owner check because
+    /// `caller != self.info.owner` can never be satisfied by a
+    /// non-empty caller, yet `self.info.owner == ""` also makes
+    /// `caller == self.info.owner` accidentally true for callers
+    /// who themselves happen to pass an empty string. The result
+    /// is a token whose `mint`/`pause`/`burn` authorization model
+    /// is in an unresolvable state. Reject the transition up front.
+    ///
+    /// Also refuses transferring ownership to the current owner,
+    /// which is a no-op that should surface as an error so the
+    /// caller knows the transaction accomplished nothing.
     pub fn transfer_ownership(&mut self, caller: &str, new_owner: &str) -> Result<(), VmError> {
         if caller != self.info.owner {
             return Err(VmError::ContractError("Only owner can transfer ownership".to_string()));
+        }
+        if new_owner.is_empty() {
+            return Err(VmError::ContractError(
+                "Cannot transfer ownership to an empty address — owner checks \
+                 would become ambiguous and the token's authorization model \
+                 would be unresolvable".to_string(),
+            ));
+        }
+        if new_owner == self.info.owner {
+            return Err(VmError::ContractError(
+                "new_owner is identical to current owner — refusing no-op transfer".to_string(),
+            ));
         }
         self.info.owner = new_owner.to_string();
         Ok(())
@@ -421,12 +471,69 @@ mod tests {
     }
 
     #[test]
+    fn burn_fails_closed_when_supply_invariant_broken() {
+        // Regression for the saturating_sub masking bug. Stage an
+        // artificial invariant break by driving total_supply below
+        // the caller's balance (would normally never happen, but
+        // does indicate the token's books are corrupted). The old
+        // burn would silently saturate total_supply to 0 and hide
+        // the corruption; the new burn must refuse with an explicit
+        // "supply invariant broken" error.
+        let mut token = create_token();
+        // Force the invariant break: balance is 1_000_000 but we
+        // pretend the recorded supply is only 500.
+        token.info.total_supply = 500;
+
+        // Burn 1000: passes the balance check (balance >= 1000) but
+        // would underflow total_supply (500 - 1000). Old code would
+        // set total_supply = 0 silently; new code must Err.
+        let result = token.burn("SD1owner", 1000);
+        assert!(result.is_err(), "burn must refuse when supply < amount");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("supply invariant broken"),
+            "error must describe the invariant break, got: {}",
+            msg
+        );
+        // Crucially, the token state must be UNCHANGED by the failed
+        // burn — no partial debit, no partial supply change.
+        assert_eq!(token.balance_of("SD1owner"), 1_000_000,
+            "failed burn must not debit the caller");
+        assert_eq!(token.info.total_supply, 500,
+            "failed burn must not mutate total_supply");
+    }
+
+    #[test]
     fn pause_blocks_transfers() {
         let mut token = create_token();
         token.pause("SD1owner").unwrap();
         assert!(token.transfer("SD1owner", "SD1alice", 100).is_err());
         token.unpause("SD1owner").unwrap();
         token.transfer("SD1owner", "SD1alice", 100).unwrap();
+    }
+
+    #[test]
+    fn transfer_ownership_rejects_empty_new_owner() {
+        // Regression for the "owner = empty string" bug. An empty
+        // new_owner makes every future caller == owner check
+        // ambiguous, so the transition must be refused.
+        let mut token = create_token();
+        let result = token.transfer_ownership("SD1owner", "");
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("empty"));
+        // State must be unchanged.
+        assert_eq!(token.info.owner, "SD1owner");
+    }
+
+    #[test]
+    fn transfer_ownership_rejects_same_owner() {
+        // No-op transfer is also refused so the caller knows
+        // nothing happened.
+        let mut token = create_token();
+        let result = token.transfer_ownership("SD1owner", "SD1owner");
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("identical"));
+        assert_eq!(token.info.owner, "SD1owner");
     }
 
     #[test]
