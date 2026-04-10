@@ -49,7 +49,8 @@ use crate::runtime::vm::core::vm::{
 use crate::runtime::vm::gas::gas_meter::{GasMeter, GasResult};
 use crate::runtime::vm::contracts::contract_deployer::ContractDeployer;
 use crate::runtime::vm::precompiles::precompile_registry::PrecompileRegistry;
-use crate::runtime::vm::contracts::contract_storage::ContractStorage;
+use crate::runtime::vm::contracts::contract_storage::{ContractStorage, PendingBatch};
+use crate::slog_error;
 
 /// Maximum call depth for nested calls
 pub const MAX_CALL_DEPTH: usize = 1024;
@@ -118,48 +119,77 @@ impl ExecutionEnvironment {
         }
     }
 
-    /// Persist all state changes to ContractStorage (RocksDB).
-    /// Called after top-level execution succeeds.
+    /// Persist all state changes to ContractStorage atomically.
+    ///
+    /// The previous implementation issued individual `set_state(...)` calls
+    /// in a loop — one RocksDB put per account, per code blob, per storage
+    /// slot. If any single put failed, the earlier writes had already
+    /// landed on disk, leaving the contract store in a partial state
+    /// (e.g. account metadata updated but storage slots half-written).
+    /// `Executor::deploy()` and `Executor::call()` both rely on this
+    /// method for their post-success persistence, so the bug opened a
+    /// real window for corrupted on-disk contract state.
+    ///
+    /// The new implementation buffers every write into a `PendingBatch`
+    /// and commits it in a single RocksDB `WriteBatch` via
+    /// `ContractStorage::commit_batch`. RocksDB guarantees WriteBatch is
+    /// atomic — either every put lands or none of them do — so partial
+    /// persistence is no longer possible.
     pub fn persist_to_storage(&self, storage: &ContractStorage) -> Result<(), VmError> {
+        let mut batch = PendingBatch::new();
+
         for (addr, account) in self.state.iter_accounts() {
             // Persist account metadata (balance|nonce|code_hash)
             let meta = format!("{}|{}|{}", account.balance, account.nonce, account.code_hash);
-            storage.set_state(&format!("account:{}", addr), &meta)
-                .map_err(VmError::Storage)?;
+            batch.put(format!("account:{}", addr), meta);
+
             // Persist code if contract
             if !account.code.is_empty() {
-                storage.set_state(&format!("code:{}", addr), &hex::encode(&account.code))
-                    .map_err(VmError::Storage)?;
+                batch.put(format!("code:{}", addr), hex::encode(&account.code));
             }
         }
+
         // Persist storage slots
         for (addr, slots) in self.state.iter_storage() {
             for (key, value) in slots {
-                storage.set_state(&format!("{}:{}", addr, key), value)
-                    .map_err(VmError::Storage)?;
+                batch.put(format!("{}:{}", addr, key), value.clone());
             }
         }
-        Ok(())
+
+        storage.commit_batch(&mut batch)
     }
 
-    /// Persist state changes AND build undo data for rollback.
+    /// Persist state changes AND build undo data for rollback, atomically.
     ///
     /// Captures the previous value of every key touched during this block
     /// before overwriting it, so that `ContractStorage::rollback_block()`
     /// can reverse the mutations during a reorg.
     ///
-    /// Returns the undo data; the caller is responsible for saving it
-    /// (which this method also does via `storage.save_undo()`).
+    /// Atomicity guarantees (all-or-nothing, enforced by a single RocksDB
+    /// `WriteBatch`):
+    ///
+    /// - every account metadata update,
+    /// - every contract code update,
+    /// - every storage slot update,
+    /// - and the `contract:undo:{block_hash}` record itself,
+    ///
+    /// commit together. The previous implementation called `set_state`
+    /// once per key and then `save_undo` as a separate put, so a crash
+    /// or write failure mid-loop could land account metadata without
+    /// matching storage slots, or land all state without the
+    /// corresponding undo record (making a later reorg silently fail).
     pub fn persist_with_undo(
         &self,
         storage: &ContractStorage,
         block_hash: &str,
     ) -> Result<crate::runtime::vm::contracts::contract_storage::ContractUndoData, VmError> {
         use crate::runtime::vm::contracts::contract_storage::ContractUndoData;
+        use rocksdb::WriteBatch;
 
         let mut modified_keys = Vec::new();
         let mut created_accounts = Vec::new();
         let mut destroyed_accounts = Vec::new();
+        let mut wb = WriteBatch::default();
 
         // Capture undo data BEFORE writing — accounts
         for (addr, account) in self.state.iter_accounts() {
@@ -170,18 +200,20 @@ impl ExecutionEnvironment {
                 created_accounts.push(addr.clone());
             }
 
-            // Save new account state
+            // Buffer new account state
             let meta = format!("{}|{}|{}", account.balance, account.nonce, account.code_hash);
             modified_keys.push((account_key.clone(), old_val));
-            storage.set_state(&account_key, &meta).map_err(VmError::Storage)?;
+            let db_key = format!("contract:{}", account_key);
+            wb.put(db_key.as_bytes(), meta.as_bytes());
 
-            // Save code
+            // Buffer code
             if !account.code.is_empty() {
                 let code_key = format!("code:{}", addr);
                 let old_code = storage.get_state(&code_key);
                 modified_keys.push((code_key.clone(), old_code));
-                storage.set_state(&code_key, &hex::encode(&account.code))
-                    .map_err(VmError::Storage)?;
+                let db_key = format!("contract:{}", code_key);
+                let code_hex = hex::encode(&account.code);
+                wb.put(db_key.as_bytes(), code_hex.as_bytes());
             }
         }
 
@@ -191,7 +223,8 @@ impl ExecutionEnvironment {
                 let full_key = format!("{}:{}", addr, key);
                 let old_val = storage.get_state(&full_key);
                 modified_keys.push((full_key.clone(), old_val));
-                storage.set_state(&full_key, value).map_err(VmError::Storage)?;
+                let db_key = format!("contract:{}", full_key);
+                wb.put(db_key.as_bytes(), value.as_bytes());
             }
         }
 
@@ -211,35 +244,121 @@ impl ExecutionEnvironment {
             state_root: None,   // Set by caller after state root computation
         };
 
-        // Save undo data atomically alongside the state changes
-        storage.save_undo(block_hash, &undo).map_err(VmError::Storage)?;
+        // Serialize the undo record and include it in the SAME WriteBatch
+        // so state + undo either both land or both don't. Mirrors the
+        // layout used by `ContractStorage::save_undo` (prefix
+        // `contract:undo:`, bincode payload).
+        let undo_key = format!("contract:undo:{}", block_hash);
+        let undo_bytes = bincode::serialize(&undo).map_err(|e| {
+            VmError::Other(format!("failed to serialize contract undo data: {}", e))
+        })?;
+        wb.put(undo_key.as_bytes(), &undo_bytes);
+
+        // Commit state + undo atomically via the shared DB handle.
+        storage.shared_db().write(wb).map_err(|e| {
+            VmError::Other(format!(
+                "persist_with_undo atomic commit failed for block {}: {}",
+                block_hash, e
+            ))
+        })?;
 
         Ok(undo)
     }
 
-    /// Load a contract's state from ContractStorage into the in-memory StateManager.
-    pub fn load_contract_from_storage(&mut self, storage: &ContractStorage, addr: &str) {
-        // Load account metadata
+    /// Load a contract's state from ContractStorage into the in-memory
+    /// StateManager, fail-closed on corruption.
+    ///
+    /// Returns `Ok(())` on success AND on genuine absence (no state on
+    /// disk for `addr`). Returns `Err(VmError::ContractError)` only when
+    /// the on-disk state is present but corrupt:
+    ///
+    ///   - account metadata is not in the expected `balance|nonce|code_hash`
+    ///     layout (wrong field count),
+    ///   - balance or nonce cannot be parsed as `u64`,
+    ///   - the stored code blob is not valid hex,
+    ///   - `StateManager::set_balance` / `set_code` / `increment_nonce`
+    ///     returns an internal error.
+    ///
+    /// The previous implementation collapsed every one of those cases
+    /// into a silent no-op via `unwrap_or(0)` and `.ok()`, which meant a
+    /// single corrupt account could load into the VM as a zero-balance
+    /// account and quietly reset state. Callers that must continue past
+    /// a corruption error (for example best-effort block pre-loaders)
+    /// can still do so by matching on the returned `Result` and logging;
+    /// the error is no longer invisible.
+    pub fn load_contract_from_storage(
+        &mut self,
+        storage: &ContractStorage,
+        addr: &str,
+    ) -> Result<(), VmError> {
+        // Load account metadata (if present).
         if let Some(meta) = storage.get_state(&format!("account:{}", addr)) {
             let parts: Vec<&str> = meta.splitn(3, '|').collect();
-            if parts.len() == 3 {
-                let balance: u64 = parts[0].parse().unwrap_or(0);
-                let nonce: u64 = parts[1].parse().unwrap_or(0);
-                // Create account in StateManager
-                self.state.get_or_create_account(addr);
-                self.state.set_balance(addr, balance).ok();
-                // Set nonce by incrementing
-                for _ in 0..nonce {
-                    self.state.increment_nonce(addr).ok();
-                }
+            if parts.len() != 3 {
+                slog_error!("vm", "load_contract_account_meta_malformed",
+                    contract => addr, field_count => parts.len(), raw => &meta);
+                return Err(VmError::ContractError(format!(
+                    "corrupt account metadata for '{}': expected 3 pipe-separated fields, got {}",
+                    addr, parts.len()
+                )));
+            }
+
+            let balance: u64 = parts[0].parse().map_err(|e| {
+                slog_error!("vm", "load_contract_balance_parse_failed",
+                    contract => addr, raw => parts[0], error => &format!("{}", e));
+                VmError::ContractError(format!(
+                    "corrupt account balance for '{}': cannot parse '{}' as u64: {}",
+                    addr, parts[0], e
+                ))
+            })?;
+
+            let nonce: u64 = parts[1].parse().map_err(|e| {
+                slog_error!("vm", "load_contract_nonce_parse_failed",
+                    contract => addr, raw => parts[1], error => &format!("{}", e));
+                VmError::ContractError(format!(
+                    "corrupt account nonce for '{}': cannot parse '{}' as u64: {}",
+                    addr, parts[1], e
+                ))
+            })?;
+
+            // Create account in StateManager and apply the parsed values.
+            self.state.get_or_create_account(addr);
+            self.state.set_balance(addr, balance).map_err(|e| {
+                VmError::Other(format!(
+                    "set_balance during load_contract_from_storage failed for '{}': {}",
+                    addr, e
+                ))
+            })?;
+            // Set nonce by incrementing — StateManager only exposes increment.
+            for _ in 0..nonce {
+                self.state.increment_nonce(addr).map_err(|e| {
+                    VmError::Other(format!(
+                        "increment_nonce during load_contract_from_storage failed for '{}': {}",
+                        addr, e
+                    ))
+                })?;
             }
         }
-        // Load code
+
+        // Load code (if present).
         if let Some(code_hex) = storage.get_state(&format!("code:{}", addr)) {
-            if let Ok(code) = hex::decode(&code_hex) {
-                self.state.set_code(addr, code).ok();
-            }
+            let code = hex::decode(&code_hex).map_err(|e| {
+                slog_error!("vm", "load_contract_code_hex_corrupt",
+                    contract => addr, error => &format!("{}", e));
+                VmError::ContractError(format!(
+                    "corrupt contract code hex for '{}': {}",
+                    addr, e
+                ))
+            })?;
+            self.state.set_code(addr, code).map_err(|e| {
+                VmError::Other(format!(
+                    "set_code during load_contract_from_storage failed for '{}': {}",
+                    addr, e
+                ))
+            })?;
         }
+
+        Ok(())
     }
 
     /// Execute a call frame. This is the reentrant core of the VM.

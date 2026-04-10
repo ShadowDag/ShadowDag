@@ -868,14 +868,22 @@ impl FullNode {
         let mut receipts = Vec::with_capacity(block.body.transactions.len());
         let mut has_contract_txs = false;
 
-        // Pre-load referenced contracts from storage
+        // Pre-load referenced contracts from storage. `load_contract_from_storage`
+        // now returns `Result`; here we log any corruption loudly but
+        // keep processing so that a single corrupt contract entry
+        // doesn't abort the entire block pipeline. The per-TX execution
+        // path in the executor surfaces the error again if a caller
+        // actually tries to touch the corrupt account.
         for tx in &block.body.transactions {
             match tx.tx_type {
                 TxType::ContractCreate => {
                     let deployer = tx.inputs.first()
                         .map(|i| i.owner.clone())
                         .unwrap_or_default();
-                    env.load_contract_from_storage(contract_storage, &deployer);
+                    if let Err(e) = env.load_contract_from_storage(contract_storage, &deployer) {
+                        crate::slog_error!("vm", "preload_deployer_failed",
+                            deployer => &deployer, error => &format!("{}", e));
+                    }
                 }
                 TxType::ContractCall => {
                     let target = tx.contract_address.clone().unwrap_or_else(|| {
@@ -883,11 +891,17 @@ impl FullNode {
                             .map(|o| o.address.clone())
                             .unwrap_or_default()
                     });
-                    env.load_contract_from_storage(contract_storage, &target);
+                    if let Err(e) = env.load_contract_from_storage(contract_storage, &target) {
+                        crate::slog_error!("vm", "preload_target_failed",
+                            target => &target, error => &format!("{}", e));
+                    }
                     let caller = tx.inputs.first()
                         .map(|i| i.owner.clone())
                         .unwrap_or_default();
-                    env.load_contract_from_storage(contract_storage, &caller);
+                    if let Err(e) = env.load_contract_from_storage(contract_storage, &caller) {
+                        crate::slog_error!("vm", "preload_caller_failed",
+                            caller => &caller, error => &format!("{}", e));
+                    }
 
                     // Load contract code into in-memory state
                     if let Some(code_hex) = contract_storage.get_state(&format!("code:{}", target)) {

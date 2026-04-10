@@ -70,8 +70,10 @@ impl Executor {
             block_hash: block_hash.to_string(),
         });
 
-        // Load deployer account from persistent storage
-        env.load_contract_from_storage(self.context.storage(), deployer);
+        // Load deployer account from persistent storage. Propagate any
+        // corruption as a structured error instead of silently loading
+        // a zero-balance account.
+        env.load_contract_from_storage(self.context.storage(), deployer)?;
 
         // Set code for the new contract address so execute_frame can run it
         env.state.set_code(&contract_addr, bytecode.to_vec())?;
@@ -168,9 +170,27 @@ impl Executor {
             block_hash: block_hash.to_string(),
         });
 
-        // Load contract and caller accounts from persistent storage
-        env.load_contract_from_storage(self.context.storage(), contract_addr);
-        env.load_contract_from_storage(self.context.storage(), caller);
+        // Load contract and caller accounts from persistent storage. A
+        // corruption in either path is surfaced as a structured error —
+        // the VM must refuse to execute against zero-reset state.
+        if let Err(e) = env.load_contract_from_storage(self.context.storage(), contract_addr) {
+            return ExecutionResult::Error {
+                gas_used: 0,
+                message: format!(
+                    "failed to load contract '{}' state: {}",
+                    contract_addr, e
+                ),
+            };
+        }
+        if let Err(e) = env.load_contract_from_storage(self.context.storage(), caller) {
+            return ExecutionResult::Error {
+                gas_used: 0,
+                message: format!(
+                    "failed to load caller '{}' state: {}",
+                    caller, e
+                ),
+            };
+        }
 
         // Ensure contract code is loaded into the in-memory state.
         //

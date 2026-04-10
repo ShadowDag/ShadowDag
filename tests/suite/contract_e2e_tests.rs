@@ -366,7 +366,8 @@ mod contract_e2e {
 
         // Reload in a completely fresh environment
         let mut env2 = make_env();
-        env2.load_contract_from_storage(&storage, "contract1");
+        env2.load_contract_from_storage(&storage, "contract1")
+            .expect("load_contract_from_storage should succeed on valid state");
 
         // Code should be loadable from the reloaded env
         let code = env2.state.get_code("contract1");

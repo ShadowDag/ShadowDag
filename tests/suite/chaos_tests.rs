@@ -87,7 +87,8 @@ mod chaos {
         {
             let storage = ContractStorage::new(&path).unwrap();
             let mut env = make_env();
-            env.load_contract_from_storage(&storage, "contract");
+            env.load_contract_from_storage(&storage, "contract")
+                .expect("load_contract_from_storage should succeed on valid state");
             let code = env.state.get_code("contract");
             assert!(!code.is_empty(), "Code should survive crash/restart");
         }
