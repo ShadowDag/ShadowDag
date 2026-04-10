@@ -210,14 +210,40 @@ impl ContractVerifier {
         storage.set_state(&key, &meta)
     }
 
-    /// Check if a contract has verification metadata stored.
+    /// Check if a contract has **usable** verification metadata stored.
     ///
-    /// **Note**: this only checks for the presence of the key — it does
-    /// NOT validate the payload. Use [`Self::get_verification`] (which
-    /// now logs corruption explicitly) if you need to know whether the
-    /// stored bytes are still readable.
+    /// Returns `true` only when the `verified:{address}` key holds a
+    /// payload that deserializes into a valid `VerificationMeta` — a
+    /// corrupt JSON payload, a read error, or UTF-8 corruption all
+    /// return `false`.
+    ///
+    /// # Why this had to change
+    ///
+    /// The old implementation was
+    /// `storage.get_state(&format!("verified:{}", address)).is_some()`
+    /// — a presence-only check that returned `true` for ANY non-empty
+    /// bytes under the key, including bytes that `get_verification` /
+    /// `get_verification_strict` would immediately refuse. Explorer
+    /// UI that asked "is this contract verified?" via `is_verified`
+    /// and then "show me its ABI" via `get_verification` would paint
+    /// a "verified" badge next to a record it could not actually
+    /// decode, confusing users about what the chain really knew
+    /// about the contract. The two answers MUST agree on the same
+    /// key for the product surface to be coherent.
+    ///
+    /// Implementation-wise this now delegates to
+    /// [`Self::get_verification_strict`] and collapses read failures
+    /// and JSON corruption into `false`. Callers that need the
+    /// underlying `Result` shape — e.g. audit pipelines that must
+    /// flag damaged records as DISTINCT from absent records —
+    /// should continue using `get_verification_strict` directly;
+    /// `is_verified` is only for boolean "is there something usable
+    /// here?" questions.
     pub fn is_verified(storage: &ContractStorage, address: &str) -> bool {
-        storage.get_state(&format!("verified:{}", address)).is_some()
+        matches!(
+            Self::get_verification_strict(storage, address),
+            Ok(Some(_))
+        )
     }
 
     /// Load verification metadata for a contract.
@@ -434,5 +460,52 @@ mod tests {
         // Strict surfaces it as an explicit error
         let strict = ContractVerifier::get_verification_strict(&storage, "SD1c_corrupt");
         assert!(strict.is_err(), "strict get_verification must expose corruption, got: {:?}", strict);
+    }
+
+    #[test]
+    fn is_verified_agrees_with_get_verification_strict_on_corrupt_payload() {
+        // Regression for the `is_verified` vs `get_verification*`
+        // disagreement. The old `is_verified` returned `true` for ANY
+        // non-empty bytes at `verified:{address}` — including bytes
+        // that `get_verification` / `get_verification_strict` would
+        // immediately refuse. An explorer that asked "is this
+        // verified?" and then "show me the ABI" would paint a
+        // verified badge next to a record it could not decode.
+        //
+        // The new `is_verified` delegates to `get_verification_strict`
+        // and must agree with it on every input.
+        let path = tmp_path();
+        let storage = ContractStorage::new(&path).unwrap();
+
+        // 1. Genuine miss → is_verified = false, strict = Ok(None).
+        assert!(!ContractVerifier::is_verified(&storage, "SD1c_absent"));
+        assert!(matches!(
+            ContractVerifier::get_verification_strict(&storage, "SD1c_absent"),
+            Ok(None)
+        ));
+
+        // 2. Corrupt JSON payload → is_verified = false, strict = Err.
+        //    The OLD behaviour here was is_verified = true.
+        storage.set_state("verified:SD1c_corrupt", "not-json-at-all").unwrap();
+        assert!(
+            !ContractVerifier::is_verified(&storage, "SD1c_corrupt"),
+            "is_verified must refuse a corrupt payload (old behaviour returned true)"
+        );
+        assert!(ContractVerifier::get_verification_strict(&storage, "SD1c_corrupt").is_err());
+
+        // 3. Valid verified record → is_verified = true, strict = Ok(Some).
+        let bytecode = vec![0x10, 42, 0x00];
+        storage.set_state("code:SD1c_ok", &hex::encode(&bytecode)).unwrap();
+        storage.set_state("vm_version:SD1c_ok", "1").unwrap();
+        let abi = ContractAbi::new("Ok");
+        let pkg = ContractPackage::new("Ok", bytecode, abi);
+        let result = ContractVerifier::verify(&storage, "SD1c_ok", &pkg);
+        assert!(result.verified);
+        ContractVerifier::save_verification(&storage, &result, &pkg).unwrap();
+        assert!(ContractVerifier::is_verified(&storage, "SD1c_ok"));
+        assert!(matches!(
+            ContractVerifier::get_verification_strict(&storage, "SD1c_ok"),
+            Ok(Some(_))
+        ));
     }
 }
