@@ -25,44 +25,11 @@ use ed25519_dalek::{SigningKey, Signer, VerifyingKey, Verifier, Signature};
 use rand::rngs::OsRng;
 use crate::errors::VmError;
 
-// ── Network prefix helpers ──────────────────────────────────────────────
-
-/// The three canonical network prefixes used by ShadowDAG addresses.
-/// Matches the on-chain format used by [`generate_address`] / [`validate_address`].
-const MAINNET_PREFIX: &str = "SD1";
-const TESTNET_PREFIX: &str = "ST1";
-const REGTEST_PREFIX: &str = "SR1";
-
-/// Resolve a network name (`"mainnet"` / `"testnet"` / `"regtest"`) to its
-/// 3-character on-chain prefix. Returns `None` for unknown networks so the
-/// caller can surface a structured error instead of generating a
-/// mainnet-looking address by accident.
-fn network_prefix(network: &str) -> Option<&'static str> {
-    match network {
-        "mainnet" => Some(MAINNET_PREFIX),
-        "testnet" => Some(TESTNET_PREFIX),
-        "regtest" => Some(REGTEST_PREFIX),
-        _ => None,
-    }
-}
-
-/// Extract the 3-character network prefix from an existing ShadowDAG
-/// address (`"SD1..."` / `"ST1..."` / `"SR1..."`). This lets
-/// `generate_stealth_address` and `compute_contract_address` stay
-/// network-aware without taking an explicit `network` argument: the
-/// network identity of the output is tied to the network identity of
-/// the input.
-fn prefix_from_address(addr: &str) -> Option<&'static str> {
-    if addr.starts_with(MAINNET_PREFIX) {
-        Some(MAINNET_PREFIX)
-    } else if addr.starts_with(TESTNET_PREFIX) {
-        Some(TESTNET_PREFIX)
-    } else if addr.starts_with(REGTEST_PREFIX) {
-        Some(REGTEST_PREFIX)
-    } else {
-        None
-    }
-}
+// Re-use the canonical network-prefix helpers from
+// `domain::address::address`. They're the single source of truth for
+// address prefixes, so both this WASM SDK and the in-VM executor stay
+// consistent.
+use crate::domain::address::address::{network_prefix, prefix_from_address};
 
 /// Keypair result (all hex-encoded)
 pub struct WasmKeypair {

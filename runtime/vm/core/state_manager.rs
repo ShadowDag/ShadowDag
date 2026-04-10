@@ -136,7 +136,24 @@ impl StateManager {
         self.accounts.get(address).map(|a| a.balance).unwrap_or(0)
     }
 
-    /// Transfer value between accounts
+    /// Transfer `value` from `from` to `to`.
+    ///
+    /// Fail-closed on both sides BEFORE touching state:
+    ///
+    ///   - Returns `Err(VmError::ContractError("insufficient balance …"))`
+    ///     when the sender does not have enough balance.
+    ///   - Returns `Err(VmError::ContractError("balance overflow …"))`
+    ///     when crediting the receiver would exceed `u64::MAX`.
+    ///
+    /// Previously the credit used `to_balance.saturating_add(value)`,
+    /// which silently CLIPPED at `u64::MAX`. On a transfer that would
+    /// push the receiver past `u64::MAX` the excess was simply deleted
+    /// — a silent value-conservation violation. The sender was debited
+    /// in full but the receiver only credited partially, so the total
+    /// supply dropped. Refuse those transfers explicitly instead.
+    ///
+    /// Because both checks run BEFORE any `set_balance` call, this
+    /// transfer is atomic: either both sides apply or neither does.
     pub fn transfer(&mut self, from: &str, to: &str, value: u64) -> Result<(), VmError> {
         let from_balance = self.get_balance(from);
         if from_balance < value {
@@ -146,11 +163,25 @@ impl StateManager {
             )));
         }
 
-        // Debit sender
-        self.set_balance(from, from_balance - value)?;
-        // Credit receiver
+        // Pre-compute the receiver's new balance with a checked add so we
+        // catch overflow BEFORE debiting the sender. If we did the credit
+        // after the debit and relied on saturating_add, a receiver near
+        // u64::MAX would quietly swallow part of the transfer and leave
+        // the system in a state where value conservation is broken.
         let to_balance = self.get_balance(to);
-        self.set_balance(to, to_balance.saturating_add(value))?;
+        let new_to_balance = to_balance.checked_add(value).ok_or_else(|| {
+            VmError::ContractError(format!(
+                "balance overflow: crediting '{}' with {} would exceed u64::MAX \
+                 (current balance {})",
+                to, value, to_balance
+            ))
+        })?;
+
+        // Debit sender. Subtraction is safe because we already verified
+        // `from_balance >= value` above.
+        self.set_balance(from, from_balance - value)?;
+        // Credit receiver with the pre-validated new balance.
+        self.set_balance(to, new_to_balance)?;
 
         Ok(())
     }
@@ -444,6 +475,47 @@ mod tests {
         let mut sm = StateManager::new();
         sm.set_balance("alice", 100).unwrap();
         assert!(sm.transfer("alice", "bob", 200).is_err());
+    }
+
+    #[test]
+    fn transfer_overflow_is_rejected_not_silently_clipped() {
+        let mut sm = StateManager::new();
+        // Alice has a modest amount to send
+        sm.set_balance("alice", 5).unwrap();
+        // Bob is already at u64::MAX — 3, so crediting him with 5 would
+        // overflow by 2.
+        sm.set_balance("bob", u64::MAX - 3).unwrap();
+
+        let before_alice = sm.get_balance("alice");
+        let before_bob = sm.get_balance("bob");
+
+        // The transfer MUST be rejected with an explicit overflow error,
+        // not silently saturate and delete value.
+        let result = sm.transfer("alice", "bob", 5);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("overflow"), "expected overflow error, got: {}", msg);
+
+        // Crucially, both sides must be unchanged — the transfer must be
+        // atomic. With the old saturating_add, alice was debited in full
+        // but bob only credited by 3, leaking 2 out of existence.
+        assert_eq!(sm.get_balance("alice"), before_alice,
+            "alice must not be debited when the credit side overflows");
+        assert_eq!(sm.get_balance("bob"), before_bob,
+            "bob must not be partially credited when the transfer overflows");
+    }
+
+    #[test]
+    fn transfer_up_to_u64_max_still_succeeds() {
+        // Boundary test: the largest transfer that does NOT overflow
+        // must still succeed cleanly.
+        let mut sm = StateManager::new();
+        sm.set_balance("alice", 5).unwrap();
+        sm.set_balance("bob", u64::MAX - 5).unwrap();
+
+        sm.transfer("alice", "bob", 5).unwrap();
+        assert_eq!(sm.get_balance("alice"), 0);
+        assert_eq!(sm.get_balance("bob"), u64::MAX);
     }
 
     #[test]
