@@ -39,16 +39,38 @@ impl AbiType {
         }
     }
 
+    /// Parse an ABI type name (case-sensitive) into the typed enum.
+    ///
+    /// Returns `Err(VmError::ContractError)` for any name that is not
+    /// in the known set. The previous implementation defaulted unknown
+    /// types to `AbiType::Bytes`, which silently changed the meaning
+    /// of an interface — a typo like `"uint66"` or an aspirational
+    /// type like `"uint256"` would be accepted as `Bytes` and
+    /// decoded as a variable-length blob, producing nonsense values
+    /// at runtime instead of failing fast at parse time.
+    ///
+    /// Accepted names (matching the canonical mnemonic AND a short
+    /// alias where one historically existed):
+    ///
+    ///   `uint64` / `uint`, `int64` / `int`, `bool`, `string`,
+    ///   `bytes`, `address`
+    ///
+    /// `Array(_)` is NOT parsed here — it has its own constructor
+    /// path because the inner type would need recursive parsing.
     #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_str(s: &str) -> Result<Self, VmError> {
         match s {
-            "uint64" | "uint"   => AbiType::Uint64,
-            "int64" | "int"     => AbiType::Int64,
-            "bool"              => AbiType::Bool,
-            "string"            => AbiType::String,
-            "bytes"             => AbiType::Bytes,
-            "address"           => AbiType::Address,
-            _                   => AbiType::Bytes, // Default
+            "uint64" | "uint"   => Ok(AbiType::Uint64),
+            "int64"  | "int"    => Ok(AbiType::Int64),
+            "bool"              => Ok(AbiType::Bool),
+            "string"            => Ok(AbiType::String),
+            "bytes"             => Ok(AbiType::Bytes),
+            "address"           => Ok(AbiType::Address),
+            other => Err(VmError::ContractError(format!(
+                "unknown ABI type '{}': expected one of \
+                 uint64/uint, int64/int, bool, string, bytes, address",
+                other
+            ))),
         }
     }
 }
@@ -400,5 +422,37 @@ mod tests {
         let data = vec![0xAA, 0xBB, 0xCC, 0xDD, 0x01, 0x02];
         let sel = ContractAbi::decode_selector(&data).unwrap();
         assert_eq!(sel, [0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn abi_type_from_str_resolves_known_types() {
+        assert_eq!(AbiType::from_str("uint64").unwrap(), AbiType::Uint64);
+        assert_eq!(AbiType::from_str("uint").unwrap(),   AbiType::Uint64);
+        assert_eq!(AbiType::from_str("int64").unwrap(),  AbiType::Int64);
+        assert_eq!(AbiType::from_str("int").unwrap(),    AbiType::Int64);
+        assert_eq!(AbiType::from_str("bool").unwrap(),   AbiType::Bool);
+        assert_eq!(AbiType::from_str("string").unwrap(), AbiType::String);
+        assert_eq!(AbiType::from_str("bytes").unwrap(),  AbiType::Bytes);
+        assert_eq!(AbiType::from_str("address").unwrap(), AbiType::Address);
+    }
+
+    #[test]
+    fn abi_type_from_str_rejects_unknown_types() {
+        // Regression for the silent-default-to-Bytes bug. A typo like
+        // "uint66" or an aspirational type like "uint256" must produce
+        // an error, not be quietly coerced to Bytes (which would change
+        // the encoding semantics of every call that uses it).
+        assert!(AbiType::from_str("uint66").is_err());
+        assert!(AbiType::from_str("uint256").is_err());
+        assert!(AbiType::from_str("UINT64").is_err()); // case-sensitive
+        assert!(AbiType::from_str("").is_err());
+        assert!(AbiType::from_str("garbage").is_err());
+
+        // The error message must mention the offending name so users
+        // can fix the typo, and list the accepted alternatives.
+        let err = AbiType::from_str("uint66").unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("uint66"), "error must include the offending name, got: {}", msg);
+        assert!(msg.contains("uint64"), "error must list the accepted alternatives, got: {}", msg);
     }
 }

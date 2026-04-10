@@ -375,7 +375,7 @@ fn cmd_trace(args: &[String]) {
 fn parse_abi_from_source(source: &str, name: &str) -> ContractAbi {
     let mut abi = ContractAbi::new(name);
 
-    for line in source.lines() {
+    for (line_num, line) in source.lines().enumerate() {
         let trimmed = line.trim();
         if let Some(ann) = trimmed.strip_prefix(";; @fn ") {
             // Parse: name(type1,type2):return_type
@@ -385,17 +385,44 @@ fn parse_abi_from_source(source: &str, name: &str) -> ContractAbi {
                     let inputs: Vec<AbiParam> = if params_str.is_empty() {
                         vec![]
                     } else {
-                        params_str.split(',').enumerate().map(|(i, t)| AbiParam {
-                            name: format!("arg{}", i),
-                            abi_type: AbiType::from_str(t.trim()),
-                            indexed: false,
-                        }).collect()
+                        let mut parsed = Vec::new();
+                        for (i, t) in params_str.split(',').enumerate() {
+                            // AbiType::from_str now returns Result and rejects
+                            // unknown type names. Skip the bad parameter and
+                            // print a warning so the user can fix the typo
+                            // instead of getting a silent `Bytes` default.
+                            let abi_type = match AbiType::from_str(t.trim()) {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    eprintln!(
+                                        "warning: line {} fn {}: skipping parameter {}: {}",
+                                        line_num + 1, fname.trim(), i, e
+                                    );
+                                    continue;
+                                }
+                            };
+                            parsed.push(AbiParam {
+                                name: format!("arg{}", i),
+                                abi_type,
+                                indexed: false,
+                            });
+                        }
+                        parsed
                     };
-                    let outputs = vec![AbiParam {
-                        name: "result".into(),
-                        abi_type: AbiType::from_str(ret.trim()),
-                        indexed: false,
-                    }];
+                    let outputs = match AbiType::from_str(ret.trim()) {
+                        Ok(t) => vec![AbiParam {
+                            name: "result".into(),
+                            abi_type: t,
+                            indexed: false,
+                        }],
+                        Err(e) => {
+                            eprintln!(
+                                "warning: line {} fn {}: skipping return type: {}",
+                                line_num + 1, fname.trim(), e
+                            );
+                            vec![]
+                        }
+                    };
                     abi.add_function(fname.trim(), inputs, outputs, Mutability::Mutable);
                 }
             }
@@ -405,11 +432,25 @@ fn parse_abi_from_source(source: &str, name: &str) -> ContractAbi {
                 let params: Vec<AbiParam> = if params_str.is_empty() {
                     vec![]
                 } else {
-                    params_str.split(',').enumerate().map(|(i, t)| AbiParam {
-                        name: format!("param{}", i),
-                        abi_type: AbiType::from_str(t.trim()),
-                        indexed: i == 0,
-                    }).collect()
+                    let mut parsed = Vec::new();
+                    for (i, t) in params_str.split(',').enumerate() {
+                        let abi_type = match AbiType::from_str(t.trim()) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                eprintln!(
+                                    "warning: line {} event {}: skipping parameter {}: {}",
+                                    line_num + 1, ename.trim(), i, e
+                                );
+                                continue;
+                            }
+                        };
+                        parsed.push(AbiParam {
+                            name: format!("param{}", i),
+                            abi_type,
+                            indexed: i == 0,
+                        });
+                    }
+                    parsed
                 };
                 abi.add_event(ename.trim(), params);
             }
