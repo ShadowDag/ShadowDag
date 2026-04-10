@@ -174,15 +174,43 @@ impl ContractAbi {
         });
     }
 
-    /// Compute 4-byte function selector from name + input types
+    /// Compute 4-byte function selector from name + input types.
+    ///
+    /// Function selectors are intentionally truncated to 4 bytes
+    /// (first 4 bytes of `SHA-256("name(type1,type2,…)")`) to keep
+    /// call data compact. Events do NOT use this — they use
+    /// [`Self::compute_event_topic0`], which keeps the full 32-byte
+    /// hash so it can be compared byte-for-byte against the 64-char
+    /// hex topics emitted by `event_log::EventCollector`.
     fn compute_selector(name: &str, inputs: &[AbiParam]) -> [u8; 4] {
+        let hash = Self::compute_signature_hash(name, inputs);
+        [hash[0], hash[1], hash[2], hash[3]]
+    }
+
+    /// Compute the 32-byte event topic0 for an event with the given
+    /// name and parameters.
+    ///
+    /// `event_log::EventCollector::emit` requires every topic to be a
+    /// 64-char lowercase hex string (32 bytes). The convention for
+    /// topic0 on a non-anonymous event is
+    /// `hex(SHA-256("name(type1,type2,…)"))` — the full hash, not the
+    /// truncated 4-byte function selector. `decode_event` compares
+    /// topic0 against this full value with strict equality.
+    fn compute_event_topic0(name: &str, params: &[AbiParam]) -> [u8; 32] {
+        Self::compute_signature_hash(name, params).into()
+    }
+
+    /// Shared SHA-256 of the canonical signature string
+    /// `"name(type1,type2,…)"`. Used by both [`Self::compute_selector`]
+    /// (function call data) and [`Self::compute_event_topic0`] (event
+    /// topic0) so they cannot drift apart.
+    fn compute_signature_hash(name: &str, params: &[AbiParam]) -> [u8; 32] {
         let sig = format!("{}({})", name,
-            inputs.iter().map(|p| p.abi_type.name().to_string()).collect::<Vec<_>>().join(",")
+            params.iter().map(|p| p.abi_type.name().to_string()).collect::<Vec<_>>().join(",")
         );
         let mut h = Sha256::new();
         h.update(sig.as_bytes());
-        let hash = h.finalize();
-        [hash[0], hash[1], hash[2], hash[3]]
+        h.finalize().into()
     }
 
     /// Find a function by its 4-byte selector
@@ -255,16 +283,24 @@ impl ContractAbi {
 
     /// Serialize ABI to JSON.
     ///
-    /// Logs a structured error if serialization fails rather than silently
-    /// returning an empty string.
-    pub fn to_json(&self) -> String {
-        match serde_json::to_string_pretty(self) {
-            Ok(s) => s,
-            Err(e) => {
-                slog_error!("vm", "abi_to_json_failed", error => &e.to_string());
-                String::new()
-            }
-        }
+    /// Returns `Err(VmError::ContractError)` if serialization fails.
+    /// The previous implementation swallowed the failure and returned
+    /// an empty string (logging the error via `slog_error!`), which
+    /// was the exact fail-silent-on-serialize pattern the verifier /
+    /// persistence layers have been closing. In particular
+    /// `ContractVerifier::save_verification` embeds `abi.to_json()`
+    /// into the stored `VerificationMeta.abi_json` — if serialization
+    /// had failed, the verifier would have stored a valid JSON record
+    /// with `abi_json: ""`, and downstream explorers / decoders would
+    /// see a "verified" contract with no ABI at all. Surfacing the
+    /// error here means `save_verification` can propagate it as
+    /// `StorageError::Serialization` and refuse to persist a
+    /// meaningless record.
+    pub fn to_json(&self) -> Result<String, VmError> {
+        serde_json::to_string_pretty(self).map_err(|e| {
+            slog_error!("vm", "abi_to_json_failed", error => &e.to_string());
+            VmError::ContractError(format!("ABI serialize failed: {}", e))
+        })
     }
 
     /// Deserialize ABI from JSON
@@ -303,32 +339,127 @@ impl ContractAbi {
     }
 
     /// Decode a log event using the ABI event definition.
-    /// Matches topic0 (event selector) to find the event, then decodes
-    /// indexed parameters from remaining topics and non-indexed from data.
+    ///
+    /// Matches topic0 against the 32-byte event selector with STRICT
+    /// equality (after normalizing a leading `0x` and lowercasing the
+    /// hex), then decodes parameters using independent cursors:
+    /// indexed params are pulled from `topics[1..]` in declaration
+    /// order, non-indexed params are pulled from `data` in declaration
+    /// order using the same fixed/variable-length rules as
+    /// [`Self::decode_return`].
+    ///
+    /// # Previous bugs this replaces
+    ///
+    /// 1. **Prefix-collision topic match.** The old matcher used
+    ///    `selector.starts_with(topic0) || topic0.starts_with(&selector)`
+    ///    against the 4-byte function selector, which accepted:
+    ///     * empty `topic0 == ""` (always a prefix) → first event in
+    ///       the ABI matched every log;
+    ///     * any short topic0 like `"aabb"` against selector
+    ///       `"aabbccdd"` → cross-decode across events sharing a
+    ///       byte prefix;
+    ///     * a long topic0 like `"aabbccdd0011"` against selector
+    ///       `"aabbccdd"` → same cross-decode in the other direction.
+    ///    Using the full 32-byte topic hash + strict equality closes
+    ///    all three.
+    ///
+    /// 2. **`indexed` flag ignored.** The old decoder used
+    ///    `i + 1 < topics.len()` as a proxy for "this param is
+    ///    indexed", which is only correct when every indexed param
+    ///    comes before every non-indexed param in declaration order.
+    ///    For an event declared as
+    ///    `Foo(uint64 amount /* non-indexed */, address from /* indexed */)`
+    ///    the old code pulled `topics[1]` into `amount` and
+    ///    `hex::encode(data)` into `from`, silently swapping the two
+    ///    values. The new decoder walks `event.params` and consults
+    ///    `param.indexed` on each iteration.
+    ///
+    /// 3. **Full data blob replicated across non-indexed params.**
+    ///    The old non-indexed branch used `hex::encode(data)` for
+    ///    every non-indexed param, so two non-indexed params would
+    ///    receive the entire data blob each. The new decoder slices
+    ///    `data` by `expected_arg_size` exactly like `decode_return`.
     pub fn decode_event(&self, topics: &[String], data: &[u8]) -> Result<DecodedEvent, String> {
         if topics.is_empty() {
             return Err("no topics in log entry".into());
         }
 
-        // Find matching event by topic0 (selector)
-        let topic0 = &topics[0];
+        // Normalize topic0: strip an optional "0x" / "0X" prefix and
+        // lowercase the hex. `event_log::EventCollector::emit` already
+        // requires 64 ascii-hex chars, but the caller may still pass
+        // either form, and `hex::encode` on the event side always
+        // produces lowercase without a prefix.
+        let topic0_norm = {
+            let raw = &topics[0];
+            let stripped = raw
+                .strip_prefix("0x")
+                .or_else(|| raw.strip_prefix("0X"))
+                .unwrap_or(raw);
+            stripped.to_ascii_lowercase()
+        };
+
+        // Strict equality against the full 32-byte event selector.
+        // See the compute_event_topic0 doc for why this is NOT the
+        // 4-byte function selector.
         let event = self.events.iter()
             .find(|e| {
-                let selector = hex::encode(&Self::compute_selector(&e.name, &e.params)[..]);
-                selector.starts_with(topic0) || topic0.starts_with(&selector)
+                let selector = hex::encode(Self::compute_event_topic0(&e.name, &e.params));
+                selector == topic0_norm
             })
-            .ok_or_else(|| format!("no matching event for topic0 '{}'", topic0))?;
+            .ok_or_else(|| format!("no matching event for topic0 '{}'", topics[0]))?;
+
+        // Independent cursors for topics and data.
+        let mut topic_cursor = 1usize; // skip topic0 (event selector)
+        let mut data_offset  = 0usize;
+        let mut decoded = Vec::with_capacity(event.params.len());
+
+        for param in &event.params {
+            let value = if param.indexed {
+                // Indexed param → next topic in order.
+                if topic_cursor >= topics.len() {
+                    return Err(format!(
+                        "event '{}' declares indexed param '{}' but log has no \
+                         matching topic (topic_cursor={}, topics.len()={})",
+                        event.name, param.name, topic_cursor, topics.len()
+                    ));
+                }
+                let v = topics[topic_cursor].clone();
+                topic_cursor += 1;
+                v
+            } else {
+                // Non-indexed param → next slice of `data` according
+                // to the param type, mirroring decode_return's rules.
+                match Self::expected_arg_size(&param.abi_type) {
+                    Some(s) => {
+                        if data_offset + s > data.len() {
+                            return Err(format!(
+                                "event '{}' data too short for non-indexed \
+                                 param '{}' (need {} bytes at offset {}, \
+                                 data.len()={})",
+                                event.name, param.name, s, data_offset, data.len()
+                            ));
+                        }
+                        let encoded = hex::encode(&data[data_offset..data_offset + s]);
+                        data_offset += s;
+                        encoded
+                    }
+                    None => {
+                        // Variable-length non-indexed params eat the
+                        // remainder. This matches decode_return and is
+                        // why every event should have at most one
+                        // trailing variable-length non-indexed param.
+                        let encoded = hex::encode(&data[data_offset..]);
+                        data_offset = data.len();
+                        encoded
+                    }
+                }
+            };
+            decoded.push((param.name.clone(), value));
+        }
 
         Ok(DecodedEvent {
             name: event.name.clone(),
-            params: event.params.iter().enumerate().map(|(i, p)| {
-                let value = if i + 1 < topics.len() {
-                    topics[i + 1].clone() // indexed params from topics
-                } else {
-                    hex::encode(data) // non-indexed from data
-                };
-                (p.name.clone(), value)
-            }).collect(),
+            params: decoded,
         })
     }
 }
@@ -410,11 +541,25 @@ mod tests {
     #[test]
     fn json_roundtrip() {
         let abi = make_abi();
-        let json = abi.to_json();
+        let json = abi.to_json().expect("to_json must succeed on a well-formed ABI");
         let restored = ContractAbi::from_json(&json).unwrap();
         assert_eq!(restored.name, "TestToken");
         assert_eq!(restored.functions.len(), 2);
         assert_eq!(restored.events.len(), 1);
+    }
+
+    #[test]
+    fn to_json_returns_result_not_empty_string() {
+        // Regression for the fail-silent-on-serialize pattern. The old
+        // `to_json` returned `String`, masking any serde failure as an
+        // empty string that `save_verification` then stored in the
+        // contract DB as `abi_json: ""`. With the new signature, the
+        // happy path is an Ok with valid JSON — an empty string is
+        // never returned.
+        let abi = make_abi();
+        let json = abi.to_json().unwrap();
+        assert!(!json.is_empty(), "to_json must not return an empty string on success");
+        assert!(json.starts_with('{'), "to_json must return JSON object");
     }
 
     #[test]
@@ -454,5 +599,178 @@ mod tests {
         let msg = format!("{}", err);
         assert!(msg.contains("uint66"), "error must include the offending name, got: {}", msg);
         assert!(msg.contains("uint64"), "error must list the accepted alternatives, got: {}", msg);
+    }
+
+    // ─── decode_event regression tests ──────────────────────────────
+    //
+    // These tests pin the three bugs the decoder used to have:
+    //   1. topic0 matched by bidirectional `starts_with`
+    //   2. `indexed` flag ignored in favor of positional indexing
+    //   3. full `data` blob replicated across every non-indexed param
+
+    /// Build an ABI whose only event has a NON-leading indexed layout:
+    ///   NonLeadingIndexed(uint64 amount /* non-indexed */, address from /* indexed */)
+    /// This is the exact shape the old decoder silently mis-swapped.
+    fn abi_with_non_leading_indexed_event() -> ContractAbi {
+        let mut abi = ContractAbi::new("NonLeadingIndexedTest");
+        abi.add_event("NonLeadingIndexed", vec![
+            AbiParam { name: "amount".into(), abi_type: AbiType::Uint64,  indexed: false },
+            AbiParam { name: "from".into(),   abi_type: AbiType::Address, indexed: true  },
+        ]);
+        abi
+    }
+
+    /// Compute the full 32-byte event topic0 for an event in `abi` by
+    /// name. Mirrors what `event_log::EventCollector` would emit as
+    /// topic0 on a LOG1+ for this event.
+    fn event_topic0_hex(abi: &ContractAbi, event_name: &str) -> String {
+        let ev = abi.events.iter().find(|e| e.name == event_name).expect("event present");
+        hex::encode(ContractAbi::compute_event_topic0(&ev.name, &ev.params))
+    }
+
+    #[test]
+    fn decode_event_honors_indexed_flag_on_non_leading_layout() {
+        // Regression for the positional-indexing bug. The old decoder
+        // used `i + 1 < topics.len()` as a proxy for "this param is
+        // indexed", which was wrong for a param declared as
+        // non-indexed followed by an indexed param.
+        let abi = abi_with_non_leading_indexed_event();
+        let topic0 = event_topic0_hex(&abi, "NonLeadingIndexed");
+
+        // Real log would carry topic0 + one indexed topic for `from`.
+        // Per event_log::EventCollector, each topic is a 64-char hex
+        // string — construct a plausible address-shaped topic1.
+        let topic1 = "f".repeat(64);
+
+        // `amount` is non-indexed → comes from `data` as 8 BE bytes.
+        let amount_bytes: [u8; 8] = 1234u64.to_be_bytes();
+
+        let topics = vec![topic0, topic1.clone()];
+        let decoded = abi.decode_event(&topics, &amount_bytes).unwrap();
+
+        assert_eq!(decoded.name, "NonLeadingIndexed");
+        assert_eq!(decoded.params.len(), 2);
+
+        // `amount` (declared first, non-indexed) MUST decode from data,
+        // not from topics[1]. Old code pulled topics[1] here.
+        assert_eq!(decoded.params[0].0, "amount");
+        assert_eq!(decoded.params[0].1, hex::encode(amount_bytes));
+
+        // `from` (declared second, indexed) MUST decode from topics[1],
+        // not from hex::encode(data). Old code pulled hex::encode(data)
+        // here.
+        assert_eq!(decoded.params[1].0, "from");
+        assert_eq!(decoded.params[1].1, topic1);
+    }
+
+    #[test]
+    fn decode_event_strict_equality_rejects_prefix_collision() {
+        // Regression for the `starts_with` bug. The old matcher
+        // accepted empty topic0, short topic0 that is a prefix of a
+        // selector, and long topic0 that a selector is a prefix of.
+        let abi = abi_with_non_leading_indexed_event();
+        let real_topic0 = event_topic0_hex(&abi, "NonLeadingIndexed");
+        let amount_bytes: [u8; 8] = 0u64.to_be_bytes();
+        let topic1 = "a".repeat(64);
+
+        // (1) empty topic0 → must NOT match anything
+        {
+            let topics = vec!["".to_string(), topic1.clone()];
+            assert!(abi.decode_event(&topics, &amount_bytes).is_err(),
+                "empty topic0 must not match any event");
+        }
+
+        // (2) short topic0 that is a prefix of the real selector → must NOT match
+        {
+            let short = real_topic0[..8].to_string();
+            let topics = vec![short, topic1.clone()];
+            assert!(abi.decode_event(&topics, &amount_bytes).is_err(),
+                "byte-prefix of the real selector must not match the event");
+        }
+
+        // (3) long topic0 that the real selector is a prefix of → must NOT match
+        {
+            let long = format!("{}deadbeef", real_topic0);
+            let topics = vec![long, topic1.clone()];
+            assert!(abi.decode_event(&topics, &amount_bytes).is_err(),
+                "super-string of the real selector must not match the event");
+        }
+
+        // (4) the real full-length topic0 → matches
+        {
+            let topics = vec![real_topic0.clone(), topic1];
+            let decoded = abi.decode_event(&topics, &amount_bytes).unwrap();
+            assert_eq!(decoded.name, "NonLeadingIndexed");
+        }
+    }
+
+    #[test]
+    fn decode_event_accepts_0x_prefixed_topic0() {
+        let abi = abi_with_non_leading_indexed_event();
+        let topic0 = event_topic0_hex(&abi, "NonLeadingIndexed");
+        let amount_bytes: [u8; 8] = 0u64.to_be_bytes();
+        let topic1 = "a".repeat(64);
+
+        let topics = vec![format!("0x{}", topic0), topic1];
+        let decoded = abi.decode_event(&topics, &amount_bytes).unwrap();
+        assert_eq!(decoded.name, "NonLeadingIndexed");
+    }
+
+    #[test]
+    fn decode_event_splits_data_across_multiple_non_indexed_params() {
+        // Regression for the "full data blob duplicated into every
+        // non-indexed param" bug. The old decoder wrote
+        // `hex::encode(data)` into every non-indexed param, so two
+        // non-indexed params both got the entire blob. The new
+        // decoder walks `data` by `expected_arg_size` so each
+        // fixed-width non-indexed param slices its own segment.
+        let mut abi = ContractAbi::new("TwoFixedDataFields");
+        abi.add_event("TwoFixed", vec![
+            AbiParam { name: "a".into(), abi_type: AbiType::Uint64, indexed: false },
+            AbiParam { name: "b".into(), abi_type: AbiType::Uint64, indexed: false },
+        ]);
+
+        let topic0 = event_topic0_hex(&abi, "TwoFixed");
+        // 16 bytes: first 8 = 1u64, next 8 = 2u64
+        let mut data = Vec::with_capacity(16);
+        data.extend_from_slice(&1u64.to_be_bytes());
+        data.extend_from_slice(&2u64.to_be_bytes());
+
+        let topics = vec![topic0];
+        let decoded = abi.decode_event(&topics, &data).unwrap();
+        assert_eq!(decoded.params[0], ("a".into(), hex::encode(1u64.to_be_bytes())));
+        assert_eq!(decoded.params[1], ("b".into(), hex::encode(2u64.to_be_bytes())));
+    }
+
+    #[test]
+    fn decode_event_errors_on_data_too_short() {
+        // Fail-loud when the encoded data is shorter than the fixed
+        // non-indexed params can consume.
+        let mut abi = ContractAbi::new("Short");
+        abi.add_event("Short", vec![
+            AbiParam { name: "a".into(), abi_type: AbiType::Uint64, indexed: false },
+        ]);
+        let topic0 = event_topic0_hex(&abi, "Short");
+
+        // 4 bytes — not enough for a uint64 (8 bytes)
+        let short_data = vec![0u8; 4];
+        let topics = vec![topic0];
+        let err = abi.decode_event(&topics, &short_data).unwrap_err();
+        assert!(err.contains("data too short"), "got: {}", err);
+    }
+
+    #[test]
+    fn decode_event_errors_on_missing_indexed_topic() {
+        // Event declares an indexed param but the log doesn't include
+        // the matching topic.
+        let mut abi = ContractAbi::new("MissingTopic");
+        abi.add_event("MissingTopic", vec![
+            AbiParam { name: "from".into(), abi_type: AbiType::Address, indexed: true },
+        ]);
+        let topic0 = event_topic0_hex(&abi, "MissingTopic");
+
+        let topics = vec![topic0]; // no topic1 even though `from` is indexed
+        let err = abi.decode_event(&topics, &[]).unwrap_err();
+        assert!(err.contains("indexed param"), "got: {}", err);
     }
 }

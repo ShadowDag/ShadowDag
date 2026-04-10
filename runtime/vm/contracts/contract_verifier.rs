@@ -169,7 +169,24 @@ impl ContractVerifier {
     ) -> Result<(), StorageError> {
         if !result.verified { return Ok(()); } // Only store verified contracts
 
-        // Store verification metadata
+        // Store verification metadata.
+        //
+        // `ContractAbi::to_json` now returns `Result<String, VmError>`
+        // — previously it swallowed serialize failures and returned
+        // `""`. A verified record with `abi_json: ""` parsed back as a
+        // valid `VerificationMeta` and made downstream decoders /
+        // explorers show a "verified" contract with no ABI at all, so
+        // we propagate the error as `StorageError::Serialization` and
+        // refuse to persist the meaningless record.
+        let abi_json = package.abi.to_json().map_err(|e| {
+            slog_error!("vm", "save_verification_abi_serialize_failed",
+                address => &result.address, error => &e.to_string());
+            StorageError::Serialization(format!(
+                "verification abi_json serialize failed for {}: {}",
+                result.address, e
+            ))
+        })?;
+
         let key = format!("verified:{}", result.address);
         let meta_value = VerificationMeta {
             name: package.name.clone(),
@@ -178,7 +195,7 @@ impl ContractVerifier {
             vm_version: package.vm_version,
             format_version: package.format_version,
             code_size: result.deployed_code_size,
-            abi_json: package.abi.to_json(),
+            abi_json,
             source_hash: package.source_hash.clone(),
         };
         let meta = serde_json::to_string(&meta_value).map_err(|e| {
