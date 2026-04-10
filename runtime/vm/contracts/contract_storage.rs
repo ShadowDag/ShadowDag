@@ -42,6 +42,26 @@ pub struct ContractUndoData {
     pub state_root: Option<String>,
 }
 
+/// Result of a [`PendingBatch::lookup`] query.
+///
+/// Used by SLOAD to implement read-your-writes within a single
+/// execution frame: a SSTORE earlier in the same frame must be
+/// visible to a later SLOAD on the same key, even though the write
+/// hasn't been committed to RocksDB yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingLookup<'a> {
+    /// The key has a buffered put — return this value instead of
+    /// hitting disk. Equivalent to "the contract just wrote here".
+    Buffered(&'a String),
+    /// The key has a buffered delete — treat this as if disk returned
+    /// the empty / default value. Equivalent to "the contract just
+    /// deleted this slot".
+    Tombstoned,
+    /// The key is not in the pending buffer at all — fall through to
+    /// the underlying ContractStorage / RocksDB read.
+    NotBuffered,
+}
+
 /// Buffered state changes awaiting atomic commit
 pub struct PendingBatch {
     /// Writes: key -> Some(value) for puts, key -> None for deletes
@@ -69,6 +89,29 @@ impl PendingBatch {
     /// Buffer a delete operation
     pub fn delete(&mut self, key: String) {
         self.changes.insert(key, None);
+    }
+
+    /// Look up `key` in the pending buffer.
+    ///
+    /// SLOAD must call this BEFORE reading from the underlying
+    /// `ContractStorage`, so that an SSTORE earlier in the same frame
+    /// is visible to a later SLOAD (read-your-writes). The previous
+    /// implementation only ever read from disk, so a contract pattern
+    /// like
+    ///
+    /// ```text
+    ///     PUSH1 v   PUSH1 k   SSTORE   PUSH1 k   SLOAD
+    /// ```
+    ///
+    /// returned `0` (the on-disk value) instead of `v`. That broke
+    /// every standard accumulator / counter pattern within a single
+    /// transaction.
+    pub fn lookup(&self, key: &str) -> PendingLookup<'_> {
+        match self.changes.get(key) {
+            Some(Some(v)) => PendingLookup::Buffered(v),
+            Some(None)    => PendingLookup::Tombstoned,
+            None          => PendingLookup::NotBuffered,
+        }
     }
 
     /// Number of pending changes

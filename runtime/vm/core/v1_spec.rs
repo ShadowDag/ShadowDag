@@ -201,6 +201,59 @@ mod tests {
         }
     }
 
+    /// Regression guard: every byte that the v1 spec defines must round-trip
+    /// through `vm::OpCode::from_byte` to a non-INVALID variant whose name
+    /// matches the spec entry. This catches drift between the consensus
+    /// execution path (vm.rs OpCode) and the authoritative byte layout
+    /// declared here. If a future refactor moves an opcode in vm.rs without
+    /// updating v1_spec.rs (or vice versa), this test will fail BEFORE the
+    /// change reaches consensus.
+    ///
+    /// This is the test that would have caught the parallel
+    /// `core::opcodes::OpCode` enum drift (JUMPDEST = 0x05 vs 0x82, etc.)
+    /// if the assembler had been built against vm::OpCode from the start.
+    #[test]
+    fn vm_opcode_table_matches_v1_spec_byte_layout() {
+        use crate::runtime::vm::core::vm::OpCode;
+        for (byte, name, _gas, _pop, _push) in V1_OPCODES {
+            let op = OpCode::from_byte(*byte);
+            assert!(
+                op != OpCode::INVALID || *byte == 0xFF,
+                "v1 spec defines byte 0x{:02X} as {} but vm::OpCode treats it as INVALID",
+                byte, name
+            );
+            // The names must match too. The spec stores short mnemonics
+            // and vm::OpCode::name() returns the same canonical strings.
+            assert_eq!(
+                op.name(), *name,
+                "v1 spec byte 0x{:02X} = {} but vm::OpCode = {}",
+                byte, name, op.name()
+            );
+        }
+    }
+
+    /// And the inverse direction: every byte that vm::OpCode treats as a
+    /// real opcode (i.e. not INVALID) MUST be declared in the v1 spec.
+    /// This catches the case where vm.rs grows a new opcode but forgets
+    /// to update the spec — the new opcode would then deploy successfully
+    /// (because the v1 validator wouldn't know to reject it … or would
+    /// reject it on every block, breaking consensus).
+    #[test]
+    fn every_vm_opcode_is_declared_in_v1_spec() {
+        use crate::runtime::vm::core::vm::OpCode;
+        for b in 0u8..=255 {
+            let op = OpCode::from_byte(b);
+            if op == OpCode::INVALID {
+                continue;
+            }
+            assert!(
+                is_v1_opcode(b),
+                "vm::OpCode::{:?} (byte 0x{:02X}) is not declared in v1_spec::V1_OPCODES",
+                op, b
+            );
+        }
+    }
+
     #[test]
     fn v1_validation_rejects_unknown_opcode() {
         // 0xEE is not in v1
