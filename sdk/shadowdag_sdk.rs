@@ -1,16 +1,20 @@
 //! ShadowDAG Rust SDK — programmatic interface for smart contracts.
 //!
 //! Provides high-level functions for deploying, calling, and querying
-//! contracts through the ShadowDAG RPC interface.
+//! contracts through the ShadowDAG JSON-RPC interface.
 //!
-//! # Status: STUB — HTTP transport not yet connected
+//! # Transport
 //!
-//! This SDK defines the complete API surface for ShadowDAG contract interaction.
-//! All method signatures and types are finalized, but the HTTP transport layer
-//! is not yet implemented. Methods currently return SdkError::Other explaining
-//! the transport gap.
+//! The SDK speaks JSON-RPC 2.0 over plain HTTP/1.1, connecting via
+//! `std::net::TcpStream`. This matches the hand-rolled HTTP server in
+//! `service/network/rpc/rpc_server.rs` and deliberately avoids pulling
+//! in a new dependency (`reqwest` / `hyper` / `ureq`). HTTPS is not yet
+//! supported — the SDK rejects `https://` URLs explicitly so callers
+//! know TLS is unavailable instead of silently downgrading.
 //!
-//! To connect: implement rpc_call() using reqwest, hyper, or ureq HTTP client.
+//! Both `with_auth()` and `with_timeout()` are honoured on the wire:
+//! the token is sent as `Authorization: Bearer {token}` and the
+//! timeout is applied to `connect`, `read`, and `write`.
 //!
 //! # Example
 //! ```no_run
@@ -20,16 +24,21 @@
 //! let addr = sdk.deploy_contract(&bytecode, "deployer", 0, 10_000_000)?;
 //! let result = sdk.call_contract(&addr, &calldata, "caller", 0, 1_000_000)?;
 //! let receipt = sdk.wait_for_receipt(&result.tx_hash, 30)?;
+//! # Ok::<_, shadowdag::sdk::shadowdag_sdk::SdkError>(())
 //! ```
 
 use serde::{Serialize, Deserialize};
 use serde_json::{json, Value};
 
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
+
 /// ShadowDAG SDK client.
 ///
-/// **STATUS: API defined, transport not connected.**
-/// All public methods are typed and documented, but rpc_call()
-/// needs an HTTP client implementation to function.
+/// Speaks JSON-RPC 2.0 over plain HTTP/1.1 to a ShadowDAG node. Use
+/// [`Self::with_auth`] and [`Self::with_timeout`] to customize the
+/// `Authorization` header and the socket connect/read/write timeout.
 pub struct ShadowDagSdk {
     rpc_url: String,
     auth_token: Option<String>,
@@ -252,31 +261,206 @@ impl ShadowDagSdk {
         self.rpc_call("get_contract_info", params)
     }
 
-    /// Raw RPC call helper.
+    /// Raw RPC call helper — JSON-RPC 2.0 over HTTP/1.1.
+    ///
+    /// This is a minimal hand-rolled client (matching the project's
+    /// `rpc_server.rs` style) with the following guarantees:
+    ///
+    /// - `self.timeout_secs` is applied to `connect`, `read`, and `write`.
+    ///   A connect / read timeout surfaces as [`SdkError::Timeout`].
+    /// - `self.auth_token`, if set, is sent as `Authorization: Bearer {token}`.
+    /// - `https://` URLs are rejected with a clear error (no TLS support).
+    /// - A JSON-RPC `error` field is propagated as [`SdkError::Rpc`].
+    /// - An HTTP 404 maps to [`SdkError::NotFound`].
+    /// - All other non-2xx statuses become [`SdkError::Rpc`] with body.
     fn rpc_call(&self, method: &str, params: Value) -> Result<Value, SdkError> {
-        // Build JSON-RPC request
-        let _request = json!({
+        let request = json!({
             "jsonrpc": "2.0",
             "method": method,
             "params": params,
             "id": 1
         });
+        let body = serde_json::to_string(&request)
+            .map_err(|e| SdkError::Other(format!("serialize request: {}", e)))?;
 
-        // NOTE: In a real implementation, this would use HTTP to connect
-        // to the RPC server. For now, we return the request structure
-        // so the SDK can be tested without a running node.
-        //
-        // Future: use reqwest or hyper for HTTP transport.
-        Err(SdkError::Other(format!(
-            "HTTP transport not yet connected. RPC URL: {}, Method: {}",
-            self.rpc_url, method
-        )))
+        let (host, port, path) = parse_rpc_url(&self.rpc_url)?;
+
+        // Resolve + connect with the configured timeout. We use
+        // `to_socket_addrs` (not `TcpStream::connect(&str)`) so the
+        // timeout actually applies to the connect phase.
+        let addr_str = format!("{}:{}", host, port);
+        let socket_addr = addr_str
+            .to_socket_addrs()
+            .map_err(|e| SdkError::Other(format!("resolve {}: {}", addr_str, e)))?
+            .next()
+            .ok_or_else(|| SdkError::Other(format!("no address for {}", addr_str)))?;
+
+        let timeout = Duration::from_secs(self.timeout_secs);
+        let mut stream = TcpStream::connect_timeout(&socket_addr, timeout).map_err(|e| {
+            match e.kind() {
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => SdkError::Timeout,
+                _ => SdkError::Other(format!("connect {} failed: {}", addr_str, e)),
+            }
+        })?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| SdkError::Other(format!("set_read_timeout: {}", e)))?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|e| SdkError::Other(format!("set_write_timeout: {}", e)))?;
+
+        // Build the HTTP request. Header order is canonical; Connection:
+        // close lets us use `read_to_end` as the termination signal, which
+        // avoids having to parse chunked transfer encoding.
+        let auth_line = match &self.auth_token {
+            Some(token) => format!("Authorization: Bearer {}\r\n", token),
+            None => String::new(),
+        };
+        let request_str = format!(
+            "POST {} HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             {}\
+             Connection: close\r\n\
+             \r\n\
+             {}",
+            path,
+            host,
+            body.len(),
+            auth_line,
+            body
+        );
+        stream
+            .write_all(request_str.as_bytes())
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => SdkError::Timeout,
+                _ => SdkError::Other(format!("write failed: {}", e)),
+            })?;
+
+        let mut raw_response = Vec::with_capacity(4096);
+        stream
+            .read_to_end(&mut raw_response)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => SdkError::Timeout,
+                _ => SdkError::Other(format!("read failed: {}", e)),
+            })?;
+
+        // The response body can contain arbitrary bytes but a correctly
+        // formed JSON-RPC response is always UTF-8. We lose nothing by
+        // using `from_utf8_lossy` for the header search and then taking
+        // the exact byte slice for the body.
+        let header_end = raw_response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or_else(|| SdkError::Other("malformed HTTP response: no header terminator".into()))?;
+        let headers_bytes = &raw_response[..header_end];
+        let body_bytes = &raw_response[header_end + 4..];
+
+        let headers_str = std::str::from_utf8(headers_bytes)
+            .map_err(|e| SdkError::Other(format!("non-UTF8 HTTP headers: {}", e)))?;
+        let status_line = headers_str
+            .lines()
+            .next()
+            .ok_or_else(|| SdkError::Other("empty HTTP response".into()))?;
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| SdkError::Other(format!("bad status line: {}", status_line)))?;
+
+        let body_str = std::str::from_utf8(body_bytes)
+            .map_err(|e| SdkError::Other(format!("non-UTF8 response body: {}", e)))?;
+
+        if status == 404 {
+            return Err(SdkError::NotFound);
+        }
+        if !(200..300).contains(&status) {
+            return Err(SdkError::Rpc(format!("HTTP {}: {}", status, body_str)));
+        }
+
+        let json: Value = serde_json::from_str(body_str)
+            .map_err(|e| SdkError::Other(format!("invalid JSON-RPC body: {}", e)))?;
+
+        // JSON-RPC error field wins over a 200 status — nodes return
+        // application-level errors this way.
+        if let Some(err) = json.get("error") {
+            if !err.is_null() {
+                // 404 and NotFound are also sometimes expressed via
+                // `error.code == -32601` (method not found) or a
+                // message containing "not found"; surface those as
+                // SdkError::NotFound so `wait_for_receipt` can poll.
+                let msg = err.to_string().to_ascii_lowercase();
+                if msg.contains("not found") {
+                    return Err(SdkError::NotFound);
+                }
+                return Err(SdkError::Rpc(err.to_string()));
+            }
+        }
+
+        json.get("result")
+            .cloned()
+            .ok_or_else(|| SdkError::Other("JSON-RPC response missing 'result' field".into()))
     }
 
     /// Get the RPC URL.
     pub fn rpc_url(&self) -> &str {
         &self.rpc_url
     }
+}
+
+// ── URL parsing ─────────────────────────────────────────────────────────
+
+/// Parse a plain-HTTP RPC URL into `(host, port, path)`.
+///
+/// Accepts `http://host[:port][/path]` (scheme optional, defaults to
+/// `http://`, default port 80, default path `/`). Rejects `https://`
+/// because TLS is not implemented in the SDK.
+fn parse_rpc_url(url: &str) -> Result<(String, u16, String), SdkError> {
+    let rest = if let Some(r) = url.strip_prefix("http://") {
+        r
+    } else if url.starts_with("https://") {
+        return Err(SdkError::Other(
+            "https:// is not supported by the SDK (no TLS). Use http://".into(),
+        ));
+    } else {
+        url
+    };
+
+    let (hostport, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].to_string()),
+        None => (rest, "/".to_string()),
+    };
+
+    // Handle bracketed IPv6 `[::1]:port` first so the `:` inside the
+    // address isn't mistaken for a port separator.
+    let (host, port) = if let Some(stripped) = hostport.strip_prefix('[') {
+        let end = stripped
+            .find(']')
+            .ok_or_else(|| SdkError::Other(format!("unterminated IPv6 literal in URL: {}", url)))?;
+        let host = &stripped[..end];
+        let after = &stripped[end + 1..];
+        let port = if let Some(p) = after.strip_prefix(':') {
+            p.parse::<u16>()
+                .map_err(|_| SdkError::Other(format!("invalid port in URL: {}", url)))?
+        } else {
+            80
+        };
+        (host.to_string(), port)
+    } else if let Some(i) = hostport.rfind(':') {
+        let port = hostport[i + 1..]
+            .parse::<u16>()
+            .map_err(|_| SdkError::Other(format!("invalid port in URL: {}", url)))?;
+        (hostport[..i].to_string(), port)
+    } else {
+        (hostport.to_string(), 80)
+    };
+
+    if host.is_empty() {
+        return Err(SdkError::Other(format!("URL has no host: {}", url)));
+    }
+
+    Ok((host, port, path))
 }
 
 #[cfg(test)]
@@ -288,10 +472,11 @@ mod tests {
         let sdk = ShadowDagSdk::new("http://localhost:9332");
         assert_eq!(sdk.rpc_url(), "http://localhost:9332");
         assert!(sdk.auth_token.is_none());
+        assert_eq!(sdk.timeout_secs, 30);
     }
 
     #[test]
-    fn sdk_with_auth() {
+    fn sdk_with_auth_and_timeout_are_honoured() {
         let sdk = ShadowDagSdk::new("http://localhost:9332")
             .with_auth("secret123")
             .with_timeout(60);
@@ -300,10 +485,19 @@ mod tests {
     }
 
     #[test]
-    fn sdk_deploy_returns_rpc_error() {
-        let sdk = ShadowDagSdk::new("http://localhost:9332");
+    fn sdk_deploy_returns_error_when_no_node_running() {
+        // A port we deliberately don't run anything on. Expect Rpc/Other,
+        // but NOT the old "HTTP transport not yet connected" message.
+        let sdk = ShadowDagSdk::new("http://127.0.0.1:1").with_timeout(1);
         let result = sdk.deploy_contract(&[0x00], "deployer", 0, 1000);
-        assert!(result.is_err()); // No running node
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            !msg.contains("HTTP transport not yet connected"),
+            "SDK still reports transport as stub: {}",
+            msg
+        );
     }
 
     #[test]
@@ -311,5 +505,61 @@ mod tests {
         assert_eq!(format!("{}", SdkError::Timeout), "Request timeout");
         assert_eq!(format!("{}", SdkError::NotFound), "Not found");
         assert!(format!("{}", SdkError::Rpc("test".into())).contains("test"));
+    }
+
+    #[test]
+    fn parse_url_with_port_and_path() {
+        let (h, p, path) = parse_rpc_url("http://localhost:9332/rpc").unwrap();
+        assert_eq!(h, "localhost");
+        assert_eq!(p, 9332);
+        assert_eq!(path, "/rpc");
+    }
+
+    #[test]
+    fn parse_url_without_scheme_defaults_to_http() {
+        let (h, p, path) = parse_rpc_url("example.com:8080").unwrap();
+        assert_eq!(h, "example.com");
+        assert_eq!(p, 8080);
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn parse_url_without_port_defaults_to_80() {
+        let (h, p, path) = parse_rpc_url("http://example.com").unwrap();
+        assert_eq!(h, "example.com");
+        assert_eq!(p, 80);
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn parse_url_ipv6_literal() {
+        let (h, p, path) = parse_rpc_url("http://[::1]:9332/").unwrap();
+        assert_eq!(h, "::1");
+        assert_eq!(p, 9332);
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn parse_url_rejects_https() {
+        let err = parse_rpc_url("https://example.com").unwrap_err();
+        assert!(format!("{}", err).contains("https"));
+    }
+
+    #[test]
+    fn parse_url_rejects_bad_port() {
+        assert!(parse_rpc_url("http://example.com:abc").is_err());
+    }
+
+    #[test]
+    fn parse_url_rejects_empty_host() {
+        assert!(parse_rpc_url("http://").is_err());
+    }
+
+    #[test]
+    fn sdk_rejects_https_at_call_time() {
+        let sdk = ShadowDagSdk::new("https://example.com").with_timeout(1);
+        let result = sdk.estimate_gas("SD1abc", &[], "caller", 0);
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("https"));
     }
 }
