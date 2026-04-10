@@ -506,11 +506,44 @@ mod tests {
 
     #[test]
     fn gas_costs_are_sane() {
-        assert_eq!(OpCode::STOP.gas_cost(), 0);
+        // DETERMINISM INVARIANT #9 (see vm.rs module header):
+        // All opcodes cost ≥ 1 gas. Previously STOP/NOP/JUMPDEST/
+        // RETURN/REVERT were 0 gas, but a loop like `LOOP: NOP JUMP(LOOP)`
+        // would then run forever without consuming gas. The floor of
+        // 1 prevents that infinite-loop DoS, and this test is the
+        // regression guard for the invariant.
+        assert!(
+            OpCode::STOP.gas_cost() >= 1,
+            "STOP must cost ≥ 1 gas (vm.rs invariant #9)"
+        );
+        assert!(OpCode::NOP.gas_cost() >= 1);
+        assert!(OpCode::JUMPDEST.gas_cost() >= 1);
+        assert!(OpCode::RETURN.gas_cost() >= 1);
+        assert!(OpCode::REVERT.gas_cost() >= 1);
+
         assert_eq!(OpCode::ADD.gas_cost(), 3);
         assert!(OpCode::SSTORE.gas_cost() > OpCode::SLOAD.gas_cost());
         assert!(OpCode::CREATE.gas_cost() > OpCode::CALL.gas_cost());
         assert!(OpCode::SELFDESTRUCT.gas_cost() > OpCode::SSTORE.gas_cost());
+    }
+
+    #[test]
+    fn every_opcode_respects_minimum_gas_invariant() {
+        // Exhaustive check of invariant #9 — every non-INVALID opcode
+        // in the enum must charge at least 1 gas. If a new opcode is
+        // added and accidentally assigned 0, this test must catch it
+        // instead of the inconsistency living only in a comment.
+        for b in 0..=255u8 {
+            let op = OpCode::from_byte(b);
+            if op == OpCode::INVALID {
+                continue;
+            }
+            assert!(
+                op.gas_cost() >= 1,
+                "opcode {:?} (byte 0x{:02x}) has gas_cost 0, violating invariant #9",
+                op, b
+            );
+        }
     }
 
     #[test]

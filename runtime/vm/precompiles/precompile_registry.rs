@@ -151,24 +151,59 @@ impl PrecompileRegistry {
         self.contracts.contains_key(&address)
     }
 
-    /// Execute a precompile by address
+    /// Execute a precompile by address.
+    ///
+    /// The registry enforces **both** ends of the precompile gas invariant:
+    ///
+    /// 1. **Floor (new):** `result.gas_used` is clamped UP to
+    ///    `required_gas = base_gas + per_word_gas * words`. If a
+    ///    precompile implementation under-reports gas usage — whether
+    ///    by a bug or by forgetting to charge per-word — the registry
+    ///    raises it to the declared schedule. This guarantees that the
+    ///    published `base_gas` / `per_word_gas` figures in this
+    ///    module are the ACTUAL minimum price paid per call, not just
+    ///    a pre-flight check that the caller has enough gas.
+    ///
+    /// 2. **Ceiling (existing):** `result.gas_used` is clamped DOWN to
+    ///    `gas_limit`. If a precompile over-reports gas, the caller is
+    ///    never charged more than it allocated.
+    ///
+    /// Both clamps are applied regardless of whether the precompile
+    /// reported success or failure, so that gas accounting cannot be
+    /// bypassed by returning an error with zero `gas_used`.
     pub fn execute(&self, address: u64, input: &[u8], gas_limit: u64) -> PrecompileResult {
         match self.contracts.get(&address) {
             Some(entry) => {
-                // Calculate gas cost
+                // Calculate gas cost from the declared schedule.
                 let words = (input.len() as u64).div_ceil(32);
-                let required_gas = entry.base_gas.saturating_add(words.saturating_mul(entry.per_word_gas));
+                let required_gas = entry
+                    .base_gas
+                    .saturating_add(words.saturating_mul(entry.per_word_gas));
 
                 if gas_limit < required_gas {
                     return PrecompileResult::err("insufficient gas for precompile", gas_limit);
                 }
 
-                // Execute the precompile function
+                // Execute the precompile function.
                 let mut result = (entry.func)(input, gas_limit);
 
-                // Enforce that the precompile does not report more gas than allocated.
-                // If a precompile implementation has a bug that over-reports gas_used,
-                // cap it to the gas_limit to maintain accounting invariants.
+                // (1) Floor: enforce that gas_used is at least the
+                //     declared required_gas from the gas schedule. This
+                //     catches precompile implementations that forget to
+                //     charge per-word gas, or return `PrecompileResult::err`
+                //     with `gas_used = 0` and thereby skip the base fee
+                //     entirely. The published gas schedule in `base_gas`
+                //     and `per_word_gas` is now the authoritative floor
+                //     regardless of what the implementation reports.
+                if result.gas_used < required_gas {
+                    result.gas_used = required_gas;
+                }
+
+                // (2) Ceiling: enforce that the precompile does not
+                //     report more gas than allocated. If a precompile
+                //     implementation has a bug that over-reports
+                //     gas_used, cap it to the gas_limit so the caller
+                //     is never charged more than it allowed.
                 if result.gas_used > gas_limit {
                     result.gas_used = gas_limit;
                 }
@@ -223,5 +258,103 @@ mod tests {
         let reg = PrecompileRegistry::new();
         let result = reg.execute(0x01, &[0u8; 128], 1); // ecrecover needs 3000
         assert!(!result.success);
+    }
+
+    // ── Gas floor enforcement (the new invariant) ────────────────────
+
+    /// A fake precompile that deliberately UNDER-reports gas usage by
+    /// returning `gas_used = 0`. Used to prove that the registry's new
+    /// floor clamp catches buggy precompiles that would otherwise skip
+    /// the base fee.
+    fn underreporting_precompile(_input: &[u8], _gas_limit: u64) -> PrecompileResult {
+        PrecompileResult::ok(vec![0xAA], 0) // ← lies about gas
+    }
+
+    /// A fake precompile that deliberately OVER-reports gas usage.
+    fn overreporting_precompile(_input: &[u8], gas_limit: u64) -> PrecompileResult {
+        PrecompileResult::ok(vec![0xBB], gas_limit * 10) // ← lies the other way
+    }
+
+    fn registry_with_fake(
+        addr: u64,
+        base_gas: u64,
+        per_word_gas: u64,
+        func: PrecompileFn,
+    ) -> PrecompileRegistry {
+        let mut reg = PrecompileRegistry::new();
+        reg.contracts.insert(
+            addr,
+            PrecompileEntry {
+                name: "fake",
+                address: addr,
+                base_gas,
+                per_word_gas,
+                func,
+            },
+        );
+        reg
+    }
+
+    #[test]
+    fn gas_floor_clamps_underreporting_precompile_to_required_gas() {
+        // With a declared base_gas of 5000 and an input of 0 words, the
+        // floor is exactly 5000. A precompile that returns gas_used = 0
+        // must be clamped UP to 5000 so the declared gas schedule is
+        // the authoritative price.
+        let reg = registry_with_fake(0xFE, 5000, 100, underreporting_precompile);
+        let result = reg.execute(0xFE, b"", 1_000_000);
+        assert!(result.success);
+        assert_eq!(
+            result.gas_used, 5000,
+            "under-reported gas must be clamped up to the declared base floor"
+        );
+    }
+
+    #[test]
+    fn gas_floor_includes_per_word_charge() {
+        // Input is 65 bytes → ceil(65/32) = 3 words → required_gas
+        // = base_gas(100) + per_word_gas(50)*3 = 100 + 150 = 250.
+        // Fake precompile reports 0 → must be clamped to 250, not 100.
+        let reg = registry_with_fake(0xFD, 100, 50, underreporting_precompile);
+        let result = reg.execute(0xFD, &[0u8; 65], 10_000);
+        assert!(result.success);
+        assert_eq!(
+            result.gas_used, 250,
+            "floor must include base_gas + per_word_gas * words, not just base_gas"
+        );
+    }
+
+    #[test]
+    fn gas_ceiling_still_clamps_overreporting_precompile() {
+        // And in the other direction, an over-reporting precompile is
+        // capped at the gas_limit the caller allocated.
+        let reg = registry_with_fake(0xFC, 100, 0, overreporting_precompile);
+        let result = reg.execute(0xFC, b"", 5_000);
+        assert!(result.success);
+        assert_eq!(
+            result.gas_used, 5_000,
+            "over-reported gas must be clamped down to gas_limit"
+        );
+    }
+
+    #[test]
+    fn gas_floor_applies_even_when_limit_exactly_matches_required() {
+        // Edge case: gas_limit == required_gas means the caller has
+        // exactly enough gas. Under-reporting must still be floored.
+        let reg = registry_with_fake(0xFB, 500, 0, underreporting_precompile);
+        let result = reg.execute(0xFB, b"", 500);
+        assert!(result.success);
+        assert_eq!(result.gas_used, 500);
+    }
+
+    #[test]
+    fn insufficient_gas_still_rejected_before_floor_applies() {
+        // The floor is an accounting enforcement; the existing pre-flight
+        // check still rejects calls where the CALLER didn't allocate
+        // enough gas — i.e. we don't silently charge the floor if the
+        // caller couldn't cover it.
+        let reg = registry_with_fake(0xFA, 1000, 0, underreporting_precompile);
+        let result = reg.execute(0xFA, b"", 500); // only 500, need 1000
+        assert!(!result.success, "insufficient-gas path must still reject");
     }
 }

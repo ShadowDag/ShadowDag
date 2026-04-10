@@ -1060,9 +1060,21 @@ impl ExecutionEnvironment {
                         return CallOutcome::Failure { gas_used: gas.gas_used() };
                     }
 
-                    // Compute address
+                    // Compute address. compute_create_address now returns
+                    // Result because an unknown deployer prefix must not
+                    // silently tag the new contract as mainnet. If the
+                    // currently-executing contract address is malformed
+                    // (shouldn't happen in practice, but we refuse to
+                    // synthesize state from garbage) we treat the CREATE
+                    // as a Failure outcome rather than proceeding.
                     let nonce = self.state.get_nonce(&ctx.address);
-                    let new_addr = ContractDeployer::compute_create_address(&ctx.address, nonce);
+                    let new_addr = match ContractDeployer::compute_create_address(&ctx.address, nonce) {
+                        Ok(addr) => addr,
+                        Err(_) => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        }
+                    };
                     self.state.increment_nonce(&ctx.address).ok();
 
                     // Check address not occupied
@@ -1151,8 +1163,19 @@ impl ExecutionEnvironment {
                         return CallOutcome::Failure { gas_used: gas.gas_used() };
                     }
 
+                    // Same fail-closed rationale as CREATE above: a bogus
+                    // deployer prefix must not produce a mainnet-tagged
+                    // contract address.
                     let salt_bytes = salt.to_be_bytes();
-                    let new_addr = ContractDeployer::compute_create2_address(&ctx.address, &salt_bytes, &init_code);
+                    let new_addr = match ContractDeployer::compute_create2_address(
+                        &ctx.address, &salt_bytes, &init_code,
+                    ) {
+                        Ok(addr) => addr,
+                        Err(_) => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        }
+                    };
 
                     self.state.increment_nonce(&ctx.address).ok();
 

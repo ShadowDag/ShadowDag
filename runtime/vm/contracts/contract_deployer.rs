@@ -8,9 +8,18 @@
 // CREATE:  address = SHA-256(deployer || nonce)
 // CREATE2: address = SHA-256(0xFF || deployer || salt || code_hash)
 //   (deterministic — same inputs always produce same address)
+//
+// Network-aware prefixes: every contract address produced by this module
+// **inherits the network of the deployer**. A mainnet deployer (`SD1…`)
+// creates a `SD1c…` contract, a testnet deployer (`ST1…`) creates a
+// `ST1c…` contract, and a regtest deployer (`SR1…`) creates a `SR1c…`
+// contract. Unknown-prefix deployers are rejected with a structured
+// `VmError::ContractError` so the VM never silently tags output with
+// the wrong network.
 // ═══════════════════════════════════════════════════════════════════════════
 
 use sha2::{Sha256, Digest};
+use crate::domain::address::address::prefix_from_address;
 use crate::errors::VmError;
 
 /// Gas cost for contract creation
@@ -49,14 +58,33 @@ pub enum CreateMethod {
 pub struct ContractDeployer;
 
 impl ContractDeployer {
-    /// CREATE: deploy contract with nonce-based address
+    /// Look up the network prefix for `deployer` and fail fast with a
+    /// structured error when it is not a known ShadowDAG address.
+    /// Centralizing this means the four address-computing entry points
+    /// below can't silently disagree on what "mainnet" means.
+    fn deployer_prefix(deployer: &str) -> Result<&'static str, VmError> {
+        prefix_from_address(deployer).ok_or_else(|| {
+            VmError::ContractError(format!(
+                "contract deployer '{}' has unknown network prefix \
+                 (expected SD1/ST1/SR1)",
+                deployer
+            ))
+        })
+    }
+
+    /// CREATE: deploy contract with nonce-based address.
     ///
-    /// address = "SD1c" || hex(SHA-256("ShadowDAG_CREATE" || deployer || nonce))[0..40]
+    /// The generated address inherits the deployer's network:
+    /// `{net}c` || hex(SHA-256("ShadowDAG_CREATE" || deployer || nonce))[0..40]
     pub fn create(
         deployer: &str,
         nonce: u64,
         init_code: &[u8],
     ) -> Result<DeployResult, VmError> {
+        // Resolve the network FIRST — a bogus deployer should fail
+        // before we spend cycles validating the init code.
+        let net_prefix = Self::deployer_prefix(deployer)?;
+
         // Validate init code size
         if init_code.is_empty() {
             return Err(VmError::ContractError("empty init code".to_string()));
@@ -71,7 +99,7 @@ impl ContractDeployer {
         Digest::update(&mut h, deployer.as_bytes());
         Digest::update(&mut h, nonce.to_le_bytes());
         let hash = Digest::finalize(h);
-        let address = format!("SD1c{}", hex::encode(&hash[..20]));
+        let address = format!("{}c{}", net_prefix, hex::encode(&hash[..20]));
 
         // Calculate gas
         let gas = CREATE_BASE_GAS
@@ -86,14 +114,17 @@ impl ContractDeployer {
         })
     }
 
-    /// CREATE2: deploy contract with deterministic address
+    /// CREATE2: deploy contract with deterministic address.
     ///
-    /// address = "SD1c" || hex(SHA-256(0xFF || deployer || salt || SHA-256(init_code)))[0..40]
+    /// The generated address inherits the deployer's network:
+    /// `{net}c` || hex(SHA-256(0xFF || deployer || salt || SHA-256(init_code)))[0..40]
     pub fn create2(
         deployer: &str,
         salt: [u8; 32],
         init_code: &[u8],
     ) -> Result<DeployResult, VmError> {
+        let net_prefix = Self::deployer_prefix(deployer)?;
+
         if init_code.is_empty() {
             return Err(VmError::ContractError("empty init code".to_string()));
         }
@@ -113,7 +144,7 @@ impl ContractDeployer {
         Digest::update(&mut h, salt);
         Digest::update(&mut h, code_hash);
         let hash = Digest::finalize(h);
-        let address = format!("SD1c{}", hex::encode(&hash[..20]));
+        let address = format!("{}c{}", net_prefix, hex::encode(&hash[..20]));
 
         let gas = CREATE2_BASE_GAS
             .saturating_add((init_code.len() as u64).saturating_mul(CODE_DEPOSIT_GAS_PER_BYTE));
@@ -127,27 +158,43 @@ impl ContractDeployer {
         })
     }
 
-    /// Compute CREATE address from deployer and nonce (no validation).
-    /// Used by ExecutionEnvironment for inline CREATE opcode.
+    /// Compute CREATE address from deployer and nonce (no size validation).
+    /// Used by ExecutionEnvironment for the inline CREATE opcode.
+    ///
+    /// Returns `Err(VmError::ContractError)` if the deployer has no
+    /// recognized network prefix, so the in-VM CREATE opcode can
+    /// refuse to mint an address from a malformed account string
+    /// instead of silently tagging it as mainnet.
     ///
     /// hash = SHA-256("ShadowDAG_CREATE" || deployer || nonce_le_bytes)
-    /// address = "SD1c" + hex(hash[0..20])
-    pub fn compute_create_address(deployer: &str, nonce: u64) -> String {
+    /// address = `{net}c` + hex(hash[0..20])
+    pub fn compute_create_address(deployer: &str, nonce: u64) -> Result<String, VmError> {
+        let net_prefix = Self::deployer_prefix(deployer)?;
         let mut h = <Sha256 as Digest>::new();
         Digest::update(&mut h, b"ShadowDAG_CREATE");
         Digest::update(&mut h, deployer.as_bytes());
         Digest::update(&mut h, nonce.to_le_bytes());
         let hash = Digest::finalize(h);
-        format!("SD1c{}", hex::encode(&hash[..20]))
+        Ok(format!("{}c{}", net_prefix, hex::encode(&hash[..20])))
     }
 
-    /// Compute CREATE2 address from deployer, salt, and init code (no validation).
-    /// Used by ExecutionEnvironment for inline CREATE2 opcode.
+    /// Compute CREATE2 address from deployer, salt, and init code (no
+    /// size validation). Used by ExecutionEnvironment for the inline
+    /// CREATE2 opcode.
+    ///
+    /// Returns `Err(VmError::ContractError)` for an unknown deployer
+    /// prefix. See [`Self::compute_create_address`] for rationale.
     ///
     /// code_hash = SHA-256(init_code)
     /// hash = SHA-256(0xFF || deployer || salt || code_hash)
-    /// address = "SD1c" + hex(hash[0..20])
-    pub fn compute_create2_address(deployer: &str, salt: &[u8], init_code: &[u8]) -> String {
+    /// address = `{net}c` + hex(hash[0..20])
+    pub fn compute_create2_address(
+        deployer: &str,
+        salt: &[u8],
+        init_code: &[u8],
+    ) -> Result<String, VmError> {
+        let net_prefix = Self::deployer_prefix(deployer)?;
+
         let mut code_hasher = <Sha256 as Digest>::new();
         Digest::update(&mut code_hasher, init_code);
         let code_hash = Digest::finalize(code_hasher);
@@ -158,15 +205,22 @@ impl ContractDeployer {
         Digest::update(&mut h, salt);
         Digest::update(&mut h, code_hash);
         let hash = Digest::finalize(h);
-        format!("SD1c{}", hex::encode(&hash[..20]))
+        Ok(format!("{}c{}", net_prefix, hex::encode(&hash[..20])))
     }
 
-    /// Predict CREATE2 address without deploying
+    /// Predict CREATE2 address without deploying.
+    ///
+    /// Returns `Err(VmError::ContractError)` for an unknown deployer
+    /// prefix. This keeps predict / create / compute in agreement:
+    /// you can't predict an address the real CREATE2 path would refuse
+    /// to produce.
     pub fn predict_create2_address(
         deployer: &str,
         salt: [u8; 32],
         init_code: &[u8],
-    ) -> String {
+    ) -> Result<String, VmError> {
+        let net_prefix = Self::deployer_prefix(deployer)?;
+
         let mut code_hasher = <Sha256 as Digest>::new();
         Digest::update(&mut code_hasher, init_code);
         let code_hash = Digest::finalize(code_hasher);
@@ -177,7 +231,7 @@ impl ContractDeployer {
         Digest::update(&mut h, salt);
         Digest::update(&mut h, code_hash);
         let hash = Digest::finalize(h);
-        format!("SD1c{}", hex::encode(&hash[..20]))
+        Ok(format!("{}c{}", net_prefix, hex::encode(&hash[..20])))
     }
 
     /// Validate runtime code after init execution
@@ -210,17 +264,27 @@ pub struct DeployResult {
 mod tests {
     use super::*;
 
+    // ── Test addresses — always network-valid ────────────────────────
+    // The deployer strings in these tests deliberately start with a
+    // real ShadowDAG network prefix (SD1/ST1/SR1) rather than
+    // generic placeholders like "deployer_a". The old tests used
+    // placeholders and therefore silently worked against a
+    // hard-coded "SD1c" output, hiding the network-bias bug.
+    const MAINNET_DEPLOYER: &str = "SD1deployeralpha";
+    const TESTNET_DEPLOYER: &str = "ST1deployerbeta";
+    const REGTEST_DEPLOYER: &str = "SR1deployergamma";
+
     #[test]
     fn create_deterministic() {
-        let r1 = ContractDeployer::create("deployer_a", 0, &[0x60, 0x00]).unwrap();
-        let r2 = ContractDeployer::create("deployer_a", 0, &[0x60, 0x00]).unwrap();
+        let r1 = ContractDeployer::create(MAINNET_DEPLOYER, 0, &[0x60, 0x00]).unwrap();
+        let r2 = ContractDeployer::create(MAINNET_DEPLOYER, 0, &[0x60, 0x00]).unwrap();
         assert_eq!(r1.address, r2.address);
     }
 
     #[test]
     fn create_different_nonce_different_address() {
-        let r1 = ContractDeployer::create("deployer_a", 0, &[0x60, 0x00]).unwrap();
-        let r2 = ContractDeployer::create("deployer_a", 1, &[0x60, 0x00]).unwrap();
+        let r1 = ContractDeployer::create(MAINNET_DEPLOYER, 0, &[0x60, 0x00]).unwrap();
+        let r2 = ContractDeployer::create(MAINNET_DEPLOYER, 1, &[0x60, 0x00]).unwrap();
         assert_ne!(r1.address, r2.address);
     }
 
@@ -228,8 +292,8 @@ mod tests {
     fn create2_deterministic() {
         let salt = [0xAA; 32];
         let code = vec![0x60, 0x00, 0x60, 0x00];
-        let r1 = ContractDeployer::create2("deployer_b", salt, &code).unwrap();
-        let r2 = ContractDeployer::create2("deployer_b", salt, &code).unwrap();
+        let r1 = ContractDeployer::create2(MAINNET_DEPLOYER, salt, &code).unwrap();
+        let r2 = ContractDeployer::create2(MAINNET_DEPLOYER, salt, &code).unwrap();
         assert_eq!(r1.address, r2.address);
     }
 
@@ -237,26 +301,114 @@ mod tests {
     fn create2_predict_matches() {
         let salt = [0xBB; 32];
         let code = vec![0x60, 0x00];
-        let predicted = ContractDeployer::predict_create2_address("x", salt, &code);
-        let deployed = ContractDeployer::create2("x", salt, &code).unwrap();
+        let predicted = ContractDeployer::predict_create2_address(MAINNET_DEPLOYER, salt, &code).unwrap();
+        let deployed = ContractDeployer::create2(MAINNET_DEPLOYER, salt, &code).unwrap();
         assert_eq!(predicted, deployed.address);
     }
 
     #[test]
-    fn address_starts_with_sd1c() {
-        let r = ContractDeployer::create("test", 0, &[0x00]).unwrap();
-        assert!(r.address.starts_with("SD1c"));
+    fn mainnet_deployer_produces_sd1c_address() {
+        let r = ContractDeployer::create(MAINNET_DEPLOYER, 0, &[0x00]).unwrap();
+        assert!(r.address.starts_with("SD1c"), "got: {}", r.address);
+    }
+
+    #[test]
+    fn testnet_deployer_produces_st1c_address() {
+        // Regression for the bug where CREATE hard-coded "SD1c" and
+        // silently mis-tagged all non-mainnet deployments.
+        let r = ContractDeployer::create(TESTNET_DEPLOYER, 0, &[0x00]).unwrap();
+        assert!(r.address.starts_with("ST1c"), "got: {}", r.address);
+        assert!(!r.address.starts_with("SD1"), "testnet contract must not be tagged mainnet");
+    }
+
+    #[test]
+    fn regtest_deployer_produces_sr1c_address() {
+        let r = ContractDeployer::create(REGTEST_DEPLOYER, 0, &[0x00]).unwrap();
+        assert!(r.address.starts_with("SR1c"), "got: {}", r.address);
+        assert!(!r.address.starts_with("SD1"), "regtest contract must not be tagged mainnet");
+    }
+
+    #[test]
+    fn create2_inherits_network_across_all_three_networks() {
+        let salt = [0xCC; 32];
+        let code = vec![0x60, 0x00];
+
+        let mainnet = ContractDeployer::create2(MAINNET_DEPLOYER, salt, &code).unwrap();
+        let testnet = ContractDeployer::create2(TESTNET_DEPLOYER, salt, &code).unwrap();
+        let regtest = ContractDeployer::create2(REGTEST_DEPLOYER, salt, &code).unwrap();
+
+        assert!(mainnet.address.starts_with("SD1c"));
+        assert!(testnet.address.starts_with("ST1c"));
+        assert!(regtest.address.starts_with("SR1c"));
+
+        // The address bytes must also differ: the hash input doesn't
+        // change, but the VISIBLE prefix does — clients reading the
+        // address must see the right network.
+        assert_ne!(mainnet.address, testnet.address);
+        assert_ne!(testnet.address, regtest.address);
+    }
+
+    #[test]
+    fn compute_create_address_inherits_network() {
+        let m = ContractDeployer::compute_create_address(MAINNET_DEPLOYER, 0).unwrap();
+        let t = ContractDeployer::compute_create_address(TESTNET_DEPLOYER, 0).unwrap();
+        let r = ContractDeployer::compute_create_address(REGTEST_DEPLOYER, 0).unwrap();
+        assert!(m.starts_with("SD1c"));
+        assert!(t.starts_with("ST1c"));
+        assert!(r.starts_with("SR1c"));
+    }
+
+    #[test]
+    fn compute_create2_address_inherits_network() {
+        let salt = [0xDD; 32];
+        let code = vec![0x60, 0x00];
+        let m = ContractDeployer::compute_create2_address(MAINNET_DEPLOYER, &salt, &code).unwrap();
+        let t = ContractDeployer::compute_create2_address(TESTNET_DEPLOYER, &salt, &code).unwrap();
+        let r = ContractDeployer::compute_create2_address(REGTEST_DEPLOYER, &salt, &code).unwrap();
+        assert!(m.starts_with("SD1c"));
+        assert!(t.starts_with("ST1c"));
+        assert!(r.starts_with("SR1c"));
+    }
+
+    #[test]
+    fn predict_create2_address_inherits_network() {
+        let salt = [0xEE; 32];
+        let code = vec![0x60, 0x00];
+        let m = ContractDeployer::predict_create2_address(MAINNET_DEPLOYER, salt, &code).unwrap();
+        let t = ContractDeployer::predict_create2_address(TESTNET_DEPLOYER, salt, &code).unwrap();
+        let r = ContractDeployer::predict_create2_address(REGTEST_DEPLOYER, salt, &code).unwrap();
+        assert!(m.starts_with("SD1c"));
+        assert!(t.starts_with("ST1c"));
+        assert!(r.starts_with("SR1c"));
+    }
+
+    #[test]
+    fn unknown_deployer_prefix_rejected_on_all_entry_points() {
+        let bad = "BTC1notours";
+        let salt = [0x00; 32];
+        let code = vec![0x60, 0x00];
+
+        assert!(ContractDeployer::create(bad, 0, &code).is_err());
+        assert!(ContractDeployer::create2(bad, salt, &code).is_err());
+        assert!(ContractDeployer::compute_create_address(bad, 0).is_err());
+        assert!(ContractDeployer::compute_create2_address(bad, &salt, &code).is_err());
+        assert!(ContractDeployer::predict_create2_address(bad, salt, &code).is_err());
+    }
+
+    #[test]
+    fn empty_deployer_string_rejected() {
+        assert!(ContractDeployer::create("", 0, &[0x00]).is_err());
     }
 
     #[test]
     fn empty_code_rejected() {
-        assert!(ContractDeployer::create("a", 0, &[]).is_err());
+        assert!(ContractDeployer::create(MAINNET_DEPLOYER, 0, &[]).is_err());
     }
 
     #[test]
     fn oversized_code_rejected() {
         let big = vec![0x00; MAX_INIT_CODE_SIZE + 1];
-        assert!(ContractDeployer::create("a", 0, &big).is_err());
+        assert!(ContractDeployer::create(MAINNET_DEPLOYER, 0, &big).is_err());
     }
 
     #[test]
