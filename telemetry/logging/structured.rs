@@ -141,6 +141,12 @@ impl LogEvent {
     }
 
     /// Format as human-readable line.
+    ///
+    /// Field values are sanitized via [`escape_plain`] to prevent log forging
+    /// or multi-line injection: newlines, CR, tab, and other control characters
+    /// in untrusted field values (peer addresses, error messages, etc.) are
+    /// escaped so they cannot synthesize fake log entries or break downstream
+    /// line-based parsers.
     pub fn to_pretty(&self) -> String {
         let secs = self.timestamp / 1000;
         let ms   = self.timestamp % 1000;
@@ -155,12 +161,16 @@ impl LogEvent {
             s.push(' ');
             s.push_str(k);
             s.push('=');
-            s.push_str(v);
+            s.push_str(&escape_plain(v));
         }
         s
     }
 
     /// Format as compact key=value line.
+    ///
+    /// Field values are sanitized via [`escape_plain`] (see `to_pretty` for
+    /// rationale) and then wrapped in quotes when they contain whitespace,
+    /// `=`, or `"` so that `key=value` pairs remain unambiguously parseable.
     pub fn to_compact(&self) -> String {
         let mut s = String::with_capacity(256);
         s.push_str("ts=");
@@ -175,7 +185,7 @@ impl LogEvent {
             s.push(' ');
             s.push_str(k);
             s.push('=');
-            s.push_str(v);
+            s.push_str(&format_compact_value(v));
         }
         s
     }
@@ -199,6 +209,57 @@ fn escape_json(s: &str) -> String {
     out
 }
 
+// ── Pretty/compact escape helpers ───────────────────────────────────────
+
+/// Escape a plain-text field value for embedding in pretty or compact log
+/// output. Protects against log forging and multi-line injection by turning
+/// newlines, carriage returns, tabs, and other control characters into
+/// printable escape sequences.
+///
+/// Unlike `escape_json`, this does NOT touch `"` or `\` — those characters
+/// are allowed verbatim in human-readable logs.
+fn escape_plain(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // 0x00-0x1F (except the three above) and DEL → hex escape
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Escape a field value for the compact `key=value` format.
+///
+/// Applies `escape_plain` first, then wraps the result in double quotes
+/// when the value contains whitespace, `=`, or `"` — so that `key=value`
+/// remains unambiguously parseable. Internal `"` is escaped to `\"`.
+fn format_compact_value(s: &str) -> String {
+    let escaped = escape_plain(s);
+    let needs_quoting = escaped.chars().any(|c| c.is_whitespace() || c == '=' || c == '"');
+    if needs_quoting {
+        let mut out = String::with_capacity(escaped.len() + 2);
+        out.push('"');
+        for c in escaped.chars() {
+            if c == '"' {
+                out.push_str("\\\"");
+            } else {
+                out.push(c);
+            }
+        }
+        out.push('"');
+        out
+    } else {
+        escaped
+    }
+}
+
 // ── Global logger state ─────────────────────────────────────────────────
 
 static LOG_FORMAT: OnceLock<LogFormat> = OnceLock::new();
@@ -210,10 +271,27 @@ static LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static LOG_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Initialize the structured logger. Safe to call multiple times (first wins).
+///
+/// The minimum level is taken from `SHADOWDAG_LOG_LEVEL` (or INFO if unset).
+/// Callers who have already resolved a level from CLI flags or a config file
+/// should prefer [`init_with_level`] so that the structured logger and any
+/// neighbouring loggers (e.g. `env_logger`) stay in sync.
 pub fn init() {
     let _ = LOG_FORMAT.set(LogFormat::from_env());
     let level_str = std::env::var("SHADOWDAG_LOG_LEVEL").unwrap_or_else(|_| "INFO".to_string());
     let _ = MIN_LEVEL.set(Level::from_str(&level_str));
+}
+
+/// Initialize the structured logger with an explicit minimum level.
+///
+/// Use this instead of [`init`] when another part of the process (for
+/// example `env_logger` configured via `LogConfig::init_with_level`) has
+/// already chosen a level — otherwise the two loggers can silently drift
+/// out of sync because [`init`] only consults `SHADOWDAG_LOG_LEVEL`.
+/// Safe to call multiple times (first wins, matches [`init`] semantics).
+pub fn init_with_level(level: Level) {
+    let _ = LOG_FORMAT.set(LogFormat::from_env());
+    let _ = MIN_LEVEL.set(level);
 }
 
 /// Get current format.
@@ -380,5 +458,51 @@ mod tests {
         init();
         slog!(Level::Info, "test", "macro_test", key => "val", num => 42);
         slog_info!("test", "convenience_test", x => 1);
+    }
+
+    #[test]
+    fn pretty_escapes_control_chars_and_newlines() {
+        // An attacker-controlled field value containing newlines and a
+        // synthetic "fake" line must not break the output onto multiple
+        // lines or allow log forging.
+        let malicious = "normal\nFATAL [security] fake_alert admin_bypass=1";
+        let ev = LogEvent::new(Level::Info, "p2p", "peer_msg")
+            .field("addr", malicious);
+        let pretty = ev.to_pretty();
+        // Result must still be exactly one line
+        assert_eq!(pretty.matches('\n').count(), 0, "to_pretty leaked a newline: {}", pretty);
+        // And the forged content must be escaped, not inline
+        assert!(pretty.contains("\\n"));
+        assert!(!pretty.contains("\nFATAL"));
+    }
+
+    #[test]
+    fn compact_escapes_and_quotes_values_with_whitespace() {
+        // Compact format uses key=value pairs; values containing spaces,
+        // `=`, or `"` must be quoted so downstream parsers can recover
+        // the original value unambiguously.
+        let ev = LogEvent::new(Level::Info, "mempool", "tx_rejected")
+            .field("reason", "fee too low")
+            .field("hash", "abc123")
+            .field("bad", "key=injected");
+        let compact = ev.to_compact();
+        // Whitespace-containing value must be quoted
+        assert!(compact.contains("reason=\"fee too low\""));
+        // Simple value must NOT be quoted
+        assert!(compact.contains("hash=abc123"));
+        // `=`-containing value must be quoted to disambiguate
+        assert!(compact.contains("bad=\"key=injected\""));
+        // And the whole thing must still be a single line
+        assert_eq!(compact.matches('\n').count(), 0);
+    }
+
+    #[test]
+    fn compact_escapes_control_chars_in_values() {
+        let malicious = "v1\nts=0 level=FATAL sub=sec event=forged";
+        let ev = LogEvent::new(Level::Info, "p2p", "peer_msg")
+            .field("x", malicious);
+        let compact = ev.to_compact();
+        assert_eq!(compact.matches('\n').count(), 0);
+        assert!(compact.contains("\\n"));
     }
 }
