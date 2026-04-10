@@ -1100,7 +1100,18 @@ mod tests {
         let vm = make_vm();
         let result = exec(&vm, &[0x00], 1000); // STOP
         match result {
-            ExecutionResult::Success { gas_used, .. } => assert_eq!(gas_used, 0),
+            // Per invariant #9 (vm.rs module header), STOP costs ≥ 1 gas
+            // to prevent free-opcode infinite loops — so a single STOP
+            // execution MUST consume at least that floor. Previously this
+            // asserted `gas_used == 0`, which matched the old 0-gas STOP
+            // and now contradicts the actual gas schedule in opcodes.rs.
+            ExecutionResult::Success { gas_used, .. } => {
+                assert!(
+                    gas_used >= OpCode::STOP.gas_cost(),
+                    "STOP should consume at least its declared gas cost, got gas_used={}",
+                    gas_used
+                );
+            }
             _ => panic!("Expected success"),
         }
     }
