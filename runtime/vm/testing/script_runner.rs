@@ -64,21 +64,28 @@ pub struct ScriptRunner {
 }
 
 impl ScriptRunner {
-    pub fn new(network: &str, deployer: &str) -> Self {
-        Self {
+    /// Create a new ScriptRunner for the given network.
+    ///
+    /// Returns `Err(VmError::ContractError)` if `network` is not one
+    /// of the known ShadowDAG networks — the cascade comes from
+    /// `DeploymentManifest::new`, which now refuses to build a
+    /// manifest for an unknown network string instead of silently
+    /// defaulting to `chain_id = 0` with a bogus RPC URL.
+    pub fn new(network: &str, deployer: &str) -> Result<Self, crate::errors::VmError> {
+        Ok(Self {
             env: ExecutionEnvironment::new(BlockContext {
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default().as_secs(),
                 block_hash: "00".repeat(32),
             }),
-            manifest: DeploymentManifest::new(network),
+            manifest: DeploymentManifest::new(network)?,
             storage: None,
             deployed: std::collections::HashMap::new(),
             results: Vec::new(),
             deployer: deployer.to_string(),
             block_height: 0,
-        }
+        })
     }
 
     /// Attach persistent storage for verification and state persistence.
@@ -326,7 +333,7 @@ mod tests {
 
     #[test]
     fn script_deploy_and_call() {
-        let mut runner = ScriptRunner::new("local", "deployer");
+        let mut runner = ScriptRunner::new("local", "deployer").expect("local is valid");
         runner.fund_deployer(1_000_000_000);
 
         let abi = ContractAbi::new("Counter");
@@ -356,7 +363,7 @@ mod tests {
 
     #[test]
     fn script_idempotent_deploy() {
-        let mut runner = ScriptRunner::new("local", "deployer");
+        let mut runner = ScriptRunner::new("local", "deployer").expect("local is valid");
         runner.fund_deployer(1_000_000_000);
         let abi = ContractAbi::new("Token");
         let bytecode = vec![0x00]; // STOP
@@ -376,7 +383,7 @@ mod tests {
 
     #[test]
     fn script_stops_on_failure() {
-        let mut runner = ScriptRunner::new("local", "deployer");
+        let mut runner = ScriptRunner::new("local", "deployer").expect("local is valid");
         // Don't fund -- deploy will fail due to v1 validation if bad bytecode
         // Actually: deploy with 0xFF (INVALID opcode) -- v1 validation catches it
         let abi = ContractAbi::new("Bad");
@@ -390,7 +397,7 @@ mod tests {
 
     #[test]
     fn script_manifest_populated() {
-        let mut runner = ScriptRunner::new("testnet", "deployer");
+        let mut runner = ScriptRunner::new("testnet", "deployer").expect("testnet is valid");
         runner.fund_deployer(1_000_000_000);
         let abi = ContractAbi::new("MyToken");
         runner.execute(&[

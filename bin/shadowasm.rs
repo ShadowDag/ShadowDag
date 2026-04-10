@@ -498,9 +498,15 @@ fn cmd_script(args: &[String]) {
     }
 
     use shadowdag::runtime::vm::testing::script_runner::*;
-    
 
-    let mut runner = ScriptRunner::new(&network, "script_deployer");
+
+    let mut runner = match ScriptRunner::new(&network, "script_deployer") {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: invalid deployment network '{}': {}", network, e);
+            std::process::exit(1);
+        }
+    };
     runner.fund_deployer(1_000_000_000_000);
 
     let results = runner.execute(&actions);

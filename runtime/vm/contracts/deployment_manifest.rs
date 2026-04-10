@@ -9,6 +9,8 @@
 use std::collections::BTreeMap;
 use serde::{Serialize, Deserialize};
 
+use crate::errors::VmError;
+
 /// Per-network deployment registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentManifest {
@@ -48,25 +50,69 @@ pub struct DeployedContract {
     pub package_file: Option<String>,
 }
 
+/// Canonicalize a network name into one of the three on-chain
+/// networks: `"mainnet"`, `"testnet"`, `"regtest"`. The alias
+/// `"local"` is accepted and folded into `"regtest"` for historical
+/// compatibility with existing scripts and `ScriptRunner` tests.
+/// Any other name returns `None` so the caller can fail-closed
+/// instead of producing a manifest with `chain_id = 0` and a
+/// random default RPC URL.
+fn canonical_network(network: &str) -> Option<&'static str> {
+    match network {
+        "mainnet" => Some("mainnet"),
+        "testnet" => Some("testnet"),
+        "regtest" | "local" => Some("regtest"),
+        _ => None,
+    }
+}
+
 impl DeploymentManifest {
-    pub fn new(network: &str) -> Self {
-        Self {
-            network: network.to_string(),
+    /// Create an empty deployment manifest for the given network.
+    ///
+    /// Returns `Err(VmError::ContractError)` if `network` is not one
+    /// of the known ShadowDAG networks (`mainnet` / `testnet` /
+    /// `regtest`, plus `local` as an alias for `regtest`).
+    ///
+    /// The previous implementation accepted ANY string and silently
+    /// coerced unknown names to `chain_id = 0` with a default RPC
+    /// URL pointing at `localhost:29332`. A typo like `"mainmet"`
+    /// therefore produced a manifest that looked valid but was
+    /// bound to the wrong (non-)chain. The new signature forces
+    /// the caller to handle the error path explicitly, and the
+    /// returned manifest always has a well-defined `chain_id` and
+    /// `rpc_url` for one of the three real networks.
+    pub fn new(network: &str) -> Result<Self, VmError> {
+        let canonical = canonical_network(network).ok_or_else(|| {
+            VmError::ContractError(format!(
+                "unknown deployment network '{}': expected one of \
+                 mainnet, testnet, regtest (or 'local' as alias for regtest)",
+                network
+            ))
+        })?;
+
+        let chain_id = match canonical {
+            "mainnet" => 0xDA0C_0001,
+            "testnet" => 0xDA0C_0002,
+            "regtest" => 0xDA0C_0003,
+            // Unreachable: canonical_network only returns the three
+            // strings above.
+            _ => unreachable!("canonical_network returned unknown value"),
+        };
+        let rpc_url = match canonical {
+            "mainnet" => "http://localhost:9332".into(),
+            "testnet" => "http://localhost:19332".into(),
+            "regtest" => "http://localhost:29332".into(),
+            _ => unreachable!(),
+        };
+
+        Ok(Self {
+            network: canonical.to_string(),
             contracts: BTreeMap::new(),
             version: 1,
-            chain_id: match network {
-                "mainnet" => 0xDA0C_0001,
-                "testnet" => 0xDA0C_0002,
-                "regtest" | "local" => 0xDA0C_0003,
-                _ => 0,
-            },
-            rpc_url: match network {
-                "mainnet" => "http://localhost:9332".into(),
-                "testnet" => "http://localhost:19332".into(),
-                _ => "http://localhost:29332".into(),
-            },
+            chain_id,
+            rpc_url,
             migration_version: 0,
-        }
+        })
     }
 
     pub fn increment_migration(&mut self) {
@@ -110,14 +156,18 @@ mod tests {
 
     #[test]
     fn manifest_create_and_query() {
-        let mut m = DeploymentManifest::new("testnet");
+        let mut m = DeploymentManifest::new("testnet").expect("testnet is valid");
+        assert_eq!(m.network, "testnet");
         assert_eq!(m.chain_id, 0xDA0C_0002);
         assert_eq!(m.rpc_url, "http://localhost:19332");
         assert_eq!(m.migration_version, 0);
 
+        // Use a testnet-prefixed address (ST1c…) so the test doesn't
+        // silently drift into mainnet-tagged contract addresses on a
+        // testnet manifest.
         m.add_deployment(DeployedContract {
             name: "MyToken".into(),
-            address: "SD1c_abc123".into(),
+            address: "ST1c_abc123".into(),
             bytecode_hash: "hash123".into(),
             deploy_height: 1000,
             deploy_tx: "tx_abc".into(),
@@ -128,27 +178,51 @@ mod tests {
         });
 
         assert!(m.is_deployed("MyToken"));
-        assert_eq!(m.get_address("MyToken"), Some("SD1c_abc123"));
+        assert_eq!(m.get_address("MyToken"), Some("ST1c_abc123"));
         assert!(!m.is_deployed("Other"));
     }
 
     #[test]
     fn manifest_chain_ids() {
-        let mainnet = DeploymentManifest::new("mainnet");
+        let mainnet = DeploymentManifest::new("mainnet").unwrap();
+        assert_eq!(mainnet.network, "mainnet");
         assert_eq!(mainnet.chain_id, 0xDA0C_0001);
         assert_eq!(mainnet.rpc_url, "http://localhost:9332");
 
-        let local = DeploymentManifest::new("local");
+        // "local" canonicalizes to "regtest" — same chain_id AND same
+        // network string, so there is no drift between scripts that
+        // pass "local" and scripts that pass "regtest".
+        let local = DeploymentManifest::new("local").unwrap();
+        assert_eq!(local.network, "regtest");
         assert_eq!(local.chain_id, 0xDA0C_0003);
         assert_eq!(local.rpc_url, "http://localhost:29332");
 
-        let regtest = DeploymentManifest::new("regtest");
+        let regtest = DeploymentManifest::new("regtest").unwrap();
+        assert_eq!(regtest.network, "regtest");
         assert_eq!(regtest.chain_id, 0xDA0C_0003);
     }
 
     #[test]
+    fn manifest_rejects_unknown_network() {
+        // Regression for the silent-chain_id-0 fallback bug. A typo
+        // must produce a structured error, not a manifest bound to
+        // a non-network.
+        let err = DeploymentManifest::new("mainmet").unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("unknown deployment network"),
+            "error must describe the problem, got: {}", msg
+        );
+        assert!(msg.contains("mainmet"), "error must include the offending name");
+
+        assert!(DeploymentManifest::new("").is_err());
+        assert!(DeploymentManifest::new("devnet").is_err());
+        assert!(DeploymentManifest::new("Mainnet").is_err()); // case-sensitive
+    }
+
+    #[test]
     fn manifest_increment_migration() {
-        let mut m = DeploymentManifest::new("local");
+        let mut m = DeploymentManifest::new("local").unwrap();
         assert_eq!(m.migration_version, 0);
         m.increment_migration();
         assert_eq!(m.migration_version, 1);
@@ -158,7 +232,7 @@ mod tests {
 
     #[test]
     fn manifest_json_roundtrip() {
-        let mut m = DeploymentManifest::new("mainnet");
+        let mut m = DeploymentManifest::new("mainnet").unwrap();
         m.add_deployment(DeployedContract {
             name: "Token".into(),
             address: "SD1c_xyz".into(),
