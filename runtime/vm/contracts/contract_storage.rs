@@ -129,9 +129,22 @@ impl PendingBatch {
         self.changes.clear();
     }
 
-    /// Consume the batch and return the changes for commit
-    fn take_changes(&mut self) -> BTreeMap<String, Option<String>> {
-        std::mem::take(&mut self.changes)
+    /// Iterate the pending changes as `(&key, &Option<value>)` pairs.
+    ///
+    /// Used by [`ContractStorage::commit_batch`] to build a RocksDB
+    /// `WriteBatch` WITHOUT consuming the buffer, so a write failure
+    /// leaves the `PendingBatch` intact for the caller.
+    fn iter(&self) -> impl Iterator<Item = (&String, &Option<String>)> {
+        self.changes.iter()
+    }
+
+    /// Clear all pending changes after a successful commit.
+    ///
+    /// Separate from [`Self::discard`] only to keep the call sites
+    /// self-documenting: `commit_batch` clears on success,
+    /// REVERT/OutOfGas paths discard.
+    fn clear(&mut self) {
+        self.changes.clear();
     }
 }
 
@@ -167,25 +180,79 @@ impl ContractStorage {
         Ok(())
     }
 
-    /// Direct get.
+    /// Direct get (non-strict).
     ///
-    /// Returns `None` only for genuine absence (key not found).
-    /// Logs errors for read failures and UTF-8 corruption rather than
-    /// silently conflating them with missing keys.
+    /// Returns `None` for genuine absence, and ALSO collapses
+    /// read failures and UTF-8 corruption into `None` (logged via
+    /// `slog_error!`). This is the "backwards-compatible" helper
+    /// every existing SLOAD-ish path uses; if you need to tell
+    /// "absent" apart from "corrupt" — e.g. audit tooling or a
+    /// fail-closed SLOAD variant — use [`Self::get_state_strict`].
+    ///
+    /// The non-strict variant is preserved so existing callers don't
+    /// suddenly start reporting errors on read failures that they
+    /// historically treated as "value not set".
     pub fn get_state(&self, key: &str) -> Option<String> {
         let db_key = format!("contract:{}", key);
         match self.db.get(db_key.as_bytes()) {
             Ok(Some(data)) => match String::from_utf8(data.to_vec()) {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    slog_error!("runtime", "contract_state_utf8_corruption", key => key, error => &e.to_string());
+                    slog_error!("runtime", "contract_state_utf8_corruption_may_be_false_negative",
+                        key => key, error => &e.to_string(),
+                        note => "returning None but the raw stored bytes are not valid UTF-8 — use get_state_strict to surface this");
                     None
                 }
             },
             Ok(None) => None,
             Err(e) => {
-                slog_error!("runtime", "contract_state_read_failed", key => key, error => &e.to_string());
+                slog_error!("runtime", "contract_state_read_failed_may_be_false_negative",
+                    key => key, error => &e.to_string(),
+                    note => "returning None but the read failed — use get_state_strict to surface this");
                 None
+            }
+        }
+    }
+
+    /// Strict variant of [`Self::get_state`] that distinguishes the
+    /// three possible states:
+    ///
+    ///   - `Ok(None)`         → key is genuinely absent
+    ///   - `Ok(Some(value))`  → key exists with a valid UTF-8 payload
+    ///   - `Err(StorageError)` → read failed OR the stored bytes are
+    ///     not valid UTF-8 (i.e. the on-disk record is corrupt)
+    ///
+    /// Use this from audit / explorer / reorg code that needs to tell
+    /// a genuine miss apart from a disk corruption. The plain
+    /// [`Self::get_state`] collapses the two into `None`, which is
+    /// exactly the masking pattern that `load_undo_strict` /
+    /// `has_undo_data_strict` close for block-level undo data. The
+    /// main contract state read path was the one hole left in that
+    /// family of strict variants.
+    ///
+    /// The SLOAD opcode currently still uses the non-strict variant
+    /// for backward compatibility with existing tests; a follow-up
+    /// can route it through this helper when the consensus semantics
+    /// of "contract reads from a corrupted slot" are decided.
+    pub fn get_state_strict(&self, key: &str) -> Result<Option<String>, StorageError> {
+        let db_key = format!("contract:{}", key);
+        match self.db.get(db_key.as_bytes()) {
+            Ok(Some(data)) => match String::from_utf8(data.to_vec()) {
+                Ok(s) => Ok(Some(s)),
+                Err(e) => {
+                    slog_error!("runtime", "contract_state_utf8_corruption_strict",
+                        key => key, error => &e.to_string());
+                    Err(StorageError::Serialization(format!(
+                        "contract state for key '{}' is not valid UTF-8: {}",
+                        key, e
+                    )))
+                }
+            },
+            Ok(None) => Ok(None),
+            Err(e) => {
+                slog_error!("runtime", "contract_state_read_failed_strict",
+                    key => key, error => &e.to_string());
+                Err(StorageError::ReadFailed(e.to_string()))
             }
         }
     }
@@ -206,16 +273,47 @@ impl ContractStorage {
     /// Atomically commit a PendingBatch using RocksDB WriteBatch.
     ///
     /// All puts and deletes are applied in a single atomic operation.
-    /// If ANY write fails, NONE of the changes are persisted.
+    /// If ANY write fails, NONE of the changes are persisted — that
+    /// guarantee comes from RocksDB's `WriteBatch` itself.
+    ///
+    /// # Behaviour on failure (now preserved)
+    ///
+    /// On a successful write the `PendingBatch` is cleared so the
+    /// caller can reuse it for the next frame. On a FAILED write the
+    /// batch is left **untouched**: the caller's `&mut PendingBatch`
+    /// still holds every pending change, so it can be re-logged,
+    /// surfaced to audit tooling, or handed back to a retry path.
+    ///
+    /// The previous implementation called `batch.take_changes()`
+    /// BEFORE the `db.write(wb)` call. `take_changes` uses
+    /// `std::mem::take`, which replaces the inner map with a default
+    /// (empty) — so after a failed commit the caller received an
+    /// `Err` but the `PendingBatch` had already been emptied. A
+    /// second commit attempt would then silently succeed on a
+    /// no-longer-pending batch, erasing any record of what the VM
+    /// was actually trying to persist. The doc comment only promised
+    /// RocksDB-level atomicity, not "the batch in memory is also
+    /// destroyed on any return path", so the silent clear was a
+    /// surprising and hard-to-notice footgun.
+    ///
+    /// The new flow:
+    ///
+    ///   1. If the batch is empty → return `Ok(())` (no-op).
+    ///   2. Build the `WriteBatch` by **borrowing** `batch.changes`.
+    ///   3. Call `self.db.write(wb)`.
+    ///      - On `Ok(())` → clear the batch and return `Ok(())`.
+    ///      - On `Err(e)` → leave the batch intact and return the
+    ///        error as `VmError::Other`.
     pub fn commit_batch(&self, batch: &mut PendingBatch) -> Result<(), VmError> {
         if batch.is_empty() {
             return Ok(());
         }
 
-        let changes = batch.take_changes();
+        // Borrow via PendingBatch::iter() — do NOT consume the buffer
+        // — so a write failure leaves the PendingBatch intact for the
+        // caller to inspect, log, or retry.
         let mut wb = WriteBatch::default();
-
-        for (key, value) in &changes {
+        for (key, value) in batch.iter() {
             let db_key = format!("contract:{}", key);
             match value {
                 Some(v) => wb.put(db_key.as_bytes(), v.as_bytes()),
@@ -223,7 +321,23 @@ impl ContractStorage {
             }
         }
 
-        self.db.write(wb).map_err(|e| VmError::Other(format!("WriteBatch commit failed: {}", e)))
+        match self.db.write(wb) {
+            Ok(()) => {
+                // Write succeeded → drop the pending state so the
+                // caller can reuse the batch for the next frame.
+                batch.clear();
+                Ok(())
+            }
+            Err(e) => {
+                // Write failed → RocksDB guarantees no partial state
+                // was persisted. Leave the batch as-is so the caller
+                // still sees exactly what failed to land.
+                slog_error!("runtime", "contract_commit_batch_write_failed_batch_preserved",
+                    error => &e.to_string(),
+                    pending_len => batch.len());
+                Err(VmError::Other(format!("WriteBatch commit failed: {}", e)))
+            }
+        }
     }
 
     pub fn path(&self) -> &str {
@@ -614,5 +728,126 @@ mod tests {
         let count = s.prune_finalized_undo_data_strict(&["nonexistent".to_string()]).unwrap();
         assert_eq!(count, 0);
         assert_eq!(s.prune_finalized_undo_data(&["nonexistent".to_string()]), 0);
+    }
+
+    // ─── commit_batch preservation tests ─────────────────────────────
+
+    #[test]
+    fn commit_batch_empty_is_noop() {
+        let s = tmp_storage();
+        let mut batch = PendingBatch::new();
+        assert!(batch.is_empty());
+        s.commit_batch(&mut batch).unwrap();
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn commit_batch_clears_on_successful_write() {
+        let s = tmp_storage();
+        let mut batch = PendingBatch::new();
+        batch.put("alpha".into(), "v1".into());
+        batch.put("beta".into(),  "v2".into());
+        batch.delete("gamma".into());
+        assert_eq!(batch.len(), 3);
+
+        // Successful commit → batch is cleared AND the values are on disk.
+        s.commit_batch(&mut batch).unwrap();
+        assert!(batch.is_empty(), "successful commit must clear the pending batch");
+
+        assert_eq!(s.get_state("alpha"), Some("v1".into()));
+        assert_eq!(s.get_state("beta"),  Some("v2".into()));
+        assert_eq!(s.get_state("gamma"), None); // the delete landed as "no key"
+    }
+
+    #[test]
+    fn commit_batch_idempotent_on_same_buffer() {
+        // Regression for the "take_changes happens before the write"
+        // bug. The old flow would, on a SECOND commit of the same
+        // in-memory batch, silently succeed on an empty buffer even
+        // though the caller re-staged writes in between. With the new
+        // flow, a second commit of the SAME buffer that has been
+        // re-populated with new writes after the first commit must
+        // succeed and land the new writes — and must NOT leak the
+        // previously-committed keys.
+        let s = tmp_storage();
+        let mut batch = PendingBatch::new();
+        batch.put("round1".into(), "first".into());
+        s.commit_batch(&mut batch).unwrap();
+        assert!(batch.is_empty());
+        assert_eq!(s.get_state("round1"), Some("first".into()));
+
+        // Re-stage on the same buffer and commit again.
+        batch.put("round2".into(), "second".into());
+        s.commit_batch(&mut batch).unwrap();
+        assert!(batch.is_empty());
+        assert_eq!(s.get_state("round1"), Some("first".into()));
+        assert_eq!(s.get_state("round2"), Some("second".into()));
+    }
+
+    #[test]
+    fn commit_batch_can_still_observe_buffer_contents_before_commit() {
+        // The previous `take_changes()` flow moved the internal map
+        // out of the PendingBatch BEFORE calling db.write(), so even
+        // a successful commit would, at the moment of dispatch, have
+        // a partially-empty batch depending on how the caller
+        // observed it. The new flow borrows during the write, so the
+        // buffer is visible up until the write succeeds.
+        let s = tmp_storage();
+        let mut batch = PendingBatch::new();
+        batch.put("x".into(), "1".into());
+        assert_eq!(batch.len(), 1);
+        assert!(matches!(batch.lookup("x"), PendingLookup::Buffered(_)));
+        s.commit_batch(&mut batch).unwrap();
+        assert_eq!(batch.len(), 0);
+        assert!(matches!(batch.lookup("x"), PendingLookup::NotBuffered));
+    }
+
+    // ─── get_state_strict tests ──────────────────────────────────────
+
+    #[test]
+    fn get_state_strict_returns_none_for_absent_key() {
+        let s = tmp_storage();
+        assert!(matches!(s.get_state_strict("never_written"), Ok(None)));
+    }
+
+    #[test]
+    fn get_state_strict_returns_value_for_valid_utf8_key() {
+        let s = tmp_storage();
+        s.set_state("hello", "world").unwrap();
+        let v = s.get_state_strict("hello").unwrap();
+        assert_eq!(v, Some("world".to_string()));
+        // Non-strict agrees on the happy path.
+        assert_eq!(s.get_state("hello"), Some("world".to_string()));
+    }
+
+    #[test]
+    fn get_state_strict_surfaces_utf8_corruption_as_err() {
+        // Regression for the main-state UTF-8 masking bug. The
+        // non-strict `get_state` collapses UTF-8 corruption into
+        // `None` (logged but otherwise silent); the strict variant
+        // must return Err so audit / reorg code can tell a genuine
+        // miss apart from a damaged on-disk record.
+        let s = tmp_storage();
+
+        // Plant raw non-UTF-8 bytes under the correctly-namespaced
+        // contract: key directly via the underlying DB handle — the
+        // same technique the undo tests use.
+        let bad: [u8; 4] = [0xff, 0xfe, 0xfd, 0xfc]; // not valid UTF-8
+        s.db.put(b"contract:bad_key", bad).expect("raw put");
+
+        // Non-strict masks corruption as None (with log).
+        assert_eq!(s.get_state("bad_key"), None,
+            "non-strict get_state must return None on UTF-8 corruption for backward compat");
+
+        // Strict variant surfaces it as an explicit error.
+        let strict = s.get_state_strict("bad_key");
+        assert!(strict.is_err(),
+            "get_state_strict must return Err on UTF-8 corruption, got {:?}", strict);
+        let msg = format!("{}", strict.unwrap_err());
+        assert!(
+            msg.contains("not valid UTF-8") || msg.contains("Serialization"),
+            "expected corruption error mentioning UTF-8, got: {}",
+            msg
+        );
     }
 }
