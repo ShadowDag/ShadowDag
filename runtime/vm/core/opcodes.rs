@@ -3,7 +3,33 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// ShadowVM Opcodes — Complete instruction set definition.
+// ShadowVM Opcodes — PARALLEL / ASPIRATIONAL TABLE.
+//
+// ┌───────────────────────────────────────────────────────────────────────┐
+// │  WARNING — NOT THE CONSENSUS OPCODE SET                               │
+// │                                                                       │
+// │  The authoritative source of v1 opcode byte values is                 │
+// │  `runtime/vm/core/v1_spec.rs`, and the consensus execution path       │
+// │  uses the table embedded in `runtime/vm/core/vm.rs::OpCode`,          │
+// │  which mirrors the v1 spec.                                           │
+// │                                                                       │
+// │  The table in THIS file is a parallel design that explores a          │
+// │  re-numbered / extended instruction set (different bytes for          │
+// │  JUMPDEST, MOD, EQ, …, plus opcodes like SDIV / BLAKE3 / NEQ          │
+// │  that v1 doesn't implement). It is NOT what the live VM executes      │
+// │  and is NOT what `validate_v1_bytecode` accepts.                      │
+// │                                                                       │
+// │  Code that emits or interprets bytecode for the live VM MUST use      │
+// │  `vm::OpCode` (or refer to `v1_spec::V1_OPCODES`). The drift          │
+// │  regression test in `v1_spec::tests::vm_opcode_table_matches_v1_spec` │
+// │  guards the consensus side.                                           │
+// │                                                                       │
+// │  This file is kept compiling so existing tooling that imports its     │
+// │  90-opcode enum (e.g. for documentation generation or future v2       │
+// │  design work) doesn't break, but using it from the assembler /        │
+// │  disassembler / executor would re-introduce the JUMPDEST = 0x05 vs    │
+// │  0x82 drift that the assembler used to suffer from.                   │
+// └───────────────────────────────────────────────────────────────────────┘
 //
 // 90+ opcodes organized by category. Each opcode is 1 byte.
 // Gas costs are calibrated for fair resource pricing.

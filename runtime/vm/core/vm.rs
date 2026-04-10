@@ -21,8 +21,17 @@
 //   6. Storage values parsed deterministically (hex > decimal > zero)
 //   7. Gas metering is pre-execution — checked BEFORE each opcode runs
 //   8. has_gas() is pub(crate) — contracts cannot branch on remaining gas
-//   9. All opcodes cost ≥ 1 gas — prevents infinite-loop DoS
+//   9. Almost all opcodes cost ≥ 1 gas; the only zero-gas opcodes are
+//      STOP and JUMPDEST. Both are *terminating or marker* opcodes:
+//      STOP halts execution immediately and JUMPDEST is a no-op marker
+//      that cannot form an unbounded loop on its own (a JUMP/JUMPI to
+//      reach a JUMPDEST already pays its 8 gas), so neither enables
+//      free infinite-loop DoS. The full schedule lives in
+//      `OpCode::gas_cost()` below and in `runtime/vm/core/v1_spec.rs`.
 //  10. State changes are atomic — committed only on successful STOP/RETURN
+//      (storage writes are buffered into a PendingBatch during execution
+//       and SLOAD reads through the pending buffer first so contracts
+//       observe their own writes within a single frame — see SLOAD).
 //
 // Opcodes are 1 byte. Operands follow inline.
 // Stack elements are 256-bit unsigned integers (U256).
@@ -281,6 +290,74 @@ impl OpCode {
 
             // Invalid -- costs all remaining gas
             OpCode::INVALID => u64::MAX,
+        }
+    }
+
+    /// Human-readable mnemonic for this opcode.
+    ///
+    /// Mirrors the names used in the v1_spec table so the assembler /
+    /// disassembler can produce text that round-trips through
+    /// `validate_v1_bytecode`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            OpCode::STOP => "STOP", OpCode::NOP => "NOP",
+            OpCode::PC => "PC", OpCode::GAS => "GAS", OpCode::GASLIMIT => "GASLIMIT",
+            OpCode::PUSH1 => "PUSH1", OpCode::PUSH2 => "PUSH2",
+            OpCode::PUSH4 => "PUSH4", OpCode::PUSH8 => "PUSH8",
+            OpCode::PUSH16 => "PUSH16", OpCode::PUSH32 => "PUSH32",
+            OpCode::POP => "POP", OpCode::DUP => "DUP", OpCode::SWAP => "SWAP",
+            OpCode::ADD => "ADD", OpCode::SUB => "SUB", OpCode::MUL => "MUL",
+            OpCode::DIV => "DIV", OpCode::MOD => "MOD", OpCode::EXP => "EXP",
+            OpCode::ADDMOD => "ADDMOD", OpCode::MULMOD => "MULMOD",
+            OpCode::EQ => "EQ", OpCode::LT => "LT", OpCode::GT => "GT",
+            OpCode::ISZERO => "ISZERO",
+            OpCode::AND => "AND", OpCode::OR => "OR", OpCode::XOR => "XOR",
+            OpCode::NOT => "NOT", OpCode::SHL => "SHL", OpCode::SHR => "SHR",
+            OpCode::SLOAD => "SLOAD", OpCode::SSTORE => "SSTORE",
+            OpCode::SDELETE => "SDELETE",
+            OpCode::SHA256 => "SHA256", OpCode::KECCAK => "KECCAK",
+            OpCode::CALLER => "CALLER", OpCode::CALLVALUE => "CALLVALUE",
+            OpCode::TIMESTAMP => "TIMESTAMP", OpCode::BLOCKHASH => "BLOCKHASH",
+            OpCode::BALANCE => "BALANCE", OpCode::ADDRESS => "ADDRESS",
+            OpCode::JUMP => "JUMP", OpCode::JUMPI => "JUMPI",
+            OpCode::JUMPDEST => "JUMPDEST",
+            OpCode::MLOAD => "MLOAD", OpCode::MSTORE => "MSTORE",
+            OpCode::MSTORE8 => "MSTORE8", OpCode::MSIZE => "MSIZE",
+            // The 0xA0 mnemonic in v1_spec is "LOG0" (matching the
+            // EVM "LOGn" family); the vm.rs enum variant is named LOG
+            // for historical reasons but its on-the-wire mnemonic is
+            // LOG0 so the assembler/disassembler stay v1-compatible.
+            OpCode::LOG => "LOG0", OpCode::LOG1 => "LOG1",
+            OpCode::LOG2 => "LOG2", OpCode::LOG3 => "LOG3", OpCode::LOG4 => "LOG4",
+            OpCode::CALL => "CALL", OpCode::CALLCODE => "CALLCODE",
+            OpCode::DELEGATECALL => "DELEGATECALL", OpCode::STATICCALL => "STATICCALL",
+            OpCode::CREATE => "CREATE", OpCode::CREATE2 => "CREATE2",
+            OpCode::RETURN => "RETURN", OpCode::REVERT => "REVERT",
+            OpCode::SELFDESTRUCT => "SELFDESTRUCT",
+            OpCode::CALLDATALOAD => "CALLDATALOAD", OpCode::CALLDATASIZE => "CALLDATASIZE",
+            OpCode::CALLDATACOPY => "CALLDATACOPY", OpCode::CODESIZE => "CODESIZE",
+            OpCode::CODECOPY => "CODECOPY", OpCode::EXTCODESIZE => "EXTCODESIZE",
+            OpCode::RETURNDATASIZE => "RETURNDATASIZE",
+            OpCode::RETURNDATACOPY => "RETURNDATACOPY",
+            OpCode::DUP2 => "DUP2", OpCode::DUP3 => "DUP3", OpCode::DUP4 => "DUP4",
+            OpCode::DUP5 => "DUP5", OpCode::DUP6 => "DUP6", OpCode::DUP7 => "DUP7",
+            OpCode::DUP8 => "DUP8",
+            OpCode::SWAP2 => "SWAP2", OpCode::SWAP3 => "SWAP3", OpCode::SWAP4 => "SWAP4",
+            OpCode::INVALID => "INVALID",
+        }
+    }
+
+    /// Number of inline operand bytes that follow this opcode.
+    /// Only PUSHn opcodes carry operand data; everything else is 0.
+    pub fn operand_size(&self) -> usize {
+        match self {
+            OpCode::PUSH1  => 1,
+            OpCode::PUSH2  => 2,
+            OpCode::PUSH4  => 4,
+            OpCode::PUSH8  => 8,
+            OpCode::PUSH16 => 16,
+            OpCode::PUSH32 => 32,
+            _              => 0,
         }
     }
 }
@@ -642,52 +719,34 @@ impl VM {
                 }
 
                 // -- STORAGE (buffered via PendingBatch) --
+                //
+                // SLOAD READ-YOUR-WRITES INVARIANT:
+                //
+                // Storage writes (SSTORE / SDELETE) buffer into `pending`
+                // and only commit on STOP/RETURN. SLOAD therefore MUST
+                // consult `pending` first; otherwise an SSTORE earlier
+                // in the same frame is invisible to a later SLOAD on the
+                // same key, breaking every counter / accumulator pattern
+                // within a transaction.
+                //
+                // Lookup order:
+                //   1. pending.lookup(key) → buffered put / tombstone
+                //   2. self.context.get(key) → committed on-disk value
+                //   3. U256::ZERO if both miss
                 OpCode::SLOAD => {
                     let slot = match Self::pop1(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
                     let key = format!("{}:slot:{}", contract_addr, slot);
-                    let val = self.context.get(&key)
-                        .map(|s| {
-                            // DETERMINISTIC parsing: try hex first (canonical format
-                            // written by SSTORE), then decimal as fallback for
-                            // backward compatibility. Both paths produce identical
-                            // U256 values regardless of input format.
-                            if let Some(hex_str) = s.strip_prefix("0x") {
-                                match U256::from_hex(hex_str) {
-                                    Some(v) => v,
-                                    None => {
-                                        slog_warn!("vm", "sload_malformed_storage",
-                                            key => &key, error => "invalid hex after 0x prefix");
-                                        U256::ZERO
-                                    }
-                                }
-                            } else if s.starts_with("0x") {
-                                match U256::from_hex(&s) {
-                                    Some(v) => v,
-                                    None => {
-                                        slog_warn!("vm", "sload_malformed_storage",
-                                            key => &key, error => "invalid hex value");
-                                        U256::ZERO
-                                    }
-                                }
-                            } else {
-                                // Strict decimal parsing: only digits, no signs
-                                if s.bytes().all(|b| b.is_ascii_digit()) && !s.is_empty() {
-                                    match s.parse::<u64>() {
-                                        Ok(n) => U256::from_u64(n),
-                                        Err(e) => {
-                                            slog_warn!("vm", "sload_malformed_storage",
-                                                key => &key, error => &e.to_string());
-                                            U256::ZERO
-                                        }
-                                    }
-                                } else {
-                                    slog_warn!("vm", "sload_malformed_storage",
-                                        key => &key, error => "non-numeric non-hex value");
-                                    U256::ZERO
-                                }
-                            }
-                        })
-                        .unwrap_or(U256::ZERO);
+
+                    use crate::runtime::vm::contracts::contract_storage::PendingLookup;
+                    let val = match pending.lookup(&key) {
+                        PendingLookup::Buffered(v) => Self::parse_storage_u256(v, &key),
+                        PendingLookup::Tombstoned  => U256::ZERO,
+                        PendingLookup::NotBuffered => {
+                            self.context.get(&key)
+                                .map(|s| Self::parse_storage_u256(&s, &key))
+                                .unwrap_or(U256::ZERO)
+                        }
+                    };
                     stack.push(val);
                 }
                 OpCode::SSTORE => {
@@ -974,6 +1033,42 @@ impl VM {
 
     // -- Helpers --
 
+    /// Parse a stored storage value into a U256.
+    ///
+    /// SSTORE writes a U256 as `val.to_string()` (decimal). Older
+    /// records may also have a `0x...` hex prefix. The parsing tries
+    /// hex first (canonical SSTORE format historically), then strict
+    /// decimal, falling back to ZERO with a warning on malformed
+    /// input. This is shared between the pending-buffer and on-disk
+    /// SLOAD paths so both interpret the storage byte stream the
+    /// same way — preserving the read-your-writes invariant.
+    fn parse_storage_u256(s: &str, key: &str) -> U256 {
+        if let Some(hex_str) = s.strip_prefix("0x") {
+            return match U256::from_hex(hex_str) {
+                Some(v) => v,
+                None => {
+                    slog_warn!("vm", "sload_malformed_storage",
+                        key => key, error => "invalid hex after 0x prefix");
+                    U256::ZERO
+                }
+            };
+        }
+        // Strict decimal parsing: only digits, no signs.
+        if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+            return match s.parse::<u64>() {
+                Ok(n) => U256::from_u64(n),
+                Err(e) => {
+                    slog_warn!("vm", "sload_malformed_storage",
+                        key => key, error => &e.to_string());
+                    U256::ZERO
+                }
+            };
+        }
+        slog_warn!("vm", "sload_malformed_storage",
+            key => key, error => "non-numeric non-hex value");
+        U256::ZERO
+    }
+
     fn pop1(stack: &mut Vec<U256>, gas: &GasMeter, pending: &mut PendingBatch) -> Result<U256, ExecutionResult> {
         match stack.pop() {
             Some(v) => Ok(v),
@@ -1201,12 +1296,20 @@ mod tests {
     #[test]
     fn revert_discards_state() {
         let vm = make_vm();
-        // PUSH1 42, PUSH1 0, SSTORE, REVERT
-        // The SSTORE should be discarded because of REVERT
-        let bytecode = vec![0x10, 42, 0x10, 0, 0x51, 0xB2];
+        // PUSH1 0  (slot — bottom),
+        // PUSH1 42 (val  — top),
+        // SSTORE   → pending: slot 0 = 42
+        // REVERT   → discards pending and exits with Revert
+        //
+        // The previous bytecode used 0xB2 as the terminating opcode,
+        // but 0xB2 is DELEGATECALL in vm.rs (and v1_spec). REVERT is
+        // 0xB7. The old test therefore actually executed a malformed
+        // DELEGATECALL on top of an empty stack and matched on the
+        // wrong outcome. This rewrite uses the correct REVERT byte.
+        let bytecode = vec![0x10, 0, 0x10, 42, 0x51, 0xB7];
         match exec(&vm, &bytecode, 100000) {
             ExecutionResult::Revert { .. } => {}
-            _ => panic!("Expected revert"),
+            other => panic!("Expected revert, got {:?}", other),
         }
     }
 
@@ -1239,11 +1342,24 @@ mod tests {
     #[test]
     fn conditional_jump() {
         let vm = make_vm();
-        // PUSH1 1 (condition=true), PUSH1 5 (dest), JUMPI, JUMPDEST, STOP
-        let bytecode = vec![0x10, 1, 0x10, 5, 0x81, 0x82, 0x00];
+        // JUMPI's stack convention is `(dest_val, cond) = pop2()`, where
+        // cond is the TOP of stack and dest is below it (pop2 returns
+        // `(below, top)`). So the correct push order is:
+        //   PUSH1 5  (dest, ends up below)
+        //   PUSH1 1  (cond, ends up on top — non-zero = take the jump)
+        //   JUMPI    → jumps to byte 5
+        //   JUMPDEST (byte 5) → no-op marker
+        //   STOP
+        //
+        // The previous bytecode reversed the order (PUSH cond first,
+        // PUSH dest second), which made JUMPI try to jump to address 1
+        // instead of 5 — landing inside a PUSH operand byte rather
+        // than on a JUMPDEST, so the test always errored on
+        // "Invalid jump destination".
+        let bytecode = vec![0x10, 5, 0x10, 1, 0x81, 0x82, 0x00];
         match exec(&vm, &bytecode, 10000) {
             ExecutionResult::Success { .. } => {}
-            _ => panic!("Expected success"),
+            other => panic!("Expected success, got {:?}", other),
         }
     }
 
@@ -1381,16 +1497,120 @@ mod tests {
         }
     }
 
+    /// Regression for the SLOAD read-your-writes bug.
+    ///
+    /// Before the fix, SSTORE buffered the write into `pending` and SLOAD
+    /// read directly from `self.context` (committed disk state), so an
+    /// SSTORE k=v followed by an SLOAD k inside the same frame returned
+    /// 0 instead of v. This test runs exactly that program and asserts
+    /// the loaded value matches what was just written.
+    ///
+    /// pop2 returns `(below, top)` so push order is `(slot, val)` for
+    /// SSTORE and `(offset, val)` for MSTORE — i.e. the second push
+    /// becomes the value parameter.
+    #[test]
+    fn sload_sees_pending_sstore_within_same_frame() {
+        let vm = make_vm();
+        let bytecode = vec![
+            // SSTORE slot 7 = 99
+            0x10, 7,         // PUSH1 7   (slot — bottom)
+            0x10, 99,        // PUSH1 99  (val  — top)
+            0x51,            // SSTORE → pending: slot 7 = 99
+
+            // mem[0..32] = SLOAD(7) — must see the pending 99, not 0
+            0x10, 0,         // PUSH1 0   (mem offset, will be `a`)
+            0x10, 7,         // PUSH1 7   (slot for SLOAD)
+            0x50,            // SLOAD     → pops 7, pushes value (99)
+                             // stack: [0, 99]
+            0x91,            // MSTORE    → (offset=0, val=99); mem[0..32]=99 BE
+
+            // RETURN mem[0..32]
+            0x10, 0,         // PUSH1 0   (return offset)
+            0x10, 32,        // PUSH1 32  (return size)
+            0xB6,            // RETURN
+        ];
+        match exec(&vm, &bytecode, 100_000) {
+            ExecutionResult::Success { return_data, .. } => {
+                // Big-endian U256 of 99 → last byte is 99, all others 0.
+                assert_eq!(return_data.len(), 32, "expected 32-byte RETURN payload");
+                assert_eq!(
+                    return_data[31], 99,
+                    "SLOAD must read its own pending SSTORE: expected 99 in last byte, got {:?}",
+                    &return_data[..]
+                );
+                // The other 31 bytes must be zero (no leftover stack data).
+                assert!(
+                    return_data[..31].iter().all(|&b| b == 0),
+                    "high bytes of returned value must be zero, got {:?}",
+                    &return_data[..]
+                );
+            }
+            other => panic!("Expected Success with return_data, got {:?}", other),
+        }
+    }
+
+    /// Companion: SDELETE inside the same frame must also be visible to
+    /// a later SLOAD on the same slot — the read should return 0 even
+    /// though committed disk may still have the old value (the pending
+    /// tombstone wins over disk).
+    #[test]
+    fn sload_sees_pending_sdelete_within_same_frame() {
+        let vm = make_vm();
+        let bytecode = vec![
+            // SSTORE slot 5 = 77 first
+            0x10, 5,         // PUSH1 5   (slot)
+            0x10, 77,        // PUSH1 77  (val)
+            0x51,            // SSTORE    → pending: slot 5 = 77
+
+            // SDELETE slot 5
+            0x10, 5,         // PUSH1 5   (slot)
+            0x52,            // SDELETE   → pending: slot 5 = tombstone
+
+            // mem[0..32] = SLOAD(5)
+            0x10, 0,         // PUSH1 0   (mem offset, will be `a`)
+            0x10, 5,         // PUSH1 5   (slot for SLOAD)
+            0x50,            // SLOAD     → reads tombstone, pushes 0
+            0x91,            // MSTORE    → mem[0..32] = 0
+
+            // RETURN mem[0..32]
+            0x10, 0,
+            0x10, 32,
+            0xB6,            // RETURN
+        ];
+        match exec(&vm, &bytecode, 100_000) {
+            ExecutionResult::Success { return_data, .. } => {
+                assert_eq!(return_data.len(), 32);
+                assert!(
+                    return_data.iter().all(|&b| b == 0),
+                    "SLOAD after pending SDELETE must return 0, got {:?}",
+                    &return_data[..]
+                );
+            }
+            other => panic!("Expected Success, got {:?}", other),
+        }
+    }
+
     #[test]
     fn sload_roundtrip_large_value() {
         let vm = make_vm();
-        // Store u64::MAX then load it back
-        // PUSH8 <u64::MAX>, PUSH1 1 (slot), SSTORE, PUSH1 1 (slot), SLOAD, STOP
-        let mut bytecode = vec![0x12]; // PUSH8
+        // Store u64::MAX at slot 1 then load it back.
+        //
+        // Two old bugs in this test:
+        //   1. The opcode for PUSH8 is 0x13, not 0x12. The literal 0x12
+        //      is PUSH4, which only consumes 4 of the next 8 bytes —
+        //      so the high half of u64::MAX was being interpreted as
+        //      subsequent opcodes (0xFF...0xFF = INVALID).
+        //   2. The push order had the value pushed before the slot,
+        //      which (with pop2 returning `(below, top)` and the
+        //      destructuring `(slot, val) = pop2()`) wrote the value
+        //      to the wrong slot. Correct order is slot first, val
+        //      second.
+        let mut bytecode = vec![0x10, 1];          // PUSH1 1     (slot — bottom)
+        bytecode.push(0x13);                       // PUSH8       (val opcode)
         bytecode.extend_from_slice(&u64::MAX.to_be_bytes());
-        bytecode.extend_from_slice(&[0x10, 1, 0x51]); // PUSH1 1, SSTORE
+        bytecode.push(0x51);                       // SSTORE
         bytecode.extend_from_slice(&[0x10, 1, 0x50]); // PUSH1 1, SLOAD
-        bytecode.push(0x00); // STOP
+        bytecode.push(0x00);                       // STOP
         match exec(&vm, &bytecode, 100000) {
             ExecutionResult::Success { .. } => {}
             other => panic!("Expected success, got {:?}", other),

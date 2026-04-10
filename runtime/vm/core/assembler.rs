@@ -29,7 +29,13 @@
 
 use std::collections::BTreeMap;
 use hex;
-use crate::runtime::vm::core::opcodes::OpCode;
+// IMPORTANT: this assembler MUST use the consensus-correct opcode table
+// from `vm::OpCode`, which mirrors the authoritative `v1_spec` byte
+// layout (e.g. JUMPDEST = 0x82). The parallel `core::opcodes::OpCode`
+// enum has drifted away from v1_spec (its JUMPDEST is 0x05) and is NOT
+// the consensus opcode set; assembling against it would produce
+// bytecode that the live VM rejects as INVALID.
+use crate::runtime::vm::core::vm::OpCode;
 
 /// Assembly error
 #[derive(Debug, Clone)]
@@ -371,14 +377,20 @@ mod tests {
 
     #[test]
     fn assemble_labels() {
-        // :start at byte 0 → JUMPDEST (0x05)
+        // :start at byte 0 → JUMPDEST (0x82, per v1_spec / vm::OpCode)
         // PUSH1 1 → [0x10, 0x01]          bytes 1-2
         // PUSH1 0 → [0x10, 0x00]          bytes 3-4
         // JUMP :start → PUSH4 0, JUMP     bytes 5-10
         //   0x11, 0x00,0x00,0x00,0x00, 0x80
+        //
+        // The previous expectation was 0x05 (the parallel
+        // `core::opcodes::OpCode::JUMPDEST` value), which silently
+        // produced bytecode the live VM rejects as INVALID. The
+        // assembler now imports `vm::OpCode` so JUMPDEST = 0x82,
+        // matching the consensus v1 byte layout.
         let source = ":start\nPUSH1 1\nPUSH1 0\nJUMP :start";
         let bytecode = Assembler::assemble(source).unwrap();
-        assert_eq!(bytecode[0], 0x05); // JUMPDEST
+        assert_eq!(bytecode[0], 0x82, "JUMPDEST must be the v1 byte 0x82");
         assert_eq!(bytecode[5], 0x11); // PUSH4
         // 4-byte big-endian offset to :start (byte 0)
         assert_eq!(&bytecode[6..10], &[0x00, 0x00, 0x00, 0x00]);
@@ -402,7 +414,9 @@ mod tests {
         assert_eq!(bytecode[0], 0x11); // PUSH4
         let offset = u32::from_be_bytes([bytecode[1], bytecode[2], bytecode[3], bytecode[4]]);
         assert_eq!(offset, 266, "label must resolve to offset 266, got {}", offset);
-        assert_eq!(bytecode[266], 0x05); // JUMPDEST at the target
+        // JUMPDEST at the target — 0x82 in v1 / vm::OpCode (was 0x05
+        // in the obsolete `core::opcodes::OpCode` table).
+        assert_eq!(bytecode[266], 0x82, "JUMPDEST at label must be the v1 byte 0x82");
     }
 
     #[test]
