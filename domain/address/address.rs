@@ -14,6 +14,41 @@ pub const STEALTH_PREFIX: &str = "SD1s";
 pub const SCHNORR_PREFIX: &str = "SD1k";   // k for key (Schnorr)
 pub const P2SH_PREFIX:    &str = "SD1h";   // h for hash (P2SH)
 
+/// Resolve a network name (`"mainnet"` / `"testnet"` / `"regtest"`) to its
+/// 3-character on-chain prefix. Returns `None` for unknown networks so the
+/// caller can surface a structured error instead of silently defaulting to
+/// mainnet.
+pub fn network_prefix(network: &str) -> Option<&'static str> {
+    match network {
+        "mainnet" => Some(MAINNET_PREFIX),
+        "testnet" => Some(TESTNET_PREFIX),
+        "regtest" => Some(REGTEST_PREFIX),
+        _ => None,
+    }
+}
+
+/// Extract the 3-character network prefix from an existing ShadowDAG
+/// address (`"SD1…"` / `"ST1…"` / `"SR1…"`).
+///
+/// This is the canonical helper for "derive a child address on the same
+/// network as the input", used by the WASM wallet SDK and the in-VM
+/// contract-address computation so they stay consistent.
+///
+/// Returns `None` if the address does not start with any known
+/// ShadowDAG prefix, so callers can refuse to silently tag output as
+/// mainnet when the input was on testnet/regtest (or vice versa).
+pub fn prefix_from_address(addr: &str) -> Option<&'static str> {
+    if addr.starts_with(MAINNET_PREFIX) {
+        Some(MAINNET_PREFIX)
+    } else if addr.starts_with(TESTNET_PREFIX) {
+        Some(TESTNET_PREFIX)
+    } else if addr.starts_with(REGTEST_PREFIX) {
+        Some(REGTEST_PREFIX)
+    } else {
+        None
+    }
+}
+
 /// Address types — ShadowDAG supports more address types than Kaspa
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AddressType {
