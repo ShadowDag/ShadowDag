@@ -387,7 +387,13 @@ impl ScriptRunner {
         // `save_verification` succeeded. A runner without storage
         // still reports the deployment but with `verified: false`,
         // which is accurate: no one ever called ContractVerifier.
-        self.manifest.add_deployment(DeployedContract {
+        //
+        // `add_deployment` now validates that the address prefix
+        // matches the manifest's network. This should always succeed
+        // because `contract_addr_prefix()` derives `addr` from the
+        // SAME network string, but we propagate the error just in
+        // case a future refactor breaks that invariant.
+        if let Err(e) = self.manifest.add_deployment(DeployedContract {
             name: name.to_string(),
             address: addr.clone(),
             bytecode_hash,
@@ -397,7 +403,19 @@ impl ScriptRunner {
             verified: persisted_verified,
             deployed_at: self.env.block_ctx.timestamp,
             package_file: None,
-        });
+        }) {
+            // Roll back the in-memory `deployed` entry so the runner
+            // state stays consistent with the manifest.
+            self.deployed.remove(name);
+            return ScriptStepResult {
+                action_index: idx,
+                action_type: "deploy".into(),
+                success: false,
+                contract_address: None,
+                gas_used,
+                message: format!("manifest.add_deployment({}) failed: {}", name, e),
+            };
+        }
 
         ScriptStepResult {
             action_index: idx,
