@@ -197,7 +197,7 @@ impl ContractAbi {
     /// truncated 4-byte function selector. `decode_event` compares
     /// topic0 against this full value with strict equality.
     fn compute_event_topic0(name: &str, params: &[AbiParam]) -> [u8; 32] {
-        Self::compute_signature_hash(name, params).into()
+        Self::compute_signature_hash(name, params)
     }
 
     /// Shared SHA-256 of the canonical signature string
@@ -353,15 +353,14 @@ impl ContractAbi {
     /// 1. **Prefix-collision topic match.** The old matcher used
     ///    `selector.starts_with(topic0) || topic0.starts_with(&selector)`
     ///    against the 4-byte function selector, which accepted:
-    ///     * empty `topic0 == ""` (always a prefix) → first event in
-    ///       the ABI matched every log;
-    ///     * any short topic0 like `"aabb"` against selector
-    ///       `"aabbccdd"` → cross-decode across events sharing a
-    ///       byte prefix;
-    ///     * a long topic0 like `"aabbccdd0011"` against selector
-    ///       `"aabbccdd"` → same cross-decode in the other direction.
-    ///    Using the full 32-byte topic hash + strict equality closes
-    ///    all three.
+    ///    empty `topic0 == ""` (always a prefix of every selector) so
+    ///    the first event in the ABI matched every log; any short
+    ///    topic0 like `"aabb"` against selector `"aabbccdd"` so events
+    ///    sharing a byte prefix cross-decoded; and any long topic0
+    ///    like `"aabbccdd0011"` against selector `"aabbccdd"` so the
+    ///    same cross-decode happened in the other direction. Using
+    ///    the full 32-byte topic hash + strict equality closes all
+    ///    three.
     ///
     /// 2. **`indexed` flag ignored.** The old decoder used
     ///    `i + 1 < topics.len()` as a proxy for "this param is
