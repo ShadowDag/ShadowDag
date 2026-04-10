@@ -507,7 +507,10 @@ fn cmd_script(args: &[String]) {
             std::process::exit(1);
         }
     };
-    runner.fund_deployer(1_000_000_000_000);
+    if let Err(e) = runner.fund_deployer(1_000_000_000_000) {
+        eprintln!("error: fund_deployer failed: {}", e);
+        std::process::exit(1);
+    }
 
     let results = runner.execute(&actions);
     runner.print_summary();

@@ -4,6 +4,7 @@
 //! pass constructor args, wait for receipts, auto-verify, and save addresses
 //! to deployment manifests.
 
+use crate::domain::address::address::network_prefix;
 use crate::runtime::vm::core::execution_env::*;
 use crate::runtime::vm::core::v1_spec;
 use crate::runtime::vm::contracts::contract_package::ContractPackage;
@@ -95,8 +96,35 @@ impl ScriptRunner {
     }
 
     /// Fund the deployer account.
-    pub fn fund_deployer(&mut self, amount: u64) {
-        self.env.state.set_balance(&self.deployer, amount).ok();
+    ///
+    /// Returns `Err(String)` if the underlying `set_balance` fails —
+    /// the previous implementation used `.ok()` to silently swallow
+    /// the error, so a failed fund looked like a successful setup
+    /// and later steps would run against an unfunded account.
+    pub fn fund_deployer(&mut self, amount: u64) -> Result<(), String> {
+        self.env.state.set_balance(&self.deployer, amount)
+            .map_err(|e| format!("fund_deployer '{}' failed: {}", self.deployer, e))
+    }
+
+    /// Return `{prefix}c` for the manifest's network, e.g. `SD1c`,
+    /// `ST1c`, or `SR1c`. Used to tag script-deploy addresses so a
+    /// testnet manifest never produces mainnet-looking contract
+    /// addresses. The manifest itself was constructed via
+    /// `DeploymentManifest::new`, which rejects unknown networks, so
+    /// this helper cannot see an invalid `self.manifest.network`.
+    fn contract_addr_prefix(&self) -> &'static str {
+        match network_prefix(&self.manifest.network) {
+            Some(p) => match p {
+                "SD1" => "SD1c",
+                "ST1" => "ST1c",
+                "SR1" => "SR1c",
+                _     => "SD1c", // unreachable: network_prefix limited to 3 values
+            },
+            // Unreachable: DeploymentManifest::new already refuses
+            // unknown networks. Use a sentinel that no other path
+            // produces so any future regression is visible.
+            None => "??1c",
+        }
     }
 
     /// Execute a list of script actions.
@@ -110,14 +138,27 @@ impl ScriptRunner {
                     self.execute_call(i, contract_name, calldata, *value, *gas_limit)
                 }
                 ScriptAction::Fund { address, amount } => {
-                    self.env.state.set_balance(address, *amount).ok();
-                    ScriptStepResult {
-                        action_index: i,
-                        action_type: "fund".into(),
-                        success: true,
-                        contract_address: None,
-                        gas_used: 0,
-                        message: format!("funded {} with {}", address, amount),
+                    // Propagate set_balance failure instead of .ok() so
+                    // a failed fund doesn't masquerade as a successful
+                    // step. Downstream actions will see the Fund as
+                    // failed and the script will stop.
+                    match self.env.state.set_balance(address, *amount) {
+                        Ok(()) => ScriptStepResult {
+                            action_index: i,
+                            action_type: "fund".into(),
+                            success: true,
+                            contract_address: None,
+                            gas_used: 0,
+                            message: format!("funded {} with {}", address, amount),
+                        },
+                        Err(e) => ScriptStepResult {
+                            action_index: i,
+                            action_type: "fund".into(),
+                            success: false,
+                            contract_address: None,
+                            gas_used: 0,
+                            message: format!("fund {} with {} failed: {}", address, amount, e),
+                        },
                     }
                 }
                 ScriptAction::Log { message } => {
@@ -145,15 +186,63 @@ impl ScriptRunner {
     }
 
     fn execute_deploy(&mut self, idx: usize, name: &str, bytecode: &[u8], value: u64, gas_limit: u64, abi: &ContractAbi) -> ScriptStepResult {
-        // Check if already deployed (idempotent)
-        if let Some(existing) = self.deployed.get(name) {
-            return ScriptStepResult {
-                action_index: idx,
-                action_type: "deploy".into(),
-                success: true,
-                contract_address: Some(existing.clone()),
-                gas_used: 0,
-                message: format!("{} already deployed at {}", name, existing),
+        // Compute the bytecode hash up front so it can participate in
+        // the idempotency check below.
+        let bytecode_hash = {
+            use sha2::{Sha256, Digest};
+            let mut h = Sha256::new();
+            h.update(bytecode);
+            hex::encode(h.finalize())
+        };
+
+        // Content-based idempotency: a re-deploy of the same `name`
+        // with the SAME bytecode returns the existing address as a
+        // successful no-op, but a re-deploy of the same name with
+        // DIFFERENT bytecode fails loudly. The previous behaviour
+        // compared only on name, so a caller that re-ran a script
+        // after editing the contract source would silently keep the
+        // old contract and report the step as successful.
+        if let Some(existing) = self.deployed.get(name).cloned() {
+            // Look up the prior bytecode_hash from the manifest to
+            // compare by content.
+            let prior_hash = self.manifest.contracts.get(name)
+                .map(|c| c.bytecode_hash.clone());
+            return match prior_hash {
+                Some(ph) if ph == bytecode_hash => ScriptStepResult {
+                    action_index: idx,
+                    action_type: "deploy".into(),
+                    success: true,
+                    contract_address: Some(existing.clone()),
+                    gas_used: 0,
+                    message: format!("{} already deployed at {} (same bytecode)", name, existing),
+                },
+                Some(ph) => ScriptStepResult {
+                    action_index: idx,
+                    action_type: "deploy".into(),
+                    success: false,
+                    contract_address: Some(existing.clone()),
+                    gas_used: 0,
+                    message: format!(
+                        "deploy {} refused: already deployed at {} with a DIFFERENT bytecode \
+                         (prior hash: {}, new hash: {}) — re-deploying would silently shadow \
+                         the previous contract",
+                        name, existing, ph, bytecode_hash
+                    ),
+                },
+                // No manifest entry but the `deployed` map has one —
+                // shouldn't happen in practice but surface it.
+                None => ScriptStepResult {
+                    action_index: idx,
+                    action_type: "deploy".into(),
+                    success: false,
+                    contract_address: Some(existing.clone()),
+                    gas_used: 0,
+                    message: format!(
+                        "deploy {} refused: in-memory deployed map has an entry but the \
+                         manifest does not — cannot verify content equivalence",
+                        name
+                    ),
+                },
             };
         }
 
@@ -169,13 +258,46 @@ impl ScriptRunner {
             };
         }
 
-        let addr = format!("SD1c_script_{}", name.to_lowercase().replace(' ', "_"));
-        self.env.state.set_code(&addr, bytecode.to_vec()).ok();
+        // Tag the deployed address with the MANIFEST's network prefix
+        // — not a hardcoded "SD1c". A testnet manifest now produces
+        // "ST1c_script_…" and a regtest manifest produces
+        // "SR1c_script_…", matching the rest of the network-aware
+        // contract-address pipeline (contract_deployer, executor, wasm).
+        let addr = format!(
+            "{}_script_{}",
+            self.contract_addr_prefix(),
+            name.to_lowercase().replace(' ', "_")
+        );
+
+        // Load the code into state and surface a failure as a
+        // ScriptStepResult with success=false. The previous `.ok()`
+        // swallow would have marked the step successful even when
+        // set_code failed at the state-manager layer.
+        if let Err(e) = self.env.state.set_code(&addr, bytecode.to_vec()) {
+            return ScriptStepResult {
+                action_index: idx,
+                action_type: "deploy".into(),
+                success: false,
+                contract_address: None,
+                gas_used: 0,
+                message: format!("set_code({}) failed: {}", addr, e),
+            };
+        }
         self.env.state.get_or_create_account(&addr);
 
-        // Transfer value if needed
+        // Transfer value if needed — fail loudly instead of .ok().
         if value > 0 {
-            self.env.state.transfer(&self.deployer, &addr, value).ok();
+            if let Err(e) = self.env.state.transfer(&self.deployer, &addr, value) {
+                return ScriptStepResult {
+                    action_index: idx,
+                    action_type: "deploy".into(),
+                    success: false,
+                    contract_address: None,
+                    gas_used: 0,
+                    message: format!("transfer {} -> {} ({}) failed: {}",
+                        self.deployer, addr, value, e),
+                };
+            }
         }
 
         // Execute constructor (if bytecode does something on deploy)
@@ -197,53 +319,93 @@ impl ScriptRunner {
             CallOutcome::Failure { gas_used } => (false, *gas_used),
         };
 
-        if success {
-            self.deployed.insert(name.to_string(), addr.clone());
-            self.block_height += 1;
-
-            // Add to manifest
-            let bytecode_hash = {
-                use sha2::{Sha256, Digest};
-                let mut h = Sha256::new();
-                h.update(bytecode);
-                hex::encode(h.finalize())
+        if !success {
+            return ScriptStepResult {
+                action_index: idx,
+                action_type: "deploy".into(),
+                success: false,
+                contract_address: None,
+                gas_used,
+                message: format!("deploy {} failed", name),
             };
+        }
 
-            self.manifest.add_deployment(DeployedContract {
-                name: name.to_string(),
-                address: addr.clone(),
-                bytecode_hash,
-                deploy_height: self.block_height,
-                deploy_tx: format!("script_deploy_{}", idx),
-                vm_version: 1,
-                verified: true, // Script deployments are self-verified
-                deployed_at: self.env.block_ctx.timestamp,
-                package_file: None,
-            });
+        // Persist + verify BEFORE mutating the manifest, so a
+        // persistence failure doesn't leave behind a manifest entry
+        // that claims `verified: true` on a record that never made
+        // it to disk.
+        let mut persisted_verified = false;
+        if let Some(ref storage) = self.storage {
+            let pkg = ContractPackage::new(name, bytecode.to_vec(), abi.clone());
 
-            // Auto-verify if storage available
-            if let Some(ref storage) = self.storage {
-                let pkg = ContractPackage::new(name, bytecode.to_vec(), abi.clone());
-                storage.set_state(&format!("code:{}", addr), &hex::encode(bytecode)).ok();
-                storage.set_state(&format!("vm_version:{}", addr), "1").ok();
-                let verify_result = ContractVerifier::verify(storage, &addr, &pkg);
-                if verify_result.verified {
-                    ContractVerifier::save_verification(storage, &verify_result, &pkg).ok();
+            if let Err(e) = storage.set_state(&format!("code:{}", addr), &hex::encode(bytecode)) {
+                return ScriptStepResult {
+                    action_index: idx,
+                    action_type: "deploy".into(),
+                    success: false,
+                    contract_address: None,
+                    gas_used,
+                    message: format!("storage.set_state(code:{}) failed: {}", addr, e),
+                };
+            }
+            if let Err(e) = storage.set_state(&format!("vm_version:{}", addr), "1") {
+                return ScriptStepResult {
+                    action_index: idx,
+                    action_type: "deploy".into(),
+                    success: false,
+                    contract_address: None,
+                    gas_used,
+                    message: format!("storage.set_state(vm_version:{}) failed: {}", addr, e),
+                };
+            }
+
+            let verify_result = ContractVerifier::verify(storage, &addr, &pkg);
+            if verify_result.verified {
+                if let Err(e) = ContractVerifier::save_verification(storage, &verify_result, &pkg) {
+                    return ScriptStepResult {
+                        action_index: idx,
+                        action_type: "deploy".into(),
+                        success: false,
+                        contract_address: None,
+                        gas_used,
+                        message: format!("save_verification({}) failed: {}", addr, e),
+                    };
                 }
+                persisted_verified = true;
             }
         }
+
+        // All persistence paths succeeded (or no storage attached);
+        // THEN record the deployment in the in-memory map and the
+        // manifest. The manifest's `verified` flag now reflects the
+        // ACTUAL persistence outcome rather than a pre-commit
+        // optimistic `true`.
+        self.deployed.insert(name.to_string(), addr.clone());
+        self.block_height += 1;
+
+        // `verified` is only true if we actually attached storage AND
+        // `save_verification` succeeded. A runner without storage
+        // still reports the deployment but with `verified: false`,
+        // which is accurate: no one ever called ContractVerifier.
+        self.manifest.add_deployment(DeployedContract {
+            name: name.to_string(),
+            address: addr.clone(),
+            bytecode_hash,
+            deploy_height: self.block_height,
+            deploy_tx: format!("script_deploy_{}", idx),
+            vm_version: 1,
+            verified: persisted_verified,
+            deployed_at: self.env.block_ctx.timestamp,
+            package_file: None,
+        });
 
         ScriptStepResult {
             action_index: idx,
             action_type: "deploy".into(),
-            success,
-            contract_address: if success { Some(addr) } else { None },
+            success: true,
+            contract_address: Some(addr.clone()),
             gas_used,
-            message: if success {
-                format!("deployed {} at {}", name, self.deployed.get(name).unwrap())
-            } else {
-                format!("deploy {} failed", name)
-            },
+            message: format!("deployed {} at {}", name, addr),
         }
     }
 
@@ -333,8 +495,8 @@ mod tests {
 
     #[test]
     fn script_deploy_and_call() {
-        let mut runner = ScriptRunner::new("local", "deployer").expect("local is valid");
-        runner.fund_deployer(1_000_000_000);
+        let mut runner = ScriptRunner::new("local", "SR1deployer").expect("local is valid");
+        runner.fund_deployer(1_000_000_000).expect("fund_deployer must succeed");
 
         let abi = ContractAbi::new("Counter");
         let bytecode = vec![0x10, 42, 0x10, 0, 0x51, 0x00]; // PUSH1 42, PUSH1 0, SSTORE, STOP
@@ -356,15 +518,17 @@ mod tests {
             },
         ]);
 
-        assert!(results.iter().all(|r| r.success), "All steps should succeed");
+        assert!(results.iter().all(|r| r.success),
+            "All steps should succeed, got {:#?}", results);
         assert!(runner.get_address("Counter").is_some());
         assert!(runner.manifest().is_deployed("Counter"));
     }
 
     #[test]
-    fn script_idempotent_deploy() {
-        let mut runner = ScriptRunner::new("local", "deployer").expect("local is valid");
-        runner.fund_deployer(1_000_000_000);
+    fn script_idempotent_deploy_with_same_bytecode() {
+        // Same name + same bytecode → success + same address.
+        let mut runner = ScriptRunner::new("local", "SR1deployer").expect("local is valid");
+        runner.fund_deployer(1_000_000_000).expect("fund_deployer must succeed");
         let abi = ContractAbi::new("Token");
         let bytecode = vec![0x00]; // STOP
 
@@ -373,19 +537,63 @@ mod tests {
         ]);
         let addr1 = runner.get_address("Token").unwrap().to_string();
 
-        // Deploy again -- should be idempotent
-        runner.execute(&[
+        // Deploy again with the SAME bytecode -- should be idempotent
+        let results = runner.execute(&[
             ScriptAction::Deploy { name: "Token".into(), bytecode, value: 0, gas_limit: 1_000_000, abi },
         ]);
         let addr2 = runner.get_address("Token").unwrap().to_string();
         assert_eq!(addr1, addr2, "Idempotent deploy should return same address");
+        assert!(results.last().unwrap().success);
+        assert!(results.last().unwrap().message.contains("same bytecode"));
+    }
+
+    #[test]
+    fn script_redeploy_with_different_bytecode_refused() {
+        // Regression for the name-only idempotency bug. The old
+        // implementation returned "already deployed" as a SUCCESS
+        // when the same name was re-deployed with a DIFFERENT
+        // bytecode — silently shadowing the new contract with the
+        // old one. The new code refuses the re-deploy and surfaces
+        // both hashes in the error message.
+        let mut runner = ScriptRunner::new("local", "SR1deployer").expect("local is valid");
+        runner.fund_deployer(1_000_000_000).expect("fund_deployer must succeed");
+        let abi = ContractAbi::new("Token");
+
+        // First deploy with bytecode A.
+        runner.execute(&[
+            ScriptAction::Deploy {
+                name: "Token".into(),
+                bytecode: vec![0x00], // STOP
+                value: 0,
+                gas_limit: 1_000_000,
+                abi: abi.clone(),
+            },
+        ]);
+        assert!(runner.results().last().unwrap().success);
+
+        // Second deploy with bytecode B, SAME name.
+        let results = runner.execute(&[
+            ScriptAction::Deploy {
+                name: "Token".into(),
+                bytecode: vec![0x10, 1, 0x00], // PUSH1 1, STOP — different
+                value: 0,
+                gas_limit: 1_000_000,
+                abi,
+            },
+        ]);
+        let last = results.last().unwrap();
+        assert!(!last.success, "re-deploy with different bytecode must fail");
+        assert!(last.message.contains("DIFFERENT bytecode"),
+            "error must explain the content mismatch, got: {}", last.message);
+        assert!(last.message.contains("prior hash"));
+        assert!(last.message.contains("new hash"));
     }
 
     #[test]
     fn script_stops_on_failure() {
-        let mut runner = ScriptRunner::new("local", "deployer").expect("local is valid");
+        let mut runner = ScriptRunner::new("local", "SR1deployer").expect("local is valid");
         // Don't fund -- deploy will fail due to v1 validation if bad bytecode
-        // Actually: deploy with 0xFF (INVALID opcode) -- v1 validation catches it
+        // Actually: deploy with 0xEE (non-v1 opcode) -- v1 validation catches it
         let abi = ContractAbi::new("Bad");
         let results = runner.execute(&[
             ScriptAction::Deploy { name: "Bad".into(), bytecode: vec![0xEE], value: 0, gas_limit: 1_000_000, abi },
@@ -396,19 +604,64 @@ mod tests {
     }
 
     #[test]
-    fn script_manifest_populated() {
-        let mut runner = ScriptRunner::new("testnet", "deployer").expect("testnet is valid");
-        runner.fund_deployer(1_000_000_000);
+    fn script_manifest_populated_on_testnet() {
+        // Regression for the hardcoded "SD1c" bug. A testnet manifest
+        // used to produce SD1c_script_… addresses because
+        // execute_deploy hardcoded the prefix. It must now produce
+        // ST1c_script_… so the manifest network and the contract
+        // address prefix agree.
+        let mut runner = ScriptRunner::new("testnet", "ST1deployer").expect("testnet is valid");
+        runner.fund_deployer(1_000_000_000).expect("fund_deployer must succeed");
         let abi = ContractAbi::new("MyToken");
-        runner.execute(&[
+        let results = runner.execute(&[
             ScriptAction::Deploy { name: "MyToken".into(), bytecode: vec![0x00], value: 0, gas_limit: 1_000_000, abi },
         ]);
+        assert!(results.iter().all(|r| r.success),
+            "deploy must succeed on testnet, got {:#?}", results);
 
         let manifest = runner.manifest();
         assert_eq!(manifest.network, "testnet");
         assert!(manifest.is_deployed("MyToken"));
         let contract = manifest.contracts.get("MyToken").unwrap();
         assert_eq!(contract.vm_version, 1);
-        assert!(contract.verified);
+        // Without storage attached, `verified` is now false — the
+        // runner did not persist anything through ContractVerifier,
+        // so claiming "verified" would be a lie. The old code
+        // optimistically set this to true.
+        assert!(!contract.verified,
+            "runner without storage must not report verified=true");
+        // Address prefix MUST match the manifest network.
+        assert!(contract.address.starts_with("ST1c_script_"),
+            "testnet manifest must produce ST1c-prefixed addresses, got: {}",
+            contract.address);
+        assert!(!contract.address.starts_with("SD1"),
+            "testnet manifest must NOT leak SD1 (mainnet) tag, got: {}",
+            contract.address);
+    }
+
+    #[test]
+    fn script_mainnet_manifest_produces_sd1c_addresses() {
+        let mut runner = ScriptRunner::new("mainnet", "SD1deployer").expect("mainnet is valid");
+        runner.fund_deployer(1_000_000_000).expect("fund_deployer must succeed");
+        let abi = ContractAbi::new("Any");
+        let results = runner.execute(&[
+            ScriptAction::Deploy { name: "Any".into(), bytecode: vec![0x00], value: 0, gas_limit: 1_000_000, abi },
+        ]);
+        assert!(results.iter().all(|r| r.success));
+        let addr = runner.get_address("Any").unwrap();
+        assert!(addr.starts_with("SD1c_script_"), "mainnet prefix, got: {}", addr);
+    }
+
+    #[test]
+    fn script_regtest_manifest_produces_sr1c_addresses() {
+        let mut runner = ScriptRunner::new("regtest", "SR1deployer").expect("regtest is valid");
+        runner.fund_deployer(1_000_000_000).expect("fund_deployer must succeed");
+        let abi = ContractAbi::new("Any");
+        let results = runner.execute(&[
+            ScriptAction::Deploy { name: "Any".into(), bytecode: vec![0x00], value: 0, gas_limit: 1_000_000, abi },
+        ]);
+        assert!(results.iter().all(|r| r.success));
+        let addr = runner.get_address("Any").unwrap();
+        assert!(addr.starts_with("SR1c_script_"), "regtest prefix, got: {}", addr);
     }
 }
