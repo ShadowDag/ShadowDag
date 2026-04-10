@@ -71,9 +71,28 @@ pub fn collect() -> String {
     match hooks().lock() {
         Ok(map) => {
             for (name, hook) in map.iter() {
-                let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook))
-                    .unwrap_or_else(|_| format!("\"<panic in {} diagnostic hook>\"", name));
-                subsystems.push(format!("\"{}\":{}", name, output));
+                // Validate hook output is valid JSON before including it.
+                // If a hook returns malformed JSON or panics, wrap its output
+                // as a JSON string literal with an explicit error marker so
+                // the overall diagnostic report remains valid JSON.
+                let output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook)) {
+                    Ok(s) => {
+                        // Best-effort JSON validation: if it parses, use as-is.
+                        // Otherwise wrap as escaped string with error marker.
+                        if serde_json::from_str::<serde_json::Value>(&s).is_ok() {
+                            s
+                        } else {
+                            format!("{{\"error\":\"invalid_json_from_hook\",\"raw\":{}}}",
+                                escape_json_string(&s))
+                        }
+                    }
+                    Err(payload) => {
+                        let msg = panic_payload_to_string(&payload);
+                        format!("{{\"error\":\"hook_panicked\",\"hook\":\"{}\",\"panic\":{}}}",
+                            name, escape_json_string(&msg))
+                    }
+                };
+                subsystems.push(format!("{}:{}", escape_json_string(name), output));
             }
         }
         Err(e) => { crate::slog_error!("diagnostics", "collect_lock_failed", error => e.to_string()); }
@@ -85,14 +104,48 @@ pub fn collect() -> String {
     // Log stats
     let (emitted, dropped) = crate::telemetry::logging::structured::log_stats();
 
+    // Version from Cargo.toml at compile time (single source of truth)
+    let version = env!("CARGO_PKG_VERSION");
+
     format!(
-        "{{\"timestamp\":{},\"version\":\"1.0.0\",\"subsystems\":{{{}}},\"metrics\":{},\"log_stats\":{{\"emitted\":{},\"dropped\":{}}}}}",
+        "{{\"timestamp\":{},\"version\":\"{}\",\"subsystems\":{{{}}},\"metrics\":{},\"log_stats\":{{\"emitted\":{},\"dropped\":{}}}}}",
         now,
+        version,
         subsystems.join(","),
         metrics_json,
         emitted,
         dropped
     )
+}
+
+/// Escape a string for JSON embedding (full RFC-compliant subset).
+fn escape_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"'  => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Extract a readable message from a panic payload (if possible).
+fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(&s) = payload.downcast_ref::<&'static str>() {
+        s.to_string()
+    } else {
+        "<unknown panic payload>".to_string()
+    }
 }
 
 /// Collect diagnostics and format as human-readable text.
@@ -102,16 +155,22 @@ pub fn dump_pretty() -> String {
         .unwrap_or_default()
         .as_secs();
 
+    let version = env!("CARGO_PKG_VERSION");
     let mut lines = Vec::new();
-    lines.push(format!("═══ ShadowDAG Diagnostics ═══  timestamp={}", now));
+    lines.push(format!("═══ ShadowDAG Diagnostics ═══  version={} timestamp={}", version, now));
     lines.push(String::new());
 
     match hooks().lock() {
         Ok(map) => {
             for (name, hook) in map.iter() {
                 lines.push(format!("── {} ──", name));
-                let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook))
-                    .unwrap_or_else(|_| format!("<panic in {} hook>", name));
+                let output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook)) {
+                    Ok(s) => s,
+                    Err(payload) => {
+                        let msg = panic_payload_to_string(&payload);
+                        format!("<panic in {} hook: {}>", name, msg)
+                    }
+                };
                 lines.push(output);
                 lines.push(String::new());
             }

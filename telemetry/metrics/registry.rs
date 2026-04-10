@@ -144,9 +144,13 @@ impl<'a> Drop for HistogramTimer<'a> {
 // ── Registry ────────────────────────────────────────────────────────────
 
 pub struct MetricsRegistry {
-    counters:   RwLock<HashMap<&'static str, Counter>>,
-    gauges:     RwLock<HashMap<&'static str, Gauge>>,
-    histograms: RwLock<HashMap<&'static str, Histogram>>,
+    // Metrics are boxed to ensure stable heap addresses even when the
+    // HashMap rehashes. The HashMap moves its entries; Box<T> does not.
+    // We leak the &'static reference via Box::leak, which is safe because
+    // the registry is a OnceLock global with 'static lifetime.
+    counters:   RwLock<HashMap<&'static str, &'static Counter>>,
+    gauges:     RwLock<HashMap<&'static str, &'static Gauge>>,
+    histograms: RwLock<HashMap<&'static str, &'static Histogram>>,
     start_time: Instant,
 }
 
@@ -168,52 +172,63 @@ impl MetricsRegistry {
 
     // ── Counter access ──────────────────────────────────────────────────
 
-    /// Get or create a counter. The first call allocates; subsequent calls
-    /// return the existing counter (lock-free hot path via read lock).
-    pub fn counter(&self, name: &'static str) -> &Counter {
+    /// Get or create a counter. The first call allocates a boxed Counter
+    /// (leaked to 'static) and subsequent calls return the same reference.
+    /// The 'static reference is safe because the MetricsRegistry is a
+    /// OnceLock global with 'static lifetime.
+    pub fn counter(&self, name: &'static str) -> &'static Counter {
         // Fast path: read lock
         {
             let map = self.counters.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(c) = map.get(name) {
-                // SAFETY: Counter lives as long as the registry (static lifetime)
-                return unsafe { &*(c as *const Counter) };
+            if let Some(&c) = map.get(name) {
+                return c;
             }
         }
         // Slow path: write lock + insert
         let mut map = self.counters.write().unwrap_or_else(|e| e.into_inner());
-        map.entry(name).or_insert_with(Counter::new);
-        let c = map.get(name).unwrap();
-        unsafe { &*(c as *const Counter) }
+        // Double-check after acquiring write lock (another thread may have inserted)
+        if let Some(&c) = map.get(name) {
+            return c;
+        }
+        let boxed: &'static Counter = Box::leak(Box::new(Counter::new()));
+        map.insert(name, boxed);
+        boxed
     }
 
     // ── Gauge access ────────────────────────────────────────────────────
 
-    pub fn gauge(&self, name: &'static str) -> &Gauge {
+    pub fn gauge(&self, name: &'static str) -> &'static Gauge {
         {
             let map = self.gauges.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(g) = map.get(name) {
-                return unsafe { &*(g as *const Gauge) };
+            if let Some(&g) = map.get(name) {
+                return g;
             }
         }
         let mut map = self.gauges.write().unwrap_or_else(|e| e.into_inner());
-        map.entry(name).or_insert_with(Gauge::new);
-        let g = map.get(name).unwrap();
-        unsafe { &*(g as *const Gauge) }
+        if let Some(&g) = map.get(name) {
+            return g;
+        }
+        let boxed: &'static Gauge = Box::leak(Box::new(Gauge::new()));
+        map.insert(name, boxed);
+        boxed
     }
 
     // ── Histogram access ────────────────────────────────────────────────
 
-    pub fn histogram(&self, name: &'static str) -> &Histogram {
+    pub fn histogram(&self, name: &'static str) -> &'static Histogram {
         {
             let map = self.histograms.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(h) = map.get(name) {
-                return unsafe { &*(h as *const Histogram) };
+            if let Some(&h) = map.get(name) {
+                return h;
             }
         }
         let mut map = self.histograms.write().unwrap_or_else(|e| e.into_inner());
-        map.entry(name).or_insert_with(Histogram::new);
-        let h = map.get(name).unwrap();
-        unsafe { &*(h as *const Histogram) }
+        if let Some(&h) = map.get(name) {
+            return h;
+        }
+        let boxed: &'static Histogram = Box::leak(Box::new(Histogram::new()));
+        map.insert(name, boxed);
+        boxed
     }
 
     // ── Uptime ──────────────────────────────────────────────────────────

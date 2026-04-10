@@ -111,10 +111,22 @@ impl DaemonNode {
                 .map_err(|e| NodeError::Init(format!("Failed to init mempool: {}", e)))?
         ));
 
-        // Open persistent contract storage (from ~/.shadowdag/<network>/contracts/)
+        // Open persistent contract storage (from ~/.shadowdag/<network>/contracts/).
+        // Path MUST be valid UTF-8 — we never silently fall back to a relative
+        // "contracts" string because that would create a second on-disk database
+        // in the current working directory, divorced from the real data dir.
+        let contract_path_buf = cfg.contract_path();
+        let contract_path_str = contract_path_buf.to_str().ok_or_else(|| {
+            NodeError::Init(format!(
+                "[daemon] FATAL: contract path is not valid UTF-8: {:?}. \
+                 Refusing to fall back to a relative path that could split state \
+                 across two directories. Fix the data directory path and restart.",
+                contract_path_buf
+            ))
+        })?;
         let contract_storage = Arc::new(
             crate::runtime::vm::contracts::contract_storage::ContractStorage::new(
-                cfg.contract_path().to_str().unwrap_or("contracts")
+                contract_path_str
             ).map_err(|e| NodeError::Init(format!("[daemon] contract storage init failed: {}", e)))?
         );
 
@@ -160,9 +172,29 @@ impl DaemonNode {
         Lifecycle::on_start();
         self.print_banner();
 
-        // ── Genesis initialization (idempotent) ──────────────────
-        let existing_best = self.block_store.get_best_hash();
-        if existing_best.is_none() || existing_best.as_deref() == Some("") {
+        // ── Genesis initialization (idempotent, fail-closed) ─────
+        //
+        // CRITICAL: we MUST distinguish "no chain yet" (safe to init genesis)
+        // from "read error / corrupt best_hash" (unsafe — aborting the process
+        // is the only correct response, because re-initializing genesis over an
+        // existing but unreadable chain would wipe the UTXO set and all blocks).
+        //
+        // `get_best_hash_strict()` collapses the three states correctly:
+        //   Ok(None)    → key genuinely absent → init genesis
+        //   Ok(Some(h)) → chain present → recover + resume
+        //   Err(_)      → corrupt / read failure → FATAL, refuse to proceed
+        let existing_best = self.block_store.get_best_hash_strict().map_err(|e| {
+            NodeError::Init(format!(
+                "[daemon] FATAL: refusing to start — could not read best_hash from \
+                 BlockStore: {}. This typically means on-disk state is corrupt or \
+                 RocksDB is unreadable. Do NOT proceed to genesis initialization \
+                 (that would wipe any existing chain). Investigate the data \
+                 directory, restore from backup, or use --reindex if appropriate.",
+                e
+            ))
+        })?;
+
+        if existing_best.is_none() {
             let genesis = create_genesis_block_for(&self.cfg.network);
             slog_info!("daemon", "genesis_hash", hash => genesis.header.hash);
 
