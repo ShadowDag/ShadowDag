@@ -252,7 +252,10 @@ fn cmd_test(args: &[String]) {
 
     // Run tests
     let mut runner = TestRunner::new();
-    runner.fund_account("test_caller", 1_000_000_000);
+    if let Err(e) = runner.fund_account("test_caller", 1_000_000_000) {
+        eprintln!("Fund failed: {}", e);
+        process::exit(1);
+    }
     match runner.deploy_bytecode(bytecode, "test_caller") {
         Ok(_) => {}
         Err(e) => {
@@ -341,7 +344,10 @@ fn cmd_trace(args: &[String]) {
 
     // Execute and trace
     let mut runner = TestRunner::new();
-    runner.fund_account("tracer", 1_000_000_000);
+    if let Err(e) = runner.fund_account("tracer", 1_000_000_000) {
+        eprintln!("Fund failed: {}", e);
+        process::exit(1);
+    }
     match runner.deploy_bytecode(bytecode, "tracer") {
         Ok(_) => {}
         Err(e) => {
