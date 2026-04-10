@@ -87,7 +87,14 @@ impl BlockStore {
     pub fn get_utxo_commitment(&self, block_hash: &str) -> Option<String> {
         let key = format!("{}utxo_commit:{}", BLK_PREFIX, block_hash);
         match self.db.get(key.as_bytes()) {
-            Ok(Some(data)) => String::from_utf8(data.to_vec()).ok(),
+            Ok(Some(data)) => match String::from_utf8(data.to_vec()) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    slog_error!("storage", "utxo_commitment_corrupt_utf8",
+                        block_hash => block_hash, error => e);
+                    None
+                }
+            },
             Ok(None) => None,
             Err(e) => {
                 slog_error!("storage", "utxo_commitment_read_error", block_hash => block_hash, error => e);
@@ -129,12 +136,26 @@ impl BlockStore {
 
     pub fn block_exists(&self, hash: &str) -> bool {
         let key = format!("{}{}", BLK_PREFIX, hash);
-        matches!(self.db.get(key.as_bytes()), Ok(Some(_)))
+        match self.db.get(key.as_bytes()) {
+            Ok(Some(_)) => true,
+            Ok(None)    => false,
+            Err(e)      => {
+                slog_error!("storage", "block_exists_read_failed_may_be_false_negative",
+                    hash => hash, error => e);
+                false // TODO: Consider Result<bool> return type
+            }
+        }
     }
 
     pub fn get_best_hash(&self) -> Option<String> {
         match self.db.get(BLK_BEST_HASH) {
-            Ok(Some(data)) => String::from_utf8(data.to_vec()).ok(),
+            Ok(Some(data)) => match String::from_utf8(data.to_vec()) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    slog_error!("storage", "best_hash_corrupt_utf8", error => e);
+                    None
+                }
+            },
             Ok(None) => None,
             Err(e) => {
                 slog_error!("storage", "best_hash_read_error", error => e);
@@ -145,6 +166,7 @@ impl BlockStore {
 
     pub fn get_recent_blocks(&self, limit: usize) -> Vec<Block> {
         let mut blocks: Vec<Block> = Vec::new();
+        let mut deserialize_errors = 0usize;
         let prefix = BLK_PREFIX.as_bytes();
         let iter = self.db.prefix_iterator(prefix);
         for item in iter {
@@ -162,9 +184,18 @@ impl BlockStore {
             if key_str.contains(":height:") { continue; }
             if key_str.contains(":h2h:") { continue; }
             if key_str.contains(":utxo_commit:") { continue; }
-            if let Ok(block) = bincode::deserialize::<Block>(&v) {
-                blocks.push(block);
+            match bincode::deserialize::<Block>(&v) {
+                Ok(block) => blocks.push(block),
+                Err(e) => {
+                    deserialize_errors += 1;
+                    slog_error!("storage", "recent_blocks_deserialize_failed",
+                        key => &key_str, error => e);
+                }
             }
+        }
+        if deserialize_errors > 0 {
+            slog_error!("storage", "recent_blocks_deserialize_errors_total",
+                errors => deserialize_errors, loaded => blocks.len());
         }
         // Sort by height descending (most recent first), with hash tiebreaker
         // for deterministic ordering among blocks at the same height.
