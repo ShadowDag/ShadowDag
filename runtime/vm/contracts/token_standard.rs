@@ -20,6 +20,7 @@
 
 use std::collections::BTreeMap;
 use sha2::{Sha256, Digest};
+use crate::domain::address::address::prefix_from_address;
 use crate::errors::VmError;
 
 /// Token transfer event
@@ -62,15 +63,31 @@ pub struct SRC20Token {
 }
 
 impl SRC20Token {
-    /// Deploy a new token
+    /// Deploy a new token.
+    ///
+    /// The `owner` must carry a recognized ShadowDAG network prefix
+    /// (`SD1` / `ST1` / `SR1`); otherwise this returns
+    /// `Err(VmError::ContractError)`. The token's deterministic
+    /// contract address inherits the same network prefix, so a
+    /// testnet owner produces a `ST1t…` token, a regtest owner
+    /// produces a `SR1t…` token, and a mainnet owner produces a
+    /// `SD1t…` token — matching the rest of the network-aware
+    /// contract-address pipeline in contract_deployer / executor /
+    /// wasm / script_runner.
+    ///
+    /// The previous signature was `-> Self` (infallible) and the
+    /// contract address was hardcoded to `SD1t{…}`, so the SRC-20
+    /// reference implementation could only ever produce
+    /// mainnet-tagged tokens even when deployed on testnet or
+    /// regtest. That was the last mainnet-bias hole in the VM.
     pub fn new(
         name:     &str,
         symbol:   &str,
         decimals: u8,
         initial_supply: u64,
         owner:    &str,
-    ) -> Self {
-        let contract_addr = Self::compute_address(name, symbol, owner);
+    ) -> Result<Self, VmError> {
+        let contract_addr = Self::compute_address(name, symbol, owner)?;
 
         let mut balances = BTreeMap::new();
         balances.insert(owner.to_string(), initial_supply);
@@ -99,7 +116,7 @@ impl SRC20Token {
             amount: initial_supply,
         });
 
-        token
+        Ok(token)
     }
 
     // ── ERC-20 Standard Functions ────────────────────────────────
@@ -365,13 +382,35 @@ impl SRC20Token {
         holders
     }
 
-    fn compute_address(name: &str, symbol: &str, owner: &str) -> String {
+    /// Compute the deterministic token contract address for
+    /// `(name, symbol, owner)`.
+    ///
+    /// The address format is `{net_prefix}t{20_bytes_hex}`, where
+    /// `net_prefix` is the 3-character on-chain prefix of the
+    /// owner's network (`SD1` / `ST1` / `SR1`). The previous
+    /// implementation hardcoded `"SD1t"`, which tagged every SRC-20
+    /// token as mainnet regardless of where it was actually
+    /// deployed.
+    ///
+    /// Returns `Err(VmError::ContractError)` if `owner` does not
+    /// carry a recognized ShadowDAG prefix — a non-ShadowDAG string
+    /// cannot have its network determined, and silently defaulting
+    /// to mainnet is exactly the bug this commit is closing.
+    fn compute_address(name: &str, symbol: &str, owner: &str) -> Result<String, VmError> {
+        let net_prefix = prefix_from_address(owner).ok_or_else(|| {
+            VmError::ContractError(format!(
+                "token owner '{}' has unknown network prefix (expected SD1/ST1/SR1) \
+                 — SRC-20 reference implementation cannot mint a token for a deployer \
+                 whose network cannot be determined",
+                owner
+            ))
+        })?;
         let mut h = Sha256::new();
         h.update(b"ShadowDAG_SRC20_v1");
         h.update(name.as_bytes());
         h.update(symbol.as_bytes());
         h.update(owner.as_bytes());
-        format!("SD1t{}", hex::encode(&h.finalize()[..20]))
+        Ok(format!("{}t{}", net_prefix, hex::encode(&h.finalize()[..20])))
     }
 }
 
@@ -385,6 +424,7 @@ mod tests {
 
     fn create_token() -> SRC20Token {
         SRC20Token::new("ShadowToken", "STKN", 8, 1_000_000, "SD1owner")
+            .expect("SD1owner has a valid mainnet prefix")
     }
 
     #[test]
@@ -574,7 +614,8 @@ mod tests {
 
     #[test]
     fn complex_scenario() {
-        let mut token = SRC20Token::new("ShadowUSD", "SUSD", 6, 10_000_000, "SD1bank");
+        let mut token = SRC20Token::new("ShadowUSD", "SUSD", 6, 10_000_000, "SD1bank")
+            .expect("SD1bank has a valid mainnet prefix");
 
         // Bank distributes to users
         token.transfer("SD1bank", "SD1alice", 1_000).unwrap();
@@ -601,5 +642,87 @@ mod tests {
         token.mint("SD1bank", "SD1alice", 5_000).unwrap();
         assert_eq!(token.balance_of("SD1alice"), 5_700);
         assert_eq!(token.total_supply(), 9_005_000);
+    }
+
+    // ─── Network-aware compute_address regression tests ──────────────
+
+    #[test]
+    fn mainnet_owner_produces_sd1t_token_address() {
+        // Regression pin: the pre-existing SD1owner tests must
+        // continue to produce SD1t-tagged tokens after the network
+        // derivation was made dynamic. This guards against a future
+        // "simplification" that drops the mainnet prefix by accident.
+        let token = SRC20Token::new("T", "T", 0, 1, "SD1owner").unwrap();
+        assert!(token.info.contract_addr.starts_with("SD1t"),
+            "mainnet owner must produce SD1t-prefixed contract address, got: {}",
+            token.info.contract_addr);
+    }
+
+    #[test]
+    fn testnet_owner_produces_st1t_token_address() {
+        // Regression for the hardcoded "SD1t" bug. A testnet owner
+        // must produce a testnet-tagged token address. The old code
+        // would have silently produced SD1t regardless.
+        let token = SRC20Token::new("T", "T", 0, 1, "ST1testowner").unwrap();
+        assert!(token.info.contract_addr.starts_with("ST1t"),
+            "testnet owner must produce ST1t-prefixed contract address, got: {}",
+            token.info.contract_addr);
+        assert!(!token.info.contract_addr.starts_with("SD1"),
+            "testnet owner must NOT leak SD1 (mainnet) tag, got: {}",
+            token.info.contract_addr);
+    }
+
+    #[test]
+    fn regtest_owner_produces_sr1t_token_address() {
+        let token = SRC20Token::new("T", "T", 0, 1, "SR1regowner").unwrap();
+        assert!(token.info.contract_addr.starts_with("SR1t"),
+            "regtest owner must produce SR1t-prefixed contract address, got: {}",
+            token.info.contract_addr);
+        assert!(!token.info.contract_addr.starts_with("SD1"),
+            "regtest owner must NOT leak SD1 (mainnet) tag, got: {}",
+            token.info.contract_addr);
+    }
+
+    #[test]
+    fn different_networks_produce_different_token_addresses() {
+        // Same (name, symbol), different network prefixes → different
+        // contract addresses. This prevents a testnet and mainnet
+        // deployment of the "same" token from aliasing at the same
+        // address.
+        let m = SRC20Token::new("Same", "SAME", 0, 1, "SD1owner").unwrap();
+        let t = SRC20Token::new("Same", "SAME", 0, 1, "ST1owner").unwrap();
+        let r = SRC20Token::new("Same", "SAME", 0, 1, "SR1owner").unwrap();
+
+        assert_ne!(m.info.contract_addr, t.info.contract_addr);
+        assert_ne!(t.info.contract_addr, r.info.contract_addr);
+        assert_ne!(m.info.contract_addr, r.info.contract_addr);
+
+        assert!(m.info.contract_addr.starts_with("SD1t"));
+        assert!(t.info.contract_addr.starts_with("ST1t"));
+        assert!(r.info.contract_addr.starts_with("SR1t"));
+    }
+
+    #[test]
+    fn unknown_owner_prefix_rejected() {
+        // An owner string with no recognized ShadowDAG prefix must
+        // be refused — silently defaulting to SD1 was the whole bug.
+        //
+        // Note: SRC20Token does not derive Debug, so we avoid
+        // `unwrap_err()` (which requires `T: Debug`) and match
+        // on the Result directly.
+        match SRC20Token::new("T", "T", 0, 1, "BTC1foreign") {
+            Ok(_) => panic!("BTC1foreign must be refused"),
+            Err(e) => {
+                let msg = format!("{}", e);
+                assert!(msg.contains("unknown network prefix"),
+                    "error must explain the problem, got: {}", msg);
+            }
+        }
+
+        // Empty owner is also refused.
+        assert!(SRC20Token::new("T", "T", 0, 1, "").is_err());
+
+        // A bare deployer name like "deployer" has no prefix.
+        assert!(SRC20Token::new("T", "T", 0, 1, "deployer").is_err());
     }
 }
