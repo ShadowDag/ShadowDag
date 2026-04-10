@@ -164,6 +164,42 @@ impl BlockStore {
         }
     }
 
+    /// Strict version of `get_best_hash` that distinguishes three states:
+    /// - `Ok(None)` → key genuinely absent (no chain yet, safe to init genesis)
+    /// - `Ok(Some(_))` → valid best tip present
+    /// - `Err(StorageError)` → read failed or value corrupt (fail-closed: refuse
+    ///   to proceed, caller must surface the error and abort)
+    ///
+    /// Callers making genesis-init decisions MUST use this method rather than
+    /// `get_best_hash()`, because `Option<None>` from the non-strict version
+    /// collapses corruption/read-failure into "no chain" and can wipe existing
+    /// chain state on startup.
+    pub fn get_best_hash_strict(&self) -> Result<Option<String>, crate::errors::StorageError> {
+        match self.db.get(BLK_BEST_HASH) {
+            Ok(Some(data)) => match String::from_utf8(data.to_vec()) {
+                Ok(s) if s.is_empty() => {
+                    slog_error!("storage", "best_hash_empty_value_treated_as_corrupt");
+                    Err(crate::errors::StorageError::ReadFailed(
+                        "best_hash key present but value is empty".to_string(),
+                    ))
+                }
+                Ok(s) => Ok(Some(s)),
+                Err(e) => {
+                    slog_error!("storage", "best_hash_corrupt_utf8_strict", error => e);
+                    Err(crate::errors::StorageError::ReadFailed(format!(
+                        "best_hash corrupt utf8: {}",
+                        e
+                    )))
+                }
+            },
+            Ok(None) => Ok(None),
+            Err(e) => {
+                slog_error!("storage", "best_hash_read_error_strict", error => e);
+                Err(crate::errors::StorageError::ReadFailed(e.to_string()))
+            }
+        }
+    }
+
     pub fn get_recent_blocks(&self, limit: usize) -> Vec<Block> {
         let mut blocks: Vec<Block> = Vec::new();
         let mut deserialize_errors = 0usize;
@@ -218,10 +254,18 @@ impl BlockStore {
                 }
             })
             .filter(|(k, _)| {
+                // Only count primary block records (`blk:{hash}`).
+                // Exclude every auxiliary entry that shares the `blk:` prefix:
+                //   - `blk:best_hash`      (tip pointer)
+                //   - `blk:height:{h}:{hash}` (height index)
+                //   - `blk:h2h:{hash}`     (hash → height reverse index)
+                //   - `blk:utxo_commit:{hash}` (UTXO commitment per block)
                 let key_str = String::from_utf8(k.to_vec()).unwrap_or_default();
                 key_str.starts_with(BLK_PREFIX)
                     && key_str != "blk:best_hash"
                     && !key_str.contains(":height:")
+                    && !key_str.contains(":h2h:")
+                    && !key_str.contains(":utxo_commit:")
             })
             .count()
     }
