@@ -171,6 +171,20 @@ impl PrecompileRegistry {
     /// Both clamps are applied regardless of whether the precompile
     /// reported success or failure, so that gas accounting cannot be
     /// bypassed by returning an error with zero `gas_used`.
+    ///
+    /// **Unknown addresses also respect the invariant.** The previous
+    /// implementation returned `PrecompileResult::err("unknown precompile
+    /// address", 0)`, which set `gas_used = 0` on a failure path — the
+    /// exact pattern the floor clamp was meant to close for registered
+    /// precompiles. Even though in-production this path is unreachable
+    /// (the executor's `is_precompile_addr` helper already restricts
+    /// calls to 0x01..=0x09), a future drift — a new address added to
+    /// `is_precompile_addr` but not registered in `new()`, or a direct
+    /// caller that bypasses the helper — would fall through to this
+    /// arm and bypass gas accounting entirely. Matching the
+    /// "insufficient gas" path, an unknown address now charges
+    /// `gas_limit` so a bogus lookup costs the caller the full
+    /// allocation they handed in.
     pub fn execute(&self, address: u64, input: &[u8], gas_limit: u64) -> PrecompileResult {
         match self.contracts.get(&address) {
             Some(entry) => {
@@ -210,7 +224,14 @@ impl PrecompileRegistry {
 
                 result
             }
-            None => PrecompileResult::err("unknown precompile address", 0),
+            None => {
+                // Unknown address → charge `gas_limit`, mirroring the
+                // "insufficient gas" arm above, so gas accounting
+                // cannot be bypassed by a bogus address. The old
+                // `gas_used: 0` left this arm outside the floor/
+                // ceiling envelope the rest of this function enforces.
+                PrecompileResult::err("unknown precompile address", gas_limit)
+            }
         }
     }
 
@@ -356,5 +377,47 @@ mod tests {
         let reg = registry_with_fake(0xFA, 1000, 0, underreporting_precompile);
         let result = reg.execute(0xFA, b"", 500); // only 500, need 1000
         assert!(!result.success, "insufficient-gas path must still reject");
+    }
+
+    #[test]
+    fn unknown_precompile_address_charges_gas_limit() {
+        // Regression for the `gas_used = 0` bypass in the unknown-
+        // address arm. An address that was never registered must
+        // charge the caller `gas_limit` on failure, matching the
+        // "insufficient gas for precompile" arm, so a future drift
+        // where an address slips through `is_precompile_addr` without
+        // being registered cannot silently skip gas accounting. The
+        // old arm returned `gas_used: 0`, which sat outside the
+        // floor/ceiling envelope the rest of `execute` enforces.
+        let reg = PrecompileRegistry::new();
+        // 0xFF is not registered in new(). Call it with a 5000-gas
+        // allocation and verify the result charges 5000, not 0.
+        let result = reg.execute(0xFF, b"", 5000);
+        assert!(!result.success, "unknown address must fail");
+        assert_eq!(
+            result.gas_used, 5000,
+            "unknown address must charge the full gas_limit, not 0 — \
+             previous behaviour left the failure path outside the floor invariant"
+        );
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("unknown precompile"),
+            "error must describe the missing address, got: {:?}",
+            result.error
+        );
+    }
+
+    #[test]
+    fn unknown_precompile_with_zero_gas_limit_returns_zero_used() {
+        // Edge case: gas_limit is 0 and the address is unknown. The
+        // failure still charges `gas_limit`, which is 0. This is
+        // consistent with the "insufficient gas" arm (which would
+        // also charge 0 in this case because there is nothing to
+        // charge), and documents that gas_used == 0 here means "the
+        // caller allocated zero", not "this path leaks free calls".
+        let reg = PrecompileRegistry::new();
+        let result = reg.execute(0xFF, b"", 0);
+        assert!(!result.success);
+        assert_eq!(result.gas_used, 0,
+            "zero-allocation unknown address charges the full (zero) limit");
     }
 }
