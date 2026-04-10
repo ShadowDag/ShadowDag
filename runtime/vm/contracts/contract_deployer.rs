@@ -185,12 +185,27 @@ impl ContractDeployer {
     /// Returns `Err(VmError::ContractError)` for an unknown deployer
     /// prefix. See [`Self::compute_create_address`] for rationale.
     ///
+    /// # Salt is exactly 32 bytes
+    ///
+    /// The salt parameter is typed as `&[u8; 32]` so the caller
+    /// cannot accidentally feed a slice of the wrong length. The
+    /// sibling entry points [`Self::create2`] and
+    /// [`Self::predict_create2_address`] both already take
+    /// `salt: [u8; 32]` — the previous signature of this function
+    /// was `salt: &[u8]`, which accepted a slice of ANY length and
+    /// produced addresses that the real CREATE2 path could never
+    /// reproduce for a 31- or 33-byte salt. That meant `predict` /
+    /// `create2` / `compute` could silently disagree on the address
+    /// for the "same" deployment as soon as a caller forgot to
+    /// normalize the salt to 32 bytes. The type system now catches
+    /// the mismatch at compile time.
+    ///
     /// code_hash = SHA-256(init_code)
     /// hash = SHA-256(0xFF || deployer || salt || code_hash)
     /// address = `{net}c` + hex(hash[0..20])
     pub fn compute_create2_address(
         deployer: &str,
-        salt: &[u8],
+        salt: &[u8; 32],
         init_code: &[u8],
     ) -> Result<String, VmError> {
         let net_prefix = Self::deployer_prefix(deployer)?;
@@ -419,5 +434,38 @@ mod tests {
     #[test]
     fn valid_code_passes() {
         assert!(ContractDeployer::validate_runtime_code(&[0x60, 0x00]).is_ok());
+    }
+
+    #[test]
+    fn compute_create2_address_matches_create2_and_predict_for_32_byte_salt() {
+        // Regression for the bug where `compute_create2_address` took
+        // `salt: &[u8]` while `create2` / `predict_create2_address`
+        // took `salt: [u8; 32]`. A direct caller of compute could pass
+        // a 31- or 33-byte slice and compute an address that the real
+        // CREATE2 path could never produce. The new signature is
+        // `salt: &[u8; 32]` so the mismatch is a type error at
+        // compile time.
+        //
+        // This runtime test only verifies the positive path: a 32-byte
+        // salt produces the same address across all three entry
+        // points. The compile-time check cannot be exercised from a
+        // passing test — it exists in the type system.
+        let salt: [u8; 32] = [0x11; 32];
+        let code = vec![0x60, 0x00, 0x60, 0x20];
+
+        let predicted = ContractDeployer::predict_create2_address(
+            MAINNET_DEPLOYER, salt, &code,
+        ).unwrap();
+        let deployed = ContractDeployer::create2(
+            MAINNET_DEPLOYER, salt, &code,
+        ).unwrap();
+        let computed = ContractDeployer::compute_create2_address(
+            MAINNET_DEPLOYER, &salt, &code,
+        ).unwrap();
+
+        assert_eq!(predicted, deployed.address,
+            "predict_create2_address must match create2 for the same inputs");
+        assert_eq!(deployed.address, computed,
+            "compute_create2_address must match create2 for the same 32-byte salt");
     }
 }
