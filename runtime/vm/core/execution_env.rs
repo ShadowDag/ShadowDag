@@ -1921,14 +1921,84 @@ fn is_precompile_addr(addr: &str) -> Option<u8> {
 }
 
 /// Parse a storage value to U256 (deterministic: hex > decimal > zero)
+/// Parse a stored U256 value from its on-disk string representation.
+///
+/// SSTORE always writes `"0x<64 hex chars>"`, so the hex path is the
+/// hot path. The decimal path exists for backward compatibility with
+/// older state and for any external code that wrote decimal values.
+///
+/// Both paths return `U256::ZERO` only when the input is empty,
+/// genuinely zero, or malformed. The previous decimal path used
+/// `s.parse::<u64>().unwrap_or(0)`, which silently truncated any
+/// decimal value larger than `u64::MAX` to zero — a silent
+/// data-loss path for U256 storage values that happened to be
+/// stored in decimal form. The new path parses up to a full
+/// 256-bit decimal via repeated `wrapping_mul(10) + digit` and
+/// rejects anything that wouldn't fit in U256 by length-checking
+/// against `U256::MAX`'s 78-digit decimal representation.
 fn parse_storage_value(s: &str) -> U256 {
     if let Some(hex_str) = s.strip_prefix("0x") {
-        U256::from_hex(hex_str).unwrap_or(U256::ZERO)
-    } else if s.bytes().all(|b| b.is_ascii_digit()) && !s.is_empty() {
-        U256::from_u64(s.parse::<u64>().unwrap_or(0))
-    } else {
-        U256::ZERO
+        return U256::from_hex(hex_str).unwrap_or_else(|| {
+            slog_error!("vm", "parse_storage_value_corrupt_hex",
+                raw => s, note => "returning ZERO on malformed hex storage value");
+            U256::ZERO
+        });
     }
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        if !s.is_empty() {
+            slog_error!("vm", "parse_storage_value_corrupt_decimal",
+                raw => s, note => "returning ZERO on non-numeric, non-hex storage value");
+        }
+        return U256::ZERO;
+    }
+    // Decimal path: parse up to a full 256-bit value, NOT just u64.
+    parse_decimal_u256(s).unwrap_or_else(|| {
+        slog_error!("vm", "parse_storage_value_decimal_overflow",
+            raw => s, note => "returning ZERO on decimal storage value that exceeds U256::MAX");
+        U256::ZERO
+    })
+}
+
+/// Decimal-string → U256 parser. Returns `None` if the string is
+/// empty, contains non-digit characters, or represents a value
+/// strictly greater than `U256::MAX`.
+///
+/// `U256::MAX` is exactly 78 decimal digits long (≈ 1.158 × 10^77),
+/// so any input with 79+ significant digits is rejected up front.
+/// 78-digit inputs are compared lexicographically against the
+/// canonical `U256::MAX` decimal string before computing the value,
+/// which is correct because both strings have the same length.
+fn parse_decimal_u256(s: &str) -> Option<U256> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Strip leading zeros so the digit-count comparison is correct.
+    // "00000000000000000000000000000000000000000000000000000000000000000000000000000000042"
+    // is a valid U256 even though it has 83 digits before trimming.
+    let trimmed = s.trim_start_matches('0');
+    let trimmed = if trimmed.is_empty() { "0" } else { trimmed };
+
+    // Canonical decimal representation of U256::MAX (78 digits).
+    const U256_MAX_DECIMAL: &str =
+        "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+    debug_assert_eq!(U256_MAX_DECIMAL.len(), 78);
+
+    if trimmed.len() > 78 {
+        return None;
+    }
+    if trimmed.len() == 78 && trimmed > U256_MAX_DECIMAL {
+        return None;
+    }
+
+    // At this point the decimal value is provably ≤ U256::MAX, so
+    // wrapping arithmetic cannot overflow into garbage.
+    let mut result = U256::ZERO;
+    let ten = U256::from_u64(10);
+    for c in trimmed.bytes() {
+        let digit = (c - b'0') as u64;
+        result = result.wrapping_mul(ten).wrapping_add(U256::from_u64(digit));
+    }
+    Some(result)
 }
 
 /// Find valid JUMPDEST positions in bytecode
@@ -3124,5 +3194,76 @@ mod tests {
             "contract balance must NOT be touched when SELFDESTRUCT fails to \
              forward its funds"
         );
+    }
+
+    // ── parse_decimal_u256 — decimal storage values larger than u64 ──
+
+    /// Regression for the `parse::<u64>().unwrap_or(0)` silent
+    /// truncation bug. A decimal value larger than `u64::MAX` must
+    /// round-trip through the storage parser, not collapse to ZERO.
+    #[test]
+    fn parse_storage_value_decodes_decimal_larger_than_u64() {
+        // u64::MAX = 18_446_744_073_709_551_615 (20 digits).
+        // Pick something one digit longer that the old code would
+        // have silently dropped.
+        let big_dec = "184467440737095516150"; // u64::MAX * 10
+        let parsed = parse_storage_value(big_dec);
+        assert_ne!(parsed, U256::ZERO,
+            "decimal value larger than u64::MAX must NOT silently parse as ZERO");
+
+        // And the value must round-trip via the same parser.
+        let expected = parse_decimal_u256(big_dec).expect("must parse");
+        assert_eq!(parsed, expected, "parse_storage_value must agree with parse_decimal_u256");
+    }
+
+    /// `U256::MAX` itself must round-trip cleanly through the
+    /// decimal parser — that's the boundary case for the 78-digit
+    /// length check.
+    #[test]
+    fn parse_decimal_u256_handles_u256_max_exactly() {
+        let max_dec = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+        let parsed = parse_decimal_u256(max_dec).expect("U256::MAX must parse");
+        // Re-encode to bytes and verify all 32 bytes are 0xFF.
+        let bytes = parsed.to_be_bytes();
+        assert!(bytes.iter().all(|&b| b == 0xFF),
+            "U256::MAX must decode to all 0xFF bytes, got: {:?}", bytes);
+    }
+
+    /// Anything strictly larger than `U256::MAX` must be rejected
+    /// with `None` (not silently truncated to a wrapped value).
+    #[test]
+    fn parse_decimal_u256_rejects_overflow() {
+        // U256::MAX + 1
+        let too_big = "115792089237316195423570985008687907853269984665640564039457584007913129639936";
+        assert!(parse_decimal_u256(too_big).is_none(),
+            "value U256::MAX + 1 must be rejected, not silently wrapped");
+
+        // 79 digits — guaranteed overflow regardless of leading digit.
+        let way_too_big = "9".repeat(79);
+        assert!(parse_decimal_u256(&way_too_big).is_none(),
+            "79-digit decimal must be rejected up front");
+
+        // 100 digits.
+        let absurd = "1".repeat(100);
+        assert!(parse_decimal_u256(&absurd).is_none());
+    }
+
+    /// Decimal values with leading zeros must still parse correctly.
+    /// "00000000000000000000000000000042" is exactly 42, even though
+    /// it has 32 digits.
+    #[test]
+    fn parse_decimal_u256_strips_leading_zeros() {
+        let padded = "0".repeat(50) + "42";
+        let parsed = parse_decimal_u256(&padded).expect("must parse");
+        assert_eq!(parsed, U256::from_u64(42));
+    }
+
+    /// Empty string and non-digit input return None.
+    #[test]
+    fn parse_decimal_u256_rejects_non_decimal_input() {
+        assert!(parse_decimal_u256("").is_none());
+        assert!(parse_decimal_u256("abc").is_none());
+        assert!(parse_decimal_u256("12-34").is_none());
+        assert!(parse_decimal_u256("0x42").is_none()); // hex prefix is not decimal
     }
 }
