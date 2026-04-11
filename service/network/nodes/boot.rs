@@ -59,8 +59,17 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
     let db = node_db.shared();
 
     // ✅ runtime
+    //
+    // `start()` returns Result now — a failed write to
+    // `runtime:status` / `runtime:version` must surface as a boot
+    // error rather than logging-and-continuing, otherwise the node
+    // would come up claiming to be "running" while the persisted
+    // markers say something else (or nothing).
     let runtime = RuntimeManager::new(db.clone());
-    runtime.start();
+    runtime.start().map_err(|e| {
+        slog_error!("boot", "runtime_manager_start_failed", error => &e.to_string());
+        NodeError::Init(format!("RuntimeManager::start failed: {}", e))
+    })?;
 
     // ✅ إضافات runtime layer (بدون تغيير أي شيء ثاني)
     let _event_bus = EventBus::new(db.clone())
