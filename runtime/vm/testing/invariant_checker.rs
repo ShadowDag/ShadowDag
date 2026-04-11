@@ -148,6 +148,7 @@ mod tests {
         ExecutionEnvironment::new(BlockContext {
             timestamp: 1000,
             block_hash: "00".repeat(32),
+            network: "mainnet".to_string(),
         })
     }
 

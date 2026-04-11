@@ -3142,6 +3142,24 @@ impl RpcServer {
     //  CONTRACT RPC METHODS
     // ═══════════════════════════════════════════════════════════════════
 
+    /// Dry-run a contract deployment against the current contract state.
+    ///
+    /// This endpoint is SIMULATION-ONLY. It loads the caller's state
+    /// from the shared contract DB into an ephemeral
+    /// ExecutionEnvironment, runs the constructor, computes the
+    /// deterministic contract address, and returns the execution
+    /// result — without persisting any state changes to disk. The
+    /// previous implementation called `Executor::deploy`, which
+    /// directly committed contract state to the shared DB outside
+    /// the consensus block-application pipeline; those writes were
+    /// not covered by `persist_with_undo` and could not be reversed
+    /// by `ContractStorage::rollback_block()` on reorg, leaving
+    /// orphaned on-disk contract state after any chain reorganization.
+    ///
+    /// To actually deploy a contract, clients must submit a
+    /// `ContractCreate` transaction via the mempool so that the
+    /// block-application path (which DOES build undo data) is the
+    /// single source of on-chain contract state.
     fn cmd_deploy_contract(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
         let s = match state.lock() {
             Ok(s) => s,
@@ -3175,7 +3193,10 @@ impl RpcServer {
         );
         let executor = Executor::new(ctx);
 
-        match executor.deploy(&bytecode, deployer, value, gas_limit, 0, "", 0) {
+        // Dry-run: simulate_deploy does NOT persist state changes to
+        // the shared contract DB. See the doc comment above for why
+        // the RPC must never commit contract state directly.
+        match executor.simulate_deploy(&bytecode, deployer, value, gas_limit, 0, "", 0) {
             Ok((addr, result)) => {
                 let gas_used = match &result {
                     ExecutionResult::Success { gas_used, .. } => *gas_used,
@@ -3188,12 +3209,20 @@ impl RpcServer {
                     "address": addr,
                     "success": success,
                     "gas_used": gas_used,
+                    "simulated": true,
                 }))
             }
             Err(e) => RpcResponse::err(id, ERR_INTERNAL, format!("deploy failed: {}", e)),
         }
     }
 
+    /// Dry-run a contract call against the current contract state.
+    ///
+    /// Simulation-only — see `cmd_deploy_contract` above for the
+    /// full rationale. State writes made during this call are NOT
+    /// persisted to the shared contract DB. Clients that want their
+    /// writes to land on-chain must submit a `ContractCall`
+    /// transaction via the mempool.
     fn cmd_call_contract(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
         let s = match state.lock() {
             Ok(s) => s,
@@ -3231,7 +3260,8 @@ impl RpcServer {
         );
         let executor = Executor::new(ctx);
 
-        let result = executor.call(contract_addr, &calldata, caller, value, gas_limit, 0, "");
+        // Dry-run: simulate_call does NOT persist state changes.
+        let result = executor.simulate_call(contract_addr, &calldata, caller, value, gas_limit, 0, "");
 
         let gas_used = match &result {
             ExecutionResult::Success { gas_used, .. } => *gas_used,
@@ -3249,6 +3279,7 @@ impl RpcServer {
             "success": success,
             "gas_used": gas_used,
             "return_data": return_data_hex,
+            "simulated": true,
         }))
     }
 
@@ -3282,7 +3313,14 @@ impl RpcServer {
             None => return RpcResponse::err(id, ERR_INTERNAL, "contract storage not available"),
         };
 
-        // Use a fresh ContractStorage for estimation — changes are NOT persisted
+        // Use simulate_call so the gas estimation does NOT persist any
+        // state mutations to the shared contract DB. The previous
+        // implementation's comment claimed "changes are NOT persisted"
+        // but the underlying `Executor::call` ran its normal
+        // `persist_to_storage` step on success, silently committing
+        // estimation side effects to disk outside the block-application
+        // path (no undo data, not reversible on reorg). Using
+        // `simulate_call` makes the comment match reality.
         let estimate_gas_limit: u64 = 100_000_000; // high ceiling for estimation
         let ctx = VMContext::new(
             ContractStorage::new(cs.shared_db())
@@ -3290,7 +3328,7 @@ impl RpcServer {
         );
         let executor = Executor::new(ctx);
 
-        let result = executor.call(contract_addr, &calldata, caller, value, estimate_gas_limit, 0, "");
+        let result = executor.simulate_call(contract_addr, &calldata, caller, value, estimate_gas_limit, 0, "");
 
         let gas_used = match &result {
             ExecutionResult::Success { gas_used, .. } => *gas_used,

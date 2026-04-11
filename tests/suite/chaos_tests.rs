@@ -19,6 +19,7 @@ mod chaos {
         ExecutionEnvironment::new(BlockContext {
             timestamp: 1_000_000,
             block_hash: "00".repeat(32),
+            network: "mainnet".to_string(),
         })
     }
 

@@ -26,6 +26,7 @@ mod multi_node_determinism {
         ExecutionEnvironment::new(BlockContext {
             timestamp: 1_000_000,
             block_hash: block_hash.to_string(),
+            network: "mainnet".to_string(),
         })
     }
 
