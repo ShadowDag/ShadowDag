@@ -164,6 +164,7 @@ impl Executor {
         let mut env = ExecutionEnvironment::new(BlockContext {
             timestamp,
             block_hash: block_hash.to_string(),
+            network: "mainnet".to_string(),
         });
 
         // Load deployer account from persistent storage. Propagate any
@@ -347,6 +348,7 @@ impl Executor {
         let mut env = ExecutionEnvironment::new(BlockContext {
             timestamp,
             block_hash: block_hash.to_string(),
+            network: "mainnet".to_string(),
         });
 
         // Load contract and caller accounts from persistent storage. A

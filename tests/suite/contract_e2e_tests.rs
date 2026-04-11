@@ -50,6 +50,7 @@ mod contract_e2e {
         ExecutionEnvironment::new(BlockContext {
             timestamp: 1000,
             block_hash: "00".repeat(32),
+            network: "mainnet".to_string(),
         })
     }
 
@@ -203,13 +204,16 @@ mod contract_e2e {
         // Contract B: stores CALLVALUE in slot 0, then STOP
         let code_b = vec![CALLVALUE, PUSH1, 0, SSTORE, STOP];
 
-        // The CALL opcode resolves the target via addr.to_hex(), so a
-        // PUSH1 of value N calls the contract at address hex(N).
-        // We use PUSH1 0x0b => address is the hex representation of
-        // a U256 with value 11.  to_hex() on a U256(11) produces a
-        // 64-char hex string with leading zeros ending in "0b".
-        // We store code at the full hex address the VM will resolve to.
-        let target_addr = format!("{:0>64}", "0b"); // 64-char hex addr for value 11
+        // CALL resolves its target via `resolve_address` — a 20-byte
+        // canonical body popped off the stack is reconstructed as
+        // `"SD1c" + hex(body)` using the block context's network.
+        // PUSH1 0x0b pushes `[0u8; 19, 0x0b]` as the right-aligned
+        // body inside a 32-byte U256 word, so the resolved target
+        // string is `"SD1c" + hex([0u8; 19, 0x0b])` — a 44-char
+        // mainnet contract address. Store B's code at that exact key.
+        let mut body = [0u8; 20];
+        body[19] = 0x0b;
+        let target_addr = format!("SD1c{}", hex::encode(body));
         env.state.set_code(&target_addr, code_b).unwrap();
 
         // Contract A: CALL B with value=100
