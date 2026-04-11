@@ -1116,6 +1116,17 @@ impl ExecutionEnvironment {
                             return CallOutcome::Failure { gas_used: gas.gas_used() };
                         }
                     };
+
+                    // Increment caller's nonce BEFORE taking the CREATE
+                    // sub-snapshot so the bump is preserved across a
+                    // failed CREATE. EVM semantics: the caller's nonce
+                    // is consumed by any CREATE attempt, success or
+                    // failure, but every other side effect (new
+                    // account, value transfer, temporary init code
+                    // install) MUST be reverted on failure so an
+                    // unsuccessful deploy does not leave an orphaned
+                    // empty account or unspent value sitting at the
+                    // would-be contract address.
                     self.state.increment_nonce(&ctx.address).ok();
 
                     // Check address not occupied
@@ -1133,16 +1144,35 @@ impl ExecutionEnvironment {
                         return CallOutcome::Failure { gas_used: gas.gas_used() };
                     }
 
-                    // Create account + transfer value
-                    self.state.get_or_create_account(&new_addr);
-                    if create_value > 0
-                        && self.state.transfer(&ctx.address, &new_addr, create_value).is_err() {
-                            stack.push(U256::ZERO);
-                            gas.return_gas(child_gas);
-                            pc += 1; continue;
-                        }
+                    // Sub-snapshot AFTER the nonce increment. Anything
+                    // mutated from this point forward inside the CREATE
+                    // path will be undone on failure via
+                    // `rollback(create_snapshot)`; the nonce bump sits
+                    // BEFORE this point and therefore survives rollback.
+                    let create_snapshot = self.state.snapshot();
 
-                    // Execute init code
+                    // Create the new account (empty) and install the
+                    // init code as its temporary bytecode so the child
+                    // frame's get_code lookup can find something to
+                    // execute. Value transfer is deliberately NOT done
+                    // here — it is delegated to `execute_frame`, which
+                    // performs `state.transfer(caller, address, value)`
+                    // at frame entry. Doing the transfer in both places
+                    // produced a double debit of `create_value` from
+                    // the caller, which is the "CREATE fails but
+                    // caller loses value twice" bug this fix also
+                    // closes.
+                    self.state.get_or_create_account(&new_addr);
+                    self.state.set_code(&new_addr, init_code).ok();
+
+                    // Execute init code. execute_frame handles the
+                    // caller -> new_addr value transfer internally via
+                    // its own entry-point transfer + snapshot pair,
+                    // and rolls back its own child snapshot on
+                    // failure, which automatically reverts that
+                    // transfer. On child failure we ALSO rollback
+                    // create_snapshot below, which reverts the new
+                    // account creation and the temporary set_code.
                     let child_ctx = CallContext {
                         address: new_addr.clone(),
                         code_address: new_addr.clone(),
@@ -1154,8 +1184,6 @@ impl ExecutionEnvironment {
                         depth: ctx.depth + 1,
                     };
 
-                    // Temporarily set the init code as the new contract's code
-                    self.state.set_code(&new_addr, init_code).ok();
                     let outcome = self.execute_frame(&child_ctx);
 
                     match outcome {
@@ -1166,11 +1194,27 @@ impl ExecutionEnvironment {
                                 self.state.set_code(&new_addr, runtime_code).ok();
                             }
                             self.created_in_tx.insert(new_addr.clone());
+                            // Keep all CREATE-side effects: let the
+                            // sub-snapshot age into the parent's
+                            // snapshot stack via commit so later
+                            // snapshots don't observe a stale handle.
+                            self.state.commit(create_snapshot).ok();
                             // Push address as U256
                             stack.push(U256::from_hex(&hex::encode(new_addr.as_bytes())).unwrap_or(U256::ZERO));
                         }
                         _ => {
-                            // Failed -- clean up
+                            // CREATE failed. Revert every state
+                            // change made since create_snapshot:
+                            //   - get_or_create_account(new_addr)
+                            //   - set_code(new_addr, init_code)
+                            //   - any child-frame changes that the
+                            //     child's own rollback didn't reach
+                            //     (normally none — child rolls back
+                            //     via its own snapshot on failure)
+                            // The nonce increment, which was done
+                            // BEFORE create_snapshot, is preserved
+                            // as required by EVM semantics.
+                            self.state.rollback(create_snapshot).ok();
                             stack.push(U256::ZERO);
                         }
                     }
@@ -1218,6 +1262,9 @@ impl ExecutionEnvironment {
                         }
                     };
 
+                    // Nonce bump BEFORE sub-snapshot so it survives a
+                    // failed CREATE2 — see the full CREATE comment
+                    // block above for the rationale.
                     self.state.increment_nonce(&ctx.address).ok();
 
                     if !self.state.get_code(&new_addr).is_empty() {
@@ -1233,13 +1280,17 @@ impl ExecutionEnvironment {
                         return CallOutcome::Failure { gas_used: gas.gas_used() };
                     }
 
+                    // Sub-snapshot AFTER the nonce increment. Any
+                    // CREATE2 side effect from here on is reverted on
+                    // failure via rollback(create_snapshot); the
+                    // nonce bump is not.
+                    let create_snapshot = self.state.snapshot();
+
+                    // See CREATE above: value transfer is delegated
+                    // to execute_frame so a CREATE2 with value does
+                    // not double-debit the caller.
                     self.state.get_or_create_account(&new_addr);
-                    if create_value > 0
-                        && self.state.transfer(&ctx.address, &new_addr, create_value).is_err() {
-                            stack.push(U256::ZERO);
-                            gas.return_gas(child_gas);
-                            pc += 1; continue;
-                        }
+                    self.state.set_code(&new_addr, init_code).ok();
 
                     let child_ctx = CallContext {
                         address: new_addr.clone(),
@@ -1252,7 +1303,6 @@ impl ExecutionEnvironment {
                         depth: ctx.depth + 1,
                     };
 
-                    self.state.set_code(&new_addr, init_code).ok();
                     let outcome = self.execute_frame(&child_ctx);
 
                     match outcome {
@@ -1262,9 +1312,15 @@ impl ExecutionEnvironment {
                                 self.state.set_code(&new_addr, runtime_code).ok();
                             }
                             self.created_in_tx.insert(new_addr.clone());
+                            self.state.commit(create_snapshot).ok();
                             stack.push(U256::from_hex(&hex::encode(new_addr.as_bytes())).unwrap_or(U256::ZERO));
                         }
                         _ => {
+                            // Revert every state change made since
+                            // create_snapshot (new account creation,
+                            // temporary init code install) while
+                            // preserving the nonce increment above.
+                            self.state.rollback(create_snapshot).ok();
                             stack.push(U256::ZERO);
                         }
                     }
@@ -1796,6 +1852,120 @@ mod tests {
         // Verify storage was written
         let stored = env.state.storage_load("contract1", "slot:0");
         assert!(stored.is_some(), "Slot 0 should have a value");
+    }
+
+    #[test]
+    fn failed_create_rolls_back_side_effects_but_keeps_nonce() {
+        // Regression for two adjacent bugs in the CREATE opcode
+        // handler:
+        //
+        //   1. Failed CREATE left the new-address account creation
+        //      and the temporary init-code install on the parent's
+        //      state. EVM semantics require these to be reverted on
+        //      failure; only the caller's nonce bump survives.
+        //
+        //   2. The parent-level `state.transfer(caller, new_addr,
+        //      create_value)` happened BEFORE the child frame, and
+        //      then execute_frame's own entry-level transfer re-ran
+        //      the transfer a SECOND time — a CREATE with value > 0
+        //      silently double-debited the caller.
+        //
+        // The fix defers the transfer entirely to execute_frame's
+        // own entry path and adds a sub-snapshot after the nonce
+        // bump so the new-account + set_code side effects are
+        // reverted on failure.
+        //
+        // Test bytecode for contract_a:
+        //   1. MSTORE a 32-byte word whose last 5 bytes encode an
+        //      init code that PUSH1 0 PUSH1 0 REVERT (i.e. reverts
+        //      immediately).
+        //   2. CREATE with value=50, offset=27, length=5 — the
+        //      init code will revert, so CREATE must return 0 on
+        //      the stack AND leave contract_a's balance unchanged.
+        let mut env = make_env();
+        let parent = "SD1parent";
+        env.state.set_balance(parent, 1_000).unwrap();
+
+        // Init code bytes: PUSH1 0, PUSH1 0, REVERT (0x10 00 0x10 00 0xB7)
+        //
+        // Container bytecode for the parent, built by hand:
+        //   PUSH32 <27 zero bytes + [0x10, 0x00, 0x10, 0x00, 0xB7]>
+        //   PUSH1  0       (MSTORE offset)
+        //   MSTORE         (mem[0..32] = the word)
+        //   PUSH1  5       (CREATE length)
+        //   PUSH1  27      (CREATE offset)
+        //   PUSH1  50      (CREATE value)
+        //   CREATE
+        //   STOP
+        let mut code_a: Vec<u8> = Vec::with_capacity(64);
+        code_a.push(0x15); // PUSH32
+        for _ in 0..27 { code_a.push(0x00); }
+        code_a.extend_from_slice(&[0x10, 0x00, 0x10, 0x00, 0xB7]);
+        code_a.extend_from_slice(&[
+            0x10, 0x00,   // PUSH1 0   (MSTORE offset)
+            0x91,         // MSTORE
+            0x10, 0x05,   // PUSH1 5   (CREATE length)
+            0x10, 0x1B,   // PUSH1 27  (CREATE offset)
+            0x10, 0x32,   // PUSH1 50  (CREATE value)
+            0xB4,         // CREATE
+            0x00,         // STOP
+        ]);
+        env.state.set_code(parent, code_a).unwrap();
+
+        // Snapshot the pre-CREATE state
+        let bal_before = env.state.get_balance(parent);
+        let nonce_before = env.state.get_nonce(parent);
+        assert_eq!(bal_before, 1_000);
+
+        let ctx = CallContext {
+            address: parent.into(),
+            code_address: parent.into(),
+            caller: "SD1user".into(),
+            value: 0,
+            gas_limit: 1_000_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+        };
+        let outcome = env.execute_frame(&ctx);
+        assert!(
+            matches!(outcome, CallOutcome::Success { .. }),
+            "parent frame itself must succeed (CREATE failure is an in-frame failure, not a frame failure), got: {:?}",
+            outcome
+        );
+
+        // Nonce must be incremented — EVM preserves the nonce bump
+        // across a failed CREATE.
+        assert_eq!(
+            env.state.get_nonce(parent),
+            nonce_before + 1,
+            "caller's nonce must be incremented even on failed CREATE"
+        );
+
+        // Balance must be unchanged: execute_frame rolls back its own
+        // entry-level transfer when the child frame fails, and we no
+        // longer do a second parent-level transfer that the old code
+        // would have left behind as a double debit.
+        assert_eq!(
+            env.state.get_balance(parent),
+            bal_before,
+            "failed CREATE must not debit the caller (regression for the \
+             double-transfer bug: old code debited `create_value` at the \
+             parent level before calling execute_frame, then execute_frame \
+             debited again, so a failed CREATE with value left the caller \
+             short by `create_value`)"
+        );
+
+        // The new contract address must have no code installed —
+        // rollback(create_snapshot) must have undone the temporary
+        // init-code set_code. Compute the expected address the same
+        // way the CREATE handler does.
+        let expected_addr = crate::runtime::vm::contracts::contract_deployer::ContractDeployer::compute_create_address(parent, nonce_before).unwrap();
+        assert!(
+            env.state.get_code(&expected_addr).is_empty(),
+            "failed CREATE must not leave init code installed at the new address ({})",
+            expected_addr
+        );
     }
 
     #[test]
