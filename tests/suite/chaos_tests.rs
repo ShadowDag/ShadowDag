@@ -33,7 +33,7 @@ mod chaos {
         let ctx = CallContext {
             address: "loop".into(), code_address: "loop".into(),
             caller: "user".into(), value: 0, gas_limit: 1000,
-            calldata: vec![], is_static: false, depth: 0,
+            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Failure { .. }), "Should OOG");
@@ -52,7 +52,7 @@ mod chaos {
         let ctx = CallContext {
             address: "c".into(), code_address: "c".into(),
             caller: "u".into(), value: 0, gas_limit: 10_000_000,
-            calldata, is_static: false, depth: 0,
+            calldata, is_static: false, depth: 0, is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Success { .. }), "Large calldata should work");
@@ -77,7 +77,7 @@ mod chaos {
             let ctx = CallContext {
                 address: "contract".into(), code_address: "contract".into(),
                 caller: "u".into(), value: 0, gas_limit: 1_000_000,
-                calldata: vec![], is_static: false, depth: 0,
+                calldata: vec![], is_static: false, depth: 0, is_delegate: false,
             };
             env.execute_frame(&ctx);
             env.persist_to_storage(&storage).unwrap();
@@ -106,7 +106,7 @@ mod chaos {
         let ctx = CallContext {
             address: "c".into(), code_address: "c".into(),
             caller: "u".into(), value: 0, gas_limit: 1_000_000,
-            calldata: vec![], is_static: false, depth: 0,
+            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
         };
         env.execute_frame(&ctx);
         let root_chain_a = env.state.state_root();
@@ -129,7 +129,7 @@ mod chaos {
         let ctx = CallContext {
             address: "c".into(), code_address: "c".into(),
             caller: "u".into(), value: 0, gas_limit: 1_000_000,
-            calldata: vec![], is_static: false, depth: 0,
+            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
         };
         env.execute_frame(&ctx);
         let root1 = env.state.state_root();
@@ -157,7 +157,7 @@ mod chaos {
         let ctx = CallContext {
             address: "spammer".into(), code_address: "spammer".into(),
             caller: "u".into(), value: 0, gas_limit: 10_000_000,
-            calldata: vec![], is_static: false, depth: 0,
+            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         match result {
@@ -177,6 +177,7 @@ mod chaos {
             caller: "u".into(), value: 0, gas_limit: 1_000_000,
             calldata: vec![], is_static: false,
             depth: 1025, // Over limit
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Failure { .. }), "Over max depth should fail");

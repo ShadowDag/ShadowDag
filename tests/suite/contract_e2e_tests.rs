@@ -65,6 +65,7 @@ mod contract_e2e {
             calldata,
             is_static: false,
             depth: 0,
+            is_delegate: false,
         }
     }
 
@@ -104,6 +105,7 @@ mod contract_e2e {
             calldata,
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
 
         let result = env.execute_frame(&ctx);
@@ -174,6 +176,7 @@ mod contract_e2e {
             calldata: vec![],
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
 
         let result = env.execute_frame(&ctx);
@@ -490,6 +493,7 @@ mod contract_e2e {
             calldata: vec![],
             is_static: true, // STATIC -- no state writes allowed
             depth: 0,
+            is_delegate: false,
         };
 
         let result = env.execute_frame(&ctx);

@@ -987,6 +987,7 @@ impl FullNode {
                         calldata: vec![],
                         is_static: false,
                         depth: 0,
+                        is_delegate: false,
                     };
 
                     // Phase 2: Run the constructor.
@@ -1118,6 +1119,7 @@ impl FullNode {
                         calldata,
                         is_static: false,
                         depth: 0,
+                        is_delegate: false,
                     };
 
                     let outcome = env.execute_frame(&call_ctx);

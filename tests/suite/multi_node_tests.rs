@@ -41,6 +41,7 @@ mod multi_node_determinism {
             calldata,
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
         env.execute_frame(&ctx)
     }
@@ -163,7 +164,7 @@ mod multi_node_determinism {
             let ctx1 = CallContext {
                 address: "contract".into(), code_address: "contract".into(),
                 caller: "user".into(), value: 0, gas_limit: 10_000_000,
-                calldata: vec![], is_static: false, depth: 0,
+                calldata: vec![], is_static: false, depth: 0, is_delegate: false,
             };
             env.execute_frame(&ctx1);
 
@@ -172,7 +173,7 @@ mod multi_node_determinism {
             let ctx2 = CallContext {
                 address: "contract".into(), code_address: "contract".into(),
                 caller: "user".into(), value: 0, gas_limit: 10_000_000,
-                calldata: vec![], is_static: false, depth: 0,
+                calldata: vec![], is_static: false, depth: 0, is_delegate: false,
             };
             env.execute_frame(&ctx2);
 

@@ -54,6 +54,7 @@ mod soak {
                 calldata: vec![],
                 is_static: false,
                 depth: 0,
+                is_delegate: false,
             };
             let outcome = env.execute_frame(&ctx);
             let gas = match &outcome {
@@ -115,6 +116,7 @@ mod soak {
                 calldata: vec![],
                 is_static: false,
                 depth: 0,
+                is_delegate: false,
             };
             let outcome = env.execute_frame(&ctx);
 
@@ -163,6 +165,7 @@ mod soak {
                     calldata: vec![],
                     is_static: false,
                     depth: 0,
+                    is_delegate: false,
                 };
                 env.execute_frame(&ctx);
             }
@@ -202,6 +205,7 @@ mod soak {
                     calldata: vec![],
                     is_static: false,
                     depth: 0,
+                    is_delegate: false,
                 };
                 env.execute_frame(&ctx);
                 roots.push(env.state.state_root());
