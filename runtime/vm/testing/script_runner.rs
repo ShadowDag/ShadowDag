@@ -79,6 +79,7 @@ impl ScriptRunner {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default().as_secs(),
                 block_hash: "00".repeat(32),
+                network: network.to_string(),
             }),
             manifest: DeploymentManifest::new(network)?,
             storage: None,

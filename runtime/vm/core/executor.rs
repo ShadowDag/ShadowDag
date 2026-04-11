@@ -75,6 +75,73 @@ impl Executor {
         block_hash: &str,
         nonce:     u64,
     ) -> Result<(String, ExecutionResult), VmError> {
+        self.deploy_impl(
+            bytecode, deployer, value, gas_limit, timestamp, block_hash, nonce,
+            /* persist = */ true,
+        )
+    }
+
+    /// Dry-run deploy: runs the constructor against a fresh
+    /// ExecutionEnvironment loaded from the current persistent state,
+    /// validates EIP-3541 on the returned runtime code, and returns the
+    /// computed contract address + execution result — but DOES NOT
+    /// persist any state changes to the underlying `ContractStorage`
+    /// and does NOT write the `vm_version:{addr}` marker.
+    ///
+    /// Call sites: the RPC `cmd_deploy_contract` endpoint used to use
+    /// the persistent [`Self::deploy`] entry point against the shared
+    /// `contract_storage` DB, which committed contract state outside
+    /// the consensus block-application pipeline. Those writes were NOT
+    /// covered by `persist_with_undo` and could not be reversed by
+    /// `ContractStorage::rollback_block()` on reorg, opening a real
+    /// window for orphaned on-disk contract state. The dry-run
+    /// variant closes that hole by making the RPC strictly a
+    /// simulation — if callers want an actual deploy, they must
+    /// submit a `ContractCreate` transaction via the mempool so the
+    /// block-application path (which DOES build undo data) is the
+    /// single source of on-chain contract state.
+    ///
+    /// Return shape matches [`Self::deploy`] exactly, including the
+    /// computed contract address, so RPC responses remain identical
+    /// apart from the absence of on-disk side effects.
+    #[allow(clippy::too_many_arguments)]
+    pub fn simulate_deploy(
+        &self,
+        bytecode:  &[u8],
+        deployer:  &str,
+        value:     u64,
+        gas_limit: u64,
+        timestamp: u64,
+        block_hash: &str,
+        nonce:     u64,
+    ) -> Result<(String, ExecutionResult), VmError> {
+        self.deploy_impl(
+            bytecode, deployer, value, gas_limit, timestamp, block_hash, nonce,
+            /* persist = */ false,
+        )
+    }
+
+    /// Shared implementation of [`Self::deploy`] and [`Self::simulate_deploy`].
+    ///
+    /// The `persist` flag is the ONLY difference between the two:
+    /// when `true`, a successful constructor run commits all buffered
+    /// state changes to the shared `ContractStorage` and writes the
+    /// `vm_version:{addr}` marker via the legacy KV context; when
+    /// `false`, both of those persistence steps are skipped and the
+    /// caller sees the computed contract address + execution result
+    /// without mutating any on-disk state.
+    #[allow(clippy::too_many_arguments)]
+    fn deploy_impl(
+        &self,
+        bytecode:  &[u8],
+        deployer:  &str,
+        value:     u64,
+        gas_limit: u64,
+        timestamp: u64,
+        block_hash: &str,
+        nonce:     u64,
+        persist:   bool,
+    ) -> Result<(String, ExecutionResult), VmError> {
         if bytecode.is_empty() {
             return Err(VmError::ContractError("Empty bytecode".to_string()));
         }
@@ -97,6 +164,7 @@ impl Executor {
         let mut env = ExecutionEnvironment::new(BlockContext {
             timestamp,
             block_hash: block_hash.to_string(),
+            network: "mainnet".to_string(),
         });
 
         // Load deployer account from persistent storage. Propagate any
@@ -128,7 +196,8 @@ impl Executor {
         let outcome = env.execute_frame(&ctx);
 
         // Phase 3: On success, replace the init code with the returned
-        // runtime code (if any) and persist.
+        // runtime code (if any) and — if `persist` is set — commit the
+        // state changes to RocksDB.
         let result = match outcome {
             CallOutcome::Success { gas_used, return_data, logs } => {
                 // If the constructor RETURNed a non-empty payload, that
@@ -143,21 +212,25 @@ impl Executor {
                     env.state.set_code(&contract_addr, return_data.clone())?;
                 }
 
-                // Persist all state changes (accounts, storage, code) to RocksDB.
-                // `persist_to_storage` commits a WriteBatch atomically; see
-                // execution_env.rs::persist_to_storage for the full contract.
-                //
-                // NOTE: This helper is NOT the consensus block-application
-                // path (that path lives in `full_node::execute_contract_transactions`
-                // + `persist_with_undo`). `Executor::deploy` is a one-shot
-                // API used by tests and the RPC `cmd_deploy_contract` endpoint.
-                // See the doc comment on the struct / module for the full
-                // distinction and the rollback implications.
-                env.persist_to_storage(self.context.storage())?;
+                if persist {
+                    // Persist all state changes (accounts, storage, code) to RocksDB.
+                    // `persist_to_storage` commits a WriteBatch atomically; see
+                    // execution_env.rs::persist_to_storage for the full contract.
+                    //
+                    // NOTE: This helper is NOT the consensus block-application
+                    // path (that path lives in `full_node::execute_contract_transactions`
+                    // + `persist_with_undo`). `Executor::deploy` is a one-shot
+                    // API used by tests. RPC endpoints MUST go through
+                    // [`Self::simulate_deploy`] instead so RPC traffic
+                    // never commits contract state outside the block
+                    // pipeline (which is the only path that builds undo
+                    // data for reorg safety).
+                    env.persist_to_storage(self.context.storage())?;
 
-                // Store VM version in contract metadata
-                let vm_key = format!("vm_version:{}", contract_addr);
-                self.context.set(&vm_key, &vm_version.to_string())?;
+                    // Store VM version in contract metadata
+                    let vm_key = format!("vm_version:{}", contract_addr);
+                    self.context.set(&vm_key, &vm_version.to_string())?;
+                }
 
                 ExecutionResult::Success { gas_used, return_data, logs }
             }
@@ -189,6 +262,58 @@ impl Executor {
         gas_limit:  u64,
         timestamp:  u64,
         block_hash: &str,
+    ) -> ExecutionResult {
+        self.call_impl(
+            contract_addr, input_data, caller, value, gas_limit, timestamp, block_hash,
+            /* persist = */ true,
+        )
+    }
+
+    /// Dry-run call: runs the target contract against a fresh
+    /// ExecutionEnvironment loaded from the current persistent state
+    /// and returns the execution result, but does NOT persist any
+    /// state changes.
+    ///
+    /// Use this from every RPC surface (`cmd_call_contract`,
+    /// `cmd_estimate_gas`) so that read-only RPC traffic never commits
+    /// state to the shared contract DB. The block-application path
+    /// is the single source of on-chain state, because it is the
+    /// only path that builds block-level undo data via
+    /// `persist_with_undo` for reorg safety.
+    ///
+    /// Return shape is identical to [`Self::call`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn simulate_call(
+        &self,
+        contract_addr: &str,
+        input_data: &[u8],
+        caller:     &str,
+        value:      u64,
+        gas_limit:  u64,
+        timestamp:  u64,
+        block_hash: &str,
+    ) -> ExecutionResult {
+        self.call_impl(
+            contract_addr, input_data, caller, value, gas_limit, timestamp, block_hash,
+            /* persist = */ false,
+        )
+    }
+
+    /// Shared implementation of [`Self::call`] and [`Self::simulate_call`].
+    ///
+    /// The `persist` flag controls whether the final `persist_to_storage`
+    /// step runs on successful execution.
+    #[allow(clippy::too_many_arguments)]
+    fn call_impl(
+        &self,
+        contract_addr: &str,
+        input_data: &[u8],
+        caller:     &str,
+        value:      u64,
+        gas_limit:  u64,
+        timestamp:  u64,
+        block_hash: &str,
+        persist:    bool,
     ) -> ExecutionResult {
         // Load contract bytecode from storage
         let code_key = format!("code:{}", contract_addr);
@@ -223,6 +348,7 @@ impl Executor {
         let mut env = ExecutionEnvironment::new(BlockContext {
             timestamp,
             block_hash: block_hash.to_string(),
+            network: "mainnet".to_string(),
         });
 
         // Load contract and caller accounts from persistent storage. A
@@ -282,14 +408,17 @@ impl Executor {
         let outcome = env.execute_frame(&ctx);
 
         // Convert CallOutcome to ExecutionResult and persist on success
+        // (only when `persist` is set — simulate_call skips this step
+        // so RPC traffic cannot commit state to the shared contract DB).
         match outcome {
             CallOutcome::Success { gas_used, return_data, logs } => {
-                // Persist all state changes to RocksDB
-                if let Err(e) = env.persist_to_storage(self.context.storage()) {
-                    return ExecutionResult::Error {
-                        gas_used,
-                        message: format!("State persistence failed: {}", e),
-                    };
+                if persist {
+                    if let Err(e) = env.persist_to_storage(self.context.storage()) {
+                        return ExecutionResult::Error {
+                            gas_used,
+                            message: format!("State persistence failed: {}", e),
+                        };
+                    }
                 }
                 ExecutionResult::Success { gas_used, return_data, logs }
             }
@@ -620,5 +749,130 @@ mod tests {
         // Strict surfaces it as an explicit error
         let strict = exec.get_code_strict(addr);
         assert!(strict.is_err(), "strict get_code must expose corruption, got: {:?}", strict);
+    }
+
+    // ─── Dry-run variants (RPC path) ──────────────────────────────────
+
+    #[test]
+    fn simulate_deploy_does_not_persist_contract_code() {
+        // Regression for the RPC persist-without-undo hole. The
+        // RPC `cmd_deploy_contract` endpoint used to call
+        // `Executor::deploy`, which committed contract state to the
+        // shared contract DB outside the consensus block-application
+        // path. Those writes had no block-level undo data and could
+        // not be reversed by `ContractStorage::rollback_block()` on
+        // reorg. The fix routes the RPC through `simulate_deploy`,
+        // which executes the constructor and returns the computed
+        // address but MUST NOT persist any contract code or account
+        // state to the storage layer.
+        let exec = make_executor();
+        let bytecode = vec![0x10, 42, 0x00]; // PUSH1 42, STOP
+
+        // Run simulate_deploy — it must return a deterministic
+        // contract address and a successful execution result.
+        let (addr, result) = exec
+            .simulate_deploy(&bytecode, "SD1simdeployer", 0, 100_000, 1_000, "bh", 0)
+            .expect("simulate_deploy must succeed on a valid bytecode");
+        assert!(addr.starts_with("SD1c"));
+        assert!(
+            matches!(result, ExecutionResult::Success { .. }),
+            "simulate_deploy must produce a Success result for valid constructor bytecode, got: {:?}",
+            result
+        );
+
+        // The critical assertion: the contract must NOT appear in
+        // the storage layer after simulate_deploy. `contract_exists`
+        // reads `code:{addr}` from the ContractStorage and returns
+        // true only if a persist landed. simulate_deploy must leave
+        // the storage untouched.
+        assert!(
+            !exec.contract_exists(&addr),
+            "simulate_deploy must NOT persist contract code, but `contract_exists({})` returned true",
+            addr
+        );
+        assert!(
+            exec.get_code(&addr).is_none(),
+            "simulate_deploy must NOT leave a code blob on disk, but get_code returned Some"
+        );
+    }
+
+    #[test]
+    fn simulate_deploy_returns_same_address_as_deploy() {
+        // simulate_deploy and deploy must agree on the contract
+        // address they compute for the same (deployer, bytecode,
+        // nonce) triple, because RPC clients and on-chain
+        // transactions both compute addresses deterministically and
+        // any divergence would break `eth_getContractAddress`-style
+        // client flows where a dry-run prints the address the real
+        // deploy will land at.
+        let exec_real = make_executor();
+        let exec_sim = make_executor();
+        let bytecode = vec![0x10, 42, 0x00];
+
+        let (addr_real, _) = exec_real
+            .deploy(&bytecode, "SD1dep", 0, 100_000, 1_000, "bh", 0)
+            .unwrap();
+        let (addr_sim, _) = exec_sim
+            .simulate_deploy(&bytecode, "SD1dep", 0, 100_000, 1_000, "bh", 0)
+            .unwrap();
+        assert_eq!(
+            addr_real, addr_sim,
+            "simulate_deploy must compute the same address as deploy for identical inputs"
+        );
+    }
+
+    #[test]
+    fn simulate_call_does_not_persist_state_changes() {
+        // Regression for the "cmd_estimate_gas claimed NOT persisted
+        // but actually persisted" bug. Deploy a contract that writes
+        // to storage when called (SSTORE 42 into slot 0), then
+        // invoke simulate_call and verify that slot 0 remains empty
+        // on disk afterwards.
+        let exec = make_executor();
+        // PUSH1 42, PUSH1 0, SSTORE, STOP
+        let bytecode: Vec<u8> = vec![0x10, 42, 0x10, 0, 0x51, 0x00];
+        let (addr, result) = exec
+            .deploy(&bytecode, "SD1simcaller", 0, 100_000, 1_000, "bh", 0)
+            .expect("deploy must succeed");
+        assert!(matches!(result, ExecutionResult::Success { .. }));
+
+        // First verify that a real `call` DOES persist: slot 0 must
+        // end up with the stored value. This pins the "deploy + call
+        // path actually writes storage" baseline before we assert
+        // that simulate_call doesn't.
+        let real_result = exec.call(&addr, &[], "SD1caller", 0, 100_000, 2_000, "bh");
+        assert!(
+            matches!(real_result, ExecutionResult::Success { .. }),
+            "real call must succeed as the baseline, got: {:?}",
+            real_result
+        );
+        // Snapshot the on-disk slot value after the real call.
+        let slot_key = format!("{}:slot:0", addr);
+        let slot_after_real = exec.context.get(&slot_key);
+        assert!(
+            slot_after_real.is_some(),
+            "real call must persist slot 0 to storage (baseline); got None"
+        );
+
+        // Now clear slot 0 directly via the KV backdoor so we have
+        // a clean starting point, then run simulate_call on the
+        // same contract. simulate_call must return Success but must
+        // NOT rewrite slot 0 on disk — the snapshot read after
+        // simulate_call must match what was on disk BEFORE the
+        // simulate_call ran.
+        exec.execute(&slot_key, "").unwrap();
+        let slot_before_sim = exec.context.get(&slot_key);
+        let sim_result = exec.simulate_call(&addr, &[], "SD1caller", 0, 100_000, 3_000, "bh");
+        assert!(
+            matches!(sim_result, ExecutionResult::Success { .. }),
+            "simulate_call must succeed, got: {:?}",
+            sim_result
+        );
+        let slot_after_sim = exec.context.get(&slot_key);
+        assert_eq!(
+            slot_before_sim, slot_after_sim,
+            "simulate_call must NOT mutate slot 0 on disk; before={:?} after={:?}",
+            slot_before_sim, slot_after_sim
+        );
     }
 }
