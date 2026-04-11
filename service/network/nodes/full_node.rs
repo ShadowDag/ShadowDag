@@ -968,7 +968,8 @@ impl FullNode {
                         hex::encode(hasher.finalize())[..40].to_string()
                     };
 
-                    // Set code for new contract so execute_frame can run it
+                    // Phase 1: Install the INIT code as the new contract's
+                    // temporary code so execute_frame has something to run.
                     env.state.set_code(&contract_addr, payload.to_vec()).ok();
 
                     let call_ctx = CallContext {
@@ -982,9 +983,54 @@ impl FullNode {
                         depth: 0,
                     };
 
+                    // Phase 2: Run the constructor.
                     let outcome = env.execute_frame(&call_ctx);
                     let exec_result = match outcome {
                         CallOutcome::Success { gas_used, return_data, logs } => {
+                            // Phase 3: If the constructor RETURNed a non-empty
+                            // payload, that's the RUNTIME code — replace the
+                            // init code with it and validate (EIP-3541, size).
+                            // If RETURN was empty, keep the init code as the
+                            // runtime code — the simple "raw runtime" pattern.
+                            //
+                            // This matches the inline CREATE/CREATE2 opcode
+                            // path in execution_env.rs:1117-1125 and the
+                            // top-level Executor::deploy, so all three deploy
+                            // entry points now produce the same runtime code
+                            // for the same inputs — previously, this block-
+                            // application path silently kept the init code as
+                            // the stored runtime code, diverging from the
+                            // inline CREATE opcode.
+                            if !return_data.is_empty() {
+                                match crate::runtime::vm::contracts::contract_deployer::ContractDeployer::validate_runtime_code(&return_data) {
+                                    Ok(()) => {
+                                        let _ = env.state.set_code(&contract_addr, return_data.clone());
+                                    }
+                                    Err(e) => {
+                                        // Invalid runtime code (e.g. 0xEF
+                                        // prefix per EIP-3541). Surface as
+                                        // an execution error — the contract
+                                        // is NOT deployed. This matches the
+                                        // semantics Ethereum uses when init
+                                        // code returns bad runtime code.
+                                        slog_error!("node", "contract_deploy_runtime_code_rejected",
+                                            tx => &tx.hash,
+                                            address => &contract_addr,
+                                            error => &format!("{}", e));
+                                        receipts.push(TxReceipt::from_execution(
+                                            &tx.hash,
+                                            &ExecutionResult::Error {
+                                                gas_used,
+                                                message: format!("invalid runtime code returned from constructor: {}", e),
+                                            },
+                                            &block.header.hash,
+                                            block.header.height,
+                                            tx_index as u32,
+                                        ));
+                                        continue;
+                                    }
+                                }
+                            }
                             ExecutionResult::Success { gas_used, return_data, logs }
                         }
                         CallOutcome::Revert { gas_used, return_data } => {
