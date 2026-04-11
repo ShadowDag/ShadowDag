@@ -4,6 +4,31 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // Gas Rules — Gas accounting with limits and refunds for ShadowVM.
+//
+// Public surface intentionally LIMITED to:
+//   - `GasRules::new`            — construction
+//   - `GasRules::charge`         — the only legitimate way to spend gas
+//   - `GasRules::calculate_refund` — pure helper
+//
+// The gas-introspection helpers (`has_gas`, `remaining`, `meter`,
+// `meter_mut`) are restricted to `pub(crate)` so neither user
+// contracts nor downstream tooling can branch on the meter's current
+// state, mirroring the same restriction `GasMeter::has_gas` already
+// carries. The previous `pub fn has_gas` / `pub fn remaining` /
+// `pub fn meter` / `pub fn meter_mut` exposed exactly the
+// branch-on-remaining-gas surface `GasMeter` was trying to hide,
+// re-opening the determinism hole from a different door:
+//
+//     // Old surface: a downstream caller could write
+//     if rules.has_gas(SOME_THRESHOLD) {
+//         // expensive happy path
+//     } else {
+//         // cheaper fallback
+//     }
+//
+// which would make the contract's behaviour depend on the gas
+// the caller happened to allocate — different gas limits → different
+// branches → state divergence between honest validators.
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::runtime::vm::gas::gas_meter::{GasMeter, GasResult};
@@ -50,23 +75,52 @@ impl GasRules {
         refund_counter.min(max_refund)
     }
 
-    /// Get remaining gas
-    pub fn remaining(&self, _key: &str, _gas_limit: u64) -> u64 {
+    /// Get remaining gas.
+    ///
+    /// **Restricted to `pub(crate)`** for the same reason
+    /// `GasMeter::has_gas` is restricted: exposing a branch-on-
+    /// remaining-gas surface to user contracts or downstream tooling
+    /// creates non-deterministic execution paths (different gas
+    /// limits → different branches → state divergence). Only the
+    /// VM execution loop should call this. The `_key` and
+    /// `_gas_limit` arguments are vestigial from an older signature
+    /// and kept to avoid touching the call sites that already
+    /// import the function — they are not used.
+    #[allow(dead_code)] // Reserved for VM execution loop; intentionally restricted from public API
+    pub(crate) fn remaining(&self, _key: &str, _gas_limit: u64) -> u64 {
         self.meter.gas_remaining()
     }
 
     /// Check if there is enough gas remaining for the given cost.
-    pub fn has_gas(&self, cost: u64) -> bool {
+    ///
+    /// **Restricted to `pub(crate)`** to match the same restriction
+    /// on `GasMeter::has_gas`. See the doc comment on
+    /// [`Self::remaining`] for the rationale. The previous `pub fn`
+    /// signature re-opened the introspection surface that
+    /// `GasMeter::has_gas` was specifically restricted to close.
+    #[allow(dead_code)] // Reserved for VM execution loop; intentionally restricted from public API
+    pub(crate) fn has_gas(&self, cost: u64) -> bool {
         self.meter.gas_remaining() >= cost
     }
 
-    /// Access the underlying meter
-    pub fn meter(&self) -> &GasMeter {
+    /// Access the underlying meter.
+    ///
+    /// **Restricted to `pub(crate)`** because handing out a
+    /// `&GasMeter` lets the recipient call any of the meter's own
+    /// pub-readable accessors (`gas_used`, `gas_remaining`,
+    /// `gas_limit`) and re-derive the introspection surface
+    /// `GasMeter::has_gas` was restricted to hide.
+    #[allow(dead_code)] // Reserved for VM execution loop; intentionally restricted from public API
+    pub(crate) fn meter(&self) -> &GasMeter {
         &self.meter
     }
 
-    /// Access the underlying meter mutably
-    pub fn meter_mut(&mut self) -> &mut GasMeter {
+    /// Access the underlying meter mutably.
+    ///
+    /// **Restricted to `pub(crate)`** for the same reason as
+    /// [`Self::meter`].
+    #[allow(dead_code)] // Reserved for VM execution loop; intentionally restricted from public API
+    pub(crate) fn meter_mut(&mut self) -> &mut GasMeter {
         &mut self.meter
     }
 }
