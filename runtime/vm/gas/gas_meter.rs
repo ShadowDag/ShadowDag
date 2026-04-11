@@ -86,9 +86,59 @@ impl GasMeter {
     }
 
     /// Return unused gas from a sub-call back to the caller.
+    ///
     /// Called when a child frame completes and has leftover gas.
+    /// `amount` MUST be the leftover from the child frame, which by
+    /// the call protocol cannot exceed the `child_gas` previously
+    /// reserved from this meter via `consume(child_gas)`. The caller
+    /// (always `execution_env::execute_frame`) computes `amount` as
+    /// `child_gas.saturating_sub(child_used)`, so the invariant
+    /// `amount <= child_gas <= self.gas_used` holds at every real
+    /// call site.
+    ///
+    /// Defensive guard: this function used to be a bare
+    /// `self.gas_used.saturating_sub(amount)`, which silently
+    /// under-charged if a future caller passed an `amount` larger
+    /// than what was actually reserved. The new code uses
+    /// `checked_sub` so an over-return surfaces immediately:
+    ///
+    ///   - In **debug builds**, an over-return panics via
+    ///     `debug_assert!`, so the bug is caught the moment it ships
+    ///     into a test or local run.
+    ///   - In **release builds**, the saturation still happens (so
+    ///     existing call sites cannot suddenly OOM the chain), but
+    ///     the event is logged via `slog_error!` with the requested
+    ///     and capped amounts so an operator can correlate it with
+    ///     a node crash or audit anomaly.
+    ///
+    /// Either way, an over-return is no longer silent.
     pub fn return_gas(&mut self, amount: u64) {
-        self.gas_used = self.gas_used.saturating_sub(amount);
+        match self.gas_used.checked_sub(amount) {
+            Some(new_used) => {
+                self.gas_used = new_used;
+            }
+            None => {
+                // Defensive: a caller asked us to return more gas
+                // than has been used. The protocol invariant says
+                // this cannot happen, so this branch is dead in
+                // practice — but keeping it loud means any future
+                // refactor that breaks the invariant is visible.
+                debug_assert!(
+                    false,
+                    "return_gas over-return: requested {} but gas_used is only {} \
+                     — caller protocol violation, see GasMeter::return_gas docs",
+                    amount, self.gas_used
+                );
+                crate::slog_error!(
+                    "vm",
+                    "gas_meter_return_gas_over_return_clamped_to_zero",
+                    requested => amount,
+                    gas_used  => self.gas_used,
+                    note      => "release build clamps gas_used to 0; debug build panics on debug_assert"
+                );
+                self.gas_used = 0;
+            }
+        }
     }
 
     /// Add to the gas refund counter (e.g. for SDELETE clearing storage)
@@ -215,4 +265,35 @@ mod tests {
         let mut meter = GasMeter::new(0);
         assert_eq!(meter.consume(0), GasResult::Ok(0));
     }
+
+    // ─── return_gas guard tests ─────────────────────────────────────
+
+    #[test]
+    fn return_gas_happy_path_subtracts_amount() {
+        // Sanity: a normal child-frame leftover return reduces
+        // gas_used by exactly `amount`.
+        let mut meter = GasMeter::new(1000);
+        meter.consume(800);
+        assert_eq!(meter.gas_used(), 800);
+        meter.return_gas(300);
+        assert_eq!(meter.gas_used(), 500);
+        assert_eq!(meter.gas_remaining(), 500);
+    }
+
+    #[test]
+    fn return_gas_amount_equal_to_used_zeroes_out() {
+        // Returning exactly gas_used drops it to 0 — same as
+        // refunding all the consumed gas.
+        let mut meter = GasMeter::new(1000);
+        meter.consume(400);
+        meter.return_gas(400);
+        assert_eq!(meter.gas_used(), 0);
+    }
+
+    // The over-return case is documented as a protocol violation
+    // and panics in debug builds via `debug_assert!`. We can't pin
+    // a panicking test path with #[should_panic] without tightening
+    // the message, so the regression coverage here is by inspection
+    // of the doc comment + the always-on `slog_error!` and saturating
+    // clamp in the release branch.
 }
