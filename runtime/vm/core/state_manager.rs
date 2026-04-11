@@ -202,6 +202,23 @@ impl StateManager {
     }
 
     /// Increment nonce
+    /// Increment an account's nonce by 1 and return the new value.
+    ///
+    /// Fail-closed on overflow: the previous implementation used
+    /// `old_nonce.saturating_add(1)`, which silently froze the nonce
+    /// at `u64::MAX` once the account had been used `u64::MAX` times.
+    /// After that point every subsequent CREATE / CREATE2 / CALL /
+    /// transaction-send would compute the same nonce-derived address,
+    /// the same CREATE-collision check, and (worse) the same CREATE
+    /// address — turning the saturation into a silent loss of nonce
+    /// uniqueness, which is a consensus-critical invariant.
+    ///
+    /// `u64::MAX` is unreachable in any realistic chain (it would
+    /// take ~5×10^11 years at 1 tx/ms), but the failure mode is
+    /// silent corruption rather than a clean error, so we close the
+    /// hole anyway. The new code uses `checked_add` and returns
+    /// `VmError::ContractError("nonce overflow …")` on the unrealistic
+    /// boundary.
     pub fn increment_nonce(&mut self, address: &str) -> Result<u64, VmError> {
         self.get_or_create_account(address);
         let account = self.accounts.get_mut(address)
@@ -209,8 +226,16 @@ impl StateManager {
                 "account missing after get_or_create for {}", address
             )))?;
         let old_nonce = account.nonce;
-        account.nonce = old_nonce.saturating_add(1);
-        let new_nonce = account.nonce;
+        let new_nonce = old_nonce.checked_add(1).ok_or_else(|| {
+            VmError::ContractError(format!(
+                "nonce overflow for {}: cannot increment {} (already at u64::MAX). \
+                 The previous saturating_add silently froze the nonce here, which \
+                 would have collapsed every future CREATE-derived address into a \
+                 single value — refused to maintain that broken invariant.",
+                address, old_nonce
+            ))
+        })?;
+        account.nonce = new_nonce;
         self.journal.push(StateChange::NonceChange {
             address: address.to_string(), old_nonce, new_nonce
         });
@@ -584,6 +609,42 @@ mod tests {
         assert_eq!(sm.get_nonce("alice"), 1);
         assert_eq!(sm.increment_nonce("alice").unwrap(), 2);
         assert_eq!(sm.get_nonce("alice"), 2);
+    }
+
+    #[test]
+    fn increment_nonce_at_u64_max_fails_closed() {
+        // Regression for the saturating_add bug. Pre-load the
+        // account with nonce = u64::MAX and verify that the next
+        // increment is REFUSED with a structured error rather than
+        // silently freezing at u64::MAX (which would collapse every
+        // future CREATE-derived address into a single value, since
+        // CREATE addresses are derived from `(deployer, nonce)`).
+        let mut sm = StateManager::new();
+        sm.get_or_create_account("alice");
+        // Bump the nonce to u64::MAX directly. We can't call
+        // increment_nonce u64::MAX times in a test, so we mutate
+        // the in-memory account through the BTreeMap. This is
+        // exactly the kind of corruption an out-of-band write
+        // could leave behind.
+        if let Some(acc) = sm.accounts.get_mut("alice") {
+            acc.nonce = u64::MAX;
+        }
+        assert_eq!(sm.get_nonce("alice"), u64::MAX);
+
+        let result = sm.increment_nonce("alice");
+        assert!(result.is_err(), "increment past u64::MAX must error, got: {:?}", result);
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("nonce overflow"),
+            "error must describe the overflow, got: {}", msg
+        );
+
+        // The nonce must be UNCHANGED by the failed increment —
+        // saturation would silently lose the failure signal AND
+        // freeze the value at u64::MAX, which is exactly the
+        // corruption we're refusing.
+        assert_eq!(sm.get_nonce("alice"), u64::MAX,
+            "failed increment must not mutate the nonce");
     }
 
     #[test]

@@ -404,7 +404,39 @@ pub const MEMORY_GAS_PER_WORD: u64 = 3;
 // ═══════════════════════════════════════════════════════════════════════════
 //                        VM IMPLEMENTATION
 // ═══════════════════════════════════════════════════════════════════════════
-
+//
+// LEGACY ENGINE — NOT THE PRODUCTION EXECUTION PATH.
+//
+// `VM::execute_bytecode` is a flat opcode loop that pre-dates the
+// reentrant `runtime::vm::core::execution_env::ExecutionEnvironment`
+// pipeline. It still implements the simple opcodes (PUSH/POP/ADD/
+// SLOAD/SSTORE/JUMP/…) and is used as a self-contained test harness
+// for those opcodes, but it has stub returns for every CALL-family
+// and contract-creation opcode:
+//
+//     CALL          → "CALL opcode not yet implemented"
+//     CALLCODE      → "CALLCODE opcode not yet implemented"
+//     DELEGATECALL  → "DELEGATECALL opcode not yet implemented"
+//     STATICCALL    → "STATICCALL opcode not yet implemented"
+//     CREATE        → "CREATE opcode not yet implemented"
+//     CREATE2       → "CREATE2 opcode not yet implemented"
+//     SELFDESTRUCT  → "SELFDESTRUCT opcode not yet implemented"
+//
+// If a production caller routed bytecode through this engine, those
+// opcodes would all return errors instead of executing — a silent
+// behavioural divergence from the real ExecutionEnvironment path.
+// To prevent that, this struct is intentionally NOT used by:
+//   - `runtime::vm::core::executor::Executor` (which builds an
+//     `ExecutionEnvironment` and calls `execute_frame`),
+//   - `service::network::nodes::full_node::execute_contract_transactions`
+//     (same path), or
+//   - any of the contract / RPC / SDK helpers.
+//
+// `cargo grep ShadowVm` returns no callers; `execute_bytecode` is
+// only invoked from `vm::tests` inside this same file. The struct is
+// kept compiling so the existing simple-opcode tests still run, but
+// new code MUST use `ExecutionEnvironment::execute_frame` instead.
+// See `runtime::vm::core::execution_env` for the full implementation.
 pub struct VM {
     context: VMContext,
 }
@@ -942,51 +974,62 @@ impl VM {
                     };
                 }
 
-                // -- STUBS: opcodes recognized but not yet fully implemented --
-                // Gas is already charged above via gas.consume(cost).
-                // These return a typed VM error identifying the specific opcode.
+                // -- STUBS: opcodes intentionally NOT implemented in this engine --
+                //
+                // The legacy `VM::execute_bytecode` flat loop never grew the
+                // call-frame / contract-creation machinery. Anything that
+                // hits these branches has accidentally routed bytecode
+                // through the legacy engine instead of through
+                // `ExecutionEnvironment::execute_frame`, which DOES implement
+                // every CALL-family and CREATE opcode correctly. The error
+                // messages name `ExecutionEnvironment` so the operator can
+                // immediately see where to redirect the caller.
+                //
+                // Gas is already charged above via gas.consume(cost), so a
+                // bytecode that hits one of these stubs still pays the
+                // declared opcode cost — it just doesn't get the work done.
 
-                // CALL: inter-contract call. Stub -- requires full message-call
-                // frame implementation (value transfer, gas stipend, call depth).
                 OpCode::CALL => {
                     pending.discard();
-                    return Self::err(gas.gas_used(), "CALL opcode not yet implemented");
+                    return Self::err(gas.gas_used(),
+                        "CALL is not implemented in the legacy VM engine; \
+                         route this bytecode through ExecutionEnvironment::execute_frame");
                 }
-                // CALLCODE: like CALL but executes callee code in caller's storage.
-                // Stub -- requires full message-call frame implementation.
                 OpCode::CALLCODE => {
                     pending.discard();
-                    return Self::err(gas.gas_used(), "CALLCODE opcode not yet implemented");
+                    return Self::err(gas.gas_used(),
+                        "CALLCODE is not implemented in the legacy VM engine; \
+                         route this bytecode through ExecutionEnvironment::execute_frame");
                 }
-                // DELEGATECALL: like CALLCODE but preserves caller and value.
-                // Stub -- requires full message-call frame implementation.
                 OpCode::DELEGATECALL => {
                     pending.discard();
-                    return Self::err(gas.gas_used(), "DELEGATECALL opcode not yet implemented");
+                    return Self::err(gas.gas_used(),
+                        "DELEGATECALL is not implemented in the legacy VM engine; \
+                         route this bytecode through ExecutionEnvironment::execute_frame");
                 }
-                // STATICCALL: read-only call (no state changes allowed).
-                // Stub -- requires full message-call frame implementation.
                 OpCode::STATICCALL => {
                     pending.discard();
-                    return Self::err(gas.gas_used(), "STATICCALL opcode not yet implemented");
+                    return Self::err(gas.gas_used(),
+                        "STATICCALL is not implemented in the legacy VM engine; \
+                         route this bytecode through ExecutionEnvironment::execute_frame");
                 }
-                // CREATE: deploy a new contract. Stub -- requires contract
-                // deployment logic (init code execution, address derivation).
                 OpCode::CREATE => {
                     pending.discard();
-                    return Self::err(gas.gas_used(), "CREATE opcode not yet implemented");
+                    return Self::err(gas.gas_used(),
+                        "CREATE is not implemented in the legacy VM engine; \
+                         route this bytecode through ExecutionEnvironment::execute_frame");
                 }
-                // CREATE2: deterministic contract deployment. Stub -- requires
-                // contract deployment with salt-based address derivation.
                 OpCode::CREATE2 => {
                     pending.discard();
-                    return Self::err(gas.gas_used(), "CREATE2 opcode not yet implemented");
+                    return Self::err(gas.gas_used(),
+                        "CREATE2 is not implemented in the legacy VM engine; \
+                         route this bytecode through ExecutionEnvironment::execute_frame");
                 }
-                // SELFDESTRUCT: destroy the contract and transfer remaining balance.
-                // Stub -- requires balance transfer and account cleanup.
                 OpCode::SELFDESTRUCT => {
                     pending.discard();
-                    return Self::err(gas.gas_used(), "SELFDESTRUCT opcode not yet implemented");
+                    return Self::err(gas.gas_used(),
+                        "SELFDESTRUCT is not implemented in the legacy VM engine; \
+                         route this bytecode through ExecutionEnvironment::execute_frame");
                 }
 
                 OpCode::INVALID => {
@@ -1614,6 +1657,64 @@ mod tests {
         match exec(&vm, &bytecode, 100000) {
             ExecutionResult::Success { .. } => {}
             other => panic!("Expected success, got {:?}", other),
+        }
+    }
+
+    /// Regression for the dual-VM-engines bug. The legacy `VM`
+    /// engine in this file has stub implementations of CALL,
+    /// CALLCODE, DELEGATECALL, STATICCALL, CREATE, CREATE2, and
+    /// SELFDESTRUCT. If a production caller accidentally routed
+    /// bytecode through this engine instead of through
+    /// `ExecutionEnvironment::execute_frame`, they would silently
+    /// get errors for those opcodes — a subtle behavioural
+    /// divergence from the real execution path.
+    ///
+    /// This test pins the stub error messages so that:
+    ///   1. Each stub returns a typed `Error` (not `Success` or
+    ///      `OutOfGas`), so accidental routing is loud not silent.
+    ///   2. The error message names `ExecutionEnvironment` so
+    ///      operators can immediately see where to redirect the
+    ///      caller.
+    ///
+    /// If a future change implements one of these opcodes inside
+    /// the legacy engine, this test must be updated AT THE SAME
+    /// TIME — otherwise the dual-engine drift returns.
+    #[test]
+    fn legacy_vm_call_family_opcodes_route_to_execution_environment() {
+        let vm = make_vm();
+
+        // Each stub byte. Per `OpCode::from_byte` in this file:
+        //   CALL=0xB0, CALLCODE=0xB1, DELEGATECALL=0xB2,
+        //   STATICCALL=0xB3, CREATE=0xB4, CREATE2=0xB5,
+        //   SELFDESTRUCT=0xB8.
+        let stubs: &[(u8, &str)] = &[
+            (0xB0, "CALL"),
+            (0xB1, "CALLCODE"),
+            (0xB2, "DELEGATECALL"),
+            (0xB3, "STATICCALL"),
+            (0xB4, "CREATE"),
+            (0xB5, "CREATE2"),
+            (0xB8, "SELFDESTRUCT"),
+        ];
+
+        for (byte, name) in stubs {
+            let result = exec(&vm, &[*byte, 0x00], 1_000_000);
+            let msg = match result {
+                ExecutionResult::Error { ref message, .. } => message.clone(),
+                other => panic!("expected Error for legacy {} stub, got: {:?}", name, other),
+            };
+            assert!(
+                msg.contains(name),
+                "{} stub error must name the opcode, got: {}", name, msg
+            );
+            assert!(
+                msg.contains("legacy VM engine"),
+                "{} stub error must mention 'legacy VM engine', got: {}", name, msg
+            );
+            assert!(
+                msg.contains("ExecutionEnvironment"),
+                "{} stub error must redirect to ExecutionEnvironment, got: {}", name, msg
+            );
         }
     }
 
