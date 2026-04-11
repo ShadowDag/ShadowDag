@@ -363,8 +363,20 @@ impl ExecutionEnvironment {
 
     /// Execute a call frame. This is the reentrant core of the VM.
     pub fn execute_frame(&mut self, ctx: &CallContext) -> CallOutcome {
-        // Depth check
-        if ctx.depth > MAX_CALL_DEPTH {
+        // Depth check. Matches EVM semantics (EIP-150): a top-level call
+        // starts at depth 0, and the maximum nested call depth is
+        // MAX_CALL_DEPTH frames total. Because child frames are built
+        // with `depth: ctx.depth + 1`, the valid range of `ctx.depth`
+        // values is `0..MAX_CALL_DEPTH` — i.e. the highest depth that
+        // may execute is `MAX_CALL_DEPTH - 1` (the 1024th frame).
+        //
+        // The previous check was `ctx.depth > MAX_CALL_DEPTH`, which
+        // allowed `ctx.depth == MAX_CALL_DEPTH` to execute — one extra
+        // frame beyond the EVM limit (1025 frames total instead of
+        // 1024). Using `>=` closes the off-by-one and aligns with the
+        // identical check in `call_stack.rs::CallStack::push`, which
+        // already uses `self.frames.len() >= self.max_depth`.
+        if ctx.depth >= MAX_CALL_DEPTH {
             return CallOutcome::Failure { gas_used: ctx.gas_limit };
         }
 
@@ -1605,6 +1617,64 @@ mod tests {
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Failure { .. }));
+    }
+
+    #[test]
+    fn call_depth_limit_at_exact_max_rejects() {
+        // Regression for the off-by-one in the depth check. The old
+        // check was `ctx.depth > MAX_CALL_DEPTH`, which allowed a
+        // frame at `depth == MAX_CALL_DEPTH` to execute — 1025
+        // frames total instead of the EVM-standard 1024. The new
+        // check `ctx.depth >= MAX_CALL_DEPTH` rejects the 1025th
+        // frame exactly at the boundary, so the valid range of
+        // `ctx.depth` is `0..MAX_CALL_DEPTH` (inclusive-exclusive).
+        let mut env = make_env();
+        let ctx = CallContext {
+            address: "contract".into(),
+            code_address: "contract".into(),
+            caller: "user".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: MAX_CALL_DEPTH, // exactly at the boundary
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(
+            matches!(result, CallOutcome::Failure { .. }),
+            "ctx.depth == MAX_CALL_DEPTH must be rejected (1025th frame is one past the EVM limit), got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn call_depth_limit_one_below_max_passes_depth_check() {
+        // Complement of the boundary-rejection test: the frame at
+        // `ctx.depth == MAX_CALL_DEPTH - 1` is the LAST allowed
+        // frame (the 1024th frame), and the depth check must let it
+        // through. We can't easily check that `execute_frame` runs
+        // the contract to completion here because the target has no
+        // code, so `execute_frame` takes the "empty-code success"
+        // fast-path and returns `Success`. That's still sufficient
+        // to prove the depth check did NOT short-circuit to Failure,
+        // which is the regression we care about.
+        let mut env = make_env();
+        let ctx = CallContext {
+            address: "contract".into(),
+            code_address: "contract".into(),
+            caller: "user".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: MAX_CALL_DEPTH - 1, // last allowed frame
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(
+            matches!(result, CallOutcome::Success { .. }),
+            "ctx.depth == MAX_CALL_DEPTH - 1 is the last allowed frame and must not be rejected by the depth check, got: {:?}",
+            result
+        );
     }
 
     #[test]
