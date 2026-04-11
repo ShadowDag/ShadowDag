@@ -97,6 +97,20 @@ pub struct CallContext {
     pub calldata: Vec<u8>,      // Input data
     pub is_static: bool,        // STATICCALL flag (propagated to nested calls)
     pub depth: usize,           // Current call depth
+    /// Marks the frame as a DELEGATECALL or CALLCODE child. When
+    /// `true`, `execute_frame` MUST NOT perform the
+    /// `caller -> address` value transfer at frame entry — the
+    /// `value` field is preserved from the parent frame purely so
+    /// CALLVALUE inside the child reads the right number, but no
+    /// actual debit happens because msg.value is conceptually
+    /// already in `address` (DELEGATECALL borrows code, not funds).
+    /// The previous code only checked `is_static` here, so a
+    /// DELEGATECALL with `value > 0` re-debited the parent's value
+    /// from itself to itself on entry — turning every DELEGATECALL
+    /// into a self-mint via the `from == to` mint bug, or (after
+    /// the self-transfer fix) a noop that still corrupted bookkeeping
+    /// because `caller != address` for nested DELEGATECALLs.
+    pub is_delegate: bool,
 }
 
 /// Outcome of a sub-call execution
@@ -212,9 +226,22 @@ impl ExecutionEnvironment {
     /// atomic — either every put lands or none of them do — so partial
     /// persistence is no longer possible.
     pub fn persist_to_storage(&self, storage: &ContractStorage) -> Result<(), VmError> {
+        use rocksdb::{Direction, IteratorMode};
+
         let mut batch = PendingBatch::new();
 
+        // Skip accounts that SELFDESTRUCTed in this transaction. They
+        // may still surface via `iter_accounts` depending on when the
+        // caller built the execution environment, but their on-disk
+        // rows must be DELETED below, not re-PUT here. Writing the
+        // destroyed contract's metadata at the same time we're trying
+        // to delete it would leave the result non-deterministic
+        // depending on PendingBatch ordering.
         for (addr, account) in self.state.iter_accounts() {
+            if self.destroyed_contracts.contains(addr) {
+                continue;
+            }
+
             // Persist account metadata (balance|nonce|code_hash)
             let meta = format!("{}|{}|{}", account.balance, account.nonce, account.code_hash);
             batch.put(format!("account:{}", addr), meta);
@@ -225,10 +252,59 @@ impl ExecutionEnvironment {
             }
         }
 
-        // Persist storage slots
+        // Persist storage slots (same "skip destroyed" rule).
         for (addr, slots) in self.state.iter_storage() {
+            if self.destroyed_contracts.contains(addr) {
+                continue;
+            }
+
             for (key, value) in slots {
                 batch.put(format!("{}:{}", addr, key), value.clone());
+            }
+        }
+
+        // Emit DELETEs for accounts that SELFDESTRUCTed in this
+        // transaction. The previous implementation only ever wrote
+        // (`batch.put`) and never deleted, so a SELFDESTRUCT'd
+        // contract — which had been removed from the in-memory
+        // `state.accounts` and `state.storage` maps — would still
+        // have its `account:{addr}` / `code:{addr}` / storage rows
+        // sitting on disk from a previous block. Reading the
+        // contract back via `load_contract_from_storage` would then
+        // resurrect a "destroyed" contract with its old code and
+        // balance, which is consensus-visible silent corruption.
+        //
+        // We prefix-scan `contract:{addr}:` on the shared DB to
+        // enumerate every slot row that was ever persisted for the
+        // destroyed contract, and emit a delete for each one — plus
+        // the canonical account and code rows. The slot keys are
+        // materialized back into `{addr}:{suffix}` form before being
+        // buffered so that `commit_batch`'s `contract:` prefixing
+        // produces the exact DB key we scanned.
+        let db = storage.shared_db();
+        for addr in &self.destroyed_contracts {
+            batch.delete(format!("account:{}", addr));
+            batch.delete(format!("code:{}", addr));
+
+            let db_prefix = format!("contract:{}:", addr);
+            let db_prefix_bytes = db_prefix.as_bytes();
+            let iter = db.iterator(IteratorMode::From(db_prefix_bytes, Direction::Forward));
+            for item in iter {
+                let (raw_key, _raw_value) = item.map_err(|e| {
+                    VmError::Other(format!(
+                        "persist_to_storage: slot scan for destroyed contract '{}' failed: {}",
+                        addr, e
+                    ))
+                })?;
+                if !raw_key.starts_with(db_prefix_bytes) {
+                    break;
+                }
+                if let Ok(full_key_str) = std::str::from_utf8(&raw_key) {
+                    let slot_key_suffix = full_key_str[db_prefix.len()..].to_string();
+                    // `commit_batch` will re-prefix with `contract:`, so
+                    // we store the key in its pre-prefix form.
+                    batch.delete(format!("{}:{}", addr, slot_key_suffix));
+                }
             }
         }
 
@@ -259,16 +335,29 @@ impl ExecutionEnvironment {
         storage: &ContractStorage,
         block_hash: &str,
     ) -> Result<crate::runtime::vm::contracts::contract_storage::ContractUndoData, VmError> {
-        use crate::runtime::vm::contracts::contract_storage::ContractUndoData;
-        use rocksdb::WriteBatch;
+        use crate::runtime::vm::contracts::contract_storage::{
+            ContractUndoData, DestroyedAccountDetails,
+        };
+        use rocksdb::{Direction, IteratorMode, WriteBatch};
 
         let mut modified_keys = Vec::new();
         let mut created_accounts = Vec::new();
         let mut destroyed_accounts = Vec::new();
         let mut wb = WriteBatch::default();
 
-        // Capture undo data BEFORE writing — accounts
+        // Capture undo data BEFORE writing — accounts.
+        //
+        // Skip accounts that SELFDESTRUCTed in this block. They are
+        // still present in `iter_accounts` as a side effect of how the
+        // rest of the VM code touches them post-destroy, but their
+        // canonical `account:{addr}` / `code:{addr}` / slot rows must
+        // be DELETED on disk, not re-PUT. Writing them here would
+        // resurrect the destroyed contract on the next read.
         for (addr, account) in self.state.iter_accounts() {
+            if self.destroyed_contracts.contains(addr) {
+                continue;
+            }
+
             let account_key = format!("account:{}", addr);
             let old_val = storage.get_state(&account_key);
 
@@ -293,8 +382,14 @@ impl ExecutionEnvironment {
             }
         }
 
-        // Capture undo data BEFORE writing — storage slots
+        // Capture undo data BEFORE writing — storage slots.
+        // Same "skip destroyed" rule: an address that SELFDESTRUCTed
+        // must not have its slots re-PUT on disk.
         for (addr, slots) in self.state.iter_storage() {
+            if self.destroyed_contracts.contains(addr) {
+                continue;
+            }
+
             for (key, value) in slots {
                 let full_key = format!("{}:{}", addr, key);
                 let old_val = storage.get_state(&full_key);
@@ -304,11 +399,132 @@ impl ExecutionEnvironment {
             }
         }
 
-        // Handle destroyed accounts — capture their data before removal
+        // Handle destroyed accounts — fully tear them down on disk AND
+        // capture everything needed for reorg rollback.
+        //
+        // The previous implementation:
+        //
+        //   1. Read `account:{addr}` into `destroyed_accounts` for the
+        //      undo record and did nothing else. It NEVER emitted a
+        //      `batch.delete()` for the account row, the code row, or
+        //      the storage slots — so a SELFDESTRUCT'd contract lived
+        //      on in RocksDB with its pre-destroy state intact, and
+        //      the next `load_contract_from_storage` call resurrected
+        //      it wholesale. This is consensus-visible silent
+        //      corruption.
+        //
+        //   2. Captured only the account row in the undo record, so a
+        //      reorg that rolled back the destroy could not restore
+        //      the code or storage even if it wanted to — all the
+        //      contract state was silently dropped on the floor.
+        //
+        // The new flow for each destroyed address:
+        //
+        //   a. Read the account row and the code row from disk.
+        //   b. Prefix-scan `contract:{addr}:` on the shared DB handle
+        //      to collect every storage slot row that currently lives
+        //      on disk, along with its value.
+        //   c. Serialize (a) and (b) into a `DestroyedAccountDetails`
+        //      record, stuff it into the undo as JSON, so
+        //      `rollback_block` can restore account + code + all
+        //      slots byte-for-byte.
+        //   d. Emit `batch.delete()` for the account row, the code
+        //      row, and each scanned slot key so that after this
+        //      commit the DB no longer carries any trace of the
+        //      destroyed contract.
+        let db = storage.shared_db();
         for addr in &self.destroyed_contracts {
+            // (a) account row
             let account_key = format!("account:{}", addr);
-            if let Some(old_data) = storage.get_state(&account_key) {
-                destroyed_accounts.push((addr.clone(), old_data));
+            let old_account = storage.get_state(&account_key);
+
+            // (a) code row
+            let code_key = format!("code:{}", addr);
+            let old_code = storage.get_state(&code_key);
+
+            // (b) enumerate storage slots by prefix-scanning the
+            // shared DB. Keys look like `contract:{addr}:{suffix}`;
+            // the trailing `:` in the seek prefix disambiguates
+            // against other addresses that share a leading substring.
+            let db_prefix = format!("contract:{}:", addr);
+            let db_prefix_bytes = db_prefix.as_bytes();
+            let mut destroyed_slots: Vec<(String, String)> = Vec::new();
+            let mut destroyed_slot_db_keys: Vec<Vec<u8>> = Vec::new();
+
+            let iter = db.iterator(IteratorMode::From(db_prefix_bytes, Direction::Forward));
+            for item in iter {
+                let (raw_key, raw_value) = item.map_err(|e| {
+                    VmError::Other(format!(
+                        "persist_with_undo: slot scan for destroyed contract '{}' failed: {}",
+                        addr, e
+                    ))
+                })?;
+                if !raw_key.starts_with(db_prefix_bytes) {
+                    // Passed the end of this contract's slot range.
+                    break;
+                }
+                destroyed_slot_db_keys.push(raw_key.to_vec());
+
+                // Parse out the slot-key suffix (everything after the
+                // `contract:{addr}:` prefix) and the UTF-8 value for
+                // the undo record. Non-UTF-8 bytes here would indicate
+                // a corrupt store; we log loudly and skip the slot for
+                // undo purposes but still emit the delete so that the
+                // destroyed contract is fully wiped.
+                if let Ok(full_key_str) = std::str::from_utf8(&raw_key) {
+                    let slot_key_suffix = full_key_str[db_prefix.len()..].to_string();
+                    match std::str::from_utf8(&raw_value) {
+                        Ok(v) => destroyed_slots
+                            .push((slot_key_suffix, v.to_string())),
+                        Err(e) => {
+                            crate::slog_error!("vm",
+                                "persist_with_undo_destroyed_slot_value_not_utf8",
+                                contract => addr,
+                                slot => &slot_key_suffix,
+                                error => &format!("{}", e));
+                        }
+                    }
+                }
+            }
+
+            // (c) Only record the destroyed account in the undo if
+            // there was ever anything on disk to restore. If the
+            // contract was created AND destroyed within the same
+            // block, there is nothing pre-block to restore — the
+            // `created_accounts` cleanup in `rollback_block` is
+            // already wrong to list it (it wasn't persisted in this
+            // block either), and the destroyed-accounts entry would
+            // re-PUT a nonexistent row.
+            if let Some(meta) = old_account.clone() {
+                let details = DestroyedAccountDetails {
+                    meta,
+                    code: old_code.clone(),
+                    slots: destroyed_slots,
+                };
+                let payload = serde_json::to_string(&details).map_err(|e| {
+                    VmError::Other(format!(
+                        "persist_with_undo: failed to serialize destroyed account \
+                         details for '{}': {}",
+                        addr, e
+                    ))
+                })?;
+                destroyed_accounts.push((addr.clone(), payload));
+            }
+
+            // (d) DELETEs for the account row, code row, and every
+            // scanned slot row. These go in the same WriteBatch as
+            // the rest of the state writes and the undo record so
+            // everything commits atomically.
+            {
+                let account_db_key = format!("contract:{}", account_key);
+                wb.delete(account_db_key.as_bytes());
+            }
+            if old_code.is_some() {
+                let code_db_key = format!("contract:{}", code_key);
+                wb.delete(code_db_key.as_bytes());
+            }
+            for slot_db_key in &destroyed_slot_db_keys {
+                wb.delete(slot_db_key.as_slice());
             }
         }
 
@@ -413,15 +629,28 @@ impl ExecutionEnvironment {
                     addr, e
                 ))
             })?;
-            // Set nonce by incrementing — StateManager only exposes increment.
-            for _ in 0..nonce {
-                self.state.increment_nonce(addr).map_err(|e| {
-                    VmError::Other(format!(
-                        "increment_nonce during load_contract_from_storage failed for '{}': {}",
-                        addr, e
-                    ))
-                })?;
-            }
+            // Restore the persisted nonce in O(1) via `set_nonce`.
+            //
+            // The previous implementation looped `for _ in 0..nonce`
+            // and called `increment_nonce` each time. For a benign
+            // account that was a no-op, but for any account whose
+            // persisted nonce had been driven into the hundreds of
+            // millions or billions — which is trivially reachable on
+            // a long-running network — this turned every
+            // `load_contract_from_storage` call into an O(nonce)
+            // stall on the hot block-execution path. An attacker who
+            // could mint an account with a large nonce (e.g. by
+            // repeated no-op CREATE2s from a contract) could then
+            // DoS every future block that touched that account,
+            // since each load re-walked the full nonce loop from
+            // zero. `set_nonce` applies the change in a single
+            // journal entry.
+            self.state.set_nonce(addr, nonce).map_err(|e| {
+                VmError::Other(format!(
+                    "set_nonce during load_contract_from_storage failed for '{}': {}",
+                    addr, e
+                ))
+            })?;
         }
 
         // Load code (if present).
@@ -569,8 +798,20 @@ impl ExecutionEnvironment {
         // Take state snapshot for rollback on failure
         let snapshot = self.state.snapshot();
 
-        // Value transfer (if not delegate/static)
-        if ctx.value > 0 && !ctx.is_static
+        // Value transfer at frame entry.
+        //
+        // Skipped for STATICCALL (no state changes allowed) and for
+        // DELEGATECALL / CALLCODE (which BORROW code without moving
+        // funds — `ctx.value` is preserved purely so CALLVALUE inside
+        // the child returns the parent's msg.value, but no transfer
+        // is performed because the funds are conceptually already in
+        // `ctx.address`). The previous check only excluded
+        // `is_static`, so DELEGATECALL with `value > 0` triggered a
+        // `caller -> address` transfer at entry — duplicating the
+        // parent's debit and (depending on whose storage the
+        // delegatecall ran in) either silently minting value via
+        // the from==to bug or producing a wrong cross-account move.
+        if ctx.value > 0 && !ctx.is_static && !ctx.is_delegate
             && self.state.transfer(&ctx.caller, &ctx.address, ctx.value).is_err()
         {
             self.state.rollback(snapshot).ok();
@@ -815,25 +1056,48 @@ impl ExecutionEnvironment {
                     stack.push(U256::from_u64(self.block_ctx.timestamp));
                 }
                 OpCode::BLOCKHASH => {
-                    // The block_ctx.block_hash is a ShadowDAG block
-                    // identifier string, not necessarily a bare hex
-                    // dump. The previous code passed it directly to
-                    // `U256::from_hex` which, per its 64-char limit,
-                    // silently fell back to `U256::ZERO` for any
-                    // real block hash — so every contract that
-                    // reads BLOCKHASH saw `0` regardless of the
-                    // actual block.
+                    // EVM semantics: BLOCKHASH pops one word (the
+                    // requested block number) and pushes the hash
+                    // of that block. The previous implementation
+                    // popped NOTHING, leaving the requested number
+                    // stranded on the stack and corrupting every
+                    // subsequent opcode — so a contract that did
                     //
-                    // Produce a deterministic 32-byte digest from
-                    // whatever string form the block hash takes
-                    // (raw hex, `SD1…`-prefixed, or an internal
-                    // identifier), routed through the canonical
-                    // block-hash SHA-256. The result is stable
-                    // across re-execution of the same block and
-                    // non-zero for any non-empty block_hash.
+                    //   PUSH1 3   BLOCKHASH   PUSH1 5   ADD
+                    //
+                    // read `hash + 5` but ALSO still had the `3`
+                    // lingering under it, which is a consensus
+                    // divergence the moment any later opcode (DUP,
+                    // SWAP, the return-stack effect) notices. The
+                    // test suite did not catch this because its
+                    // BLOCKHASH exerciser never pushed an argument
+                    // at all.
+                    //
+                    // ShadowDAG does not track block numbers in
+                    // `BlockContext`, so we cannot implement the
+                    // canonical "hash of block N if N is in the
+                    // last 256 blocks, else 0" rule. Instead we
+                    // produce a deterministic SHA-256 derived from
+                    // both the current `block_hash` AND the
+                    // requested `block_number`, so different
+                    // requested numbers give different (stable)
+                    // answers and the stack effect is correct.
+                    //
+                    // The digest domain tag is bumped to v2 so
+                    // that the result intentionally diverges from
+                    // the old v1 hash — any contract whose state
+                    // depended on the v1 output was reading what
+                    // was effectively a constant anyway.
+                    if stack.is_empty() {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                    }
+                    let requested = stack.pop().unwrap();
                     let mut hasher = <Sha256 as Digest>::new();
-                    Digest::update(&mut hasher, b"ShadowDAG_BLOCKHASH_v1");
+                    Digest::update(&mut hasher, b"ShadowDAG_BLOCKHASH_v2");
                     Digest::update(&mut hasher, self.block_ctx.block_hash.as_bytes());
+                    Digest::update(&mut hasher, b":");
+                    Digest::update(&mut hasher, &requested.to_be_bytes());
                     let mut out = [0u8; 32];
                     out.copy_from_slice(&Digest::finalize(hasher));
                     stack.push(U256::from_be_bytes(&out));
@@ -921,13 +1185,27 @@ impl ExecutionEnvironment {
                 }
 
                 // ── RETURN ───────────────────────────────────
+                //
+                // RETURN pops `[offset, size]` from the stack and
+                // finalises the call with the memory window as the
+                // return data. A stack underflow — fewer than two
+                // items on the stack — is a hard EVM fault: the
+                // frame must rollback with no return data, not
+                // silently treat the empty-stack case as "commit
+                // with zero-length return". The previous code did
+                // the latter, which turned a malformed RETURN
+                // instruction into a consensus-visible success
+                // outcome that committed whatever SSTOREs the
+                // frame had already made.
                 OpCode::RETURN => {
-                    if stack.len() >= 2 {
-                        let offset = stack.pop().unwrap().as_u64() as usize;
-                        let size = stack.pop().unwrap().as_u64() as usize;
-                        if size > 0 && offset + size <= memory.len() {
-                            return_data = memory[offset..offset+size].to_vec();
-                        }
+                    if stack.len() < 2 {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                    }
+                    let offset = stack.pop().unwrap().as_u64() as usize;
+                    let size = stack.pop().unwrap().as_u64() as usize;
+                    if size > 0 && offset + size <= memory.len() {
+                        return_data = memory[offset..offset+size].to_vec();
                     }
                     self.state.commit(snapshot).ok();
                     return CallOutcome::Success {
@@ -936,13 +1214,26 @@ impl ExecutionEnvironment {
                         logs,
                     };
                 }
+                // REVERT: stack underflow still rolls back (like a
+                // normal revert would have) but produces a Failure
+                // outcome, NOT a Revert outcome with empty data.
+                // The distinction matters to the caller — a Revert
+                // returns success=0 with the revert data made
+                // visible via RETURNDATA, while a Failure zeroes
+                // out returndata. The previous code silently
+                // replaced the malformed REVERT with a
+                // zero-length REVERT, which would let a
+                // parent frame read stale RETURNDATA from before
+                // the child frame ran.
                 OpCode::REVERT => {
-                    if stack.len() >= 2 {
-                        let offset = stack.pop().unwrap().as_u64() as usize;
-                        let size = stack.pop().unwrap().as_u64() as usize;
-                        if size > 0 && offset + size <= memory.len() {
-                            return_data = memory[offset..offset+size].to_vec();
-                        }
+                    if stack.len() < 2 {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                    }
+                    let offset = stack.pop().unwrap().as_u64() as usize;
+                    let size = stack.pop().unwrap().as_u64() as usize;
+                    if size > 0 && offset + size <= memory.len() {
+                        return_data = memory[offset..offset+size].to_vec();
                     }
                     self.state.rollback(snapshot).ok();
                     return CallOutcome::Revert {
@@ -1034,6 +1325,34 @@ impl ExecutionEnvironment {
 
                     // Check for precompile (addresses 0x01-0x09)
                     if let Some(precompile_id) = is_precompile_addr(&target_addr) {
+                        // EIP-150: a CALL to a precompile with
+                        // `value > 0` STILL has to perform the
+                        // caller -> precompile balance transfer.
+                        // The previous code skipped this entirely,
+                        // so a contract could effectively
+                        // `CALL(0x04, value=anything)` and never
+                        // actually move funds out of its own balance —
+                        // a free burn or, when combined with the
+                        // static check, an unconditional success.
+                        //
+                        // Reset last_return_data BEFORE the call.
+                        // Any CALL-family opcode resets the
+                        // return-data buffer at the start per EVM
+                        // semantics; precompile fast-path used to
+                        // skip this and leak the previous call's
+                        // bytes through RETURNDATACOPY.
+                        self.last_return_data.clear();
+                        if call_value > 0 {
+                            if let Err(_e) = self.state.transfer(&ctx.address, &target_addr, call_value) {
+                                // Insufficient balance or overflow:
+                                // CALL returns 0 for failure but the
+                                // gas reserved for the child stays
+                                // consumed (matches EVM).
+                                stack.push(U256::ZERO);
+                                pc += 1; continue;
+                            }
+                        }
+
                         let registry = PrecompileRegistry::new();
                         let result = registry.execute(precompile_id as u64, &calldata, child_gas);
                         if result.success {
@@ -1049,11 +1368,27 @@ impl ExecutionEnvironment {
                             }
                             stack.push(U256::ONE);
                         } else {
+                            // Precompile failed — refund the value
+                            // we just transferred so the caller's
+                            // balance is back where it started
+                            // (matches EVM revert semantics for
+                            // failed precompile calls).
+                            if call_value > 0 {
+                                let _ = self.state.transfer(&target_addr, &ctx.address, call_value);
+                            }
                             self.last_return_data.clear();
                             stack.push(U256::ZERO);
                         }
                         pc += 1; continue;
                     }
+
+                    // Reset last_return_data BEFORE invoking the child
+                    // so a CALL that early-exits via the precompile or
+                    // fails the value transfer doesn't leak the
+                    // PREVIOUS call's return data through RETURNDATACOPY.
+                    // EVM semantics: any CALL-family opcode resets the
+                    // return-data buffer at the start.
+                    self.last_return_data.clear();
 
                     let child_ctx = CallContext {
                         address: target_addr.clone(),
@@ -1064,6 +1399,7 @@ impl ExecutionEnvironment {
                         calldata,
                         is_static: ctx.is_static,
                         depth: ctx.depth + 1,
+                        is_delegate: false,
                     };
 
                     let outcome = self.execute_frame(&child_ctx);
@@ -1086,6 +1422,21 @@ impl ExecutionEnvironment {
                         CallOutcome::Revert { gas_used, return_data: rd } => {
                             gas.return_gas(child_gas.saturating_sub(*gas_used));
                             self.last_return_data = rd.clone();
+                            // EVM semantics: revert return data is ALSO
+                            // copied to the caller's retOffset/retLen
+                            // window — RETURNDATACOPY isn't the only
+                            // way to read it. Mirror the success path
+                            // copy here so a contract that uses CALL
+                            // and reads from retOffset gets the revert
+                            // reason on either outcome.
+                            if ret_len > 0 && !rd.is_empty() {
+                                let copy_len = ret_len.min(rd.len());
+                                if !Self::charge_and_expand_memory(&mut gas, &mut memory, ret_offset + copy_len) {
+                                    self.state.rollback(snapshot).ok();
+                                    return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                }
+                                memory[ret_offset..ret_offset+copy_len].copy_from_slice(&rd[..copy_len]);
+                            }
                             stack.push(U256::ZERO); // failure
                         }
                         CallOutcome::Failure { gas_used } => {
@@ -1148,6 +1499,8 @@ impl ExecutionEnvironment {
                         pc += 1; continue;
                     }
 
+                    self.last_return_data.clear();
+
                     let child_ctx = CallContext {
                         address: target_addr.clone(),
                         code_address: target_addr,
@@ -1157,6 +1510,7 @@ impl ExecutionEnvironment {
                         calldata,
                         is_static: true, // STATICCALL propagates
                         depth: ctx.depth + 1,
+                        is_delegate: false,
                     };
 
                     let outcome = self.execute_frame(&child_ctx);
@@ -1177,6 +1531,17 @@ impl ExecutionEnvironment {
                         CallOutcome::Revert { gas_used, return_data: rd } => {
                             gas.return_gas(child_gas.saturating_sub(*gas_used));
                             self.last_return_data = rd.clone();
+                            // Mirror success path: also copy revert
+                            // returndata into the caller's
+                            // retOffset/retLen window.
+                            if ret_len > 0 && !rd.is_empty() {
+                                let copy_len = ret_len.min(rd.len());
+                                if !Self::charge_and_expand_memory(&mut gas, &mut memory, ret_offset + copy_len) {
+                                    self.state.rollback(snapshot).ok();
+                                    return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                }
+                                memory[ret_offset..ret_offset+copy_len].copy_from_slice(&rd[..copy_len]);
+                            }
                             stack.push(U256::ZERO);
                         }
                         CallOutcome::Failure { .. } => {
@@ -1214,8 +1579,14 @@ impl ExecutionEnvironment {
                     // bytecode but keeps the CURRENT frame's storage
                     // context (ctx.address).
                     let target_code = self.resolve_address(code_addr);
+                    self.last_return_data.clear();
                     // DELEGATECALL: execute target's CODE but in CALLER's storage
-                    // msg.sender and msg.value are PRESERVED from parent
+                    // msg.sender and msg.value are PRESERVED from parent.
+                    // is_delegate=true tells `execute_frame` NOT to perform
+                    // a fresh `caller -> address` value transfer at frame
+                    // entry — the funds are conceptually already in
+                    // `address`, and re-transferring them produces wrong
+                    // bookkeeping (or, before the from==to fix, a free mint).
                     let child_ctx = CallContext {
                         address: ctx.address.clone(),      // storage = caller's
                         code_address: target_code,          // code = target's
@@ -1225,6 +1596,7 @@ impl ExecutionEnvironment {
                         calldata,
                         is_static: ctx.is_static,
                         depth: ctx.depth + 1,
+                        is_delegate: true,
                     };
 
                     let outcome = self.execute_frame(&child_ctx);
@@ -1245,6 +1617,15 @@ impl ExecutionEnvironment {
                         CallOutcome::Revert { gas_used, return_data: rd } => {
                             gas.return_gas(child_gas.saturating_sub(*gas_used));
                             self.last_return_data = rd.clone();
+                            // Mirror success path: copy revert returndata too.
+                            if ret_len > 0 && !rd.is_empty() {
+                                let copy_len = ret_len.min(rd.len());
+                                if !Self::charge_and_expand_memory(&mut gas, &mut memory, ret_offset + copy_len) {
+                                    self.state.rollback(snapshot).ok();
+                                    return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                }
+                                memory[ret_offset..ret_offset+copy_len].copy_from_slice(&rd[..copy_len]);
+                            }
                             stack.push(U256::ZERO);
                         }
                         CallOutcome::Failure { .. } => {
@@ -1295,8 +1676,13 @@ impl ExecutionEnvironment {
                     // address via the runtime registry, same as
                     // DELEGATECALL above.
                     let target_code = self.resolve_address(code_addr);
-                    // CALLCODE: execute target's CODE in CALLER's storage
-                    // msg.sender = caller (NOT preserved like DELEGATECALL)
+                    self.last_return_data.clear();
+                    // CALLCODE: execute target's CODE in CALLER's storage.
+                    // msg.sender = the current contract (NOT preserved
+                    // like DELEGATECALL). Like DELEGATECALL, the funds
+                    // are conceptually already in `address`, so we
+                    // mark `is_delegate: true` to skip the entry-point
+                    // value transfer.
                     let child_ctx = CallContext {
                         address: ctx.address.clone(),       // storage = caller's
                         code_address: target_code,           // code = target's
@@ -1306,6 +1692,7 @@ impl ExecutionEnvironment {
                         calldata,
                         is_static: ctx.is_static,
                         depth: ctx.depth + 1,
+                        is_delegate: true,
                     };
 
                     let outcome = self.execute_frame(&child_ctx);
@@ -1326,6 +1713,15 @@ impl ExecutionEnvironment {
                         CallOutcome::Revert { gas_used, return_data: rd } => {
                             gas.return_gas(child_gas.saturating_sub(*gas_used));
                             self.last_return_data = rd.clone();
+                            // Mirror success path: copy revert returndata too.
+                            if ret_len > 0 && !rd.is_empty() {
+                                let copy_len = ret_len.min(rd.len());
+                                if !Self::charge_and_expand_memory(&mut gas, &mut memory, ret_offset + copy_len) {
+                                    self.state.rollback(snapshot).ok();
+                                    return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                }
+                                memory[ret_offset..ret_offset+copy_len].copy_from_slice(&rd[..copy_len]);
+                            }
                             stack.push(U256::ZERO);
                         }
                         CallOutcome::Failure { .. } => {
@@ -1388,10 +1784,33 @@ impl ExecutionEnvironment {
                     // unsuccessful deploy does not leave an orphaned
                     // empty account or unspent value sitting at the
                     // would-be contract address.
-                    self.state.increment_nonce(&ctx.address).ok();
+                    //
+                    // Fail-closed on nonce overflow: the previous code
+                    // used `.ok()` which silently ignored the error
+                    // returned by `increment_nonce`, so a CREATE
+                    // against an account that had hit the nonce
+                    // boundary just kept executing as if the nonce had
+                    // bumped. The state_manager fix to `checked_add`
+                    // means a real overflow now returns Err — propagate
+                    // it as a CallOutcome::Failure for the whole frame.
+                    if let Err(_e) = self.state.increment_nonce(&ctx.address) {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                    }
 
-                    // Check address not occupied
-                    if !self.state.get_code(&new_addr).is_empty() {
+                    // Collision check. EVM semantics (EIP-684): a CREATE
+                    // attempt to an address that already has either
+                    // code OR a non-zero nonce MUST be rejected as a
+                    // collision. The previous code only checked
+                    // `get_code(...).is_empty()`, which let a CREATE
+                    // overwrite an existing EOA-with-history (code is
+                    // empty, but the account already exists with a
+                    // non-zero nonce / non-zero balance from prior
+                    // activity). Tighten to also reject when the
+                    // account exists with a non-zero nonce.
+                    let collision = !self.state.get_code(&new_addr).is_empty()
+                        || self.state.get_nonce(&new_addr) != 0;
+                    if collision {
                         stack.push(U256::ZERO);
                         pc += 1; continue;
                     }
@@ -1423,8 +1842,17 @@ impl ExecutionEnvironment {
                     // the caller, which is the "CREATE fails but
                     // caller loses value twice" bug this fix also
                     // closes.
+                    //
+                    // Fail-closed on set_code error: the previous
+                    // `.ok()` swallowed any failure from set_code, so
+                    // execute_frame could end up running with stale or
+                    // missing code at the new address.
                     self.state.get_or_create_account(&new_addr);
-                    self.state.set_code(&new_addr, init_code).ok();
+                    if let Err(_e) = self.state.set_code(&new_addr, init_code) {
+                        self.state.rollback(create_snapshot).ok();
+                        stack.push(U256::ZERO);
+                        pc += 1; continue;
+                    }
 
                     // Execute init code. execute_frame handles the
                     // caller -> new_addr value transfer internally via
@@ -1443,6 +1871,7 @@ impl ExecutionEnvironment {
                         calldata: Vec::new(),
                         is_static: false,
                         depth: ctx.depth + 1,
+                        is_delegate: false,
                     };
 
                     let outcome = self.execute_frame(&child_ctx);
@@ -1451,8 +1880,18 @@ impl ExecutionEnvironment {
                         CallOutcome::Success { gas_used: child_used, return_data: runtime_code, .. } => {
                             gas.return_gas(child_gas.saturating_sub(child_used));
                             if !runtime_code.is_empty() {
-                                // Store runtime code
-                                self.state.set_code(&new_addr, runtime_code).ok();
+                                // Store runtime code. Fail-closed: if
+                                // set_code returns Err here we cannot
+                                // honestly report Success — the
+                                // contract address would have a
+                                // bytecode mismatch. Roll back the
+                                // create_snapshot and report ZERO so
+                                // the caller knows the deploy failed.
+                                if let Err(_e) = self.state.set_code(&new_addr, runtime_code) {
+                                    self.state.rollback(create_snapshot).ok();
+                                    stack.push(U256::ZERO);
+                                    pc += 1; continue;
+                                }
                             }
                             self.created_in_tx.insert(new_addr.clone());
                             // Keep all CREATE-side effects: let the
@@ -1530,10 +1969,22 @@ impl ExecutionEnvironment {
 
                     // Nonce bump BEFORE sub-snapshot so it survives a
                     // failed CREATE2 — see the full CREATE comment
-                    // block above for the rationale.
-                    self.state.increment_nonce(&ctx.address).ok();
+                    // block above for the rationale. Fail-closed on
+                    // overflow: previously `.ok()` swallowed the
+                    // error and let CREATE2 keep running with a
+                    // stale (un-bumped) nonce.
+                    if let Err(_e) = self.state.increment_nonce(&ctx.address) {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                    }
 
-                    if !self.state.get_code(&new_addr).is_empty() {
+                    // EIP-684 collision check: also reject when the
+                    // target already has a non-zero nonce, not just
+                    // when it has code. See the CREATE handler above
+                    // for the full rationale.
+                    let collision = !self.state.get_code(&new_addr).is_empty()
+                        || self.state.get_nonce(&new_addr) != 0;
+                    if collision {
                         stack.push(U256::ZERO);
                         pc += 1; continue;
                     }
@@ -1554,9 +2005,14 @@ impl ExecutionEnvironment {
 
                     // See CREATE above: value transfer is delegated
                     // to execute_frame so a CREATE2 with value does
-                    // not double-debit the caller.
+                    // not double-debit the caller. Fail-closed on
+                    // set_code error.
                     self.state.get_or_create_account(&new_addr);
-                    self.state.set_code(&new_addr, init_code).ok();
+                    if let Err(_e) = self.state.set_code(&new_addr, init_code) {
+                        self.state.rollback(create_snapshot).ok();
+                        stack.push(U256::ZERO);
+                        pc += 1; continue;
+                    }
 
                     let child_ctx = CallContext {
                         address: new_addr.clone(),
@@ -1567,6 +2023,7 @@ impl ExecutionEnvironment {
                         calldata: Vec::new(),
                         is_static: false,
                         depth: ctx.depth + 1,
+                        is_delegate: false,
                     };
 
                     let outcome = self.execute_frame(&child_ctx);
@@ -1575,7 +2032,11 @@ impl ExecutionEnvironment {
                         CallOutcome::Success { gas_used: child_used, return_data: runtime_code, .. } => {
                             gas.return_gas(child_gas.saturating_sub(child_used));
                             if !runtime_code.is_empty() {
-                                self.state.set_code(&new_addr, runtime_code).ok();
+                                if let Err(_e) = self.state.set_code(&new_addr, runtime_code) {
+                                    self.state.rollback(create_snapshot).ok();
+                                    stack.push(U256::ZERO);
+                                    pc += 1; continue;
+                                }
                             }
                             self.created_in_tx.insert(new_addr.clone());
                             self.state.commit(create_snapshot).ok();
@@ -1903,10 +2364,40 @@ impl ExecutionEnvironment {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-/// Check if a hex address string maps to a precompile (0x01-0x09).
-/// Precompile addresses are the low addresses: "0000...01" through "0000...09".
+/// Check if an address maps to a precompile (0x01-0x09).
+///
+/// Accepts BOTH the bare-hex form (`"01"`, `"0000…0001"`, etc.) AND the
+/// canonical ShadowDAG `{net}c{40-hex}` form. The previous version only
+/// stripped leading zeros from the input and required the result to be
+/// ≤2 hex characters, which excluded EVERY canonical address — every
+/// `SD1c…` body starts with `S`, not `0`, so `trim_start_matches('0')`
+/// was a no-op and the length check immediately bailed out as None.
+/// Result: a CALL targeting precompile `0x09` via the canonical address
+/// (e.g. `SD1c0000…00000000000000000000000000000009`) routed past the
+/// precompile fast path and through `execute_frame`, where it failed
+/// with "Contract … not found" because no real contract is deployed
+/// at that address.
+///
+/// The new logic strips a recognized network/subtype prefix
+/// (`SD1`, `ST1`, `SR1`, optionally followed by `c`/`t`/`s`/`k`/`h`)
+/// before doing the leading-zero trim, so canonical precompile
+/// addresses are detected just as well as bare hex.
 fn is_precompile_addr(addr: &str) -> Option<u8> {
-    let trimmed = addr.trim_start_matches('0');
+    // Strip an optional ShadowDAG network/subtype prefix.
+    let body = if let Some(rest) = addr.strip_prefix("SD1")
+        .or_else(|| addr.strip_prefix("ST1"))
+        .or_else(|| addr.strip_prefix("SR1"))
+    {
+        // Optional 1-char subtype: c/t/s/k/h.
+        match rest.as_bytes().first() {
+            Some(b'c') | Some(b't') | Some(b's') | Some(b'k') | Some(b'h') => &rest[1..],
+            _ => rest,
+        }
+    } else {
+        addr
+    };
+
+    let trimmed = body.trim_start_matches('0');
     if trimmed.is_empty() {
         return None;
     }
@@ -2056,6 +2547,7 @@ mod tests {
             calldata: vec![],
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Success { .. }));
@@ -2080,6 +2572,7 @@ mod tests {
             calldata: vec![],
             is_static: true,
             depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         // SSTORE in static context -> Failure
@@ -2099,6 +2592,7 @@ mod tests {
             calldata: vec![],
             is_static: false,
             depth: MAX_CALL_DEPTH + 1,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Failure { .. }));
@@ -2131,6 +2625,7 @@ mod tests {
             calldata: vec![],
             is_static: false,
             depth: MAX_CALL_DEPTH, // exactly at the limit — must be rejected
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(
@@ -2159,6 +2654,7 @@ mod tests {
             calldata: vec![],
             is_static: false,
             depth: MAX_CALL_DEPTH - 1, // the deepest allowed frame
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(
@@ -2184,6 +2680,7 @@ mod tests {
             calldata: vec![],
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Success { .. }));
@@ -2213,6 +2710,7 @@ mod tests {
             calldata: vec![],
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Success { .. }));
@@ -2251,6 +2749,7 @@ mod tests {
             calldata,
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Success { .. }), "Contract call should succeed");
@@ -2332,6 +2831,7 @@ mod tests {
             calldata: vec![],
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
         let outcome = env.execute_frame(&ctx);
         assert!(
@@ -2436,6 +2936,7 @@ mod tests {
             calldata: vec![],
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
         let outcome = env.execute_frame(&ctx);
         let return_data = match outcome {
@@ -2541,6 +3042,7 @@ mod tests {
                 calldata: vec![],
                 is_static: false,
                 depth: 0,
+                is_delegate: false,
             };
             match env.execute_frame(&ctx) {
                 CallOutcome::Success { gas_used, .. } => gas_used,
@@ -2605,6 +3107,7 @@ mod tests {
             calldata: vec![],
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Success { .. }), "A calling B should succeed");
@@ -2626,6 +3129,7 @@ mod tests {
             calldata: vec![],
             is_static: true,
             depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Failure { .. }), "SSTORE in static context must fail");
@@ -2652,6 +3156,7 @@ mod tests {
             calldata: vec![],
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Success { .. }));
@@ -2688,6 +3193,7 @@ mod tests {
             calldata: vec![],
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Revert { .. }));
@@ -2715,7 +3221,7 @@ mod tests {
             address: "c".into(), code_address: "c".into(),
             caller: "u".into(), value: 0, gas_limit: 100_000,
             calldata: vec![1, 2, 3, 4, 5], // 5 bytes
-            is_static: false, depth: 0,
+            is_static: false, depth: 0, is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         match result {
@@ -2745,7 +3251,7 @@ mod tests {
         let ctx = CallContext {
             address: "c".into(), code_address: "c".into(),
             caller: "u".into(), value: 0, gas_limit: 100_000,
-            calldata: vec![], is_static: false, depth: 0,
+            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         match result {
@@ -2771,7 +3277,7 @@ mod tests {
             address: "c".into(), code_address: "c".into(),
             caller: "u".into(), value: 0,
             gas_limit: 100, // Very low gas
-            calldata: vec![], is_static: false, depth: 0,
+            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Failure { .. }), "Should run out of gas");
@@ -2789,7 +3295,7 @@ mod tests {
         let ctx = CallContext {
             address: "c".into(), code_address: "c".into(),
             caller: "u".into(), value: 0, gas_limit: 100_000,
-            calldata: vec![], is_static: false, depth: 0,
+            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
         };
         env.execute_frame(&ctx);
 
@@ -2801,7 +3307,7 @@ mod tests {
         let ctx2 = CallContext {
             address: "c".into(), code_address: "c".into(),
             caller: "u".into(), value: 0, gas_limit: 100_000,
-            calldata: vec![], is_static: false, depth: 0,
+            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
         };
         let result = env.execute_frame(&ctx2);
         assert!(matches!(result, CallOutcome::Success { .. }));
@@ -2828,7 +3334,7 @@ mod tests {
         let ctx = CallContext {
             address: "c".into(), code_address: "c".into(),
             caller: "u".into(), value: 0, gas_limit: 100_000,
-            calldata: vec![], is_static: false, depth: 0,
+            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         match result {
@@ -2853,7 +3359,7 @@ mod tests {
         let ctx = CallContext {
             address: "c".into(), code_address: "c".into(),
             caller: "u".into(), value: 0, gas_limit: 100_000,
-            calldata: vec![], is_static: false, depth: 0,
+            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         match result {
@@ -2883,7 +3389,7 @@ mod tests {
         let ctx = CallContext {
             address: "c".into(), code_address: "c".into(),
             caller: "u".into(), value: 0, gas_limit: 100_000,
-            calldata: vec![], is_static: false, depth: 0,
+            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         match result {
@@ -2909,7 +3415,7 @@ mod tests {
         let ctx = CallContext {
             address: "contract".into(), code_address: "contract".into(),
             caller: "user".into(), value: 0, gas_limit: 100_000,
-            calldata: vec![], is_static: false, depth: 0,
+            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Success { .. }));
@@ -2928,7 +3434,7 @@ mod tests {
         let ctx = CallContext {
             address: "target".into(), code_address: "target".into(),
             caller: "sender".into(), value: 1000, gas_limit: 100_000,
-            calldata: vec![], is_static: false, depth: 0,
+            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Failure { .. }), "Insufficient balance should fail");
@@ -2950,7 +3456,7 @@ mod tests {
         let ctx = CallContext {
             address: "c".into(), code_address: "c".into(),
             caller: "u".into(), value: 0, gas_limit: 100_000,
-            calldata: vec![], is_static: false, depth: 0,
+            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         match result {
@@ -2982,6 +3488,7 @@ mod tests {
             calldata: vec![],
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
         match env.execute_frame(&ctx) {
             CallOutcome::Success { return_data, .. } => {
@@ -3051,6 +3558,10 @@ mod tests {
     /// The old code used `U256::from_hex(&self.block_ctx.block_hash)`
     /// which silently returned `ZERO` for any string longer than 64
     /// chars OR containing non-hex bytes.
+    ///
+    /// Updated for the v2 opcode: BLOCKHASH now pops one word off the
+    /// stack (the requested block number) before hashing, so this
+    /// test pushes a dummy block number of `0` first.
     #[test]
     fn blockhash_produces_stable_nonzero_for_non_hex_block_hash() {
         let mut env = ExecutionEnvironment::new(BlockContext {
@@ -3060,9 +3571,14 @@ mod tests {
             block_hash: "SD1b_deadbeef_cafe".into(),
             network: "mainnet".into(),
         });
-        // BLOCKHASH, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
-        let code = vec![0x73, 0x10, 0, 0x91, 0x10, 32, 0x10, 0, 0xB6];
-        let got = run_and_read_u256(&mut env, code);
+        // PUSH1 0, BLOCKHASH, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
+        let code = vec![
+            0x10, 0,          // PUSH1 0   (requested block number)
+            0x73,             // BLOCKHASH
+            0x10, 0, 0x91,    // PUSH1 0 MSTORE
+            0x10, 32, 0x10, 0, 0xB6, // PUSH1 32 PUSH1 0 RETURN
+        ];
+        let got = run_and_read_u256(&mut env, code.clone());
         assert!(got.iter().any(|&b| b != 0),
             "BLOCKHASH must return a non-zero digest for a non-hex block identifier, got {:?}", got);
 
@@ -3072,9 +3588,42 @@ mod tests {
             block_hash: "SD1b_deadbeef_cafe".into(),
             network: "mainnet".into(),
         });
-        let code = vec![0x73, 0x10, 0, 0x91, 0x10, 32, 0x10, 0, 0xB6];
         let got2 = run_and_read_u256(&mut env2, code);
         assert_eq!(got, got2, "BLOCKHASH must be deterministic for a given block");
+    }
+
+    /// BLOCKHASH must pop one word from the stack. The previous
+    /// implementation popped nothing, leaving the requested block
+    /// number stranded on the stack and corrupting every subsequent
+    /// opcode. Different pushed values must produce different
+    /// digests, and the stack depth after BLOCKHASH must match
+    /// `depth_before - 1 + 1 = depth_before` (net zero), not
+    /// `depth_before + 1` like it used to.
+    #[test]
+    fn blockhash_pops_stack_arg_and_mixes_into_digest() {
+        fn run_with_arg(arg: u8) -> [u8; 32] {
+            let mut env = ExecutionEnvironment::new(BlockContext {
+                timestamp: 1000,
+                block_hash: "SD1b_deadbeef_cafe".into(),
+                network: "mainnet".into(),
+            });
+            // PUSH1 <arg>, BLOCKHASH, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
+            let code = vec![
+                0x10, arg,
+                0x73,
+                0x10, 0, 0x91,
+                0x10, 32, 0x10, 0, 0xB6,
+            ];
+            run_and_read_u256(&mut env, code)
+        }
+
+        let a = run_with_arg(0);
+        let b = run_with_arg(1);
+        let c = run_with_arg(7);
+
+        assert_ne!(a, b, "BLOCKHASH(0) must differ from BLOCKHASH(1)");
+        assert_ne!(a, c, "BLOCKHASH(0) must differ from BLOCKHASH(7)");
+        assert_ne!(b, c, "BLOCKHASH(1) must differ from BLOCKHASH(7)");
     }
 
     /// Memory expansion must be charged for at every opcode that
@@ -3118,6 +3667,7 @@ mod tests {
                 calldata: vec![],
                 is_static: false,
                 depth: 0,
+                is_delegate: false,
             };
             match env.execute_frame(&ctx) {
                 CallOutcome::Success { gas_used, .. } => gas_used,
@@ -3177,6 +3727,7 @@ mod tests {
             calldata: vec![],
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(
@@ -3265,5 +3816,466 @@ mod tests {
         assert!(parse_decimal_u256("abc").is_none());
         assert!(parse_decimal_u256("12-34").is_none());
         assert!(parse_decimal_u256("0x42").is_none()); // hex prefix is not decimal
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //        BATCH REGRESSIONS — 16-bug audit patch
+    // ═══════════════════════════════════════════════════════════════
+
+    // ─────────────────────────────────────────────────────────────
+    // P1-10 — RETURN / REVERT must not silently commit on stack
+    //         underflow. The previous code just skipped the
+    //         pop-and-read and still ran `commit` / `rollback` with
+    //         empty return data, which turned a malformed program
+    //         into a successful state-committing frame.
+    // ─────────────────────────────────────────────────────────────
+
+    /// RETURN with an empty stack is a stack-underflow fault.
+    /// Before the fix it silently returned `Success` with empty
+    /// return data AND committed any SSTOREs the frame had made.
+    /// After the fix it rolls back and returns `Failure`.
+    #[test]
+    fn return_with_empty_stack_is_failure_not_silent_success() {
+        let mut env = make_env();
+        // PUSH1 42, PUSH1 0, SSTORE, RETURN
+        //   (no operands on the stack for RETURN — it expects
+        //    [offset, size] but the SSTORE consumed both items)
+        let code = vec![
+            0x10, 42,   // PUSH1 42
+            0x10, 0,    // PUSH1 0
+            0x51,       // SSTORE  (stack becomes empty)
+            0xB6,       // RETURN  (empty stack → fault)
+        ];
+        env.state.set_code("probe", code).unwrap();
+        let ctx = CallContext {
+            address: "probe".into(),
+            code_address: "probe".into(),
+            caller: "user".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(
+            matches!(result, CallOutcome::Failure { .. }),
+            "RETURN with empty stack must fail, got {:?}", result
+        );
+        // The earlier SSTORE must have been rolled back.
+        assert!(
+            env.state.storage_load("probe", "slot:0").is_none(),
+            "RETURN failure must roll back the prior SSTORE"
+        );
+    }
+
+    /// REVERT with fewer than two stack items must also become
+    /// Failure (not a Revert with empty data) so the parent
+    /// frame's RETURNDATA is cleared rather than left pointing
+    /// at whatever was in the previous frame.
+    #[test]
+    fn revert_with_empty_stack_is_failure_not_silent_revert() {
+        let mut env = make_env();
+        // PUSH1 7, REVERT — stack has one item when REVERT runs,
+        // so the `stack.len() < 2` branch fires.
+        let code = vec![
+            0x10, 7,   // PUSH1 7
+            0xB7,      // REVERT — underflow
+        ];
+        env.state.set_code("probe2", code).unwrap();
+        let ctx = CallContext {
+            address: "probe2".into(),
+            code_address: "probe2".into(),
+            caller: "user".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(
+            matches!(result, CallOutcome::Failure { .. }),
+            "REVERT with stack.len() < 2 must fail, got {:?}", result
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // P1-13 — `is_precompile_addr` must accept canonical ShadowDAG
+    //         contract addresses such as SD1c<hex> for the low
+    //         precompile slots, not just bare hex.
+    // ─────────────────────────────────────────────────────────────
+
+    /// `is_precompile_addr` must strip the `SD1c` (and variants)
+    /// prefix and recognise the low-nibble precompile slots. The
+    /// old implementation only accepted bare hex, so CALL to the
+    /// canonical `SD1c…02` address for SHA-256 silently loaded
+    /// (empty) code instead of routing through the precompile.
+    #[test]
+    fn is_precompile_addr_accepts_canonical_shadowdag_address_forms() {
+        // Bare hex (old behaviour still works). `is_precompile_addr`
+        // expects a raw hex body or a ShadowDAG-prefixed address,
+        // NOT a `0x`-prefixed form, so we don't assert on `"0x02"`.
+        assert_eq!(is_precompile_addr("02"),   Some(2));
+        assert_eq!(is_precompile_addr("9"),    Some(9));
+
+        // SD1c-prefixed canonical 40-char hex body, right-aligned
+        let sd1c_02 = format!("SD1c{}", "0".repeat(38) + "02");
+        let sd1c_09 = format!("SD1c{}", "0".repeat(39) + "9");
+        assert_eq!(is_precompile_addr(&sd1c_02), Some(2),
+            "canonical SD1c address for precompile 2 must be detected");
+        assert_eq!(is_precompile_addr(&sd1c_09), Some(9),
+            "canonical SD1c address for precompile 9 must be detected");
+
+        // Other network / subtype markers
+        assert_eq!(is_precompile_addr(&format!("ST1t{}", "0".repeat(38) + "03")), Some(3));
+        assert_eq!(is_precompile_addr(&format!("SR1s{}", "0".repeat(38) + "04")), Some(4));
+
+        // Address that LOOKS structurally similar but is not a
+        // precompile slot must still return None.
+        assert!(is_precompile_addr(&format!("SD1c{}", "0".repeat(36) + "abcd")).is_none(),
+            "non-precompile canonical address must not be misidentified");
+        // And a precompile beyond the 0x01..=0x09 window.
+        assert!(is_precompile_addr(&format!("SD1c{}", "0".repeat(38) + "0a")).is_none(),
+            "precompile slot 0x0a (> 9) must not be accepted");
+        // An address with no precompile slot at all.
+        assert!(is_precompile_addr("SD1ccafecafecafecafecafecafecafecafecafecafe").is_none());
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // P0-3 — DELEGATECALL must not double-debit the caller's
+    //        balance. The entry-frame `transfer(caller → address)`
+    //        in `execute_frame` is suppressed when
+    //        `ctx.is_delegate` is true, because the outer frame
+    //        already paid the transfer once.
+    // ─────────────────────────────────────────────────────────────
+
+    /// A direct execution with `is_delegate: true` and a non-zero
+    /// `value` must NOT debit the caller. This is the entry-frame
+    /// half of the DELEGATECALL fix — the child frame inherits the
+    /// parent's value context and must not re-apply the transfer.
+    #[test]
+    fn delegate_frame_does_not_debit_caller() {
+        let mut env = make_env();
+        env.state.set_balance("caller", 1_000).unwrap();
+        env.state.set_balance("library", 0).unwrap();
+        env.state.set_code("library", vec![0x00]).unwrap(); // STOP
+
+        let ctx = CallContext {
+            address: "library".into(),
+            code_address: "library".into(),
+            caller: "caller".into(),
+            value: 500,   // value set, but must NOT move under delegate semantics
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: true,
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(matches!(result, CallOutcome::Success { .. }),
+            "delegate frame must succeed, got {:?}", result);
+
+        assert_eq!(
+            env.state.get_balance("caller"),
+            1_000,
+            "is_delegate=true must suppress entry-frame transfer"
+        );
+        assert_eq!(
+            env.state.get_balance("library"),
+            0,
+            "is_delegate=true must not credit the code target either"
+        );
+    }
+
+    /// Counter-test: a non-delegate frame with the same shape
+    /// DOES debit the caller and credit the target. Confirms the
+    /// above assertion is actually exercising the delegate branch
+    /// and not a universal no-op.
+    #[test]
+    fn non_delegate_frame_still_debits_caller() {
+        let mut env = make_env();
+        env.state.set_balance("caller", 1_000).unwrap();
+        env.state.set_balance("target", 0).unwrap();
+        env.state.set_code("target", vec![0x00]).unwrap();
+
+        let ctx = CallContext {
+            address: "target".into(),
+            code_address: "target".into(),
+            caller: "caller".into(),
+            value: 500,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,   // regular CALL semantics
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(matches!(result, CallOutcome::Success { .. }));
+
+        assert_eq!(env.state.get_balance("caller"), 500,
+            "normal call must debit caller by value");
+        assert_eq!(env.state.get_balance("target"), 500,
+            "normal call must credit target by value");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // P0-5 — destroy_account must journal the full storage map so
+    //        a reverted SELFDESTRUCT restores every slot, not just
+    //        the account row.
+    // ─────────────────────────────────────────────────────────────
+
+    /// Set up a contract with storage, take a snapshot, destroy the
+    /// account, then roll back. Every slot must reappear exactly
+    /// as it was. The previous `destroy_account` journaled only
+    /// the `Account`, dropping the storage on the floor — rolling
+    /// back restored the account row but left storage empty.
+    #[test]
+    fn selfdestruct_rollback_restores_storage() {
+        let mut env = make_env();
+        env.state.set_code("victim", vec![0x00]).unwrap();
+        env.state.storage_store("victim", "slot:0", "0x2a");
+        env.state.storage_store("victim", "slot:1", "0x1337");
+        env.state.set_balance("victim", 1_234).unwrap();
+
+        let snap = env.state.snapshot();
+
+        // Directly destroy the account (this mirrors what the
+        // SELFDESTRUCT opcode does after the balance transfer).
+        env.state
+            .destroy_account("victim")
+            .expect("destroy_account must succeed");
+
+        // Post-destroy: storage is gone.
+        assert!(env.state.storage_load("victim", "slot:0").is_none());
+        assert!(env.state.storage_load("victim", "slot:1").is_none());
+
+        // Roll back the destroy.
+        env.state.rollback(snap).expect("rollback must succeed");
+
+        // Post-rollback: both the account AND the storage are back.
+        assert!(env.state.get_account("victim").is_some(),
+            "rolled-back account must be present");
+        assert_eq!(
+            env.state.storage_load("victim", "slot:0"),
+            Some("0x2a".to_string()),
+            "slot:0 must be restored on rollback"
+        );
+        assert_eq!(
+            env.state.storage_load("victim", "slot:1"),
+            Some("0x1337".to_string()),
+            "slot:1 must be restored on rollback"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // P0-6 / P1-7 — persistence must delete destroyed contracts'
+    //        rows AND capture enough undo data to restore them on
+    //        reorg. Exercised through ContractStorage so the
+    //        prefix-scan + JSON-encoded DestroyedAccountDetails
+    //        path is actually hit.
+    // ─────────────────────────────────────────────────────────────
+
+    fn tmp_contract_storage()
+        -> crate::runtime::vm::contracts::contract_storage::ContractStorage
+    {
+        use crate::runtime::vm::contracts::contract_storage::ContractStorage;
+        let dir = std::env::temp_dir().join(format!(
+            "shadowdag_persist_regression_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        ContractStorage::new(dir.to_str().unwrap()).expect("open ContractStorage")
+    }
+
+    /// Persist a contract with storage, then SELFDESTRUCT it and
+    /// persist again. Afterwards the on-disk account, code, and
+    /// every storage slot for the destroyed contract must be
+    /// gone — not "still sitting on disk with pre-destroy state".
+    #[test]
+    fn persist_to_storage_deletes_destroyed_contract_rows_and_slots() {
+        let storage = tmp_contract_storage();
+
+        // Block 1: deploy contract with two storage slots.
+        {
+            let mut env = make_env();
+            env.state
+                .set_code("victim", vec![0x10, 1, 0x10, 0, 0x51, 0x00])
+                .unwrap();
+            env.state.set_balance("victim", 500).unwrap();
+            env.state.storage_store("victim", "slot:0", "0xaa");
+            env.state.storage_store("victim", "slot:1", "0xbb");
+            env.persist_to_storage(&storage).expect("persist block 1");
+        }
+
+        // Sanity: the rows ARE on disk.
+        assert!(
+            storage.get_state("account:victim").is_some(),
+            "post-persist account row must exist"
+        );
+        assert!(
+            storage.get_state("code:victim").is_some(),
+            "post-persist code row must exist"
+        );
+        assert_eq!(
+            storage.get_state("victim:slot:0"),
+            Some("0xaa".to_string()),
+            "post-persist slot:0 must exist"
+        );
+        assert_eq!(
+            storage.get_state("victim:slot:1"),
+            Some("0xbb".to_string()),
+            "post-persist slot:1 must exist"
+        );
+
+        // Block 2: load the contract back, SELFDESTRUCT it, persist.
+        {
+            let mut env = make_env();
+            env.load_contract_from_storage(&storage, "victim")
+                .expect("load pre-destroy state");
+            env.state
+                .destroy_account("victim")
+                .expect("destroy_account");
+            env.destroyed_contracts.insert("victim".to_string());
+            env.persist_to_storage(&storage).expect("persist block 2");
+        }
+
+        // Post-destroy persistence: every row for `victim` must be
+        // deleted. The previous implementation left slot rows on
+        // disk because `persist_to_storage` only emitted deletes
+        // for `account:` and `code:` and never touched the storage
+        // slot prefix.
+        assert!(
+            storage.get_state("account:victim").is_none(),
+            "destroyed account row must be deleted on persist"
+        );
+        assert!(
+            storage.get_state("code:victim").is_none(),
+            "destroyed code row must be deleted on persist"
+        );
+        assert!(
+            storage.get_state("victim:slot:0").is_none(),
+            "destroyed slot:0 must be deleted on persist"
+        );
+        assert!(
+            storage.get_state("victim:slot:1").is_none(),
+            "destroyed slot:1 must be deleted on persist"
+        );
+    }
+
+    /// Drive the same scenario through `persist_with_undo` and
+    /// then `rollback_block`: the destroyed contract must be
+    /// fully restored — account row, code row, and every storage
+    /// slot. Previously only the account row came back, losing
+    /// code and storage on any reorg.
+    #[test]
+    fn persist_with_undo_rollback_restores_destroyed_contract_fully() {
+        let storage = tmp_contract_storage();
+        let block_a = "aa".repeat(32);
+
+        // Block A: deploy the victim with code + storage and
+        // persist via the plain `persist_to_storage` path so the
+        // pre-destroy state lives on disk WITHOUT an undo record.
+        {
+            let mut env = make_env();
+            env.state
+                .set_code("victim", vec![0x10, 1, 0x10, 0, 0x51, 0x00])
+                .unwrap();
+            env.state.set_balance("victim", 777).unwrap();
+            env.state.storage_store("victim", "slot:0", "0xaa");
+            env.state.storage_store("victim", "slot:1", "0xbb");
+            env.persist_to_storage(&storage).expect("persist block A");
+        }
+
+        // Block B: destroy the victim, persist with an undo record.
+        {
+            let mut env = make_env();
+            env.load_contract_from_storage(&storage, "victim")
+                .expect("load pre-destroy state");
+            env.state
+                .destroy_account("victim")
+                .expect("destroy_account");
+            env.destroyed_contracts.insert("victim".to_string());
+            env.persist_with_undo(&storage, &block_a)
+                .expect("persist with undo");
+        }
+
+        // Sanity: rows gone from disk post-destroy.
+        assert!(storage.get_state("account:victim").is_none());
+        assert!(storage.get_state("code:victim").is_none());
+        assert!(storage.get_state("victim:slot:0").is_none());
+        assert!(storage.get_state("victim:slot:1").is_none());
+
+        // Roll back block B — must fully re-materialize the victim.
+        storage.rollback_block(&block_a).expect("rollback_block");
+
+        assert!(
+            storage.get_state("account:victim").is_some(),
+            "rollback_block must restore the destroyed account row"
+        );
+        assert!(
+            storage.get_state("code:victim").is_some(),
+            "rollback_block must restore the destroyed code row"
+        );
+        assert_eq!(
+            storage.get_state("victim:slot:0"),
+            Some("0xaa".to_string()),
+            "rollback_block must restore destroyed slot:0"
+        );
+        assert_eq!(
+            storage.get_state("victim:slot:1"),
+            Some("0xbb".to_string()),
+            "rollback_block must restore destroyed slot:1"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // P2-15 — `set_nonce` is O(1); loading a contract with a large
+    //         persisted nonce must not stall the block-execution
+    //         hot path.
+    // ─────────────────────────────────────────────────────────────
+
+    /// `load_contract_from_storage` for an account whose persisted
+    /// nonce is very large must NOT walk a nonce-long loop of
+    /// `increment_nonce` calls. We manually inject such an account
+    /// row into storage and reload: the call must return quickly
+    /// AND the final nonce must match.
+    #[test]
+    fn load_contract_with_huge_nonce_is_o1_via_set_nonce() {
+        let storage = tmp_contract_storage();
+        // Plant an account row with a huge nonce. Before the fix
+        // this would spin in `for _ in 0..nonce { increment_nonce }`
+        // for ~10 billion iterations, hanging the test.
+        storage
+            .set_state(
+                "account:whale",
+                &format!("{}|{}|{}", 1_u64, 10_000_000_000_u64, "0".repeat(64)),
+            )
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        let mut env = make_env();
+        env.load_contract_from_storage(&storage, "whale")
+            .expect("load whale");
+        let elapsed = start.elapsed();
+
+        // 10-billion loop iterations would take many seconds even
+        // on a fast machine. O(1) `set_nonce` should complete in
+        // well under a second. Use a generous 5s ceiling to avoid
+        // flake on loaded CI hosts.
+        assert!(
+            elapsed.as_secs() < 5,
+            "load_contract_from_storage must be O(1); took {:?}",
+            elapsed
+        );
+        assert_eq!(
+            env.state.get_nonce("whale"),
+            10_000_000_000_u64,
+            "persisted nonce must be restored exactly"
+        );
     }
 }

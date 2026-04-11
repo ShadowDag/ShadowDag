@@ -190,6 +190,7 @@ impl Executor {
             calldata: vec![], // deploy has no input data
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
 
         // Phase 2: Run the constructor.
@@ -403,6 +404,7 @@ impl Executor {
             calldata: input_data.to_vec(),
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
 
         let outcome = env.execute_frame(&ctx);

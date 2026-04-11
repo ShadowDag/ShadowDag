@@ -1224,9 +1224,15 @@ mod tests {
     use super::*;
 
     fn make_vm() -> VM {
+        // Use `std::env::temp_dir()` instead of a hard-coded `/tmp/…`
+        // path. Windows has no `/tmp`, so the previous test helper
+        // failed the whole vm.rs test module on Windows before any
+        // assertion could run. Nanosecond suffix keeps runs unique.
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        VM::new(&format!("/tmp/test_vm_{}", ts)).expect("VM::new failed")
+        let dir = std::env::temp_dir().join(format!("shadowdag_test_vm_{}", ts));
+        VM::new(dir.to_str().expect("tempdir path is not valid UTF-8"))
+            .expect("VM::new failed")
     }
 
     fn exec(vm: &VM, bytecode: &[u8], gas: u64) -> ExecutionResult {

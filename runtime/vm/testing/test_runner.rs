@@ -204,6 +204,7 @@ impl TestRunner {
             calldata: test.calldata.clone(),
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
 
         let outcome = self.env.execute_frame(&ctx);

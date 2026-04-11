@@ -75,8 +75,19 @@ pub enum StateChange {
     NonceChange { address: String, old_nonce: u64, new_nonce: u64 },
     /// Account created
     AccountCreated { address: String },
-    /// Account destroyed (SELFDESTRUCT)
-    AccountDestroyed { address: String, account: Account },
+    /// Account destroyed (SELFDESTRUCT). Carries BOTH the account row
+    /// and the full storage map so that `rollback` can re-materialize
+    /// the contract exactly as it was. The previous variant only kept
+    /// `account` and dropped the storage on the floor — rolling back
+    /// a SELFDESTRUCT then re-installed an account with empty storage,
+    /// which is consensus-visible silent corruption (any contract that
+    /// SELFDESTRUCTed in a block that later got reverted came back
+    /// with all of its storage zeroed out).
+    AccountDestroyed {
+        address: String,
+        account: Account,
+        storage: BTreeMap<String, String>,
+    },
     /// Storage value changed
     StorageChange { address: String, key: String, old_value: Option<String>, new_value: Option<String> },
     /// Contract code changed
@@ -163,6 +174,23 @@ impl StateManager {
             )));
         }
 
+        // Self-transfer short-circuit. If `from == to`, the only legal
+        // outcome is a no-op (after the balance check passes). The old
+        // code did `set_balance(from, from_balance - value)` followed by
+        // `set_balance(to, from_balance + value)`, and because `from`
+        // and `to` resolve to the same key the SECOND write wins —
+        // leaving the account with `from_balance + value`, i.e. a free
+        // mint of `value`. We special-case the equality up front so the
+        // arithmetic is never even attempted.
+        //
+        // We still required `from_balance >= value` above so that a
+        // self-transfer of `value > balance` is rejected with the same
+        // error a cross-account transfer would produce — clients can't
+        // tell that the destination happens to be the source.
+        if from == to {
+            return Ok(());
+        }
+
         // Pre-compute the receiver's new balance with a checked add so we
         // catch overflow BEFORE debiting the sender. If we did the credit
         // after the debit and relied on saturating_add, a receiver near
@@ -247,6 +275,28 @@ impl StateManager {
         self.accounts.get(address).map(|a| a.nonce).unwrap_or(0)
     }
 
+    /// Set an account's nonce directly, producing a journal entry so
+    /// the change can be rolled back. Used by load paths (e.g.
+    /// `ExecutionEnvironment::load_contract_from_storage`) to restore
+    /// a persisted nonce in O(1) time instead of looping over
+    /// `increment_nonce` nonce times — which was a denial-of-service
+    /// vector on any account whose persisted nonce had reached into
+    /// the billions, since every block load would then stall the
+    /// node for the duration of `nonce` journal-appends.
+    pub fn set_nonce(&mut self, address: &str, new_nonce: u64) -> Result<(), VmError> {
+        self.get_or_create_account(address);
+        let account = self.accounts.get_mut(address)
+            .ok_or_else(|| VmError::Other(format!(
+                "account missing after get_or_create for {}", address
+            )))?;
+        let old_nonce = account.nonce;
+        account.nonce = new_nonce;
+        self.journal.push(StateChange::NonceChange {
+            address: address.to_string(), old_nonce, new_nonce
+        });
+        Ok(())
+    }
+
     /// Deploy contract code to an address
     pub fn set_code(&mut self, address: &str, code: Vec<u8>) -> Result<(), VmError> {
         self.get_or_create_account(address);
@@ -286,19 +336,28 @@ impl StateManager {
     }
 
     /// Destroy a contract account (SELFDESTRUCT).
-    /// Records the full account state in the journal for rollback.
+    ///
+    /// Records the FULL account state — including its storage map —
+    /// in the journal so that `rollback` can re-materialize the
+    /// contract exactly as it was. The previous implementation only
+    /// captured `account` and called `self.storage.remove(address)`
+    /// directly; rollback then restored the account row but NOT the
+    /// storage, leaving a re-materialized contract with empty
+    /// storage. Any contract that SELFDESTRUCTed inside a block
+    /// that later got reverted came back with its slots zeroed out,
+    /// which is consensus-visible silent state corruption.
     pub fn destroy_account(&mut self, address: &str) -> Result<(), VmError> {
-        if let Some(account) = self.accounts.remove(address) {
-            self.journal.push(StateChange::AccountDestroyed {
-                address: address.to_string(),
-                account,
-            });
-            // Also clear storage
-            self.storage.remove(address);
-            Ok(())
-        } else {
-            Err(VmError::Other(format!("cannot destroy non-existent account: {}", address)))
-        }
+        let account = self.accounts.remove(address)
+            .ok_or_else(|| VmError::Other(format!("cannot destroy non-existent account: {}", address)))?;
+        // Snapshot the storage map BEFORE removing it so the journal
+        // entry carries everything needed to undo the destroy.
+        let storage = self.storage.remove(address).unwrap_or_default();
+        self.journal.push(StateChange::AccountDestroyed {
+            address: address.to_string(),
+            account,
+            storage,
+        });
+        Ok(())
     }
 
     // ─── Storage Operations ──────────────────────────────────────────
@@ -400,8 +459,15 @@ impl StateManager {
                 self.accounts.remove(&address);
                 self.storage.remove(&address);
             }
-            StateChange::AccountDestroyed { address, account } => {
-                self.accounts.insert(address, account);
+            StateChange::AccountDestroyed { address, account, storage } => {
+                // Re-materialize BOTH the account row and the full
+                // pre-destroy storage map. The previous undo only
+                // restored the account and silently dropped the
+                // storage on the floor.
+                self.accounts.insert(address.clone(), account);
+                if !storage.is_empty() {
+                    self.storage.insert(address, storage);
+                }
             }
             StateChange::StorageChange { address, key, old_value, .. } => {
                 match old_value {
@@ -670,5 +736,102 @@ mod tests {
         assert!(acc.is_contract());
         assert_eq!(acc.code, code);
         assert!(acc.nonce >= 1);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //        BATCH REGRESSIONS — 16-bug audit patch
+    // ═══════════════════════════════════════════════════════════
+
+    /// P0-2: `transfer(from, from, value)` must be a no-op, not a
+    /// silent mint. The previous code did
+    /// `set_balance(from, from_balance - value);
+    ///  set_balance(to,   from_balance + value);`
+    /// and because `from == to`, the second write overwrote the
+    /// first and the account ended up with `balance + value`.
+    #[test]
+    fn self_transfer_is_noop_not_mint() {
+        let mut sm = StateManager::new();
+        sm.set_balance("alice", 100).unwrap();
+
+        sm.transfer("alice", "alice", 30)
+            .expect("self-transfer within balance must succeed");
+
+        assert_eq!(
+            sm.get_balance("alice"),
+            100,
+            "self-transfer must leave the balance unchanged"
+        );
+    }
+
+    /// P0-2 corollary: self-transfer of MORE than the sender's
+    /// balance must still be rejected with the same error a
+    /// cross-account insufficient-balance transfer would give, so
+    /// the equality special-case is not observable as a
+    /// permissive bypass.
+    #[test]
+    fn self_transfer_above_balance_is_rejected() {
+        let mut sm = StateManager::new();
+        sm.set_balance("alice", 10).unwrap();
+
+        let res = sm.transfer("alice", "alice", 50);
+        assert!(
+            res.is_err(),
+            "self-transfer > balance must still be rejected"
+        );
+        assert_eq!(sm.get_balance("alice"), 10,
+            "rejected self-transfer must not mutate balance");
+    }
+
+    /// P0-5: `destroy_account` journals storage so a rollback can
+    /// re-materialize the contract exactly as it was. Direct
+    /// StateManager exercise so the regression covers the bare
+    /// journal path, not just the execution-frame integration.
+    #[test]
+    fn destroy_account_rollback_restores_storage_map() {
+        let mut sm = StateManager::new();
+        sm.set_code("v", vec![0xde, 0xad, 0xbe, 0xef]).unwrap();
+        sm.storage_store("v", "slot:0", "one");
+        sm.storage_store("v", "slot:1", "two");
+        sm.set_balance("v", 99).unwrap();
+
+        let snap = sm.snapshot();
+        sm.destroy_account("v").expect("destroy");
+        assert!(sm.get_account("v").is_none());
+        assert!(sm.storage_load("v", "slot:0").is_none());
+
+        sm.rollback(snap).expect("rollback");
+        assert!(sm.get_account("v").is_some(),
+            "rollback must restore account");
+        assert_eq!(
+            sm.storage_load("v", "slot:0"),
+            Some("one".to_string()),
+            "rollback must restore slot:0 that destroy_account removed"
+        );
+        assert_eq!(
+            sm.storage_load("v", "slot:1"),
+            Some("two".to_string()),
+            "rollback must restore slot:1 that destroy_account removed"
+        );
+    }
+
+    /// P2-15: `set_nonce` applies the change in one journal entry
+    /// and is reversible via `rollback`.
+    #[test]
+    fn set_nonce_is_rollbackable_o1_change() {
+        let mut sm = StateManager::new();
+        sm.get_or_create_account("alice");
+        assert_eq!(sm.get_nonce("alice"), 0);
+
+        let snap = sm.snapshot();
+        sm.set_nonce("alice", 10_000_000_000)
+            .expect("set_nonce must succeed");
+        assert_eq!(sm.get_nonce("alice"), 10_000_000_000);
+
+        sm.rollback(snap).expect("rollback must succeed");
+        assert_eq!(
+            sm.get_nonce("alice"),
+            0,
+            "set_nonce must be rollbackable to the pre-snapshot value"
+        );
     }
 }

@@ -311,6 +311,7 @@ impl ScriptRunner {
             calldata: vec![],
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
         let outcome = self.env.execute_frame(&ctx);
 
@@ -450,6 +451,7 @@ impl ScriptRunner {
             calldata: calldata.to_vec(),
             is_static: false,
             depth: 0,
+            is_delegate: false,
         };
         let outcome = self.env.execute_frame(&ctx);
 

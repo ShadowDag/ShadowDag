@@ -24,6 +24,42 @@ use crate::slog_error;
 // CONTRACT UNDO DATA — block-level rollback support for reorg safety
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Full record of a destroyed account, including its code and storage,
+/// so that a reorg can fully re-materialize everything the SELFDESTRUCT
+/// removed — not just the account metadata row.
+///
+/// Serialized as a JSON string and stored inside
+/// [`ContractUndoData::destroyed_accounts`]'s second tuple element. This
+/// keeps the on-disk bincode layout of `ContractUndoData` unchanged (the
+/// field is still `Vec<(String, String)>`), so pending undo records
+/// written before this patch still deserialize. The reader side in
+/// [`ContractStorage::rollback_block`] tries `serde_json::from_str`
+/// first, and falls back to the legacy "pipe-delimited account metadata"
+/// format when the string is not valid JSON.
+///
+/// The legacy format stored only `"balance|nonce|code_hash"` and could
+/// therefore only restore the account row; a SELFDESTRUCT'd contract's
+/// code bytes and storage slots were silently lost after a reorg. This
+/// new format carries all three.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DestroyedAccountDetails {
+    /// Account metadata row in the legacy `"balance|nonce|code_hash"`
+    /// format, exactly as persisted under `contract:account:{addr}`.
+    pub meta: String,
+    /// Hex-encoded contract code that was previously stored under
+    /// `contract:code:{addr}`. `None` for externally-owned accounts
+    /// with no code (which should not normally be destroyed, but
+    /// we track the `Option` for completeness).
+    pub code: Option<String>,
+    /// Every pre-destroy storage slot under this contract, as
+    /// `(slot_key_suffix, value)` pairs. The `slot_key_suffix` is the
+    /// key without the leading `contract:{addr}:` prefix, i.e. it's
+    /// whatever the in-memory StateManager stored as the slot's key
+    /// (e.g. `"slot:0"`). On rollback we re-assemble the full DB key
+    /// as `format!("contract:{}:{}", addr, slot_key_suffix)`.
+    pub slots: Vec<(String, String)>,
+}
+
 /// Block-level contract undo data for reorg rollback.
 ///
 /// Captures every state mutation made during a block's contract execution
@@ -34,7 +70,16 @@ pub struct ContractUndoData {
     pub modified_keys: Vec<(String, Option<String>)>,
     /// Accounts created in this block
     pub created_accounts: Vec<String>,
-    /// Accounts destroyed in this block (with full serialized account data for restore)
+    /// Accounts destroyed in this block.
+    ///
+    /// The second tuple element is a JSON-serialized
+    /// [`DestroyedAccountDetails`] carrying the account metadata,
+    /// the pre-destroy code blob, and every pre-destroy storage slot,
+    /// so that `rollback_block` can fully restore the contract. For
+    /// backwards compatibility with pending undo records written
+    /// before the richer format existed, the reader accepts the
+    /// legacy form (a bare `"balance|nonce|code_hash"` string) and
+    /// falls through to the old "restore account row only" path.
     pub destroyed_accounts: Vec<(String, String)>,
     /// Receipt root computed for this block
     pub receipt_root: Option<String>,
@@ -510,10 +555,50 @@ impl ContractStorage {
             }
         }
 
-        // Restore destroyed accounts
-        for (addr, account_data) in &undo.destroyed_accounts {
-            let db_key = format!("contract:account:{}", addr);
-            batch.put(db_key.as_bytes(), account_data.as_bytes());
+        // Restore destroyed accounts.
+        //
+        // For each destroyed contract we try to parse the second tuple
+        // element as JSON-encoded `DestroyedAccountDetails`; if it
+        // parses we restore the account metadata, the pre-destroy code
+        // blob, and every pre-destroy storage slot, reversing the full
+        // SELFDESTRUCT. If it does NOT parse (i.e. the record was
+        // written before this patch, when `destroyed_accounts` only
+        // ever held a bare `"balance|nonce|code_hash"` string), we
+        // fall back to the legacy behaviour of restoring the account
+        // row alone — that's all the old format could recover.
+        for (addr, payload) in &undo.destroyed_accounts {
+            match serde_json::from_str::<DestroyedAccountDetails>(payload) {
+                Ok(details) => {
+                    // v2 path — restore account, code, and all slots.
+                    let account_key = format!("contract:account:{}", addr);
+                    batch.put(account_key.as_bytes(), details.meta.as_bytes());
+
+                    if let Some(code_hex) = details.code {
+                        let code_key = format!("contract:code:{}", addr);
+                        batch.put(code_key.as_bytes(), code_hex.as_bytes());
+                    }
+
+                    for (slot_key_suffix, old_value) in details.slots {
+                        // Slot keys are stored by `persist_with_undo` as
+                        // `{addr}:{suffix}` → DB key `contract:{addr}:{suffix}`.
+                        let slot_db_key =
+                            format!("contract:{}:{}", addr, slot_key_suffix);
+                        batch.put(slot_db_key.as_bytes(), old_value.as_bytes());
+                    }
+                }
+                Err(_) => {
+                    // Legacy format fallback — the payload is raw
+                    // account metadata (`"balance|nonce|code_hash"`),
+                    // not JSON. Restore only the account row so that
+                    // pending undo records written before this patch
+                    // still roll back cleanly. Code + storage will be
+                    // missing, which matches the old (buggy) behaviour;
+                    // by definition no post-patch block can hit this
+                    // branch.
+                    let db_key = format!("contract:account:{}", addr);
+                    batch.put(db_key.as_bytes(), payload.as_bytes());
+                }
+            }
         }
 
         // Remove accounts created during this block
