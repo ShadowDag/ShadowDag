@@ -446,19 +446,20 @@ impl ExecutionEnvironment {
 
     /// Execute a call frame. This is the reentrant core of the VM.
     pub fn execute_frame(&mut self, ctx: &CallContext) -> CallOutcome {
-        // Depth check. Matches EVM semantics (EIP-150): a top-level call
-        // starts at depth 0, and the maximum nested call depth is
-        // MAX_CALL_DEPTH frames total. Because child frames are built
-        // with `depth: ctx.depth + 1`, the valid range of `ctx.depth`
-        // values is `0..MAX_CALL_DEPTH` — i.e. the highest depth that
-        // may execute is `MAX_CALL_DEPTH - 1` (the 1024th frame).
+        // Depth check.
         //
-        // The previous check was `ctx.depth > MAX_CALL_DEPTH`, which
-        // allowed `ctx.depth == MAX_CALL_DEPTH` to execute — one extra
-        // frame beyond the EVM limit (1025 frames total instead of
-        // 1024). Using `>=` closes the off-by-one and aligns with the
-        // identical check in `call_stack.rs::CallStack::push`, which
-        // already uses `self.frames.len() >= self.max_depth`.
+        // `MAX_CALL_DEPTH = 1024` is the INTENDED maximum number of
+        // stack frames. Depth is 0-indexed (the top-level call is
+        // `depth = 0`), so the set of allowed depths is `0..=1023`
+        // — that is, 1024 frames total, matching the constant.
+        //
+        // The previous check used `>` which allowed `depth = 1024`
+        // through, yielding 1025 frames (`0..=1024`) before rejection
+        // at `depth = 1025`. The fix is `>=` so the check rejects
+        // at `depth = MAX_CALL_DEPTH` (the 1025th frame) and the
+        // deepest allowed frame is `MAX_CALL_DEPTH - 1`. See
+        // `call_depth_limit_rejects_at_exactly_max` for the pinned
+        // boundary.
         if ctx.depth >= MAX_CALL_DEPTH {
             return CallOutcome::Failure { gas_used: ctx.gas_limit };
         }
@@ -1839,6 +1840,7 @@ mod tests {
 
     #[test]
     fn call_depth_limit_enforced() {
+        // Generic "above the limit definitely fails" smoke test.
         let mut env = make_env();
         let ctx = CallContext {
             address: "contract".into(),
@@ -1855,14 +1857,21 @@ mod tests {
     }
 
     #[test]
-    fn call_depth_limit_at_exact_max_rejects() {
-        // Regression for the off-by-one in the depth check. The old
-        // check was `ctx.depth > MAX_CALL_DEPTH`, which allowed a
-        // frame at `depth == MAX_CALL_DEPTH` to execute — 1025
-        // frames total instead of the EVM-standard 1024. The new
-        // check `ctx.depth >= MAX_CALL_DEPTH` rejects the 1025th
-        // frame exactly at the boundary, so the valid range of
-        // `ctx.depth` is `0..MAX_CALL_DEPTH` (inclusive-exclusive).
+    fn call_depth_limit_rejects_at_exactly_max() {
+        // Regression for the off-by-one in the depth check.
+        //
+        // MAX_CALL_DEPTH = 1024 is the INTENDED maximum number of
+        // stack frames, counted 0-indexed, so the set of allowed
+        // depths is 0..=1023 (1024 frames total).
+        //
+        // The old check was `if ctx.depth > MAX_CALL_DEPTH`, which
+        // rejected only at depth=1025 — allowing 1025 frames
+        // (0..=1024) through, one more than intended.
+        //
+        // This test pins `depth = MAX_CALL_DEPTH` (= 1024) as a
+        // REJECTION boundary. On the old code, this test would
+        // pass (depth 1024 was accepted). After the fix, depth
+        // 1024 fails, and the largest allowed depth is 1023.
         let mut env = make_env();
         let ctx = CallContext {
             address: "contract".into(),
@@ -1872,28 +1881,24 @@ mod tests {
             gas_limit: 100_000,
             calldata: vec![],
             is_static: false,
-            depth: MAX_CALL_DEPTH, // exactly at the boundary
+            depth: MAX_CALL_DEPTH, // exactly at the limit
         };
         let result = env.execute_frame(&ctx);
-        assert!(
-            matches!(result, CallOutcome::Failure { .. }),
-            "ctx.depth == MAX_CALL_DEPTH must be rejected (1025th frame is one past the EVM limit), got: {:?}",
-            result
-        );
+        assert!(matches!(result, CallOutcome::Failure { .. }),
+            "depth = MAX_CALL_DEPTH must be rejected (old off-by-one allowed it through)");
     }
 
     #[test]
-    fn call_depth_limit_one_below_max_passes_depth_check() {
-        // Complement of the boundary-rejection test: the frame at
-        // `ctx.depth == MAX_CALL_DEPTH - 1` is the LAST allowed
-        // frame (the 1024th frame), and the depth check must let it
-        // through. We can't easily check that `execute_frame` runs
-        // the contract to completion here because the target has no
-        // code, so `execute_frame` takes the "empty-code success"
-        // fast-path and returns `Success`. That's still sufficient
-        // to prove the depth check did NOT short-circuit to Failure,
-        // which is the regression we care about.
+    fn call_depth_limit_accepts_just_below_max() {
+        // Positive-side boundary: depth = MAX_CALL_DEPTH - 1 is the
+        // DEEPEST allowed frame. It must go through the depth check
+        // (no Failure emitted by the check itself; any later failure
+        // is unrelated, e.g. empty code + no value = early return).
         let mut env = make_env();
+        // Use an address with some trivial code so the frame
+        // actually runs past the depth check. `vec![0x00]` = STOP,
+        // which succeeds cleanly.
+        env.state.set_code("contract", vec![0x00]).unwrap();
         let ctx = CallContext {
             address: "contract".into(),
             code_address: "contract".into(),
@@ -1902,12 +1907,12 @@ mod tests {
             gas_limit: 100_000,
             calldata: vec![],
             is_static: false,
-            depth: MAX_CALL_DEPTH - 1, // last allowed frame
+            depth: MAX_CALL_DEPTH - 1, // the deepest allowed frame
         };
         let result = env.execute_frame(&ctx);
         assert!(
             matches!(result, CallOutcome::Success { .. }),
-            "ctx.depth == MAX_CALL_DEPTH - 1 is the last allowed frame and must not be rejected by the depth check, got: {:?}",
+            "depth = MAX_CALL_DEPTH - 1 must be accepted as the deepest frame, got: {:?}",
             result
         );
     }
