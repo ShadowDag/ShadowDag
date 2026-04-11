@@ -51,6 +51,10 @@ path = "bin/loadtest.rs"
 name = "shadowasm"
 path = "bin/shadowasm.rs"
 
+[[bin]]
+name = "shadowdag-rotate-rpc-password"
+path = "bin/rotate_rpc_password.rs"
+
 [dependencies]
 # ─── Database ─────────────────────────────────────────────────────────────────
 rocksdb            = "0.21"
