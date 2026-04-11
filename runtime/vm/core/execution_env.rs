@@ -363,8 +363,21 @@ impl ExecutionEnvironment {
 
     /// Execute a call frame. This is the reentrant core of the VM.
     pub fn execute_frame(&mut self, ctx: &CallContext) -> CallOutcome {
-        // Depth check
-        if ctx.depth > MAX_CALL_DEPTH {
+        // Depth check.
+        //
+        // `MAX_CALL_DEPTH = 1024` is the INTENDED maximum number of
+        // stack frames. Depth is 0-indexed (the top-level call is
+        // `depth = 0`), so the set of allowed depths is `0..=1023`
+        // — that is, 1024 frames total, matching the constant.
+        //
+        // The previous check used `>` which allowed `depth = 1024`
+        // through, yielding 1025 frames (`0..=1024`) before rejection
+        // at `depth = 1025`. The fix is `>=` so the check rejects
+        // at `depth = MAX_CALL_DEPTH` (the 1025th frame) and the
+        // deepest allowed frame is `MAX_CALL_DEPTH - 1`. See
+        // `call_depth_limit_rejects_at_exactly_max` for the pinned
+        // boundary.
+        if ctx.depth >= MAX_CALL_DEPTH {
             return CallOutcome::Failure { gas_used: ctx.gas_limit };
         }
 
@@ -1592,6 +1605,7 @@ mod tests {
 
     #[test]
     fn call_depth_limit_enforced() {
+        // Generic "above the limit definitely fails" smoke test.
         let mut env = make_env();
         let ctx = CallContext {
             address: "contract".into(),
@@ -1605,6 +1619,67 @@ mod tests {
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Failure { .. }));
+    }
+
+    #[test]
+    fn call_depth_limit_rejects_at_exactly_max() {
+        // Regression for the off-by-one in the depth check.
+        //
+        // MAX_CALL_DEPTH = 1024 is the INTENDED maximum number of
+        // stack frames, counted 0-indexed, so the set of allowed
+        // depths is 0..=1023 (1024 frames total).
+        //
+        // The old check was `if ctx.depth > MAX_CALL_DEPTH`, which
+        // rejected only at depth=1025 — allowing 1025 frames
+        // (0..=1024) through, one more than intended.
+        //
+        // This test pins `depth = MAX_CALL_DEPTH` (= 1024) as a
+        // REJECTION boundary. On the old code, this test would
+        // pass (depth 1024 was accepted). After the fix, depth
+        // 1024 fails, and the largest allowed depth is 1023.
+        let mut env = make_env();
+        let ctx = CallContext {
+            address: "contract".into(),
+            code_address: "contract".into(),
+            caller: "user".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: MAX_CALL_DEPTH, // exactly at the limit
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(matches!(result, CallOutcome::Failure { .. }),
+            "depth = MAX_CALL_DEPTH must be rejected (old off-by-one allowed it through)");
+    }
+
+    #[test]
+    fn call_depth_limit_accepts_just_below_max() {
+        // Positive-side boundary: depth = MAX_CALL_DEPTH - 1 is the
+        // DEEPEST allowed frame. It must go through the depth check
+        // (no Failure emitted by the check itself; any later failure
+        // is unrelated, e.g. empty code + no value = early return).
+        let mut env = make_env();
+        // Use an address with some trivial code so the frame
+        // actually runs past the depth check. `vec![0x00]` = STOP,
+        // which succeeds cleanly.
+        env.state.set_code("contract", vec![0x00]).unwrap();
+        let ctx = CallContext {
+            address: "contract".into(),
+            code_address: "contract".into(),
+            caller: "user".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: MAX_CALL_DEPTH - 1, // the deepest allowed frame
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(
+            matches!(result, CallOutcome::Success { .. }),
+            "depth = MAX_CALL_DEPTH - 1 must be accepted as the deepest frame, got: {:?}",
+            result
+        );
     }
 
     #[test]
