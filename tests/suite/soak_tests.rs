@@ -20,6 +20,7 @@ mod soak {
         ExecutionEnvironment::new(BlockContext {
             timestamp: 1_000_000,
             block_hash: block_hash.into(),
+            network: "mainnet".to_string(),
         })
     }
 

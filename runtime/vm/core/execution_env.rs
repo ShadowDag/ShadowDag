@@ -36,7 +36,7 @@ macro_rules! pop2 {
 
 // ── Imports ──────────────────────────────────────────────────────────────
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use sha2::{Sha256, Digest};
 
 use crate::errors::VmError;
@@ -46,6 +46,7 @@ use crate::runtime::vm::core::vm::{
     OpCode, LogEntry, MAX_STACK_SIZE, MAX_MEMORY_SIZE,
     MAX_CODE_SIZE, MEMORY_GAS_PER_WORD,
 };
+use crate::runtime::vm::core::vm_address::VmAddressBody;
 use crate::runtime::vm::gas::gas_meter::{GasMeter, GasResult};
 use crate::runtime::vm::contracts::contract_deployer::ContractDeployer;
 use crate::runtime::vm::precompiles::precompile_registry::PrecompileRegistry;
@@ -67,6 +68,21 @@ pub const CREATE2_WORD_GAS: u64 = 6;
 pub struct BlockContext {
     pub timestamp: u64,
     pub block_hash: String,
+    /// Network identifier (`"mainnet"` / `"testnet"` / `"regtest"`).
+    ///
+    /// Used by `ExecutionEnvironment::resolve_address` as the prefix
+    /// for reconstructing a ShadowDAG address string from a 20-byte
+    /// body popped off the stack when the body is not in the runtime
+    /// address registry. Defaults to `"mainnet"` when constructed via
+    /// [`BlockContext::new`].
+    pub network: String,
+}
+
+impl BlockContext {
+    /// Construct a BlockContext with a default network of `"mainnet"`.
+    pub fn new(timestamp: u64, block_hash: String) -> Self {
+        Self { timestamp, block_hash, network: "mainnet".to_string() }
+    }
 }
 
 /// Per-call execution context
@@ -106,6 +122,28 @@ pub struct ExecutionEnvironment {
     pub destroyed_contracts: HashSet<String>,
     pub created_in_tx: HashSet<String>,
     pub last_return_data: Vec<u8>,
+    /// Runtime address registry — maps 20-byte canonical address bodies
+    /// to the full ShadowDAG address string they were derived from.
+    ///
+    /// Populated every time an address is PUSHED onto the stack via
+    /// CALLER / ADDRESS / CREATE / CREATE2 (and during contract
+    /// pre-loading in `load_contract_from_storage`). Consulted on the
+    /// POP side by every opcode that treats a stack word as an
+    /// address — BALANCE, CALL, CALLCODE, DELEGATECALL, STATICCALL,
+    /// SELFDESTRUCT, EXTCODESIZE. Without this registry, the round
+    /// trip from `ctx.caller` (a prefixed ShadowDAG string like
+    /// `"SD1c…"`) through a 32-byte U256 stack word and back is
+    /// lossy: the low 20 bytes carry the canonical hash body but
+    /// lose the network prefix and type marker, so a direct
+    /// reconstruction of the original string is not guaranteed.
+    ///
+    /// The fallback for "body not in registry" is
+    /// `VmAddressBody::to_fallback_string(network)`, which produces
+    /// `"{prefix}c{hex}"` using `block_ctx.network`. That default
+    /// handles contracts called via raw inline PUSH — they resolve
+    /// to a mainnet/testnet/regtest contract address string, which
+    /// is almost certainly what the caller meant.
+    pub address_registry: HashMap<[u8; 20], String>,
 }
 
 impl ExecutionEnvironment {
@@ -116,7 +154,44 @@ impl ExecutionEnvironment {
             destroyed_contracts: HashSet::new(),
             created_in_tx: HashSet::new(),
             last_return_data: Vec::new(),
+            address_registry: HashMap::new(),
         }
+    }
+
+    /// Register an address string in the runtime registry so that later
+    /// POPs of the same canonical 20-byte body resolve back to this
+    /// exact string (including any non-canonical "ad-hoc test string"
+    /// form that was synthesized via [`VmAddressBody::from_any`]).
+    ///
+    /// Safe to call with any string: canonical ShadowDAG addresses
+    /// parse via [`VmAddressBody::from_address_string`], everything
+    /// else falls through to the SHA-256 derivation in
+    /// [`VmAddressBody::derive_from_nonstandard`]. Both cases
+    /// register in the same map keyed by the resulting body bytes.
+    pub fn register_address(&mut self, addr: &str) -> VmAddressBody {
+        let body = VmAddressBody::from_any(addr);
+        self.address_registry.insert(body.0, addr.to_string());
+        body
+    }
+
+    /// Resolve a stack U256 back to its ShadowDAG address string.
+    ///
+    /// 1. Extract the low 20 bytes of the U256 as a canonical body.
+    /// 2. If that body is in [`Self::address_registry`] (because an
+    ///    earlier CALLER / ADDRESS / CREATE / contract pre-load
+    ///    registered it), return the registered string unchanged.
+    /// 3. Otherwise, reconstruct as `"{prefix}c{hex(body)}"` using
+    ///    the network prefix from [`BlockContext::network`]. This
+    ///    fallback assumes the caller intended a contract address on
+    ///    the current network — the common case for inline-pushed
+    ///    addresses — and may produce a key that does not exist in
+    ///    state when that assumption is wrong.
+    pub fn resolve_address(&self, u: U256) -> String {
+        let body = VmAddressBody::from_u256(u);
+        if let Some(s) = self.address_registry.get(&body.0) {
+            return s.clone();
+        }
+        body.to_fallback_string(&self.block_ctx.network)
     }
 
     /// Persist all state changes to ContractStorage atomically.
@@ -291,6 +366,14 @@ impl ExecutionEnvironment {
         storage: &ContractStorage,
         addr: &str,
     ) -> Result<(), VmError> {
+        // Register the loaded address in the runtime address registry so
+        // that later CALLER / ADDRESS / BALANCE / CALL opcodes can
+        // resolve the 20-byte body popped off the stack back to this
+        // exact `addr` string — including ad-hoc non-canonical test
+        // fixtures that would otherwise fall through to the
+        // `"{prefix}c{hex}"` fallback reconstruction.
+        self.register_address(addr);
+
         // Load account metadata (if present).
         if let Some(meta) = storage.get_state(&format!("account:{}", addr)) {
             let parts: Vec<&str> = meta.splitn(3, '|').collect();
@@ -379,6 +462,22 @@ impl ExecutionEnvironment {
         // boundary.
         if ctx.depth >= MAX_CALL_DEPTH {
             return CallOutcome::Failure { gas_used: ctx.gas_limit };
+        }
+
+        // Register the frame's caller, storage address, and code address
+        // in the runtime address registry so that every later CALLER /
+        // ADDRESS push and every later BALANCE / CALL / SELFDESTRUCT /
+        // EXTCODESIZE pop inside this frame can recover the original
+        // ShadowDAG address string from a 20-byte U256 body. Without
+        // this pre-registration, the pop side can only fall back to
+        // `VmAddressBody::to_fallback_string(network)`, which
+        // reconstructs the body as a `"{prefix}c{hex}"` contract-type
+        // string — wrong for EOAs, tokens, stealth/schnorr/P2SH, and
+        // ad-hoc test fixtures.
+        self.register_address(&ctx.caller);
+        self.register_address(&ctx.address);
+        if ctx.code_address != ctx.address {
+            self.register_address(&ctx.code_address);
         }
 
         // Load code for the target
@@ -611,7 +710,13 @@ impl ExecutionEnvironment {
 
                 // ── Context ──────────────────────────────────
                 OpCode::CALLER => {
-                    stack.push(U256::from_hex(&hex::encode(ctx.caller.as_bytes())).unwrap_or(U256::ZERO));
+                    // Push the caller's 20-byte canonical body,
+                    // right-aligned in a 32-byte U256 word (EVM layout).
+                    // The frame-entry pre-registration guarantees that a
+                    // subsequent BALANCE / CALL / SELFDESTRUCT pop can
+                    // resolve this body back to `ctx.caller` via the
+                    // address registry.
+                    stack.push(VmAddressBody::from_any(&ctx.caller).to_u256());
                 }
                 OpCode::CALLVALUE => {
                     stack.push(U256::from_u64(ctx.value));
@@ -624,8 +729,16 @@ impl ExecutionEnvironment {
                 }
                 OpCode::BALANCE => {
                     let addr_val = pop1!(stack, gas, snapshot, self);
-                    let addr_hex = addr_val.to_hex();
-                    let balance = self.state.get_balance(&addr_hex);
+                    // Resolve the stack body back to its ShadowDAG
+                    // string via the runtime registry (populated by
+                    // CALLER / ADDRESS / CREATE pushes and by the
+                    // frame-entry registration of ctx.caller /
+                    // ctx.address). Falls back to `{prefix}c{hex}` if
+                    // the body was inline-pushed without being
+                    // registered — wrong for EOAs/tokens, correct for
+                    // contract-type addresses on the current network.
+                    let addr = self.resolve_address(addr_val);
+                    let balance = self.state.get_balance(&addr);
                     stack.push(U256::from_u64(balance));
                 }
 
@@ -742,8 +855,40 @@ impl ExecutionEnvironment {
                         pc += 1; continue;
                     }
 
-                    // Extra gas for value transfer
-                    let extra_gas = if call_value > 0 { CALL_VALUE_TRANSFER_GAS } else { 0 };
+                    // Resolve the popped stack body back to the target's
+                    // ShadowDAG string via the runtime address registry,
+                    // then compute it up front so both the "new account"
+                    // gas check and the downstream precompile /
+                    // child_ctx branches share one source of truth.
+                    let target_addr = self.resolve_address(addr);
+
+                    // Extra gas for value transfer. EIP-150 semantics: a
+                    // CALL with value > 0 always pays CALL_VALUE_TRANSFER_GAS
+                    // (9_000), and additionally pays NEW_ACCOUNT_GAS (25_000)
+                    // when the target account does not yet exist, because
+                    // the value transfer will materialize the account as a
+                    // side effect (`StateManager::transfer` →
+                    // `set_balance` → `get_or_create_account`). Previously
+                    // this path only charged `CALL_VALUE_TRANSFER_GAS` and
+                    // the declared `NEW_ACCOUNT_GAS` constant was unused,
+                    // so sending value to a fresh address was silently
+                    // under-charged by 25_000 gas.
+                    //
+                    // Precompile addresses (0x01..=0x09) are ALWAYS treated
+                    // as existing — they are built-in and carry no
+                    // account state — so calling a precompile with value
+                    // does not trigger the new-account surcharge.
+                    let target_is_precompile = is_precompile_addr(&target_addr).is_some();
+                    let target_is_new = call_value > 0
+                        && !target_is_precompile
+                        && self.state.get_account(&target_addr).is_none();
+                    let mut extra_gas = 0u64;
+                    if call_value > 0 {
+                        extra_gas = extra_gas.saturating_add(CALL_VALUE_TRANSFER_GAS);
+                    }
+                    if target_is_new {
+                        extra_gas = extra_gas.saturating_add(NEW_ACCOUNT_GAS);
+                    }
                     if extra_gas > 0 {
                         if let GasResult::OutOfGas { .. } = gas.consume(extra_gas) {
                             self.state.rollback(snapshot).ok();
@@ -769,8 +914,6 @@ impl ExecutionEnvironment {
                     } else {
                         Vec::new()
                     };
-
-                    let target_addr = addr.to_hex().to_string();
 
                     // Check for precompile (addresses 0x01-0x09)
                     if let Some(precompile_id) = is_precompile_addr(&target_addr) {
@@ -854,7 +997,10 @@ impl ExecutionEnvironment {
                         memory[args_offset..args_offset+args_len].to_vec()
                     } else { Vec::new() };
 
-                    let target_addr = addr.to_hex().to_string();
+                    // Resolve the popped body back to its ShadowDAG
+                    // address via the runtime registry (see BALANCE
+                    // and CALL above for the full rationale).
+                    let target_addr = self.resolve_address(addr);
 
                     // Check for precompile (addresses 0x01-0x09)
                     if let Some(precompile_id) = is_precompile_addr(&target_addr) {
@@ -933,7 +1079,12 @@ impl ExecutionEnvironment {
                         memory[args_offset..args_offset+args_len].to_vec()
                     } else { Vec::new() };
 
-                    let target_code = code_addr.to_hex().to_string();
+                    // Resolve the popped body back to its ShadowDAG
+                    // address. DELEGATECALL uses this as the
+                    // code_address so the child frame loads the target's
+                    // bytecode but keeps the CURRENT frame's storage
+                    // context (ctx.address).
+                    let target_code = self.resolve_address(code_addr);
                     // DELEGATECALL: execute target's CODE but in CALLER's storage
                     // msg.sender and msg.value are PRESERVED from parent
                     let child_ctx = CallContext {
@@ -1008,7 +1159,10 @@ impl ExecutionEnvironment {
                         memory[args_offset..args_offset+args_len].to_vec()
                     } else { Vec::new() };
 
-                    let target_code = code_addr.to_hex().to_string();
+                    // Resolve the popped body back to its ShadowDAG
+                    // address via the runtime registry, same as
+                    // DELEGATECALL above.
+                    let target_code = self.resolve_address(code_addr);
                     // CALLCODE: execute target's CODE in CALLER's storage
                     // msg.sender = caller (NOT preserved like DELEGATECALL)
                     let child_ctx = CallContext {
@@ -1088,6 +1242,17 @@ impl ExecutionEnvironment {
                             return CallOutcome::Failure { gas_used: gas.gas_used() };
                         }
                     };
+
+                    // Increment caller's nonce BEFORE taking the CREATE
+                    // sub-snapshot so the bump is preserved across a
+                    // failed CREATE. EVM semantics: the caller's nonce
+                    // is consumed by any CREATE attempt, success or
+                    // failure, but every other side effect (new
+                    // account, value transfer, temporary init code
+                    // install) MUST be reverted on failure so an
+                    // unsuccessful deploy does not leave an orphaned
+                    // empty account or unspent value sitting at the
+                    // would-be contract address.
                     self.state.increment_nonce(&ctx.address).ok();
 
                     // Check address not occupied
@@ -1105,16 +1270,35 @@ impl ExecutionEnvironment {
                         return CallOutcome::Failure { gas_used: gas.gas_used() };
                     }
 
-                    // Create account + transfer value
-                    self.state.get_or_create_account(&new_addr);
-                    if create_value > 0
-                        && self.state.transfer(&ctx.address, &new_addr, create_value).is_err() {
-                            stack.push(U256::ZERO);
-                            gas.return_gas(child_gas);
-                            pc += 1; continue;
-                        }
+                    // Sub-snapshot AFTER the nonce increment. Anything
+                    // mutated from this point forward inside the CREATE
+                    // path will be undone on failure via
+                    // `rollback(create_snapshot)`; the nonce bump sits
+                    // BEFORE this point and therefore survives rollback.
+                    let create_snapshot = self.state.snapshot();
 
-                    // Execute init code
+                    // Create the new account (empty) and install the
+                    // init code as its temporary bytecode so the child
+                    // frame's get_code lookup can find something to
+                    // execute. Value transfer is deliberately NOT done
+                    // here — it is delegated to `execute_frame`, which
+                    // performs `state.transfer(caller, address, value)`
+                    // at frame entry. Doing the transfer in both places
+                    // produced a double debit of `create_value` from
+                    // the caller, which is the "CREATE fails but
+                    // caller loses value twice" bug this fix also
+                    // closes.
+                    self.state.get_or_create_account(&new_addr);
+                    self.state.set_code(&new_addr, init_code).ok();
+
+                    // Execute init code. execute_frame handles the
+                    // caller -> new_addr value transfer internally via
+                    // its own entry-point transfer + snapshot pair,
+                    // and rolls back its own child snapshot on
+                    // failure, which automatically reverts that
+                    // transfer. On child failure we ALSO rollback
+                    // create_snapshot below, which reverts the new
+                    // account creation and the temporary set_code.
                     let child_ctx = CallContext {
                         address: new_addr.clone(),
                         code_address: new_addr.clone(),
@@ -1126,8 +1310,6 @@ impl ExecutionEnvironment {
                         depth: ctx.depth + 1,
                     };
 
-                    // Temporarily set the init code as the new contract's code
-                    self.state.set_code(&new_addr, init_code).ok();
                     let outcome = self.execute_frame(&child_ctx);
 
                     match outcome {
@@ -1138,11 +1320,32 @@ impl ExecutionEnvironment {
                                 self.state.set_code(&new_addr, runtime_code).ok();
                             }
                             self.created_in_tx.insert(new_addr.clone());
+                            // Keep all CREATE-side effects: let the
+                            // sub-snapshot age into the parent's
+                            // snapshot stack via commit so later
+                            // snapshots don't observe a stale handle.
+                            self.state.commit(create_snapshot).ok();
                             // Push address as U256
-                            stack.push(U256::from_hex(&hex::encode(new_addr.as_bytes())).unwrap_or(U256::ZERO));
+                            // Register the new address so later
+                            // opcodes that pop its 20-byte body can
+                            // resolve it back to this exact string,
+                            // then push its canonical body
+                            // right-aligned in a U256 (EVM layout).
+                            stack.push(self.register_address(&new_addr).to_u256());
                         }
                         _ => {
-                            // Failed -- clean up
+                            // CREATE failed. Revert every state
+                            // change made since create_snapshot:
+                            //   - get_or_create_account(new_addr)
+                            //   - set_code(new_addr, init_code)
+                            //   - any child-frame changes that the
+                            //     child's own rollback didn't reach
+                            //     (normally none — child rolls back
+                            //     via its own snapshot on failure)
+                            // The nonce increment, which was done
+                            // BEFORE create_snapshot, is preserved
+                            // as required by EVM semantics.
+                            self.state.rollback(create_snapshot).ok();
                             stack.push(U256::ZERO);
                         }
                     }
@@ -1190,6 +1393,9 @@ impl ExecutionEnvironment {
                         }
                     };
 
+                    // Nonce bump BEFORE sub-snapshot so it survives a
+                    // failed CREATE2 — see the full CREATE comment
+                    // block above for the rationale.
                     self.state.increment_nonce(&ctx.address).ok();
 
                     if !self.state.get_code(&new_addr).is_empty() {
@@ -1205,13 +1411,17 @@ impl ExecutionEnvironment {
                         return CallOutcome::Failure { gas_used: gas.gas_used() };
                     }
 
+                    // Sub-snapshot AFTER the nonce increment. Any
+                    // CREATE2 side effect from here on is reverted on
+                    // failure via rollback(create_snapshot); the
+                    // nonce bump is not.
+                    let create_snapshot = self.state.snapshot();
+
+                    // See CREATE above: value transfer is delegated
+                    // to execute_frame so a CREATE2 with value does
+                    // not double-debit the caller.
                     self.state.get_or_create_account(&new_addr);
-                    if create_value > 0
-                        && self.state.transfer(&ctx.address, &new_addr, create_value).is_err() {
-                            stack.push(U256::ZERO);
-                            gas.return_gas(child_gas);
-                            pc += 1; continue;
-                        }
+                    self.state.set_code(&new_addr, init_code).ok();
 
                     let child_ctx = CallContext {
                         address: new_addr.clone(),
@@ -1224,7 +1434,6 @@ impl ExecutionEnvironment {
                         depth: ctx.depth + 1,
                     };
 
-                    self.state.set_code(&new_addr, init_code).ok();
                     let outcome = self.execute_frame(&child_ctx);
 
                     match outcome {
@@ -1234,9 +1443,20 @@ impl ExecutionEnvironment {
                                 self.state.set_code(&new_addr, runtime_code).ok();
                             }
                             self.created_in_tx.insert(new_addr.clone());
-                            stack.push(U256::from_hex(&hex::encode(new_addr.as_bytes())).unwrap_or(U256::ZERO));
+                            self.state.commit(create_snapshot).ok();
+                            // Register the new address so later
+                            // opcodes that pop its 20-byte body can
+                            // resolve it back to this exact string,
+                            // then push its canonical body
+                            // right-aligned in a U256 (EVM layout).
+                            stack.push(self.register_address(&new_addr).to_u256());
                         }
                         _ => {
+                            // Revert every state change made since
+                            // create_snapshot (new account creation,
+                            // temporary init code install) while
+                            // preserving the nonce increment above.
+                            self.state.rollback(create_snapshot).ok();
                             stack.push(U256::ZERO);
                         }
                     }
@@ -1251,7 +1471,14 @@ impl ExecutionEnvironment {
                     }
                     if stack.is_empty() { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
                     let beneficiary_val = stack.pop().unwrap();
-                    let beneficiary = beneficiary_val.to_hex().to_string();
+                    // Resolve the beneficiary body back to its
+                    // ShadowDAG string via the runtime registry. This
+                    // is the same fix as BALANCE / CALL / etc. — a
+                    // SELFDESTRUCT that forwards its balance to the
+                    // CALLER pushed via the CALLER opcode must target
+                    // the actual caller address, not a hex-encoded
+                    // stack blob.
+                    let beneficiary = self.resolve_address(beneficiary_val);
 
                     // EIP-6780: only full destruct if created in same tx
                     if self.created_in_tx.contains(&ctx.address) {
@@ -1280,7 +1507,10 @@ impl ExecutionEnvironment {
                 // ── Context (extended) ───────────────────────
                 OpCode::ADDRESS => {
                     if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
-                    stack.push(U256::from_hex(&hex::encode(ctx.address.as_bytes())).unwrap_or(U256::ZERO));
+                    // Push the current frame's 20-byte canonical body
+                    // right-aligned in a U256 (EVM layout). See CALLER
+                    // above for the round-trip rationale.
+                    stack.push(VmAddressBody::from_any(&ctx.address).to_u256());
                 }
                 OpCode::PC => {
                     if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
@@ -1409,8 +1639,12 @@ impl ExecutionEnvironment {
                 OpCode::EXTCODESIZE => {
                     let addr_val = pop1!(stack, gas, snapshot, self);
                     if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
-                    let addr_hex = addr_val.to_hex();
-                    let ext_code = self.state.get_code(&addr_hex);
+                    // Resolve the popped body back to its ShadowDAG
+                    // address via the runtime registry so the code
+                    // lookup hits the same key the contract was
+                    // stored under (matches BALANCE / CALL above).
+                    let addr = self.resolve_address(addr_val);
+                    let ext_code = self.state.get_code(&addr);
                     stack.push(U256::from_u64(ext_code.len() as u64));
                 }
                 OpCode::RETURNDATASIZE => {
@@ -1550,6 +1784,7 @@ mod tests {
         ExecutionEnvironment::new(BlockContext {
             timestamp: 1000,
             block_hash: "00".repeat(32),
+            network: "mainnet".to_string(),
         })
     }
 
@@ -1772,6 +2007,309 @@ mod tests {
         // Verify storage was written
         let stored = env.state.storage_load("contract1", "slot:0");
         assert!(stored.is_some(), "Slot 0 should have a value");
+    }
+
+    #[test]
+    fn failed_create_rolls_back_side_effects_but_keeps_nonce() {
+        // Regression for two adjacent bugs in the CREATE opcode
+        // handler:
+        //
+        //   1. Failed CREATE left the new-address account creation
+        //      and the temporary init-code install on the parent's
+        //      state. EVM semantics require these to be reverted on
+        //      failure; only the caller's nonce bump survives.
+        //
+        //   2. The parent-level `state.transfer(caller, new_addr,
+        //      create_value)` happened BEFORE the child frame, and
+        //      then execute_frame's own entry-level transfer re-ran
+        //      the transfer a SECOND time — a CREATE with value > 0
+        //      silently double-debited the caller.
+        //
+        // The fix defers the transfer entirely to execute_frame's
+        // own entry path and adds a sub-snapshot after the nonce
+        // bump so the new-account + set_code side effects are
+        // reverted on failure.
+        //
+        // Test bytecode for contract_a:
+        //   1. MSTORE a 32-byte word whose last 5 bytes encode an
+        //      init code that PUSH1 0 PUSH1 0 REVERT (i.e. reverts
+        //      immediately).
+        //   2. CREATE with value=50, offset=27, length=5 — the
+        //      init code will revert, so CREATE must return 0 on
+        //      the stack AND leave contract_a's balance unchanged.
+        let mut env = make_env();
+        let parent = "SD1parent";
+        env.state.set_balance(parent, 1_000).unwrap();
+
+        // Init code bytes: PUSH1 0, PUSH1 0, REVERT (0x10 00 0x10 00 0xB7)
+        //
+        // Container bytecode for the parent, built by hand:
+        //   PUSH32 <27 zero bytes + [0x10, 0x00, 0x10, 0x00, 0xB7]>
+        //   PUSH1  0       (MSTORE offset)
+        //   MSTORE         (mem[0..32] = the word)
+        //   PUSH1  5       (CREATE length)
+        //   PUSH1  27      (CREATE offset)
+        //   PUSH1  50      (CREATE value)
+        //   CREATE
+        //   STOP
+        let mut code_a: Vec<u8> = Vec::with_capacity(64);
+        code_a.push(0x15); // PUSH32
+        for _ in 0..27 { code_a.push(0x00); }
+        code_a.extend_from_slice(&[0x10, 0x00, 0x10, 0x00, 0xB7]);
+        code_a.extend_from_slice(&[
+            0x10, 0x00,   // PUSH1 0   (MSTORE offset)
+            0x91,         // MSTORE
+            0x10, 0x05,   // PUSH1 5   (CREATE length)
+            0x10, 0x1B,   // PUSH1 27  (CREATE offset)
+            0x10, 0x32,   // PUSH1 50  (CREATE value)
+            0xB4,         // CREATE
+            0x00,         // STOP
+        ]);
+        env.state.set_code(parent, code_a).unwrap();
+
+        // Snapshot the pre-CREATE state
+        let bal_before = env.state.get_balance(parent);
+        let nonce_before = env.state.get_nonce(parent);
+        assert_eq!(bal_before, 1_000);
+
+        let ctx = CallContext {
+            address: parent.into(),
+            code_address: parent.into(),
+            caller: "SD1user".into(),
+            value: 0,
+            gas_limit: 1_000_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+        };
+        let outcome = env.execute_frame(&ctx);
+        assert!(
+            matches!(outcome, CallOutcome::Success { .. }),
+            "parent frame itself must succeed (CREATE failure is an in-frame failure, not a frame failure), got: {:?}",
+            outcome
+        );
+
+        // Nonce must be incremented — EVM preserves the nonce bump
+        // across a failed CREATE.
+        assert_eq!(
+            env.state.get_nonce(parent),
+            nonce_before + 1,
+            "caller's nonce must be incremented even on failed CREATE"
+        );
+
+        // Balance must be unchanged: execute_frame rolls back its own
+        // entry-level transfer when the child frame fails, and we no
+        // longer do a second parent-level transfer that the old code
+        // would have left behind as a double debit.
+        assert_eq!(
+            env.state.get_balance(parent),
+            bal_before,
+            "failed CREATE must not debit the caller (regression for the \
+             double-transfer bug: old code debited `create_value` at the \
+             parent level before calling execute_frame, then execute_frame \
+             debited again, so a failed CREATE with value left the caller \
+             short by `create_value`)"
+        );
+
+        // The new contract address must have no code installed —
+        // rollback(create_snapshot) must have undone the temporary
+        // init-code set_code. Compute the expected address the same
+        // way the CREATE handler does.
+        let expected_addr = crate::runtime::vm::contracts::contract_deployer::ContractDeployer::compute_create_address(parent, nonce_before).unwrap();
+        assert!(
+            env.state.get_code(&expected_addr).is_empty(),
+            "failed CREATE must not leave init code installed at the new address ({})",
+            expected_addr
+        );
+    }
+
+    #[test]
+    fn caller_balance_round_trips_via_address_registry() {
+        // Regression for the address-encoding mismatch. The old
+        // CALLER opcode pushed `U256::from_hex(hex::encode(addr.as_bytes()))`
+        // onto the stack — for any real 43/44-char ShadowDAG address
+        // the resulting 88-char hex string exceeded
+        // `U256::from_hex`'s 64-char limit and silently fell back to
+        // `U256::ZERO`, so `CALLER` literally pushed 0. The matching
+        // BALANCE opcode then called `to_hex()` on the popped word
+        // (a 64-char hex string of all zeros) and looked up the
+        // wrong key in state, returning 0 instead of the actual
+        // caller balance.
+        //
+        // With the VmAddressBody fix:
+        //   1. `register_address(&ctx.caller)` at frame entry maps the
+        //      caller's canonical 20-byte body to the full ShadowDAG
+        //      address string.
+        //   2. CALLER pushes `VmAddressBody::from_any(&ctx.caller).to_u256()`,
+        //      the 20-byte body right-aligned in a 32-byte U256.
+        //   3. BALANCE pops, extracts the low 20 bytes, and looks
+        //      them up in the address registry, recovering the
+        //      original `ctx.caller` string and the correct balance.
+        //
+        // Test flow:
+        //   - Pre-fund caller "SD1cAAAA...AA" (canonical mainnet
+        //     contract address) with 7777 units.
+        //   - Deploy a contract whose bytecode is
+        //         CALLER BALANCE PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+        //     i.e. it returns the caller's balance as a 32-byte word.
+        //   - Invoke it with that caller; assert the returned U256
+        //     equals 7777 (not 0).
+        let mut env = make_env();
+        // Use a canonical SD1c address so we can reason about the
+        // registry hit — derive_from_nonstandard would work too, but
+        // the canonical path is the one that used to overflow the
+        // 64-char hex limit and fall back to zero.
+        let caller: String = format!("SD1c{}", "a".repeat(40));
+        env.state.set_balance(&caller, 7_777).unwrap();
+
+        // CALLER → BALANCE → MSTORE(0) → RETURN(0, 32)
+        // Opcodes (from v1_spec.rs): CALLER=0x70, BALANCE=0x74,
+        // MSTORE=0x91, RETURN=0xB6, PUSH1=0x10.
+        let code: Vec<u8> = vec![
+            0x70,        // CALLER
+            0x74,        // BALANCE
+            0x10, 0,     // PUSH1 0        (MSTORE offset)
+            0x91,        // MSTORE
+            0x10, 32,    // PUSH1 32       (RETURN length)
+            0x10, 0,     // PUSH1 0        (RETURN offset)
+            0xB6,        // RETURN
+        ];
+        env.state.set_code("contract", code).unwrap();
+
+        let ctx = CallContext {
+            address: "contract".into(),
+            code_address: "contract".into(),
+            caller: caller.clone(),
+            value: 0,
+            gas_limit: 1_000_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+        };
+        let outcome = env.execute_frame(&ctx);
+        let return_data = match outcome {
+            CallOutcome::Success { return_data, .. } => return_data,
+            other => panic!(
+                "CALLER/BALANCE round-trip must succeed against a \
+                 canonical ShadowDAG caller address, got: {:?}",
+                other
+            ),
+        };
+        assert_eq!(
+            return_data.len(),
+            32,
+            "RETURN must emit exactly one 32-byte word, got {} bytes",
+            return_data.len()
+        );
+
+        // Decode the 32-byte big-endian word back into a u64 — the
+        // low 8 bytes hold the balance, the high 24 are zero.
+        let mut high_buf = [0u8; 24];
+        high_buf.copy_from_slice(&return_data[..24]);
+        assert_eq!(
+            high_buf, [0u8; 24],
+            "high 24 bytes of BALANCE result must be zero, got: {:?}",
+            high_buf
+        );
+        let mut low_buf = [0u8; 8];
+        low_buf.copy_from_slice(&return_data[24..32]);
+        let returned_balance = u64::from_be_bytes(low_buf);
+        assert_eq!(
+            returned_balance, 7_777,
+            "BALANCE(CALLER) must return the caller's actual balance \
+             (pre-funded to 7_777) — the old hex-encoded round-trip \
+             returned 0 here because `CALLER` pushed U256::ZERO \
+             silently. Got: {}",
+            returned_balance
+        );
+    }
+
+    #[test]
+    fn call_opcode_charges_new_account_gas_on_fresh_target() {
+        // Regression for the dead NEW_ACCOUNT_GAS constant. EIP-150
+        // requires a CALL opcode that transfers value to a NON-EXISTENT
+        // account to pay NEW_ACCOUNT_GAS (25_000) on top of the usual
+        // CALL_VALUE_TRANSFER_GAS (9_000), because the transfer will
+        // materialize the account as a side effect of set_balance.
+        // The old CALL path only charged CALL_VALUE_TRANSFER_GAS and
+        // left NEW_ACCOUNT_GAS as a dead constant.
+        //
+        // We prove the fix by running the same contract twice with
+        // identical bytecode and gas schedule, differing only in
+        // whether the target address already exists in state before
+        // the CALL runs. The gas delta between the two runs must be
+        // exactly NEW_ACCOUNT_GAS — that isolates the surcharge from
+        // all other gas costs, which are identical.
+        //
+        // The CALL target is the ShadowDAG canonical reconstruction of
+        // the 20-byte body `[0u8; 19, 0x0a]` — i.e. the body produced
+        // by `PUSH1 0x0a`. `resolve_address` reconstructs this as
+        // `"SD1c" + hex([0u8; 19, 0x0a])`, a 44-char mainnet contract
+        // address. 0x0a is not in the precompile range 0x01..=0x09,
+        // so the "precompiles are always existing" fast path is not
+        // taken.
+        fn run_call_scenario(preexist_target: bool) -> u64 {
+            let mut env = make_env();
+            env.state.set_balance("user", 10_000).unwrap();
+
+            // Bytecode: CALL to 0x0a with value=50, then STOP.
+            // Stack order for CALL: gas, addr, value, argsOffset,
+            // argsLen, retOffset, retLen — pushed in reverse.
+            let code_a: Vec<u8> = vec![
+                0x10, 0,     // PUSH1 0 (retLen)
+                0x10, 0,     // PUSH1 0 (retOffset)
+                0x10, 0,     // PUSH1 0 (argsLen)
+                0x10, 0,     // PUSH1 0 (argsOffset)
+                0x10, 50,    // PUSH1 50 (value)
+                0x10, 0x0a,  // PUSH1 0x0a (target addr — fresh in one run)
+                0x12, 0x00, 0x00, 0xC3, 0x50, // PUSH4 50000 (gas)
+                0xB0,        // CALL
+                0x00,        // STOP
+            ];
+            env.state.set_code("contract_a", code_a).unwrap();
+            env.state.set_balance("contract_a", 1_000).unwrap();
+
+            if preexist_target {
+                // `resolve_address` reconstructs the PUSH1 0x0a body as
+                // "SD1c" + hex([0u8; 19, 0x0a]). Pre-materialize the
+                // account at that EXACT key so the CALL's target_is_new
+                // check sees it as already existing. The address is
+                // the 44-char mainnet contract form.
+                let mut body = [0u8; 20];
+                body[19] = 0x0a;
+                let target_key = format!("SD1c{}", hex::encode(body));
+                env.state.set_balance(&target_key, 0).unwrap();
+            }
+
+            let ctx = CallContext {
+                address: "contract_a".into(),
+                code_address: "contract_a".into(),
+                caller: "user".into(),
+                value: 0,
+                gas_limit: 1_000_000,
+                calldata: vec![],
+                is_static: false,
+                depth: 0,
+            };
+            match env.execute_frame(&ctx) {
+                CallOutcome::Success { gas_used, .. } => gas_used,
+                other => panic!(
+                    "expected Success (preexist_target={}), got: {:?}",
+                    preexist_target, other
+                ),
+            }
+        }
+
+        let gas_fresh = run_call_scenario(false);
+        let gas_existing = run_call_scenario(true);
+        let delta = gas_fresh.saturating_sub(gas_existing);
+        assert_eq!(
+            delta, NEW_ACCOUNT_GAS,
+            "CALL with value to a fresh target must charge exactly \
+             NEW_ACCOUNT_GAS ({}) more than the same CALL to an existing \
+             target; fresh={} existing={} delta={}",
+            NEW_ACCOUNT_GAS, gas_fresh, gas_existing, delta
+        );
     }
 
     #[test]
