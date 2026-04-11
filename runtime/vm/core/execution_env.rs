@@ -741,8 +741,39 @@ impl ExecutionEnvironment {
                         pc += 1; continue;
                     }
 
-                    // Extra gas for value transfer
-                    let extra_gas = if call_value > 0 { CALL_VALUE_TRANSFER_GAS } else { 0 };
+                    // Compute the target address string up front so both
+                    // the "new account" gas check and the downstream
+                    // precompile / child_ctx branches share one source
+                    // of truth.
+                    let target_addr = addr.to_hex().to_string();
+
+                    // Extra gas for value transfer. EIP-150 semantics: a
+                    // CALL with value > 0 always pays CALL_VALUE_TRANSFER_GAS
+                    // (9_000), and additionally pays NEW_ACCOUNT_GAS (25_000)
+                    // when the target account does not yet exist, because
+                    // the value transfer will materialize the account as a
+                    // side effect (`StateManager::transfer` →
+                    // `set_balance` → `get_or_create_account`). Previously
+                    // this path only charged `CALL_VALUE_TRANSFER_GAS` and
+                    // the declared `NEW_ACCOUNT_GAS` constant was unused,
+                    // so sending value to a fresh address was silently
+                    // under-charged by 25_000 gas.
+                    //
+                    // Precompile addresses (0x01..=0x09) are ALWAYS treated
+                    // as existing — they are built-in and carry no
+                    // account state — so calling a precompile with value
+                    // does not trigger the new-account surcharge.
+                    let target_is_precompile = is_precompile_addr(&target_addr).is_some();
+                    let target_is_new = call_value > 0
+                        && !target_is_precompile
+                        && self.state.get_account(&target_addr).is_none();
+                    let mut extra_gas = 0u64;
+                    if call_value > 0 {
+                        extra_gas = extra_gas.saturating_add(CALL_VALUE_TRANSFER_GAS);
+                    }
+                    if target_is_new {
+                        extra_gas = extra_gas.saturating_add(NEW_ACCOUNT_GAS);
+                    }
                     if extra_gas > 0 {
                         if let GasResult::OutOfGas { .. } = gas.consume(extra_gas) {
                             self.state.rollback(snapshot).ok();
@@ -768,8 +799,6 @@ impl ExecutionEnvironment {
                     } else {
                         Vec::new()
                     };
-
-                    let target_addr = addr.to_hex().to_string();
 
                     // Check for precompile (addresses 0x01-0x09)
                     if let Some(precompile_id) = is_precompile_addr(&target_addr) {
@@ -1767,6 +1796,89 @@ mod tests {
         // Verify storage was written
         let stored = env.state.storage_load("contract1", "slot:0");
         assert!(stored.is_some(), "Slot 0 should have a value");
+    }
+
+    #[test]
+    fn call_opcode_charges_new_account_gas_on_fresh_target() {
+        // Regression for the dead NEW_ACCOUNT_GAS constant. EIP-150
+        // requires a CALL opcode that transfers value to a NON-EXISTENT
+        // account to pay NEW_ACCOUNT_GAS (25_000) on top of the usual
+        // CALL_VALUE_TRANSFER_GAS (9_000), because the transfer will
+        // materialize the account as a side effect of set_balance.
+        // The old CALL path only charged CALL_VALUE_TRANSFER_GAS and
+        // left NEW_ACCOUNT_GAS as a dead constant.
+        //
+        // We prove the fix by running the same contract twice with
+        // identical bytecode and gas schedule, differing only in
+        // whether the target address already exists in state before
+        // the CALL runs. The gas delta between the two runs must be
+        // exactly NEW_ACCOUNT_GAS — that isolates the surcharge from
+        // all other gas costs, which are identical.
+        //
+        // The CALL target is the 64-character hex representation of
+        // the number 0x0a (which is what `U256::to_hex()` produces
+        // for a `PUSH1 0x0a` operand). 0x0a is not in the precompile
+        // range (0x01..=0x09), so the "precompiles are always
+        // existing" fast path is not taken.
+        fn run_call_scenario(preexist_target: bool) -> u64 {
+            let mut env = make_env();
+            env.state.set_balance("user", 10_000).unwrap();
+
+            // Bytecode: CALL to 0x0a with value=50, then STOP.
+            // Stack order for CALL: gas, addr, value, argsOffset,
+            // argsLen, retOffset, retLen — pushed in reverse.
+            let code_a: Vec<u8> = vec![
+                0x10, 0,     // PUSH1 0 (retLen)
+                0x10, 0,     // PUSH1 0 (retOffset)
+                0x10, 0,     // PUSH1 0 (argsLen)
+                0x10, 0,     // PUSH1 0 (argsOffset)
+                0x10, 50,    // PUSH1 50 (value)
+                0x10, 0x0a,  // PUSH1 0x0a (target addr — fresh in one run)
+                0x12, 0x00, 0x00, 0xC3, 0x50, // PUSH4 50000 (gas)
+                0xB0,        // CALL
+                0x00,        // STOP
+            ];
+            env.state.set_code("contract_a", code_a).unwrap();
+            env.state.set_balance("contract_a", 1_000).unwrap();
+
+            if preexist_target {
+                // U256::to_hex() on the number 10 is the full 64-char
+                // big-endian hex string. Pre-materialize the account
+                // at that exact key so the CALL's target_is_new check
+                // sees it as already existing.
+                let target_key = format!("{:0>64}", "0a");
+                env.state.set_balance(&target_key, 0).unwrap();
+            }
+
+            let ctx = CallContext {
+                address: "contract_a".into(),
+                code_address: "contract_a".into(),
+                caller: "user".into(),
+                value: 0,
+                gas_limit: 1_000_000,
+                calldata: vec![],
+                is_static: false,
+                depth: 0,
+            };
+            match env.execute_frame(&ctx) {
+                CallOutcome::Success { gas_used, .. } => gas_used,
+                other => panic!(
+                    "expected Success (preexist_target={}), got: {:?}",
+                    preexist_target, other
+                ),
+            }
+        }
+
+        let gas_fresh = run_call_scenario(false);
+        let gas_existing = run_call_scenario(true);
+        let delta = gas_fresh.saturating_sub(gas_existing);
+        assert_eq!(
+            delta, NEW_ACCOUNT_GAS,
+            "CALL with value to a fresh target must charge exactly \
+             NEW_ACCOUNT_GAS ({}) more than the same CALL to an existing \
+             target; fresh={} existing={} delta={}",
+            NEW_ACCOUNT_GAS, gas_fresh, gas_existing, delta
+        );
     }
 
     #[test]
