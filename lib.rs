@@ -331,6 +331,7 @@ pub mod runtime {
             pub mod u256;
             pub mod v1_spec;
             pub mod vm;
+            pub mod vm_address;
             pub mod vm_context;
         }
         pub mod gas {

@@ -863,6 +863,12 @@ impl FullNode {
         let mut env = ExecutionEnvironment::new(BlockContext {
             timestamp: block.header.timestamp,
             block_hash: block.header.hash.clone(),
+            // TODO: thread actual network identifier through block
+            // processing so VM-level address reconstruction matches
+            // the chain the node is running. Defaulting to mainnet
+            // here preserves the pre-refactor behaviour for the
+            // mainnet-only pipeline this node currently serves.
+            network: "mainnet".to_string(),
         });
 
         let mut receipts = Vec::with_capacity(block.body.transactions.len());
