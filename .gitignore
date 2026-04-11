@@ -1,2 +1,12 @@
-target/ 
-.claude/ 
+target/
+.claude/
+
+# RPC admin password file.
+#
+# `service/network/rpc/rpc_server.rs::load_or_create_admin_password`
+# writes this file on first run as a convenience for the operator
+# (the canonical password is stored in RocksDB at key
+# `rpc:admin_password`). It MUST NEVER be committed: doing so
+# publishes the live admin credential for any node that ever ran
+# from this checkout.
+rpc_password
