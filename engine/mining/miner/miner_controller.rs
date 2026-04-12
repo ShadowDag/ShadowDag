@@ -95,6 +95,15 @@ impl<'a> MinerController<'a> {
             .unwrap_or_default()
             .as_secs();
 
+        // Use the latest retarget difficulty, not the static
+        // self.miner.difficulty which was set at construction
+        // and never updated — it may be stale by many epochs.
+        let current_difficulty = {
+            use crate::service::network::nodes::full_node::get_next_difficulty;
+            let d = get_next_difficulty();
+            if d > 0 { d } else { self.miner.difficulty }
+        };
+
         // Build template using DAG tips as parents
         let block = BlockTemplateBuilder::build_from_dag(
             self.tip_manager,
@@ -103,7 +112,7 @@ impl<'a> MinerController<'a> {
             self.utxo_set,
             miner_address,
             timestamp,
-            self.miner.difficulty,
+            current_difficulty,
         )?;
 
         slog_info!("mining", "template_built", height => block.header.height, parents => block.header.parents.len(), txs => block.body.transactions.len());

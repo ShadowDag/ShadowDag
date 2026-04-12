@@ -561,7 +561,10 @@ impl RpcServer {
             }
             let trimmed = line.trim();
             if trimmed.is_empty() { break; }
-            if let Some(v) = trimmed.strip_prefix("Content-Length:") {
+            // HTTP headers are case-insensitive per RFC 7230
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.starts_with("content-length:") {
+                let v = &trimmed["Content-Length:".len()..];
                 content_length = match v.trim().parse::<usize>() {
                     Ok(n) => n,
                     Err(_) => {
@@ -571,9 +574,12 @@ impl RpcServer {
                     }
                 };
             }
-            // Extract auth token from Authorization header
-            if let Some(v) = trimmed.strip_prefix("Authorization:") {
-                let token = v.trim().strip_prefix("Bearer ").unwrap_or(v.trim());
+            // Extract auth token from Authorization header (case-insensitive)
+            if lower.starts_with("authorization:") {
+                let v = &trimmed["Authorization:".len()..];
+                let token = v.trim().strip_prefix("Bearer ")
+                    .or_else(|| v.trim().strip_prefix("bearer "))
+                    .unwrap_or(v.trim());
                 auth_token = Some(token.to_string());
             }
         }
@@ -590,6 +596,14 @@ impl RpcServer {
         let response = match serde_json::from_slice::<RpcRequest>(&body) {
             Ok(req) => {
                 let id = req.id.clone();
+
+                // Validate JSON-RPC version per spec
+                if req.jsonrpc != "2.0" {
+                    let err_resp = RpcResponse::err(id, -32600, "jsonrpc must be \"2.0\"");
+                    let err_json = serde_json::to_value(&err_resp)
+                        .unwrap_or_else(|_| json!({"error": "internal"}));
+                    return Self::write_http_response(&mut stream, 200, err_json);
+                }
 
                 // AUTH CHECK: write methods require valid Bearer token
                 // verified via RpcAuthManager. Read-only methods are open.
@@ -978,6 +992,15 @@ impl RpcServer {
             // ── Admin ─────────────────────────────────────────────────
             "stop" => {
                 slog_info!("rpc", "stop_requested");
+                // Signal the process to exit after a short delay so the
+                // RPC response can be sent first. SharedState does not
+                // currently carry a shutdown flag/channel, so we use
+                // process::exit as a last resort.
+                std::thread::spawn(|| {
+                    std::thread::sleep(Duration::from_millis(500));
+                    slog_info!("rpc", "shutting_down_via_stop_command");
+                    std::process::exit(0);
+                });
                 RpcResponse::ok(id, json!({"status": "shutdown_initiated"}))
             }
 
@@ -1176,12 +1199,13 @@ impl RpcServer {
 
     fn cmd_getminerinfo(id: Value) -> RpcResponse {
         RpcResponse::ok(id, json!({
-            "block_reward":      ConsensusParams::BLOCK_REWARD,
-            "miner_percent":     ConsensusParams::MINER_PERCENT,
-            "developer_percent": ConsensusParams::DEVELOPER_PERCENT,
-            "block_time":        ConsensusParams::BLOCK_TIME,
-            "max_supply":        ConsensusParams::MAX_SUPPLY,
-            "genesis_hash":      ConsensusParams::genesis_hash(),
+            "initial_block_reward": ConsensusParams::BLOCK_REWARD,
+            "emission_schedule":    "halving",
+            "miner_percent":        ConsensusParams::MINER_PERCENT,
+            "developer_percent":    ConsensusParams::DEVELOPER_PERCENT,
+            "block_time":           ConsensusParams::BLOCK_TIME,
+            "max_supply":           ConsensusParams::MAX_SUPPLY,
+            "genesis_hash":         ConsensusParams::genesis_hash(),
         }))
     }
 
@@ -1201,7 +1225,7 @@ impl RpcServer {
                 RpcResponse::ok(id, json!({
                     "blocks":       s.best_height,
                     "difficulty":   difficulty,
-                    "block_reward": ConsensusParams::BLOCK_REWARD,
+                    "block_reward": crate::config::consensus::emission_schedule::EmissionSchedule::block_reward(s.best_height),
                     "miner_pct":    ConsensusParams::MINER_PERCENT,
                     "network":      s.network_name,
                     "algorithm":    "ShadowHash (SHA256+Blake3+SHA3-256+AntiASIC)",
@@ -1290,6 +1314,11 @@ impl RpcServer {
                         tips
                     }
                 };
+                // Filter out empty hashes that can sneak in from uninitialized tips
+                parent_hashes.retain(|h| !h.is_empty());
+                if parent_hashes.is_empty() {
+                    return RpcResponse::err(id, ERR_INTERNAL, "No valid parent hashes available");
+                }
                 // Limit to MAX_PARENTS
                 parent_hashes.truncate(ConsensusParams::MAX_PARENTS);
 
@@ -1492,12 +1521,17 @@ impl RpcServer {
     fn cmd_gettips(id: Value, state: &SharedState) -> RpcResponse {
         match state.lock() {
             Ok(s) => {
-                let height = s.best_height;
-                let hashes = s.block_store.get_block_hashes_at_height(height);
+                // Use actual DAG tips, not "all blocks at best height"
+                let tips = match &s.mining_state {
+                    Some(ms) => ms.dag_tips(),
+                    None => {
+                        use crate::service::network::nodes::full_node::get_dag_tips;
+                        get_dag_tips()
+                    }
+                };
                 RpcResponse::ok(id, json!({
-                    "tip_height":  height,
-                    "tip_count":   hashes.len(),
-                    "tip_hashes":  hashes,
+                    "tip_count":   tips.len(),
+                    "tip_hashes":  tips,
                 }))
             }
             Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
@@ -1900,7 +1934,15 @@ impl RpcServer {
             Ok(s) => match s.block_store.get_block(&hash) {
                 Some(block) => {
                     let next_height = block.header.height + 1;
-                    let children = s.block_store.get_block_hashes_at_height(next_height);
+                    let candidates = s.block_store.get_block_hashes_at_height(next_height);
+                    // Filter to actual children (blocks whose parents include this hash)
+                    let children: Vec<String> = candidates.into_iter()
+                        .filter(|child_hash| {
+                            s.block_store.get_block(child_hash)
+                                .map(|cb| cb.header.parents.contains(&hash))
+                                .unwrap_or(false)
+                        })
+                        .collect();
                     RpcResponse::ok(id, json!({
                         "hash":          hash,
                         "height":        block.header.height,
@@ -1934,7 +1976,7 @@ impl RpcServer {
 
     fn cmd_getconsensusparams(id: Value) -> RpcResponse {
         use crate::config::consensus::consensus_params::DynamicConsensusParams;
-        let p = DynamicConsensusParams::default_10bps();
+        let p = DynamicConsensusParams::new(ConsensusParams::BLOCKS_PER_SECOND as u32);
         RpcResponse::ok(id, json!({
             "bps":              p.bps(),
             "ghostdag_k":       p.ghostdag_k(),
@@ -2005,17 +2047,21 @@ impl RpcServer {
     fn cmd_getchaintips(id: Value, state: &SharedState) -> RpcResponse {
         match state.lock() {
             Ok(s) => {
-                let height = s.best_height;
-                let tips = s.block_store.get_block_hashes_at_height(height);
-                let tip_data: Vec<Value> = tips.iter().map(|h| json!({
-                    "hash": h,
-                    "height": height,
-                    "status": "active",
-                })).collect();
-                RpcResponse::ok(id, json!({
-                    "tips": tip_data,
-                    "count": tips.len(),
-                }))
+                // Use actual DAG tips, not "all blocks at best height"
+                let tips = match &s.mining_state {
+                    Some(ms) => ms.dag_tips(),
+                    None => {
+                        use crate::service::network::nodes::full_node::get_dag_tips;
+                        get_dag_tips()
+                    }
+                };
+                let tip_data: Vec<Value> = tips.iter().map(|h| {
+                    let (height, status) = s.block_store.get_block(h)
+                        .map(|b| (b.header.height, if *h == s.best_hash { "active" } else { "valid-fork" }))
+                        .unwrap_or((0, "unknown"));
+                    json!({ "hash": h, "height": height, "status": status })
+                }).collect();
+                RpcResponse::ok(id, json!({ "tips": tip_data, "count": tips.len() }))
             }
             Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
         }
@@ -2080,14 +2126,22 @@ impl RpcServer {
 
     // ── Batch 5: Block queries ──────────────────────────────────────────
 
-    #[allow(deprecated)] // TODO: migrate to get_block_hashes_at_height for DAG
     fn cmd_getblockhash(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
         let height = params.first().and_then(|v| v.as_u64()).unwrap_or(0);
         match state.lock() {
-            Ok(s) => match s.block_store.get_block_hash_at_height(height) {
-                Some(h) => RpcResponse::ok(id, json!(h)),
-                None => RpcResponse::err(id, ERR_NOT_FOUND, "No block at height"),
-            },
+            Ok(s) => {
+                let hashes = s.block_store.get_block_hashes_at_height(height);
+                if hashes.is_empty() {
+                    RpcResponse::err(id, ERR_NOT_FOUND, "No block at height")
+                } else {
+                    // Return primary hash for compatibility, plus all hashes for DAG
+                    RpcResponse::ok(id, json!({
+                        "hash": hashes[0],
+                        "all_hashes": hashes,
+                        "count": hashes.len(),
+                    }))
+                }
+            }
             Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
         }
     }
@@ -2155,11 +2209,21 @@ impl RpcServer {
         let txid = params.first().and_then(|v| v.as_str()).unwrap_or("");
         match state.lock() {
             Ok(s) => {
-                let in_mempool = s.mempool.count() > 0;
+                // Check for the specific txid, not just any tx in the pool
+                let in_mempool = s.mempool.get_transaction(txid).is_some();
+                let confirmed = if !in_mempool && !txid.is_empty() {
+                    s.receipt_db.as_ref()
+                        .and_then(|db| load_receipt(db, txid))
+                        .is_some()
+                } else { false };
+                let status = if confirmed { "confirmed" }
+                    else if in_mempool { "pending" }
+                    else { "unknown" };
                 RpcResponse::ok(id, json!({
                     "txid": txid,
                     "in_mempool": in_mempool,
-                    "status": if in_mempool { "pending" } else { "unknown" },
+                    "confirmed": confirmed,
+                    "status": status,
                 }))
             }
             Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
@@ -2680,7 +2744,15 @@ impl RpcServer {
         match state.lock() {
             Ok(s) => match s.block_store.get_block(hash) {
                 Some(b) => {
-                    let children = s.block_store.get_block_hashes_at_height(b.header.height + 1);
+                    let child_candidates = s.block_store.get_block_hashes_at_height(b.header.height + 1);
+                    // Filter to actual children (blocks whose parents include this hash)
+                    let children: Vec<String> = child_candidates.into_iter()
+                        .filter(|ch| {
+                            s.block_store.get_block(ch)
+                                .map(|cb| cb.header.parents.contains(&hash.to_string()))
+                                .unwrap_or(false)
+                        })
+                        .collect();
                     RpcResponse::ok(id, json!({
                         "hash": hash, "height": b.header.height,
                         "parents": b.header.parents, "parent_count": b.header.parents.len(),

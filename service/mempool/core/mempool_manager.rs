@@ -124,7 +124,7 @@ impl MempoolManager {
         self.current_height = height;
 
         for txid in confirmed_txids {
-            self.tx_pool.remove_transaction(txid);
+            self.tx_pool.remove_with_dependents(txid);
         }
 
         self.orphan_pool.evict_old(height);

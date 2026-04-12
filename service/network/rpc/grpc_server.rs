@@ -253,14 +253,15 @@ impl GrpcServer {
             serde_json::json!({
                 "name": "ShadowDAG",
                 "version": "1.0.0",
-                "network": "mainnet",
+                "network": std::env::var("SHADOWDAG_NETWORK").unwrap_or_else(|_| "mainnet".to_string()),
                 "features": ["privacy", "smart_contracts", "32bps", "post_quantum"]
             }).to_string().into_bytes()
         });
 
         self.register_handler(GrpcMethod::GetBpsInfo, |_| {
+            use crate::config::consensus::consensus_params::ConsensusParams;
             serde_json::json!({
-                "current_bps": 10,
+                "current_bps": ConsensusParams::BLOCKS_PER_SECOND,
                 "max_bps": 32,
                 "max_tps": 320000,
                 "profiles": ["standard(1)", "high(10)", "ultra(32)"]
