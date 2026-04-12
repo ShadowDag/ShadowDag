@@ -434,6 +434,20 @@ impl RpcServer {
         }
     }
 
+    /// Derive a short network name (`"mainnet"` / `"testnet"` / `"regtest"`)
+    /// from the full `network_name` stored in `RpcState` (e.g.
+    /// `"shadowdag-testnet"`). Falls back to `"mainnet"` when the suffix
+    /// is unrecognised.
+    fn network_short_from_name(network_name: &str) -> String {
+        if network_name.contains("testnet") {
+            "testnet".to_string()
+        } else if network_name.contains("regtest") {
+            "regtest".to_string()
+        } else {
+            "mainnet".to_string()
+        }
+    }
+
     /// Sync RPC state from the actual chain on startup and after new blocks.
     /// Reads the best block hash and height from the BlockStore.
     pub fn sync_chain_state(&self) {
@@ -3232,6 +3246,7 @@ impl RpcServer {
         // so a transient DB lock or permission hiccup would crash
         // the JSON-RPC handler thread — a remotely-triggerable
         // crash.
+        let network_short = Self::network_short_from_name(&s.network_name);
         let ctx = match ContractStorage::new(cs.shared_db()) {
             Ok(cs_clone) => VMContext::new(cs_clone),
             Err(e) => return RpcResponse::err(
@@ -3239,7 +3254,7 @@ impl RpcServer {
                 format!("contract storage init failed: {}", e),
             ),
         };
-        let executor = Executor::new(ctx);
+        let executor = Executor::new_with_network(ctx, network_short);
 
         // Dry-run: simulate_deploy does NOT persist state changes to
         // the shared contract DB. See the doc comment above for why
@@ -3310,6 +3325,7 @@ impl RpcServer {
         // so a transient DB lock or permission hiccup would crash
         // the JSON-RPC handler thread — a remotely-triggerable
         // crash.
+        let network_short = Self::network_short_from_name(&s.network_name);
         let ctx = match ContractStorage::new(cs.shared_db()) {
             Ok(cs_clone) => VMContext::new(cs_clone),
             Err(e) => return RpcResponse::err(
@@ -3317,7 +3333,7 @@ impl RpcServer {
                 format!("contract storage init failed: {}", e),
             ),
         };
-        let executor = Executor::new(ctx);
+        let executor = Executor::new_with_network(ctx, network_short);
 
         // Dry-run: simulate_call does NOT persist state changes.
         let result = executor.simulate_call(contract_addr, &calldata, caller, value, gas_limit, 0, "");
@@ -3389,6 +3405,7 @@ impl RpcServer {
         // so a transient DB lock or permission hiccup would crash
         // the JSON-RPC handler thread — a remotely-triggerable
         // crash.
+        let network_short = Self::network_short_from_name(&s.network_name);
         let ctx = match ContractStorage::new(cs.shared_db()) {
             Ok(cs_clone) => VMContext::new(cs_clone),
             Err(e) => return RpcResponse::err(
@@ -3396,7 +3413,7 @@ impl RpcServer {
                 format!("contract storage init failed: {}", e),
             ),
         };
-        let executor = Executor::new(ctx);
+        let executor = Executor::new_with_network(ctx, network_short);
 
         let result = executor.simulate_call(contract_addr, &calldata, caller, value, estimate_gas_limit, 0, "");
 

@@ -302,6 +302,16 @@ impl FullNode {
             },
         }
 
+        // ── L0.25: Exact serialized size check ────────────────────────
+        // DosGuard::check uses canonical_size_estimate which under-counts;
+        // this uses the real DoS guard size limit for a hard reject.
+        if let Err(e) = self.dos_guard.check_block_size(block_size) {
+            return Err(NodeError::PeerBanned {
+                peer: peer_id.to_string(),
+                reason: format!("BLOCK_TOO_LARGE: {}", e),
+            });
+        }
+
         // ── L0.5: Per-peer rate limiting ─────────────────────────────
         if self.is_peer_rate_limited(peer_id) {
             return Err(NodeError::PeerBanned { peer: peer_id.to_string(), reason: format!("RATE_LIMITED: exceeds {} blocks/min", MAX_BLOCKS_PER_PEER_PER_MIN) });
@@ -671,6 +681,7 @@ impl FullNode {
         }
 
         // Rollback entire old chain from current_best back to fork point
+        let mut rolled_back_old: Vec<String> = Vec::new();
         if !current_best.is_empty() && !new_chain.contains(&current_best) {
             let mut cursor = current_best.clone();
             let mut rollback_count = 0u64;
@@ -686,6 +697,7 @@ impl FullNode {
                 })?;
                 // Contract state rollback + receipt purge.
                 self.rollback_contract_block(&cursor);
+                rolled_back_old.push(cursor.clone());
                 rollback_count += 1;
                 // Walk to parent via selected_parent
                 cursor = self.block_store.get_block(&cursor)
@@ -749,6 +761,19 @@ impl FullNode {
                             for hash in applied_new.iter().rev() {
                                 let _ = self.utxo_set.rollback_block_undo(hash);
                                 self.rollback_contract_block(hash);
+                            }
+                            // Best-effort: re-apply the old chain to restore the
+                            // previous consistent state. If this also fails, the
+                            // node is in an unrecoverable state and should restart
+                            // with full UTXO rebuild.
+                            for hash in rolled_back_old.iter().rev() {
+                                if let Some(old_block) = self.block_store.get_block(hash) {
+                                    let _ = self.utxo_set.apply_block_dag_ordered(
+                                        &old_block.body.transactions,
+                                        old_block.header.height,
+                                        hash,
+                                    );
+                                }
                             }
                             return Err(NodeError::Consensus(ConsensusError::BlockValidation(
                                 format!("contract state persistence failed for block {}: {}",
@@ -820,6 +845,19 @@ impl FullNode {
                             let _ = self.utxo_set.rollback_block_undo(hash);
                             self.rollback_contract_block(hash);
                         }
+                        // Best-effort: re-apply the old chain to restore the
+                        // previous consistent state. If this also fails, the
+                        // node is in an unrecoverable state and should restart
+                        // with full UTXO rebuild.
+                        for hash in rolled_back_old.iter().rev() {
+                            if let Some(old_block) = self.block_store.get_block(hash) {
+                                let _ = self.utxo_set.apply_block_dag_ordered(
+                                    &old_block.body.transactions,
+                                    old_block.header.height,
+                                    hash,
+                                );
+                            }
+                        }
                         NodeError::Consensus(ConsensusError::BlockValidation("reward + fees overflow".into()))
                     })?;
 
@@ -836,6 +874,19 @@ impl FullNode {
                                             let _ = self.utxo_set.rollback_block_undo(hash);
                                             self.rollback_contract_block(hash);
                                         }
+                                        // Best-effort: re-apply the old chain to restore the
+                                        // previous consistent state. If this also fails, the
+                                        // node is in an unrecoverable state and should restart
+                                        // with full UTXO rebuild.
+                                        for hash in rolled_back_old.iter().rev() {
+                                            if let Some(old_block) = self.block_store.get_block(hash) {
+                                                let _ = self.utxo_set.apply_block_dag_ordered(
+                                                    &old_block.body.transactions,
+                                                    old_block.header.height,
+                                                    hash,
+                                                );
+                                            }
+                                        }
                                         return Err(NodeError::BlockRejected(format!(
                                             "coinbase output overflow in {}", block_hash
                                         )));
@@ -847,6 +898,19 @@ impl FullNode {
                                     for hash in applied_new.iter().rev() {
                                         let _ = self.utxo_set.rollback_block_undo(hash);
                                         self.rollback_contract_block(hash);
+                                    }
+                                    // Best-effort: re-apply the old chain to restore the
+                                    // previous consistent state. If this also fails, the
+                                    // node is in an unrecoverable state and should restart
+                                    // with full UTXO rebuild.
+                                    for hash in rolled_back_old.iter().rev() {
+                                        if let Some(old_block) = self.block_store.get_block(hash) {
+                                            let _ = self.utxo_set.apply_block_dag_ordered(
+                                                &old_block.body.transactions,
+                                                old_block.header.height,
+                                                hash,
+                                            );
+                                        }
                                     }
                                     return Err(NodeError::BlockRejected(format!(
                                         "coinbase mismatch in {}: actual={}, expected={}",
@@ -865,6 +929,19 @@ impl FullNode {
                             let _ = self.utxo_set.rollback_block_undo(hash);
                             self.rollback_contract_block(hash);
                         }
+                        // Best-effort: re-apply the old chain to restore the
+                        // previous consistent state. If this also fails, the
+                        // node is in an unrecoverable state and should restart
+                        // with full UTXO rebuild.
+                        for hash in rolled_back_old.iter().rev() {
+                            if let Some(old_block) = self.block_store.get_block(hash) {
+                                let _ = self.utxo_set.apply_block_dag_ordered(
+                                    &old_block.body.transactions,
+                                    old_block.header.height,
+                                    hash,
+                                );
+                            }
+                        }
                         return Err(NodeError::BlockRejected(format!(
                             "apply_block_dag_ordered failed for {}: {}", block_hash, e
                         )));
@@ -875,6 +952,19 @@ impl FullNode {
                 for hash in applied_new.iter().rev() {
                     let _ = self.utxo_set.rollback_block_undo(hash);
                     self.rollback_contract_block(hash);
+                }
+                // Best-effort: re-apply the old chain to restore the
+                // previous consistent state. If this also fails, the
+                // node is in an unrecoverable state and should restart
+                // with full UTXO rebuild.
+                for hash in rolled_back_old.iter().rev() {
+                    if let Some(old_block) = self.block_store.get_block(hash) {
+                        let _ = self.utxo_set.apply_block_dag_ordered(
+                            &old_block.body.transactions,
+                            old_block.header.height,
+                            hash,
+                        );
+                    }
                 }
                 return Err(NodeError::BlockRejected(format!(
                     "block {} missing from store during virtual chain apply", block_hash
@@ -889,6 +979,19 @@ impl FullNode {
             for hash in applied_new.iter().rev() {
                 let _ = self.utxo_set.rollback_block_undo(hash);
                 self.rollback_contract_block(hash);
+            }
+            // Best-effort: re-apply the old chain to restore the
+            // previous consistent state. If this also fails, the
+            // node is in an unrecoverable state and should restart
+            // with full UTXO rebuild.
+            for hash in rolled_back_old.iter().rev() {
+                if let Some(old_block) = self.block_store.get_block(hash) {
+                    let _ = self.utxo_set.apply_block_dag_ordered(
+                        &old_block.body.transactions,
+                        old_block.header.height,
+                        hash,
+                    );
+                }
             }
             return Err(NodeError::Consensus(ConsensusError::BlockValidation(
                 format!("failed to persist best_hash for tip {}", best_tip)
