@@ -39,6 +39,7 @@ pub struct DagSyncEngine {
     block_queue:          VecDeque<String>,
     verified_blocks:      HashSet<String>,
     failed_peers:         HashSet<String>,
+    retry_counts:         HashMap<String, u32>,
     pub synced_count:     u64,
 }
 
@@ -60,6 +61,7 @@ impl DagSyncEngine {
             block_queue:     VecDeque::new(),
             verified_blocks: HashSet::new(),
             failed_peers:    HashSet::new(),
+            retry_counts:    HashMap::new(),
             synced_count:    0,
         }
     }
@@ -110,18 +112,22 @@ impl DagSyncEngine {
 
     pub fn next_block_request(&mut self, peer: &str) -> Option<String> {
         if self.pending_blocks.len() >= MAX_PENDING_BLOCKS { return None; }
+        if self.is_failed_peer(peer) { return None; }
         let hash = self.block_queue.pop_front()?;
+        // Restore retry count from previous attempts (preserved across timeouts)
+        let retries = self.retry_counts.remove(&hash).unwrap_or(0);
         self.pending_blocks.insert(hash.clone(), BlockRequest {
             hash:    hash.clone(),
             peer:    peer.to_string(),
             queued:  Instant::now(),
-            retries: 0,
+            retries,
         });
         Some(hash)
     }
 
     pub fn on_block_received(&mut self, hash: &str) {
         self.pending_blocks.remove(hash);
+        self.retry_counts.remove(hash);
         self.verified_blocks.insert(hash.to_string());
         // Prune verified_blocks to prevent unbounded memory growth
         if self.verified_blocks.len() > 100_000 {
@@ -151,10 +157,14 @@ impl DagSyncEngine {
             if let Some(mut req) = self.pending_blocks.remove(&hash) {
                 if req.retries < 3 {
                     req.retries += 1;
+                    // Preserve retry count so next_block_request restores it
+                    self.retry_counts.insert(hash.clone(), req.retries);
                     self.block_queue.push_front(hash.clone());
                     requeue.push(hash);
                 } else {
                     self.failed_peers.insert(req.peer.clone());
+                    // Preserve retry count even for exhausted retries
+                    self.retry_counts.insert(hash.clone(), req.retries);
                     self.block_queue.push_back(hash);
                 }
             }

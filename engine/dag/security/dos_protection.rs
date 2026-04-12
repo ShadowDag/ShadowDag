@@ -101,9 +101,10 @@ impl DosProtection {
             }
         }
 
-        // Nonce
-        if block.header.nonce == 0 || block.header.nonce == MAX_NONCE {
-            return DosCheckResult::fail("Invalid nonce".to_string());
+        // Nonce — only reject the MAX_NONCE sentinel value.
+        // nonce==0 is rare but valid: a miner can solve PoW on the first try.
+        if block.header.nonce == MAX_NONCE {
+            return DosCheckResult::fail("Invalid nonce (MAX_NONCE sentinel)".to_string());
         }
 
         // Timestamp

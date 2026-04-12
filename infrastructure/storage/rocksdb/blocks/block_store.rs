@@ -74,6 +74,29 @@ impl BlockStore {
         }
     }
 
+    /// Update an existing block in the store (overwrites unconditionally).
+    /// Used for post-execution header updates (receipt_root, state_root)
+    /// where save_block would reject the write as a duplicate.
+    pub fn update_block(&self, block: &Block) -> bool {
+        let hash = &block.header.hash;
+        let block_key = format!("{}{}", BLK_PREFIX, hash);
+        match bincode::serialize(block) {
+            Ok(data) => {
+                match self.db.put(block_key.as_bytes(), &data) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        slog_error!("storage", "block_update_write_failed", hash => hash, error => e);
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                slog_error!("storage", "block_update_serialize_error", hash => hash, error => e);
+                false
+            }
+        }
+    }
+
     /// Store the UTXO commitment hash for a block.
     /// Called after UTXO state is applied, so recovery can verify integrity.
     pub fn set_utxo_commitment(&self, block_hash: &str, commitment: &str) {

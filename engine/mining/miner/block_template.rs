@@ -60,6 +60,9 @@ impl BlockTemplateBuilder {
             return Err(ConsensusError::Other("No valid parent blocks found in DAG".to_string()));
         }
 
+        // Sort parents lexicographically — consensus requires
+        // deterministic parent ordering so all nodes agree.
+        validated_parents.sort();
         Ok(validated_parents)
     }
 
@@ -76,9 +79,23 @@ impl BlockTemplateBuilder {
     ) -> Result<Block, ConsensusError> {
         let parents = Self::select_dag_parents(tip_manager, dag_manager)?;
 
-        // Height = best tip height + 1
-        let best_height = tip_manager.best_height();
-        let height = best_height + 1;
+        // Height MUST be max(parent_heights) + 1 (consensus rule).
+        // Using tip_manager.best_height() can produce incorrect
+        // heights when DAG tips lag behind the actual max parent.
+        let height = {
+            let tips = tip_manager.get_tips();
+            let tip_map: std::collections::HashMap<&str, u64> = tips
+                .iter()
+                .map(|t| (t.hash.as_str(), t.height))
+                .collect();
+            let mut max_parent_height = 0u64;
+            for parent_hash in &parents {
+                if let Some(&ph) = tip_map.get(parent_hash.as_str()) {
+                    max_parent_height = max_parent_height.max(ph);
+                }
+            }
+            max_parent_height + 1
+        };
 
         // Pull transactions from mempool, validate against current UTXO state
         // NOTE: must select transactions BEFORE building coinbase so we know total fees.
