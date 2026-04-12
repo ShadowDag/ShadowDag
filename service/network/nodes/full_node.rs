@@ -291,6 +291,10 @@ impl FullNode {
     /// Process a block received from a specific peer (with rate limiting).
     pub fn process_block_from_peer(&self, block: &Block, peer_id: &str) -> Result<(), NodeError> {
         // ── L0: Per-peer DoS guard (cheapest — no deserialization) ────
+        // canonical_size_estimate is an approximation (header + tx_count * avg_tx_size).
+        // The exact check_block_size (below) uses the real serialized size limit.
+        // This estimate is a cheap pre-filter that rejects obviously oversized blocks
+        // before the more expensive serialization-based check.
         let block_size = block.canonical_size_estimate();
         match self.dos_guard.check(peer_id, &MsgType::Block, block_size) {
             DosVerdict::Allow => {},
@@ -396,9 +400,11 @@ impl FullNode {
         //     Only reached after Phase 2. Reads/writes UTXO set.
         //     Sequential, single-threaded, atomic rollback on failure.
         //
-        // INVARIANT: Phase 1 MUST NOT read from block_store, utxo_set,
-        //            dag_manager, or any mutable state. Violation = consensus
-        //            bug where nodes disagree on block validity.
+        // INVARIANT: Phase 1 validation (PoW, merkle root, signatures)
+        // is stateless. The only DB read is collect_ancestor_timestamps
+        // for MTP/timestamp rules — this is a controlled exception that
+        // reads block_store headers (immutable after save) and does not
+        // affect consensus determinism (all nodes have the same ancestors).
         // ═══════════════════════════════════════════════════════════════
 
         // NOTE: ema_difficulty() returns the tip-chain's difficulty
@@ -799,8 +805,22 @@ impl FullNode {
                         }
 
                         // Persist receipts to DB
+                        // NOTE: persist_receipts_batch returns () and logs errors
+                        // internally. Receipt persistence failure is non-fatal for
+                        // consensus (UTXO state is authoritative), but RPC clients
+                        // will see missing receipts until recovery replays them.
+                        // TODO: refactor persist_receipts_batch to return Result<()>
+                        // so callers can handle failures explicitly.
                         use crate::domain::transaction::tx_receipt::persist_receipts_batch;
                         persist_receipts_batch(self.contract_storage.shared_db().as_ref(), &receipts);
+
+                        // NOTE: receipt_root and state_root are NOT included in the
+                        // PoW hash (shadowhash). This is by design: they are computed
+                        // AFTER block execution, which happens AFTER PoW validation.
+                        // Ethereum has the same architecture — state_root is in the
+                        // header but verified post-execution, not pre-mined. The
+                        // roots are committed to storage here and verified by peers
+                        // during sync via the InvariantChecker below.
 
                         // Update block header receipt_root and state_root in store.
                         // Uses update_block (not save_block) because the block already
@@ -839,6 +859,30 @@ impl FullNode {
                                     slog_error!("node", "INVARIANT_VIOLATION",
                                         block => block_hash, height => &block.header.height.to_string());
                                     VM_METRICS.record_violation();
+                                    // Invariant violation is a consensus-critical error.
+                                    // Roll back this block and reject it.
+                                    for hash in applied_new.iter().rev() {
+                                        let _ = self.utxo_set.rollback_block_undo(hash);
+                                        self.rollback_contract_block(hash);
+                                    }
+                                    // Re-apply old chain
+                                    for hash in rolled_back_old.iter().rev() {
+                                        if let Some(old_block) = self.block_store.get_block(hash) {
+                                            let _ = self.utxo_set.apply_block_dag_ordered(
+                                                &old_block.body.transactions, old_block.header.height, hash);
+                                            let (_, _, _, env) = self.execute_contract_transactions(
+                                                &old_block, &self.contract_storage);
+                                            if let Err(pe) = env.persist_with_undo(
+                                                &self.contract_storage, hash, None, None,
+                                            ) {
+                                                slog_error!("node", "CRITICAL_contract_restore_failed",
+                                                    block => hash, error => &format!("{}", pe));
+                                            }
+                                        }
+                                    }
+                                    return Err(NodeError::Consensus(ConsensusError::BlockValidation(
+                                        format!("INVARIANT_VIOLATION: receipt/state root mismatch in {}", block_hash)
+                                    )));
                                 }
                             }
                         }
@@ -1565,8 +1609,26 @@ impl FullNode {
                             // a distinct contract address — failing
                             // to increment it would let every
                             // subsequent ContractCreate collide.
-                            env.state.commit(deploy_snapshot).ok();
-                            let _ = env.state.increment_nonce(&deployer);
+                            if let Err(e) = env.state.commit(deploy_snapshot) {
+                                slog_error!("node", "contract_deploy_commit_failed",
+                                    tx => &tx.hash, error => &format!("{}", e));
+                                // Commit failure means the deploy state is corrupt.
+                                // Roll back instead and report as error.
+                                env.state.rollback(deploy_snapshot).ok();
+                                receipts.push(TxReceipt::from_execution(
+                                    &tx.hash,
+                                    &ExecutionResult::Error {
+                                        gas_used,
+                                        message: format!("deploy commit failed: {}", e),
+                                    },
+                                    &block.header.hash, block.header.height, tx_index as u32,
+                                ));
+                                continue;
+                            }
+                            if let Err(e) = env.state.increment_nonce(&deployer) {
+                                slog_error!("node", "deployer_nonce_increment_failed",
+                                    tx => &tx.hash, deployer => &deployer, error => &format!("{}", e));
+                            }
                             ExecutionResult::Success { gas_used, return_data, logs }
                         }
                         CallOutcome::Revert { gas_used, return_data } => {
@@ -1820,13 +1882,19 @@ impl FullNode {
         self.evict_expired_orphans();
 
         // Per-peer orphan limit: prevent single peer from flooding
-        if let Ok(counts) = self.orphan_count_by_peer.lock() {
-            let peer_count = counts.get(peer_id).copied().unwrap_or(0);
-            if peer_count >= MAX_ORPHAN_PER_PEER {
-                slog_warn!("node", "orphan_per_peer_limit", peer => peer_id, limit => &MAX_ORPHAN_PER_PEER.to_string());
-                return;
+        let counts = match self.orphan_count_by_peer.lock() {
+            Ok(c) => c,
+            Err(_) => {
+                slog_error!("node", "orphan_count_lock_poisoned");
+                return; // Fail-closed: reject orphan on lock failure
             }
+        };
+        let peer_count = counts.get(peer_id).copied().unwrap_or(0);
+        if peer_count >= MAX_ORPHAN_PER_PEER {
+            slog_warn!("node", "orphan_per_peer_limit", peer => peer_id, limit => &MAX_ORPHAN_PER_PEER.to_string());
+            return;
         }
+        drop(counts); // Release lock before acquiring orphan_pool lock
 
         let mut pool = match self.orphan_pool.lock() {
             Ok(p) => p,
@@ -1941,9 +2009,11 @@ impl FullNode {
                         }
                         if let Ok(mut by_parent) = self.orphan_by_parent.lock() {
                             for p in &block.header.parents {
-                                by_parent.entry(p.clone())
-                                    .or_insert_with(Vec::new)
-                                    .push(hash.clone());
+                                let list = by_parent.entry(p.clone())
+                                    .or_insert_with(Vec::new);
+                                if !list.contains(&hash) {
+                                    list.push(hash.clone());
+                                }
                             }
                         }
                     }
@@ -2070,7 +2140,14 @@ impl FullNode {
         // UTXO write + commitment ATOMICALLY (validation already passed in Phase 1)
         let _commitment = self.utxo_set.apply_block_write_with_commitment(
             &block.body.transactions, 0, &block.header.hash
-        ).map_err(|e| NodeError::BlockRejected(format!("Genesis UTXO write failed: {}", e)))?;
+        ).map_err(|e| {
+            // Cleanup: remove block from BlockStore since UTXO failed
+            let _ = self.block_store.delete_block(&block.header.hash);
+            slog_error!("node", "genesis_utxo_failed_cleanup",
+                error => &format!("{}", e),
+                note => "BlockStore cleaned; DAG entry may be stale until reindex");
+            NodeError::BlockRejected(format!("Genesis UTXO write failed: {}", e))
+        })?;
 
         // Genesis is always best
         if !self.block_store.update_best_hash(&block.header.hash) {

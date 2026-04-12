@@ -105,7 +105,7 @@ impl BlockRelay {
 
         log::debug!(
             "[BlockRelay] Queued block {} (height {}) for broadcast",
-            &block.header.hash[..8], block.header.height
+            &block.header.hash[..block.header.hash.len().min(8)], block.header.height
         );
     }
 
@@ -131,7 +131,15 @@ impl BlockRelay {
             slog_warn!("relay", "receive_block_pending_put_error", hash => &block.header.hash, error => e);
         }
 
-        if block.header.height == 0 || block.header.parents.is_empty() {
+        if block.header.height > 0 && block.header.parents.is_empty() {
+            slog_warn!("relay", "block_no_parents_nongenesis",
+                hash => &block.header.hash[..block.header.hash.len().min(16)],
+                height => block.header.height);
+            return false; // Invalid: non-genesis blocks must have parents
+        }
+
+        if block.header.height == 0 && block.header.parents.is_empty() {
+            // Genesis block: relay directly
             if let Ok(block_bytes) = bincode::serialize(&block) {
                 push_outbound(P2PMessage::Block { data: block_bytes });
             }
