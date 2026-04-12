@@ -3,10 +3,11 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::net::{TcpListener, TcpStream, IpAddr};
+use std::net::{TcpListener, TcpStream, IpAddr, SocketAddr};
 use std::io::{Read, Write, BufReader, BufRead};
 use std::thread;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 
@@ -266,6 +267,14 @@ impl RpcState {
         // Persistent admin password: stored in RocksDB under "rpc:admin_password"
         // First run: generate + store. Subsequent runs: load from DB.
         // NOTE: no data_dir available here — falls back to cwd for password file.
+        // In production, set SHADOWDAG_DISALLOW_CWD_PASSWORDS to reject this
+        // fallback and force callers to use new_for_network with an explicit
+        // data_dir.
+        if std::env::var("SHADOWDAG_DISALLOW_CWD_PASSWORDS").is_ok() {
+            return Err(NetworkError::Other(
+                "RpcState::new() uses CWD for password file — set SHADOWDAG_ALLOW_CWD_PASSWORDS or use new_for_network with explicit data_dir".into()
+            ));
+        }
         slog_warn!("rpc", "rpc_new_without_data_dir", note => "admin password will use cwd — prefer new_for_network with explicit data_dir");
         let admin_password = Self::load_or_create_admin_password(&db, None)?;
         let block_store = BlockStore::new(db.clone())
@@ -285,7 +294,9 @@ impl RpcState {
             utxo_store,
             mempool,
             peer_manager: PeerManager::new_default()
-                .map_err(|e| NetworkError::Other(format!("peer DB init failed: {}", e)))?,
+                .map_err(|e| NetworkError::Other(format!(
+                    "DEPRECATED peer DB init (mainnet default) — use RpcServer::new_for_network instead. Error: {}", e
+                )))?,
             auth_manager: RpcAuthManager::with_default_admin(&admin_password),
             best_height:  0,
             best_hash:    String::new(),
@@ -377,6 +388,8 @@ pub struct RpcServer {
     state:      SharedState,
     port:       u16,
     rate_table: RateTable,
+    /// Graceful shutdown flag — when set to `false` the listener thread exits.
+    running:    Arc<AtomicBool>,
 
     pub max_request_size: usize,
 }
@@ -387,6 +400,7 @@ impl RpcServer {
             state:           Arc::new(Mutex::new(RpcState::new(db)?)),
             port:            RPC_PORT,
             rate_table:      Arc::new(Mutex::new(HashMap::new())),
+            running:         Arc::new(AtomicBool::new(false)),
             max_request_size: MAX_REQUEST_SIZE,
         })
     }
@@ -396,6 +410,7 @@ impl RpcServer {
             state:           Arc::new(Mutex::new(RpcState::new(db)?)),
             port,
             rate_table:      Arc::new(Mutex::new(HashMap::new())),
+            running:         Arc::new(AtomicBool::new(false)),
             max_request_size: MAX_REQUEST_SIZE,
         })
     }
@@ -405,6 +420,7 @@ impl RpcServer {
             state: Arc::new(Mutex::new(RpcState::new_with_peers_path(peers_path, db, data_dir)?)),
             port,
             rate_table:       Arc::new(Mutex::new(HashMap::new())),
+            running:          Arc::new(AtomicBool::new(false)),
             max_request_size: MAX_REQUEST_SIZE,
         })
     }
@@ -414,6 +430,7 @@ impl RpcServer {
             state:           Arc::new(Mutex::new(RpcState::new(db)?)),
             port,
             rate_table:      Arc::new(Mutex::new(HashMap::new())),
+            running:         Arc::new(AtomicBool::new(false)),
             max_request_size: max_size,
         })
     }
@@ -466,8 +483,11 @@ impl RpcServer {
         let listener = TcpListener::bind(&addr)
             .map_err(|e| NetworkError::ConnectionFailed(format!("RPC bind {} failed: {}", addr, e)))?;
 
+        self.running.store(true, Ordering::SeqCst);
+
         let state      = Arc::clone(&self.state);
         let rate_table = Arc::clone(&self.rate_table);
+        let running    = Arc::clone(&self.running);
         let max_req_size = self.max_request_size;
 
         thread::spawn(move || {
@@ -476,12 +496,29 @@ impl RpcServer {
             let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
             for stream in listener.incoming() {
+                // Check shutdown flag on each iteration so stop() can break
+                // the accept loop. stop() sends a dummy connection to unblock
+                // the blocking accept() call.
+                if !running.load(Ordering::Relaxed) {
+                    slog_info!("rpc", "rpc_listener_shutdown");
+                    break;
+                }
+
                 match stream {
-                    Ok(s) => {
+                    Ok(mut s) => {
                         let current = active_connections.load(std::sync::atomic::Ordering::Relaxed);
                         if current >= MAX_RPC_CONNECTIONS {
+                            // Send a proper HTTP 503 so the client knows why
+                            // the connection was refused, instead of a bare RST.
+                            let resp = RpcResponse::err(
+                                Value::Null,
+                                ERR_INTERNAL,
+                                format!("Server at capacity ({}/{})", current, MAX_RPC_CONNECTIONS),
+                            );
+                            let body = serde_json::to_value(&resp)
+                                .unwrap_or_else(|_| json!({"error": "server_at_capacity"}));
+                            let _ = Self::write_http_response(&mut s, 503, body);
                             slog_warn!("rpc", "connection_limit_reached", current => current, max => MAX_RPC_CONNECTIONS);
-                            drop(s);
                             continue;
                         }
                         let sc = Arc::clone(&state);
@@ -500,6 +537,26 @@ impl RpcServer {
         });
 
         Ok(())
+    }
+
+    /// Gracefully stop the RPC listener thread.
+    ///
+    /// Sets the `running` flag to `false`, then sends a dummy TCP connection
+    /// to the listener port to unblock the blocking `accept()` call. This is
+    /// the standard workaround for `std::net::TcpListener` lacking a
+    /// shutdown API.
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        // Send a dummy connection to unblock accept()
+        if let Ok(addr) = format!("127.0.0.1:{}", self.port).parse::<SocketAddr>() {
+            let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(200));
+        }
+        slog_info!("rpc", "rpc_server_stop_requested", port => self.port);
+    }
+
+    /// Returns `true` if the listener thread is running.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
     }
 
     fn handle_connection(

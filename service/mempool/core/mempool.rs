@@ -417,6 +417,10 @@ impl Mempool {
         }
 
         // ── L2 Structural: signature verification (prevents flood) ───
+        // TODO: verify_signatures currently uses Mainnet chain_id.
+        // On Testnet/Regtest, valid signatures may be rejected because
+        // the signing message differs by network. Thread NetworkMode
+        // through Mempool::new() when multi-network support is needed.
         if !tx.is_coinbase()
             && !TxValidator::verify_signatures(tx) {
                 return false;

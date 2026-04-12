@@ -291,6 +291,16 @@ impl BlockValidator {
         expected_difficulty: Option<u64>,
     ) -> Result<(), ConsensusError> {
         if let Some(expected) = expected_difficulty {
+            // NOTE: This +/-4x tolerance is intentionally looser than
+            // RetargetEngine::validate_difficulty() (strict equality).
+            // The retarget engine validates blocks on the SELECTED chain
+            // where difficulty matches exactly. This layer validates ALL
+            // incoming blocks including side-chain blocks that may have
+            // been mined at a different epoch's difficulty. The +/-4x
+            // factor matches ADJUSTMENT_FACTOR_MAX (max single-epoch
+            // change). Blocks accepted here are re-validated by the
+            // retarget engine when they join the selected chain.
+            //
             // Allow blocks whose difficulty is within a factor of 4 of expected.
             // Side-chain blocks may have been mined at a different difficulty
             // epoch. The strict check would reject valid blocks from forks

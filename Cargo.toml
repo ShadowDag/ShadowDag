@@ -22,6 +22,10 @@ default = []
 production = []
 # Development mode: verbose logging, extra debug assertions
 dev-mode = []
+# TESTING ONLY: bypass CLSAG ring signature rejection gate in ring_validator.
+# DO NOT enable in production — allows structurally-valid but cryptographically
+# unverified privacy transactions.
+ringct_bypass = []
 
 [lib]
 name = "shadowdag"

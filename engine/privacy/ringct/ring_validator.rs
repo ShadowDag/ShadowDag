@@ -4,6 +4,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::domain::transaction::transaction::Transaction;
+use crate::slog_error;
 #[allow(deprecated)]
 use crate::engine::privacy::ringct::ring_signature::RingSignature;
 
@@ -113,6 +114,23 @@ impl RingValidator {
             }
         }
 
+        // CRITICAL: Real CLSAG ring signature verification is NOT YET
+        // wired. Until it is, privacy transactions MUST be rejected at
+        // the consensus layer to prevent forging ring signatures.
+        //
+        // When CLSAG verification is implemented:
+        //   1. Deserialize CLSAGSignature from each input
+        //   2. Call clsag::verify(message, ring, sig)
+        //   3. Remove this rejection gate
+        #[cfg(not(feature = "ringct_bypass"))]
+        {
+            slog_error!("privacy", "CLSAG_NOT_WIRED",
+                note => "Rejecting privacy TX: ring signature verification is structural-only. \
+                         Enable feature 'ringct_bypass' for testing only.");
+            return false;
+        }
+
+        #[allow(unreachable_code)]
         true
     }
 
@@ -188,12 +206,27 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ringct_bypass")]
     fn accepts_matching_key_images_count() {
-        // 3 inputs, 3 key images -- should pass the count check
+        // 3 inputs, 3 key images -- should pass the count check.
+        // Requires 'ringct_bypass' feature because the CLSAG rejection
+        // gate blocks all privacy TXs when real verification isn't wired.
         let tx = make_confidential_tx(3);
         assert!(
             RingValidator::validate(&tx),
             "TX with matching input/key_image counts should pass"
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "ringct_bypass"))]
+    fn rejects_privacy_tx_without_clsag() {
+        // Without the ringct_bypass feature, ALL privacy TXs must be
+        // rejected because CLSAG cryptographic verification is not wired.
+        let tx = make_confidential_tx(3);
+        assert!(
+            !RingValidator::validate(&tx),
+            "Privacy TX must be rejected when CLSAG is not wired"
         );
     }
 }
