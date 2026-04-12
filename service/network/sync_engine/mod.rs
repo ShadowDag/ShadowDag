@@ -137,6 +137,15 @@ impl DagSyncEngine {
             for h in to_remove { self.verified_blocks.remove(&h); }
         }
         self.local_dag_tips.insert(hash.to_string());
+        // Prune old tips to prevent unbounded growth.
+        // In a DAG, tips should be O(width) not O(total blocks).
+        if self.local_dag_tips.len() > 256 {
+            // Keep only the most recently added tips
+            let excess = self.local_dag_tips.len() - 128;
+            let to_remove: Vec<String> = self.local_dag_tips.iter()
+                .take(excess).cloned().collect();
+            for h in to_remove { self.local_dag_tips.remove(&h); }
+        }
         self.synced_count += 1;
 
         if self.pending_blocks.is_empty() && self.block_queue.is_empty() {
@@ -166,6 +175,26 @@ impl DagSyncEngine {
                     // Preserve retry count even for exhausted retries
                     self.retry_counts.insert(hash.clone(), req.retries);
                     self.block_queue.push_back(hash);
+                }
+            }
+        }
+
+        // Also timeout stale header requests
+        let stale_headers: Vec<String> = self.pending_headers.iter()
+            .filter(|(_, r)| r.queued.elapsed() > timeout)
+            .map(|(h, _)| h.clone())
+            .collect();
+        for hash in stale_headers {
+            if let Some(req) = self.pending_headers.remove(&hash) {
+                if req.retries < 3 {
+                    // Re-request header with fresh timestamp
+                    self.pending_headers.insert(hash, BlockRequest {
+                        retries: req.retries + 1,
+                        queued: Instant::now(),
+                        ..req
+                    });
+                } else {
+                    self.failed_peers.insert(req.peer.clone());
                 }
             }
         }
