@@ -46,7 +46,7 @@ pub enum ReorgResult {
     NoReorg,
     Extended(ReorgEvent),  // Chain grew without fork (depth=0, no blocks removed)
     Reorged(ReorgEvent),
-    TooDeep,
+    TooDeep { depth: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -166,14 +166,14 @@ impl ReorgManager {
             depth += 1;
 
             if depth > self.max_depth {
-                return ReorgResult::TooDeep;
+                return ReorgResult::TooDeep { depth };
             }
         }
 
         // No common ancestor found — treat as too deep to be safe.
         // Without a shared ancestor the fork cannot be evaluated reliably.
         if i == 0 || j == 0 {
-            return ReorgResult::TooDeep;
+            return ReorgResult::TooDeep { depth };
         }
 
         let ancestor_idx_old = i - 1;
@@ -187,7 +187,7 @@ impl ReorgManager {
         let depth = removed_slice.len() as u64;
 
         if depth > self.max_depth {
-            return ReorgResult::TooDeep;
+            return ReorgResult::TooDeep { depth };
         }
 
         let event = ReorgEvent {
@@ -293,6 +293,28 @@ impl ReorgManager {
                 let old_ancestor_end = old_chain.len().saturating_sub(event.blocks_removed.len());
                 let new_ancestor_end = new_chain.len().saturating_sub(event.blocks_added.len());
 
+                // SECURITY: reject reorg if difficulty arrays don't cover the
+                // chain segments. An empty/short difficulty array would produce
+                // 0 cumulative work, letting any reorg pass unchecked.
+                if old_difficulties.len() != old_chain.len() {
+                    return Err(ReorgRejection::DepthExceeded {
+                        depth: depth,
+                        max: self.max_depth,
+                    });
+                }
+                if new_difficulties.len() != new_chain.len() {
+                    return Err(ReorgRejection::DepthExceeded {
+                        depth: depth,
+                        max: self.max_depth,
+                    });
+                }
+                if old_difficulties.is_empty() && !event.blocks_removed.is_empty() {
+                    return Err(ReorgRejection::DepthExceeded {
+                        depth: depth,
+                        max: self.max_depth,
+                    });
+                }
+
                 let old_work = if old_ancestor_end < old_difficulties.len() {
                     CumulativeWork::from_difficulties(&old_difficulties[old_ancestor_end..])
                 } else {
@@ -325,10 +347,11 @@ impl ReorgManager {
 
                 Ok(result)
             }
-            ReorgResult::TooDeep => {
+            ReorgResult::TooDeep { depth: actual_depth } => {
                 // Already rejected by depth — surface as our typed error
+                // with the real depth that was detected
                 Err(ReorgRejection::DepthExceeded {
-                    depth: self.max_depth + 1,
+                    depth: *actual_depth,
                     max: self.max_depth,
                 })
             }
@@ -403,7 +426,7 @@ mod tests {
         let mut new_chain = vec!["old_0".to_string()];
         new_chain.extend((0..8).map(|i| format!("new_{}", i)));
 
-        assert_eq!(mgr.detect(&old, &new_chain), ReorgResult::TooDeep);
+        assert!(matches!(mgr.detect(&old, &new_chain), ReorgResult::TooDeep { .. }));
     }
 
     #[test]

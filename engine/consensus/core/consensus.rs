@@ -120,7 +120,16 @@ impl ConsensusStore {
     // ─────────────────────────────────────────
     pub fn get_state(&self, key: &str) -> Result<Option<String>, ConsensusError> {
         match self.db.get_pinned(Self::build_key(PFX_STATE, key)) {
-            Ok(Some(v)) => Ok(std::str::from_utf8(&v).ok().map(|s| s.to_owned())),
+            Ok(Some(v)) => match std::str::from_utf8(&v) {
+                Ok(s) => Ok(Some(s.to_owned())),
+                Err(e) => {
+                    slog_error!("consensus", "state_utf8_corrupt",
+                        key => key, error => &format!("{}", e));
+                    Err(StorageError::ReadFailed(
+                        format!("get_state '{}': UTF-8 corruption: {}", key, e)
+                    ).into())
+                }
+            },
             Ok(None) => Ok(None),
             Err(e) => {
                 slog_error!("consensus", "state_read_failed", key => key, error => e);

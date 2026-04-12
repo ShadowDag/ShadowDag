@@ -83,10 +83,14 @@ impl ChainManager {
     ///
     /// `finality_depth` should come from `FinalityManager::current_depth()` so
     /// it adapts dynamically to network conditions (k-cluster finality).
+    ///
+    /// `new_tip_hash` is reserved for future use (e.g., exact checkpoint
+    /// validation against `FinalityManager::is_checkpointed_exact`).
     #[inline(always)]
+    #[allow(unused_variables)]
     pub fn reorg_allowed(
         fork_height: u64,
-        _new_tip_hash: &str,
+        new_tip_hash: &str,
         new_tip_height: u64,
         finality_depth: u64,
     ) -> bool {
