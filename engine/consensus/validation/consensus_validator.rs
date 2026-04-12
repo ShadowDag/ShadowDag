@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::errors::{ConsensusError, StorageError};
+use crate::slog_error;
 
 pub struct ConsensusValidatorStore {
     db: Arc<DB>,
@@ -75,11 +76,13 @@ impl ConsensusValidatorStore {
 
     #[inline(always)]
     pub fn store_result(&self, key: &str, value: &str) -> bool {
-        self.db.put_opt(
-            key.as_bytes(),
-            value.as_bytes(),
-            &self.write_opts,
-        ).is_ok()
+        match self.db.put_opt(key.as_bytes(), value.as_bytes(), &self.write_opts) {
+            Ok(_) => true,
+            Err(e) => {
+                slog_error!("consensus", "store_result_failed", key => key, error => &e.to_string());
+                false
+            }
+        }
     }
 
     // ─────────────────────────────────────────
@@ -98,7 +101,13 @@ impl ConsensusValidatorStore {
             batch.put(k.as_bytes(), v.as_bytes());
         }
 
-        self.db.write_opt(batch, &self.write_opts).is_ok()
+        match self.db.write_opt(batch, &self.write_opts) {
+            Ok(_) => true,
+            Err(e) => {
+                slog_error!("consensus", "store_batch_failed", count => items.len(), error => &e.to_string());
+                false
+            }
+        }
     }
 
     // ─────────────────────────────────────────
@@ -117,7 +126,13 @@ impl ConsensusValidatorStore {
             batch.delete(k.as_bytes());
         }
 
-        self.db.write_opt(batch, &self.write_opts).is_ok()
+        match self.db.write_opt(batch, &self.write_opts) {
+            Ok(_) => true,
+            Err(e) => {
+                slog_error!("consensus", "delete_batch_failed", count => keys.len(), error => &e.to_string());
+                false
+            }
+        }
     }
 
     // ─────────────────────────────────────────
@@ -126,7 +141,13 @@ impl ConsensusValidatorStore {
 
     #[inline(always)]
     pub fn delete(&self, key: &str) -> bool {
-        self.db.delete_opt(key.as_bytes(), &self.write_opts).is_ok()
+        match self.db.delete_opt(key.as_bytes(), &self.write_opts) {
+            Ok(_) => true,
+            Err(e) => {
+                slog_error!("consensus", "delete_failed", key => key, error => &e.to_string());
+                false
+            }
+        }
     }
 
     // ─────────────────────────────────────────
@@ -135,9 +156,13 @@ impl ConsensusValidatorStore {
 
     #[inline(always)]
     pub fn exists(&self, key: &str) -> bool {
-        self.db.get_pinned_opt(key.as_bytes(), &self.read_opts)
-            .map(|v| v.is_some())
-            .unwrap_or(false)
+        match self.db.get_pinned_opt(key.as_bytes(), &self.read_opts) {
+            Ok(v) => v.is_some(),
+            Err(e) => {
+                slog_error!("consensus", "exists_check_failed", key => key, error => &e.to_string());
+                false
+            }
+        }
     }
 
     // ─────────────────────────────────────────
@@ -150,7 +175,11 @@ impl ConsensusValidatorStore {
             Ok(Some(v)) => {
                 std::str::from_utf8(v.as_ref()).ok().map(str::to_owned)
             }
-            _ => None,
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("consensus", "get_result_db_error", key => key, error => &e.to_string());
+                None
+            }
         }
     }
 
@@ -162,7 +191,11 @@ impl ConsensusValidatorStore {
     pub fn get_raw(&self, key: &str) -> Option<Vec<u8>> {
         match self.db.get_pinned_opt(key.as_bytes(), &self.read_opts) {
             Ok(Some(v)) => Some(v.to_vec()),
-            _ => None,
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("consensus", "get_raw_db_error", key => key, error => &e.to_string());
+                None
+            }
         }
     }
 
@@ -174,7 +207,11 @@ impl ConsensusValidatorStore {
     pub fn is_validated(&self, hash: &str) -> bool {
         match self.db.get_pinned_opt(hash.as_bytes(), &self.read_opts) {
             Ok(Some(v)) => v.as_ref() == b"ok",
-            _ => false,
+            Ok(None) => false,
+            Err(e) => {
+                slog_error!("consensus", "is_validated_db_error", hash => hash, error => &e.to_string());
+                false
+            }
         }
     }
 
@@ -184,7 +221,13 @@ impl ConsensusValidatorStore {
 
     #[inline(always)]
     pub fn mark_validated(&self, hash: &str) -> bool {
-        self.db.put_opt(hash.as_bytes(), b"ok", &self.write_opts).is_ok()
+        match self.db.put_opt(hash.as_bytes(), b"ok", &self.write_opts) {
+            Ok(_) => true,
+            Err(e) => {
+                slog_error!("consensus", "mark_validated_failed", hash => hash, error => &e.to_string());
+                false
+            }
+        }
     }
 
     // ─────────────────────────────────────────
@@ -198,7 +241,13 @@ impl ConsensusValidatorStore {
         value.extend_from_slice(b"rejected:");
         value.extend_from_slice(reason.as_bytes());
 
-        self.db.put_opt(hash.as_bytes(), value, &self.write_opts).is_ok()
+        match self.db.put_opt(hash.as_bytes(), value, &self.write_opts) {
+            Ok(_) => true,
+            Err(e) => {
+                slog_error!("consensus", "mark_rejected_failed", hash => hash, error => &e.to_string());
+                false
+            }
+        }
     }
 
     // ─────────────────────────────────────────
@@ -245,7 +294,13 @@ impl ConsensusValidatorStore {
             }
         }
 
-        self.db.write_opt(batch, &self.write_opts).is_ok()
+        match self.db.write_opt(batch, &self.write_opts) {
+            Ok(_) => true,
+            Err(e) => {
+                slog_error!("consensus", "clear_prefix_failed", prefix => prefix, error => &e.to_string());
+                false
+            }
+        }
     }
 }
 

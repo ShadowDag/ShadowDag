@@ -1332,19 +1332,30 @@ impl RpcServer {
             .unwrap_or_default();
 
         // Parse transactions if present
-        let transactions: Vec<Transaction> = block_json.get("transactions")
+        let transactions: Vec<Transaction> = match block_json.get("transactions")
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|tx_val| serde_json::from_value::<Transaction>(tx_val.clone()).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
+        {
+            Some(arr) => {
+                let mut txs = Vec::with_capacity(arr.len());
+                for (i, tx_val) in arr.iter().enumerate() {
+                    match serde_json::from_value::<Transaction>(tx_val.clone()) {
+                        Ok(tx) => txs.push(tx),
+                        Err(e) => {
+                            return RpcResponse::err(id, ERR_INVALID_PARAMS,
+                                format!("Malformed transaction at index {}: {}", i, e));
+                        }
+                    }
+                }
+                txs
+            }
+            None => Vec::new(),
+        };
 
         if hash.is_empty() || height == 0 {
             return RpcResponse::err(id, ERR_INVALID_PARAMS, "Invalid block: missing hash or height");
         }
 
+        let selected_parent = if parents.is_empty() { None } else { Some(parents[0].clone()) };
         let block = Block {
             header: BlockHeader {
                 version,
@@ -1356,7 +1367,7 @@ impl RpcServer {
                 difficulty,
                 height,
                 blue_score: 0,
-                selected_parent: None,
+                selected_parent,
                 utxo_commitment: None,
                 extra_nonce,
                 receipt_root: None,

@@ -14,7 +14,7 @@
 // Bandwidth savings: ~95% for blocks where peer has most TXs in mempool.
 //
 // ShadowDAG improvements over BIP-152:
-//   - BLAKE2b for short IDs (faster than SipHash)
+//   - SHA-256 for short IDs (domain-separated, more widely audited than SipHash)
 //   - DAG-aware: includes parent hashes in compact form
 //   - Prefill threshold: auto-detect which TXs to prefill
 // ═══════════════════════════════════════════════════════════════════════════
@@ -96,6 +96,9 @@ impl CompactBlock {
         for (i, short_id) in self.short_ids.iter().enumerate() {
             if transactions[i].is_some() { continue; }
 
+            // NOTE: Short ID collision is possible but extremely rare
+            // with 6-byte IDs (48-bit). If collisions become a problem,
+            // request the full block via getdata.
             let found = mempool_txs.iter().find(|tx| {
                 Self::compute_short_id(&tx.hash, self.nonce) == *short_id
             });
@@ -120,7 +123,7 @@ impl CompactBlock {
         })
     }
 
-    /// Compute 6-byte short TX ID: BLAKE2b(nonce || tx_hash)[0..6]
+    /// Compute 6-byte short TX ID: SHA256("ShadowDAG_ShortID_v1" || nonce || tx_hash)[0..6]
     fn compute_short_id(tx_hash: &str, nonce: u64) -> [u8; SHORT_ID_BYTES] {
         let mut h = Sha256::new();
         h.update(b"ShadowDAG_ShortID_v1");

@@ -99,22 +99,38 @@ impl PeerManager {
             // OnceLock returns the same instance regardless of path after first init,
             // which silently ignores the new path. This makes the mismatch visible.
             if pm._network_path != path {
-                slog_warn!("p2p", "peer_manager_path_mismatch",
+                slog_error!("p2p", "peer_manager_path_mismatch_singleton_already_bound",
                     requested => path,
-                    active => &pm._network_path
+                    active => &pm._network_path,
+                    hint => "OnceLock returns the existing instance — the requested path is ignored. \
+                             This is a configuration bug: all callers must agree on the peer DB path."
                 );
             }
             return Ok(pm.clone());
         }
 
         // Try primary path, then fallback, then temp.
+        // WARNING: falling back to a different DB path means ALL peer reputation
+        // data (ban scores, penalty history, connection counts) starts fresh.
+        // There is no automatic migration between DB paths.
         let pm = Self::open(path).or_else(|e| {
             slog_warn!("p2p", "peer_db_open_failed", path => path, error => &e.to_string());
             let fallback = format!("{}_fallback", path);
+            slog_warn!("p2p", "peer_db_fallback_reputation_reset",
+                primary_path => path,
+                fallback_path => &fallback,
+                impact => "All peer reputation state (bans, penalties, latency history) will be fresh. \
+                           Previously banned peers will be unbanned."
+            );
             Self::open(&fallback)
         }).or_else(|e| {
             slog_warn!("p2p", "peer_db_fallback_failed", error => &e.to_string());
             let temp = std::env::temp_dir().join(format!("shadowdag_peer_emergency_{}", std::process::id()));
+            slog_error!("p2p", "peer_db_emergency_fallback_reputation_reset",
+                temp_path => &temp.to_string_lossy().to_string(),
+                impact => "Using emergency temp DB — ALL peer reputation is lost. \
+                           Node is vulnerable to previously-banned peers until reputation rebuilds."
+            );
             Self::open(temp.to_str().unwrap_or("/tmp/shadowdag_peer_emergency"))
         })?;
 

@@ -244,7 +244,10 @@ impl BlockSyncManager {
         let mut by_height = self.headers_by_height.write().unwrap_or_else(|e| e.into_inner());
         for h in &headers {
             map.insert(h.hash.clone(), h.clone());
-            by_height.entry(h.height).or_default().push(h.hash.clone());
+            let entry = by_height.entry(h.height).or_default();
+            if !entry.contains(&h.hash) {
+                entry.push(h.hash.clone());
+            }
         }
         let _max_h = headers.iter().map(|h| h.height).max().unwrap_or(0);
     }

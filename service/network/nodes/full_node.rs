@@ -330,7 +330,7 @@ impl FullNode {
         use std::collections::{VecDeque, HashSet};
 
         const TARGET_ANCESTOR_COUNT: usize = 32; // Collect up to 32 ancestors
-        const MAX_WALK_DEPTH: usize = 8;         // Walk up to 8 DAG levels
+        const MAX_WALK_DEPTH: usize = 16;        // Walk up to 16 DAG levels (>= MEDIAN_TIME_SPAN=11 + headroom for DAG branching)
 
         let mut timestamps = Vec::with_capacity(TARGET_ANCESTOR_COUNT);
         let mut visited = HashSet::with_capacity(TARGET_ANCESTOR_COUNT);
@@ -765,13 +765,19 @@ impl FullNode {
                         use crate::domain::transaction::tx_receipt::persist_receipts_batch;
                         persist_receipts_batch(self.contract_storage.shared_db().as_ref(), &receipts);
 
-                        // Update block header receipt_root and state_root in store
-                        // (block is already saved; we update the header fields)
+                        // Update block header receipt_root and state_root in store.
+                        // Uses update_block (not save_block) because the block already
+                        // exists — save_block rejects duplicates and would silently fail.
                         if receipt_root.is_some() || state_root.is_some() {
                             if let Some(mut stored_block) = self.block_store.get_block(block_hash) {
                                 stored_block.header.receipt_root = receipt_root.clone();
                                 stored_block.header.state_root = state_root.clone();
-                                self.block_store.save_block(&stored_block);
+                                if !self.block_store.update_block(&stored_block) {
+                                    slog_error!("node", "block_header_update_failed",
+                                        block => block_hash,
+                                        reason => "update_block returned false — receipt_root/state_root not persisted"
+                                    );
+                                }
                             }
                         }
 
