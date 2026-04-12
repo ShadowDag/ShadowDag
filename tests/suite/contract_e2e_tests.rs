@@ -400,7 +400,7 @@ mod contract_e2e {
         env.execute_frame(&ctx);
 
         // Persist with undo data for block_123
-        let undo = env.persist_with_undo(&storage, "block_123").unwrap();
+        let undo = env.persist_with_undo(&storage, "block_123", None, None).unwrap();
         assert!(
             !undo.modified_keys.is_empty(),
             "Undo should capture modified keys",

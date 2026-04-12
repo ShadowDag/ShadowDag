@@ -161,6 +161,12 @@ pub struct RpcState {
     pub rpc_port:     u16,
     pub contract_storage: Option<Arc<ContractStorage>>,
     pub receipt_db: Option<Arc<rocksdb::DB>>,
+    /// Per-instance mining template cell shared with the owning
+    /// `FullNode`. When set, `getblocktemplate` / `getwork` reads
+    /// from this cell instead of the legacy process-global — so a
+    /// node running alongside another in the same process never
+    /// serves the other node's difficulty / tips.
+    pub mining_state: Option<Arc<crate::service::network::nodes::full_node::MiningTemplateState>>,
 }
 
 impl RpcState {
@@ -289,6 +295,7 @@ impl RpcState {
             rpc_port:     ConsensusParams::DEFAULT_RPC_PORT,
             contract_storage: None,
             receipt_db: None,
+            mining_state: None,
         })
     }
 
@@ -323,6 +330,7 @@ impl RpcState {
             rpc_port:     ConsensusParams::DEFAULT_RPC_PORT,
             contract_storage: None,
             receipt_db: None,
+            mining_state: None,
         })
     }
 
@@ -1166,14 +1174,25 @@ impl RpcServer {
     fn cmd_getmininginfo(id: Value, state: &SharedState) -> RpcResponse {
         use crate::service::network::nodes::full_node::get_next_difficulty;
         match state.lock() {
-            Ok(mut s) => { s.update_from_chain(); RpcResponse::ok(id, json!({
-                "blocks":       s.best_height,
-                "difficulty":   get_next_difficulty(),
-                "block_reward": ConsensusParams::BLOCK_REWARD,
-                "miner_pct":    ConsensusParams::MINER_PERCENT,
-                "network":      s.network_name,
-                "algorithm":    "ShadowHash (SHA256+Blake3+SHA3-256+AntiASIC)",
-            }))},
+            Ok(mut s) => {
+                s.update_from_chain();
+                // Prefer the per-instance mining-state cell when
+                // the owning FullNode wired one in; fall back to
+                // the legacy process-default otherwise so
+                // standalone RPC nodes still work.
+                let difficulty = match &s.mining_state {
+                    Some(ms) => ms.next_difficulty(),
+                    None     => get_next_difficulty(),
+                };
+                RpcResponse::ok(id, json!({
+                    "blocks":       s.best_height,
+                    "difficulty":   difficulty,
+                    "block_reward": ConsensusParams::BLOCK_REWARD,
+                    "miner_pct":    ConsensusParams::MINER_PERCENT,
+                    "network":      s.network_name,
+                    "algorithm":    "ShadowHash (SHA256+Blake3+SHA3-256+AntiASIC)",
+                }))
+            },
             Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
         }
     }
@@ -1218,7 +1237,7 @@ impl RpcServer {
 
     fn cmd_getblocktemplate(id: Value, state: &SharedState) -> RpcResponse {
         use crate::config::consensus::emission_schedule::EmissionSchedule;
-        use crate::service::network::nodes::full_node::get_next_difficulty;
+        use crate::service::network::nodes::full_node::{get_dag_tips, get_next_difficulty};
         match state.lock() {
             Ok(mut s) => {
                 // Always read fresh chain state so height/hash are up-to-date
@@ -1228,21 +1247,28 @@ impl RpcServer {
                 let count = txs.len().min(ConsensusParams::MAX_BLOCK_TXS);
                 let total_fees: u64 = txs.iter().take(count).map(|t| t.fee).fold(0u64, |a, f| a.saturating_add(f));
 
-                // The NEXT expected difficulty comes from FullNode's RetargetEngine.
-                // This is the exact value the node will validate against — miners
-                // MUST use this or their blocks will be rejected.
-                let difficulty = get_next_difficulty();
+                // The NEXT expected difficulty comes from FullNode's
+                // RetargetEngine. Prefer the per-instance
+                // `mining_state` cell so a co-tenant FullNode's
+                // state can't leak here; fall back to the legacy
+                // process-default for standalone RPC mode.
+                let difficulty = match &s.mining_state {
+                    Some(ms) => ms.next_difficulty(),
+                    None     => get_next_difficulty(),
+                };
 
                 let next_height = s.best_height + 1;
                 let block_reward = EmissionSchedule::block_reward(next_height);
 
                 // DAG tips = blocks with no children (the real frontier).
-                // These come from DagManager via the global DAG_TIPS bridge,
-                // updated after every accepted block.
+                // These come from the same per-instance cell the
+                // FullNode writes to after every accepted block.
                 // The miner MUST reference these as parents for DAG connectivity.
                 let mut parent_hashes = {
-                    use crate::service::network::nodes::full_node::get_dag_tips;
-                    let tips = get_dag_tips();
+                    let tips = match &s.mining_state {
+                        Some(ms) => ms.dag_tips(),
+                        None     => get_dag_tips(),
+                    };
                     if tips.is_empty() {
                         // Fallback: use best_hash if DAG tips not yet initialized
                         vec![s.best_hash.clone()]
@@ -3187,10 +3213,21 @@ impl RpcServer {
             None => return RpcResponse::err(id, ERR_INTERNAL, "contract storage not available"),
         };
 
-        let ctx = VMContext::new(
-            ContractStorage::new(cs.shared_db())
-                .unwrap_or_else(|_| panic!("ContractStorage init from shared DB"))
-        );
+        // Build a dry-run VM context from the shared DB. A failure
+        // here is surfaced to the RPC caller as a normal error
+        // rather than taking down the entire node via `panic!`.
+        // Previously every dry-run deploy / call / estimate /
+        // token-lookup RPC endpoint unwrapped this with `panic!`,
+        // so a transient DB lock or permission hiccup would crash
+        // the JSON-RPC handler thread — a remotely-triggerable
+        // crash.
+        let ctx = match ContractStorage::new(cs.shared_db()) {
+            Ok(cs_clone) => VMContext::new(cs_clone),
+            Err(e) => return RpcResponse::err(
+                id, ERR_INTERNAL,
+                format!("contract storage init failed: {}", e),
+            ),
+        };
         let executor = Executor::new(ctx);
 
         // Dry-run: simulate_deploy does NOT persist state changes to
@@ -3254,10 +3291,21 @@ impl RpcServer {
             None => return RpcResponse::err(id, ERR_INTERNAL, "contract storage not available"),
         };
 
-        let ctx = VMContext::new(
-            ContractStorage::new(cs.shared_db())
-                .unwrap_or_else(|_| panic!("ContractStorage init from shared DB"))
-        );
+        // Build a dry-run VM context from the shared DB. A failure
+        // here is surfaced to the RPC caller as a normal error
+        // rather than taking down the entire node via `panic!`.
+        // Previously every dry-run deploy / call / estimate /
+        // token-lookup RPC endpoint unwrapped this with `panic!`,
+        // so a transient DB lock or permission hiccup would crash
+        // the JSON-RPC handler thread — a remotely-triggerable
+        // crash.
+        let ctx = match ContractStorage::new(cs.shared_db()) {
+            Ok(cs_clone) => VMContext::new(cs_clone),
+            Err(e) => return RpcResponse::err(
+                id, ERR_INTERNAL,
+                format!("contract storage init failed: {}", e),
+            ),
+        };
         let executor = Executor::new(ctx);
 
         // Dry-run: simulate_call does NOT persist state changes.
@@ -3322,10 +3370,21 @@ impl RpcServer {
         // path (no undo data, not reversible on reorg). Using
         // `simulate_call` makes the comment match reality.
         let estimate_gas_limit: u64 = 100_000_000; // high ceiling for estimation
-        let ctx = VMContext::new(
-            ContractStorage::new(cs.shared_db())
-                .unwrap_or_else(|_| panic!("ContractStorage init from shared DB"))
-        );
+        // Build a dry-run VM context from the shared DB. A failure
+        // here is surfaced to the RPC caller as a normal error
+        // rather than taking down the entire node via `panic!`.
+        // Previously every dry-run deploy / call / estimate /
+        // token-lookup RPC endpoint unwrapped this with `panic!`,
+        // so a transient DB lock or permission hiccup would crash
+        // the JSON-RPC handler thread — a remotely-triggerable
+        // crash.
+        let ctx = match ContractStorage::new(cs.shared_db()) {
+            Ok(cs_clone) => VMContext::new(cs_clone),
+            Err(e) => return RpcResponse::err(
+                id, ERR_INTERNAL,
+                format!("contract storage init failed: {}", e),
+            ),
+        };
         let executor = Executor::new(ctx);
 
         let result = executor.simulate_call(contract_addr, &calldata, caller, value, estimate_gas_limit, 0, "");
@@ -3497,8 +3556,13 @@ impl RpcServer {
             None => return RpcResponse::err(id, ERR_INTERNAL, "contract storage not available"),
         };
 
-        let storage = ContractStorage::new(cs.shared_db())
-            .unwrap_or_else(|_| panic!("ContractStorage init from shared DB"));
+        let storage = match ContractStorage::new(cs.shared_db()) {
+            Ok(s) => s,
+            Err(e) => return RpcResponse::err(
+                id, ERR_INTERNAL,
+                format!("contract storage init failed: {}", e),
+            ),
+        };
         let result = ContractVerifier::verify(&storage, address, &package);
 
         if result.verified {
@@ -3531,8 +3595,13 @@ impl RpcServer {
             Some(cs) => cs.clone(),
             None => return RpcResponse::err(id, ERR_INTERNAL, "contract storage not available"),
         };
-        let storage = ContractStorage::new(cs.shared_db())
-            .unwrap_or_else(|_| panic!("ContractStorage init from shared DB"));
+        let storage = match ContractStorage::new(cs.shared_db()) {
+            Ok(s) => s,
+            Err(e) => return RpcResponse::err(
+                id, ERR_INTERNAL,
+                format!("contract storage init failed: {}", e),
+            ),
+        };
 
         // Check verification
         let verification = ContractVerifier::get_verification(&storage, address);

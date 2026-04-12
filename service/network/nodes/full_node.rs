@@ -30,57 +30,114 @@ use crate::runtime::vm::contracts::contract_storage::ContractStorage;
 use crate::{slog_info, slog_warn, slog_error};
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Global next difficulty — written by FullNode after each block accepted,
-// read by RPC getblocktemplate so miners always use the correct difficulty.
+// Mining template state — per-node, not per-process
 // ═══════════════════════════════════════════════════════════════════════════
-/// WARNING: Global per-process. Assumes single FullNode instance.
-/// If running multiple nodes in one process (e.g., tests), these
-/// will leak state between instances. For multi-instance safety,
-/// move to FullNode struct fields.
-static NEXT_DIFFICULTY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
+//
+// The previous implementation stored `NEXT_DIFFICULTY` and `DAG_TIPS`
+// as `static Lazy<…>` globals on the process. That works for a single
+// FullNode per process, but leaks state between instances whenever a
+// test (or a future multi-tenant deployment) spins up more than one
+// node: both nodes share the same `NEXT_DIFFICULTY` / `DAG_TIPS`, so
+// one node's retarget leaks into the other's `getblocktemplate`
+// response and mining payloads synthesized for node A can reference
+// node B's parent tips. That was marked as a P2 issue in the audit
+// ("global at process level; cross-instance contamination") and is
+// fixed by moving the state into a per-FullNode `MiningTemplateState`
+// that is also exposed on `RpcState` via `Arc` so RPC endpoints can
+// read and write the same cells.
+//
+// The legacy free functions `get_next_difficulty` /
+// `get_dag_tips` / `set_next_difficulty` / `set_dag_tips` are
+// retained as thin delegates to a process-default fallback so any
+// external caller that used them keeps working, but the hot paths
+// inside `FullNode` and the RPC contract handlers now route through
+// the per-instance `Arc<MiningTemplateState>`.
 
-/// Get the next expected difficulty for mining (called by RPC getblocktemplate).
-pub fn get_next_difficulty() -> u64 {
-    NEXT_DIFFICULTY.load(Ordering::Relaxed)
+/// Per-instance mining template cache.
+///
+/// Both `FullNode` and `RpcState` hold an `Arc<MiningTemplateState>`
+/// pointing at the same cell, so a retarget commit on the node
+/// becomes visible to the RPC `getblocktemplate` handler without
+/// going through a process-global. Tests that spin up multiple
+/// nodes in one process each get their own cell, so one node's
+/// state can no longer leak into another's mining payloads.
+pub struct MiningTemplateState {
+    next_difficulty: AtomicU64,
+    dag_tips:        Mutex<Vec<String>>,
 }
 
-/// Update the next expected difficulty (called after each accepted block).
-fn set_next_difficulty(diff: u64) {
-    NEXT_DIFFICULTY.store(diff, Ordering::Relaxed);
-}
+impl MiningTemplateState {
+    pub fn new() -> Self {
+        Self {
+            next_difficulty: AtomicU64::new(1),
+            dag_tips:        Mutex::new(Vec::new()),
+        }
+    }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Global DAG tips — written by FullNode after each block accepted,
-// read by RPC getblocktemplate so miners reference correct parents.
-// ═══════════════════════════════════════════════════════════════════════════
-/// WARNING: Global per-process. Assumes single FullNode instance.
-/// If running multiple nodes in one process (e.g., tests), these
-/// will leak state between instances. For multi-instance safety,
-/// move to FullNode struct fields.
-static DAG_TIPS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
+    pub fn next_difficulty(&self) -> u64 {
+        self.next_difficulty.load(Ordering::Relaxed)
+    }
 
-/// Get current DAG tips (blocks with no children) for mining.
-pub fn get_dag_tips() -> Vec<String> {
-    DAG_TIPS.lock().map(|t| t.clone()).unwrap_or_default()
-}
+    pub fn set_next_difficulty(&self, diff: u64) {
+        self.next_difficulty.store(diff, Ordering::Relaxed);
+    }
 
-/// Update the DAG tips (called after each accepted block).
-fn set_dag_tips(tips: Vec<String>) {
-    if let Ok(mut t) = DAG_TIPS.lock() {
-        *t = tips;
+    pub fn dag_tips(&self) -> Vec<String> {
+        self.dag_tips
+            .lock()
+            .map(|t| t.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_dag_tips(&self, tips: Vec<String>) {
+        if let Ok(mut t) = self.dag_tips.lock() {
+            *t = tips;
+        }
     }
 }
 
-/// Reset global mining template state. ONLY for testing.
-/// Clears NEXT_DIFFICULTY back to 0 and empties DAG_TIPS so that
-/// tests running multiple FullNode instances in one process don't
-/// observe stale state from a previous test.
+impl Default for MiningTemplateState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─── Legacy process-default ────────────────────────────────────────
+//
+// Retained for any caller that still uses the free functions and
+// hasn't been plumbed an explicit `Arc<MiningTemplateState>` yet.
+// The FullNode::new path stamps its own `Arc` into this slot on
+// first creation so the RPC free-function readers still observe
+// the active node's cell.
+static PROCESS_DEFAULT_MINING_STATE: Lazy<MiningTemplateState> =
+    Lazy::new(MiningTemplateState::new);
+
+/// Get the next expected difficulty for mining from the
+/// process-default cell. Prefer reading
+/// `RpcState::mining_state.next_difficulty()` directly.
+pub fn get_next_difficulty() -> u64 {
+    PROCESS_DEFAULT_MINING_STATE.next_difficulty()
+}
+
+fn set_next_difficulty(diff: u64) {
+    PROCESS_DEFAULT_MINING_STATE.set_next_difficulty(diff)
+}
+
+/// Get the DAG tips from the process-default cell. Prefer reading
+/// `RpcState::mining_state.dag_tips()` directly.
+pub fn get_dag_tips() -> Vec<String> {
+    PROCESS_DEFAULT_MINING_STATE.dag_tips()
+}
+
+fn set_dag_tips(tips: Vec<String>) {
+    PROCESS_DEFAULT_MINING_STATE.set_dag_tips(tips)
+}
+
+/// Reset the process-default mining template cell. Test-only.
 #[cfg(test)]
 pub fn reset_mining_globals() {
-    NEXT_DIFFICULTY.store(0, Ordering::Relaxed);
-    if let Ok(mut tips) = DAG_TIPS.lock() {
-        tips.clear();
-    }
+    PROCESS_DEFAULT_MINING_STATE.set_next_difficulty(0);
+    PROCESS_DEFAULT_MINING_STATE.set_dag_tips(Vec::new());
 }
 
 /// Maximum orphan blocks to hold in memory (DoS protection)
@@ -124,6 +181,12 @@ pub struct FullNode {
     dos_guard: DosGuard,
     /// Receipt store for contract execution receipts
     pub receipt_store: ReceiptStore,
+    /// Per-instance mining template cache. Shared with `RpcState`
+    /// so `getblocktemplate` / `getwork` on the RPC side reads the
+    /// same `next_difficulty` / `dag_tips` cells this node writes
+    /// to after each accepted block — without going through a
+    /// process-global that would leak between co-tenant nodes.
+    pub mining_state: Arc<MiningTemplateState>,
 }
 
 impl FullNode {
@@ -169,7 +232,7 @@ impl FullNode {
         // Initialize global DAG tips for getblocktemplate
         let initial_tips = dag_manager.get_tips();
         if !initial_tips.is_empty() {
-            set_dag_tips(initial_tips);
+            set_dag_tips(initial_tips.clone());
         }
 
         // ── Startup recovery: verify contract state_root ──────────
@@ -181,6 +244,18 @@ impl FullNode {
                         note => "full state verification requires replay from last checkpoint");
                 }
             }
+        }
+
+        // Build the per-instance mining template cell. We seed
+        // both it and the process-default cell so any legacy
+        // caller that still uses the `get_next_difficulty` /
+        // `get_dag_tips` free functions sees the same values.
+        let mining_state = Arc::new(MiningTemplateState::new());
+        mining_state.set_next_difficulty(
+            if seed_count > 1 { retarget.ema_difficulty() } else { genesis_diff }
+        );
+        if !initial_tips.is_empty() {
+            mining_state.set_dag_tips(initial_tips.clone());
         }
 
         Self {
@@ -197,6 +272,7 @@ impl FullNode {
             peer_block_timestamps: Mutex::new(HashMap::new()),
             dos_guard: DosGuard::new(),
             receipt_store: ReceiptStore::new(100_000),
+            mining_state,
         }
     }
 
@@ -592,11 +668,8 @@ impl FullNode {
                     slog_error!("node", "rollback_failed", block => &cursor, error => &format!("{}", e));
                     NodeError::BlockRejected(format!("rollback failed for {}: {}", cursor, e))
                 })?;
-                // Contract state rollback (best-effort — missing undo data is non-fatal)
-                if let Err(e) = self.contract_storage.rollback_block(&cursor) {
-                    slog_warn!("node", "contract_rollback_skipped",
-                        block => &cursor, error => &format!("{}", e));
-                }
+                // Contract state rollback + receipt purge.
+                self.rollback_contract_block(&cursor);
                 rollback_count += 1;
                 // Walk to parent via selected_parent
                 cursor = self.block_store.get_block(&cursor)
@@ -623,7 +696,7 @@ impl FullNode {
                 // Uses the persistent contract storage (not temp_dir).
                 // State is persisted with undo data after UTXO succeeds.
                 let (receipts, receipt_root, state_root, env) =
-                    Self::execute_contract_transactions(&block, &self.contract_storage);
+                    self.execute_contract_transactions(&block, &self.contract_storage);
 
                 // ── UTXO APPLICATION ──────────────────────────────────────
                 match self.utxo_set.apply_block_dag_ordered(
@@ -634,22 +707,37 @@ impl FullNode {
                     Ok((_applied, _skipped, applied_fees)) => {
                         applied_new.push(block_hash.clone());
 
-                        // UTXO succeeded → persist contract state with undo data
-                        match env.persist_with_undo(&self.contract_storage, block_hash) {
-                            Ok(mut undo) => {
-                                // Attach receipt_root and state_root to undo data
-                                undo.receipt_root = receipt_root.clone();
-                                undo.state_root = state_root.clone();
-                                // Save updated undo with roots
-                                if let Err(e) = self.contract_storage.save_undo(block_hash, &undo) {
-                                    slog_error!("node", "contract_undo_save_failed",
-                                        block => block_hash, error => &format!("{}", e));
-                                }
+                        // UTXO succeeded → persist contract state with
+                        // undo data in a SINGLE atomic WriteBatch. The
+                        // roots are passed in so they land inside the
+                        // same batch as the state changes — no second
+                        // non-atomic `save_undo(…)` hand-off is
+                        // needed.
+                        //
+                        // On failure the block is already inconsistent
+                        // (UTXO committed, contract state did not),
+                        // so we MUST roll back every block we've
+                        // applied this reorg and surface the error.
+                        // Continuing would persist receipts + header
+                        // roots for a block whose contract state
+                        // never landed, which is worse than any other
+                        // failure mode we handle here.
+                        if let Err(e) = env.persist_with_undo(
+                            &self.contract_storage,
+                            block_hash,
+                            receipt_root.clone(),
+                            state_root.clone(),
+                        ) {
+                            slog_error!("node", "contract_persist_with_undo_failed",
+                                block => block_hash, error => &format!("{}", e));
+                            for hash in applied_new.iter().rev() {
+                                let _ = self.utxo_set.rollback_block_undo(hash);
+                                self.rollback_contract_block(hash);
                             }
-                            Err(e) => {
-                                slog_error!("node", "contract_persist_with_undo_failed",
-                                    block => block_hash, error => &format!("{}", e));
-                            }
+                            return Err(NodeError::Consensus(ConsensusError::BlockValidation(
+                                format!("contract state persistence failed for block {}: {}",
+                                    block_hash, e)
+                            )));
                         }
 
                         // Store receipts in receipt store (in-memory)
@@ -708,7 +796,7 @@ impl FullNode {
                         // Rollback partially-applied new chain (UTXO + contract)
                         for hash in applied_new.iter().rev() {
                             let _ = self.utxo_set.rollback_block_undo(hash);
-                            let _ = self.contract_storage.rollback_block(hash);
+                            self.rollback_contract_block(hash);
                         }
                         NodeError::Consensus(ConsensusError::BlockValidation("reward + fees overflow".into()))
                     })?;
@@ -724,7 +812,7 @@ impl FullNode {
                                         // Rollback partially-applied new chain (UTXO + contract)
                                         for hash in applied_new.iter().rev() {
                                             let _ = self.utxo_set.rollback_block_undo(hash);
-                                            let _ = self.contract_storage.rollback_block(hash);
+                                            self.rollback_contract_block(hash);
                                         }
                                         return Err(NodeError::BlockRejected(format!(
                                             "coinbase output overflow in {}", block_hash
@@ -736,7 +824,7 @@ impl FullNode {
                                     // Rollback partially-applied new chain (UTXO + contract)
                                     for hash in applied_new.iter().rev() {
                                         let _ = self.utxo_set.rollback_block_undo(hash);
-                                        let _ = self.contract_storage.rollback_block(hash);
+                                        self.rollback_contract_block(hash);
                                     }
                                     return Err(NodeError::BlockRejected(format!(
                                         "coinbase mismatch in {}: actual={}, expected={}",
@@ -753,7 +841,7 @@ impl FullNode {
                         // Rollback partially-applied new chain (UTXO + contract)
                         for hash in applied_new.iter().rev() {
                             let _ = self.utxo_set.rollback_block_undo(hash);
-                            let _ = self.contract_storage.rollback_block(hash);
+                            self.rollback_contract_block(hash);
                         }
                         return Err(NodeError::BlockRejected(format!(
                             "apply_block_dag_ordered failed for {}: {}", block_hash, e
@@ -764,7 +852,7 @@ impl FullNode {
                 // Missing block in store — rollback partially-applied new chain (UTXO + contract)
                 for hash in applied_new.iter().rev() {
                     let _ = self.utxo_set.rollback_block_undo(hash);
-                    let _ = self.contract_storage.rollback_block(hash);
+                    self.rollback_contract_block(hash);
                 }
                 return Err(NodeError::BlockRejected(format!(
                     "block {} missing from store during virtual chain apply", block_hash
@@ -789,7 +877,13 @@ impl FullNode {
                     dag_block_count: dag_width,
                     blue_score:      best_block.header.blue_score,
                 });
-                // Publish for RPC getblocktemplate
+                // Publish for RPC getblocktemplate — write to both
+                // the per-instance cell (the canonical reader for
+                // RPC handlers that hold an `Arc<MiningTemplateState>`
+                // via `RpcState`) and the process-default cell
+                // (retained so the legacy free-function readers
+                // still observe the current value).
+                self.mining_state.set_next_difficulty(next_diff);
                 set_next_difficulty(next_diff);
             }
         }
@@ -797,6 +891,7 @@ impl FullNode {
         // Update DAG tips for getblocktemplate — miners need current tips as parents
         let tips = self.dag_manager.get_tips();
         if !tips.is_empty() {
+            self.mining_state.set_dag_tips(tips.clone());
             set_dag_tips(tips);
         }
 
@@ -844,6 +939,50 @@ impl FullNode {
     // CONTRACT EXECUTION
     // ═══════════════════════════════════════════════════════════════════
 
+    /// Roll back a block's contract execution footprint in a single
+    /// consistent step:
+    ///
+    ///   1. Replay the block's contract undo record so the on-disk
+    ///      contract state matches the pre-block view.
+    ///   2. Delete every persisted receipt for the block's TX set
+    ///      (both from the RocksDB `receipt:*` prefix and from the
+    ///      in-memory `ReceiptStore`), so RPC clients stop seeing
+    ///      receipts that correspond to an orphaned block.
+    ///
+    /// Previously, rollback paths only called
+    /// `ContractStorage::rollback_block` and left the receipts in
+    /// place. RPC clients could then `eth_getTransactionReceipt` a
+    /// TX from the orphaned block and get back a receipt marked as
+    /// "included in block X" where block X is no longer part of the
+    /// canonical chain — a stale read that confuses every indexer.
+    fn rollback_contract_block(&self, block_hash: &str) {
+        // Contract state rollback — best-effort, a missing undo is
+        // non-fatal because some blocks may not have had any
+        // contract TXs and therefore carry no undo record.
+        if let Err(e) = self.contract_storage.rollback_block(block_hash) {
+            crate::slog_warn!("node", "contract_rollback_skipped",
+                block => block_hash, error => &format!("{}", e));
+        }
+
+        // Remove receipts for every TX in the block.
+        if let Some(block) = self.block_store.get_block(block_hash) {
+            let tx_hashes: Vec<String> = block
+                .body
+                .transactions
+                .iter()
+                .map(|tx| tx.hash.clone())
+                .collect();
+            if !tx_hashes.is_empty() {
+                use crate::domain::transaction::tx_receipt::delete_receipts_for_block;
+                delete_receipts_for_block(
+                    self.contract_storage.shared_db().as_ref(),
+                    &tx_hashes,
+                );
+                self.receipt_store.remove_tx_hashes(&tx_hashes);
+            }
+        }
+    }
+
     /// Execute contract transactions (ContractCreate, ContractCall) within a block.
     ///
     /// Uses a SINGLE shared ExecutionEnvironment across all TXs in the block
@@ -856,30 +995,46 @@ impl FullNode {
     ///   - receipt_root: SHA-256 of sorted receipt data (None if no contract TXs)
     ///   - state_root: StateManager root hash (None if no contract TXs)
     ///   - env: the ExecutionEnvironment (caller persists with undo on UTXO success)
+    ///
+    /// Takes `&self` so the VM's block context inherits the node's real
+    /// `NetworkMode` (the previous free-function form unconditionally
+    /// labelled the environment as "mainnet", so a testnet/regtest
+    /// deploy synthesized mainnet-style fallback addresses whenever the
+    /// address registry missed).
     fn execute_contract_transactions(
+        &self,
         block: &Block,
         contract_storage: &ContractStorage,
     ) -> (Vec<TxReceipt>, Option<String>, Option<String>, ExecutionEnvironment) {
+        // Thread the node's actual network through to the VM so
+        // `resolve_address` fallbacks use the right prefix.
+        let network_short = self.network.short_name().to_string();
+
+        // Wire up lazy contract loading so nested CALLs into
+        // addresses that weren't explicitly preloaded (because
+        // they weren't direct TX targets in this block) can
+        // load their code from disk on first touch.
         let mut env = ExecutionEnvironment::new(BlockContext {
             timestamp: block.header.timestamp,
             block_hash: block.header.hash.clone(),
-            // TODO: thread actual network identifier through block
-            // processing so VM-level address reconstruction matches
-            // the chain the node is running. Defaulting to mainnet
-            // here preserves the pre-refactor behaviour for the
-            // mainnet-only pipeline this node currently serves.
-            network: "mainnet".to_string(),
-        });
+            network: network_short,
+        })
+        .with_lazy_load_storage(Arc::clone(&self.contract_storage));
 
         let mut receipts = Vec::with_capacity(block.body.transactions.len());
         let mut has_contract_txs = false;
 
         // Pre-load referenced contracts from storage. `load_contract_from_storage`
-        // now returns `Result`; here we log any corruption loudly but
-        // keep processing so that a single corrupt contract entry
-        // doesn't abort the entire block pipeline. The per-TX execution
-        // path in the executor surfaces the error again if a caller
-        // actually tries to touch the corrupt account.
+        // returns `Err` only when the on-disk state exists but is corrupt
+        // (distinct from "genuinely absent"). A corrupt record is a
+        // consensus-visible data-integrity problem that the block executor
+        // must NOT paper over by silently continuing — doing so would
+        // execute later TXs against a stale/zeroed contract and diverge
+        // from the rest of the network. We emit an `Error` receipt for
+        // every contract TX in the block so the block commits cleanly
+        // (receipts + state remain consistent) but no contract code is
+        // actually executed against a corrupt substrate.
+        let mut preload_error: Option<String> = None;
         for tx in &block.body.transactions {
             match tx.tx_type {
                 TxType::ContractCreate => {
@@ -887,43 +1042,104 @@ impl FullNode {
                         .map(|i| i.owner.clone())
                         .unwrap_or_default();
                     if let Err(e) = env.load_contract_from_storage(contract_storage, &deployer) {
-                        crate::slog_error!("vm", "preload_deployer_failed",
+                        crate::slog_error!("vm", "preload_deployer_corrupt_surfacing_as_error",
                             deployer => &deployer, error => &format!("{}", e));
+                        preload_error = Some(format!(
+                            "corrupt contract state for deployer '{}': {}",
+                            deployer, e
+                        ));
+                        break;
                     }
                 }
                 TxType::ContractCall => {
-                    let target = tx.contract_address.clone().unwrap_or_else(|| {
-                        tx.outputs.first()
-                            .map(|o| o.address.clone())
-                            .unwrap_or_default()
-                    });
+                    // Reject a ContractCall that doesn't set `contract_address`
+                    // explicitly. The previous fallback to `outputs[0].address`
+                    // meant a malformed tx could silently execute against the
+                    // recipient of the value transfer, which is a completely
+                    // different contract.
+                    let target = match tx.contract_address.as_ref() {
+                        Some(a) if !a.is_empty() => a.clone(),
+                        _ => {
+                            crate::slog_error!("vm", "contract_call_missing_contract_address",
+                                tx => &tx.hash);
+                            preload_error = Some(format!(
+                                "ContractCall tx '{}' has no contract_address", tx.hash
+                            ));
+                            break;
+                        }
+                    };
                     if let Err(e) = env.load_contract_from_storage(contract_storage, &target) {
-                        crate::slog_error!("vm", "preload_target_failed",
+                        crate::slog_error!("vm", "preload_target_corrupt_surfacing_as_error",
                             target => &target, error => &format!("{}", e));
+                        preload_error = Some(format!(
+                            "corrupt contract state for target '{}': {}",
+                            target, e
+                        ));
+                        break;
                     }
                     let caller = tx.inputs.first()
                         .map(|i| i.owner.clone())
                         .unwrap_or_default();
                     if let Err(e) = env.load_contract_from_storage(contract_storage, &caller) {
-                        crate::slog_error!("vm", "preload_caller_failed",
+                        crate::slog_error!("vm", "preload_caller_corrupt_surfacing_as_error",
                             caller => &caller, error => &format!("{}", e));
-                    }
-
-                    // Load contract code into in-memory state
-                    if let Some(code_hex) = contract_storage.get_state(&format!("code:{}", target)) {
-                        if let Ok(code) = hex::decode(&code_hex) {
-                            if env.state.get_code(&target).is_empty() {
-                                env.state.set_code(&target, code).ok();
-                            }
-                        }
+                        preload_error = Some(format!(
+                            "corrupt contract state for caller '{}': {}",
+                            caller, e
+                        ));
+                        break;
                     }
                 }
                 _ => {}
             }
         }
 
+        // If pre-load surfaced corruption, degrade the whole block's
+        // contract TXs to Error receipts and skip execution. The block
+        // still commits (UTXO + receipts remain consistent) but no
+        // contract code runs against corrupt state.
+        if let Some(msg) = preload_error {
+            for (tx_index, tx) in block.body.transactions.iter().enumerate() {
+                let is_contract_tx = matches!(
+                    tx.tx_type,
+                    TxType::ContractCreate | TxType::ContractCall
+                );
+                if is_contract_tx {
+                    has_contract_txs = true;
+                    receipts.push(TxReceipt::from_execution(
+                        &tx.hash,
+                        &ExecutionResult::Error { gas_used: 0, message: msg.clone() },
+                        &block.header.hash, block.header.height, tx_index as u32,
+                    ));
+                } else {
+                    receipts.push(TxReceipt::from_execution(
+                        &tx.hash,
+                        &ExecutionResult::Success { gas_used: 0, return_data: vec![], logs: vec![] },
+                        &block.header.hash, block.header.height, tx_index as u32,
+                    ));
+                }
+            }
+            let (receipt_root, state_root) = if has_contract_txs {
+                (Some(compute_receipt_root(&receipts)), Some(env.state.state_root()))
+            } else {
+                (None, None)
+            };
+            return (receipts, receipt_root, state_root, env);
+        }
+
         // Execute each TX in block order through the shared environment
         for (tx_index, tx) in block.body.transactions.iter().enumerate() {
+            // Reset per-TRANSACTION VM state so EIP-6780's
+            // `created_in_tx` and EIP-211's `last_return_data`
+            // don't leak between sibling TXs inside the same block.
+            // The previous implementation only created one env per
+            // block and never reset these fields between TXs, so a
+            // SELFDESTRUCT in TX N+1 could observe a contract as
+            // "created in the same tx" because TX N had created it,
+            // and a RETURNDATASIZE in TX N+1 could read the trailing
+            // bytes TX N's last CALL left behind.
+            env.begin_tx();
+
             match tx.tx_type {
                 TxType::ContractCreate => {
                     has_contract_txs = true;
@@ -936,7 +1152,6 @@ impl FullNode {
                             Some(ph) => match hex::decode(ph) {
                                 Ok(bytes) => bytes,
                                 Err(_) => {
-                                    // Empty receipt for unparseable TX
                                     receipts.push(TxReceipt::from_execution(
                                         &tx.hash,
                                         &ExecutionResult::Error { gas_used: 0, message: "invalid deploy payload".into() },
@@ -959,24 +1174,90 @@ impl FullNode {
                     let deployer = tx.inputs.first()
                         .map(|i| i.owner.clone())
                         .unwrap_or_default();
+                    if deployer.is_empty() {
+                        receipts.push(TxReceipt::from_execution(
+                            &tx.hash,
+                            &ExecutionResult::Error { gas_used: 0, message: "ContractCreate missing deployer (no inputs)".into() },
+                            &block.header.hash, block.header.height, tx_index as u32,
+                        ));
+                        continue;
+                    }
                     let value = tx.outputs.first()
                         .map(|o| o.amount)
                         .unwrap_or(0);
                     let gas_limit = tx.gas_limit.unwrap_or(10_000_000u64);
 
-                    // Generate deterministic contract address
-                    let contract_addr = {
-                        use sha2::{Sha256, Digest};
-                        let mut hasher = Sha256::new();
-                        hasher.update(deployer.as_bytes());
-                        hasher.update(&payload);
-                        hasher.update(0u64.to_le_bytes()); // nonce
-                        hex::encode(hasher.finalize())[..40].to_string()
+                    // Compute the contract address via the canonical
+                    // `ContractDeployer::compute_create_address`
+                    // helper so the block-apply path produces the
+                    // SAME address the inline CREATE opcode and the
+                    // executor deploy path produce for the same
+                    // inputs. The previous ad-hoc
+                    // `sha256(deployer || payload || 0)` disagreed
+                    // on every axis:
+                    //
+                    //   - no network prefix → no `SD1c…` /
+                    //     `ST1c…` form, so the stored address
+                    //     couldn't round-trip through the address
+                    //     registry,
+                    //   - no domain separator → hash collided with
+                    //     any other (deployer, payload) pair that
+                    //     any other code happened to hash,
+                    //   - fixed `nonce = 0` → re-deploying the same
+                    //     code from the same deployer always
+                    //     landed at the same address (guaranteed
+                    //     EIP-684 collision after the first deploy).
+                    //
+                    // We read the deployer's current nonce from
+                    // state and increment it after a successful
+                    // deploy, matching Ethereum's CREATE semantics.
+                    let deployer_nonce = env.state.get_nonce(&deployer);
+                    let contract_addr = match crate::runtime::vm::contracts::contract_deployer::ContractDeployer::compute_create_address(&deployer, deployer_nonce) {
+                        Ok(addr) => addr,
+                        Err(e) => {
+                            slog_error!("node", "contract_deploy_address_derivation_failed",
+                                tx => &tx.hash, deployer => &deployer, error => &format!("{}", e));
+                            receipts.push(TxReceipt::from_execution(
+                                &tx.hash,
+                                &ExecutionResult::Error {
+                                    gas_used: 0,
+                                    message: format!("contract address derivation failed: {}", e),
+                                },
+                                &block.header.hash, block.header.height, tx_index as u32,
+                            ));
+                            continue;
+                        }
                     };
+
+                    // Take a snapshot BEFORE installing the init code
+                    // so a failing constructor / rejected runtime
+                    // code can roll back every side effect —
+                    // including the temporary `set_code(init)` and
+                    // any storage mutations the constructor made.
+                    // The previous code installed the init code
+                    // outside any snapshot, so a failing
+                    // constructor left the init code sitting in
+                    // state: a subsequent call to that address
+                    // would run the init code as runtime code, which
+                    // is a completely different EVM program.
+                    let deploy_snapshot = env.state.snapshot();
 
                     // Phase 1: Install the INIT code as the new contract's
                     // temporary code so execute_frame has something to run.
-                    env.state.set_code(&contract_addr, payload.to_vec()).ok();
+                    if let Err(e) = env.state.set_code(&contract_addr, payload.to_vec()) {
+                        env.state.rollback(deploy_snapshot).ok();
+                        slog_error!("node", "contract_deploy_init_set_code_failed",
+                            tx => &tx.hash, address => &contract_addr, error => &format!("{}", e));
+                        receipts.push(TxReceipt::from_execution(
+                            &tx.hash,
+                            &ExecutionResult::Error {
+                                gas_used: 0,
+                                message: format!("init code set failed: {}", e),
+                            },
+                            &block.header.hash, block.header.height, tx_index as u32,
+                        ));
+                        continue;
+                    }
 
                     let call_ctx = CallContext {
                         address: contract_addr.clone(),
@@ -999,27 +1280,43 @@ impl FullNode {
                             // init code with it and validate (EIP-3541, size).
                             // If RETURN was empty, keep the init code as the
                             // runtime code — the simple "raw runtime" pattern.
-                            //
-                            // This matches the inline CREATE/CREATE2 opcode
-                            // path in execution_env.rs:1117-1125 and the
-                            // top-level Executor::deploy, so all three deploy
-                            // entry points now produce the same runtime code
-                            // for the same inputs — previously, this block-
-                            // application path silently kept the init code as
-                            // the stored runtime code, diverging from the
-                            // inline CREATE opcode.
                             if !return_data.is_empty() {
                                 match crate::runtime::vm::contracts::contract_deployer::ContractDeployer::validate_runtime_code(&return_data) {
                                     Ok(()) => {
-                                        let _ = env.state.set_code(&contract_addr, return_data.clone());
+                                        if let Err(e) = env.state.set_code(&contract_addr, return_data.clone()) {
+                                            // set_code of runtime code
+                                            // failed — roll the entire
+                                            // deployment back so neither
+                                            // the init code NOR the
+                                            // constructor's storage
+                                            // mutations linger.
+                                            env.state.rollback(deploy_snapshot).ok();
+                                            slog_error!("node", "contract_deploy_runtime_set_code_failed",
+                                                tx => &tx.hash, address => &contract_addr, error => &format!("{}", e));
+                                            receipts.push(TxReceipt::from_execution(
+                                                &tx.hash,
+                                                &ExecutionResult::Error {
+                                                    gas_used,
+                                                    message: format!("runtime code set failed: {}", e),
+                                                },
+                                                &block.header.hash, block.header.height, tx_index as u32,
+                                            ));
+                                            continue;
+                                        }
                                     }
                                     Err(e) => {
                                         // Invalid runtime code (e.g. 0xEF
-                                        // prefix per EIP-3541). Surface as
-                                        // an execution error — the contract
-                                        // is NOT deployed. This matches the
-                                        // semantics Ethereum uses when init
-                                        // code returns bad runtime code.
+                                        // prefix per EIP-3541). Roll back
+                                        // EVERY constructor side effect —
+                                        // including init code, storage
+                                        // writes, transferred value —
+                                        // so the failed deploy is
+                                        // indistinguishable from "never
+                                        // happened". The previous code
+                                        // left the init code + storage
+                                        // committed and only emitted an
+                                        // Error receipt.
+                                        env.state.rollback(deploy_snapshot).ok();
                                         slog_error!("node", "contract_deploy_runtime_code_rejected",
                                             tx => &tx.hash,
                                             address => &contract_addr,
@@ -1038,13 +1335,46 @@ impl FullNode {
                                     }
                                 }
                             }
+                            // Success path: commit the snapshot and
+                            // bump the deployer's nonce. The nonce
+                            // bump is what guarantees that the next
+                            // deploy from the same deployer lands at
+                            // a distinct contract address — failing
+                            // to increment it would let every
+                            // subsequent ContractCreate collide.
+                            env.state.commit(deploy_snapshot).ok();
+                            let _ = env.state.increment_nonce(&deployer);
                             ExecutionResult::Success { gas_used, return_data, logs }
                         }
                         CallOutcome::Revert { gas_used, return_data } => {
+                            // Revert path: roll back the init
+                            // code + constructor effects, not just
+                            // the call's own snapshot. The
+                            // inner `execute_frame` already rolled
+                            // back its own nested snapshot, but the
+                            // `set_code(init)` we did above was
+                            // OUTSIDE that nested snapshot, so we
+                            // still need to rewind our own one.
+                            env.state.rollback(deploy_snapshot).ok();
                             ExecutionResult::Revert { gas_used, reason: String::from_utf8_lossy(&return_data).to_string() }
                         }
                         CallOutcome::Failure { gas_used } => {
-                            ExecutionResult::OutOfGas { gas_used }
+                            // Same rollback reasoning as Revert.
+                            env.state.rollback(deploy_snapshot).ok();
+                            // Map to `Error` instead of `OutOfGas`:
+                            // `CallOutcome::Failure` covers stack
+                            // underflow, static violations, value
+                            // transfer rejection, invalid opcode,
+                            // and depth limit in addition to true
+                            // out-of-gas. Labelling every one of
+                            // those as `OutOfGas` in the receipt
+                            // misleads RPC clients that rely on the
+                            // variant tag to decide whether to
+                            // retry with more gas.
+                            ExecutionResult::Error {
+                                gas_used,
+                                message: "constructor execution failed".into(),
+                            }
                         }
                     };
 
@@ -1072,11 +1402,25 @@ impl FullNode {
                 TxType::ContractCall => {
                     has_contract_txs = true;
 
-                    let target = tx.contract_address.clone().unwrap_or_else(|| {
-                        tx.outputs.first()
-                            .map(|o| o.address.clone())
-                            .unwrap_or_default()
-                    });
+                    // `contract_address` is REQUIRED. The fallback
+                    // to `outputs[0].address` silently rerouted
+                    // calls to whatever address happened to be the
+                    // recipient of the value transfer — a completely
+                    // different contract.
+                    let target = match tx.contract_address.as_ref() {
+                        Some(a) if !a.is_empty() => a.clone(),
+                        _ => {
+                            receipts.push(TxReceipt::from_execution(
+                                &tx.hash,
+                                &ExecutionResult::Error {
+                                    gas_used: 0,
+                                    message: "ContractCall missing contract_address".into(),
+                                },
+                                &block.header.hash, block.header.height, tx_index as u32,
+                            ));
+                            continue;
+                        }
+                    };
                     let calldata = if let Some(ref cd) = tx.calldata {
                         cd.clone()
                     } else {
@@ -1105,10 +1449,62 @@ impl FullNode {
                     let caller = tx.inputs.first()
                         .map(|i| i.owner.clone())
                         .unwrap_or_default();
+                    if caller.is_empty() {
+                        receipts.push(TxReceipt::from_execution(
+                            &tx.hash,
+                            &ExecutionResult::Error { gas_used: 0, message: "ContractCall missing caller (no inputs)".into() },
+                            &block.header.hash, block.header.height, tx_index as u32,
+                        ));
+                        continue;
+                    }
                     let value = tx.outputs.first()
                         .map(|o| o.amount)
                         .unwrap_or(0);
                     let gas_limit = tx.gas_limit.unwrap_or(10_000_000u64);
+
+                    // Lazy-load the target's code from disk on
+                    // first touch. `load_contract_from_storage`
+                    // only populates the account row; the code
+                    // blob lives under `code:{addr}` and is read
+                    // here. Previously this was a no-error `.ok()`
+                    // — so a set_code failure (disk full,
+                    // permissions, corruption) silently dropped
+                    // the contract's runtime code and the CALL
+                    // executed as if it were an empty address.
+                    if let Some(code_hex) = contract_storage.get_state(&format!("code:{}", target)) {
+                        match hex::decode(&code_hex) {
+                            Ok(code) => {
+                                if env.state.get_code(&target).is_empty() {
+                                    if let Err(e) = env.state.set_code(&target, code) {
+                                        slog_error!("node", "contract_call_code_load_set_code_failed",
+                                            target => &target, error => &format!("{}", e));
+                                        receipts.push(TxReceipt::from_execution(
+                                            &tx.hash,
+                                            &ExecutionResult::Error {
+                                                gas_used: 0,
+                                                message: format!("load contract code: {}", e),
+                                            },
+                                            &block.header.hash, block.header.height, tx_index as u32,
+                                        ));
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                slog_error!("node", "contract_call_code_hex_corrupt",
+                                    target => &target, error => &format!("{}", e));
+                                receipts.push(TxReceipt::from_execution(
+                                    &tx.hash,
+                                    &ExecutionResult::Error {
+                                        gas_used: 0,
+                                        message: format!("contract code is not valid hex: {}", e),
+                                    },
+                                    &block.header.hash, block.header.height, tx_index as u32,
+                                ));
+                                continue;
+                            }
+                        }
+                    }
 
                     let call_ctx = CallContext {
                         address: target.clone(),
@@ -1131,7 +1527,12 @@ impl FullNode {
                             ExecutionResult::Revert { gas_used, reason: String::from_utf8_lossy(&return_data).to_string() }
                         }
                         CallOutcome::Failure { gas_used } => {
-                            ExecutionResult::OutOfGas { gas_used }
+                            // See the ContractCreate branch above
+                            // for why Failure → Error, not OutOfGas.
+                            ExecutionResult::Error {
+                                gas_used,
+                                message: "contract call failed".into(),
+                            }
                         }
                     };
 
