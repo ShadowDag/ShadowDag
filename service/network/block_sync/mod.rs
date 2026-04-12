@@ -272,8 +272,15 @@ impl BlockSyncManager {
 
     pub fn on_headers_received(&self, headers: Vec<SyncHeader>) {
         if headers.is_empty() {
-            self.set_phase(SyncPhase::BlockSync);
-            self.enqueue_block_downloads();
+            // Peer has no more headers. Only transition to BlockSync
+            // if we actually have headers to download blocks for.
+            let has_pending = !self.headers.read().unwrap_or_else(|e| e.into_inner()).is_empty();
+            if has_pending {
+                self.set_phase(SyncPhase::BlockSync);
+                self.enqueue_block_downloads();
+            } else {
+                log::warn!("on_headers_received: peer sent empty headers but we have nothing to download");
+            }
             return;
         }
 
@@ -302,6 +309,19 @@ impl BlockSyncManager {
         if headers.is_empty() {
             log::warn!("on_headers_received: all headers rejected by validation");
             return;
+        }
+
+        // Verify headers are in ascending height order (basic continuity)
+        let mut prev_h = 0u64;
+        for h in &headers {
+            if h.height > 0 && h.height <= prev_h {
+                log::warn!(
+                    "on_headers_received: header height not ascending (height={}, prev={})",
+                    h.height, prev_h
+                );
+                return; // Reject entire batch
+            }
+            prev_h = h.height;
         }
 
         let mut map = self.headers.write().unwrap_or_else(|e| e.into_inner());
@@ -367,7 +387,8 @@ impl BlockSyncManager {
         let mut inflight    = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
         let mut batch       = Vec::new();
 
-        while batch.len() < MAX_BLOCK_BATCH {
+        let inflight_count = inflight.len();
+        while batch.len() < MAX_BLOCK_BATCH && (inflight_count + batch.len()) < MAX_CONCURRENT_DOWNLOADS {
             match pending.pop_front() {
                 Some(mut job) => {
                     job.assigned_to = peer.to_string();
@@ -431,14 +452,19 @@ impl BlockSyncManager {
     }
 
     pub fn on_block_failed(&self, hash: &str, peer: &str) {
-        let mut inflight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-        let mut pending  = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inflight    = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending     = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending_set = self.pending_set.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(mut job) = inflight.remove(hash) {
             job.retries += 1;
             if job.retries < MAX_RETRIES {
-                pending.push_back(job);
-            } 
+                // Check pending_set before re-adding to avoid duplicate entries
+                if !pending_set.contains(&job.hash) {
+                    pending_set.insert(job.hash.clone());
+                    pending.push_back(job);
+                }
+            }
         }
 
         let mut states = self.peer_states.write().unwrap_or_else(|e| e.into_inner());

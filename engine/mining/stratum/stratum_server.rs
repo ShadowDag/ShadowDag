@@ -362,6 +362,17 @@ impl StratumServer {
                     return StratumResponse::err(req.id, "invalid mining address");
                 }
 
+                // Validate mining address format (not just length)
+                let addr_valid = address.len() >= 20
+                    && address.len() <= 64
+                    && (address.starts_with("SD1")
+                        || address.starts_with("ST1")
+                        || address.starts_with("SR1")
+                        || address.chars().all(|c| c.is_ascii_alphanumeric()));
+                if !addr_valid {
+                    return StratumResponse::err(req.id, "Invalid mining address format");
+                }
+
                 // Retrieve the worker_id that was assigned during Subscribe for
                 // this connection. This eliminates the race where concurrent
                 // subscribe/authorize pairs could read the wrong ID.
@@ -442,7 +453,13 @@ impl StratumServer {
             // Prevent unbounded memory growth. Templates rotate frequently
             // so old shares are irrelevant anyway.
             if seen.len() > 100_000 {
+                // Partial eviction — keep roughly half to minimize replay window.
+                // Clearing everything opens a replay window for recently
+                // submitted shares. Keeping ~50K entries ensures recent shares
+                // remain protected while still bounding memory.
+                let keep: Vec<_> = seen.iter().take(50_000).cloned().collect();
                 seen.clear();
+                for k in keep { seen.insert(k); }
                 seen.insert(share_key);
             }
         }
@@ -470,9 +487,11 @@ impl StratumServer {
         if share_valid {
             worker.accept_share();
 
-            // Periodically adjust worker difficulty based on share rate
-            let elapsed = now_secs().saturating_sub(worker.connected_at);
-            if elapsed > 0 && elapsed % VARDIFF_INTERVAL_SEC == 0 {
+            // Adjust difficulty when enough shares have accumulated in
+            // the current window. The old approach (elapsed % 60 == 0)
+            // was fragile — it could miss the exact second or fire
+            // multiple times. Checking shares_in_window is deterministic.
+            if worker.shares_in_window >= TARGET_SHARES_PER_MIN {
                 if worker.vardiff_adjust() {
                     // TODO: Send mining.set_difficulty notification to worker
                 }
@@ -569,6 +588,8 @@ impl StratumServer {
         // to prevent a single malicious client from exhausting memory.
         let mut limited_reader = reader;
         let mut line_buf = String::new();
+        let mut parse_errors = 0u32;
+        const MAX_PARSE_ERRORS: u32 = 50;
         loop {
             line_buf.clear();
             if !self.running.load(Ordering::Relaxed) { break; }
@@ -611,6 +632,12 @@ impl StratumServer {
             let request = match Self::parse_json_rpc(&line) {
                 Ok(req) => req,
                 Err(e) => {
+                    parse_errors += 1;
+                    if parse_errors >= MAX_PARSE_ERRORS {
+                        slog_warn!("stratum", "too_many_parse_errors",
+                            peer => peer_addr, errors => parse_errors);
+                        break; // Disconnect — likely a misbehaving or malicious client
+                    }
                     let err_resp = format!(
                         "{{\"id\":null,\"result\":null,\"error\":\"Parse error: {}\"}}\n", e
                     );
