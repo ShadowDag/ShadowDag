@@ -685,6 +685,18 @@ impl BlockValidator {
             }
         }
 
+        // Validate selected_parent is a member of parents (if set).
+        // The reorg path walks selected_parent to find fork points,
+        // so an invalid selected_parent would cause incorrect chain
+        // traversal.
+        if let Some(ref sp) = block.header.selected_parent {
+            if !block.header.parents.contains(sp) {
+                return Err(ConsensusError::BlockValidation(format!(
+                    "selected_parent {} is not in parents list", &sp[..sp.len().min(16)]
+                )));
+            }
+        }
+
         Ok(())
     }
 

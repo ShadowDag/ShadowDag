@@ -40,7 +40,7 @@ use crate::service::mempool::pools::tx_pool::TxPoolResult;
 use crate::service::network::nodes::full_node::FullNode;
 use crate::service::network::p2p::p2p::{P2P, P2PMessage, push_outbound, drain_pending_txs, drain_pending_blocks, requeue_pending_blocks, requeue_pending_txs, report_bad_peer, report_bad_peer_cat};
 use crate::engine::dag::security::dag_shield::DagShield;
-use crate::service::network::dos_guard::BanCategory;
+use crate::service::network::dos_guard::{BanCategory, MAX_TX_BYTES};
 use crate::service::network::rpc::rpc_server::RpcServer;
 use crate::engine::consensus::finality::FinalityManager;
 
@@ -394,6 +394,22 @@ impl DaemonNode {
                 {
                     let mut mempool = self.mempool.lock();
                     for (peer_id, tx) in txs.into_iter() {
+                        // ── TX size check (defense-in-depth) ────────
+                        // Reject oversized transactions before expensive
+                        // validation. Uses the canonical serialization
+                        // length against the DoS guard constant.
+                        let tx_size = tx.canonical_bytes().len();
+                        if tx_size > MAX_TX_BYTES {
+                            total_txs_rejected += 1;
+                            report_bad_peer_cat(
+                                &peer_id,
+                                BAN_SCORE_INVALID_TX,
+                                &format!("TX_TOO_LARGE: {} > {}", tx_size, MAX_TX_BYTES),
+                                BanCategory::Malformed,
+                            );
+                            continue;
+                        }
+
                         // ── DagShield safety net (defense-in-depth) ──
                         if let Err(rej) = DagShield::pre_validate_tx(&tx) {
                             total_txs_rejected += 1;

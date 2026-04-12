@@ -421,13 +421,20 @@ fn rpc_call(addr: &str, method: &str, params: &str) -> Option<String> {
 fn rpc_get_template(addr: &str) -> Option<BlockTemplate> {
     let response = rpc_call(addr, "getblocktemplate", "")?;
 
-    let height = extract_json_u64(&response, "height")?;
-    let prev_hash = extract_json_str(&response, "prev_hash")?;
-    let difficulty = extract_json_u64(&response, "difficulty").unwrap_or(1);
-    let total_fees = extract_json_u64(&response, "total_fees").unwrap_or(0);
+    let parsed: serde_json::Value = serde_json::from_str(&response).ok()?;
+    let result = parsed.get("result")?;
 
-    // Parse DAG parent hashes — the tips the miner must reference
-    let parent_hashes = extract_json_str_array(&response, "parent_hashes")
+    let height = result.get("height").and_then(|v| v.as_u64())?;
+    let prev_hash = result.get("prev_hash").and_then(|v| v.as_str())?.to_string();
+    let difficulty = result.get("difficulty").and_then(|v| v.as_u64()).unwrap_or(1);
+    let total_fees = result.get("total_fees").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    // Parse DAG parent hashes -- the tips the miner must reference
+    let parent_hashes = result.get("parent_hashes")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect::<Vec<String>>())
         .unwrap_or_else(|| vec![prev_hash.clone()]);
 
     Some(BlockTemplate { height, prev_hash, parent_hashes, difficulty, total_fees })
@@ -466,52 +473,32 @@ fn rpc_submit_block(addr: &str, block: &Block) -> SubmitResult {
     let params = format!(r#""{}""#, block_str.replace('"', r#"\""#));
     match rpc_call(addr, "submitblock", &params) {
         Some(response) => {
-            if response.contains("\"error\"") && !response.contains("\"error\":null") {
-                // Extract error message
-                let reason = extract_json_str(&response, "message")
-                    .unwrap_or_else(|| response[..response.len().min(200)].to_string());
-                SubmitResult::Rejected(reason)
-            } else {
-                SubmitResult::Accepted
+            match serde_json::from_str::<serde_json::Value>(&response) {
+                Ok(parsed) => {
+                    // Check if the response contains a non-null error field
+                    match parsed.get("error") {
+                        Some(err) if !err.is_null() => {
+                            let reason = err.get("message")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or_else(|| {
+                                    err.as_str().unwrap_or("unknown error")
+                                })
+                                .to_string();
+                            SubmitResult::Rejected(reason)
+                        }
+                        _ => SubmitResult::Accepted,
+                    }
+                }
+                Err(_) => {
+                    // Unparseable response -- treat as rejection
+                    SubmitResult::Rejected(
+                        response[..response.len().min(200)].to_string()
+                    )
+                }
             }
         }
         None => SubmitResult::ConnError,
     }
-}
-
-fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
-    let pattern = format!(r#""{}":"#, key);
-    let pos = json.find(&pattern)? + pattern.len();
-    let rest = &json[pos..];
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-    rest[..end].trim().parse().ok()
-}
-
-fn extract_json_str(json: &str, key: &str) -> Option<String> {
-    let pattern = format!(r#""{}":""#, key);
-    let pos = json.find(&pattern)? + pattern.len();
-    let rest = &json[pos..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
-}
-
-/// Extract a JSON array of strings: "key":["a","b","c"]
-fn extract_json_str_array(json: &str, key: &str) -> Option<Vec<String>> {
-    let pattern = format!(r#""{}":["#, key);
-    let pos = json.find(&pattern)? + pattern.len();
-    let rest = &json[pos..];
-    let end = rest.find(']')?;
-    let inner = &rest[..end];
-    if inner.trim().is_empty() {
-        return Some(vec![]);
-    }
-    let items: Vec<String> = inner.split(',')
-        .filter_map(|s| {
-            let s = s.trim().trim_matches('"');
-            if s.is_empty() { None } else { Some(s.to_string()) }
-        })
-        .collect();
-    Some(items)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

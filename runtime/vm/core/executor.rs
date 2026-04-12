@@ -24,11 +24,28 @@ pub const MAX_CONTRACT_SIZE: usize = 24 * 1024; // 24 KB
 
 pub struct Executor {
     context: VMContext,
+    /// Network identifier passed through to `BlockContext::network`
+    /// so that address resolution uses the correct prefix
+    /// (`"mainnet"` / `"testnet"` / `"regtest"`).
+    network: String,
 }
 
 impl Executor {
+    /// Create an Executor that defaults to `"mainnet"`.
+    ///
+    /// Prefer [`Self::new_with_network`] when the caller knows the
+    /// actual network (RPC endpoints, test harnesses, etc.).
     pub fn new(context: VMContext) -> Self {
-        Self { context }
+        Self { context, network: "mainnet".to_string() }
+    }
+
+    /// Create an Executor with an explicit network identifier.
+    ///
+    /// The `network` string is forwarded verbatim to every
+    /// `BlockContext` the executor creates, so `ExecutionEnvironment`
+    /// address-resolution fallbacks use the correct prefix.
+    pub fn new_with_network(context: VMContext, network: String) -> Self {
+        Self { context, network }
     }
 
     /// Deploy a new contract. Returns the contract address.
@@ -164,7 +181,7 @@ impl Executor {
         let mut env = ExecutionEnvironment::new(BlockContext {
             timestamp,
             block_hash: block_hash.to_string(),
-            network: "mainnet".to_string(),
+            network: self.network.clone(),
         });
 
         // Load deployer account from persistent storage. Propagate any
@@ -349,7 +366,7 @@ impl Executor {
         let mut env = ExecutionEnvironment::new(BlockContext {
             timestamp,
             block_hash: block_hash.to_string(),
-            network: "mainnet".to_string(),
+            network: self.network.clone(),
         });
 
         // Load contract and caller accounts from persistent storage. A
