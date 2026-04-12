@@ -80,9 +80,11 @@ impl SyncManager {
         true
     }
 
-    pub fn on_headers_received(&mut self, hashes: Vec<String>, _peer: &str) {
+    pub fn on_headers_received(&mut self, hashes: Vec<String>, peer: &str) {
+        // Remove pending header requests from this peer (the request
+        // key is from_hash, not the received hash — they're different).
+        self.pending_headers.retain(|_, req| req.peer != peer);
         for hash in &hashes {
-            self.pending_headers.remove(hash); // Clean up pending state
             if !self.downloaded_blocks.contains(hash) && !self.block_queue.contains(hash) {
                 self.block_queue.push_back(hash.clone());
             }
@@ -106,10 +108,16 @@ impl SyncManager {
     }
 
     pub fn on_block_received(&mut self, hash: &str) {
-        self.pending_blocks.remove(hash);
+        let was_pending = self.pending_blocks.remove(hash).is_some();
+        if !was_pending {
+            return; // Unsolicited block — ignore
+        }
         self.downloaded_blocks.insert(hash.to_string());
         if self.pending_blocks.is_empty() && self.block_queue.is_empty() {
-            self.local_height = self.best_height;
+            // Don't jump local_height — it should be updated by the
+            // caller after each block is actually validated and applied.
+            // Setting it here to best_height creates a false "synced"
+            // state even if downloaded blocks failed validation.
             self.state = SyncState::Synced;
         }
     }
@@ -155,6 +163,11 @@ impl SyncManager {
         }
 
         retry_list
+    }
+
+    /// Get the next header hash to re-request from the retry queue.
+    pub fn next_header_retry(&mut self) -> Option<String> {
+        self.header_queue.pop_front()
     }
 
     pub fn is_synced(&self)               -> bool    { self.state == SyncState::Synced }

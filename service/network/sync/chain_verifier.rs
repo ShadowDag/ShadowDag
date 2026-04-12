@@ -101,6 +101,11 @@ impl ChainVerifier {
             //    The previous leading-zeros check silently skipped PoW for
             //    difficulty > 64, and used a weaker difficulty metric than
             //    the actual consensus rule.
+            // NOTE: We verify that header.hash meets the difficulty target,
+            // but we do NOT recompute the hash from header fields here.
+            // Full hash recomputation requires the block body (for shadow_hash),
+            // which is unavailable during header-only sync. The block validator
+            // performs full hash verification when the block body is downloaded.
             if header.difficulty > 0 {
                 use crate::engine::mining::pow::pow_validator::PowValidator;
                 if !PowValidator::hash_meets_target(&header.hash, header.difficulty) {
@@ -109,6 +114,13 @@ impl ChainVerifier {
                         hash: header.hash.clone(),
                     };
                 }
+            } else if header.height > 0 {
+                // Non-genesis header with difficulty 0 is invalid — it would
+                // bypass PoW entirely.
+                return ChainVerifyResult::InvalidPoW {
+                    height: header.height,
+                    hash: format!("difficulty=0 on non-genesis height {}", header.height),
+                };
             }
 
             // 2b. Parent continuity

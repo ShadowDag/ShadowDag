@@ -339,6 +339,9 @@ impl BlockSyncManager {
                 .get(hash).cloned()
             {
                 let cur = self.local_height.load(Ordering::SeqCst);
+                // NOTE: In a DAG, height gaps are expected. This update
+                // does NOT guarantee all blocks below this height exist.
+                // The Synced check uses a 5-block tolerance (local >= best-5).
                 if hdr.height > cur {
                     self.local_height.store(hdr.height, Ordering::SeqCst);
                 }
