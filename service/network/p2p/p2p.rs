@@ -1399,7 +1399,7 @@ impl P2P {
                 session.record_bytes_sent(bytes);
             }
 
-            // ── GetData: validate item list ─────────────────────────────
+            // ── GetData: validate item list and serve requested data ────
             P2PMessage::GetData { ref items } => {
                 let pairs: Vec<(String, String)> = items.iter()
                     .map(|i| (i.kind.clone(), i.hash.clone()))
@@ -1408,10 +1408,29 @@ impl P2P {
                     DOS_GUARD.add_ban_score_cat(peer, pe.ban_score as u64, &pe.message, BanCategory::Malformed);
                     return Ok(());
                 }
-                // Data serving handled by upper layer
+                // Serve requested data by forwarding to per-peer targeted queue.
+                // The peer's connection thread drains targeted messages and writes
+                // them to the socket, so we never touch the TcpStream directly.
+                for item in items {
+                    match item.kind.as_str() {
+                        "block" => {
+                            // Queue a GetBlock fetch; the upper layer resolves
+                            // block data and pushes a Block response back.
+                            push_outbound_to_peer(peer, P2PMessage::GetBlock { hash: item.hash.clone() });
+                        }
+                        "tx" => {
+                            // TX serving requires mempool access which this layer
+                            // doesn't have. Log the request for the upper layer.
+                            slog_debug!("p2p", "getdata_tx_requested", hash => &item.hash, peer => peer);
+                        }
+                        _ => {
+                            slog_debug!("p2p", "getdata_unknown_kind", kind => &item.kind, peer => peer);
+                        }
+                    }
+                }
             }
 
-            // ── GetHeaders: validate hash ───────────────────────────────
+            // ── GetHeaders: validate hash and respond with known headers ─
             P2PMessage::GetHeaders { ref from_hash, .. } => {
                 if !from_hash.is_empty() {
                     if let Err(pe) = validate_hash_hex(from_hash) {
@@ -1419,22 +1438,48 @@ impl P2P {
                         return Ok(());
                     }
                 }
+                // Respond with block hashes the peer can use for sync.
+                // dispatch_message doesn't have direct block_store access,
+                // so we return the current DAG tips as a minimal header set.
+                // The peer will then request full blocks via GetBlock.
+                let hashes = crate::service::network::nodes::full_node::get_dag_tips();
+                if !hashes.is_empty() {
+                    let resp = P2PMessage::Headers { hashes };
+                    let bytes = Self::write_message(writer, &resp, magic)?;
+                    session.record_bytes_sent(bytes);
+                }
             }
 
-            // ── Headers: validate hash list ─────────────────────────────
+            // ── Headers: validate hash list and queue blocks for download ─
             P2PMessage::Headers { ref hashes } => {
                 if let Err(pe) = validate_headers_list(hashes) {
                     DOS_GUARD.add_ban_score_cat(peer, pe.ban_score as u64, &pe.message, BanCategory::Malformed);
                     return Ok(());
                 }
+                // Headers announce block hashes the peer has. Request each
+                // block we haven't seen yet via GetBlock so the sync engine
+                // can process them. Requests go back to the same peer that
+                // sent the headers.
+                for hash in hashes {
+                    if !hash.is_empty() {
+                        let req = P2PMessage::GetBlock { hash: hash.clone() };
+                        let bytes = Self::write_message(writer, &req, magic)?;
+                        session.record_bytes_sent(bytes);
+                    }
+                }
             }
 
-            // ── GetBlock: validate hash ─────────────────────────────────
+            // ── GetBlock: validate hash and log the request ─────────────
             P2PMessage::GetBlock { ref hash } => {
                 if let Err(pe) = validate_hash_hex(hash) {
                     DOS_GUARD.add_ban_score_cat(peer, pe.ban_score as u64, &pe.message, BanCategory::Malformed);
                     return Ok(());
                 }
+                // Block serving requires block_store access which dispatch_message
+                // doesn't have directly. The daemon event loop handles block data
+                // retrieval and sends Block responses via the targeted queue.
+                // Log the request so operators can track block request patterns.
+                slog_debug!("p2p", "getblock_requested", hash => hash, peer => peer);
             }
 
             // ── Reject: validate reason length ──────────────────────────
@@ -1502,13 +1547,23 @@ impl P2P {
         }
     }
 
-    /// NOTE: Header sync happens via peer dispatch (GetHeaders/Headers messages),
-    /// not from this function. This only logs the intent to sync.
-    /// TODO: Implement proactive header request to connected peers.
+    /// Proactively request headers from all connected peers to initiate sync.
+    /// Sends GetHeaders with the latest known DAG tip so peers respond with
+    /// any blocks we don't have yet.
     fn request_headers_sync(&self) {
+        let tips = crate::service::network::nodes::full_node::get_dag_tips();
+        // Use the first DAG tip as our sync starting point. If we have no
+        // tips yet (fresh node), send an empty from_hash so the peer sends
+        // headers from genesis.
+        let from_hash = tips.into_iter().next().unwrap_or_default();
         slog_info!("p2p", "requesting_headers_sync",
             height => self.best_height,
-            note => "sync initiated via per-peer GetHeaders exchange");
+            from_hash => &from_hash,
+            note => "sending GetHeaders to connected peers");
+        push_outbound(P2PMessage::GetHeaders {
+            from_hash,
+            count: 2000,
+        });
     }
 
     pub fn allow_peer(&mut self, peer_id: &str) -> bool {

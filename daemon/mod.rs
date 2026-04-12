@@ -359,7 +359,12 @@ impl DaemonNode {
                             total_blocks_rejected += 1;
                             let err_msg = e.to_string().to_lowercase();
                             // "already exists" is normal during sync — don't penalize
-                            if !err_msg.contains(ERR_ALREADY_EXISTS) && !err_msg.contains(ERR_ORPHAN) {
+                            if !err_msg.contains(ERR_ALREADY_EXISTS)
+                                && !err_msg.contains(ERR_ORPHAN)
+                                && !err_msg.contains("peer is banned")
+                                && !err_msg.contains("rate_limited")
+                                && !err_msg.contains("dos_rejected")
+                            {
                                 // Ban feedback: penalize peer that sent the bad block
                                 report_bad_peer_cat(peer_id, BAN_SCORE_INVALID_BLOCK, "invalid block rejected by consensus", BanCategory::Malformed);
                                 slog_error!("daemon", "block_rejected_consensus", hash => hash_prefix, peer => peer_id, error => err_msg);

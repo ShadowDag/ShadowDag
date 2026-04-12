@@ -514,25 +514,24 @@ impl StratumServer {
             }
         };
 
-        // Set a non-blocking accept timeout so we can check the running flag
-        listener.set_nonblocking(false).ok();
+        // Use non-blocking mode so the running flag can be checked between
+        // accept attempts, allowing stop() to terminate the loop promptly.
+        listener.set_nonblocking(true).ok();
 
-        for stream in listener.incoming() {
+        loop {
             if !self.running.load(Ordering::Relaxed) { break; }
 
-            // DoS protection: reject new connections when at capacity
-            let current = self.active_connections.load(Ordering::Relaxed) as usize;
-            if current >= MAX_CONNECTIONS {
-                if let Ok(s) = stream {
-                    drop(s); // immediately close the excess connection
-                }
-                slog_warn!("stratum", "connection_limit_reached",
-                    current => current, max => MAX_CONNECTIONS);
-                continue;
-            }
+            match listener.accept() {
+                Ok((tcp_stream, _addr)) => {
+                    // DoS protection: reject new connections when at capacity
+                    let current = self.active_connections.load(Ordering::Relaxed) as usize;
+                    if current >= MAX_CONNECTIONS {
+                        drop(tcp_stream); // immediately close the excess connection
+                        slog_warn!("stratum", "connection_limit_reached",
+                            current => current, max => MAX_CONNECTIONS);
+                        continue;
+                    }
 
-            match stream {
-                Ok(tcp_stream) => {
                     self.active_connections.fetch_add(1, Ordering::Relaxed);
                     let server = Arc::clone(self);
                     std::thread::spawn(move || {
@@ -542,7 +541,14 @@ impl StratumServer {
                         server.active_connections.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
-                Err(e) => slog_error!("stratum", "accept_error", error => e),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+                Err(e) => {
+                    slog_error!("stratum", "accept_error", error => e);
+                    break;
+                }
             }
         }
     }
