@@ -24,7 +24,7 @@ use crate::engine::dag::security::dag_shield::DagShield;
 use crate::service::network::p2p::connection_puzzle::{ConnectionPuzzle, ChallengeSolution};
 use crate::service::network::p2p::peer_diversity::PeerIdentity;
 use crate::service::network::p2p::protocol::{
-    self, WireHeader, CommandId, ProtocolSession, VersionPayload,
+    WireHeader, CommandId, ProtocolSession, VersionPayload,
     WIRE_HEADER_SIZE, DEFAULT_BPS, MAX_MESSAGE_SIZE,
     validate_header, validate_payload_checksum, validate_payload_size,
     validate_inv_items, validate_addr_list, validate_headers_list, validate_hash_hex,
@@ -150,17 +150,17 @@ pub fn drain_received_addrs() -> Vec<String> {
 /// Requeue excess blocks that couldn't be processed in this tick.
 /// Prepends them to the front of the queue so they're processed first next tick.
 /// Re-increments PEER_PENDING block counts that were decremented during drain.
+///
+/// LOCK ORDER: PENDING_BLOCKS first, then PEER_PENDING.
 pub fn requeue_pending_blocks(items: Vec<(String, Block)>) {
     if items.is_empty() { return; }
-    // Restore per-peer pending counts that were decremented during drain
-    {
-        let mut counts = PEER_PENDING.lock();
-        for (peer_id, _) in &items {
-            let entry = counts.entry(peer_id.clone()).or_insert((0, 0));
-            entry.1 = entry.1.saturating_add(1);
-        }
-    }
     let mut q = PENDING_BLOCKS.lock();
+    let mut counts = PEER_PENDING.lock();
+    // Restore per-peer pending counts that were decremented during drain
+    for (peer_id, _) in &items {
+        let entry = counts.entry(peer_id.clone()).or_insert((0, 0));
+        entry.1 = entry.1.saturating_add(1);
+    }
     let mut combined = items;
     combined.extend(q.drain(..));
     *q = combined;
@@ -168,17 +168,17 @@ pub fn requeue_pending_blocks(items: Vec<(String, Block)>) {
 
 /// Requeue excess transactions that couldn't be processed in this tick.
 /// Re-increments PEER_PENDING tx counts that were decremented during drain.
+///
+/// LOCK ORDER: PENDING_TXS first, then PEER_PENDING.
 pub fn requeue_pending_txs(items: Vec<(String, Transaction)>) {
     if items.is_empty() { return; }
-    // Restore per-peer pending counts that were decremented during drain
-    {
-        let mut counts = PEER_PENDING.lock();
-        for (peer_id, _) in &items {
-            let entry = counts.entry(peer_id.clone()).or_insert((0, 0));
-            entry.0 = entry.0.saturating_add(1);
-        }
-    }
     let mut q = PENDING_TXS.lock();
+    let mut counts = PEER_PENDING.lock();
+    // Restore per-peer pending counts that were decremented during drain
+    for (peer_id, _) in &items {
+        let entry = counts.entry(peer_id.clone()).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(1);
+    }
     let mut combined = items;
     combined.extend(q.drain(..));
     *q = combined;
@@ -188,62 +188,52 @@ pub fn requeue_pending_txs(items: Vec<(String, Transaction)>) {
 /// Thread-safe: can be called from RPC or any thread.
 /// The daemon event loop drains this queue and processes each block
 /// through FullNode::process_block() (full validation pipeline).
+///
+/// LOCK ORDER: PENDING_BLOCKS first, then PEER_PENDING.
+/// This matches the lock order in dispatch_message to prevent deadlocks.
 pub fn push_pending_block(peer_id: &str, block: Block) -> bool {
-    // Reserve slot FIRST (increment before push) to close TOCTOU race.
-    // If the queue is full, rollback the increment.
-    {
-        let mut pending = PEER_PENDING.lock();
-        let entry = pending.entry(peer_id.to_string()).or_insert((0, 0));
-        if entry.1 >= MAX_PENDING_BLOCKS_PER_PEER {
-            slog_warn!("p2p", "per_peer_block_limit_reached", peer => peer_id);
-            return false;
-        }
-        entry.1 += 1;
+    // Lock queue FIRST to match lock order in dispatch_message
+    // (queue → PEER_PENDING), preventing deadlocks.
+    let mut q = PENDING_BLOCKS.lock();
+    if q.len() >= 1_000 {
+        slog_warn!("p2p", "pending_block_queue_full");
+        return false;
     }
 
-    let mut q = PENDING_BLOCKS.lock();
-    if q.len() < 1_000 {
-        q.push((peer_id.to_string(), block));
-        true
-    } else {
-        // Rollback the increment since we couldn't push
-        let mut pending = PEER_PENDING.lock();
-        if let Some(entry) = pending.get_mut(peer_id) {
-            entry.1 = entry.1.saturating_sub(1);
-        }
-        slog_warn!("p2p", "pending_block_queue_full");
-        false
+    let mut pending = PEER_PENDING.lock();
+    let entry = pending.entry(peer_id.to_string()).or_insert((0, 0));
+    if entry.1 >= MAX_PENDING_BLOCKS_PER_PEER {
+        slog_warn!("p2p", "per_peer_block_limit_reached", peer => peer_id);
+        return false;
     }
+    entry.1 += 1;
+    q.push((peer_id.to_string(), block));
+    true
 }
 
 /// Push a transaction into the pending queue for mempool validation.
 /// Thread-safe: can be called from RPC or any thread.
+///
+/// LOCK ORDER: PENDING_TXS first, then PEER_PENDING.
+/// This matches the lock order in dispatch_message to prevent deadlocks.
 pub fn push_pending_tx(peer_id: &str, tx: Transaction) -> bool {
-    // Reserve slot FIRST (increment before push) to close TOCTOU race.
-    // If the queue is full, rollback the increment.
-    {
-        let mut pending = PEER_PENDING.lock();
-        let entry = pending.entry(peer_id.to_string()).or_insert((0, 0));
-        if entry.0 >= MAX_PENDING_TXS_PER_PEER {
-            slog_warn!("p2p", "per_peer_tx_limit_reached", peer => peer_id);
-            return false;
-        }
-        entry.0 += 1;
+    // Lock queue FIRST to match lock order in dispatch_message
+    // (queue → PEER_PENDING), preventing deadlocks.
+    let mut q = PENDING_TXS.lock();
+    if q.len() >= 10_000 {
+        slog_warn!("p2p", "pending_tx_queue_full");
+        return false;
     }
 
-    let mut q = PENDING_TXS.lock();
-    if q.len() < 10_000 {
-        q.push((peer_id.to_string(), tx));
-        true
-    } else {
-        // Rollback the increment since we couldn't push
-        let mut pending = PEER_PENDING.lock();
-        if let Some(entry) = pending.get_mut(peer_id) {
-            entry.0 = entry.0.saturating_sub(1);
-        }
-        slog_warn!("p2p", "pending_tx_queue_full");
-        false
+    let mut pending = PEER_PENDING.lock();
+    let entry = pending.entry(peer_id.to_string()).or_insert((0, 0));
+    if entry.0 >= MAX_PENDING_TXS_PER_PEER {
+        slog_warn!("p2p", "per_peer_tx_limit_reached", peer => peer_id);
+        return false;
     }
+    entry.0 += 1;
+    q.push((peer_id.to_string(), tx));
+    true
 }
 
 /// Report a bad TX/block to the DoS guard (called by event loop on rejection).
@@ -579,10 +569,14 @@ impl P2P {
                         continue;
                     }
 
-                    // ── Pending connection limit ──
-                    let current_pending = pending.load(std::sync::atomic::Ordering::Relaxed);
-                    if current_pending >= MAX_PENDING_CONNECTIONS {
-                        slog_warn!("p2p", "too_many_pending_connections", pending => current_pending);
+                    // ── Pending connection limit (atomic check+increment) ──
+                    // Use fetch_add to atomically increment, then rollback if over limit.
+                    // This closes the TOCTOU race where multiple threads pass the check
+                    // before any of them increment.
+                    let prev_pending = pending.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    if prev_pending >= MAX_PENDING_CONNECTIONS {
+                        pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        slog_warn!("p2p", "too_many_pending_connections", pending => prev_pending);
                         drop(s);
                         continue;
                     }
@@ -593,6 +587,7 @@ impl P2P {
 
                     // ── Check if peer is banned ──
                     if DOS_GUARD.is_banned(&peer_addr) {
+                        pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         slog_warn!("p2p", "rejected_banned_peer", addr => &peer_addr);
                         drop(s);
                         continue;
@@ -602,7 +597,6 @@ impl P2P {
                     // Query fresh peer list on each connection (fix stale snapshot)
                     let peers_snapshot = peer_manager.get_addr_list_limited(100);
                     let pending_clone = Arc::clone(&pending);
-                    pending_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                     thread::spawn(move || {
                         let result = Self::handle_peer_connection(s, false, magic, peers_snapshot);
@@ -1062,7 +1056,26 @@ impl P2P {
         // ── DoS Guard: rate limit + ban check ──
         let cmd = Self::msg_to_command_id(&msg);
         let dos_type = Self::cmd_to_dos_type(cmd);
-        let msg_size = std::mem::size_of_val(&msg);
+        // Estimate actual payload size (heap data) rather than stack enum size.
+        // size_of_val only measures the enum discriminant + inline fields, missing
+        // heap-allocated Vec<u8>/String contents which dominate real message size.
+        let msg_size = match &msg {
+            P2PMessage::Block { data }     => data.len(),
+            P2PMessage::Tx { data }        => data.len(),
+            P2PMessage::ShadowTx { data }  => data.len(),
+            P2PMessage::OnionTx { data }   => data.len(),
+            P2PMessage::Addr { peers }     => peers.iter().map(|s| s.len()).sum(),
+            P2PMessage::Headers { hashes } => hashes.iter().map(|s| s.len()).sum(),
+            P2PMessage::Inv { items }      => items.iter().map(|i| i.kind.len() + i.hash.len()).sum(),
+            P2PMessage::GetData { items }  => items.iter().map(|i| i.kind.len() + i.hash.len()).sum(),
+            P2PMessage::PuzzleSolution { challenge, hash, .. } => challenge.len() + hash.len() + 8,
+            P2PMessage::PuzzleChallenge { challenge } => challenge.len(),
+            P2PMessage::Version { user_agent, .. } => user_agent.len() + 32,
+            P2PMessage::Reject { reason }  => reason.len(),
+            P2PMessage::GetHeaders { from_hash, .. } => from_hash.len() + 4,
+            P2PMessage::GetBlock { hash }  => hash.len(),
+            _ => std::mem::size_of_val(&msg), // small fixed-size messages (Ping, Pong, etc.)
+        };
         match DOS_GUARD.check(peer, &dos_type, msg_size) {
             DosVerdict::Allow => {}
             DosVerdict::BanActive => {
@@ -1107,15 +1120,29 @@ impl P2P {
             // ── Version: full validation via ProtocolSession ────────���──
             P2PMessage::Version { version, height, timestamp, user_agent,
                                   bps, chain_id, services, nonce } => {
-                // Build VersionPayload and validate through protocol state machine
+                // Build VersionPayload and validate through protocol state machine.
+                // Do NOT normalize zero values — reject them outright.
+                // Zero bps/services indicates a broken or malicious peer; silently
+                // substituting defaults masks protocol violations and lets
+                // incompatible peers connect.
+                if bps == 0 {
+                    DOS_GUARD.add_ban_score_cat(peer, 100, "version bps=0 (invalid)", BanCategory::Malformed);
+                    return Err(NetworkError::ConnectionFailed(
+                        format!("Rejected version from {}: bps=0", peer)));
+                }
+                if services == 0 {
+                    DOS_GUARD.add_ban_score_cat(peer, 100, "version services=0 (invalid)", BanCategory::Malformed);
+                    return Err(NetworkError::ConnectionFailed(
+                        format!("Rejected version from {}: services=0", peer)));
+                }
                 let payload = VersionPayload {
                     version,
                     height,
                     timestamp,
                     user_agent: user_agent.clone(),
-                    bps:      if bps == 0 { DEFAULT_BPS } else { bps },  // backward compat
-                    chain_id, // Don't normalize — let protocol layer enforce strict check
-                    services: if services == 0 { protocol::SERVICE_NODE_NETWORK } else { services },
+                    bps,
+                    chain_id,
+                    services,
                     nonce,
                 };
 

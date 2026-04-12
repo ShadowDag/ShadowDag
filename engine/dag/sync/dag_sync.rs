@@ -180,35 +180,18 @@ impl DagSync {
         }
 
         //////////////////////////////////////////////////////////////
-        // WRITE
-        //////////////////////////////////////////////////////////////
-        let mut batch = WriteBatch::default();
-        let cf = match self.cf_sync() {
-            Some(cf) => cf,
-            None => { slog_error!("dag", "dag_sync_no_cf_write"); return; }
-        };
-        batch.put_cf(cf, hash, b"1");
-
-        if self.db.write_opt(batch, &self.fast_write_opts).is_err() {
-            let mut batch2 = WriteBatch::default();
-            let cf = match self.cf_sync() {
-                Some(cf) => cf,
-                None => { slog_error!("dag", "dag_sync_no_cf_retry_write"); return; }
-            };
-            batch2.put_cf(cf, hash, b"1");
-
-            if self.db.write_opt(batch2, &self.safe_write_opts).is_err() {
-                return;
-            }
-        }
-
-        //////////////////////////////////////////////////////////////
         // BACKPRESSURE (CAS)
+        // Fix #10: Check inflight pressure BEFORE writing to DB.
+        // Previously, the hash was written to DB first, so if we
+        // returned early here the block was permanently "seen" but
+        // never processed — lost forever.
         //////////////////////////////////////////////////////////////
         loop {
             let current = self.inflight.load(Ordering::Relaxed);
 
             if current >= MAX_INFLIGHT_TASKS {
+                // Don't mark hash as seen — the block hasn't been processed.
+                // It will be retried on the next receive_block call.
                 return;
             }
 
@@ -229,9 +212,36 @@ impl DagSync {
         // we can't send a reference to self across thread boundaries.
         if let Err(e) = node.process_block(&block_clone) {
             slog_warn!("dag", "dag_sync_block_rejected", error => e);
-            // Fix #4: Don't cache on failure — block may be retried
+            // Don't cache on failure — block may be retried
         } else {
-            // Fix #4: Only insert into seen_cache AFTER successful processing
+            // Fix #9: Only persist to DB AFTER successful processing.
+            // Previously the DB write happened before process_block, so
+            // failed blocks were permanently marked as "seen" and never
+            // retried. Now we write only on success.
+            let mut batch = WriteBatch::default();
+            let cf = match self.cf_sync() {
+                Some(cf) => cf,
+                None => { slog_error!("dag", "dag_sync_no_cf_write"); self.inflight.fetch_sub(1, Ordering::Release); return; }
+            };
+            batch.put_cf(cf, hash, b"1");
+
+            if self.db.write_opt(batch, &self.fast_write_opts).is_err() {
+                let mut batch2 = WriteBatch::default();
+                let cf = match self.cf_sync() {
+                    Some(cf) => cf,
+                    None => { slog_error!("dag", "dag_sync_no_cf_retry_write"); self.inflight.fetch_sub(1, Ordering::Release); return; }
+                };
+                batch2.put_cf(cf, hash, b"1");
+
+                if self.db.write_opt(batch2, &self.safe_write_opts).is_err() {
+                    // DB write failed but block was processed successfully.
+                    // The block won't be de-duped on disk, but the in-memory
+                    // cache will still prevent double-processing this session.
+                    slog_warn!("dag", "dag_sync_db_write_failed_after_process");
+                }
+            }
+
+            // Only insert into seen_cache AFTER successful processing
             self.seen_cache.insert(hash);
         }
         self.inflight.fetch_sub(1, Ordering::Release);

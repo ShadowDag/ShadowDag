@@ -20,13 +20,13 @@
 //   mining.subscribe → mining.authorize → mining.notify → mining.submit
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Read as _, Write};
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
-use crate::{slog_info, slog_error};
+use crate::{slog_info, slog_error, slog_warn};
 use crate::errors::NetworkError;
 
 /// Default Stratum port
@@ -49,6 +49,12 @@ const MAX_PENDING_SUBS: usize = 10_000;
 
 /// Time-to-live for pending subscribe entries (seconds)
 const PENDING_SUB_TTL_SECS: u64 = 60;
+
+/// Maximum concurrent TCP connections (DoS protection)
+const MAX_CONNECTIONS: usize = 1_024;
+
+/// Maximum JSON-RPC line length in bytes (DoS protection)
+const MAX_LINE_LENGTH: usize = 8_192;
 
 /// Stratum method types
 #[derive(Debug, Clone, PartialEq)]
@@ -130,6 +136,7 @@ pub struct Worker {
     pub id:              u64,
     pub name:            String,
     pub address:         String,
+    pub peer_addr:       SocketAddr, // Bound to the originating connection
     pub difficulty:      u64,
     pub shares_accepted: u64,
     pub shares_rejected: u64,
@@ -141,11 +148,12 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn new(id: u64, name: String, address: String, extra_nonce: u64) -> Self {
+    pub fn new(id: u64, name: String, address: String, extra_nonce: u64, peer_addr: SocketAddr) -> Self {
         Self {
             id,
             name,
             address,
+            peer_addr,
             difficulty:       MIN_SHARE_DIFF,
             shares_accepted:  0,
             shares_rejected:  0,
@@ -296,6 +304,10 @@ pub struct StratumServer {
     /// during Subscribe so the subsequent Authorize for the same connection
     /// retrieves the correct ID (fixes race condition with concurrent miners).
     pending_subs:    RwLock<HashMap<SocketAddr, (u64, std::time::Instant)>>,
+    /// Share replay prevention: set of (job_id, nonce_hex) pairs already seen.
+    seen_shares:     RwLock<HashSet<(String, String)>>,
+    /// Active TCP connection count (DoS protection).
+    active_connections: AtomicU64,
 }
 
 impl StratumServer {
@@ -309,6 +321,8 @@ impl StratumServer {
             blocks_found:     AtomicU64::new(0),
             _pool_hashrate:    AtomicU64::new(0),
             pending_subs:     RwLock::new(HashMap::new()),
+            seen_shares:      RwLock::new(HashSet::new()),
+            active_connections: AtomicU64::new(0),
         }
     }
 
@@ -366,14 +380,14 @@ impl StratumServer {
                 }
                 drop(workers);
 
-                let worker = Worker::new(worker_id, worker_name, address, worker_id);
+                let worker = Worker::new(worker_id, worker_name, address, worker_id, peer_addr);
                 self.workers.write().unwrap_or_else(|e| e.into_inner()).insert(worker_id, worker);
 
                 StratumResponse::ok(req.id, "true")
             }
 
             StratumMethod::Submit => {
-                self.handle_submit(req)
+                self.handle_submit(req, peer_addr)
             }
 
             StratumMethod::GetWork => {
@@ -389,7 +403,7 @@ impl StratumServer {
         }
     }
 
-    fn handle_submit(&self, req: &StratumRequest) -> StratumResponse {
+    fn handle_submit(&self, req: &StratumRequest, peer_addr: SocketAddr) -> StratumResponse {
         // params: [worker_name, job_id, nonce, result_hash]
         if req.params.len() < 3 {
             return StratumResponse::err(req.id, "Invalid submit params");
@@ -413,10 +427,25 @@ impl StratumServer {
             }
         }
 
-        // Find the submitting worker first to get their current difficulty
+        // Share replay prevention: reject duplicate (job_id, nonce) pairs
+        {
+            let share_key = (job_id.clone(), nonce_hex.clone());
+            let mut seen = self.seen_shares.write().unwrap_or_else(|e| e.into_inner());
+            if !seen.insert(share_key) {
+                return StratumResponse::err(req.id, "Duplicate share");
+            }
+        }
+
+        // Find the submitting worker by name AND validate peer_addr matches
         let mut workers = self.workers.write().unwrap_or_else(|e| e.into_inner());
         let worker = match workers.values_mut().find(|w| w.name == *worker_name) {
-            Some(w) => w,
+            Some(w) => {
+                // Verify the submit comes from the same connection that authorized
+                if w.peer_addr != peer_addr {
+                    return StratumResponse::err(req.id, "Worker peer address mismatch");
+                }
+                w
+            }
             None => return StratumResponse::err(req.id, "Worker not authorized"),
         };
 
@@ -444,6 +473,9 @@ impl StratumServer {
     /// Update the block template (called when new block arrives)
     pub fn update_template(&self, template: BlockTemplate) {
         *self.current_template.write().unwrap_or_else(|e| e.into_inner()) = Some(template);
+        // New template means old job_id shares are stale — clear the replay
+        // prevention set so it doesn't grow unbounded.
+        self.seen_shares.write().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Start the Stratum TCP server.
@@ -467,13 +499,27 @@ impl StratumServer {
 
         for stream in listener.incoming() {
             if !self.running.load(Ordering::Relaxed) { break; }
+
+            // DoS protection: reject new connections when at capacity
+            let current = self.active_connections.load(Ordering::Relaxed) as usize;
+            if current >= MAX_CONNECTIONS {
+                if let Ok(s) = stream {
+                    drop(s); // immediately close the excess connection
+                }
+                slog_warn!("stratum", "connection_limit_reached",
+                    current => current, max => MAX_CONNECTIONS);
+                continue;
+            }
+
             match stream {
                 Ok(tcp_stream) => {
+                    self.active_connections.fetch_add(1, Ordering::Relaxed);
                     let server = Arc::clone(self);
                     std::thread::spawn(move || {
                         if let Err(e) = server.handle_connection(tcp_stream) {
                             slog_error!("stratum", "connection_error", error => e);
                         }
+                        server.active_connections.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 Err(e) => slog_error!("stratum", "accept_error", error => e),
@@ -493,18 +539,46 @@ impl StratumServer {
         let reader = BufReader::new(stream.try_clone().map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?);
         let mut writer = stream;
 
-        for line_result in reader.lines() {
+        // Use a size-limited line reader instead of unbounded reader.lines()
+        // to prevent a single malicious client from exhausting memory.
+        let mut limited_reader = reader;
+        let mut line_buf = String::new();
+        loop {
+            line_buf.clear();
             if !self.running.load(Ordering::Relaxed) { break; }
 
-            let line = match line_result {
-                Ok(l) => l,
-                Err(e) => {
-                    slog_error!("stratum", "read_error", peer => peer_addr, error => e);
-                    break;
+            // Read up to MAX_LINE_LENGTH bytes for a single line
+            let bytes_read = {
+                let mut handle = (&mut limited_reader).take(MAX_LINE_LENGTH as u64);
+                match handle.read_line(&mut line_buf) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        slog_error!("stratum", "read_error", peer => peer_addr, error => e);
+                        break;
+                    }
                 }
             };
+            if bytes_read == 0 { break; } // EOF — connection closed
 
-            let line = line.trim().to_string();
+            // If the line buffer is at limit but has no newline, the line is
+            // too long. Discard and notify the client.
+            if line_buf.len() >= MAX_LINE_LENGTH && !line_buf.ends_with('\n') {
+                slog_warn!("stratum", "line_too_long", peer => peer_addr, len => line_buf.len());
+                let err_resp = "{\"id\":null,\"result\":null,\"error\":\"Line too long\"}\n";
+                if writer.write_all(err_resp.as_bytes()).is_err() { break; }
+                // Drain the rest of the oversized line
+                let mut drain = [0u8; 1024];
+                loop {
+                    match limited_reader.get_mut().read(&mut drain) {
+                        Ok(0) => break,
+                        Ok(n) => { if drain[..n].contains(&b'\n') { break; } }
+                        Err(_) => break,
+                    }
+                }
+                continue;
+            }
+
+            let line = line_buf.trim().to_string();
             if line.is_empty() { continue; }
 
             // Parse the JSON-RPC request
@@ -549,6 +623,12 @@ impl StratumServer {
         // in the pending_subs map.
         self.pending_subs.write().unwrap_or_else(|e| e.into_inner())
             .remove(&peer_addr);
+
+        // Remove all workers bound to this peer address on disconnect
+        {
+            let mut workers = self.workers.write().unwrap_or_else(|e| e.into_inner());
+            workers.retain(|_, w| w.peer_addr != peer_addr);
+        }
 
         slog_info!("stratum", "miner_disconnected", peer => peer_addr);
         Ok(())
@@ -763,7 +843,8 @@ impl PayoutCalculator {
         // Only consider the last `window_size` shares. If total shares
         // exceed the window, scale each worker's shares proportionally so
         // the effective total equals window_size.
-        let effective_window = window_size.min(total_shares);
+        // .max(1) guards against division by zero when window_size is 0.
+        let effective_window = window_size.min(total_shares).max(1);
 
         let mut payouts: HashMap<String, u64> = HashMap::new();
         for w in workers.values() {
@@ -827,7 +908,7 @@ mod tests {
 
     #[test]
     fn worker_vardiff_adjusts() {
-        let mut worker = Worker::new(1, "test".into(), "SD1x".into(), 1);
+        let mut worker = Worker::new(1, "test".into(), "SD1x".into(), 1, test_addr(0));
         worker.shares_in_window = 100; // Way too many shares
         let changed = worker.vardiff_adjust();
         assert!(changed || worker.difficulty > MIN_SHARE_DIFF);
@@ -836,7 +917,7 @@ mod tests {
     #[test]
     fn vardiff_direction_high_ratio_increases_difficulty() {
         // ratio > 2.0 means too many shares (too easy) => difficulty should INCREASE
-        let mut worker = Worker::new(1, "test".into(), "SD1x".into(), 1);
+        let mut worker = Worker::new(1, "test".into(), "SD1x".into(), 1, test_addr(0));
         worker.difficulty = 100;
         // 60 shares when target is 20 => ratio = 3.0
         worker.shares_in_window = 60;
@@ -848,7 +929,7 @@ mod tests {
     #[test]
     fn vardiff_direction_low_ratio_decreases_difficulty() {
         // ratio < 0.5 means too few shares (too hard) => difficulty should DECREASE
-        let mut worker = Worker::new(1, "test".into(), "SD1x".into(), 1);
+        let mut worker = Worker::new(1, "test".into(), "SD1x".into(), 1, test_addr(0));
         worker.difficulty = 100;
         // 5 shares when target is 20 => ratio = 0.25
         worker.shares_in_window = 5;
@@ -860,7 +941,7 @@ mod tests {
     #[test]
     fn vardiff_stable_ratio_no_change() {
         // ratio between 0.5 and 2.0 => no adjustment
-        let mut worker = Worker::new(1, "test".into(), "SD1x".into(), 1);
+        let mut worker = Worker::new(1, "test".into(), "SD1x".into(), 1, test_addr(0));
         worker.difficulty = 100;
         // 20 shares when target is 20 => ratio = 1.0
         worker.shares_in_window = 20;
@@ -872,7 +953,7 @@ mod tests {
     #[test]
     fn vardiff_clamps_to_min_max() {
         // Test minimum clamp
-        let mut worker = Worker::new(1, "test".into(), "SD1x".into(), 1);
+        let mut worker = Worker::new(1, "test".into(), "SD1x".into(), 1, test_addr(0));
         worker.difficulty = MIN_SHARE_DIFF;
         worker.shares_in_window = 1; // ratio = 0.05 => wants to decrease below minimum
         worker.vardiff_adjust();
@@ -881,7 +962,7 @@ mod tests {
 
     #[test]
     fn worker_acceptance_rate() {
-        let mut w = Worker::new(1, "w".into(), "a".into(), 1);
+        let mut w = Worker::new(1, "w".into(), "a".into(), 1, test_addr(0));
         w.accept_share();
         w.accept_share();
         w.reject_share();
@@ -924,8 +1005,8 @@ mod tests {
 
     #[test]
     fn workers_get_distinct_extra_nonce() {
-        let w1 = Worker::new(1, "w1".into(), "a".into(), 1);
-        let w2 = Worker::new(2, "w2".into(), "a".into(), 2);
+        let w1 = Worker::new(1, "w1".into(), "a".into(), 1, test_addr(0));
+        let w2 = Worker::new(2, "w2".into(), "a".into(), 2, test_addr(1));
         assert_ne!(w1.extra_nonce, w2.extra_nonce,
             "Workers must have distinct extra_nonce values");
     }

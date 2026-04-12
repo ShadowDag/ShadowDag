@@ -77,20 +77,48 @@ impl ChainVerifier {
             };
         }
 
+        // If the chain doesn't start at height 0, require a checkpoint
+        // match for the first header — otherwise there's no root of trust.
+        if headers[0].height > 0 {
+            let has_matching_checkpoint = self.checkpoints.iter()
+                .any(|cp| cp.height == headers[0].height && cp.hash == headers[0].hash);
+            if !has_matching_checkpoint && !self.checkpoints.is_empty() {
+                // No checkpoint covers this starting height — reject
+                return ChainVerifyResult::InvalidGenesis {
+                    expected: format!("checkpoint at height {}", headers[0].height),
+                    got: headers[0].hash.clone(),
+                };
+            }
+        }
+
         let mut cumulative_work: u64 = 0;
         let mut prev_timestamp: u64 = 0;
+        let mut prev_hash: Option<&str> = None;
 
         for header in headers {
-            // 2. PoW check — hash must have required leading zeros
-            let required_zeros = header.difficulty as usize;
-            if required_zeros > 0 && required_zeros <= header.hash.len() {
-                let has_zeros = header.hash.as_bytes()[..required_zeros]
-                    .iter()
-                    .all(|&b| b == b'0');
-                if !has_zeros {
+            // 2. PoW check — use PowValidator (numeric target comparison)
+            //    so sync verification matches consensus validation exactly.
+            //    The previous leading-zeros check silently skipped PoW for
+            //    difficulty > 64, and used a weaker difficulty metric than
+            //    the actual consensus rule.
+            if header.difficulty > 0 {
+                use crate::engine::mining::pow::pow_validator::PowValidator;
+                if !PowValidator::hash_meets_target(&header.hash, header.difficulty) {
                     return ChainVerifyResult::InvalidPoW {
                         height: header.height,
                         hash: header.hash.clone(),
+                    };
+                }
+            }
+
+            // 2b. Parent continuity
+            if let Some(ph) = prev_hash {
+                if !header.parents.iter().any(|p| p == ph)
+                    && header.selected_parent.as_deref() != Some(ph)
+                {
+                    return ChainVerifyResult::InvalidPoW {
+                        height: header.height,
+                        hash: format!("parent continuity: expected parent {}", &ph[..ph.len().min(16)]),
                     };
                 }
             }
@@ -105,10 +133,10 @@ impl ChainVerifier {
                     };
                 }
                 let gap = header.timestamp - prev_timestamp;
-                if gap > MAX_HEADER_TIME_GAP_SECS * 1000 { // milliseconds
+                if gap > MAX_HEADER_TIME_GAP_SECS {
                     return ChainVerifyResult::TimestampGap {
                         height: header.height,
-                        gap_secs: gap / 1000,
+                        gap_secs: gap,
                     };
                 }
             }
@@ -127,6 +155,8 @@ impl ChainVerifier {
 
             // 5. Accumulate work
             cumulative_work = cumulative_work.saturating_add(header.difficulty);
+
+            prev_hash = Some(&header.hash);
         }
 
         // 6. Minimum cumulative work

@@ -111,10 +111,15 @@ impl TxPool {
 
     fn add_to_orphan_pool(&mut self, tx: &Transaction) {
         for input in &tx.inputs {
-            self.orphan_parents
+            let bucket = self.orphan_parents
                 .entry(input.txid.clone())
-                .or_default()
-                .push(tx.clone());
+                .or_default();
+            // BUG FIX: Dedup check — skip if this tx hash is already in the
+            // bucket. Without this, re-submitting the same orphan TX appends
+            // duplicates, causing double-promotion and inflated orphan counts.
+            if !bucket.iter().any(|t| t.hash == tx.hash) {
+                bucket.push(tx.clone());
+            }
         }
     }
 

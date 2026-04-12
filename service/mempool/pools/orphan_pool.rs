@@ -39,6 +39,14 @@ impl OrphanPool {
             return false;
         }
 
+        // BUG FIX: Dedup check — if this tx hash is already tracked, skip.
+        // Without this, re-adding the same orphan increments count and
+        // pushes duplicate entries into bucket vectors, inflating the pool
+        // count and causing double-promotion.
+        if self.tx_buckets.contains_key(&tx.hash) {
+            return false;
+        }
+
         let mut bucket_keys = Vec::new();
         for input in &tx.inputs {
             self.orphans
@@ -87,6 +95,11 @@ impl OrphanPool {
 
         for txid in &old_txids {
             self.age_map.remove(txid);
+            // BUG FIX: Also clean up tx_buckets for evicted entries.
+            // Without this, tx_buckets grows unboundedly with stale entries
+            // that reference tx hashes no longer in any orphan bucket,
+            // causing memory leaks and incorrect promote() behavior.
+            self.tx_buckets.remove(txid);
             if self.count > 0 { self.count -= 1; }
         }
 
@@ -94,9 +107,6 @@ impl OrphanPool {
             txs.retain(|tx| !old_txids.contains(&tx.hash));
             !txs.is_empty()
         });
-
-        if !old_txids.is_empty() {
-        }
     }
 
     pub fn count(&self) -> usize { self.count }

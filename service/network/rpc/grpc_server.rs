@@ -302,6 +302,13 @@ impl GrpcServer {
         handlers: &RwLock<HashMap<u8, HandlerFn>>,
         stats: &GrpcStats,
     ) {
+        // Set read timeout to prevent slow-loris attacks where a client holds
+        // a connection slot indefinitely without sending data.
+        if let Err(e) = stream.set_read_timeout(Some(std::time::Duration::from_secs(30))) {
+            slog_error!("rpc", "grpc_set_read_timeout_failed", error => e);
+            return;
+        }
+
         loop {
             // Read 4-byte length prefix
             let mut len_buf = [0u8; 4];
@@ -381,9 +388,11 @@ impl GrpcServer {
             }
         }
 
-        // Set a non-blocking accept timeout so we periodically re-check the running flag.
-        // Without this, listener.incoming() blocks indefinitely and stop() cannot
-        // break the accept loop (known limitation of std TcpListener).
+        // Explicitly set blocking mode — listener.incoming() blocks on accept().
+        // stop() breaks the accept loop by connecting briefly to the listener
+        // (dummy connection), which unblocks accept() so it can re-check the
+        // running flag. This is the standard workaround for std TcpListener
+        // lacking a shutdown API.
         let _ = listener.set_nonblocking(false);
         let _ = listener.set_ttl(30);
 

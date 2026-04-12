@@ -98,12 +98,24 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
     let utxo_set = UtxoSet::new(utxo_store_arc.clone() as Arc<dyn crate::domain::traits::utxo_backend::UtxoBackend>);
 
     // Idempotent genesis: only create if no existing chain found
-    let existing_best = blocks.get_best_hash();
+    // Use fail-closed get_best_hash_strict so a corrupt/unreadable
+    // best_hash key surfaces as an error rather than silently
+    // triggering genesis re-initialization over an existing chain.
+    let existing_best = match blocks.get_best_hash_strict() {
+        Ok(opt) => opt,
+        Err(e) => {
+            slog_error!("boot", "best_hash_read_failed", error => &e.to_string());
+            return Err(NodeError::Init(format!(
+                "cannot read best_hash (possible DB corruption): {}", e
+            )));
+        }
+    };
     if existing_best.is_none() || existing_best.as_deref() == Some("") {
         let genesis = create_genesis_block_for(&cfg.network);
         slog_info!("boot", "genesis_hash", hash => genesis.header.hash);
 
-        let _ = dag.add_block(&genesis);
+        dag.add_block(&genesis)
+            .map_err(|e| NodeError::Init(format!("genesis DAG insertion failed: {}", e)))?;
         if !blocks.save_block(&genesis) {
             return Err(NodeError::Init("failed to save genesis block".to_string()));
         }
@@ -114,7 +126,9 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
             slog_error!("boot", "genesis_utxo_failed", error => e);
             return Err(NodeError::Init(e.to_string()));
         }
-        blocks.update_best_hash(&genesis.header.hash);
+        if !blocks.update_best_hash(&genesis.header.hash) {
+            return Err(NodeError::Init("failed to persist genesis best_hash".to_string()));
+        }
         slog_info!("boot", "genesis_created");
     } else {
         // WARNING: boot.rs is DEPRECATED. It does NOT include crash recovery.

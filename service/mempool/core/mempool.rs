@@ -152,11 +152,6 @@ impl Mempool {
     /// Extract the primary sender address from a transaction.
     /// For standard TXs: first input's `owner` field.
     /// For coinbase TXs: returns None (no sender).
-    fn tx_sender(tx: &Transaction) -> Option<&str> {
-        if tx.is_coinbase() { return None; }
-        tx.inputs.first().map(|inp| inp.owner.as_str())
-    }
-
     /// Extract ALL unique sender addresses from a transaction's inputs.
     /// Prevents per-sender limit bypass when a TX has inputs from multiple owners.
     fn tx_senders(tx: &Transaction) -> Vec<&str> {
@@ -333,11 +328,18 @@ impl Mempool {
     }
 
     pub fn add_transaction(&self, tx: &Transaction) -> bool {
+        // ── L0 Coinbase rejection: coinbase TXs are created by miners,
+        // never relayed via mempool. Accepting them would let an attacker
+        // inject free-money TXs that pass `is_coinbase()` checks. ─────
+        if tx.is_coinbase() {
+            return false;
+        }
+
         // ── L1 Network: cheap sanity (no crypto, no DB) ──────────────
         if tx.canonical_bytes().len() > MAX_TX_BYTE_SIZE {
             return false;
         }
-        if tx.inputs.is_empty() && !tx.is_coinbase() {
+        if tx.inputs.is_empty() {
             return false;
         }
         if tx.hash.is_empty() || tx.outputs.is_empty() {
@@ -646,7 +648,12 @@ impl Mempool {
     pub fn get_dependents(&self, txid: &str) -> Vec<String> {
         let prefix = format!("rdep:{}:", txid);
         let prefix_bytes = prefix.as_bytes().to_vec();
-        self.db
+        // BUG FIX: Collect into a HashSet first to deduplicate.
+        // A child TX that spends multiple outputs of the same parent
+        // produces multiple rdep keys (one per output), resulting in
+        // duplicate child hashes. Dedup prevents double-eviction in
+        // RBF and cascade removal.
+        let set: HashSet<String> = self.db
             .prefix_iterator(prefix.as_bytes())
             .filter_map(|r| r.ok())
             .take_while(|(k, _)| k.starts_with(&prefix_bytes))
@@ -660,7 +667,8 @@ impl Mempool {
                         remainder.split_once(':').map(|(_, child)| child.to_string())
                     })
             })
-            .collect()
+            .collect();
+        set.into_iter().collect()
     }
 
     pub fn has_dependency_path(&self, child: &str, parent: &str) -> bool {
@@ -681,6 +689,16 @@ impl Mempool {
     }
 
     pub fn remove_transaction(&self, txid: &str) {
+        // BUG FIX: Cascade removal to dependent transactions (children that
+        // spend this TX's outputs). Without this, removing a parent leaves
+        // orphaned children in the pool whose inputs no longer exist,
+        // causing block template validation failures.
+        let dependents = self.get_dependents(txid);
+        for dep_txid in &dependents {
+            // Recursive call handles transitive dependents (grandchildren, etc.)
+            self.remove_transaction(dep_txid);
+        }
+
         if let Some(tx) = self.get_transaction(txid) {
             // Compute byte size for counter update
             let tx_bytes = bincode::serialize(&tx).map(|d| d.len() as u64).unwrap_or(0);
@@ -1029,6 +1047,7 @@ impl Mempool {
         // destroying non-mempool data in a shared DB.
         const MEMPOOL_PREFIXES: &[&[u8]] = &[
             b"tx:", b"fee:", b"inp:", b"dep:", b"rdep:", b"sender:", b"_meta:",
+            b"orphan:", b"orphan_ts:",
         ];
 
         let mempool_keys: Vec<Vec<u8>> = self.db
@@ -1139,6 +1158,13 @@ impl Mempool {
     /// Use this instead of `add_transaction` when a UTXO set is available
     /// to ensure only fully-valid transactions enter the mempool.
     pub fn add_transaction_validated(&self, tx: &Transaction, utxo_set: &UtxoSet) -> Result<(), MempoolError> {
+        // Coinbase transactions are miner-created; they must never enter the mempool.
+        if tx.is_coinbase() {
+            return Err(MempoolError::ValidationFailed(
+                "coinbase transactions cannot enter the mempool".to_string()
+            ));
+        }
+
         // Basic structural checks (size, fee) first — cheap to evaluate
         match bincode::serialize(tx) {
             Ok(b) if b.len() > MAX_TX_BYTE_SIZE => {
@@ -1191,8 +1217,11 @@ impl Mempool {
             });
         }
 
-        // Per-sender anti-spam: reject if sender already has MAX_TXS_PER_SENDER in pool
-        if let Some(sender) = Self::tx_sender(tx) {
+        // Per-sender anti-spam: reject if ANY sender already has MAX_TXS_PER_SENDER in pool.
+        // BUG FIX: Previously used tx_sender() which only checks the first input owner.
+        // A multi-input TX with owners [A, B] would bypass the limit for owner B.
+        // Now uses tx_senders() (all unique owners) consistent with add_transaction().
+        for sender in Self::tx_senders(tx) {
             if self.sender_tx_count(sender) >= MAX_TXS_PER_SENDER {
                 return Err(MempoolError::Other(
                     format!("sender {} already has {} unconfirmed TXs in mempool",
@@ -1809,7 +1838,18 @@ impl Mempool {
 
         match bincode::serialize(tx) {
             Ok(data) => {
-                self.db.put(key.as_bytes(), &data).is_ok()
+                let ok = self.db.put(key.as_bytes(), &data).is_ok();
+                if ok {
+                    // Store receive time (wall clock) for age-based eviction.
+                    // This is tamper-proof unlike tx.timestamp which is sender-set.
+                    let receive_time = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let ts_key = format!("orphan_ts:{}", tx.hash);
+                    let _ = self.db.put(ts_key.as_bytes(), receive_time.to_le_bytes());
+                }
+                ok
             }
             Err(_e) => {
                 false
@@ -1853,6 +1893,9 @@ impl Mempool {
         if let Err(e) = self.db.delete(key.as_bytes()) {
             slog_warn!("mempool", "orphan_db_delete_failed", key => &key, error => &e.to_string());
         }
+        // Also clean up the receive-time metadata key
+        let ts_key = format!("orphan_ts:{}", tx_hash);
+        let _ = self.db.delete(ts_key.as_bytes());
     }
 
     pub fn prune_orphans(&self) {
@@ -1861,13 +1904,38 @@ impl Mempool {
             .unwrap_or_default()
             .as_secs();
 
+        // BUG FIX: Use the receive-time metadata key (orphan_ts:{hash}) instead
+        // of tx.timestamp.  tx.timestamp is set by the sender and can be
+        // arbitrarily far in the past or future, so using it for age-based
+        // eviction lets an attacker craft TXs that either never expire
+        // (future timestamp) or get instantly pruned (stale timestamp).
+        // The receive-time is the wall-clock time at which add_orphan stored
+        // the TX, which is tamper-proof.
         let stale_keys: Vec<Vec<u8>> = self.db
             .prefix_iterator(PFX_ORPHAN)
             .filter_map(|r| r.ok())
             .take_while(|(k, _)| k.starts_with(PFX_ORPHAN))
-            .filter_map(|(k, v)| {
-                let tx: Transaction = bincode::deserialize(&v).ok()?;
-                if now.saturating_sub(tx.timestamp) > MAX_ORPHAN_AGE_SECS {
+            .filter_map(|(k, _)| {
+                // Extract hash from key "orphan:{hash}"
+                let key_str = String::from_utf8(k.to_vec()).ok()?;
+                let hash = key_str.strip_prefix("orphan:")?;
+                let ts_key = format!("orphan_ts:{}", hash);
+                let receive_time = match self.db.get(ts_key.as_bytes()) {
+                    Ok(Some(v)) if v.len() >= 8 => {
+                        let mut buf = [0u8; 8];
+                        buf.copy_from_slice(&v[..8]);
+                        u64::from_le_bytes(buf)
+                    }
+                    _ => {
+                        // No receive-time recorded (legacy entry) — fall back to
+                        // tx.timestamp so old entries still get pruned eventually.
+                        let tx: Transaction = bincode::deserialize(
+                            &self.db.get(&k).ok()??
+                        ).ok()?;
+                        tx.timestamp
+                    }
+                };
+                if now.saturating_sub(receive_time) > MAX_ORPHAN_AGE_SECS {
                     Some(k.to_vec())
                 } else {
                     None
@@ -1879,6 +1947,13 @@ impl Mempool {
             let label = String::from_utf8_lossy(k);
             if let Err(e) = self.db.delete(k) {
                 slog_warn!("mempool", "orphan_db_delete_failed", key => &label.to_string(), error => &e.to_string());
+            }
+            // Clean up the receive-time metadata key
+            if let Ok(key_str) = String::from_utf8(k.to_vec()) {
+                if let Some(hash) = key_str.strip_prefix("orphan:") {
+                    let ts_key = format!("orphan_ts:{}", hash);
+                    let _ = self.db.delete(ts_key.as_bytes());
+                }
             }
         }
 
