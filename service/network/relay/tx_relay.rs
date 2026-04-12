@@ -106,14 +106,11 @@ pub fn broadcast(tx: &Transaction, _peers: &PeerManager) {
     push_outbound(P2PMessage::Tx { data: tx_bytes });
 }
 
-/// Request mempool contents from peers during initial sync
+/// Request mempool contents from peers during initial sync.
+/// Uses the dedicated GetMempool message type — GetData only accepts
+/// "block" and "tx" as valid inv item kinds, so `kind: "mempool"`
+/// would be rejected by the protocol validator on the receiving peer.
 pub fn sync_mempool(_peers: &PeerManager) {
-    push_outbound(P2PMessage::GetData {
-        items: vec![crate::service::network::p2p::p2p::InvItem {
-            kind: "mempool".to_string(),
-            hash: String::new(),
-        }],
-    });
-
+    push_outbound(P2PMessage::GetMempool);
     log::debug!("[TxRelay] Requested mempool sync from peers");
 }

@@ -236,7 +236,7 @@ impl PeerManager {
             return Err(NetworkError::PeerBanned(record.addr.clone()));
         }
 
-        let ip    = record.addr.split(':').next().unwrap_or(&record.addr);
+        let ip    = Self::extract_ip(&record.addr);
         let count = self.conn_count_for_ip(ip);
         if count >= MAX_PEERS_PER_IP {
             return Err(NetworkError::ConnectionFailed(
@@ -266,7 +266,7 @@ impl PeerManager {
         if !self.peer_exists(addr) {
             return Ok(()); // Nothing to remove
         }
-        let ip    = addr.split(':').next().unwrap_or(addr);
+        let ip    = Self::extract_ip(addr);
         let count = self.conn_count_for_ip(ip);
         let db    = self.lock_db();
         let mut batch = WriteBatch::default();
@@ -711,6 +711,24 @@ impl PeerManager {
             }
         }
         self.add_addr_batch(&owned);
+    }
+
+    /// Extract IP address from addr string, handling both IPv4 and IPv6.
+    /// Formats: "1.2.3.4:9333", "[::1]:9333", "::1"
+    fn extract_ip(addr: &str) -> &str {
+        // Bracketed IPv6: [::1]:9333
+        if addr.starts_with('[') {
+            if let Some(end) = addr.find(']') {
+                return &addr[1..end];
+            }
+        }
+        // IPv4: 1.2.3.4:9333 — split on last ':' only if suffix is a port number
+        if let Some(pos) = addr.rfind(':') {
+            if addr[pos+1..].chars().all(|c| c.is_ascii_digit()) && !addr[pos+1..].is_empty() {
+                return &addr[..pos];
+            }
+        }
+        addr
     }
 }
 

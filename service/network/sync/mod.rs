@@ -82,7 +82,8 @@ impl SyncManager {
 
     pub fn on_headers_received(&mut self, hashes: Vec<String>, _peer: &str) {
         for hash in &hashes {
-            if !self.downloaded_blocks.contains(hash) {
+            self.pending_headers.remove(hash); // Clean up pending state
+            if !self.downloaded_blocks.contains(hash) && !self.block_queue.contains(hash) {
                 self.block_queue.push_back(hash.clone());
             }
             self.downloaded_headers.insert(hash.clone());
@@ -125,6 +126,7 @@ impl SyncManager {
             if let Some(mut req) = self.pending_headers.remove(&hash) {
                 if req.retries < MAX_RETRIES {
                     req.retries += 1;
+                    req.sent_at = Instant::now(); // Reset timeout clock
                     retry_list.push((hash.clone(), req.peer.clone()));
                     self.pending_headers.insert(hash, req);
                 } else {
@@ -142,6 +144,7 @@ impl SyncManager {
             if let Some(mut req) = self.pending_blocks.remove(&hash) {
                 if req.retries < MAX_RETRIES {
                     req.retries += 1;
+                    req.sent_at = Instant::now(); // Reset timeout clock
                     retry_list.push((hash.clone(), req.peer.clone()));
                     self.pending_blocks.insert(hash, req);
                 } else {
