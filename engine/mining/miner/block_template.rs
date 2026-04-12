@@ -108,7 +108,10 @@ impl BlockTemplateBuilder {
 
         // Coinbase reward = emission + transaction fees (must match validator expectation)
         let emission = EmissionSchedule::block_reward(height);
-        let reward   = emission.saturating_add(template.total_fees);
+        let reward = emission.checked_add(template.total_fees)
+            .ok_or_else(|| ConsensusError::Other(
+                "coinbase reward overflow: emission + fees exceeds u64".into()
+            ))?;
 
         let coinbase = build_coinbase_at_height(
             miner_address.to_string(),
@@ -204,8 +207,13 @@ impl BlockTemplateBuilder {
         let template = Self::select_valid_transactions(candidates, utxo_set);
 
         // Coinbase reward = emission + transaction fees (must match validator expectation)
+        // NOTE: Legacy method returns Block (not Result), so overflow panics.
+        // Production code uses build_from_dag() which returns Result and
+        // handles overflow gracefully. This legacy path is kept for backward
+        // compatibility but callers should migrate to build_from_dag().
         let emission = EmissionSchedule::block_reward(height);
-        let reward   = emission.saturating_add(template.total_fees);
+        let reward = emission.checked_add(template.total_fees)
+            .expect("coinbase reward overflow: emission + fees exceeds u64");
 
         let coinbase = build_coinbase_at_height(
             miner_address.to_string(),
