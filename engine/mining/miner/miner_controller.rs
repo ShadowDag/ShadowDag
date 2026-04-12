@@ -134,7 +134,13 @@ impl<'a> MinerController<'a> {
 
     /// After mining, submit the block to the DAG and update tip set.
     pub fn submit_block(&self, block: &Block) -> Result<(), ConsensusError> {
-        // Add block to DAG (validates parents again internally)
+        // Add block to DAG — topology/PoW validation only.
+        // NOTE: Full consensus validation (UTXO, coinbase, contracts)
+        // happens when process_block routes through the FullNode pipeline.
+        // MinerController's DAG insertion is the first step; the daemon
+        // event loop picks up the block from PENDING_BLOCKS for full
+        // validation. Direct callers of submit_block should be aware
+        // that UTXO/contract state is NOT verified here.
         self.dag_manager.add_block(block)?;
 
         // Update tip manager: remove parents from tips, add new block as tip

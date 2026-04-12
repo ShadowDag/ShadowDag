@@ -47,7 +47,9 @@ impl Miner {
         total_fees: u64,
     ) -> Transaction {
         let emission = crate::config::consensus::emission_schedule::EmissionSchedule::block_reward(height);
-        let reward = emission.saturating_add(total_fees);
+        // Use checked_add to surface overflow instead of silently capping at u64::MAX
+        let reward = emission.checked_add(total_fees)
+            .expect("coinbase reward overflow: emission + fees exceeds u64");
         let miner_reward = (reward * crate::config::consensus::consensus_params::ConsensusParams::MINER_PERCENT) / 100;
         let owner_reward = reward - miner_reward;
 

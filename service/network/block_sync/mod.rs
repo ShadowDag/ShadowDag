@@ -199,12 +199,35 @@ impl BlockSyncManager {
         }
     }
 
+    // WARNING: Snapshot discovery selects the peer offering the highest
+    // height. This is vulnerable to a malicious peer advertising a fake
+    // snapshot at an inflated height. Production deployments should:
+    //   1. Require snapshot commitments signed by a quorum of known peers
+    //   2. Verify the UTXO commitment against a known checkpoint
+    //   3. Validate a subset of the snapshot data against the header chain
+    // Currently, snapshot sync is UNSAFE and should only be used with
+    // trusted peers or on trusted networks.
     pub fn on_snapshot_offered(&self, _peer: &str, snap: UtxoSnapshot) {
+        // Basic sanity checks — these do NOT replace cryptographic verification
+        if snap.block_hash.is_empty() || snap.root_hash.is_empty() {
+            log::warn!("snapshot_discovery_untrusted: rejecting snapshot with empty hash fields");
+            return;
+        }
+        if snap.height == 0 || snap.utxo_count == 0 {
+            log::warn!("snapshot_discovery_untrusted: rejecting snapshot with zero height or utxo_count");
+            return;
+        }
+
         let mut best = self.best_snapshot.write().unwrap_or_else(|e| e.into_inner());
         let should_replace = best.as_ref()
             .map(|b| snap.height > b.height)
             .unwrap_or(true);
         if should_replace {
+            log::warn!(
+                "snapshot_discovery_untrusted: selected snapshot is NOT cryptographically verified \
+                 — vulnerable to forgery (height={}, block_hash={})",
+                snap.height, snap.block_hash
+            );
             *best = Some(snap);
         }
     }
@@ -214,6 +237,10 @@ impl BlockSyncManager {
         let snap = self.best_snapshot.read().unwrap_or_else(|e| e.into_inner()).clone()?;
 
         if snap.height > local + 10_000 {
+            log::warn!(
+                "snapshot_discovery_untrusted: proceeding with unverified snapshot at height {}",
+                snap.height
+            );
             Some(snap)
         } else {
             None
@@ -230,6 +257,15 @@ impl BlockSyncManager {
             log::info!("Snapshot chunk received: chunk_index={}, total_chunks={}, pct={}%", chunk_index, total_chunks, pct);
         }
         if chunk_index + 1 >= total_chunks {
+            // NOTE: Snapshot content integrity is NOT verified here.
+            // The chunk count alone does not guarantee data correctness.
+            // A full UTXO commitment verification should be performed
+            // before trusting the snapshot data.
+            log::warn!(
+                "snapshot_complete_unverified: proceeding to HeaderSync without content verification \
+                 (total_chunks={})",
+                total_chunks
+            );
             self.set_phase(SyncPhase::HeaderSync);
         }
     }
@@ -240,6 +276,34 @@ impl BlockSyncManager {
             self.enqueue_block_downloads();
             return;
         }
+
+        // Validate headers before accepting them into the sync pipeline.
+        // Without this, a malicious peer can inject fake headers that
+        // cause invalid block downloads.
+        let headers: Vec<SyncHeader> = headers.into_iter().filter(|h| {
+            // Basic sanity: hash must be 64 hex chars
+            if h.hash.len() != 64 || !h.hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                log::warn!("header_invalid_hash: rejecting header with bad hash '{}'", h.hash);
+                return false;
+            }
+            // Height must be positive (genesis is not synced via headers)
+            if h.height == 0 {
+                log::warn!("header_zero_height: rejecting header hash={}", h.hash);
+                return false;
+            }
+            // Difficulty must be non-zero
+            if h.difficulty == 0 {
+                log::warn!("header_zero_difficulty: rejecting header hash={}", h.hash);
+                return false;
+            }
+            true
+        }).collect();
+
+        if headers.is_empty() {
+            log::warn!("on_headers_received: all headers rejected by validation");
+            return;
+        }
+
         let mut map = self.headers.write().unwrap_or_else(|e| e.into_inner());
         let mut by_height = self.headers_by_height.write().unwrap_or_else(|e| e.into_inner());
         for h in &headers {

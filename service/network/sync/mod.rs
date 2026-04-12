@@ -81,8 +81,11 @@ impl SyncManager {
     }
 
     pub fn on_headers_received(&mut self, hashes: Vec<String>, peer: &str) {
-        // Remove pending header requests from this peer (the request
-        // key is from_hash, not the received hash — they're different).
+        // Clear ALL pending header requests from this peer because a
+        // single GetHeaders response can cover multiple outstanding
+        // requests. This is correct: the peer sends all headers it has
+        // from the requested locator forward, so any pending request
+        // from this peer is satisfied by this response.
         self.pending_headers.retain(|_, req| req.peer != peer);
         for hash in &hashes {
             if !self.downloaded_blocks.contains(hash) && !self.block_queue.contains(hash) {
