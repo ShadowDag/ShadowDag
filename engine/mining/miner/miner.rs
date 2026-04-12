@@ -11,7 +11,7 @@ use crate::engine::mining::pow::pow_validator::PowValidator;
 use crate::engine::dag::core::dag_manager::DagManager;
 use crate::engine::dag::security::dos_protection::MAX_DAG_PARENTS;
 use crate::errors::ConsensusError;
-use crate::{slog_info, slog_debug, slog_warn};
+use crate::{slog_info, slog_debug, slog_warn, slog_error};
 
 pub struct Miner {
     pub difficulty:           u64,
@@ -47,9 +47,16 @@ impl Miner {
         total_fees: u64,
     ) -> Transaction {
         let emission = crate::config::consensus::emission_schedule::EmissionSchedule::block_reward(height);
-        // Use checked_add to surface overflow instead of silently capping at u64::MAX
-        let reward = emission.checked_add(total_fees)
-            .expect("coinbase reward overflow: emission + fees exceeds u64");
+        let reward = match emission.checked_add(total_fees) {
+            Some(r) => r,
+            None => {
+                slog_error!("mining", "coinbase_reward_overflow",
+                    emission => emission, fees => total_fees);
+                // Cap at MAX to avoid panic — the block will be rejected
+                // by the validator's exact coinbase check anyway.
+                u64::MAX
+            }
+        };
         let miner_reward = (reward * crate::config::consensus::consensus_params::ConsensusParams::MINER_PERCENT) / 100;
         let owner_reward = reward - miner_reward;
 

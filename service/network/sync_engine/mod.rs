@@ -96,6 +96,11 @@ impl DagSyncEngine {
     }
 
     pub fn on_headers(&mut self, hashes: Vec<String>, _peer: &str) {
+        // Validate header hashes before accepting
+        let hashes: Vec<String> = hashes.into_iter().filter(|h| {
+            h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit())
+        }).collect();
+
         let new_count = hashes.iter()
             .filter(|h| !self.verified_blocks.contains(*h) && !self.block_queue.contains(h))
             .count();
@@ -110,8 +115,18 @@ impl DagSyncEngine {
         }
     }
 
+    /// Clear failed peers to allow retry after a cooldown period.
+    /// Call this periodically (e.g., every 60 seconds) from the sync loop.
+    pub fn reset_failed_peers(&mut self) {
+        self.failed_peers.clear();
+    }
+
     pub fn next_block_request(&mut self, peer: &str) -> Option<String> {
         if self.pending_blocks.len() >= MAX_PENDING_BLOCKS { return None; }
+        // If all known peers have failed, reset to avoid starvation
+        if self.failed_peers.len() > 10 {
+            self.failed_peers.clear();
+        }
         if self.is_failed_peer(peer) { return None; }
         let hash = self.block_queue.pop_front()?;
         // Restore retry count from previous attempts (preserved across timeouts)
@@ -128,6 +143,9 @@ impl DagSyncEngine {
     pub fn on_block_received(&mut self, hash: &str) {
         self.pending_blocks.remove(hash);
         self.retry_counts.remove(hash);
+        // NOTE: "verified" here means "received and passed structural
+        // checks". Full consensus verification happens in the FullNode
+        // pipeline after blocks leave the sync engine.
         self.verified_blocks.insert(hash.to_string());
         // Prune verified_blocks to prevent unbounded memory growth
         if self.verified_blocks.len() > 100_000 {
@@ -149,7 +167,12 @@ impl DagSyncEngine {
         self.synced_count += 1;
 
         if self.pending_blocks.is_empty() && self.block_queue.is_empty() {
-            self.phase = SyncPhase::Complete;
+            if self.synced_count > 0 {
+                self.phase = SyncPhase::Complete;
+            }
+            // If synced_count == 0, stay in current phase — we haven't
+            // actually downloaded anything. Declaring Complete with 0
+            // blocks synced is misleading.
         }
     }
 
@@ -236,14 +259,24 @@ mod tests {
     #[test]
     fn on_headers_queues_blocks() {
         let mut engine = DagSyncEngine::new();
-        engine.on_headers(vec!["b1".into(), "b2".into()], "p1");
+        let h1 = "a".repeat(64);
+        let h2 = "b".repeat(64);
+        engine.on_headers(vec![h1, h2], "p1");
         assert_eq!(engine.queue_count(), 2);
+    }
+
+    #[test]
+    fn on_headers_rejects_invalid_hashes() {
+        let mut engine = DagSyncEngine::new();
+        engine.on_headers(vec!["short".into(), "not-hex-!@#$".into()], "p1");
+        assert_eq!(engine.queue_count(), 0);
     }
 
     #[test]
     fn on_block_received_marks_complete_when_done() {
         let mut engine = DagSyncEngine::new();
-        engine.on_headers(vec!["b1".into()], "p1");
+        let h1 = "c".repeat(64);
+        engine.on_headers(vec![h1], "p1");
         let hash = engine.next_block_request("p1").unwrap();
         engine.on_block_received(&hash);
         assert!(engine.is_synced());
