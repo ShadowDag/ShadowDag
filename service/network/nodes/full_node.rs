@@ -391,6 +391,14 @@ impl FullNode {
         //            bug where nodes disagree on block validity.
         // ═══════════════════════════════════════════════════════════════
 
+        // NOTE: ema_difficulty() returns the tip-chain's difficulty
+        // estimate. For side-chain blocks this may differ from the
+        // difficulty their parents imply, but ShadowDAG's GHOSTDAG
+        // reorg mechanism re-validates after insertion, so a block
+        // accepted on this path will be re-checked when (if) it
+        // becomes part of the selected chain. A per-parent-context
+        // retarget would be more precise but requires walking the
+        // parent chain for every incoming block — acceptable for now.
         let expected_diff = {
             let retarget = self.retarget.lock()
                 .map_err(|e| NodeError::Other(format!("Retarget lock poisoned: {}", e)))?;
@@ -496,6 +504,14 @@ impl FullNode {
     /// Same as process_block_inner but WITHOUT triggering orphan processing.
     /// Used by the iterative orphan resolver to avoid recursion.
     fn process_block_without_orphans(&self, block: &Block) -> Result<(), NodeError> {
+        // NOTE: ema_difficulty() returns the tip-chain's difficulty
+        // estimate. For side-chain blocks this may differ from the
+        // difficulty their parents imply, but ShadowDAG's GHOSTDAG
+        // reorg mechanism re-validates after insertion, so a block
+        // accepted on this path will be re-checked when (if) it
+        // becomes part of the selected chain. A per-parent-context
+        // retarget would be more precise but requires walking the
+        // parent chain for every incoming block — acceptable for now.
         let expected_diff = {
             let retarget = self.retarget.lock()
                 .map_err(|e| NodeError::Other(format!("Retarget lock poisoned: {}", e)))?;
@@ -861,7 +877,17 @@ impl FullNode {
         }
 
         // Update best hash
-        self.block_store.update_best_hash(&best_tip);
+        if !self.block_store.update_best_hash(&best_tip) {
+            // Rollback everything we just applied — the tip cannot be
+            // authoritative without a persisted best_hash pointer.
+            for hash in applied_new.iter().rev() {
+                let _ = self.utxo_set.rollback_block_undo(hash);
+                self.rollback_contract_block(hash);
+            }
+            return Err(NodeError::Consensus(ConsensusError::BlockValidation(
+                format!("failed to persist best_hash for tip {}", best_tip)
+            )));
+        }
 
         // Update retarget from selected chain and publish next difficulty
         if let Some(best_block) = self.block_store.get_block(&best_tip) {
@@ -908,13 +934,35 @@ impl FullNode {
                     // Collect block hashes at or below finality height
                     // that still have undo data (UTXO or contract — batch prune them)
                     let mut to_prune: Vec<String> = Vec::new();
-                    for hash in &new_chain {
-                        if let Some(b) = self.block_store.get_block(hash) {
-                            if b.header.height <= finality_height
-                                && (self.utxo_set.has_undo_data(hash)
-                                    || self.contract_storage.has_undo_data(hash))
-                            {
-                                to_prune.push(hash.clone());
+                    // Walk the canonical chain below the tip to find
+                    // ALL blocks with undo data at or below finality
+                    // height — not just the new_chain segment, which
+                    // in the common (non-reorg) case is a single
+                    // block and would never reach old-enough heights.
+                    {
+                        let mut cursor = best_tip.clone();
+                        let mut walk_limit = 0u64;
+                        while !cursor.is_empty() && walk_limit < FINALITY_DEPTH * 2 {
+                            walk_limit += 1;
+                            if let Some(b) = self.block_store.get_block(&cursor) {
+                                if b.header.height <= finality_height {
+                                    if self.utxo_set.has_undo_data(&cursor)
+                                        || self.contract_storage.has_undo_data(&cursor)
+                                    {
+                                        to_prune.push(cursor.clone());
+                                    }
+                                    // Stop once we've walked past the
+                                    // finality boundary by a margin —
+                                    // anything deeper was already pruned.
+                                    if b.header.height + 10 < finality_height {
+                                        break;
+                                    }
+                                }
+                                cursor = b.header.selected_parent
+                                    .clone()
+                                    .unwrap_or_default();
+                            } else {
+                                break;
                             }
                         }
                     }
@@ -1668,13 +1716,16 @@ impl FullNode {
         // Max depth prevents DoS via crafted chains of 500 orphans.
         const MAX_ORPHAN_DEPTH: usize = 64;
 
-        let mut queue = vec![parent_hash.to_string()];
-        let mut depth = 0;
+        let mut queue: Vec<(String, usize)> = vec![(parent_hash.to_string(), 0)];
+        let mut total_processed = 0usize;
+        const MAX_TOTAL_ORPHANS: usize = 256; // prevent runaway processing
 
-        while let Some(current_parent) = queue.pop() {
-            depth += 1;
-            if depth > MAX_ORPHAN_DEPTH {
-                slog_warn!("node", "orphan_chain_depth_exceeded", depth => &depth.to_string());
+        while let Some((current_parent, chain_depth)) = queue.pop() {
+            total_processed += 1;
+            if chain_depth > MAX_ORPHAN_DEPTH || total_processed > MAX_TOTAL_ORPHANS {
+                slog_warn!("node", "orphan_chain_limit_exceeded",
+                    depth => &chain_depth.to_string(),
+                    total => &total_processed.to_string());
                 break;
             }
 
@@ -1706,7 +1757,7 @@ impl FullNode {
                                 if *c == 0 { counts.remove(&peer_id); }
                             }
                         }
-                        queue.push(hash);
+                        queue.push((hash, chain_depth + 1));
                     }
                     Err(ref e) if e.to_string().contains("not found") => {
                         // Still orphan — re-insert into pool and parent index
@@ -1847,7 +1898,11 @@ impl FullNode {
         ).map_err(|e| NodeError::BlockRejected(format!("Genesis UTXO write failed: {}", e)))?;
 
         // Genesis is always best
-        self.block_store.update_best_hash(&block.header.hash);
+        if !self.block_store.update_best_hash(&block.header.hash) {
+            return Err(NodeError::BlockRejected(
+                "Failed to persist best_hash for genesis block".to_string()
+            ));
+        }
 
         Ok(())
     }

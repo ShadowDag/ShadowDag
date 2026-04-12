@@ -33,7 +33,7 @@
 //   - Per-message field limits enforced (hash lengths, list sizes, etc.)
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Sha256, Digest};
@@ -758,6 +758,10 @@ pub struct ProtocolSession {
     pub connected_at:     u64,
     /// Nonces we've seen (Ping/Pong anti-replay).
     pub seen_nonces:      HashSet<u64>,
+    /// Insertion-order queue for FIFO nonce eviction (ring buffer).
+    /// When seen_nonces reaches capacity, the oldest nonce is evicted
+    /// instead of clearing the entire set.
+    nonce_order:          VecDeque<u64>,
     /// Total messages received (for stats).
     pub msgs_received:    u64,
     /// Total messages sent (for stats).
@@ -784,6 +788,7 @@ impl ProtocolSession {
             puzzle_challenge: None,
             connected_at:     now,
             seen_nonces:      HashSet::with_capacity(64),
+            nonce_order:      VecDeque::with_capacity(64),
             msgs_received:    0,
             msgs_sent:        0,
             bytes_received:   0,
@@ -1001,12 +1006,22 @@ impl ProtocolSession {
     /// Record a nonce and check for replay.
     ///
     /// Returns `true` if the nonce is new, `false` if it's a replay.
+    /// Uses a ring buffer (FIFO eviction) to cap memory at 2048 entries
+    /// without clearing the entire set — prevents replay windows.
     pub fn record_nonce(&mut self, nonce: u64) -> bool {
-        // Cap the set to prevent memory exhaustion
-        if self.seen_nonces.len() >= 2048 {
-            self.seen_nonces.clear();
+        if !self.seen_nonces.insert(nonce) {
+            return false; // duplicate — replay detected
         }
-        self.seen_nonces.insert(nonce)
+        self.nonce_order.push_back(nonce);
+        // Evict oldest entries one at a time to stay within capacity
+        while self.seen_nonces.len() > 2048 {
+            if let Some(oldest) = self.nonce_order.pop_front() {
+                self.seen_nonces.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        true
     }
 
     // ── Lifecycle transitions (post-handshake) ────────────────────────
@@ -1191,10 +1206,10 @@ pub fn validate_inv_items(items: &[(String, String)]) -> Result<(), ProtocolErro
                 20,
             ));
         }
-        if hash.len() > MAX_HASH_HEX_LEN {
+        if hash.len() != MAX_HASH_HEX_LEN {
             return Err(ProtocolError::new(
                 ProtocolErrorKind::FieldViolation,
-                format!("hash too long ({} > {})", hash.len(), MAX_HASH_HEX_LEN),
+                format!("inv hash length {} != required {}", hash.len(), MAX_HASH_HEX_LEN),
                 50,
             ));
         }
@@ -1224,10 +1239,10 @@ pub fn validate_headers_list(hashes: &[String]) -> Result<(), ProtocolError> {
         ));
     }
     for h in hashes {
-        if h.len() > MAX_HASH_HEX_LEN {
+        if h.len() != MAX_HASH_HEX_LEN {
             return Err(ProtocolError::new(
                 ProtocolErrorKind::FieldViolation,
-                format!("header hash too long ({} > {})", h.len(), MAX_HASH_HEX_LEN),
+                format!("header hash length {} != required {}", h.len(), MAX_HASH_HEX_LEN),
                 50,
             ));
         }
@@ -1247,19 +1262,16 @@ pub fn validate_reject(reason: &str) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-/// Validate a hash string (hex format, expected 64 chars for SHA-256).
+/// Validate a hash string (hex format, must be exactly 64 chars for SHA-256).
+///
+/// SHA-256 produces 32 bytes = 64 hex characters. Accepting shorter hashes
+/// would allow truncated or malformed identifiers to pass validation,
+/// potentially causing lookup failures or hash-collision exploits.
 pub fn validate_hash_hex(hash: &str) -> Result<(), ProtocolError> {
-    if hash.is_empty() {
+    if hash.len() != MAX_HASH_HEX_LEN {
         return Err(ProtocolError::new(
             ProtocolErrorKind::FieldViolation,
-            "empty hash",
-            20,
-        ));
-    }
-    if hash.len() > MAX_HASH_HEX_LEN {
-        return Err(ProtocolError::new(
-            ProtocolErrorKind::FieldViolation,
-            format!("hash too long ({} > {})", hash.len(), MAX_HASH_HEX_LEN),
+            format!("hash length {} != required {} (SHA-256 hex)", hash.len(), MAX_HASH_HEX_LEN),
             50,
         ));
     }
@@ -1677,8 +1689,12 @@ mod tests {
         for i in 0..3000u64 {
             session.record_nonce(i);
         }
-        // Set should have been cleared at 2048
-        assert!(session.seen_nonces.len() < 2048);
+        // Ring buffer evicts oldest entries, keeping at most 2048
+        assert!(session.seen_nonces.len() <= 2048);
+        // Oldest nonces should have been evicted
+        assert!(!session.seen_nonces.contains(&0));
+        // Recent nonces should still be present
+        assert!(session.seen_nonces.contains(&2999));
     }
 
     // ── Field validation tests ──────────────────────────────────────────

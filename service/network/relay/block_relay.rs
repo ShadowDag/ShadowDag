@@ -19,6 +19,12 @@ pub const MAX_ORPHANS: usize = 1_024;
 
 pub const ORPHAN_TTL_SECS: u64 = 3_600;
 
+/// TTL for relay:block:* and relay:pending:* dedup keys (24 hours).
+/// After this period the keys are eligible for pruning to prevent
+/// unbounded DB growth. In production, consider using a RocksDB TTL
+/// column family or scheduling periodic compaction instead.
+pub const RELAY_KEY_TTL_SECS: u64 = 86_400;
+
 /// Maximum serialized size of a single orphan entry (4 MB).
 /// Entries exceeding this are skipped during deserialization to prevent
 /// memory exhaustion from maliciously large or corrupted DB values.
@@ -92,8 +98,8 @@ impl BlockRelay {
         // will drain this queue and send via its TCP stream.
         push_outbound(P2PMessage::Block { data: block_bytes });
 
-        // Mark AFTER successful queue push
-        if let Err(e) = self.db.put(key.as_bytes(), b"1") {
+        // Mark AFTER successful queue push (store timestamp for TTL pruning)
+        if let Err(e) = self.db.put(key.as_bytes(), &Self::now_bytes()) {
             slog_error!("relay", "block_relay_db_put_error", error => e);
         }
 
@@ -104,14 +110,25 @@ impl BlockRelay {
     }
 
     pub fn receive_block(&self, block: Block) -> bool {
-        let key = format!("relay:block:{}", block.header.hash);
+        let relay_key = format!("relay:block:{}", block.header.hash);
+        let pending_key = format!("relay:pending:{}", block.header.hash);
 
-        if matches!(self.db.get(key.as_bytes()), Ok(Some(_))) {
+        // Already fully validated and known — skip.
+        if matches!(self.db.get(relay_key.as_bytes()), Ok(Some(_))) {
             return false;
         }
 
-        if let Err(e) = self.db.put(key.as_bytes(), b"1") {
-            slog_warn!("relay", "receive_block_put_error", hash => &block.header.hash, error => e);
+        // Already pending validation — skip to avoid duplicate processing.
+        if matches!(self.db.get(pending_key.as_bytes()), Ok(Some(_))) {
+            return false;
+        }
+
+        // Mark as "pending" for dedup — NOT as "known". The block has not
+        // been validated yet. Callers must call mark_block_known() after
+        // successful validation to promote from pending to known.
+        // Store timestamp for TTL-based pruning of stale pending keys.
+        if let Err(e) = self.db.put(pending_key.as_bytes(), &Self::now_bytes()) {
+            slog_warn!("relay", "receive_block_pending_put_error", hash => &block.header.hash, error => e);
         }
 
         if block.header.height == 0 || block.header.parents.is_empty() {
@@ -127,7 +144,6 @@ impl BlockRelay {
 
         if all_parents_known {
             // Relay to other peers (gossip propagation).
-            // Already marked as seen above, so push directly to outbound queue.
             if let Ok(block_bytes) = bincode::serialize(&block) {
                 push_outbound(P2PMessage::Block { data: block_bytes });
             }
@@ -171,6 +187,53 @@ impl BlockRelay {
     pub fn resolve_orphans(&self, parent_hash: &str) -> Vec<Block> {
         self.prune_orphans();
 
+        // ── Build in-memory parent→orphan index (O(N) once) ──────────
+        // Maps parent_hash → Vec<(orphan_hash, OrphanEntry)>.
+        // This avoids a full prefix scan on every BFS step (was O(N) per step,
+        // now O(1) lookup per parent).
+        let mut parent_index: std::collections::HashMap<String, Vec<(String, OrphanEntry)>> =
+            std::collections::HashMap::new();
+        let mut corrupt_keys: Vec<Vec<u8>> = Vec::new();
+
+        for result in self.db.prefix_iterator(PFX_ORPHAN) {
+            match result {
+                Ok((k, v)) => {
+                    if v.len() > MAX_ORPHAN_ENTRY_SIZE {
+                        // Oversized entry — treat as corrupt and delete (Fix #7)
+                        corrupt_keys.push(k.to_vec());
+                        continue;
+                    }
+                    match bincode::deserialize::<OrphanEntry>(&v) {
+                        Ok(entry) => {
+                            let hash = entry.block.header.hash.clone();
+                            for parent in &entry.block.header.parents {
+                                parent_index
+                                    .entry(parent.clone())
+                                    .or_default()
+                                    .push((hash.clone(), entry.clone()));
+                            }
+                        }
+                        Err(e) => {
+                            // Fix #7: Delete corrupt/undeserializable orphan entries
+                            // instead of silently skipping them forever.
+                            slog_warn!("relay", "orphan_corrupt_entry_deleted",
+                                key => String::from_utf8_lossy(&k), error => e);
+                            corrupt_keys.push(k.to_vec());
+                        }
+                    }
+                }
+                Err(e) => {
+                    slog_warn!("relay", "orphan_iter_read_error", error => e);
+                }
+            }
+        }
+
+        // Delete corrupt entries (best-effort cleanup)
+        for k in &corrupt_keys {
+            let _ = self.db.delete(k);
+        }
+
+        // ── BFS resolution using the index ───────────────────────────
         let mut resolved = Vec::new();
         let mut queue = vec![parent_hash.to_string()];
         // Track blocks resolved in this call so cascading resolution works
@@ -179,24 +242,16 @@ impl BlockRelay {
         // mark_block_known().
         let mut resolved_hashes = std::collections::HashSet::<String>::new();
 
-        // Iterative BFS: each resolved block may unlock further orphans
-        // whose other parents were already known.
         while let Some(current_parent) = queue.pop() {
-            let all_orphans: Vec<OrphanEntry> = self.db
-                .prefix_iterator(PFX_ORPHAN)
-                .filter_map(|r| match r {
-                    Ok(kv) => Some(kv),
-                    Err(e) => {
-                        slog_warn!("relay", "orphan_iter_read_error", error => e);
-                        None
-                    }
-                })
-                .filter(|(_, v)| v.len() <= MAX_ORPHAN_ENTRY_SIZE)
-                .filter_map(|(_, v)| bincode::deserialize::<OrphanEntry>(&v).ok())
-                .collect();
+            // O(1) lookup: only orphans that list current_parent
+            let candidates = match parent_index.remove(&current_parent) {
+                Some(c) => c,
+                None => continue,
+            };
 
-            for entry in all_orphans {
-                if !entry.block.header.parents.iter().any(|p| p == &current_parent) {
+            for (orphan_hash, entry) in candidates {
+                // Skip if already resolved in this BFS pass
+                if resolved_hashes.contains(&orphan_hash) {
                     continue;
                 }
 
@@ -205,9 +260,9 @@ impl BlockRelay {
                 });
 
                 if all_known {
-                    let orphan_key = format!("orphan:block:{}", entry.block.header.hash);
+                    let orphan_key = format!("orphan:block:{}", orphan_hash);
                     if let Err(e) = self.db.delete(orphan_key.as_bytes()) {
-                        slog_warn!("relay", "orphan_delete_error", hash => &entry.block.header.hash, error => e);
+                        slog_warn!("relay", "orphan_delete_error", hash => &orphan_hash, error => e);
                     }
 
                     // Do NOT write relay:block:{hash}=1 here — the block has
@@ -215,10 +270,10 @@ impl BlockRelay {
                     // mark_block_known() after successful validation.
 
                     // Track locally for cascading BFS
-                    resolved_hashes.insert(entry.block.header.hash.clone());
+                    resolved_hashes.insert(orphan_hash.clone());
 
                     // Enqueue so orphans waiting on THIS block get checked next
-                    queue.push(entry.block.header.hash.clone());
+                    queue.push(orphan_hash);
                     resolved.push(entry.block);
                 }
             }
@@ -229,11 +284,23 @@ impl BlockRelay {
 
     /// Mark a block as known in the relay DB. Callers should invoke this
     /// AFTER the block has been fully validated, not before.
+    /// Also cleans up the temporary "pending" marker set during receive_block().
     pub fn mark_block_known(&self, hash: &str) {
         let relay_key = format!("relay:block:{}", hash);
-        if let Err(e) = self.db.put(relay_key.as_bytes(), b"1") {
+        if let Err(e) = self.db.put(relay_key.as_bytes(), &Self::now_bytes()) {
             slog_error!("relay", "mark_block_known_error", hash => hash, error => e);
         }
+        // Clean up pending marker (best-effort)
+        let pending_key = format!("relay:pending:{}", hash);
+        let _ = self.db.delete(pending_key.as_bytes());
+    }
+
+    /// Remove the "pending" marker for a block that failed validation.
+    /// This allows the block to be re-received and retried if it arrives again
+    /// (e.g., after the missing parent is resolved).
+    pub fn unmark_block_pending(&self, hash: &str) {
+        let pending_key = format!("relay:pending:{}", hash);
+        let _ = self.db.delete(pending_key.as_bytes());
     }
 
     pub fn is_orphan(&self, hash: &str) -> bool {
@@ -257,22 +324,30 @@ impl BlockRelay {
     pub fn prune_orphans(&self) {
         let cutoff = Self::now().saturating_sub(ORPHAN_TTL_SECS);
 
-        let stale_keys: Vec<Vec<u8>> = self.db
-            .prefix_iterator(PFX_ORPHAN)
-            .filter_map(|r| match r {
-                Ok(kv) => Some(kv),
+        let mut stale_keys: Vec<Vec<u8>> = Vec::new();
+
+        for result in self.db.prefix_iterator(PFX_ORPHAN) {
+            match result {
+                Ok((k, v)) => {
+                    match bincode::deserialize::<OrphanEntry>(&v) {
+                        Ok(e) if e.received_at < cutoff => {
+                            stale_keys.push(k.to_vec());
+                        }
+                        Ok(_) => {} // not stale, keep it
+                        Err(e) => {
+                            // Fix #7: corrupt entry — delete it instead of
+                            // leaving it to accumulate forever.
+                            slog_warn!("relay", "prune_orphan_corrupt_entry_deleted",
+                                key => String::from_utf8_lossy(&k), error => e);
+                            stale_keys.push(k.to_vec());
+                        }
+                    }
+                }
                 Err(e) => {
                     slog_warn!("relay", "prune_orphans_iter_error", error => e);
-                    None
                 }
-            })
-            .filter(|(_, v)| {
-                bincode::deserialize::<OrphanEntry>(v)
-                    .map(|e| e.received_at < cutoff)
-                    .unwrap_or(false)
-            })
-            .map(|(k, _)| k.to_vec())
-            .collect();
+            }
+        }
 
         let pruned = stale_keys.len();
         for k in &stale_keys {
@@ -282,7 +357,7 @@ impl BlockRelay {
         }
 
         if pruned > 0 {
-            log::debug!("[BlockRelay] Pruned {} stale orphans", pruned);
+            log::debug!("[BlockRelay] Pruned {} stale/corrupt orphans", pruned);
         }
     }
 
@@ -327,6 +402,52 @@ impl BlockRelay {
                 slog_warn!("relay", "evict_oldest_orphan_delete_error", error => e);
             }
         }
+    }
+
+    /// Prune stale relay:block:* and relay:pending:* dedup keys older
+    /// than RELAY_KEY_TTL_SECS. Call periodically (e.g. alongside prune_orphans)
+    /// to prevent unbounded DB growth.
+    ///
+    /// NOTE: For high-throughput deployments, prefer a RocksDB TTL column
+    /// family or CompactRange with periodic compaction filters instead of
+    /// this application-level scan.
+    pub fn prune_relay_keys(&self) {
+        let cutoff = Self::now().saturating_sub(RELAY_KEY_TTL_SECS);
+        let prefixes: &[&[u8]] = &[b"relay:block:", b"relay:pending:"];
+        let mut pruned = 0usize;
+
+        for prefix in prefixes {
+            for result in self.db.prefix_iterator(*prefix) {
+                match result {
+                    Ok((k, v)) => {
+                        // Value is either b"1" (legacy) or a timestamp string.
+                        // Legacy entries without a parseable timestamp are kept
+                        // (they predate this change and will be replaced naturally).
+                        let ts: u64 = std::str::from_utf8(&v)
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(u64::MAX); // unparseable → keep
+                        if ts < cutoff {
+                            let _ = self.db.delete(&k);
+                            pruned += 1;
+                        }
+                    }
+                    Err(e) => {
+                        slog_warn!("relay", "prune_relay_keys_iter_error", error => e);
+                    }
+                }
+            }
+        }
+
+        if pruned > 0 {
+            log::debug!("[BlockRelay] Pruned {} stale relay/pending keys", pruned);
+        }
+    }
+
+    /// Return the current timestamp as a byte string suitable for DB values,
+    /// enabling TTL-based pruning of relay keys.
+    fn now_bytes() -> Vec<u8> {
+        Self::now().to_string().into_bytes()
     }
 
     fn now() -> u64 {

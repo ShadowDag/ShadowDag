@@ -246,6 +246,17 @@ impl BlockTemplateBuilder {
                     // TX failed full validation — reject it regardless of staged UTXO status.
                     // Previously, TXs whose inputs were all in staged_utxos were accepted
                     // even when signature/fee/ring checks failed. This bypassed consensus.
+                    //
+                    // KNOWN LIMITATION: validate_tx runs against the base UTXO set only,
+                    // not against (base + staged_utxos). This means a child TX whose
+                    // parent was included earlier in THIS block will fail UTXO-existence
+                    // checks even though the UTXO will exist when the block is executed.
+                    // The UTXO-existence pre-check above (in_real || in_staged) catches
+                    // the common case, but signature verification for inputs that reference
+                    // intra-block outputs may still fail if the validator's UTXO lookup
+                    // is needed for amount/script checks. A full fix requires passing a
+                    // merged UtxoSet view (base + staged) to validate_tx, which is
+                    // deferred to avoid changing the TxValidator interface mid-release.
                     continue;
                 }
 
@@ -266,7 +277,12 @@ impl BlockTemplateBuilder {
             }
             if skip { continue; }
 
-            total_fees += tx.fee;
+            // BUG FIX: Use saturating_add to prevent overflow panic.
+            // If a malicious mempool TX has fee near u64::MAX, a simple
+            // += would wrap/panic in debug builds. Saturating keeps the
+            // total capped at u64::MAX which is safe for the coinbase
+            // reward calculation (emission.saturating_add(total_fees)).
+            total_fees = total_fees.saturating_add(tx.fee);
             accepted.push(tx);
         }
 

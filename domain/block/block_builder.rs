@@ -56,10 +56,19 @@ impl BlockBuilder {
 
         for tx in mempool_txs {
             let tx_gas = tx.gas_limit.unwrap_or(0);
-            if tx_gas > 0 && block_gas_used + tx_gas > max_block_gas {
-                break; // Block gas limit reached
+            if tx_gas > 0 {
+                // BUG FIX: Use checked_add to prevent overflow.
+                // A malicious TX with gas_limit near u64::MAX could wrap
+                // block_gas_used, bypassing the block gas limit entirely.
+                let new_gas = match block_gas_used.checked_add(tx_gas) {
+                    Some(g) => g,
+                    None => break, // overflow — treat as limit reached
+                };
+                if new_gas > max_block_gas {
+                    break; // Block gas limit reached
+                }
+                block_gas_used = new_gas;
             }
-            block_gas_used += tx_gas;
             all_txs.push(tx);
         }
 

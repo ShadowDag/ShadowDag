@@ -78,9 +78,26 @@ impl RbfEngine {
             return RbfResult::NoConflict;
         }
 
-        // Rule 1: Calculate total fee of all conflicting TXs + their dependents
+        // Rule 1: Calculate total fee of all conflicting TXs AND their dependents.
+        // BUG FIX: Previously only summed direct conflict fees, but dependents
+        // are also evicted (see evicted list below). The replacement must cover
+        // ALL evicted fees to prevent net fee reduction in the mempool.
+        //
+        // NOTE: Dependent fees are approximated from the MempoolTxInfo passed
+        // by the caller. For full accuracy the caller should populate
+        // `dependent_fees` or the engine should look up each dependent.
+        // As a pragmatic fix, we sum each conflict's fee plus a per-dependent
+        // estimate of MIN_FEE_BUMP (the minimum any valid TX must pay).
         let total_evicted_fee: u64 = match conflicting.iter()
-            .try_fold(0u64, |acc, tx| acc.checked_add(tx.fee))
+            .try_fold(0u64, |acc, tx| {
+                // Sum the conflict's own fee
+                let with_own = acc.checked_add(tx.fee)?;
+                // Sum estimated fees for dependents that will also be evicted.
+                // Each dependent is a valid mempool TX, so it paid at least
+                // MIN_FEE_BUMP. This is a lower bound; the actual fee may be higher.
+                let dep_fees = (tx.dependents.len() as u64).checked_mul(MIN_FEE_BUMP)?;
+                with_own.checked_add(dep_fees)
+            })
         {
             Some(total) => total,
             None => return RbfResult::Rejected {
@@ -134,22 +151,34 @@ impl RbfEngine {
             }
         }
 
-        // All rules pass — accept replacement
+        // All rules pass — accept replacement.
+        // BUG FIX: Deduplicate the eviction list. A dependent TX may appear
+        // in multiple conflict entries (e.g., a child spending outputs from
+        // two conflicting parents). Without dedup, remove_transaction is
+        // called twice for the same hash, wasting work and producing
+        // confusing telemetry.
+        let mut seen = std::collections::HashSet::new();
         let evicted: Vec<String> = conflicting.iter()
             .flat_map(|tx| {
                 let mut hashes = vec![tx.hash.clone()];
                 hashes.extend(tx.dependents.clone());
                 hashes
             })
+            .filter(|h| seen.insert(h.clone()))
             .collect();
 
         RbfResult::Accepted { evicted }
     }
 
-    /// Calculate the minimum fee needed to replace a set of transactions
+    /// Calculate the minimum fee needed to replace a set of transactions.
+    /// Includes estimated descendant fees (consistent with evaluate()).
     pub fn minimum_replacement_fee(conflicting: &[MempoolTxInfo]) -> u64 {
         let total: u64 = conflicting.iter()
-            .try_fold(0u64, |acc, tx| acc.checked_add(tx.fee))
+            .try_fold(0u64, |acc, tx| {
+                let with_own = acc.checked_add(tx.fee)?;
+                let dep_fees = (tx.dependents.len() as u64).checked_mul(MIN_FEE_BUMP)?;
+                with_own.checked_add(dep_fees)
+            })
             .unwrap_or(u64::MAX);
         total.saturating_add(MIN_FEE_BUMP)
     }

@@ -50,8 +50,10 @@ use crate::errors::NodeError;
 
 /// Sentinel substrings used to classify block-rejection errors.
 /// Centralised here so a single rename propagates to every check.
+/// IMPORTANT: these are compared against `.to_lowercase()` error strings,
+/// so they MUST be lowercase to ensure case-insensitive matching.
 const ERR_ALREADY_EXISTS: &str = "already exists";
-const ERR_ORPHAN: &str = "ORPHAN";
+const ERR_ORPHAN: &str = "orphan";
 
 /// Ban score for peers that send invalid blocks rejected by consensus.
 const BAN_SCORE_INVALID_BLOCK: u64 = 20;
@@ -313,7 +315,8 @@ impl DaemonNode {
             if !blocks.is_empty() {
                 did_work = true;
                 let batch_start = std::time::Instant::now();
-                for (peer_id, block) in blocks.into_iter() {
+                let mut processed_count = 0usize;
+                for (peer_id, block) in blocks.iter() {
                     let hash_prefix = if block.header.hash.len() >= 16 {
                         &block.header.hash[..16]
                     } else {
@@ -324,14 +327,15 @@ impl DaemonNode {
                     // P2P dispatch already calls pre_validate_block, but the event
                     // loop is the LAST gate before FullNode — catch anything that
                     // slipped through (e.g. RPC-submitted blocks, future code paths).
-                    if let Err(rej) = DagShield::pre_validate_block(&block) {
+                    if let Err(rej) = DagShield::pre_validate_block(block) {
                         total_blocks_rejected += 1;
-                        report_bad_peer(&peer_id, rej.ban_score as u64, rej.reason);
+                        report_bad_peer(peer_id, rej.ban_score as u64, rej.reason);
                         slog_warn!("daemon", "block_rejected_dagshield", hash => hash_prefix, reason => rej.reason);
+                        processed_count += 1;
                         continue;
                     }
 
-                    match self.full_node.process_block_from_peer(&block, &peer_id) {
+                    match self.full_node.process_block_from_peer(block, peer_id) {
                         Ok(()) => {
                             total_blocks_processed += 1;
                             slog_info!("daemon", "block_processed", hash => hash_prefix, height => block.header.height, txs => block.body.transactions.len());
@@ -347,25 +351,31 @@ impl DaemonNode {
                             );
 
                             // Broadcast accepted block to peers (gossip propagation)
-                            if let Ok(block_bytes) = bincode::serialize(&block) {
+                            if let Ok(block_bytes) = bincode::serialize(block) {
                                 push_outbound(P2PMessage::Block { data: block_bytes });
                             }
                         }
                         Err(e) => {
                             total_blocks_rejected += 1;
-                            let err_msg = e.to_string();
+                            let err_msg = e.to_string().to_lowercase();
                             // "already exists" is normal during sync — don't penalize
                             if !err_msg.contains(ERR_ALREADY_EXISTS) && !err_msg.contains(ERR_ORPHAN) {
                                 // Ban feedback: penalize peer that sent the bad block
-                                report_bad_peer_cat(&peer_id, BAN_SCORE_INVALID_BLOCK, "invalid block rejected by consensus", BanCategory::Malformed);
+                                report_bad_peer_cat(peer_id, BAN_SCORE_INVALID_BLOCK, "invalid block rejected by consensus", BanCategory::Malformed);
                                 slog_error!("daemon", "block_rejected_consensus", hash => hash_prefix, peer => peer_id, error => err_msg);
                             }
                         }
                     }
 
+                    processed_count += 1;
                     if batch_start.elapsed() > std::time::Duration::from_millis(500) {
                         break; // Yield to process pending TXs
                     }
+                }
+                // Re-queue any unprocessed blocks so they are not lost on timeout
+                if processed_count < blocks.len() {
+                    let remaining: Vec<_> = blocks.into_iter().skip(processed_count).collect();
+                    requeue_pending_blocks(remaining);
                 }
             }
 
@@ -395,9 +405,22 @@ impl DaemonNode {
                             TxPoolResult::Accepted => {
                                 total_txs_processed += 1;
                             }
-                            _ => {
+                            // Duplicate, Orphan, DoubleSpend are non-malicious:
+                            // these occur normally during sync and relay races.
+                            // Do NOT increase ban score for these.
+                            TxPoolResult::Duplicate | TxPoolResult::Orphan => {
                                 total_txs_rejected += 1;
-                                // Ban feedback: penalize peer sending invalid TXs
+                            }
+                            TxPoolResult::DoubleSpend => {
+                                total_txs_rejected += 1;
+                                // DoubleSpend may indicate misbehaviour but is
+                                // common during reorgs — use a low score (1) so
+                                // that sporadic duplicates don't trigger a ban.
+                                report_bad_peer_cat(&peer_id, 1, "double-spend tx", BanCategory::Resource);
+                            }
+                            // Invalid and Rejected are truly malformed/policy-violating.
+                            TxPoolResult::Invalid | TxPoolResult::Rejected => {
+                                total_txs_rejected += 1;
                                 report_bad_peer_cat(&peer_id, BAN_SCORE_INVALID_TX, "invalid tx rejected by mempool", BanCategory::Malformed);
                             }
                         }
@@ -490,7 +513,12 @@ impl DaemonNode {
     ///      - Within tolerance → continue normally
     fn verify_and_recover(&self) -> Result<(), NodeError> {
         // Step A: Check BlockStore integrity
-        let best_hash = self.block_store.get_best_hash()
+        // Use get_best_hash_strict() to distinguish "absent" from "corrupt/unreadable".
+        // A corrupt read here must be fatal — recovery with stale data is dangerous.
+        let best_hash = self.block_store.get_best_hash_strict()
+            .map_err(|e| NodeError::Init(format!(
+                "FATAL: best_hash read failed during recovery (corrupt DB?): {}", e
+            )))?
             .ok_or(NodeError::Init("No best hash found".to_string()))?;
         let best_block = self.block_store.get_block(&best_hash)
             .ok_or(NodeError::Init("Best block not found in store".to_string()))?;
@@ -703,7 +731,10 @@ impl DaemonNode {
     fn replay_blocks(&self) -> Result<(), NodeError> {
         slog_info!("daemon", "utxo_replay_start");
 
-        let best_tip = self.block_store.get_best_hash()
+        let best_tip = self.block_store.get_best_hash_strict()
+            .map_err(|e| NodeError::Init(format!(
+                "FATAL: best_hash read failed during replay (corrupt DB?): {}", e
+            )))?
             .ok_or_else(|| NodeError::Init("no best tip for replay".into()))?;
 
         // Walk selected-parent chain from best_tip back to genesis

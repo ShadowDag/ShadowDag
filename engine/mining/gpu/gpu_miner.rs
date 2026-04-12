@@ -44,10 +44,16 @@ impl GpuMiner {
     pub fn initialize(&self) {
         slog_info!("gpu", "gpu_miner_initializing", device => self.device_id, threads => self.threads, batch => self.batch_size);
 
-        rayon::ThreadPoolBuilder::new()
+        if let Err(e) = rayon::ThreadPoolBuilder::new()
             .num_threads(self.threads)
             .build_global()
-            .ok();
+        {
+            // build_global fails if already called — this is benign
+            // in multi-miner setups. Log but don't panic.
+            slog_warn!("gpu", "thread_pool_build_global_failed",
+                error => &format!("{}", e),
+                note => "likely already initialized; mining continues with default pool");
+        }
         slog_info!("gpu", "gpu_miner_thread_pool_ready");
     }
 
@@ -63,7 +69,8 @@ impl GpuMiner {
         let difficulty = self.difficulty;
         let total_nonces: u64 = u64::MAX;
         let batch    = self.batch_size;
-        let num_batches = total_nonces / batch;
+        // +1 to cover the remainder nonces that integer division drops
+        let num_batches = total_nonces / batch + if total_nonces % batch != 0 { 1 } else { 0 };
 
         let t_hash_count = hash_count.clone();
         let result: Option<(u64, String)> = (0..num_batches)

@@ -140,11 +140,21 @@ impl Miner {
     /// Mine a block, validating parents against the DAG before starting.
     pub fn mine_block_validated(
         &self,
-        block: Block,
+        mut block: Block,
         dag_manager: &DagManager,
     ) -> Result<Block, ConsensusError> {
         Self::validate_parents(&block, dag_manager)?;
-        Ok(self.mine_block(block))
+        // Ensure the block header carries the miner's difficulty
+        // so mine_block (which now reads block.header.difficulty)
+        // uses the correct target.
+        if block.header.difficulty == 0 {
+            block.header.difficulty = self.difficulty;
+        }
+        let mined = self.mine_block(block);
+        if mined.header.hash.is_empty() {
+            return Err(ConsensusError::Other("nonce space exhausted".into()));
+        }
+        Ok(mined)
     }
 
     pub fn mine_block(&self, mut block: Block) -> Block {
@@ -158,7 +168,7 @@ impl Miner {
             block.header.nonce = nonce;
             let hash = shadow_hash(&block);
 
-            if PowValidator::hash_meets_target(&hash, self.difficulty) {
+            if PowValidator::hash_meets_target(&hash, block.header.difficulty) {
                 block.header.hash = hash.clone();
                 slog_info!("mining", "block_found", nonce => nonce, hash_prefix => &hash[..8], height => block.header.height, parents => block.header.parents.len());
                 return block;
@@ -174,7 +184,14 @@ impl Miner {
                     // Both nonce spaces exhausted — bump timestamp as last resort
                     ts_bumps += 1;
                     if ts_bumps > 100 {
-                        return block; // Give up, request new template
+                        // Nonce space fully exhausted — cannot return
+                        // an unmined block because the caller would
+                        // broadcast it. Surface as an error instead.
+                        slog_warn!("mining", "nonce_exhausted",
+                            height => block.header.height,
+                            ts_bumps => ts_bumps);
+                        block.header.hash = String::new(); // mark as invalid
+                        return block;
                     }
                     block.header.timestamp = base_timestamp + ts_bumps as u64;
                 }

@@ -71,8 +71,28 @@ impl LightNode {
         if header.hash.len() != 64 || !header.hash.chars().all(|c| c.is_ascii_hexdigit()) {
             return false;
         }
-        // 2. PoW: hash must meet difficulty target
+        // 2. PoW: recompute hash from header fields, then check target.
+        //    Without recomputation, an attacker can send a fake hash
+        //    that meets PoW but doesn't correspond to the header content.
         use crate::engine::mining::pow::pow_validator::PowValidator;
+        use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
+        let recomputed = shadow_hash_raw_full(
+            header.version,
+            header.height,
+            header.timestamp,
+            header.nonce,
+            header.extra_nonce,
+            header.difficulty,
+            &header.merkle_root,
+            &header.parents,
+        );
+        if recomputed != header.hash {
+            return false;
+        }
+        // Reject difficulty=0 on non-genesis headers — it bypasses PoW entirely.
+        if header.height > 0 && header.difficulty == 0 {
+            return false;
+        }
         if header.difficulty > 0 && !PowValidator::hash_meets_target(&header.hash, header.difficulty) {
             return false;
         }
