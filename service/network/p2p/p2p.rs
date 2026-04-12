@@ -473,11 +473,14 @@ impl ConnectionSession {
     fn check_bandwidth(&mut self, bytes_read: u64) -> bool {
         self.bytes_this_window += bytes_read;
 
-        // Reset window every BANDWIDTH_CHECK_INTERVAL_SECS
+        // Immediate check: reject if we've already exceeded the limit
+        // within the current window (don't wait for window expiry).
+        if self.bytes_this_window > MAX_BYTES_PER_PEER_PER_MIN {
+            return true; // disconnect immediately
+        }
+
+        // Reset window after interval
         if self.bandwidth_window_start.elapsed() >= Duration::from_secs(BANDWIDTH_CHECK_INTERVAL_SECS) {
-            if self.bytes_this_window > MAX_BYTES_PER_PEER_PER_MIN {
-                return true; // disconnect
-            }
             self.bytes_this_window = 0;
             self.bandwidth_window_start = Instant::now();
         }
@@ -751,7 +754,7 @@ impl P2P {
                     if cmd == CommandId::Version {
                         // Version is part of handshake — dispatch it
                         if let Err(e) = Self::dispatch_message(
-                            &mut writer, msg, &peer_str, magic, &mut session, &known_peers,
+                            &mut writer, msg, &peer_str, magic, &mut session, &known_peers, cmd,
                         ) {
                             slog_debug!("p2p", "dispatch_error", addr => &peer_str, error => &e.to_string());
                         }
@@ -830,7 +833,7 @@ impl P2P {
 
                     if let Err(e) = Self::dispatch_message(
                         &mut writer, msg, &peer_str, magic,
-                        &mut session, &known_peers,
+                        &mut session, &known_peers, cmd,
                     ) {
                         slog_error!("p2p", "dispatch_error", addr => &peer_str, error => &e.to_string());
                         break;
@@ -1100,7 +1103,10 @@ impl P2P {
             CommandId::GetBlock        => MsgType::GetBlocks,
             CommandId::GetMempool      => MsgType::Mempool,
             CommandId::Reject          => MsgType::Reject,
-            _                          => MsgType::Unknown,
+            CommandId::ShadowTx        => MsgType::Tx,      // Same cost as regular TX
+            CommandId::OnionTx         => MsgType::Tx,      // Same cost as regular TX
+            CommandId::PuzzleChallenge => MsgType::Version,  // Handshake cost
+            CommandId::PuzzleSolution  => MsgType::Version,
         }
     }
 
@@ -1111,9 +1117,21 @@ impl P2P {
         magic: [u8; 4],
         session: &mut ConnectionSession,
         known_peers: &[String],
+        wire_cmd: CommandId,
     ) -> Result<(), NetworkError> {
         // ── DoS Guard: rate limit + ban check ──
         let cmd = Self::msg_to_command_id(&msg);
+
+        // Verify the deserialized message matches the wire header command.
+        // Without this check, an attacker can claim cmd=Ping in the header
+        // (bypassing handshake restrictions for Ping) but send a Block
+        // payload, getting it processed before handshake completes.
+        if cmd != wire_cmd {
+            DOS_GUARD.add_ban_score_cat(peer, 100,
+                &format!("cmd/payload mismatch: header={} actual={}", wire_cmd, cmd),
+                BanCategory::Malicious);
+            return Ok(());
+        }
         let dos_type = Self::cmd_to_dos_type(cmd);
         // Estimate actual payload size (heap data) rather than stack enum size.
         // size_of_val only measures the enum discriminant + inline fields, missing
@@ -1414,9 +1432,12 @@ impl P2P {
                 for item in items {
                     match item.kind.as_str() {
                         "block" => {
-                            // Queue a GetBlock fetch; the upper layer resolves
-                            // block data and pushes a Block response back.
-                            push_outbound_to_peer(peer, P2PMessage::GetBlock { hash: item.hash.clone() });
+                            // Block serving requires block_store access (not
+                            // available in dispatch_message). The daemon event
+                            // loop handles block serving for GetData requests.
+                            // Do NOT send GetBlock back — that creates a loop.
+                            slog_debug!("p2p", "getdata_block_serve_needed",
+                                hash => &item.hash, peer => peer);
                         }
                         "tx" => {
                             // TX serving requires mempool access which this layer
@@ -1456,16 +1477,19 @@ impl P2P {
                     DOS_GUARD.add_ban_score_cat(peer, pe.ban_score as u64, &pe.message, BanCategory::Malformed);
                     return Ok(());
                 }
-                // Headers announce block hashes the peer has. Request each
-                // block we haven't seen yet via GetBlock so the sync engine
-                // can process them. Requests go back to the same peer that
-                // sent the headers.
+                // Limit GetBlock requests to prevent amplification attacks.
+                // A malicious peer could send 2000 header hashes to trigger
+                // 2000 outbound GetBlock requests in one message.
+                let mut seen = std::collections::HashSet::new();
+                let max_requests = 64; // Max blocks to request per Headers message
+                let mut request_count = 0;
                 for hash in hashes {
-                    if !hash.is_empty() {
-                        let req = P2PMessage::GetBlock { hash: hash.clone() };
-                        let bytes = Self::write_message(writer, &req, magic)?;
-                        session.record_bytes_sent(bytes);
-                    }
+                    if request_count >= max_requests { break; }
+                    if hash.is_empty() || !seen.insert(hash.clone()) { continue; }
+                    let req = P2PMessage::GetBlock { hash: hash.clone() };
+                    let bytes = Self::write_message(writer, &req, magic)?;
+                    session.record_bytes_sent(bytes);
+                    request_count += 1;
                 }
             }
 
@@ -1493,6 +1517,8 @@ impl P2P {
 
             // ── ShadowTx / OnionTx / GetMempool: not yet implemented ───
             P2PMessage::ShadowTx { .. } | P2PMessage::OnionTx { .. } | P2PMessage::GetMempool => {
+                // Unsupported message type — add ban score to discourage DoS via Unknown messages
+                DOS_GUARD.add_ban_score_cat(peer, 5, "unsupported message type", BanCategory::Resource);
                 slog_warn!("p2p", "unsupported_message", addr => peer, cmd => &format!("{:?}", Self::msg_to_command_id(&msg)));
             }
         }

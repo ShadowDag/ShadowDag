@@ -381,6 +381,7 @@ fn requires_auth(method: &str) -> bool {
     matches!(method,
         "sendrawtransaction" | "submitblock" | "stop"
         | "deploy_contract" | "call_contract"
+        | "verify_contract"
     )
 }
 
@@ -666,6 +667,13 @@ impl RpcServer {
                 // verified via RpcAuthManager. Read-only methods are open.
                 // EXCEPTION: localhost (127.0.0.1) MAY be trusted for submitblock
                 // but ONLY when SHADOWDAG_RPC_LOCAL_NOAUTH=1|true is set.
+                // SECURITY WARNING: SHADOWDAG_RPC_LOCAL_NOAUTH trusts loopback
+                // (127.0.0.1 / ::1). If the RPC server is behind a reverse proxy
+                // (nginx, traefik, etc.), ALL requests appear to come from loopback,
+                // effectively disabling auth for submitblock. In production:
+                //   - Do NOT set this env var behind a reverse proxy
+                //   - Use proper Bearer token authentication instead
+                //   - If you must use it, restrict to submitblock only (already done)
                 let allow_local_noauth = std::env::var("SHADOWDAG_RPC_LOCAL_NOAUTH")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
@@ -3723,7 +3731,12 @@ impl RpcServer {
         let result = ContractVerifier::verify(&storage, address, &package);
 
         if result.verified {
-            ContractVerifier::save_verification(&storage, &result, &package).ok();
+            if let Err(e) = ContractVerifier::save_verification(&storage, &result, &package) {
+                slog_error!("rpc", "save_verification_failed",
+                    address => address, error => &format!("{}", e));
+                return RpcResponse::err(id, ERR_INTERNAL,
+                    format!("verification succeeded but save failed: {}", e));
+            }
         }
 
         RpcResponse::ok(id, json!({
