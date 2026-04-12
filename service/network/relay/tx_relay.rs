@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::errors::NetworkError;
 use crate::domain::transaction::transaction::Transaction;
-use crate::slog_error;
+use crate::{slog_error, slog_warn};
 use crate::service::mempool::core::mempool::Mempool;
 use crate::service::network::p2p::p2p::{P2PMessage, push_outbound};
 use crate::service::network::p2p::peer_manager::PeerManager;
@@ -41,8 +41,13 @@ impl TxRelay {
         let key = format!("relay:tx:{}", tx.hash);
 
         // Skip if already relayed
-        if self.db.get(key.as_bytes()).unwrap_or(None).is_some() {
-            return;
+        match self.db.get(key.as_bytes()) {
+            Ok(Some(_)) => return, // Already relayed
+            Ok(None) => {} // Not yet seen — proceed
+            Err(e) => {
+                slog_warn!("relay", "tx_dedup_db_error", hash => &tx.hash, error => &format!("{}", e));
+                // Fail-open: proceed with relay on DB error (better than dropping valid TXs)
+            }
         }
 
         // Serialize transaction as bincode for the P2PMessage::Tx payload
@@ -63,7 +68,7 @@ impl TxRelay {
             slog_error!("relay", "tx_relay_db_put_error", error => e);
         }
 
-        log::debug!("[TxRelay] Queued tx {} for broadcast", &tx.hash[..8]);
+        log::debug!("[TxRelay] Queued tx {} for broadcast", &tx.hash[..tx.hash.len().min(8)]);
     }
 
     /// Receive a transaction from a peer — validate BEFORE relay.
@@ -73,11 +78,20 @@ impl TxRelay {
         let key = format!("relay:tx:{}", tx.hash);
 
         // Skip if already seen
-        if self.db.get(key.as_bytes()).unwrap_or(None).is_some() {
-            return;
+        match self.db.get(key.as_bytes()) {
+            Ok(Some(_)) => return, // Already relayed
+            Ok(None) => {} // Not yet seen — proceed
+            Err(e) => {
+                slog_warn!("relay", "tx_dedup_db_error", hash => &tx.hash, error => &format!("{}", e));
+                // Fail-open: proceed with relay on DB error (better than dropping valid TXs)
+            }
         }
 
-        // VALIDATE FIRST — add to mempool (which verifies signatures + balance)
+        // NOTE: add_transaction validates L1-L5 (size, signatures, fees,
+        // anti-spam) but not UTXO availability (L6). This is intentional:
+        // relay validation is lighter than block-inclusion validation.
+        // The block builder performs full UTXO validation when selecting
+        // transactions for a template.
         let accepted = self.mempool.add_transaction(&tx);
 
         // Only mark as seen AND relay if the transaction was accepted
