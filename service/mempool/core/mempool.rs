@@ -14,6 +14,7 @@ use crate::domain::transaction::tx_validator::TxValidator;
 use crate::domain::utxo::utxo_set::UtxoSet;
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
 use crate::service::mempool::core::rbf::{RbfEngine, RbfResult, MempoolTxInfo};
+use crate::config::node::node_config::NetworkMode;
 use crate::{slog_error, slog_warn};
 
 // ── All pool limits imported from the single source of truth ─────────
@@ -46,6 +47,7 @@ const META_TOTAL_FEES:  &[u8] = b"_meta:total_fees";
 
 pub struct Mempool {
     db: Arc<DB>,
+    network: NetworkMode,
 }
 
 // ─────────────────────────────────────────────────────────
@@ -285,7 +287,14 @@ impl Mempool {
                 path: "mempool".to_string(),
                 reason: e.to_string(),
             }))?;
-        Ok(Self { db })
+        Ok(Self { db, network: NetworkMode::Mainnet })
+    }
+
+    /// Create a mempool with explicit network mode for correct signature verification.
+    pub fn new_with_network<S: Into<SharedDbSource>>(source: S, network: NetworkMode) -> Result<Self, MempoolError> {
+        let mut m = Self::new(source)?;
+        m.network = network;
+        Ok(m)
     }
 
     /// Storage-only insertion. Does NOT validate UTXO/signatures.
@@ -417,12 +426,8 @@ impl Mempool {
         }
 
         // ── L2 Structural: signature verification (prevents flood) ───
-        // TODO: verify_signatures currently uses Mainnet chain_id.
-        // On Testnet/Regtest, valid signatures may be rejected because
-        // the signing message differs by network. Thread NetworkMode
-        // through Mempool::new() when multi-network support is needed.
         if !tx.is_coinbase()
-            && !TxValidator::verify_signatures(tx) {
+            && !TxValidator::verify_signatures_for_network(tx, &self.network) {
                 return false;
             }
 

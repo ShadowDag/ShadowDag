@@ -211,10 +211,8 @@ impl RpcAuthManager {
 
         let attempts = self.attempts.entry(username.to_string()).or_default();
         if attempts.locked_until > now_secs() {
-            return Err(NetworkError::Other(format!(
-                "Account locked until unix={}",
-                attempts.locked_until
-            )));
+            // Don't reveal lockout timing — use generic message
+            return Err(NetworkError::Other("Invalid credentials".to_string()));
         }
 
         if !verify_password(password, &user.password_hash) {
@@ -222,15 +220,9 @@ impl RpcAuthManager {
             a.failed += 1;
             if a.failed >= MAX_FAILED_LOGINS {
                 a.locked_until = now_secs() + LOCKOUT_SECS;
-                return Err(NetworkError::Other(format!(
-                    "Account locked after {} failed attempts",
-                    MAX_FAILED_LOGINS
-                )));
+                return Err(NetworkError::Other("Invalid credentials".to_string()));
             }
-            return Err(NetworkError::Other(format!(
-                "Invalid credentials ({} attempts remaining)",
-                MAX_FAILED_LOGINS - a.failed
-            )));
+            return Err(NetworkError::Other("Invalid credentials".to_string()));
         }
 
         let a = self.attempts.entry(username.to_string()).or_default();
