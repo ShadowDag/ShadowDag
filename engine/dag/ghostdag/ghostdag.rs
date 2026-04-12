@@ -429,31 +429,43 @@ impl GhostDag {
     }
 
     pub fn get_blue_score(&self, hash: &str) -> u64 {
-        self.db.get(format!("{}{}", PFX_BLUE_SCORE, hash))
-            .ok()
-            .flatten()
-            .and_then(|d| {
+        match self.db.get(format!("{}{}", PFX_BLUE_SCORE, hash)) {
+            Ok(Some(d)) => {
                 if d.len() >= 8 {
-                    Some(u64::from_le_bytes(d[..8].try_into().unwrap()))
+                    u64::from_le_bytes(d[..8].try_into().unwrap())
                 } else {
-                    None
+                    slog_error!("ghostdag", "blue_score_corrupt_length",
+                        hash => hash, len => d.len());
+                    0
                 }
-            })
-            .unwrap_or(0)
+            }
+            Ok(None) => 0, // genuinely absent -- not an error
+            Err(e) => {
+                slog_error!("ghostdag", "blue_score_read_failed",
+                    hash => hash, error => &format!("{}", e));
+                0
+            }
+        }
     }
 
     pub fn get_chain_height(&self, hash: &str) -> u64 {
-        self.db.get(format!("{}{}", PFX_CHAIN_HEIGHT, hash))
-            .ok()
-            .flatten()
-            .and_then(|d| {
+        match self.db.get(format!("{}{}", PFX_CHAIN_HEIGHT, hash)) {
+            Ok(Some(d)) => {
                 if d.len() >= 8 {
-                    Some(u64::from_le_bytes(d[..8].try_into().unwrap()))
+                    u64::from_le_bytes(d[..8].try_into().unwrap())
                 } else {
-                    None
+                    slog_error!("ghostdag", "chain_height_corrupt_length",
+                        hash => hash, len => d.len());
+                    0
                 }
-            })
-            .unwrap_or(0)
+            }
+            Ok(None) => 0, // genuinely absent -- not an error
+            Err(e) => {
+                slog_error!("ghostdag", "chain_height_read_failed",
+                    hash => hash, error => &format!("{}", e));
+                0
+            }
+        }
     }
 
     pub fn get_blue_set_diff(&self, hash: &str) -> Vec<String> {
@@ -571,9 +583,22 @@ impl GhostDag {
     // ================= ADDED METHODS =================
 
     pub fn get_selected_parent(&self, hash: &str) -> Option<String> {
-        self.db.get(format!("{}{}", PFX_SEL_PARENT, hash))
-            .ok().flatten()
-            .and_then(|d| String::from_utf8(d).ok())
+        match self.db.get(format!("{}{}", PFX_SEL_PARENT, hash)) {
+            Ok(Some(d)) => match String::from_utf8(d) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    slog_error!("ghostdag", "selected_parent_utf8_corrupt",
+                        hash => hash, error => &format!("{}", e));
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("ghostdag", "selected_parent_read_failed",
+                    hash => hash, error => &format!("{}", e));
+                None
+            }
+        }
     }
 
     pub fn store_blue_score(&self, hash: &str, score: u64) {

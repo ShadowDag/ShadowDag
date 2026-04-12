@@ -133,6 +133,37 @@ impl BlockProcessor {
         let rollback_chain = Self::collect_chain(old_tip, &fork, ghostdag, max_depth);
 
         let mut apply_chain = Self::collect_chain(new_tip, &fork, ghostdag, max_depth);
+
+        // Verify chains reached the fork point (no silent truncation).
+        // If collect_chain hit max_depth before reaching `fork`, the
+        // chain is incomplete and applying it would corrupt UTXO state.
+        if !rollback_chain.is_empty() {
+            let last_rollback = &rollback_chain[rollback_chain.len() - 1];
+            if let Some(parent) = ghostdag.get_selected_parent(last_rollback) {
+                if parent != fork {
+                    return Err(ConsensusError::ReorgRejected(format!(
+                        "rollback chain truncated at depth {} (last block parent {} != fork {})",
+                        rollback_chain.len(),
+                        &parent[..parent.len().min(8)],
+                        &fork[..fork.len().min(8)]
+                    )));
+                }
+            }
+        }
+        if !apply_chain.is_empty() {
+            let last_apply = &apply_chain[apply_chain.len() - 1];
+            if let Some(parent) = ghostdag.get_selected_parent(last_apply) {
+                if parent != fork {
+                    return Err(ConsensusError::ReorgRejected(format!(
+                        "apply chain truncated at depth {} (last block parent {} != fork {})",
+                        apply_chain.len(),
+                        &parent[..parent.len().min(8)],
+                        &fork[..fork.len().min(8)]
+                    )));
+                }
+            }
+        }
+
         apply_chain.reverse();
 
         // ───────── ROLLBACK ─────────

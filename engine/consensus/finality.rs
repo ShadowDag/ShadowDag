@@ -174,7 +174,19 @@ impl FinalityManager {
                 Err(_) => continue,
             };
             let height = u64::from_be_bytes(height_bytes);
-            let hash = String::from_utf8_lossy(&value).to_string();
+            let hash = match String::from_utf8(value.to_vec()) {
+                Ok(s) if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) => s,
+                Ok(s) => {
+                    slog_error!("finality", "checkpoint_invalid_hash",
+                        height => height, hash_len => s.len());
+                    continue; // skip corrupt checkpoint
+                }
+                Err(e) => {
+                    slog_error!("finality", "checkpoint_utf8_corrupt",
+                        height => height, error => &format!("{}", e));
+                    continue;
+                }
+            };
 
             loaded.push(AutoCheckpoint { height, hash });
         }
@@ -376,12 +388,17 @@ impl FinalityManager {
     }
 
     /// Check if a given height is below the latest auto-checkpoint
-    /// (i.e., absolutely immutable).
+    /// (i.e., absolutely immutable by height alone).
     pub fn is_checkpointed(&self, height: u64) -> bool {
         match &self.last_checkpoint {
             Some(cp) => height <= cp.height,
             None => false,
         }
+    }
+
+    /// Stronger check: verifies both height AND hash match a checkpoint.
+    pub fn is_checkpointed_exact(&self, height: u64, hash: &str) -> bool {
+        self.checkpoints.iter().any(|cp| cp.height == height && cp.hash == hash)
     }
 }
 

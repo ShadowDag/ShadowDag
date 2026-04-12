@@ -105,6 +105,12 @@ impl ConsensusManagerStore {
     // STORE IF NOT EXISTS
     // Returns Ok(true) if written, Ok(false) if already existed,
     // Err on any I/O failure (read OR write).
+    //
+    // NOTE: The get-then-put sequence is NOT atomic (TOCTOU).
+    // This is acceptable under the single-writer assumption:
+    // only one consensus thread writes tips at any given time.
+    // If multi-writer access is ever introduced, this must be
+    // replaced with a compare-and-swap or protected by a mutex.
     // ─────────────────────────────────────────
     #[inline(always)]
     pub fn store_tip_if_absent(&self, key: &str, hash: &str) -> Result<bool, ConsensusError> {
@@ -178,7 +184,13 @@ impl ConsensusManagerStore {
     #[inline(always)]
     pub fn get_tip(&self, key: &str) -> Result<Option<String>, ConsensusError> {
         self.with_value(key, |data| {
-            std::str::from_utf8(data).ok().map(|s| s.to_owned())
+            match std::str::from_utf8(data) {
+                Ok(s) => Some(s.to_owned()),
+                Err(_) => {
+                    slog_error!("consensus", "tip_utf8_corrupt", key => key);
+                    None
+                }
+            }
         }).map(|opt| opt.flatten())
     }
 

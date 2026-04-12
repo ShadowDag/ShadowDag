@@ -105,12 +105,13 @@ impl ForkChoiceStore {
     // STORE
     // ─────────────────────────────────────────
     #[inline]
-    pub fn store_choice(&self, hash: &str, score: u64) {
+    pub fn store_choice(&self, hash: &str, score: u64) -> Result<(), String> {
         let key = Self::make_key(hash);
-
-        if let Err(e) = self.db.put_opt(key, score.to_be_bytes(), &self.write_opts) {
-            slog_error!("consensus", "store_choice_failed", hash => hash, error => e);
-        }
+        self.db.put_opt(key, score.to_be_bytes(), &self.write_opts)
+            .map_err(|e| {
+                slog_error!("consensus", "store_choice_failed", hash => hash, error => &format!("{}", e));
+                format!("store_choice '{}': {}", hash, e)
+            })
     }
 
     // ─────────────────────────────────────────
@@ -176,17 +177,19 @@ impl ForkChoiceStore {
     // DELETE
     // ─────────────────────────────────────────
     #[inline]
-    pub fn delete_choice(&self, hash: &str) {
+    pub fn delete_choice(&self, hash: &str) -> Result<(), String> {
         let key = Self::make_key(hash);
-        if let Err(e) = self.db.delete_opt(key, &self.write_opts) {
-            slog_error!("consensus", "delete_choice_failed", hash => hash, error => e);
-        }
+        self.db.delete_opt(key, &self.write_opts)
+            .map_err(|e| {
+                slog_error!("consensus", "delete_choice_failed", hash => hash, error => &format!("{}", e));
+                format!("delete_choice '{}': {}", hash, e)
+            })
     }
 
     // ─────────────────────────────────────────
     // CLEAR PREFIX
     // ─────────────────────────────────────────
-    pub fn clear_all(&self) {
+    pub fn clear_all(&self) -> Result<(), String> {
         let mut batch = WriteBatch::default();
         let mut count = 0;
 
@@ -207,7 +210,11 @@ impl ForkChoiceStore {
         for item in iter {
             let (key, _) = match item {
                 Ok(kv) => kv,
-                Err(_) => break,
+                Err(e) => {
+                    let msg = format!("clear_all iterator error: {}", e);
+                    slog_error!("consensus", "fork_choice_clear_failed", error => &msg);
+                    return Err(msg);
+                }
             };
             if !key.starts_with(CHOICE_PREFIX) {
                 break;
@@ -217,19 +224,23 @@ impl ForkChoiceStore {
             count += 1;
 
             if count >= DELETE_BATCH_SIZE {
-                if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-                    slog_error!("consensus", "fork_choice_clear_failed", error => e);
-                }
+                self.db.write_opt(batch, &self.write_opts).map_err(|e| {
+                    slog_error!("consensus", "fork_choice_clear_failed", error => &format!("{}", e));
+                    format!("clear_all batch write: {}", e)
+                })?;
                 batch = WriteBatch::default();
                 count = 0;
             }
         }
 
         if count > 0 {
-            if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-                slog_error!("consensus", "fork_choice_clear_failed", error => e);
-            }
+            self.db.write_opt(batch, &self.write_opts).map_err(|e| {
+                slog_error!("consensus", "fork_choice_clear_failed", error => &format!("{}", e));
+                format!("clear_all final batch write: {}", e)
+            })?;
         }
+
+        Ok(())
     }
 
     // ─────────────────────────────────────────
@@ -270,7 +281,7 @@ impl ForkChoiceStore {
     // ─────────────────────────────────────────
     // BATCH STORE (split flush 🔥)
     // ─────────────────────────────────────────
-    pub fn store_batch_split(&self, entries: &[(&str, u64)]) {
+    pub fn store_batch_split(&self, entries: &[(&str, u64)]) -> Result<(), String> {
         let mut batch = WriteBatch::default();
         let mut key = Vec::with_capacity(64);
         let mut count = 0;
@@ -285,9 +296,10 @@ impl ForkChoiceStore {
             count += 1;
 
             if count >= WRITE_BATCH_SIZE {
-                if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-                    slog_error!("consensus", "fork_choice_batch_write_failed", batch => batch_num, error => e);
-                }
+                self.db.write_opt(batch, &self.write_opts).map_err(|e| {
+                    slog_error!("consensus", "fork_choice_batch_write_failed", batch => batch_num, error => &format!("{}", e));
+                    format!("store_batch_split batch {}: {}", batch_num, e)
+                })?;
                 batch = WriteBatch::default();
                 count = 0;
                 batch_num += 1;
@@ -295,10 +307,13 @@ impl ForkChoiceStore {
         }
 
         if count > 0 {
-            if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
-                slog_error!("consensus", "fork_choice_batch_write_failed", batch => batch_num, error => e);
-            }
+            self.db.write_opt(batch, &self.write_opts).map_err(|e| {
+                slog_error!("consensus", "fork_choice_batch_write_failed", batch => batch_num, error => &format!("{}", e));
+                format!("store_batch_split batch {}: {}", batch_num, e)
+            })?;
         }
+
+        Ok(())
     }
 }
 
@@ -317,7 +332,7 @@ mod tests {
     #[test]
     fn store_and_get_choice() {
         let store = ForkChoiceStore::new(&tmp_path()).unwrap();
-        store.store_choice("block_a", 100);
+        store.store_choice("block_a", 100).unwrap();
         assert_eq!(store.get_choice("block_a"), Some(100));
     }
 
@@ -331,33 +346,33 @@ mod tests {
     fn exists_check() {
         let store = ForkChoiceStore::new(&tmp_path()).unwrap();
         assert!(!store.exists("x"));
-        store.store_choice("x", 42);
+        store.store_choice("x", 42).unwrap();
         assert!(store.exists("x"));
     }
 
     #[test]
     fn delete_choice_removes() {
         let store = ForkChoiceStore::new(&tmp_path()).unwrap();
-        store.store_choice("del_me", 99);
+        store.store_choice("del_me", 99).unwrap();
         assert!(store.exists("del_me"));
-        store.delete_choice("del_me");
+        store.delete_choice("del_me").unwrap();
         assert!(!store.exists("del_me"));
     }
 
     #[test]
     fn overwrite_updates_score() {
         let store = ForkChoiceStore::new(&tmp_path()).unwrap();
-        store.store_choice("tip", 10);
+        store.store_choice("tip", 10).unwrap();
         assert_eq!(store.get_choice("tip"), Some(10));
-        store.store_choice("tip", 200);
+        store.store_choice("tip", 200).unwrap();
         assert_eq!(store.get_choice("tip"), Some(200));
     }
 
     #[test]
     fn get_many_ref_returns_correct() {
         let store = ForkChoiceStore::new(&tmp_path()).unwrap();
-        store.store_choice("a", 1);
-        store.store_choice("b", 2);
+        store.store_choice("a", 1).unwrap();
+        store.store_choice("b", 2).unwrap();
         let results = store.get_many_ref(&["a", "b", "c"]);
         assert_eq!(results, vec![Some(1), Some(2), None]);
     }
@@ -365,7 +380,7 @@ mod tests {
     #[test]
     fn batch_store_split() {
         let store = ForkChoiceStore::new(&tmp_path()).unwrap();
-        store.store_batch_split(&[("b1", 10), ("b2", 20), ("b3", 30)]);
+        store.store_batch_split(&[("b1", 10), ("b2", 20), ("b3", 30)]).unwrap();
         assert_eq!(store.get_choice("b1"), Some(10));
         assert_eq!(store.get_choice("b2"), Some(20));
         assert_eq!(store.get_choice("b3"), Some(30));
@@ -375,18 +390,18 @@ mod tests {
     fn len_prefix_counts() {
         let store = ForkChoiceStore::new(&tmp_path()).unwrap();
         assert_eq!(store.len_prefix(), 0);
-        store.store_choice("x", 1);
-        store.store_choice("y", 2);
+        store.store_choice("x", 1).unwrap();
+        store.store_choice("y", 2).unwrap();
         assert_eq!(store.len_prefix(), 2);
     }
 
     #[test]
     fn clear_all_removes_everything() {
         let store = ForkChoiceStore::new(&tmp_path()).unwrap();
-        store.store_choice("a", 1);
-        store.store_choice("b", 2);
+        store.store_choice("a", 1).unwrap();
+        store.store_choice("b", 2).unwrap();
         assert_eq!(store.len_prefix(), 2);
-        store.clear_all();
+        store.clear_all().unwrap();
         assert_eq!(store.len_prefix(), 0);
         assert!(!store.exists("a"));
     }
