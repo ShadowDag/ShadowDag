@@ -236,15 +236,47 @@ pub fn push_pending_tx(peer_id: &str, tx: Transaction) -> bool {
     true
 }
 
+/// Extract IP from a peer address string (ip:port), handling IPv4 and IPv6.
+/// Formats: "1.2.3.4:9333", "[::1]:9333", "::1"
+fn extract_ban_ip(addr: &str) -> String {
+    // Try parsing as SocketAddr (handles all formats correctly)
+    if let Ok(sa) = addr.parse::<SocketAddr>() {
+        return sa.ip().to_string();
+    }
+    // Bracketed IPv6: [::1]:9333
+    if addr.starts_with('[') {
+        if let Some(end) = addr.find(']') {
+            return addr[1..end].to_string();
+        }
+    }
+    // IPv4: 1.2.3.4:9333 — split on last ':'
+    if let Some(pos) = addr.rfind(':') {
+        if addr[pos+1..].chars().all(|c| c.is_ascii_digit()) {
+            return addr[..pos].to_string();
+        }
+    }
+    addr.to_string()
+}
+
 /// Report a bad TX/block to the DoS guard (called by event loop on rejection).
 /// Closes the feedback loop: event_loop → ban_score → P2P disconnects peer.
+/// Bans both the full ip:port key AND the IP-only key so reconnecting with a
+/// new ephemeral port does not bypass the ban.
 pub fn report_bad_peer(peer_id: &str, score: u64, reason: &str) {
     DOS_GUARD.add_ban_score(peer_id, score, reason);
+    let ip_key = extract_ban_ip(peer_id);
+    if ip_key != peer_id {
+        DOS_GUARD.add_ban_score(&ip_key, score, reason);
+    }
 }
 
 /// Categorized version of report_bad_peer for callers that know the offense type.
 pub fn report_bad_peer_cat(peer_id: &str, score: u64, reason: &str, category: BanCategory) {
     DOS_GUARD.add_ban_score_cat(peer_id, score, reason, category);
+    let ip_key = extract_ban_ip(peer_id);
+    if ip_key != peer_id {
+        DOS_GUARD.add_ban_score_cat(&ip_key, score, reason, category);
+    }
 }
 
 /// Push a message to be broadcast to all connected peers.
@@ -585,8 +617,17 @@ impl P2P {
                         .map(|a| a.to_string())
                         .unwrap_or_else(|_| "unknown".to_string());
 
+                    // Extract IP without port for ban checking — banning
+                    // ip:port is useless because the ephemeral port changes
+                    // on every connection.
+                    let ban_key = if let Ok(addr) = s.peer_addr() {
+                        addr.ip().to_string()
+                    } else {
+                        peer_addr.clone()
+                    };
+
                     // ── Check if peer is banned ──
-                    if DOS_GUARD.is_banned(&peer_addr) {
+                    if DOS_GUARD.is_banned(&ban_key) {
                         pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         slog_warn!("p2p", "rejected_banned_peer", addr => &peer_addr);
                         drop(s);
@@ -626,6 +667,8 @@ impl P2P {
         let peer_addr = stream.peer_addr()
             .map_err(|e| NetworkError::ConnectionFailed(format!("No peer addr: {}", e)))?;
         let peer_str = peer_addr.to_string();
+        // IP-only key for ban scoring — ephemeral port changes on reconnect
+        let peer_ip = peer_addr.ip().to_string();
 
         let mut reader = BufReader::new(&stream);
         let mut writer = BufWriter::new(&stream);
@@ -651,6 +694,7 @@ impl P2P {
                     let sol = ChallengeSolution { challenge: c, nonce, hash };
                     if !ConnectionPuzzle::verify(&challenge, &sol) {
                         DOS_GUARD.add_ban_score_cat(&peer_str, 100, "invalid puzzle solution", BanCategory::Malicious);
+                        DOS_GUARD.add_ban_score_cat(&peer_ip, 100, "invalid puzzle solution", BanCategory::Malicious);
                         return Err(NetworkError::ConnectionFailed(
                             format!("Invalid puzzle solution from {}", peer_str)));
                     }
@@ -660,6 +704,7 @@ impl P2P {
                 }
                 Ok((_, cmd, _)) => {
                     DOS_GUARD.add_ban_score_cat(&peer_str, 50, "expected puzzle solution", BanCategory::Malicious);
+                    DOS_GUARD.add_ban_score_cat(&peer_ip, 50, "expected puzzle solution", BanCategory::Malicious);
                     return Err(NetworkError::ConnectionFailed(
                         format!("Expected PuzzleSolution from {}, got {}", peer_str, cmd)));
                 }
@@ -699,12 +744,21 @@ impl P2P {
                         DOS_GUARD.add_ban_score_cat(&peer_str, 20,
                             &format!("non-Version first message ({}), expected puzzle or Version", cmd),
                             BanCategory::Malformed);
+                        DOS_GUARD.add_ban_score_cat(&peer_ip, 20,
+                            &format!("non-Version first message ({}), expected puzzle or Version", cmd),
+                            BanCategory::Malformed);
                     }
-                    if let Err(e) = Self::dispatch_message(
-                        &mut writer, msg, &peer_str, magic, &mut session, &known_peers,
-                    ) {
-                        slog_debug!("p2p", "dispatch_error", addr => &peer_str, error => &e.to_string());
+                    if cmd == CommandId::Version {
+                        // Version is part of handshake — dispatch it
+                        if let Err(e) = Self::dispatch_message(
+                            &mut writer, msg, &peer_str, magic, &mut session, &known_peers,
+                        ) {
+                            slog_debug!("p2p", "dispatch_error", addr => &peer_str, error => &e.to_string());
+                        }
                     }
+                    // Non-Version messages are dropped (ban score already added above).
+                    // Dispatching before the handshake (Version/VerAck) completes
+                    // violates the protocol state machine.
                 }
                 Err(e) => {
                     let emsg = e.to_string().to_lowercase();
@@ -738,6 +792,7 @@ impl P2P {
                     // Bandwidth enforcement
                     if session.check_bandwidth(bytes_read as u64) {
                         DOS_GUARD.add_ban_score_cat(&peer_str, 50, "bandwidth abuse (>100MB/min)", BanCategory::Resource);
+                        DOS_GUARD.add_ban_score_cat(&peer_ip, 50, "bandwidth abuse (>100MB/min)", BanCategory::Resource);
                         slog_warn!("p2p", "bandwidth_abuse_disconnect", addr => &peer_str, bytes_per_min => session.bytes_this_window);
                         break;
                     }
@@ -745,6 +800,8 @@ impl P2P {
                     // Protocol state machine: is this command allowed right now?
                     if let Err(pe) = session.protocol.check_command_allowed(cmd) {
                         DOS_GUARD.add_ban_score_cat(&peer_str, pe.ban_score as u64, &pe.message,
+                            if pe.ban_score >= 50 { BanCategory::Malicious } else { BanCategory::Malformed });
+                        DOS_GUARD.add_ban_score_cat(&peer_ip, pe.ban_score as u64, &pe.message,
                             if pe.ban_score >= 50 { BanCategory::Malicious } else { BanCategory::Malformed });
                         slog_warn!("p2p", "command_rejected", addr => &peer_str, command => &cmd.to_string(), state => &session.protocol.state.to_string(), ban_score => pe.ban_score);
                         if pe.ban_score >= 50 { break; }
@@ -760,6 +817,8 @@ impl P2P {
                             (5u64, BanCategory::Resource)    // few violations = possibly buggy client
                         };
                         DOS_GUARD.add_ban_score_cat(&peer_str, score,
+                            &format!("lifecycle violation #{}: {}", session.lifecycle_violations, pe), cat);
+                        DOS_GUARD.add_ban_score_cat(&peer_ip, score,
                             &format!("lifecycle violation #{}: {}", session.lifecycle_violations, pe), cat);
                         slog_warn!("p2p", "lifecycle_blocked", addr => &peer_str, command => &cmd.to_string(), violation_count => session.lifecycle_violations);
                         if session.lifecycle_violations > 10 {

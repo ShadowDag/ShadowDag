@@ -100,7 +100,7 @@ impl DagSyncEngine {
             .filter(|h| !self.verified_blocks.contains(*h) && !self.block_queue.contains(h))
             .count();
         for hash in hashes {
-            if !self.verified_blocks.contains(&hash) {
+            if !self.verified_blocks.contains(&hash) && !self.block_queue.contains(&hash) {
                 self.block_queue.push_back(hash.clone());
             }
             self.pending_headers.remove(&hash);

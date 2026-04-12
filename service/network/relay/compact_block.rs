@@ -54,8 +54,19 @@ impl CompactBlock {
 
         for (i, tx) in block.body.transactions.iter().enumerate() {
             // Guard against u16 overflow — blocks with >65535 TXs
-            // cannot use compact block relay (fall back to full block).
-            let idx = if i <= u16::MAX as usize { i as u16 } else { continue };
+            // cannot use compact block relay.  Return an empty CompactBlock
+            // so the caller falls back to full block relay.
+            let idx = match u16::try_from(i) {
+                Ok(idx) => idx,
+                Err(_) => {
+                    return CompactBlock {
+                        header: block.header.clone(),
+                        nonce,
+                        short_ids: Vec::new(),
+                        prefilled_txs: Vec::new(),
+                    };
+                }
+            };
             if i == 0 {
                 // Always prefill coinbase (peers don't have it in mempool)
                 prefilled.push((idx, tx.clone()));
@@ -96,16 +107,20 @@ impl CompactBlock {
         for (i, short_id) in self.short_ids.iter().enumerate() {
             if transactions[i].is_some() { continue; }
 
-            // NOTE: Short ID collision is possible but extremely rare
-            // with 6-byte IDs (48-bit). If collisions become a problem,
-            // request the full block via getdata.
-            let found = mempool_txs.iter().find(|tx| {
-                Self::compute_short_id(&tx.hash, self.nonce) == *short_id
-            });
-
-            match found {
-                Some(tx) => transactions[i] = Some(tx.clone()),
-                None     => missing_indices.push(i),
+            // Collect ALL mempool TXs matching this short_id to detect
+            // collisions.  With 6-byte (48-bit) IDs collisions are rare,
+            // but when they happen we cannot tell which TX is correct.
+            let matches: Vec<&Transaction> = mempool_txs.iter()
+                .filter(|tx| Self::compute_short_id(&tx.hash, self.nonce) == *short_id)
+                .collect();
+            match matches.len() {
+                0 => missing_indices.push(i),
+                1 => transactions[i] = Some(matches[0].clone()),
+                _ => {
+                    // Collision detected -- cannot determine which TX is
+                    // correct.  Mark as missing so the full block is requested.
+                    missing_indices.push(i);
+                }
             }
         }
 

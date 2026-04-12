@@ -495,8 +495,12 @@ impl BlockStore {
     /// Used for cleanup when DAG insertion fails after a successful save.
     pub fn delete_block(&self, hash: &str) -> bool {
         let block_key = format!("{}{}", BLK_PREFIX, hash);
-        // Try to get the block first so we can remove height index too
-        let height = self.get_block(hash).map(|b| b.header.height);
+        // Get height from the block itself, or fall back to the h2h
+        // index (which survives pruning). Without this fallback,
+        // delete_block on a pruned block leaves a stale height index.
+        let height = self.get_block(hash)
+            .map(|b| b.header.height)
+            .or_else(|| self.get_block_height_from_index(hash));
 
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete(block_key.as_bytes());
