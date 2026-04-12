@@ -37,6 +37,7 @@ macro_rules! pop2 {
 // ── Imports ──────────────────────────────────────────────────────────────
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use sha2::{Sha256, Digest};
 use sha3::Keccak256;
 
@@ -137,6 +138,29 @@ pub struct ExecutionEnvironment {
     pub destroyed_contracts: HashSet<String>,
     pub created_in_tx: HashSet<String>,
     pub last_return_data: Vec<u8>,
+    /// Optional handle to the persistent contract storage, used
+    /// by `execute_frame` for LAZY-LOADING contract code that
+    /// was never explicitly preloaded via
+    /// [`Self::load_contract_from_storage`] in the block executor's
+    /// preload phase.
+    ///
+    /// Without this, a nested CALL from contract A into contract
+    /// B silently executed as if B had empty code whenever B
+    /// wasn't one of the addresses the block executor
+    /// pre-registered. That meant contracts could be invisibly
+    /// "disabled" from the point of view of any caller that
+    /// wasn't explicitly named in the preload set — a
+    /// consensus-visible divergence between "called A, which
+    /// called B" (B loads from disk only if A happens to be in
+    /// the preload set and B happens to be B) and "called B
+    /// directly" (B always loads).
+    ///
+    /// The block executor sets this to `Some(contract_storage)`
+    /// before running any contract TXs. Stand-alone callers
+    /// (executor.rs, script_runner, test harnesses) leave it at
+    /// `None` — they allocate their own fresh state and don't
+    /// want any disk access in the middle of a frame.
+    pub lazy_load_storage: Option<Arc<ContractStorage>>,
     /// Runtime address registry — maps 20-byte canonical address bodies
     /// to the full ShadowDAG address string they were derived from.
     ///
@@ -170,7 +194,76 @@ impl ExecutionEnvironment {
             created_in_tx: HashSet::new(),
             last_return_data: Vec::new(),
             address_registry: HashMap::new(),
+            lazy_load_storage: None,
         }
+    }
+
+    /// Attach a contract-storage handle so that nested CALLs
+    /// inside `execute_frame` can lazy-load contract code on
+    /// first touch when the target address was not explicitly
+    /// pre-registered by the block executor's preload phase.
+    ///
+    /// The block executor wires this up before running any
+    /// contract TXs; stand-alone callers (executor, tests) do
+    /// not set it and get the pre-refactor "in-memory only"
+    /// behaviour.
+    pub fn with_lazy_load_storage(mut self, storage: Arc<ContractStorage>) -> Self {
+        self.lazy_load_storage = Some(storage);
+        self
+    }
+
+    /// Reset every piece of per-transaction state on this
+    /// environment so that the next top-level call executed
+    /// against it starts from a clean slate.
+    ///
+    /// This method is the fix for a consensus-visible state leak
+    /// between transactions inside the SAME block: the block
+    /// executor in `FullNode::execute_contract_transactions`
+    /// intentionally shares one `ExecutionEnvironment` across
+    /// every contract TX in a block so that storage mutations
+    /// are visible to later TXs. But several pieces of
+    /// per-transaction state were never reset:
+    ///
+    ///   - `created_in_tx` — the EIP-6780 "created in the same
+    ///     transaction" set. Without a reset, a contract that
+    ///     was CREATEd in TX N would still appear in
+    ///     `created_in_tx` during TX N+1, so a SELFDESTRUCT on
+    ///     that contract from an unrelated later TX would
+    ///     trigger a full EIP-6780 destruct instead of the
+    ///     post-Cancun "transfer balance only" behaviour. Real
+    ///     SELFDESTRUCTs could vanish or survive based purely
+    ///     on whether an earlier TX in the same block happened
+    ///     to deploy the same contract.
+    ///
+    ///   - `last_return_data` — the EIP-211 RETURNDATA buffer.
+    ///     Without a reset, TX N+1 could read RETURNDATASIZE /
+    ///     RETURNDATACOPY and see the trailing bytes left
+    ///     behind by TX N's last CALL. That's a
+    ///     consensus-visible cross-TX information leak.
+    ///
+    ///   - `destroyed_contracts` — the SELFDESTRUCT set consumed
+    ///     by `persist_to_storage` / `persist_with_undo` on
+    ///     commit. Block-level persistence should still observe
+    ///     every destroy from every TX in the block, so this
+    ///     one is NOT cleared by `begin_tx`. (See
+    ///     `persist_with_undo` — it emits DELETEs for each
+    ///     address in `destroyed_contracts`, which is exactly
+    ///     what we want at block commit time.)
+    ///
+    ///   - `address_registry` — the `VmAddressBody → string`
+    ///     map. This is a pure read-side cache, not
+    ///     consensus-critical; carrying it across TXs inside a
+    ///     block is strictly a correctness win (later TXs get
+    ///     better non-canonical address resolution). Not
+    ///     cleared.
+    ///
+    /// The block executor must call this at the start of every
+    /// contract transaction. `Executor::deploy` /
+    /// `Executor::call` use their own fresh environments and do
+    /// not need it.
+    pub fn begin_tx(&mut self) {
+        self.created_in_tx.clear();
+        self.last_return_data.clear();
     }
 
     /// Register an address string in the runtime registry so that later
@@ -195,17 +288,64 @@ impl ExecutionEnvironment {
     /// 2. If that body is in [`Self::address_registry`] (because an
     ///    earlier CALLER / ADDRESS / CREATE / contract pre-load
     ///    registered it), return the registered string unchanged.
-    /// 3. Otherwise, reconstruct as `"{prefix}c{hex(body)}"` using
-    ///    the network prefix from [`BlockContext::network`]. This
-    ///    fallback assumes the caller intended a contract address on
-    ///    the current network — the common case for inline-pushed
-    ///    addresses — and may produce a key that does not exist in
-    ///    state when that assumption is wrong.
+    /// 3. Otherwise, try each ShadowDAG subtype (`c`/`t`/`s`/`k`/`h`)
+    ///    combined with the network prefix from
+    ///    [`BlockContext::network`], and return the first form that
+    ///    actually has an account row in the in-memory state. This
+    ///    picks the correct subtype for EOAs, tokens, stealth,
+    ///    Schnorr, and P2SH addresses — not just contracts — so
+    ///    BALANCE / CALL / EXTCODESIZE against a non-contract
+    ///    address whose full string form was never pre-registered
+    ///    resolves to the right account key.
+    /// 4. If none of the subtypes have in-memory state, fall back
+    ///    to `to_fallback_string(network)` (which uses the `c`
+    ///    subtype). This keeps the old behaviour for totally unknown
+    ///    addresses — they produce a deterministic dead key that
+    ///    looks up as empty — while recovering EOA / token / stealth
+    ///    / Schnorr / P2SH addresses whenever their state has been
+    ///    loaded by the block executor's preload phase or by an
+    ///    earlier opcode in the same frame.
     pub fn resolve_address(&self, u: U256) -> String {
         let body = VmAddressBody::from_u256(u);
         if let Some(s) = self.address_registry.get(&body.0) {
             return s.clone();
         }
+
+        // Network prefix for fallback reconstruction.
+        let prefix = match self.block_ctx.network.as_str() {
+            "mainnet" => "SD1",
+            "testnet" => "ST1",
+            "regtest" => "SR1",
+            _ => "SD1",
+        };
+
+        // Probe each subtype in a stable priority order and return
+        // the first form that has state (account row) installed in
+        // the in-memory state. We prefer contract (`c`) because
+        // the most common VM-stack address origin is a contract
+        // that was CREATEd inside the current tx, but also check
+        // the EOA (`t`), token (`s`? — actually `t` is "tokens"
+        // and `s` is "stealth"; we use the existing 5-char set),
+        // stealth (`s`), Schnorr key (`k`), and P2SH (`h`) forms.
+        //
+        // The `t` ordering is pragmatic: once a CALL resolves a
+        // contract body correctly, later opcodes in the frame
+        // register that string in `address_registry`, so steps
+        // 2 (registry) and 3 (this probe) should almost never
+        // disagree — but if an EOA was pre-loaded by the block
+        // executor as a caller, its `t`-subtype row is on state
+        // and will resolve here.
+        let body_hex = hex::encode(body.0);
+        for subtype in [b'c', b't', b's', b'k', b'h'] {
+            let candidate = format!("{}{}{}", prefix, char::from(subtype), body_hex);
+            if self.state.get_account(&candidate).is_some() {
+                return candidate;
+            }
+        }
+
+        // No in-memory state for any subtype — produce the old
+        // contract-style fallback so the downstream lookup fails
+        // cleanly with "no such account".
         body.to_fallback_string(&self.block_ctx.network)
     }
 
@@ -323,17 +463,35 @@ impl ExecutionEnvironment {
     /// - every account metadata update,
     /// - every contract code update,
     /// - every storage slot update,
-    /// - and the `contract:undo:{block_hash}` record itself,
+    /// - and the `contract:undo:{block_hash}` record itself (already
+    ///   carrying the caller-supplied `receipt_root` and `state_root`),
     ///
     /// commit together. The previous implementation called `set_state`
     /// once per key and then `save_undo` as a separate put, so a crash
     /// or write failure mid-loop could land account metadata without
     /// matching storage slots, or land all state without the
     /// corresponding undo record (making a later reorg silently fail).
+    ///
+    /// # `receipt_root` / `state_root`
+    ///
+    /// These are provided by the caller because they depend on the
+    /// receipt set and final state of the *entire block*, which only
+    /// the caller knows. Earlier code took them as `None` inside this
+    /// function and then did a second, non-atomic `save_undo(…)` to
+    /// overwrite the record with the real roots — a write that could
+    /// fail independently of the state-writes, leaving an undo record
+    /// with empty roots on disk. That broke reorg invariant checks
+    /// because rollback paths could no longer verify that the receipt
+    /// and state roots the block claimed were the roots actually
+    /// persisted. The roots now land inside the same atomic WriteBatch
+    /// as every other state change, so the "state without roots" race
+    /// is no longer reachable.
     pub fn persist_with_undo(
         &self,
         storage: &ContractStorage,
         block_hash: &str,
+        receipt_root: Option<String>,
+        state_root: Option<String>,
     ) -> Result<crate::runtime::vm::contracts::contract_storage::ContractUndoData, VmError> {
         use crate::runtime::vm::contracts::contract_storage::{
             ContractUndoData, DestroyedAccountDetails,
@@ -532,8 +690,12 @@ impl ExecutionEnvironment {
             modified_keys,
             created_accounts,
             destroyed_accounts,
-            receipt_root: None, // Set by caller after receipt computation
-            state_root: None,   // Set by caller after state root computation
+            // Carry the caller-supplied roots straight into the undo
+            // record so that the single atomic WriteBatch below
+            // commits state + undo + roots together. No second,
+            // non-atomic `save_undo` hand-off is needed.
+            receipt_root,
+            state_root,
         };
 
         // Serialize the undo record and include it in the SAME WriteBatch
@@ -568,8 +730,16 @@ impl ExecutionEnvironment {
     ///     layout (wrong field count),
     ///   - balance or nonce cannot be parsed as `u64`,
     ///   - the stored code blob is not valid hex,
+    ///   - the stored `code_hash` field in the account row does not
+    ///     match the SHA-256 of the loaded code bytes (corruption /
+    ///     tamper detection),
     ///   - `StateManager::set_balance` / `set_code` / `increment_nonce`
-    ///     returns an internal error.
+    ///     returns an internal error,
+    ///   - the underlying `ContractStorage::get_state_strict` read
+    ///     surfaces a read error or a UTF-8 decode failure (which the
+    ///     non-strict `get_state` used to collapse into `None`,
+    ///     presenting corruption as "absent" and silently skipping
+    ///     the load).
     ///
     /// The previous implementation collapsed every one of those cases
     /// into a silent no-op via `unwrap_or(0)` and `.ok()`, which meant a
@@ -591,8 +761,28 @@ impl ExecutionEnvironment {
         // `"{prefix}c{hex}"` fallback reconstruction.
         self.register_address(addr);
 
+        // Use the STRICT variant of `get_state` so a read failure or a
+        // UTF-8 decode error surfaces as `Err` instead of the non-strict
+        // `None` (which would silently continue as if the account simply
+        // didn't exist on disk).
+        let account_meta_opt = storage
+            .get_state_strict(&format!("account:{}", addr))
+            .map_err(|e| {
+                slog_error!("vm", "load_contract_account_read_failed",
+                    contract => addr, error => &format!("{}", e));
+                VmError::ContractError(format!(
+                    "failed to read account row for '{}': {}",
+                    addr, e
+                ))
+            })?;
+
+        // Track the metadata `code_hash` so we can cross-check it
+        // against the SHA-256 of the loaded code bytes once the
+        // code row is read.
+        let mut expected_code_hash: Option<String> = None;
+
         // Load account metadata (if present).
-        if let Some(meta) = storage.get_state(&format!("account:{}", addr)) {
+        if let Some(meta) = account_meta_opt {
             let parts: Vec<&str> = meta.splitn(3, '|').collect();
             if parts.len() != 3 {
                 slog_error!("vm", "load_contract_account_meta_malformed",
@@ -620,6 +810,10 @@ impl ExecutionEnvironment {
                     addr, parts[1], e
                 ))
             })?;
+
+            // Capture the code_hash field so we can verify it
+            // against the actual code below.
+            expected_code_hash = Some(parts[2].to_string());
 
             // Create account in StateManager and apply the parsed values.
             self.state.get_or_create_account(addr);
@@ -653,8 +847,21 @@ impl ExecutionEnvironment {
             })?;
         }
 
-        // Load code (if present).
-        if let Some(code_hex) = storage.get_state(&format!("code:{}", addr)) {
+        // Load code (if present) via the strict read so a read
+        // failure or UTF-8 decode error surfaces instead of silently
+        // becoming `None`.
+        let code_hex_opt = storage
+            .get_state_strict(&format!("code:{}", addr))
+            .map_err(|e| {
+                slog_error!("vm", "load_contract_code_read_failed",
+                    contract => addr, error => &format!("{}", e));
+                VmError::ContractError(format!(
+                    "failed to read code row for '{}': {}",
+                    addr, e
+                ))
+            })?;
+
+        if let Some(code_hex) = code_hex_opt {
             let code = hex::decode(&code_hex).map_err(|e| {
                 slog_error!("vm", "load_contract_code_hex_corrupt",
                     contract => addr, error => &format!("{}", e));
@@ -663,6 +870,44 @@ impl ExecutionEnvironment {
                     addr, e
                 ))
             })?;
+
+            // Verify code_hash from account metadata matches the
+            // SHA-256 of the loaded code bytes. A mismatch means
+            // the account row and the code row are inconsistent
+            // — either one of them is corrupt, or a partial write
+            // landed one without the other. We refuse to install
+            // mismatched code so a subsequent CALL can't run code
+            // whose hash-commitment diverges from the account
+            // metadata (which would in turn break any hash-based
+            // invariant check the chain layer performs).
+            //
+            // Accounts where `code_hash` is all-zero — the
+            // `Account::new_eoa` sentinel — are treated as
+            // "code hash not yet committed" and skip this check.
+            // An EOA is not expected to carry a code row at all,
+            // so if one somehow ends up on disk we still refuse
+            // to load it below via the "EOA must not have code"
+            // branch.
+            if let Some(expected) = expected_code_hash.as_deref() {
+                let is_zero_sentinel = expected.chars().all(|c| c == '0');
+                if !is_zero_sentinel {
+                    let mut h = <Sha256 as Digest>::new();
+                    Digest::update(&mut h, &code);
+                    let actual = hex::encode(Digest::finalize(h));
+                    if actual != expected {
+                        slog_error!("vm", "load_contract_code_hash_mismatch",
+                            contract => addr,
+                            expected => expected,
+                            actual => &actual);
+                        return Err(VmError::ContractError(format!(
+                            "contract '{}' code_hash mismatch: account row \
+                             claims {} but code row hashes to {}",
+                            addr, expected, actual
+                        )));
+                    }
+                }
+            }
+
             self.state.set_code(addr, code).map_err(|e| {
                 VmError::Other(format!(
                     "set_code during load_contract_from_storage failed for '{}': {}",
@@ -737,6 +982,66 @@ impl ExecutionEnvironment {
         true
     }
 
+    /// Read `len` bytes from `memory` starting at `offset`, zero-padded
+    /// to exactly `len` bytes if the requested window extends past the
+    /// current memory buffer.
+    ///
+    /// Fails with `None` if:
+    ///   - `offset + len` overflows `usize` (hard reject, NOT wrap),
+    ///   - the requested end exceeds `MAX_MEMORY_SIZE`,
+    ///   - memory expansion gas charge fails.
+    ///
+    /// This replaces the inline
+    /// ```ignore
+    /// if args_len > 0 && args_offset + args_len <= memory.len() {
+    ///     memory[args_offset..args_offset+args_len].to_vec()
+    /// } else {
+    ///     Vec::new()
+    /// }
+    /// ```
+    /// pattern at every CALL-family call site. The old form had
+    /// two consensus-visible bugs:
+    ///
+    ///   1. `args_offset + args_len` was computed with plain `+`,
+    ///      which silently wraps `usize` on overflow. On a 64-bit
+    ///      host the wrap point is ~18 quintillion, normally
+    ///      unreachable, but the pattern is fragile and would
+    ///      trip on synthetic inputs; on a hypothetical 32-bit
+    ///      build it becomes reachable from a malicious contract.
+    ///
+    ///   2. When the window overflowed the current `memory.len()`,
+    ///      the branch fell through to `Vec::new()` — an empty
+    ///      calldata — instead of zero-padding up to `args_len`
+    ///      bytes. EVM semantics require the child frame to
+    ///      observe `args_len` bytes of calldata, with any bytes
+    ///      past the end of the caller's memory zero-filled.
+    ///      The old pattern erased the requested length entirely,
+    ///      so a contract reading CALLDATASIZE inside the child
+    ///      would see 0 instead of the real length the caller
+    ///      asked for. That's a silent ABI-level skew.
+    fn read_memory_zero_padded(
+        gas: &mut GasMeter,
+        memory: &mut Vec<u8>,
+        offset: usize,
+        len: usize,
+    ) -> Option<Vec<u8>> {
+        if len == 0 {
+            return Some(Vec::new());
+        }
+        let end = offset.checked_add(len)?;
+        if end > MAX_MEMORY_SIZE {
+            return None;
+        }
+        if !Self::charge_and_expand_memory(gas, memory, end) {
+            return None;
+        }
+        // After `charge_and_expand_memory`, memory is guaranteed
+        // to be at least `end` bytes long, so the slice is
+        // in-bounds and the zero-fill is implicit in the pre-existing
+        // resize-to-zero semantics of `Vec::resize`.
+        Some(memory[offset..end].to_vec())
+    }
+
     /// Execute a call frame. This is the reentrant core of the VM.
     pub fn execute_frame(&mut self, ctx: &CallContext) -> CallOutcome {
         // Depth check.
@@ -775,11 +1080,62 @@ impl ExecutionEnvironment {
             self.register_address(&ctx.code_address);
         }
 
-        // Load code for the target
-        let code = self.state.get_code(&ctx.code_address);
+        // Load code for the target.
+        //
+        // Lazy-load the contract from the attached
+        // `ContractStorage` (if any) when the in-memory state
+        // has nothing for `code_address`. The block executor's
+        // preload phase only registers the addresses mentioned
+        // in the block's own ContractCreate / ContractCall tx
+        // inputs — any nested CALL from contract A into
+        // contract B whose address wasn't in that preload set
+        // would previously see `get_code(B) == empty` and fall
+        // through to the "empty code, just transfer" branch,
+        // silently executing a call into a contract as if it
+        // didn't exist. Calling B directly in a later TX
+        // would work, but the nested path was broken.
+        //
+        // Lazy-loading here is fail-closed: a corrupt on-disk
+        // record surfaces as a frame Failure rather than being
+        // invisibly treated as "empty code".
+        let mut code = self.state.get_code(&ctx.code_address);
         if code.is_empty() {
-            // Calling a non-contract address with value -- just a transfer
-            if ctx.value > 0 && !ctx.is_static
+            if let Some(storage) = self.lazy_load_storage.clone() {
+                if let Err(e) = self.load_contract_from_storage(&storage, &ctx.code_address) {
+                    crate::slog_error!("vm", "lazy_load_contract_failed",
+                        contract => &ctx.code_address,
+                        error => &format!("{}", e));
+                    return CallOutcome::Failure { gas_used: 0 };
+                }
+                code = self.state.get_code(&ctx.code_address);
+            }
+        }
+
+        if code.is_empty() {
+            // Calling a target that has no code. Semantics:
+            //
+            //   - Normal CALL with value > 0 → transfer value
+            //     caller → address (the usual "send value to an
+            //     EOA" path).
+            //
+            //   - STATICCALL → must not move funds or mutate
+            //     state; just return Success with empty data.
+            //
+            //   - DELEGATECALL / CALLCODE → the parent frame
+            //     already paid for the value (`ctx.value` is
+            //     purely informational for CALLVALUE inside the
+            //     delegated code). Must NOT issue a second
+            //     transfer — otherwise the caller is debited
+            //     twice for the same logical value, which is
+            //     exactly the P0 double-debit bug that
+            //     `execute_frame`'s main entry-transfer check
+            //     was fixed for. The previous version of THIS
+            //     branch only guarded on `!ctx.is_static`, so a
+            //     DELEGATECALL to an empty code address with
+            //     `value > 0` fell through to the transfer call
+            //     anyway — the fix in this file's main transfer
+            //     check didn't cover it.
+            if ctx.value > 0 && !ctx.is_static && !ctx.is_delegate
                 && self.state.transfer(&ctx.caller, &ctx.address, ctx.value).is_err()
             {
                 return CallOutcome::Failure { gas_used: 0 };
@@ -972,9 +1328,27 @@ impl ExecutionEnvironment {
                 OpCode::SLOAD => {
                     let slot = pop1!(stack, gas, snapshot, self);
                     let key = format!("slot:{}", slot);
-                    let val = self.state.storage_load(&ctx.address, &key)
-                        .map(|s| parse_storage_value(&s))
-                        .unwrap_or(U256::ZERO);
+                    let val = match self.state.storage_load(&ctx.address, &key) {
+                        None => U256::ZERO,
+                        Some(raw) => match parse_storage_value_checked(&raw) {
+                            Some(v) => v,
+                            None => {
+                                // Corrupt slot value on disk. Fail
+                                // the frame rather than continuing
+                                // with `U256::ZERO` — giving the
+                                // contract a fabricated zero on a
+                                // corrupt slot is a silent
+                                // consensus divergence that the
+                                // contract has no way to detect.
+                                crate::slog_error!("vm", "sload_corrupt_slot_surfacing_as_failure",
+                                    contract => &ctx.address,
+                                    key => &key,
+                                    raw => &raw);
+                                self.state.rollback(snapshot).ok();
+                                return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            }
+                        }
+                    };
                     stack.push(val);
                 }
                 OpCode::SSTORE => {
@@ -1204,8 +1578,27 @@ impl ExecutionEnvironment {
                     }
                     let offset = stack.pop().unwrap().as_u64() as usize;
                     let size = stack.pop().unwrap().as_u64() as usize;
-                    if size > 0 && offset + size <= memory.len() {
-                        return_data = memory[offset..offset+size].to_vec();
+                    // EVM semantics: RETURN's memory window is
+                    // virtual — bytes past the end of the current
+                    // memory buffer are zero, not "truncated to
+                    // nothing". The previous code used a raw
+                    // `offset + size <= memory.len()` guard that
+                    //   (a) silently wrapped on `usize` overflow,
+                    //   (b) truncated the return data to an empty
+                    //       Vec when the window extended past the
+                    //       end of memory, instead of expanding
+                    //       memory + zero-filling.
+                    // Use the zero-padding helper so both the
+                    // overflow and the out-of-bounds cases become
+                    // consensus-correct.
+                    match Self::read_memory_zero_padded(
+                        &mut gas, &mut memory, offset, size,
+                    ) {
+                        Some(data) => return_data = data,
+                        None => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        }
                     }
                     self.state.commit(snapshot).ok();
                     return CallOutcome::Success {
@@ -1232,8 +1625,18 @@ impl ExecutionEnvironment {
                     }
                     let offset = stack.pop().unwrap().as_u64() as usize;
                     let size = stack.pop().unwrap().as_u64() as usize;
-                    if size > 0 && offset + size <= memory.len() {
-                        return_data = memory[offset..offset+size].to_vec();
+                    // Same zero-padding / checked-add fix as RETURN.
+                    // REVERT must still produce the exact `size`
+                    // bytes the contract asked for, zero-filling any
+                    // window past the end of memory.
+                    match Self::read_memory_zero_padded(
+                        &mut gas, &mut memory, offset, size,
+                    ) {
+                        Some(data) => return_data = data,
+                        None => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        }
                     }
                     self.state.rollback(snapshot).ok();
                     return CallOutcome::Revert {
@@ -1257,8 +1660,21 @@ impl ExecutionEnvironment {
                     let ret_offset = stack.pop().unwrap().as_u64() as usize;
                     let ret_len = stack.pop().unwrap().as_u64() as usize;
 
-                    // Static check: CALL with value > 0 inside STATICCALL is forbidden
+                    // Static check: CALL with value > 0 inside STATICCALL is forbidden.
+                    //
+                    // The fast-path rejection still has to clear
+                    // `last_return_data` because it's a "sub-call
+                    // was attempted and did not succeed" signal,
+                    // and EIP-211 requires RETURNDATA to reflect
+                    // the most recent sub-call, not whatever an
+                    // earlier sibling sub-call left lying around.
+                    // The previous code skipped the clear here, so
+                    // a static-with-value CALL would push 0 for
+                    // failure but leave the parent frame's
+                    // RETURNDATASIZE / RETURNDATACOPY seeing the
+                    // previous sub-call's output.
                     if ctx.is_static && call_value > 0 {
+                        self.last_return_data.clear();
                         stack.push(U256::ZERO); // failure
                         pc += 1; continue;
                     }
@@ -1317,10 +1733,20 @@ impl ExecutionEnvironment {
                     }
 
                     // Read calldata from memory
-                    let calldata = if args_len > 0 && args_offset + args_len <= memory.len() {
-                        memory[args_offset..args_offset+args_len].to_vec()
-                    } else {
-                        Vec::new()
+                    // Build the child frame's calldata using the
+                    // zero-padding / checked-add helper so an
+                    // out-of-bounds window produces the correct
+                    // zero-filled `args_len` bytes (rather than an
+                    // empty Vec) and an `args_offset + args_len`
+                    // overflow fails cleanly rather than wrapping.
+                    let calldata = match Self::read_memory_zero_padded(
+                        &mut gas, &mut memory, args_offset, args_len,
+                    ) {
+                        Some(cd) => cd,
+                        None => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        }
                     };
 
                     // Check for precompile (addresses 0x01-0x09)
@@ -1467,9 +1893,21 @@ impl ExecutionEnvironment {
                         return CallOutcome::Failure { gas_used: gas.gas_used() };
                     }
 
-                    let calldata = if args_len > 0 && args_offset + args_len <= memory.len() {
-                        memory[args_offset..args_offset+args_len].to_vec()
-                    } else { Vec::new() };
+                    // Build the child frame's calldata using the
+                    // zero-padding / checked-add helper so an
+                    // out-of-bounds window produces the correct
+                    // zero-filled `args_len` bytes (rather than an
+                    // empty Vec) and an `args_offset + args_len`
+                    // overflow fails cleanly rather than wrapping.
+                    let calldata = match Self::read_memory_zero_padded(
+                        &mut gas, &mut memory, args_offset, args_len,
+                    ) {
+                        Some(cd) => cd,
+                        None => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        }
+                    };
 
                     // Resolve the popped body back to its ShadowDAG
                     // address via the runtime registry (see BALANCE
@@ -1569,9 +2007,21 @@ impl ExecutionEnvironment {
                         return CallOutcome::Failure { gas_used: gas.gas_used() };
                     }
 
-                    let calldata = if args_len > 0 && args_offset + args_len <= memory.len() {
-                        memory[args_offset..args_offset+args_len].to_vec()
-                    } else { Vec::new() };
+                    // Build the child frame's calldata using the
+                    // zero-padding / checked-add helper so an
+                    // out-of-bounds window produces the correct
+                    // zero-filled `args_len` bytes (rather than an
+                    // empty Vec) and an `args_offset + args_len`
+                    // overflow fails cleanly rather than wrapping.
+                    let calldata = match Self::read_memory_zero_padded(
+                        &mut gas, &mut memory, args_offset, args_len,
+                    ) {
+                        Some(cd) => cd,
+                        None => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        }
+                    };
 
                     // Resolve the popped body back to its ShadowDAG
                     // address. DELEGATECALL uses this as the
@@ -1646,7 +2096,15 @@ impl ExecutionEnvironment {
                     let ret_offset = stack.pop().unwrap().as_u64() as usize;
                     let ret_len = stack.pop().unwrap().as_u64() as usize;
 
+                    // Static check: CALLCODE with value > 0 is
+                    // forbidden inside a static frame. Clear the
+                    // RETURNDATA buffer on the fast-path failure
+                    // for the same EIP-211 reason documented at
+                    // the CALL site above — the previous code
+                    // leaked an earlier sub-call's returndata
+                    // into the static-with-value failure path.
                     if ctx.is_static && call_value > 0 {
+                        self.last_return_data.clear();
                         stack.push(U256::ZERO);
                         pc += 1; continue;
                     }
@@ -1668,9 +2126,21 @@ impl ExecutionEnvironment {
                         return CallOutcome::Failure { gas_used: gas.gas_used() };
                     }
 
-                    let calldata = if args_len > 0 && args_offset + args_len <= memory.len() {
-                        memory[args_offset..args_offset+args_len].to_vec()
-                    } else { Vec::new() };
+                    // Build the child frame's calldata using the
+                    // zero-padding / checked-add helper so an
+                    // out-of-bounds window produces the correct
+                    // zero-filled `args_len` bytes (rather than an
+                    // empty Vec) and an `args_offset + args_len`
+                    // overflow fails cleanly rather than wrapping.
+                    let calldata = match Self::read_memory_zero_padded(
+                        &mut gas, &mut memory, args_offset, args_len,
+                    ) {
+                        Some(cd) => cd,
+                        None => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        }
+                    };
 
                     // Resolve the popped body back to its ShadowDAG
                     // address via the runtime registry, same as
@@ -1743,12 +2213,24 @@ impl ExecutionEnvironment {
                     let offset = stack.pop().unwrap().as_u64() as usize;
                     let length = stack.pop().unwrap().as_u64() as usize;
 
-                    // Read init code from memory
-                    let init_code = if length > 0 && offset + length <= memory.len() {
-                        memory[offset..offset+length].to_vec()
-                    } else {
-                        stack.push(U256::ZERO);
-                        pc += 1; continue;
+                    // Read init code from memory with the
+                    // zero-padding / checked-add helper. A window
+                    // that overflows `usize` or exceeds
+                    // `MAX_MEMORY_SIZE` produces a failed CREATE
+                    // (push 0 to signal failure to the parent and
+                    // continue execution); a window that extends
+                    // past the end of memory is zero-filled, which
+                    // matches the EVM CREATE semantics where the
+                    // init code read uses the memory window as-is
+                    // with zero bytes past the end.
+                    let init_code = match Self::read_memory_zero_padded(
+                        &mut gas, &mut memory, offset, length,
+                    ) {
+                        Some(code) => code,
+                        None => {
+                            stack.push(U256::ZERO);
+                            pc += 1; continue;
+                        }
                     };
 
                     // Charge per-byte cost
@@ -2236,16 +2718,32 @@ impl ExecutionEnvironment {
                     let offset = stack.pop().unwrap().as_u64() as usize;
                     let length = stack.pop().unwrap().as_u64() as usize;
                     if length > 0 {
-                        if dest + length > MAX_MEMORY_SIZE {
+                        let dest_end = match dest.checked_add(length) {
+                            Some(end) => end,
+                            None => {
+                                self.state.rollback(snapshot).ok();
+                                return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            }
+                        };
+                        if dest_end > MAX_MEMORY_SIZE {
                             self.state.rollback(snapshot).ok();
                             return CallOutcome::Failure { gas_used: gas.gas_used() };
                         }
-                        if !Self::charge_and_expand_memory(&mut gas, &mut memory, dest + length) {
+                        if !Self::charge_and_expand_memory(&mut gas, &mut memory, dest_end) {
                             self.state.rollback(snapshot).ok();
                             return CallOutcome::Failure { gas_used: gas.gas_used() };
                         }
                         for i in 0..length {
-                            memory[dest + i] = if offset + i < ctx.calldata.len() { ctx.calldata[offset + i] } else { 0 };
+                            // `offset + i` is checked against
+                            // `ctx.calldata.len()` via a saturating
+                            // comparison — on overflow the `usize`
+                            // wrap would skip the guard, so use a
+                            // checked_add-based per-byte probe.
+                            let src_idx = offset.checked_add(i);
+                            memory[dest + i] = match src_idx {
+                                Some(j) if j < ctx.calldata.len() => ctx.calldata[j],
+                                _ => 0,
+                            };
                         }
                     }
                 }
@@ -2259,16 +2757,27 @@ impl ExecutionEnvironment {
                     let offset = stack.pop().unwrap().as_u64() as usize;
                     let length = stack.pop().unwrap().as_u64() as usize;
                     if length > 0 {
-                        if dest + length > MAX_MEMORY_SIZE {
+                        let dest_end = match dest.checked_add(length) {
+                            Some(end) => end,
+                            None => {
+                                self.state.rollback(snapshot).ok();
+                                return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            }
+                        };
+                        if dest_end > MAX_MEMORY_SIZE {
                             self.state.rollback(snapshot).ok();
                             return CallOutcome::Failure { gas_used: gas.gas_used() };
                         }
-                        if !Self::charge_and_expand_memory(&mut gas, &mut memory, dest + length) {
+                        if !Self::charge_and_expand_memory(&mut gas, &mut memory, dest_end) {
                             self.state.rollback(snapshot).ok();
                             return CallOutcome::Failure { gas_used: gas.gas_used() };
                         }
                         for i in 0..length {
-                            memory[dest + i] = if offset + i < code.len() { code[offset + i] } else { 0 };
+                            let src_idx = offset.checked_add(i);
+                            memory[dest + i] = match src_idx {
+                                Some(j) if j < code.len() => code[j],
+                                _ => 0,
+                            };
                         }
                     }
                 }
@@ -2293,16 +2802,36 @@ impl ExecutionEnvironment {
                     let offset = stack.pop().unwrap().as_u64() as usize;
                     let length = stack.pop().unwrap().as_u64() as usize;
                     if length > 0 {
-                        // Bounds check against return data (EIP-211)
-                        if offset + length > self.last_return_data.len() {
+                        // Bounds check against return data (EIP-211).
+                        // Use checked_add on both the source and
+                        // destination ranges so a synthetic
+                        // `offset = usize::MAX` / `length = 1`
+                        // input doesn't wrap past the
+                        // last_return_data length check and then
+                        // panic inside the copy.
+                        let src_end = match offset.checked_add(length) {
+                            Some(e) => e,
+                            None => {
+                                self.state.rollback(snapshot).ok();
+                                return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            }
+                        };
+                        if src_end > self.last_return_data.len() {
                             self.state.rollback(snapshot).ok();
                             return CallOutcome::Failure { gas_used: gas.gas_used() };
                         }
-                        if dest + length > MAX_MEMORY_SIZE {
+                        let dest_end = match dest.checked_add(length) {
+                            Some(e) => e,
+                            None => {
+                                self.state.rollback(snapshot).ok();
+                                return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            }
+                        };
+                        if dest_end > MAX_MEMORY_SIZE {
                             self.state.rollback(snapshot).ok();
                             return CallOutcome::Failure { gas_used: gas.gas_used() };
                         }
-                        if !Self::charge_and_expand_memory(&mut gas, &mut memory, dest + length) {
+                        if !Self::charge_and_expand_memory(&mut gas, &mut memory, dest_end) {
                             self.state.rollback(snapshot).ok();
                             return CallOutcome::Failure { gas_used: gas.gas_used() };
                         }
@@ -2384,14 +2913,53 @@ impl ExecutionEnvironment {
 /// addresses are detected just as well as bare hex.
 fn is_precompile_addr(addr: &str) -> Option<u8> {
     // Strip an optional ShadowDAG network/subtype prefix.
+    //
+    // The subtype char (`c`/`t`/`s`/`k`/`h`) is only recognised when
+    // the remaining body is exactly 40 hex chars — the canonical
+    // 20-byte body length. Without this length check, a short EOA
+    // address like `"SD1cafe"` would pass through the stripper,
+    // become `"afe"`, trim to `"afe"`, and then fall out of the
+    // final `<=2`-char / `1..=9` filter — so this length guard is
+    // not strictly needed to preserve the "afe" → None case, but
+    // it IS needed to prevent a legitimately 40-char non-contract
+    // address that happens to start with a subtype char from being
+    // misread as one additional level of prefix. For example an
+    // address body `cafecafecafecafecafecafecafecafecafecafe` with
+    // no network prefix at all is 40 chars and would fall through
+    // to the `addr` branch, be fed to `trim_start_matches('0')`,
+    // and correctly fail the precompile test. But if the caller
+    // passes `SD1tcafecafecafecafecafecafecafecafecafecafecafe`
+    // (the `t` is the subtype marker for a token, body is 40
+    // chars), stripping `SD1` and then `t` leaves exactly 40 chars
+    // starting with `c` — the length check confirms this is the
+    // genuine canonical body, not a double-prefix case. Tighter
+    // enforcement prevents the non-canonical `SD1cXX` form
+    // (short, subtype char, 2-char body) from looking like a
+    // precompile: `SD1c01` would strip to `01` and parse as
+    // precompile 1, even though it's a 5-char address string
+    // that no legitimate ShadowDAG tooling would emit.
     let body = if let Some(rest) = addr.strip_prefix("SD1")
         .or_else(|| addr.strip_prefix("ST1"))
         .or_else(|| addr.strip_prefix("SR1"))
     {
-        // Optional 1-char subtype: c/t/s/k/h.
-        match rest.as_bytes().first() {
-            Some(b'c') | Some(b't') | Some(b's') | Some(b'k') | Some(b'h') => &rest[1..],
-            _ => rest,
+        // Canonical body is 40 hex chars with an optional 1-char
+        // subtype marker. Anything shorter is a test/synthetic
+        // form and should NOT be auto-stripped; fall through to
+        // the raw-body interpretation.
+        let looks_canonical_with_subtype = rest.len() == 41
+            && matches!(rest.as_bytes().first(),
+                Some(b'c') | Some(b't') | Some(b's') | Some(b'k') | Some(b'h'));
+        let looks_canonical_no_subtype = rest.len() == 40;
+
+        if looks_canonical_with_subtype {
+            &rest[1..]
+        } else if looks_canonical_no_subtype {
+            rest
+        } else {
+            // Not a canonical address — treat the whole input as
+            // opaque so the strict "1..=9 after leading-zero
+            // strip" filter below is the only way to classify it.
+            addr
         }
     } else {
         addr
@@ -2411,41 +2979,50 @@ fn is_precompile_addr(addr: &str) -> Option<u8> {
     None
 }
 
-/// Parse a storage value to U256 (deterministic: hex > decimal > zero)
 /// Parse a stored U256 value from its on-disk string representation.
 ///
 /// SSTORE always writes `"0x<64 hex chars>"`, so the hex path is the
 /// hot path. The decimal path exists for backward compatibility with
 /// older state and for any external code that wrote decimal values.
 ///
-/// Both paths return `U256::ZERO` only when the input is empty,
-/// genuinely zero, or malformed. The previous decimal path used
-/// `s.parse::<u64>().unwrap_or(0)`, which silently truncated any
-/// decimal value larger than `u64::MAX` to zero — a silent
-/// data-loss path for U256 storage values that happened to be
-/// stored in decimal form. The new path parses up to a full
-/// 256-bit decimal via repeated `wrapping_mul(10) + digit` and
-/// rejects anything that wouldn't fit in U256 by length-checking
-/// against `U256::MAX`'s 78-digit decimal representation.
-fn parse_storage_value(s: &str) -> U256 {
-    if let Some(hex_str) = s.strip_prefix("0x") {
-        return U256::from_hex(hex_str).unwrap_or_else(|| {
-            slog_error!("vm", "parse_storage_value_corrupt_hex",
-                raw => s, note => "returning ZERO on malformed hex storage value");
-            U256::ZERO
-        });
+/// Returns `None` for corrupt values so SLOAD can surface the
+/// corruption as a frame Failure instead of silently giving the
+/// contract a fake `U256::ZERO`. Before this split, the helper
+/// returned `ZERO` on every parse failure, which turned a corrupt
+/// slot into a live "slot is unset" signal that the contract
+/// couldn't distinguish from a genuine zero — a fail-open path
+/// that fed fabricated data straight into business logic.
+///
+/// A genuinely empty string still returns `Some(ZERO)` because
+/// SLOAD on an unset slot is a legitimate zero.
+fn parse_storage_value_checked(s: &str) -> Option<U256> {
+    if s.is_empty() {
+        return Some(U256::ZERO);
     }
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-        if !s.is_empty() {
-            slog_error!("vm", "parse_storage_value_corrupt_decimal",
-                raw => s, note => "returning ZERO on non-numeric, non-hex storage value");
-        }
-        return U256::ZERO;
+    if let Some(hex_str) = s.strip_prefix("0x") {
+        return U256::from_hex(hex_str);
+    }
+    if !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
     // Decimal path: parse up to a full 256-bit value, NOT just u64.
-    parse_decimal_u256(s).unwrap_or_else(|| {
-        slog_error!("vm", "parse_storage_value_decimal_overflow",
-            raw => s, note => "returning ZERO on decimal storage value that exceeds U256::MAX");
+    parse_decimal_u256(s)
+}
+
+/// Legacy non-strict variant kept for callers that genuinely want
+/// the "return ZERO, log loudly, continue" behaviour (e.g. audit
+/// tooling that reads every historical slot and doesn't care about
+/// individual corrupt slots). New code should call
+/// [`parse_storage_value_checked`] and surface failures up the
+/// call stack. Currently unused by the VM itself — SLOAD uses the
+/// checked variant — but retained as a public-ish helper for
+/// potential out-of-band tooling in `runtime::vm::testing`.
+#[allow(dead_code)]
+fn parse_storage_value(s: &str) -> U256 {
+    parse_storage_value_checked(s).unwrap_or_else(|| {
+        slog_error!("vm", "parse_storage_value_corrupt_returning_zero",
+            raw => s,
+            note => "non-strict fallback; SLOAD hot path uses the checked variant");
         U256::ZERO
     })
 }
@@ -4200,7 +4777,7 @@ mod tests {
                 .destroy_account("victim")
                 .expect("destroy_account");
             env.destroyed_contracts.insert("victim".to_string());
-            env.persist_with_undo(&storage, &block_a)
+            env.persist_with_undo(&storage, &block_a, None, None)
                 .expect("persist with undo");
         }
 
@@ -4277,5 +4854,209 @@ mod tests {
             10_000_000_000_u64,
             "persisted nonce must be restored exactly"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //        MEGA-BATCH REGRESSIONS (28-bug audit patch)
+    // ═══════════════════════════════════════════════════════════════
+
+    // M-P0-1 — per-tx state must be reset via `begin_tx` so EIP-6780
+    //          `created_in_tx` and EIP-211 `last_return_data` don't
+    //          leak between sibling TXs inside the same block.
+
+    #[test]
+    fn begin_tx_clears_created_in_tx_and_last_return_data() {
+        let mut env = make_env();
+        env.created_in_tx.insert("some-contract".to_string());
+        env.last_return_data = vec![1, 2, 3, 4];
+
+        env.begin_tx();
+
+        assert!(
+            env.created_in_tx.is_empty(),
+            "begin_tx must clear created_in_tx"
+        );
+        assert!(
+            env.last_return_data.is_empty(),
+            "begin_tx must clear last_return_data"
+        );
+    }
+
+    // M-P0-3/4 — (block executor level, not a unit test reachable
+    //             here; covered by the block e2e tests).
+
+    // M-P0-7 — CALL-family memory input read uses the zero-padding
+    //          helper: an out-of-bounds window produces `args_len`
+    //          zero bytes, not `Vec::new()`.
+    #[test]
+    fn read_memory_zero_padded_zero_fills_past_end() {
+        let mut env = make_env();
+        let mut memory: Vec<u8> = vec![0xAA, 0xBB, 0xCC];
+        let mut gas = GasMeter::new(1_000_000);
+
+        // Read 8 bytes starting at offset 1 from a 3-byte buffer.
+        // Expected: [BB, CC, 0, 0, 0, 0, 0, 0].
+        let data = ExecutionEnvironment::read_memory_zero_padded(
+            &mut gas, &mut memory, 1, 8,
+        ).expect("zero-pad read must succeed after expansion");
+
+        assert_eq!(data.len(), 8);
+        assert_eq!(&data[..2], &[0xBB, 0xCC]);
+        assert!(data[2..].iter().all(|&b| b == 0),
+            "bytes past the original end must be zero, got {:?}", data);
+
+        let _ = env;
+    }
+
+    // M-P0-10 — offset + length overflow fails the frame closed.
+    #[test]
+    fn read_memory_zero_padded_rejects_checked_add_overflow() {
+        let mut env = make_env();
+        let mut memory: Vec<u8> = Vec::new();
+        let mut gas = GasMeter::new(1_000_000);
+
+        // `usize::MAX + 1` → checked_add overflow → None.
+        let result = ExecutionEnvironment::read_memory_zero_padded(
+            &mut gas, &mut memory, usize::MAX, 1,
+        );
+        assert!(result.is_none(),
+            "checked_add overflow must return None, not wrap");
+
+        let _ = env;
+    }
+
+    // M-P0-8 — RETURN with out-of-bounds memory must zero-pad to the
+    //          requested size, not truncate.
+    #[test]
+    fn return_zero_pads_memory_window_past_end() {
+        let mut env = make_env();
+        // PUSH1 0x42, PUSH1 0, MSTORE8    (memory[0] = 0x42)
+        // PUSH1 8,    PUSH1 0,  RETURN    (return 8 bytes from 0)
+        //
+        // Memory is only 1 byte after the MSTORE8 (the rest of the
+        // word is zeros after the round-up to 32 bytes), but the
+        // RETURN window asks for 8 bytes. We expect the first byte
+        // to be 0x42 and the remaining 7 to be zero — not an empty
+        // return (the old bug).
+        let code = vec![
+            0x10, 0x42,     // PUSH1 0x42  (val)
+            0x10, 0,        // PUSH1 0     (offset)
+            0x92,           // MSTORE8
+            0x10, 8,        // PUSH1 8   (size)
+            0x10, 0,        // PUSH1 0   (offset)
+            0xB6,           // RETURN
+        ];
+        env.state.set_code("probe", code).unwrap();
+        let ctx = CallContext {
+            address: "probe".into(),
+            code_address: "probe".into(),
+            caller: "user".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
+        };
+        match env.execute_frame(&ctx) {
+            CallOutcome::Success { return_data, .. } => {
+                assert_eq!(return_data.len(), 8,
+                    "RETURN with out-of-bounds window must produce the requested size, got {:?}", return_data);
+                assert_eq!(return_data[0], 0x42,
+                    "first byte must be the MSTORE8 value");
+                assert!(return_data[1..].iter().all(|&b| b == 0),
+                    "remaining bytes must be zero-filled");
+            }
+            other => panic!("expected Success, got {:?}", other),
+        }
+    }
+
+    // M-P0-9 — DELEGATECALL to an empty-code target must NOT issue
+    //          a second value transfer (the entry-frame transfer
+    //          was already paid by the parent).
+    #[test]
+    fn delegate_frame_to_empty_code_does_not_transfer() {
+        let mut env = make_env();
+        env.state.set_balance("caller", 1_000).unwrap();
+        env.state.set_balance("nowhere", 0).unwrap();
+        // no code installed at "nowhere"
+
+        let ctx = CallContext {
+            address: "nowhere".into(),
+            code_address: "nowhere".into(),
+            caller: "caller".into(),
+            value: 500,                  // value is set
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: true,           // delegate → parent already paid
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(matches!(result, CallOutcome::Success { .. }),
+            "delegate to empty code must succeed, got {:?}", result);
+
+        assert_eq!(env.state.get_balance("caller"), 1_000,
+            "delegate to empty code must not debit caller");
+        assert_eq!(env.state.get_balance("nowhere"), 0,
+            "delegate to empty code must not credit target");
+    }
+
+    // M-P0-11/P1-7 — load_contract_from_storage must reject code that
+    //               doesn't match the account row's code_hash.
+    #[test]
+    fn load_contract_rejects_code_hash_mismatch() {
+        use crate::runtime::vm::contracts::contract_storage::ContractStorage;
+        let dir = std::env::temp_dir().join(format!(
+            "shadowdag_code_hash_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let storage = ContractStorage::new(dir.to_str().unwrap())
+            .expect("open contract storage");
+
+        // Plant an account row with a FAKE code_hash that doesn't
+        // correspond to the code we're about to plant.
+        storage
+            .set_state(
+                "account:victim",
+                &format!("{}|{}|{}", 0_u64, 1_u64, "deadbeef".repeat(8)),
+            )
+            .unwrap();
+        // Plant real code bytes whose actual SHA-256 is NOT "deadbeef…".
+        storage
+            .set_state("code:victim", &hex::encode([0x00, 0x01, 0x02]))
+            .unwrap();
+
+        let mut env = make_env();
+        let result = env.load_contract_from_storage(&storage, "victim");
+        assert!(result.is_err(),
+            "code_hash mismatch must be rejected, got {:?}", result);
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("code_hash mismatch"),
+            "error must describe the mismatch, got: {}", msg);
+    }
+
+    // M-P1-2 — resolve_address probes every ShadowDAG subtype, not
+    //          just `c`.
+    #[test]
+    fn resolve_address_probes_non_contract_subtypes() {
+        let mut env = make_env();
+        // Pre-load an EOA (subtype `t`) into state WITHOUT going
+        // through `register_address`, so the registry misses and
+        // `resolve_address` has to fall through to the
+        // state-probe branch.
+        let eoa_addr = format!("SD1t{}", "0".repeat(39) + "1");
+        env.state.set_balance(&eoa_addr, 5_000).unwrap();
+
+        // Convert the low 20 bytes of `eoa_addr` back through the
+        // stack to simulate what a contract would observe after
+        // popping the EOA body.
+        let body = VmAddressBody::from_any(&eoa_addr).to_u256();
+        let resolved = env.resolve_address(body);
+        assert_eq!(resolved, eoa_addr,
+            "resolve_address must probe the 't' subtype for loaded EOAs");
     }
 }

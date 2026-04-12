@@ -10,3 +10,5 @@ target/
 # publishes the live admin credential for any node that ever ran
 # from this checkout.
 rpc_password
+target/ 
+.claude/ 

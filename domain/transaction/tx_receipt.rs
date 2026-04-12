@@ -305,6 +305,29 @@ impl ReceiptStore {
 
     pub fn count(&self) -> usize { self.receipts.read().unwrap_or_else(|e| e.into_inner()).len() }
 
+    /// Remove the in-memory entries for the given TX hashes.
+    ///
+    /// Used by the reorg / rollback paths to drop receipts whose
+    /// block has just been orphaned, so that a subsequent RPC
+    /// `eth_getTransactionReceipt` doesn't return a receipt marked
+    /// as "included in block X" where block X is no longer part
+    /// of the canonical chain. The on-disk counterparts live
+    /// under `receipt:{tx_hash}` and are removed by
+    /// [`delete_receipts_for_block`].
+    ///
+    /// Missing entries are silently ignored — the caller doesn't
+    /// care whether the TX was in the cache or not, only that it
+    /// isn't there after the call.
+    pub fn remove_tx_hashes(&self, tx_hashes: &[String]) {
+        if tx_hashes.is_empty() {
+            return;
+        }
+        let mut receipts = self.receipts.write().unwrap_or_else(|e| e.into_inner());
+        for h in tx_hashes {
+            receipts.remove(h);
+        }
+    }
+
     fn evict_old(&self, receipts: &mut HashMap<String, TxReceipt>) {
         // Remove final/rejected/expired receipts that are oldest
         let mut candidates: Vec<(String, u64)> = receipts.iter()
