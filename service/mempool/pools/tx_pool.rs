@@ -76,6 +76,22 @@ impl TxPool {
         self.seen_hashes.remove(txid);
     }
 
+    /// Remove a transaction and all its dependents, cleaning up TxPool caches
+    /// (spent_inputs, seen_hashes) for each one.
+    /// mempool.remove_transaction cascades to dependents internally, but only
+    /// cleans up the top-level tx's TxPool caches.  This method ensures every
+    /// recursively removed dependent also has its caches cleaned.
+    pub fn remove_with_dependents(&mut self, txid: &str) {
+        // First collect dependents before removing anything
+        let deps = self.mempool.get_dependents(txid);
+        // Remove the target first (cleans up its own caches)
+        self.remove_transaction(txid);
+        // Then remove each dependent (which cleans up their caches too)
+        for dep_txid in &deps {
+            self.remove_with_dependents(dep_txid);
+        }
+    }
+
     fn check_double_spend(&self, tx: &Transaction) -> bool {
         for input in &tx.inputs {
             match crate::domain::utxo::utxo_set::utxo_key(&input.txid, input.index) {

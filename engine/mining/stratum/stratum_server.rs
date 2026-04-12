@@ -304,8 +304,8 @@ pub struct StratumServer {
     /// during Subscribe so the subsequent Authorize for the same connection
     /// retrieves the correct ID (fixes race condition with concurrent miners).
     pending_subs:    RwLock<HashMap<SocketAddr, (u64, std::time::Instant)>>,
-    /// Share replay prevention: set of (job_id, nonce_hex) pairs already seen.
-    seen_shares:     RwLock<HashSet<(String, String)>>,
+    /// Share replay prevention: set of (job_id, nonce_hex, worker_name) tuples already seen.
+    seen_shares:     RwLock<HashSet<(String, String, String)>>,
     /// Active TCP connection count (DoS protection).
     active_connections: AtomicU64,
 }
@@ -413,8 +413,10 @@ impl StratumServer {
         let job_id = &req.params[1];
         let nonce_hex = &req.params[2];
 
-        // Validate job_id matches current template
-        {
+        // Read the template ONCE and reuse it for both job_id validation and
+        // share validation below, eliminating a TOCTOU race where the template
+        // could change between the two reads.
+        let template_snapshot = {
             let template = self.current_template.read().unwrap_or_else(|e| e.into_inner());
             match template.as_ref() {
                 Some(t) if t.job_id != *job_id => {
@@ -423,16 +425,25 @@ impl StratumServer {
                 None => {
                     return StratumResponse::err(req.id, "No current job");
                 }
-                _ => {}
+                Some(t) => t.clone(),
             }
-        }
+        };
 
-        // Share replay prevention: reject duplicate (job_id, nonce) pairs
+        // Share replay prevention: reject duplicate (job_id, nonce, worker) tuples.
+        // Include worker_name so two different workers submitting the same nonce
+        // for the same job are not falsely flagged as replays.
+        // Normalize nonce to lowercase to prevent case-bypass.
         {
-            let share_key = (job_id.clone(), nonce_hex.clone());
+            let share_key = (job_id.clone(), nonce_hex.to_lowercase(), worker_name.clone());
             let mut seen = self.seen_shares.write().unwrap_or_else(|e| e.into_inner());
-            if !seen.insert(share_key) {
+            if !seen.insert(share_key.clone()) {
                 return StratumResponse::err(req.id, "Duplicate share");
+            }
+            // Prevent unbounded memory growth. Templates rotate frequently
+            // so old shares are irrelevant anyway.
+            if seen.len() > 100_000 {
+                seen.clear();
+                seen.insert(share_key);
             }
         }
 
@@ -452,14 +463,23 @@ impl StratumServer {
         let worker_difficulty = worker.difficulty;
         let worker_extra_nonce = worker.extra_nonce;
 
-        // Validate share against the worker's current vardiff difficulty
-        let share_valid = self.validate_share(nonce_hex, worker_difficulty, worker_extra_nonce);
+        // Validate share against the worker's current vardiff difficulty,
+        // using the template snapshot captured above (avoids TOCTOU).
+        let share_valid = self.validate_share(nonce_hex, worker_difficulty, worker_extra_nonce, &template_snapshot);
 
         if share_valid {
             worker.accept_share();
 
+            // Periodically adjust worker difficulty based on share rate
+            let elapsed = now_secs().saturating_sub(worker.connected_at);
+            if elapsed > 0 && elapsed % VARDIFF_INTERVAL_SEC == 0 {
+                if worker.vardiff_adjust() {
+                    // TODO: Send mining.set_difficulty notification to worker
+                }
+            }
+
             // Check if share also meets network difficulty (block found!)
-            if self.meets_network_difficulty(nonce_hex, worker_extra_nonce) {
+            if self.meets_network_difficulty(nonce_hex, worker_extra_nonce, &template_snapshot) {
                 self.blocks_found.fetch_add(1, Ordering::Relaxed);
             }
 
@@ -688,7 +708,9 @@ impl StratumServer {
     /// Validate a share submission using ShadowHash.
     /// Recomputes the block hash with the submitted nonce and checks against
     /// the worker's share difficulty target.
-    fn validate_share(&self, nonce_hex: &str, share_difficulty: u64, worker_extra_nonce: u64) -> bool {
+    /// The template is passed in directly (captured once in handle_submit)
+    /// to eliminate the TOCTOU race of re-reading current_template.
+    fn validate_share(&self, nonce_hex: &str, share_difficulty: u64, worker_extra_nonce: u64, template: &BlockTemplate) -> bool {
         // A valid share must be a proper hex-encoded nonce
         if nonce_hex.is_empty() || nonce_hex.len() > 16 {
             return false;
@@ -700,12 +722,6 @@ impl StratumServer {
         let nonce = match u64::from_str_radix(nonce_hex, 16) {
             Ok(n) => n,
             Err(_) => return false,
-        };
-
-        // Get the current block template to recompute the hash
-        let template = match self.current_template.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            Some(t) => t.clone(),
-            None => return false, // No work available — cannot validate
         };
 
         // Combine template extra_nonce with worker's unique extra_nonce to ensure
@@ -733,7 +749,9 @@ impl StratumServer {
 
     /// Check if a share meets the full network difficulty (block found!).
     /// Recomputes the hash with ShadowHash and compares against network target.
-    fn meets_network_difficulty(&self, nonce_hex: &str, worker_extra_nonce: u64) -> bool {
+    /// The template is passed in directly (captured once in handle_submit)
+    /// to eliminate the TOCTOU race of re-reading current_template.
+    fn meets_network_difficulty(&self, nonce_hex: &str, worker_extra_nonce: u64, template: &BlockTemplate) -> bool {
         if nonce_hex.is_empty() || nonce_hex.len() > 16 {
             return false;
         }
@@ -741,11 +759,6 @@ impl StratumServer {
         let nonce = match u64::from_str_radix(nonce_hex, 16) {
             Ok(n) => n,
             Err(_) => return false,
-        };
-
-        let template = match self.current_template.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            Some(t) => t.clone(),
-            None => return false,
         };
 
         // Combine template extra_nonce with worker's unique extra_nonce
