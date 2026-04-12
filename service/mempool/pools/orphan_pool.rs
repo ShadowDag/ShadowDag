@@ -67,6 +67,14 @@ impl OrphanPool {
 
     pub fn promote(&mut self, parent_txid: &str) -> Vec<Transaction> {
         let promoted = self.orphans.remove(parent_txid).unwrap_or_default();
+        // Filter out TXs that were already promoted via a different parent bucket.
+        // A TX with multiple inputs can appear in multiple orphan buckets (one per
+        // parent). When parent A triggers promotion the TX is promoted and removed
+        // from tx_buckets. If parent B later triggers, the same TX would appear
+        // again without this filter.
+        let promoted: Vec<Transaction> = promoted.into_iter()
+            .filter(|tx| self.tx_buckets.contains_key(&tx.hash))
+            .collect();
         for tx in &promoted {
             // Remove from all other buckets this tx was registered in
             if let Some(buckets) = self.tx_buckets.remove(&tx.hash) {

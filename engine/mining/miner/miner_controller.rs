@@ -114,6 +114,12 @@ impl<'a> MinerController<'a> {
         // Mine the block
         let mined_block = self.miner.mine_block(block);
 
+        if mined_block.header.hash.is_empty() {
+            return Err(ConsensusError::Other(
+                "nonce space exhausted — request new template".to_string()
+            ));
+        }
+
         Ok(mined_block)
     }
 

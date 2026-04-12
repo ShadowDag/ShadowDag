@@ -1870,6 +1870,10 @@ impl Mempool {
                 if let Err(e) = self.db.delete(key.as_bytes()) {
                     slog_warn!("mempool", "orphan_db_delete_failed", key => &key, error => &e.to_string());
                 }
+                // Also clean up the receive-time metadata key so it doesn't
+                // leak in the DB after promotion.
+                let ts_key = format!("orphan_ts:{}", orphan.hash);
+                let _ = self.db.delete(ts_key.as_bytes());
                 promoted.push(orphan.hash.clone());
             }
         }

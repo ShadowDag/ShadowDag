@@ -121,8 +121,41 @@ impl BlockTemplateBuilder {
 
         let merkle_root = Self::compute_merkle_root(&coinbase, &template.transactions, height, &parents);
 
-        // Selected parent = the one with highest blue score (first in our sorted list)
-        let selected_parent = Some(parents[0].clone());
+        // Selected parent = parent with highest blue score, NOT the
+        // lexicographically first. The parent list is sorted lexicographically
+        // for consensus determinism, but the selected parent follows GHOSTDAG
+        // ordering (highest blue score wins, then lexicographic tiebreaker).
+        let selected_parent = {
+            let tips = tip_manager.get_tips();
+            let tip_map: std::collections::HashMap<&str, u64> = tips
+                .iter()
+                .map(|t| (t.hash.as_str(), t.blue_score))
+                .collect();
+            let best = parents.iter()
+                .max_by(|a, b| {
+                    let sa = tip_map.get(a.as_str()).copied().unwrap_or(0);
+                    let sb = tip_map.get(b.as_str()).copied().unwrap_or(0);
+                    sa.cmp(&sb).then_with(|| b.cmp(a)) // higher score, then lower hash
+                })
+                .cloned();
+            best.or_else(|| parents.first().cloned())
+        };
+
+        // Compute blue_score from selected parent + 1
+        // (the simplest approximation — full GHOSTDAG score is computed on insert)
+        let blue_score = {
+            let tips = tip_manager.get_tips();
+            let tip_map: std::collections::HashMap<&str, u64> = tips
+                .iter()
+                .map(|t| (t.hash.as_str(), t.blue_score))
+                .collect();
+            parents.iter()
+                .filter_map(|p| tip_map.get(p.as_str()))
+                .max()
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1)
+        };
 
         let header = BlockHeader {
             version:         1,
@@ -133,7 +166,7 @@ impl BlockTemplateBuilder {
             nonce:           0,
             difficulty,
             height,
-            blue_score:      0,
+            blue_score,
             selected_parent,
             utxo_commitment: None,
             extra_nonce:     0,
