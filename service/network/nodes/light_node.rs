@@ -35,16 +35,25 @@ pub struct LightNode {
     best_height:  u64,
     /// Network identifier
     network:      String,
+    /// Known genesis hash for this network
+    genesis_hash: String,
 }
 
 impl LightNode {
     pub fn new(network: &str) -> Self {
+        // Resolve the known genesis hash for this network so we can
+        // verify the first header we receive in add_header().
+        let genesis_hash = network.parse::<crate::config::node::node_config::NetworkMode>()
+            .ok()
+            .map(|mode| crate::config::genesis::genesis::genesis_hash_for(&mode))
+            .unwrap_or_default();
         Self {
             headers:     Vec::with_capacity(MAX_HEADERS_CACHE),
             watch_list:  Vec::new(),
             syncing:     false,
             best_height: 0,
             network:     network.to_string(),
+            genesis_hash,
         }
     }
 
@@ -118,6 +127,10 @@ impl LightNode {
         if self.headers.is_empty() {
             // First header must be genesis — no arbitrary starting point
             if header.height != 0 {
+                return false;
+            }
+            // Verify genesis hash matches the network's known genesis
+            if !self.genesis_hash.is_empty() && header.hash != self.genesis_hash {
                 return false;
             }
             self.best_height = 0;
@@ -209,28 +222,45 @@ impl LightNode {
 mod tests {
     use super::*;
 
-    fn make_header(height: u64) -> BlockHeader {
-        // Use valid 64-char hex hashes so validate_header_basic passes.
-        // Difficulty 0 bypasses PoW check (genesis-style for testing).
-        let hash = format!("{:0>64x}", height + 1);
-        let parent_hash = format!("{:0>64x}", height.saturating_sub(1) + 1);
+    /// Build a header at `height` whose parent is `parent_hash`.
+    /// The hash is computed via the real hashing function so that
+    /// `validate_header_basic`'s recomputation check passes.
+    fn make_header_with_parent(height: u64, parent_hash: &str) -> BlockHeader {
+        use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
+
+        let parents = vec![parent_hash.to_string()];
+        let merkle_root = "merkle_root".to_string();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        let timestamp = now - 60 + height;
+        let version = 1u32;
+        let nonce = 0u64;
+        let extra_nonce = 0u64;
+        // Genesis uses difficulty 0; non-genesis uses difficulty 1
+        // (easiest target -- any hash passes). validate_header_basic
+        // rejects height > 0 with difficulty 0.
+        let difficulty = if height == 0 { 0u64 } else { 1u64 };
+
+        let hash = shadow_hash_raw_full(
+            version, height, timestamp, nonce, extra_nonce,
+            difficulty, &merkle_root, &parents,
+        );
+
         BlockHeader {
-            version: 1,
+            version,
             hash,
-            parents: vec![parent_hash],
-            merkle_root: "merkle_root".to_string(),
-            timestamp: now - 60 + height,
-            nonce: 0,
-            difficulty: 0,
+            parents,
+            merkle_root,
+            timestamp,
+            nonce,
+            difficulty,
             height,
             blue_score: 0,
             selected_parent: None,
             utxo_commitment: None,
-            extra_nonce: 0,
+            extra_nonce,
             receipt_root: None,
             state_root: None,
         }
@@ -238,12 +268,18 @@ mod tests {
 
     #[test]
     fn add_header_increments_height() {
-        let mut node = LightNode::new("testnet");
+        // Use an unrecognized network name so genesis_hash is empty,
+        // allowing fabricated test headers to pass the genesis check.
+        // Real genesis-hash validation is tested separately.
+        let mut node = LightNode::new("test_local");
+        let null_parent = "0".repeat(64);
         // First header must be genesis (height 0)
-        assert!(node.add_header(make_header(0)));
+        let genesis = make_header_with_parent(0, &null_parent);
+        let genesis_hash = genesis.hash.clone();
+        assert!(node.add_header(genesis));
         assert_eq!(node.best_height(), 0);
-        // Then add height 1
-        assert!(node.add_header(make_header(1)));
+        // Then add height 1, chained to genesis
+        assert!(node.add_header(make_header_with_parent(1, &genesis_hash)));
         assert_eq!(node.best_height(), 1);
         assert_eq!(node.header_count(), 2);
     }

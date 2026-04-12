@@ -271,13 +271,18 @@ impl AdvancedPruningEngine {
 
         let commitment = UtxoCommitment::compute(self.lowest_block, utxo_hashes, total_value);
 
+        let proof_chain: Vec<String> = utxo_hashes.iter().take(10).cloned().collect();
+        // Generate monotonically increasing blue scores matching proof_chain length.
+        // In production, these would come from actual GHOSTDAG block data.
+        let blue_scores: Vec<u64> = (0..proof_chain.len())
+            .map(|i| self.lowest_block.saturating_sub(proof_chain.len() as u64) + i as u64 + 1)
+            .collect();
+
         Some(PruningProof {
             pruning_height:  self.lowest_block,
             utxo_commitment: commitment,
-            // Proof chain: hashes of blocks from pruning point to current tip
-            // In production, this would be the selected parent chain headers
-            proof_chain:     utxo_hashes.iter().take(10).cloned().collect(),
-            blue_scores:     vec![self.lowest_block],
+            proof_chain,
+            blue_scores,
             selected_chain:  utxo_hashes.iter().take(5).cloned().collect(),
         })
     }

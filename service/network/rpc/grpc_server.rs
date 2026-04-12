@@ -400,12 +400,21 @@ impl GrpcServer {
         for stream in listener.incoming() {
             if !self.running.load(Ordering::Relaxed) { break; }
 
-            if self.stats.active_conns.load(Ordering::Relaxed) >= MAX_CONNECTIONS as u64 {
-                continue;
-            }
-
             match stream {
                 Ok(mut stream) => {
+                    // Check connection limit AFTER accepting the stream so we
+                    // can send a proper error response instead of silently
+                    // dropping the TCP connection with a bare RST.
+                    if self.stats.active_conns.load(Ordering::Relaxed) >= MAX_CONNECTIONS as u64 {
+                        let err_resp = GrpcResponse::err(0, "server_at_capacity");
+                        let _ = stream.write_all(&err_resp.to_bytes());
+                        let _ = stream.flush();
+                        drop(stream);
+                        slog_error!("rpc", "grpc_connection_limit_reached",
+                            active => self.stats.active_conns.load(Ordering::Relaxed),
+                            limit => MAX_CONNECTIONS);
+                        continue;
+                    }
                     self.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                     let handlers = Arc::clone(&self.handlers);
                     let stats = Arc::clone(&self.stats);
