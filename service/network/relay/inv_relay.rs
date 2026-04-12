@@ -20,8 +20,10 @@ use crate::service::network::p2p::p2p::{
     InvItem as P2PInvItem,
 };
 
-/// Maximum inventory items per broadcast message
-pub const MAX_INV_PER_MSG: usize = 50_000;
+/// Maximum inventory items per broadcast message.
+/// Must match protocol::MAX_INV_PER_MSG (5,000) — exceeding the wire
+/// limit causes peers to reject the entire Inv message.
+pub const MAX_INV_PER_MSG: usize = 5_000;
 
 /// Seen inventory hashes — prevent re-broadcasting items we've already sent.
 /// Capped at 100K entries; cleared when full.
@@ -45,8 +47,11 @@ pub struct InvItem {
 pub struct InvRelay;
 
 impl InvRelay {
-    /// Broadcast inventory items to all connected peers.
-    /// Each peer receives a list of hashes they can then request.
+    /// Broadcast **transaction** inventory items to all connected peers.
+    /// Each peer receives a list of hashes they can then request via GetData.
+    ///
+    /// **TX-only**: all items are tagged `kind: "tx"`. For mixed block+tx
+    /// inventory, use [`broadcast_typed`] with explicit [`InvItem`] entries.
     ///
     /// Items are pushed to the P2P outbound queue; peer threads drain and
     /// write to their sockets — no direct socket access needed here.

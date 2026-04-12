@@ -666,6 +666,9 @@ impl FullNode {
             }
         }
 
+        // `cursor` now holds the fork point — the first block common to both chains.
+        let fork_point = cursor.clone();
+
         // Reverse so we apply from oldest to newest (GHOSTDAG order)
         new_chain.reverse();
 
@@ -673,7 +676,7 @@ impl FullNode {
         // Reject reorgs deeper than MAX_REORG_DEPTH. Blocks older than
         // this are considered final. This prevents an attacker from
         // secretly building a long side-chain and causing a massive reorg.
-        if new_chain.len() as u64 >= MAX_REORG_DEPTH {
+        if new_chain.len() as u64 > MAX_REORG_DEPTH {
             return Err(NodeError::BlockRejected(format!(
                 "reorg depth {} exceeds MAX_REORG_DEPTH {}",
                 new_chain.len(), MAX_REORG_DEPTH
@@ -685,7 +688,7 @@ impl FullNode {
         if !current_best.is_empty() && !new_chain.contains(&current_best) {
             let mut cursor = current_best.clone();
             let mut rollback_count = 0u64;
-            while !cursor.is_empty() && !new_chain.contains(&cursor) {
+            while !cursor.is_empty() && cursor != fork_point {
                 if rollback_count >= MAX_REORG_DEPTH {
                     return Err(NodeError::BlockRejected(format!(
                         "reorg rollback depth {} exceeds MAX_REORG_DEPTH", rollback_count
@@ -773,6 +776,15 @@ impl FullNode {
                                         old_block.header.height,
                                         hash,
                                     );
+                                    // Re-execute contracts for the old block to restore state
+                                    let (_, _, _, env) = self.execute_contract_transactions(
+                                        &old_block, &self.contract_storage);
+                                    if let Err(pe) = env.persist_with_undo(
+                                        &self.contract_storage, hash, None, None,
+                                    ) {
+                                        slog_error!("node", "CRITICAL_contract_restore_failed",
+                                            block => hash, error => &format!("{}", pe));
+                                    }
                                 }
                             }
                             return Err(NodeError::Consensus(ConsensusError::BlockValidation(
@@ -856,6 +868,15 @@ impl FullNode {
                                     old_block.header.height,
                                     hash,
                                 );
+                                // Re-execute contracts for the old block to restore state
+                                let (_, _, _, env) = self.execute_contract_transactions(
+                                    &old_block, &self.contract_storage);
+                                if let Err(pe) = env.persist_with_undo(
+                                    &self.contract_storage, hash, None, None,
+                                ) {
+                                    slog_error!("node", "CRITICAL_contract_restore_failed",
+                                        block => hash, error => &format!("{}", pe));
+                                }
                             }
                         }
                         NodeError::Consensus(ConsensusError::BlockValidation("reward + fees overflow".into()))
@@ -885,6 +906,15 @@ impl FullNode {
                                                     old_block.header.height,
                                                     hash,
                                                 );
+                                                // Re-execute contracts for the old block to restore state
+                                                let (_, _, _, env) = self.execute_contract_transactions(
+                                                    &old_block, &self.contract_storage);
+                                                if let Err(pe) = env.persist_with_undo(
+                                                    &self.contract_storage, hash, None, None,
+                                                ) {
+                                                    slog_error!("node", "CRITICAL_contract_restore_failed",
+                                                        block => hash, error => &format!("{}", pe));
+                                                }
                                             }
                                         }
                                         return Err(NodeError::BlockRejected(format!(
@@ -910,6 +940,15 @@ impl FullNode {
                                                 old_block.header.height,
                                                 hash,
                                             );
+                                            // Re-execute contracts for the old block to restore state
+                                            let (_, _, _, env) = self.execute_contract_transactions(
+                                                &old_block, &self.contract_storage);
+                                            if let Err(pe) = env.persist_with_undo(
+                                                &self.contract_storage, hash, None, None,
+                                            ) {
+                                                slog_error!("node", "CRITICAL_contract_restore_failed",
+                                                    block => hash, error => &format!("{}", pe));
+                                            }
                                         }
                                     }
                                     return Err(NodeError::BlockRejected(format!(
@@ -940,6 +979,15 @@ impl FullNode {
                                     old_block.header.height,
                                     hash,
                                 );
+                                // Re-execute contracts for the old block to restore state
+                                let (_, _, _, env) = self.execute_contract_transactions(
+                                    &old_block, &self.contract_storage);
+                                if let Err(pe) = env.persist_with_undo(
+                                    &self.contract_storage, hash, None, None,
+                                ) {
+                                    slog_error!("node", "CRITICAL_contract_restore_failed",
+                                        block => hash, error => &format!("{}", pe));
+                                }
                             }
                         }
                         return Err(NodeError::BlockRejected(format!(
@@ -964,6 +1012,15 @@ impl FullNode {
                             old_block.header.height,
                             hash,
                         );
+                        // Re-execute contracts for the old block to restore state
+                        let (_, _, _, env) = self.execute_contract_transactions(
+                            &old_block, &self.contract_storage);
+                        if let Err(pe) = env.persist_with_undo(
+                            &self.contract_storage, hash, None, None,
+                        ) {
+                            slog_error!("node", "CRITICAL_contract_restore_failed",
+                                block => hash, error => &format!("{}", pe));
+                        }
                     }
                 }
                 return Err(NodeError::BlockRejected(format!(
@@ -991,6 +1048,15 @@ impl FullNode {
                         old_block.header.height,
                         hash,
                     );
+                    // Re-execute contracts for the old block to restore state
+                    let (_, _, _, env) = self.execute_contract_transactions(
+                        &old_block, &self.contract_storage);
+                    if let Err(pe) = env.persist_with_undo(
+                        &self.contract_storage, hash, None, None,
+                    ) {
+                        slog_error!("node", "CRITICAL_contract_restore_failed",
+                            block => hash, error => &format!("{}", pe));
+                    }
                 }
             }
             return Err(NodeError::Consensus(ConsensusError::BlockValidation(
