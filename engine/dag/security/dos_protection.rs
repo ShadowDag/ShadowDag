@@ -86,7 +86,8 @@ impl DosProtection {
         // DAG
         let parents = &block.header.parents;
 
-        if parents.is_empty() {
+        // Genesis is the only block with no parents by design.
+        if parents.is_empty() && block.header.height > 0 {
             return DosCheckResult::fail("No parents".to_string());
         }
 

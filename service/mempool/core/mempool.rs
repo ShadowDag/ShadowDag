@@ -2077,9 +2077,13 @@ mod orphan_tests {
     #[test]
     fn prune_orphans_evicts_stale() {
         let mp = pool();
-        let mut stale = orphan_tx("stale_orphan", "parent_gone");
-        stale.timestamp = 100;
+        let stale = orphan_tx("stale_orphan", "parent_gone");
         mp.add_orphan(&stale);
+        // Overwrite the receive-time metadata to simulate a stale orphan.
+        // prune_orphans uses orphan_ts:{hash} (not tx.timestamp) for age checks.
+        let ts_key = format!("orphan_ts:{}", stale.hash);
+        let old_time: u64 = 100;
+        let _ = mp.db.put(ts_key.as_bytes(), old_time.to_le_bytes());
         mp.prune_orphans();
         assert!(!mp.is_orphan("stale_orphan"), "stale orphan must be pruned");
     }

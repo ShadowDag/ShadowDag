@@ -416,12 +416,13 @@ impl ConsensusState {
     /// Update the finality point to the block at `depth` positions below the tip.
     /// Callers should use `FinalityManager::current_depth()` for the dynamic depth
     /// instead of the static `FINALITY_DEPTH` constant.
+    /// `depth` is interpreted as confirmation count (inclusive): depth=1 means tip.
     /// Blocks at or below the finality point are considered irreversible.
     /// Returns the new finality point hash if updated, None if unchanged or on error.
     pub fn update_finality(&mut self, depth: u64) -> Option<String> {
         let path = self.selected_chain_path();
-        if path.len() as u64 > depth + 1 {
-            let idx = (path.len() as u64 - depth - 1) as usize;
+        if depth > 0 && path.len() as u64 >= depth {
+            let idx = (path.len() as u64 - depth) as usize;
             let new_fp = path[idx].clone();
             // Ensure finality only moves forward (never regresses)
             if let Some(ref old_fp) = self.chain.finality_point {
@@ -472,8 +473,17 @@ impl ConsensusState {
             return false;
         }
 
-        // Check if block is an ancestor of the finality point (on selected chain)
-        self.chain_path_cache.contains(&block_hash.to_string())
+        // Check if block is an ancestor of the finality point (on selected chain).
+        // Use parent traversal instead of chain_path_cache because this method
+        // takes &self and the cache may be stale when called from read-only paths.
+        let mut cur = Some(fp.as_str());
+        while let Some(h) = cur {
+            if h == block_hash {
+                return true;
+            }
+            cur = self.block_data.get(h).and_then(|d| d.selected_parent.as_deref());
+        }
+        false
     }
 
     /// Get the finality point height (0 if no finality point set).

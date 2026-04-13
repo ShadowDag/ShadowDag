@@ -147,7 +147,8 @@ mod tests {
 
     #[test]
     fn anonymity_set() {
-        let batch: Vec<_> = (0..7).map(|i| make_stx(&format!("tx{}", i))).collect();
+        // MIN_ANONYMITY_SET is 8, so we need at least 8 transactions
+        let batch: Vec<_> = (0..8).map(|i| make_stx(&format!("tx{}", i))).collect();
         assert!(ShadowMixer::has_sufficient_anonymity(&batch));
     }
 

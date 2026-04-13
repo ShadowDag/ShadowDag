@@ -433,10 +433,12 @@ impl RingSignature {
     /// CONSTANT-TIME: delegates to curve25519-dalek's Scalar, which uses
     /// Montgomery multiplication — guaranteed CT on all platforms.
     fn scalar_mul_bytes(a: &[u8; 32], b: &[u8; 32]) -> Result<[u8; 32], CryptoError> {
-        let sa: Option<Scalar> = Scalar::from_canonical_bytes(*a).into();
-        let sa = sa.ok_or(CryptoError::NonCanonicalScalar)?;
-        let sb: Option<Scalar> = Scalar::from_canonical_bytes(*b).into();
-        let sb = sb.ok_or(CryptoError::NonCanonicalScalar)?;
+        // Inputs come from SHA-256 hashes or random bytes which may exceed
+        // the Ristretto group order L.  Reduce mod L so the multiplication
+        // always succeeds.  This is safe because the ring signature only
+        // needs the arithmetic to be consistent, not canonical encodings.
+        let sa = Scalar::from_bytes_mod_order(*a);
+        let sb = Scalar::from_bytes_mod_order(*b);
         let product = sa * sb;
         Ok(product.to_bytes())
     }

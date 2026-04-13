@@ -72,7 +72,7 @@ mod tests {
         let mut tx = make_tx(
             "abc123",
             vec![],
-            vec![make_output("addr1", 100)],
+            vec![make_output("addr1", 546)], // at least DUST_LIMIT (546)
         );
         // Mark as coinbase so it passes the "non-coinbase must have inputs" rule
         tx.is_coinbase = true;

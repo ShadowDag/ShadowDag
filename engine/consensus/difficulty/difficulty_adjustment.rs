@@ -369,13 +369,10 @@ mod tests {
     fn recalculate_increases_when_blocks_too_fast() {
         let da = temp_adjuster("fast");
         da.set_difficulty(1000).unwrap();
-        // Window with blocks arriving faster than target.
-        // Height 1000 → sample_size = XL_WINDOW = 120.
-        // expected_timespan = 120 * 1 = 120.
-        // Provide timestamps spanning much less than expected.
-        let count = 20;
-        let ts: Vec<u64> = (0..count).map(|i| i as u64).collect(); // ~1s apart but window_size=120
-        // actual_timespan will be small relative to expected → difficulty increases
+        // Compressed window: most blocks share the same timestamp.
+        // This should be interpreted as very fast block production.
+        let mut ts: Vec<u64> = vec![100; 20];
+        ts[19] = 101;
         let d = da.recalculate_difficulty(1000, &ts);
         assert!(d > 1000, "should increase when blocks are fast: got {}", d);
     }

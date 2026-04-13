@@ -1268,6 +1268,7 @@ impl RpcServer {
 
     fn cmd_getminerinfo(id: Value) -> RpcResponse {
         RpcResponse::ok(id, json!({
+            "block_reward":         ConsensusParams::BLOCK_REWARD,
             "initial_block_reward": ConsensusParams::BLOCK_REWARD,
             "emission_schedule":    "halving",
             "miner_percent":        ConsensusParams::MINER_PERCENT,

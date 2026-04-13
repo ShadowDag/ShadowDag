@@ -1530,18 +1530,43 @@ mod tests {
 
     #[test]
     fn full_validation_genesis_height_uses_genesis_path() {
-        // Height 0 triggers validate_genesis, which checks genesis hash
+        // Height 0 triggers validate_genesis, which checks genesis hash.
+        // Build a genesis-shaped block (no parents, single coinbase TX)
+        // so it passes DagShield's genesis check, but with a wrong hash
+        // so block_validator's validate_genesis rejects it.
         let cb = make_coinbase(0);
-        let mut block = make_block(0, vec![cb]);
-        block.header.height = 0;
-        block.header.hash = "not_genesis_hash".into();
+        let parents: Vec<String> = vec![];
+        let merkle = MerkleTree::build(&[cb.clone()], 0, &parents);
+        let block = Block {
+            header: BlockHeader {
+                version:         1,
+                hash:            "11".repeat(32), // wrong genesis hash
+                parents,
+                merkle_root:     merkle,
+                timestamp:       now_secs(),
+                nonce:           0,
+                difficulty:      1,
+                height:          0,
+                blue_score:      0,
+                selected_parent: None,
+                utxo_commitment: None,
+                extra_nonce:     0,
+                receipt_root:    None,
+                state_root:      None,
+            },
+            body: BlockBody { transactions: vec![cb] },
+        };
 
         let utxo_set = UtxoSet::new_empty();
         let result = BlockValidator::validate_block_full_with_network(
             &block, &utxo_set, &NetworkMode::Mainnet,
         );
         assert!(!result.valid, "wrong genesis hash must fail");
-        assert!(result.reason.as_ref().unwrap().contains("genesis mismatch"));
+        assert!(
+            result.reason.as_ref().is_some_and(|r| r.contains("genesis mismatch")),
+            "unexpected reason: {:?}",
+            result.reason
+        );
     }
 
     #[test]

@@ -10,19 +10,20 @@ mod tests {
     use crate::domain::transaction::tx_validator::validate_tx;
 
     fn make_tx_with_n_outputs(n: usize) -> Transaction {
+        use crate::domain::transaction::tx_validator::DUST_LIMIT;
         Transaction {
             hash:      format!("dos_tx_{}", n),
             inputs:    vec![],
             outputs:   (0..n).map(|i| TxOutput {
                 address: format!("addr{}", i),
-                amount: 1,
+                amount: DUST_LIMIT, // at least DUST_LIMIT to pass sum_outputs
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
             }).collect(),
             fee:       1,
             timestamp: 1735689600,
-            is_coinbase: false,
+            is_coinbase: true, // coinbase has no inputs; tests output limits only
             tx_type: TxType::Transfer,
             payload_hash: None,
             ..Default::default()

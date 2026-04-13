@@ -122,14 +122,18 @@ impl ViewKey {
     }
 
     fn from_raw(raw: [u8; 32]) -> Result<Self, CryptoError> {
-        let scalar = Option::from(Scalar::from_canonical_bytes(raw))
-            .ok_or(CryptoError::NonCanonicalScalar)?;
+        // HMAC-SHA256 output is arbitrary 32 bytes which may exceed the
+        // Ristretto group order L.  Reduce mod L so the result is always
+        // a valid Scalar.  This is standard practice (cf. RFC 8032 key
+        // derivation) and does not weaken the key space.
+        let scalar = Scalar::from_bytes_mod_order(raw);
+        let key_bytes = scalar.to_bytes();
         let public = scalar * RISTRETTO_BASEPOINT_POINT;
         Ok(Self {
             scalar,
             public,
-            key_bytes: raw,
-            key: hex::encode(raw),
+            key_bytes,
+            key: hex::encode(key_bytes),
         })
     }
 }

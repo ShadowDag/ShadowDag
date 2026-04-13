@@ -78,8 +78,9 @@ impl StealthScanner {
         h.update(tx_hash.as_bytes());
         h.update((output_index as u64).to_le_bytes());
         let hash: [u8; 32] = h.finalize().into();
-        let hs: Scalar = Option::from(Scalar::from_canonical_bytes(hash))
-            .ok_or_else(|| CryptoError::InvalidKey("Hash scalar is not canonical".to_string()))?;
+        // SHA-256 output may exceed the Ristretto group order L.
+        // Reduce mod L for a valid Scalar (standard hash-to-scalar).
+        let hs: Scalar = Scalar::from_bytes_mod_order(hash);
 
         // P = hs*G + S
         let expected_pub = hs * RISTRETTO_BASEPOINT_POINT + spend_pub;

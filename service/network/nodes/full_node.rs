@@ -202,7 +202,10 @@ impl FullNode {
         // NOT MIN_DIFFICULTY. This ensures the first blocks after genesis
         // are validated against a reasonable difficulty.
         let genesis_diff = crate::config::genesis::genesis::genesis_difficulty_for(&network);
-        let mut retarget = RetargetEngine::new(genesis_diff);
+        let mut retarget = RetargetEngine::new_with_bps(
+            genesis_diff,
+            crate::config::consensus::consensus_params::ConsensusParams::BLOCKS_PER_SECOND,
+        );
 
         // ── Seed retarget from chain history ──────────────────────
         // On restart, load the last SHORT_WINDOW blocks from BlockStore
