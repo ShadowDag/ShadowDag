@@ -147,6 +147,17 @@ impl BlockRelay {
         }
 
         if block.header.height == 0 && block.header.parents.is_empty() {
+            // Genesis block: verify hash matches the network's known genesis
+            // before relaying. A fake genesis with height=0 and no parents
+            // could otherwise propagate across the network.
+            let known_genesis = crate::config::consensus::consensus_params::ConsensusParams::genesis_hash();
+            if !known_genesis.is_empty() && block.header.hash != known_genesis {
+                slog_warn!("relay", "fake_genesis_rejected",
+                    claimed => &block.header.hash[..block.header.hash.len().min(16)],
+                    expected => &known_genesis[..known_genesis.len().min(16)]);
+                let _ = self.db.delete(pending_key.as_bytes());
+                return false;
+            }
             // Genesis block: relay directly and promote to known
             // (skip the orphan/validation pipeline).
             if let Ok(block_bytes) = bincode::serialize(&block) {
