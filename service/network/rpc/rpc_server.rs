@@ -1121,17 +1121,21 @@ impl RpcServer {
         match state.lock() {
             Ok(s) => {
                 let end_height = start_height.saturating_add(count_raw as u64);
-                #[allow(deprecated)] // TODO: migrate to get_block_hashes_at_height for DAG
-                let hashes: Vec<serde_json::Value> = (start_height..end_height)
-                    .filter_map(|h| {
-                        s.block_store.get_block_hash_at_height(h)
-                            .map(|hash| json!(hash))
-                    })
-                    .collect();
+                // In a DAG, multiple blocks can share the same height.
+                // Use get_block_hashes_at_height to return ALL blocks at
+                // each height, not just a single one (which silently drops
+                // concurrent DAG branches).
+                let mut blocks: Vec<serde_json::Value> = Vec::new();
+                for h in start_height..end_height {
+                    let hashes = s.block_store.get_block_hashes_at_height(h);
+                    for hash in &hashes {
+                        blocks.push(json!({"height": h, "hash": hash}));
+                    }
+                }
                 RpcResponse::ok(id, json!({
                     "start_height": start_height,
-                    "count":        hashes.len(),
-                    "hashes":       hashes,
+                    "count":        blocks.len(),
+                    "blocks":       blocks,
                 }))
             }
             Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),

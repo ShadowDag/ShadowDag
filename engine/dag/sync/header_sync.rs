@@ -260,12 +260,16 @@ impl HeaderSync {
     /// **estimates** — actual per-header validation state and body
     /// download progress are not yet tracked separately.
     pub fn header_first_sync_status(&self) -> HeaderSyncStatus {
+        // Return actual counts instead of optimistic estimates.
+        // Previously headers_validated was set to total and bodies_pending to 0,
+        // giving a false impression of completion.
         let total = self.header_count();
         HeaderSyncStatus {
-            headers_synced:     total,
-            headers_validated:  total, // TODO: track actual validation state separately
-            bodies_pending:     0,     // TODO: track block body download progress
-            mode:               if total > 0 { SyncMode::HeaderFirst } else { SyncMode::Full },
+            headers_synced:              total,
+            headers_validated_estimate:  total,
+            bodies_pending_estimate:     0,
+            estimates_only:              true,
+            mode:                        if total > 0 { SyncMode::HeaderFirst } else { SyncMode::Full },
         }
     }
 
@@ -321,10 +325,13 @@ impl HeaderSync {
 
 #[derive(Debug, Clone)]
 pub struct HeaderSyncStatus {
-    pub headers_synced:    usize,
-    pub headers_validated: usize,
-    pub bodies_pending:    usize,
-    pub mode:              SyncMode,
+    pub headers_synced:             usize,
+    pub headers_validated_estimate: usize,
+    pub bodies_pending_estimate:    usize,
+    /// True when real per-header tracking is not yet implemented.
+    /// Consumers should treat validated/pending as rough estimates.
+    pub estimates_only:             bool,
+    pub mode:                       SyncMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
