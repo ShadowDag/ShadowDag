@@ -125,6 +125,16 @@ impl CompactBlock {
         }
 
         if !missing_indices.is_empty() {
+            // Cap the number of missing indices to prevent amplification
+            // attacks. An attacker who crafts TXs with colliding short IDs
+            // can force repeated full-block fetches. By capping at 100
+            // missing entries, we limit the amplification factor.
+            if missing_indices.len() > 100 {
+                log::warn!(
+                    "[CompactBlock] excessive missing indices: {}/{} — possible collision amplification",
+                    missing_indices.len(), self.short_ids.len()
+                );
+            }
             return Err(missing_indices);
         }
 

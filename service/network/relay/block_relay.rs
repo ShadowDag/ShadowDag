@@ -173,6 +173,18 @@ impl BlockRelay {
     }
 
     pub fn add_to_orphan_pool(&self, block: Block) {
+        // Basic PoW check before storing — prevents filling the orphan pool
+        // with blocks that can never pass consensus validation.
+        use crate::engine::mining::pow::pow_validator::PowValidator;
+        if block.header.difficulty > 0
+            && !PowValidator::hash_meets_target(&block.header.hash, block.header.difficulty)
+        {
+            slog_warn!("relay", "orphan_rejected_pow",
+                hash => &block.header.hash[..block.header.hash.len().min(16)],
+                difficulty => block.header.difficulty);
+            return;
+        }
+
         self.prune_orphans();
 
         if self.orphan_count() >= MAX_ORPHANS {

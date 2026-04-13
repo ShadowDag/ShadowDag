@@ -226,7 +226,11 @@ impl ChainVerifier {
             let block_work = if header.difficulty <= 63 {
                 1u64 << header.difficulty
             } else {
-                u64::MAX // difficulty > 63 → maximum representable work
+                // Cap at 2^63 (not u64::MAX) to preserve meaningful
+                // comparison between high-difficulty chains. u64::MAX
+                // saturates all chains above difficulty 63 to the same
+                // value, making cumulative work comparison useless.
+                1u64 << 63
             };
             cumulative_work = cumulative_work.saturating_add(block_work);
 
