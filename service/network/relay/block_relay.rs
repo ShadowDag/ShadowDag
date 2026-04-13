@@ -135,14 +135,24 @@ impl BlockRelay {
             slog_warn!("relay", "block_no_parents_nongenesis",
                 hash => &block.header.hash[..block.header.hash.len().min(16)],
                 height => block.header.height);
+            // Clean up the pending key — this block will never be valid,
+            // and leaving it pending blocks future re-receipt permanently.
+            let _ = self.db.delete(pending_key.as_bytes());
             return false; // Invalid: non-genesis blocks must have parents
         }
 
         if block.header.height == 0 && block.header.parents.is_empty() {
-            // Genesis block: relay directly
+            // Genesis block: relay directly and promote to known
+            // (skip the orphan/validation pipeline).
             if let Ok(block_bytes) = bincode::serialize(&block) {
                 push_outbound(P2PMessage::Block { data: block_bytes });
             }
+            // Promote pending → known so future re-receipt is properly deduped
+            let _ = self.db.delete(pending_key.as_bytes());
+            let _ = self.db.put(
+                format!("relay:block:{}", block.header.hash).as_bytes(),
+                &Self::now_bytes(),
+            );
             return true;
         }
 

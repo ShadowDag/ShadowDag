@@ -164,11 +164,12 @@ impl ChainVerifier {
                 };
             }
 
-            // 2b. Parent continuity
+            // 2b. Parent continuity — require the previous header's hash
+            // to appear in the parents list. selected_parent alone is NOT
+            // sufficient: it's an untrusted header field that an attacker
+            // could set to any value without it being in the parents array.
             if let Some(ph) = prev_hash {
-                if !header.parents.iter().any(|p| p == ph)
-                    && header.selected_parent.as_deref() != Some(ph)
-                {
+                if !header.parents.iter().any(|p| p == ph) {
                     return ChainVerifyResult::InvalidPoW {
                         height: header.height,
                         hash: format!("parent continuity: expected parent {}", &ph[..ph.len().min(16)]),
