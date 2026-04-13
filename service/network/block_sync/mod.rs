@@ -186,7 +186,9 @@ impl BlockSyncManager {
             ps.score -= PEER_SCORE_PENALTY;
         }
 
-        let mut inflight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inflight    = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending     = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending_set = self.pending_set.lock().unwrap_or_else(|e| e.into_inner());
         let re_queue: Vec<DownloadJob> = inflight
             .values()
             .filter(|j| j.assigned_to == addr)
@@ -194,7 +196,7 @@ impl BlockSyncManager {
             .collect();
         for job in re_queue {
             inflight.remove(&job.hash);
-            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending_set.insert(job.hash.clone());
             pending.push_front(job);
         }
     }
@@ -271,6 +273,18 @@ impl BlockSyncManager {
     }
 
     pub fn on_headers_received(&self, headers: Vec<SyncHeader>) {
+        // Enforce MAX_HEADER_BATCH to prevent memory abuse from a peer
+        // sending an oversized header batch.
+        let headers: Vec<SyncHeader> = if headers.len() > MAX_HEADER_BATCH {
+            log::warn!(
+                "header_batch_truncated: received={}, max={}",
+                headers.len(), MAX_HEADER_BATCH
+            );
+            headers.into_iter().take(MAX_HEADER_BATCH).collect()
+        } else {
+            headers
+        };
+
         if headers.is_empty() {
             // Peer has no more headers. Only transition to BlockSync
             // if we actually have headers to download blocks for.
@@ -322,6 +336,20 @@ impl BlockSyncManager {
                 return; // Reject entire batch
             }
             prev_h = h.height;
+        }
+
+        // Verify prev_hash continuity between consecutive headers
+        for window in headers.windows(2) {
+            if !window[1].parents.contains(&window[0].hash)
+                && window[1].prev_hash != window[0].hash
+            {
+                log::warn!(
+                    "header_chain_break: height={}, expected_parent={}",
+                    window[1].height,
+                    &window[0].hash[..window[0].hash.len().min(16)]
+                );
+                return; // Reject entire batch — broken chain
+            }
         }
 
         let mut map = self.headers.write().unwrap_or_else(|e| e.into_inner());
@@ -447,6 +475,24 @@ impl BlockSyncManager {
                 self.mark_synced();
             } else {
                 self.set_phase(SyncPhase::TailSync);
+            }
+        }
+
+        // Prune completed set to prevent unbounded memory growth.
+        // Once synced, old entries are no longer needed.
+        if completed.len() > 50_000 {
+            let excess = completed.len() - 25_000;
+            let to_remove: Vec<String> = completed.iter().take(excess).cloned().collect();
+            for h in &to_remove { completed.remove(h); }
+        }
+
+        // Prune headers map to prevent unbounded memory growth.
+        {
+            let mut map = self.headers.write().unwrap_or_else(|e| e.into_inner());
+            if map.len() > 50_000 {
+                let excess = map.len() - 25_000;
+                let to_remove: Vec<String> = map.keys().take(excess).cloned().collect();
+                for h in &to_remove { map.remove(h); }
             }
         }
     }
