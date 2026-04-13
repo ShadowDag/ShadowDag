@@ -1412,9 +1412,21 @@ impl P2P {
                     DOS_GUARD.add_ban_score_cat(peer, pe.ban_score as u64, &pe.message, BanCategory::Malformed);
                     return Ok(());
                 }
-                let get_data = P2PMessage::GetData { items: items.clone() };
-                let bytes = Self::write_message(writer, &get_data, magic)?;
-                session.record_bytes_sent(bytes);
+                // Filter out items we already have to avoid redundant GetData
+                // requests. Without this, a peer can send repeated Inv messages
+                // to force us to re-download everything we already have.
+                let needed: Vec<_> = {
+                    let pending = PENDING_BLOCKS.lock();
+                    items.iter()
+                        .filter(|i| !pending.iter().any(|(_, b)| b.header.hash == i.hash))
+                        .cloned()
+                        .collect()
+                };
+                if !needed.is_empty() {
+                    let get_data = P2PMessage::GetData { items: needed };
+                    let bytes = Self::write_message(writer, &get_data, magic)?;
+                    session.record_bytes_sent(bytes);
+                }
             }
 
             // ── GetData: validate item list and serve requested data ────
@@ -1495,6 +1507,14 @@ impl P2P {
                 for hash in hashes {
                     if request_count >= max_requests { break; }
                     if hash.is_empty() || !seen.insert(hash.clone()) { continue; }
+                    // Skip blocks already in the pending queue — avoids
+                    // redundant GetBlock requests that waste bandwidth.
+                    {
+                        let pending = PENDING_BLOCKS.lock();
+                        if pending.iter().any(|(_, b)| b.header.hash == *hash) {
+                            continue;
+                        }
+                    }
                     let req = P2PMessage::GetBlock { hash: hash.clone() };
                     let bytes = Self::write_message(writer, &req, magic)?;
                     session.record_bytes_sent(bytes);

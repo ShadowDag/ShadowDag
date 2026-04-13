@@ -365,12 +365,22 @@ impl StratumServer {
                 }
 
                 // Validate mining address format (not just length)
+                // Validate address format: known prefix + alphanumeric body,
+                // OR fully alphanumeric for legacy/external addresses.
+                // Previously "SD1@#$..." would pass because starts_with
+                // matched but the remaining chars weren't checked.
                 let addr_valid = address.len() >= 20
                     && address.len() <= 64
-                    && (address.starts_with("SD1")
+                    && if address.starts_with("SD1")
                         || address.starts_with("ST1")
                         || address.starts_with("SR1")
-                        || address.chars().all(|c| c.is_ascii_alphanumeric()));
+                    {
+                        // Known prefix: verify ENTIRE address is alphanumeric
+                        address.chars().all(|c| c.is_ascii_alphanumeric())
+                    } else {
+                        // Unknown prefix: must be fully alphanumeric
+                        address.chars().all(|c| c.is_ascii_alphanumeric())
+                    };
                 if !addr_valid {
                     return StratumResponse::err(req.id, "Invalid mining address format");
                 }
