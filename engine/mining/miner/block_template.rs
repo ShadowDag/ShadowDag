@@ -205,6 +205,10 @@ impl BlockTemplateBuilder {
 
     /// Legacy build method — accepts explicit parents (kept for backward compatibility).
     #[allow(clippy::too_many_arguments)]
+    /// DEPRECATED: Use `build_from_dag()` instead. This legacy method sets
+    /// `blue_score = 0` and `selected_parent = parents.first()` without
+    /// GHOSTDAG input, producing headers with incorrect DAG metadata.
+    #[deprecated(note = "Use build_from_dag() for correct DAG-aware template building")]
     pub fn build(
         mempool:       &dyn TxPool,
         utxo_set:      &UtxoSet,

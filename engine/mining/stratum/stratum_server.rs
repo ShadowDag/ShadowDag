@@ -452,16 +452,14 @@ impl StratumServer {
             if !seen.insert(share_key.clone()) {
                 return StratumResponse::err(req.id, "Duplicate share");
             }
-            // Prevent unbounded memory growth. Templates rotate frequently
-            // so old shares are irrelevant anyway.
+            // Prevent unbounded memory growth. Since HashSet has no
+            // ordering (can't distinguish "newest" from "oldest"),
+            // we clear and re-seed with the current share. This is safe
+            // because templates rotate frequently (clearing seen_shares
+            // on each template update), and the 100K threshold means
+            // this path fires rarely between rotations.
             if seen.len() > 100_000 {
-                // Partial eviction — keep roughly half to minimize replay window.
-                // Clearing everything opens a replay window for recently
-                // submitted shares. Keeping ~50K entries ensures recent shares
-                // remain protected while still bounding memory.
-                let keep: Vec<_> = seen.iter().take(50_000).cloned().collect();
                 seen.clear();
-                for k in keep { seen.insert(k); }
                 seen.insert(share_key);
             }
         }

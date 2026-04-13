@@ -1461,9 +1461,18 @@ impl P2P {
                 }
                 // Respond with block hashes the peer can use for sync.
                 // dispatch_message doesn't have direct block_store access,
-                // so we return the current DAG tips as a minimal header set.
-                // The peer will then request full blocks via GetBlock.
-                let hashes = crate::service::network::nodes::full_node::get_dag_tips();
+                // so we return DAG tips as our header set.
+                // TODO: When block_store access is available, walk from
+                // from_hash forward and return actual sequential headers.
+                let mut hashes = crate::service::network::nodes::full_node::get_dag_tips();
+                // Respect count parameter if provided (default: no limit → use protocol max)
+                let count = match msg {
+                    P2PMessage::GetHeaders { count, .. } => count as usize,
+                    _ => 2000,
+                };
+                // Cap at protocol limit to prevent oversized response
+                const MAX_HEADERS_RESPONSE: usize = 2_000;
+                hashes.truncate(count.min(MAX_HEADERS_RESPONSE));
                 if !hashes.is_empty() {
                     let resp = P2PMessage::Headers { hashes };
                     let bytes = Self::write_message(writer, &resp, magic)?;
@@ -1577,10 +1586,26 @@ impl P2P {
     /// Sends GetHeaders with the latest known DAG tip so peers respond with
     /// any blocks we don't have yet.
     fn request_headers_sync(&self) {
-        let tips = crate::service::network::nodes::full_node::get_dag_tips();
-        // Use the first DAG tip as our sync starting point. If we have no
-        // tips yet (fresh node), send an empty from_hash so the peer sends
-        // headers from genesis.
+        let mut tips = crate::service::network::nodes::full_node::get_dag_tips();
+        tips.sort(); // deterministic ordering
+        // Send GetHeaders for EACH DAG tip so peers respond with branches
+        // we might be missing. Previously only the first tip was used,
+        // which could miss entire DAG branches.
+        if tips.is_empty() {
+            // Fresh node — request from genesis
+            push_outbound(P2PMessage::GetHeaders {
+                from_hash: String::new(),
+                count: 2000,
+            });
+            slog_info!("p2p", "requesting_headers_sync_genesis");
+            return;
+        }
+        for tip in &tips {
+            push_outbound(P2PMessage::GetHeaders {
+                from_hash: tip.clone(),
+                count: 2000,
+            });
+        }
         let from_hash = tips.into_iter().next().unwrap_or_default();
         slog_info!("p2p", "requesting_headers_sync",
             height => self.best_height,

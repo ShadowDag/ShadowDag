@@ -115,6 +115,13 @@ impl PowValidator {
             return false;
         }
 
+        // Enforce difficulty bounds (MIN_DIFFICULTY..=MAX_DIFFICULTY)
+        if header.difficulty > 0 {
+            if header.difficulty < MIN_DIFFICULTY || header.difficulty > MAX_DIFFICULTY {
+                return false;
+            }
+        }
+
         // If difficulty > 0, check target
         if header.difficulty > 0 {
             Self::hash_meets_target(&recomputed, header.difficulty)
