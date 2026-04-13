@@ -273,7 +273,14 @@ impl HeaderSync {
         }
     }
 
-    /// Check if we have a header (without requiring full block body)
+    /// Check if we have a header (without requiring full block body).
+    ///
+    /// TRUST NOTE: The in-memory cache may contain hashes that were added
+    /// during sync without full PoW verification. Callers that need
+    /// cryptographic assurance should verify the header via
+    /// PowValidator::validate_header() after this returns true.
+    /// The DB path (below) stores headers that passed at least structural
+    /// validation on insertion.
     pub fn has_header_only(&self, hash: &str) -> bool {
         if self.cache.contains(hash) {
             return true;
