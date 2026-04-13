@@ -79,11 +79,31 @@ impl DagSyncEngine {
         }
     }
 
+    /// Build a block locator with exponential step-back for better
+    /// ancestor discovery. Includes current tips + historical hashes
+    /// from verified_blocks at exponentially increasing gaps.
     pub fn build_locator(&self) -> Vec<String> {
         let mut locator: Vec<String> = self.local_dag_tips.iter().cloned().collect();
-        // Sort for deterministic ordering — HashSet iteration order varies
-        // between runs, which makes sync behavior unpredictable.
-        locator.sort();
+        locator.sort(); // deterministic ordering
+
+        // Add exponential step-back from verified_blocks for deeper
+        // ancestor discovery. Tips alone fail when DAGs diverge at
+        // the tips but share deep ancestors.
+        let verified: Vec<&String> = self.verified_blocks.iter().collect();
+        if verified.len() > 1 {
+            let mut step = 1usize;
+            let mut idx = verified.len().saturating_sub(1);
+            loop {
+                if let Some(h) = verified.get(idx) {
+                    if !locator.contains(h) {
+                        locator.push((*h).clone());
+                    }
+                }
+                if idx < step || locator.len() >= 64 { break; }
+                idx -= step;
+                step *= 2;
+            }
+        }
         locator
     }
 
@@ -112,7 +132,13 @@ impl DagSyncEngine {
         let new_count = hashes.iter()
             .filter(|h| !self.verified_blocks.contains(*h) && !self.block_queue.contains(h))
             .count();
+        // Cap block_queue to prevent unbounded memory growth from
+        // a malicious peer flooding on_headers with valid-looking hashes.
+        const MAX_BLOCK_QUEUE: usize = 10_000;
         for hash in hashes {
+            if self.block_queue.len() >= MAX_BLOCK_QUEUE {
+                break; // queue full — ignore remaining hashes
+            }
             if !self.verified_blocks.contains(&hash) && !self.block_queue.contains(&hash) {
                 self.block_queue.push_back(hash.clone());
             }
