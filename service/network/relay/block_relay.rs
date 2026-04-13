@@ -110,6 +110,11 @@ impl BlockRelay {
     }
 
     pub fn receive_block(&self, block: Block) -> bool {
+        // Periodically prune stale relay/pending keys. Called here
+        // because there's no external scheduler — each receive_block
+        // invocation piggybacks a lightweight TTL check.
+        self.prune_relay_keys();
+
         let relay_key = format!("relay:block:{}", block.header.hash);
         let pending_key = format!("relay:pending:{}", block.header.hash);
 
