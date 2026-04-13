@@ -1213,6 +1213,13 @@ pub fn validate_inv_items(items: &[(String, String)]) -> Result<(), ProtocolErro
                 50,
             ));
         }
+        if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(ProtocolError::new(
+                ProtocolErrorKind::FieldViolation,
+                "inv hash contains non-hex characters".to_string(),
+                50,
+            ));
+        }
     }
     Ok(())
 }
@@ -1243,6 +1250,13 @@ pub fn validate_headers_list(hashes: &[String]) -> Result<(), ProtocolError> {
             return Err(ProtocolError::new(
                 ProtocolErrorKind::FieldViolation,
                 format!("header hash length {} != required {}", h.len(), MAX_HASH_HEX_LEN),
+                50,
+            ));
+        }
+        if !h.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(ProtocolError::new(
+                ProtocolErrorKind::FieldViolation,
+                "header hash contains non-hex characters".to_string(),
                 50,
             ));
         }
