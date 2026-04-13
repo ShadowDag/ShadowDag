@@ -449,6 +449,26 @@ impl DaemonNode {
                 }
             }
 
+            // ── Drain discovered peer addresses into PeerManager ────
+            // The P2P layer collects Addr messages from peers into
+            // RECEIVED_ADDRS but doesn't add them to PeerManager.
+            // Without this drain, dynamic peer discovery is dead.
+            {
+                use crate::service::network::p2p::p2p::drain_received_addrs;
+                let addrs = drain_received_addrs();
+                if !addrs.is_empty() {
+                    // Use a temporary PeerManager to add discovered addresses.
+                    // The daemon's PeerManager is inside the P2P instance which
+                    // may not be accessible here, so we use the global singleton.
+                    if let Ok(pm) = crate::service::network::p2p::peer_manager::PeerManager::new_default() {
+                        for addr in &addrs {
+                            let _ = pm.add_peer(addr);
+                        }
+                    }
+                    slog_info!("daemon", "peer_addrs_ingested", count => addrs.len());
+                }
+            }
+
             // ── Periodic stats ──────────────────────────────────────
             if last_stats.elapsed() >= STATS_INTERVAL {
                 slog_info!("daemon", "event_loop_stats",
@@ -728,7 +748,13 @@ impl DaemonNode {
         let tips = self.ghostdag.get_tips();
         let best_tip = FullNode::select_best_tip(&tips, &self.ghostdag);
         if let Some(ref best_tip) = best_tip {
-            self.block_store.update_best_hash(best_tip);
+            if !self.block_store.update_best_hash(best_tip) {
+                slog_error!("daemon", "rebuild_ghostdag_best_hash_failed",
+                    tip => &best_tip[..best_tip.len().min(16)]);
+                return Err(NodeError::Init(
+                    "failed to persist best_hash after GHOSTDAG rebuild".into()
+                ));
+            }
             slog_info!("daemon", "ghostdag_rebuilt",
                 total => total,
                 failed => failed,

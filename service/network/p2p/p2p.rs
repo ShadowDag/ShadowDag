@@ -1626,15 +1626,10 @@ impl P2P {
                 count: 2000,
             });
         }
-        let from_hash = tips.into_iter().next().unwrap_or_default();
         slog_info!("p2p", "requesting_headers_sync",
             height => self.best_height,
-            from_hash => &from_hash,
-            note => "sending GetHeaders to connected peers");
-        push_outbound(P2PMessage::GetHeaders {
-            from_hash,
-            count: 2000,
-        });
+            tips => tips.len(),
+            note => "sent GetHeaders for each DAG tip");
     }
 
     pub fn allow_peer(&mut self, peer_id: &str) -> bool {

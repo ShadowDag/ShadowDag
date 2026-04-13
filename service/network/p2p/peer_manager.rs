@@ -141,6 +141,11 @@ impl PeerManager {
     }
 
     pub fn open(path: &str) -> Result<Self, NetworkError> {
+        Self::open_for_network(path, crate::config::node::node_config::NetworkMode::Mainnet)
+    }
+
+    /// Open with explicit network mode so bootstrap seeds match the network.
+    pub fn open_for_network(path: &str, network: crate::config::node::node_config::NetworkMode) -> Result<Self, NetworkError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_write_buffer_size(32 * 1024 * 1024);
@@ -154,7 +159,7 @@ impl PeerManager {
             db:           Arc::new(Mutex::new(db)),
             addr_cache:   Arc::new(Mutex::new(Vec::new())),
             _network_path: path.to_string(),
-            network:      crate::config::node::node_config::NetworkMode::Mainnet,
+            network,
         })
     }
 
