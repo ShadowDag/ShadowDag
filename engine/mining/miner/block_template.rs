@@ -145,11 +145,28 @@ impl BlockTemplateBuilder {
                     sa.cmp(&sb).then_with(|| b.cmp(a)) // higher score, then lower hash
                 })
                 .cloned();
+            // Warn if the best parent has score 0 (not found in tips) —
+            // this means the selected_parent choice is based on fallback
+            // ordering, not GHOSTDAG blue score.
+            if let Some(ref best_hash) = best {
+                if tip_map_score.get(best_hash.as_str()).copied().unwrap_or(0) == 0 {
+                    slog_warn!("mining", "selected_parent_not_in_tips",
+                        parent => &best_hash[..best_hash.len().min(16)],
+                        note => "parent not found in tip_manager — using fallback ordering");
+                }
+            }
             best.or_else(|| parents.first().cloned())
         };
 
-        // Compute blue_score from selected parent + 1
-        // (the simplest approximation — full GHOSTDAG score is computed on insert)
+        // APPROXIMATION: blue_score = max(parent_blue_scores) + 1.
+        // The real GHOSTDAG blue score is computed when the block is
+        // inserted into GHOSTDAG (ghostdag.add_block). This template
+        // value is a best-effort estimate that may differ from the
+        // GHOSTDAG result. Since blue_score in the header is overwritten
+        // by GHOSTDAG on insertion, this approximation only affects
+        // pre-insertion display (e.g., getblocktemplate RPC response).
+        // If blue_score accuracy matters before insertion, query
+        // GHOSTDAG directly.
         // Uses tip_map_score from the single tips read above (no re-read).
         let blue_score = {
             parents.iter()

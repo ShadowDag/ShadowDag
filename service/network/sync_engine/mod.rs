@@ -80,7 +80,11 @@ impl DagSyncEngine {
     }
 
     pub fn build_locator(&self) -> Vec<String> {
-        self.local_dag_tips.iter().cloned().collect()
+        let mut locator: Vec<String> = self.local_dag_tips.iter().cloned().collect();
+        // Sort for deterministic ordering — HashSet iteration order varies
+        // between runs, which makes sync behavior unpredictable.
+        locator.sort();
+        locator
     }
 
     pub fn request_header(&mut self, hash: &str, peer: &str) -> bool {
@@ -97,6 +101,10 @@ impl DagSyncEngine {
 
     pub fn on_headers(&mut self, hashes: Vec<String>, _peer: &str) {
         // Validate header hashes before accepting
+        // NOTE: We validate hash format (64 hex chars) but cannot verify
+        // PoW or chain continuity from hashes alone — that requires the
+        // full block header which arrives when the block is downloaded.
+        // The block validator performs full PoW/continuity checks on download.
         let hashes: Vec<String> = hashes.into_iter().filter(|h| {
             h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit())
         }).collect();

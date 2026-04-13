@@ -149,6 +149,21 @@ impl ChainVerifier {
                 };
             }
 
+            // Wall-clock future check: reject headers with timestamps
+            // too far in the future. Without this, an attacker could
+            // serve a chain with all timestamps set years ahead and
+            // it would pass the relative monotonicity/gap checks.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if header.timestamp > now + MAX_HEADER_TIME_GAP_SECS {
+                return ChainVerifyResult::TimestampGap {
+                    height: header.height,
+                    gap_secs: header.timestamp - now,
+                };
+            }
+
             // 2b. Parent continuity
             if let Some(ph) = prev_hash {
                 if !header.parents.iter().any(|p| p == ph)
