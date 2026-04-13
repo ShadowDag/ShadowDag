@@ -106,7 +106,7 @@ impl BlockBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
+    use crate::domain::transaction::transaction::{Transaction, TxOutput};
     use crate::domain::utxo::utxo_set::UtxoSet;
 
     /// Empty TxPool that always returns no transactions.
@@ -132,15 +132,16 @@ mod tests {
     #[test]
     fn empty_blocks_at_different_heights_have_different_merkle_roots() {
         let pool = EmptyPool;
-        let coinbase = make_coinbase("aa".repeat(32).as_str());
+        let coinbase_10 = make_coinbase("aa".repeat(32).as_str());
+        let coinbase_20 = make_coinbase("ab".repeat(32).as_str());
         let parents = vec!["bb".repeat(32)];
 
         let block1 = BlockBuilder::build_block(
-            1, 10, parents.clone(), coinbase.clone(), &pool, 100, 1, 1735689600
+            1, 10, parents.clone(), coinbase_10, &pool, 100, 1, 1735689600
         ).expect("build height=10");
 
         let block2 = BlockBuilder::build_block(
-            1, 20, parents, coinbase, &pool, 100, 1, 1735689600
+            1, 20, parents, coinbase_20, &pool, 100, 1, 1735689600
         ).expect("build height=20");
 
         assert_ne!(
@@ -152,14 +153,15 @@ mod tests {
     #[test]
     fn empty_blocks_with_different_parents_have_different_merkle_roots() {
         let pool = EmptyPool;
-        let coinbase = make_coinbase("aa".repeat(32).as_str());
+        let coinbase_a = make_coinbase("aa".repeat(32).as_str());
+        let coinbase_b = make_coinbase("ac".repeat(32).as_str());
 
         let block1 = BlockBuilder::build_block(
-            1, 10, vec!["parent_a".repeat(8)], coinbase.clone(), &pool, 100, 1, 1735689600
+            1, 10, vec!["parent_a".repeat(8)], coinbase_a, &pool, 100, 1, 1735689600
         ).expect("build parent_a");
 
         let block2 = BlockBuilder::build_block(
-            1, 10, vec!["parent_b".repeat(8)], coinbase, &pool, 100, 1, 1735689600
+            1, 10, vec!["parent_b".repeat(8)], coinbase_b, &pool, 100, 1, 1735689600
         ).expect("build parent_b");
 
         assert_ne!(

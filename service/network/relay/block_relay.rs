@@ -31,6 +31,8 @@ pub const RELAY_KEY_TTL_SECS: u64 = 86_400;
 pub const MAX_ORPHAN_ENTRY_SIZE: usize = 4 * 1024 * 1024;
 
 const PFX_ORPHAN: &[u8] = b"orphan:block:";
+const PFX_RELAY_BLOCK: &[u8] = b"relay:block:";
+const PFX_RELAY_PENDING: &[u8] = b"relay:pending:";
 
 use serde::{Serialize, Deserialize};
 
@@ -47,6 +49,11 @@ pub struct BlockRelay {
 }
 
 impl BlockRelay {
+    #[inline]
+    fn key_has_prefix(k: &[u8], p: &[u8]) -> bool {
+        k.starts_with(p)
+    }
+
     pub fn new(path: &str, peer_manager: Arc<PeerManager>) -> Result<Self, NetworkError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -244,6 +251,9 @@ impl BlockRelay {
         for result in self.db.prefix_iterator(PFX_ORPHAN) {
             match result {
                 Ok((k, v)) => {
+                    if !Self::key_has_prefix(k.as_ref(), PFX_ORPHAN) {
+                        break;
+                    }
                     if v.len() > MAX_ORPHAN_ENTRY_SIZE {
                         // Oversized entry — treat as corrupt and delete (Fix #7)
                         corrupt_keys.push(k.to_vec());
@@ -358,7 +368,13 @@ impl BlockRelay {
         self.db
             .prefix_iterator(PFX_ORPHAN)
             .filter_map(|r| match r {
-                Ok(kv) => Some(kv),
+                Ok((k, v)) => {
+                    if Self::key_has_prefix(k.as_ref(), PFX_ORPHAN) {
+                        Some((k, v))
+                    } else {
+                        None
+                    }
+                }
                 Err(e) => {
                     slog_warn!("relay", "orphan_count_iter_error", error => e);
                     None
@@ -375,6 +391,9 @@ impl BlockRelay {
         for result in self.db.prefix_iterator(PFX_ORPHAN) {
             match result {
                 Ok((k, v)) => {
+                    if !Self::key_has_prefix(k.as_ref(), PFX_ORPHAN) {
+                        break;
+                    }
                     match bincode::deserialize::<OrphanEntry>(&v) {
                         Ok(e) if e.received_at < cutoff => {
                             stale_keys.push(k.to_vec());
@@ -411,7 +430,13 @@ impl BlockRelay {
         let keys: Vec<Vec<u8>> = self.db
             .prefix_iterator(PFX_ORPHAN)
             .filter_map(|r| match r {
-                Ok(kv) => Some(kv),
+                Ok((k, v)) => {
+                    if Self::key_has_prefix(k.as_ref(), PFX_ORPHAN) {
+                        Some((k, v))
+                    } else {
+                        None
+                    }
+                }
                 Err(e) => {
                     slog_warn!("relay", "clear_orphan_pool_iter_error", error => e);
                     None
@@ -430,7 +455,13 @@ impl BlockRelay {
         let oldest: Option<(u64, Vec<u8>)> = self.db
             .prefix_iterator(PFX_ORPHAN)
             .filter_map(|r| match r {
-                Ok(kv) => Some(kv),
+                Ok((k, v)) => {
+                    if Self::key_has_prefix(k.as_ref(), PFX_ORPHAN) {
+                        Some((k, v))
+                    } else {
+                        None
+                    }
+                }
                 Err(e) => {
                     slog_warn!("relay", "evict_oldest_orphan_iter_error", error => e);
                     None
@@ -459,13 +490,16 @@ impl BlockRelay {
     /// this application-level scan.
     pub fn prune_relay_keys(&self) {
         let cutoff = Self::now().saturating_sub(RELAY_KEY_TTL_SECS);
-        let prefixes: &[&[u8]] = &[b"relay:block:", b"relay:pending:"];
+        let prefixes: &[&[u8]] = &[PFX_RELAY_BLOCK, PFX_RELAY_PENDING];
         let mut pruned = 0usize;
 
         for prefix in prefixes {
             for result in self.db.prefix_iterator(*prefix) {
                 match result {
                     Ok((k, v)) => {
+                        if !Self::key_has_prefix(k.as_ref(), prefix) {
+                            break;
+                        }
                         // Value is either b"1" (legacy) or a timestamp string.
                         // Legacy entries without a parseable timestamp are kept
                         // (they predate this change and will be replaced naturally).
@@ -531,7 +565,7 @@ mod tests {
                 merkle_root: "root".to_string(),
                 timestamp:   1_735_689_600,
                 nonce:       0,
-                difficulty:  1,
+                difficulty:  0,
                 height,
                 blue_score:      0,
                 selected_parent: None,
@@ -615,7 +649,11 @@ mod tests {
     #[test]
     fn genesis_always_accepted() {
         let relay = make_relay();
-        let genesis = make_block("genesis_hash", vec![], 0);
+        let genesis = make_block(
+            &crate::config::consensus::consensus_params::ConsensusParams::genesis_hash(),
+            vec![],
+            0,
+        );
         assert!(relay.receive_block(genesis), "Genesis must be accepted immediately");
     }
 

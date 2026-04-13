@@ -35,22 +35,19 @@ impl KeyDerivation {
     /// parent_key: 32-byte hex-encoded parent private key
     /// index: child index for derivation
     pub fn derive_child(parent_key: &[u8; 32], index: u32) -> [u8; 32] {
-        let mut attempt_index = index;
-        loop {
-            let mut mac = HmacSha256::new_from_slice(parent_key)
-                .expect("HMAC key length");
-            mac.update(TAG_CHILD_KEY);
-            mac.update(&attempt_index.to_be_bytes());
-            let result = mac.finalize().into_bytes();
+        // Use from_bytes_mod_order to reduce the HMAC output into a valid
+        // Scalar encoding.  This avoids the skip-ahead loop that caused
+        // derive_child(k, 0) == derive_child(k, 1) when index 0 happened
+        // to produce a non-canonical result and wrapped to index 1.
+        let mut mac = HmacSha256::new_from_slice(parent_key)
+            .expect("HMAC key length");
+        mac.update(TAG_CHILD_KEY);
+        mac.update(&index.to_be_bytes());
+        let result = mac.finalize().into_bytes();
 
-            let mut candidate = [0u8; 32];
-            candidate.copy_from_slice(&result);
-            if bool::from(Scalar::from_canonical_bytes(candidate).is_some()) {
-                return candidate;
-            }
-            attempt_index = attempt_index.wrapping_add(1);
-            assert_ne!(attempt_index, index, "exhausted all indices");
-        }
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(&result);
+        Scalar::from_bytes_mod_order(raw).to_bytes()
     }
 
     /// Derive an address from a public key
@@ -64,42 +61,26 @@ impl KeyDerivation {
 
     /// Derive a view key from a master private key.
     /// Returns bytes guaranteed to be a canonical Scalar encoding.
-    /// Uses a counter in the HMAC input to retry on non-canonical results.
     pub fn derive_view_key(master_key: &[u8; 32]) -> [u8; 32] {
-        let mut counter: u32 = 0;
-        loop {
-            let mut mac = HmacSha256::new_from_slice(master_key)
-                .expect("HMAC key length");
-            mac.update(b"shadowdag_view_key_v2");
-            mac.update(&counter.to_le_bytes());
-            let result = mac.finalize().into_bytes();
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&result);
-            if bool::from(Scalar::from_canonical_bytes(out).is_some()) {
-                return out;
-            }
-            counter += 1;
-        }
+        let mut mac = HmacSha256::new_from_slice(master_key)
+            .expect("HMAC key length");
+        mac.update(b"shadowdag_view_key_v2");
+        let result = mac.finalize().into_bytes();
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(&result);
+        Scalar::from_bytes_mod_order(raw).to_bytes()
     }
 
     /// Derive a spend key from a master private key.
     /// Returns bytes guaranteed to be a canonical Scalar encoding.
-    /// Uses a counter in the HMAC input to retry on non-canonical results.
     pub fn derive_spend_key(master_key: &[u8; 32]) -> [u8; 32] {
-        let mut counter: u32 = 0;
-        loop {
-            let mut mac = HmacSha256::new_from_slice(master_key)
-                .expect("HMAC key length");
-            mac.update(b"shadowdag_spend_key_v2");
-            mac.update(&counter.to_le_bytes());
-            let result = mac.finalize().into_bytes();
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&result);
-            if bool::from(Scalar::from_canonical_bytes(out).is_some()) {
-                return out;
-            }
-            counter += 1;
-        }
+        let mut mac = HmacSha256::new_from_slice(master_key)
+            .expect("HMAC key length");
+        mac.update(b"shadowdag_spend_key_v2");
+        let result = mac.finalize().into_bytes();
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(&result);
+        Scalar::from_bytes_mod_order(raw).to_bytes()
     }
 
     /// Derive multiple child keys at sequential indices

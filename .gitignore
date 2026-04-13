@@ -12,3 +12,5 @@ target/
 rpc_password
 target/ 
  
+full_test2.log
+full_test_final.log

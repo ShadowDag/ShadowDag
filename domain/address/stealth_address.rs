@@ -63,8 +63,11 @@ pub fn derive_hash_scalar_with_context(
         h.update((output_index as u64).to_le_bytes());
     }
     let hash: [u8; 32] = h.finalize().into();
-    Option::from(Scalar::from_canonical_bytes(hash))
-        .ok_or_else(|| CryptoError::InvalidKey("Hash scalar is not canonical".to_string()))
+    // SHA-256 output is arbitrary 32 bytes which may exceed the Ristretto
+    // group order L.  Reduce mod L so the result is always a valid Scalar.
+    // This is standard practice in hash-to-scalar constructions (cf.
+    // CryptoNote / Monero) and does not weaken the derived key space.
+    Ok(Scalar::from_bytes_mod_order(hash))
 }
 
 // ─────────────────────────────────────────────────────────────────────────

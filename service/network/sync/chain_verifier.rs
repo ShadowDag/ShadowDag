@@ -287,14 +287,14 @@ mod tests {
 
     #[test]
     fn valid_chain() {
-        let genesis = make_header(0, 4, 1000, vec![]);
+        let genesis = make_header(0, 1, 1000, vec![]);
         let cv = ChainVerifier::new(&genesis.hash);
-        // MIN_CUMULATIVE_WORK = 1000; difficulty 4 → work = 2^4 = 16 per block
-        // Need 1000/16 = 63 blocks minimum → use 70
+        // MIN_CUMULATIVE_WORK = 1000; difficulty 1 => work = 2 per block.
+        // Need ~500 blocks minimum.
         let mut headers = vec![genesis];
-        for i in 1..70u64 {
+        for i in 1..550u64 {
             let prev_hash = headers.last().unwrap().hash.clone();
-            headers.push(make_header(i, 4, 1000 + i * 100, vec![prev_hash]));
+            headers.push(make_header(i, 1, 1000 + i * 100, vec![prev_hash]));
         }
         assert!(matches!(cv.verify_header_chain(&headers), ChainVerifyResult::Valid));
     }
@@ -303,7 +303,7 @@ mod tests {
     fn invalid_genesis() {
         let cv = ChainVerifier::new("0000real_genesis");
         // Use a real-hash header (hash won't match "0000real_genesis")
-        let headers = vec![make_header(0, 4, 1000, vec![])];
+        let headers = vec![make_header(0, 1, 1000, vec![])];
         assert!(matches!(
             cv.verify_header_chain(&headers),
             ChainVerifyResult::InvalidGenesis { .. }
@@ -313,11 +313,11 @@ mod tests {
     #[test]
     fn invalid_pow() {
         // Header with a bad hash will fail the hash recomputation check
-        let genesis = make_header(0, 4, 1000, vec![]);
+        let genesis = make_header(0, 1, 1000, vec![]);
         let cv = ChainVerifier::new(&genesis.hash);
         let headers = vec![
             genesis.clone(),
-            make_header_bad_hash(1, "abcd_no_zeros", 4, 2000),
+            make_header_bad_hash(1, "abcd_no_zeros", 1, 2000),
         ];
         assert!(matches!(
             cv.verify_header_chain(&headers),
@@ -327,10 +327,10 @@ mod tests {
 
     #[test]
     fn checkpoint_mismatch() {
-        let genesis = make_header(0, 4, 1000, vec![]);
+        let genesis = make_header(0, 1, 1000, vec![]);
         let mut cv = ChainVerifier::new(&genesis.hash);
         // Set a checkpoint that the real hash won't match
-        let block1 = make_header(1, 4, 2000, vec![genesis.hash.clone()]);
+        let block1 = make_header(1, 1, 2000, vec![genesis.hash.clone()]);
         cv.add_checkpoint(1, "0000wrong_checkpoint_hash");
         let headers = vec![genesis, block1];
         assert!(matches!(
@@ -347,11 +347,11 @@ mod tests {
 
     #[test]
     fn backward_timestamp_rejected() {
-        let genesis = make_header(0, 50, 5000, vec![]);
+        let genesis = make_header(0, 1, 5000, vec![]);
         let cv = ChainVerifier::new(&genesis.hash);
         // Block 1 has earlier timestamp — will fail recomputation then timestamp check
         // But since we need a real hash for block1, create it with earlier timestamp
-        let block1 = make_header(1, 50, 4000, vec![genesis.hash.clone()]);
+        let block1 = make_header(1, 1, 4000, vec![genesis.hash.clone()]);
         let headers = vec![genesis, block1];
         assert!(matches!(
             cv.verify_header_chain(&headers),
@@ -361,9 +361,9 @@ mod tests {
 
     #[test]
     fn equal_timestamp_rejected() {
-        let genesis = make_header(0, 50, 5000, vec![]);
+        let genesis = make_header(0, 1, 5000, vec![]);
         let cv = ChainVerifier::new(&genesis.hash);
-        let block1 = make_header(1, 50, 5000, vec![genesis.hash.clone()]);
+        let block1 = make_header(1, 1, 5000, vec![genesis.hash.clone()]);
         let headers = vec![genesis, block1];
         assert!(matches!(
             cv.verify_header_chain(&headers),
@@ -373,10 +373,10 @@ mod tests {
 
     #[test]
     fn height_gap_rejected() {
-        let genesis = make_header(0, 50, 5000, vec![]);
+        let genesis = make_header(0, 1, 5000, vec![]);
         let cv = ChainVerifier::new(&genesis.hash);
         // Skip from height 0 to height 5
-        let block5 = make_header(5, 50, 6000, vec![genesis.hash.clone()]);
+        let block5 = make_header(5, 1, 6000, vec![genesis.hash.clone()]);
         let headers = vec![genesis, block5];
         assert!(matches!(
             cv.verify_header_chain(&headers),
