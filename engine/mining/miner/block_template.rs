@@ -79,18 +79,26 @@ impl BlockTemplateBuilder {
     ) -> Result<Block, ConsensusError> {
         let parents = Self::select_dag_parents(tip_manager, dag_manager)?;
 
+        // Read tips ONCE to avoid TOCTOU between height, selected_parent,
+        // and blue_score computations. If tips change between reads, the
+        // template could have an inconsistent combination.
+        let tips = tip_manager.get_tips();
+        let tip_map_height: std::collections::HashMap<&str, u64> = tips
+            .iter()
+            .map(|t| (t.hash.as_str(), t.height))
+            .collect();
+        let tip_map_score: std::collections::HashMap<&str, u64> = tips
+            .iter()
+            .map(|t| (t.hash.as_str(), t.blue_score))
+            .collect();
+
         // Height MUST be max(parent_heights) + 1 (consensus rule).
         // Using tip_manager.best_height() can produce incorrect
         // heights when DAG tips lag behind the actual max parent.
         let height = {
-            let tips = tip_manager.get_tips();
-            let tip_map: std::collections::HashMap<&str, u64> = tips
-                .iter()
-                .map(|t| (t.hash.as_str(), t.height))
-                .collect();
             let mut max_parent_height = 0u64;
             for parent_hash in &parents {
-                if let Some(&ph) = tip_map.get(parent_hash.as_str()) {
+                if let Some(&ph) = tip_map_height.get(parent_hash.as_str()) {
                     max_parent_height = max_parent_height.max(ph);
                 }
             }
@@ -128,16 +136,12 @@ impl BlockTemplateBuilder {
         // lexicographically first. The parent list is sorted lexicographically
         // for consensus determinism, but the selected parent follows GHOSTDAG
         // ordering (highest blue score wins, then lexicographic tiebreaker).
+        // Uses tip_map_score from the single tips read above (no re-read).
         let selected_parent = {
-            let tips = tip_manager.get_tips();
-            let tip_map: std::collections::HashMap<&str, u64> = tips
-                .iter()
-                .map(|t| (t.hash.as_str(), t.blue_score))
-                .collect();
             let best = parents.iter()
                 .max_by(|a, b| {
-                    let sa = tip_map.get(a.as_str()).copied().unwrap_or(0);
-                    let sb = tip_map.get(b.as_str()).copied().unwrap_or(0);
+                    let sa = tip_map_score.get(a.as_str()).copied().unwrap_or(0);
+                    let sb = tip_map_score.get(b.as_str()).copied().unwrap_or(0);
                     sa.cmp(&sb).then_with(|| b.cmp(a)) // higher score, then lower hash
                 })
                 .cloned();
@@ -146,14 +150,10 @@ impl BlockTemplateBuilder {
 
         // Compute blue_score from selected parent + 1
         // (the simplest approximation — full GHOSTDAG score is computed on insert)
+        // Uses tip_map_score from the single tips read above (no re-read).
         let blue_score = {
-            let tips = tip_manager.get_tips();
-            let tip_map: std::collections::HashMap<&str, u64> = tips
-                .iter()
-                .map(|t| (t.hash.as_str(), t.blue_score))
-                .collect();
             parents.iter()
-                .filter_map(|p| tip_map.get(p.as_str()))
+                .filter_map(|p| tip_map_score.get(p.as_str()))
                 .max()
                 .copied()
                 .unwrap_or(0)

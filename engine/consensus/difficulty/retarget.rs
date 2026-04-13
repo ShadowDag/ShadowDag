@@ -230,6 +230,17 @@ impl RetargetEngine {
         //
         // We blend the blue-rate signal with the block-rate signal:
         //   70% block-rate (responsive) + 30% blue-rate (stable)
+        //
+        // TRUST ASSUMPTION: blue_score comes from the block header and
+        // is verified by GHOSTDAG::add_block before the retarget engine
+        // sees it. If this trust boundary is violated (e.g., a block is
+        // fed to retarget before GHOSTDAG verification), an attacker could
+        // manipulate difficulty by claiming a false blue_score.
+        //
+        // The FullNode pipeline ensures GHOSTDAG runs before retarget:
+        //   1. process_block -> validate + DAG/GHOSTDAG insert
+        //   2. recompute_virtual_chain -> retarget.on_new_block
+        // Any path that bypasses step 1 breaks this assumption.
         if n >= 10
             && self.blue_score_window_end > self.blue_score_window_start
         {

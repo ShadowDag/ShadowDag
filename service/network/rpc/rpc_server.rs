@@ -1463,7 +1463,12 @@ impl RpcServer {
             return RpcResponse::err(id, ERR_INVALID_PARAMS, "Invalid block: missing hash or height");
         }
 
-        let selected_parent = if parents.is_empty() { None } else { Some(parents[0].clone()) };
+        // Do NOT set selected_parent from client input (parents[0]) —
+        // it must be determined by GHOSTDAG during consensus validation.
+        // Setting it here would let the submitter influence fork-choice
+        // traversal paths. The FullNode pipeline computes and stores
+        // the correct GHOSTDAG-selected parent on block acceptance.
+        let selected_parent = None;
         let block = Block {
             header: BlockHeader {
                 version,

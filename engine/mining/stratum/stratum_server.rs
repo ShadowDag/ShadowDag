@@ -145,6 +145,7 @@ pub struct Worker {
     pub last_share_at:   u64,
     pub shares_in_window: u32, // Shares in current vardiff window
     pub extra_nonce:     u64,  // Unique per-worker nonce prefix (assigned on subscribe)
+    pub pending_difficulty_update: bool, // True when vardiff changed and client needs notification
 }
 
 impl Worker {
@@ -162,6 +163,7 @@ impl Worker {
             last_share_at:    0,
             shares_in_window: 0,
             extra_nonce,
+            pending_difficulty_update: false,
         }
     }
 
@@ -493,7 +495,11 @@ impl StratumServer {
             // multiple times. Checking shares_in_window is deterministic.
             if worker.shares_in_window >= TARGET_SHARES_PER_MIN {
                 if worker.vardiff_adjust() {
-                    // TODO: Send mining.set_difficulty notification to worker
+                    // Flag the worker so the connection handler sends
+                    // mining.set_difficulty after writing the submit response.
+                    // We cannot write to the TCP stream here because
+                    // handle_submit has no access to the writer.
+                    worker.pending_difficulty_update = true;
                 }
             }
 
@@ -655,6 +661,27 @@ impl StratumServer {
 
             if writer.write_all(resp_json.as_bytes()).is_err() {
                 break; // Connection lost
+            }
+
+            // After a submit, check if vardiff flagged a pending difficulty
+            // update and send mining.set_difficulty to the worker.
+            if request.method == StratumMethod::Submit {
+                let mut workers = self.workers.write().unwrap_or_else(|e| e.into_inner());
+                if let Some(worker) = workers.values_mut().find(|w| w.peer_addr == peer_addr) {
+                    if worker.pending_difficulty_update {
+                        worker.pending_difficulty_update = false;
+                        let diff_msg = format!(
+                            "{{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[{}]}}\n",
+                            worker.difficulty
+                        );
+                        if let Err(e) = writer.write_all(diff_msg.as_bytes()) {
+                            slog_warn!("stratum", "set_difficulty_send_failed",
+                                peer => peer_addr, error => format!("{}", e));
+                        } else {
+                            let _ = writer.flush();
+                        }
+                    }
+                }
             }
 
             // After subscribe, send the current block template if available
