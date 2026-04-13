@@ -463,7 +463,10 @@ pub fn parse_request(data: &[u8]) -> Option<GrpcRequest> {
     if data.len() < 13 { return None; } // 4B len + 1B method + 8B req_id
 
     let msg_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    if msg_len > MAX_MESSAGE_SIZE { return None; }
+    // msg_len must cover at least 1B method + 8B req_id = 9 bytes,
+    // and must not exceed MAX_MESSAGE_SIZE.  Without the lower bound
+    // the slice `data[13..4+msg_len]` underflows and panics.
+    if !(9..=MAX_MESSAGE_SIZE).contains(&msg_len) { return None; }
     if data.len() < 4 + msg_len { return None; }
 
     let method = GrpcMethod::from_byte(data[4]);
