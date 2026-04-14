@@ -60,6 +60,9 @@ name = "shadowdag-rotate-rpc-password"
 path = "bin/rotate_rpc_password.rs"
 
 [dependencies]
+# ─── System ───────────────────────────────────────────────────────────────────
+libc               = "0.2"
+
 # ─── Database ─────────────────────────────────────────────────────────────────
 rocksdb            = "0.21"
 
