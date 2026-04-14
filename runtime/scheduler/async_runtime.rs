@@ -3,8 +3,8 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::{slog_error, slog_warn};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 static ACTIVE_TASKS: AtomicUsize = AtomicUsize::new(0);
 
@@ -39,7 +39,7 @@ impl AsyncRuntime {
                 let _guard = TaskGuard;
                 task();
             }) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => {
                 slog_error!("runtime", "spawn_named_thread_failed", error => &e.to_string());
                 ACTIVE_TASKS.fetch_sub(1, Ordering::SeqCst);

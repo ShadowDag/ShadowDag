@@ -15,14 +15,14 @@
 // layer, making transaction source tracking practically impossible.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 
-use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::domain::transaction::transaction::Transaction;
 use crate::engine::privacy::shadow_pool::shadow_pool::ShadowPool;
 use crate::engine::privacy::shadow_pool::shadow_transaction::MixDelay;
+use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::slog_info;
 
 /// Maximum transactions queued in the shadow relay
@@ -47,17 +47,17 @@ pub enum ShadowMode {
 
 pub struct ShadowNode {
     /// The shadow transaction pool
-    pool:            ShadowPool,
+    pool: ShadowPool,
     /// Operating mode
-    mode:            ShadowMode,
+    mode: ShadowMode,
     /// Node's unique (ephemeral) identity — regenerated on restart
-    node_id:         String,
+    node_id: String,
     /// Whether the node is active
-    active:          bool,
+    active: bool,
     /// Total transactions relayed
-    total_relayed:   u64,
+    total_relayed: u64,
     /// Network name
-    network:         String,
+    network: String,
 }
 
 impl ShadowNode {
@@ -108,15 +108,18 @@ impl ShadowNode {
         match self.mode {
             ShadowMode::Relay => {
                 // Simple relay: add to pool with minimal delay
-                self.pool.submit_with_privacy(tx, timestamp, MixDelay::Short, 1);
+                self.pool
+                    .submit_with_privacy(tx, timestamp, MixDelay::Short, 1);
             }
             ShadowMode::Mix => {
                 // Mix mode: full mixing with multiple hops
-                self.pool.submit_with_privacy(tx, timestamp, MixDelay::Long, 5);
+                self.pool
+                    .submit_with_privacy(tx, timestamp, MixDelay::Long, 5);
             }
             ShadowMode::Full => {
                 // Full mode: maximum privacy
-                self.pool.submit_with_privacy(tx, timestamp, MixDelay::Long, 8);
+                self.pool
+                    .submit_with_privacy(tx, timestamp, MixDelay::Long, 8);
             }
         }
     }
@@ -147,11 +150,21 @@ impl ShadowNode {
     }
 
     /// Get node statistics
-    pub fn pool_size(&self) -> usize { self.pool.size() }
-    pub fn total_relayed(&self) -> u64 { self.total_relayed }
-    pub fn is_active(&self) -> bool { self.active }
-    pub fn mode(&self) -> &ShadowMode { &self.mode }
-    pub fn node_id_short(&self) -> &str { &self.node_id[..8] }
+    pub fn pool_size(&self) -> usize {
+        self.pool.size()
+    }
+    pub fn total_relayed(&self) -> u64 {
+        self.total_relayed
+    }
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+    pub fn mode(&self) -> &ShadowMode {
+        &self.mode
+    }
+    pub fn node_id_short(&self) -> &str {
+        &self.node_id[..8]
+    }
 }
 
 #[cfg(test)]
@@ -163,7 +176,13 @@ mod tests {
         Transaction {
             hash: hash.to_string(),
             inputs: vec![],
-            outputs: vec![TxOutput { address: "addr".into(), amount: 100, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            outputs: vec![TxOutput {
+                address: "addr".into(),
+                amount: 100,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee: 1,
             timestamp: 1735689600,
             is_coinbase: false,

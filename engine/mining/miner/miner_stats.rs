@@ -3,13 +3,12 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options};
-use std::path::Path;
 use crate::slog_error;
+use rocksdb::{Options, DB};
+use std::path::Path;
 
 pub struct MinerStats {
     db: DB,
-
 }
 
 impl MinerStats {
@@ -17,34 +16,34 @@ impl MinerStats {
         let mut opts = Options::default();
         opts.create_if_missing(true);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| crate::errors::StorageError::OpenFailed {
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| {
+            crate::errors::StorageError::OpenFailed {
                 path: path.to_string(),
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         Ok(Self { db })
-
     }
 
     pub fn set_hashrate(&self, rate: u64) {
-        if let Err(_e) = self.db.put("hashrate", rate.to_be_bytes()) { slog_error!("mining", "stats_put_hashrate_failed", error => _e); }
-
+        if let Err(_e) = self.db.put("hashrate", rate.to_be_bytes()) {
+            slog_error!("mining", "stats_put_hashrate_failed", error => _e);
+        }
     }
 
     pub fn get_hashrate(&self) -> Option<u64> {
         match self.db.get("hashrate").unwrap_or(None) {
             Some(bytes) => {
-                if bytes.len() != 8 { return None; }
+                if bytes.len() != 8 {
+                    return None;
+                }
                 let mut arr = [0u8; 8];
                 arr.copy_from_slice(&bytes);
                 Some(u64::from_be_bytes(arr))
             }
 
-            None => None
-
+            None => None,
         }
-
     }
-
 }

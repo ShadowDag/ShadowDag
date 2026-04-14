@@ -3,19 +3,19 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::collections::HashMap;
 use crate::domain::transaction::transaction::Transaction;
+use std::collections::HashMap;
 
 pub const MAX_ORPHAN_AGE: u64 = 100;
 
 pub const MAX_ORPHAN_COUNT: usize = 1_000;
 
 pub struct OrphanPool {
-    orphans:   HashMap<String, Vec<Transaction>>,
+    orphans: HashMap<String, Vec<Transaction>>,
     /// Reverse index: tx.hash → list of bucket keys this tx was added to
     tx_buckets: HashMap<String, Vec<String>>,
-    age_map:   HashMap<String, u64>,
-    count:     usize,
+    age_map: HashMap<String, u64>,
+    count: usize,
 }
 
 impl Default for OrphanPool {
@@ -27,10 +27,10 @@ impl Default for OrphanPool {
 impl OrphanPool {
     pub fn new() -> Self {
         Self {
-            orphans:    HashMap::new(),
+            orphans: HashMap::new(),
             tx_buckets: HashMap::new(),
-            age_map:    HashMap::new(),
-            count:      0,
+            age_map: HashMap::new(),
+            count: 0,
         }
     }
 
@@ -72,14 +72,17 @@ impl OrphanPool {
         // parent). When parent A triggers promotion the TX is promoted and removed
         // from tx_buckets. If parent B later triggers, the same TX would appear
         // again without this filter.
-        let promoted: Vec<Transaction> = promoted.into_iter()
+        let promoted: Vec<Transaction> = promoted
+            .into_iter()
             .filter(|tx| self.tx_buckets.contains_key(&tx.hash))
             .collect();
         for tx in &promoted {
             // Remove from all other buckets this tx was registered in
             if let Some(buckets) = self.tx_buckets.remove(&tx.hash) {
                 for bucket_key in &buckets {
-                    if bucket_key == parent_txid { continue; }
+                    if bucket_key == parent_txid {
+                        continue;
+                    }
                     if let Some(bucket) = self.orphans.get_mut(bucket_key) {
                         bucket.retain(|t| t.hash != tx.hash);
                         if bucket.is_empty() {
@@ -89,13 +92,16 @@ impl OrphanPool {
                 }
             }
             self.age_map.remove(&tx.hash);
-            if self.count > 0 { self.count -= 1; }
+            if self.count > 0 {
+                self.count -= 1;
+            }
         }
         promoted
     }
 
     pub fn evict_old(&mut self, current_height: u64) {
-        let old_txids: Vec<String> = self.age_map
+        let old_txids: Vec<String> = self
+            .age_map
             .iter()
             .filter(|(_, &age)| current_height.saturating_sub(age) > MAX_ORPHAN_AGE)
             .map(|(k, _)| k.clone())
@@ -108,7 +114,9 @@ impl OrphanPool {
             // that reference tx hashes no longer in any orphan bucket,
             // causing memory leaks and incorrect promote() behavior.
             self.tx_buckets.remove(txid);
-            if self.count > 0 { self.count -= 1; }
+            if self.count > 0 {
+                self.count -= 1;
+            }
         }
 
         self.orphans.retain(|_, txs| {
@@ -117,7 +125,9 @@ impl OrphanPool {
         });
     }
 
-    pub fn count(&self) -> usize { self.count }
+    pub fn count(&self) -> usize {
+        self.count
+    }
 }
 
 #[cfg(test)]
@@ -128,15 +138,19 @@ mod tests {
     fn make_tx(hash: &str, input_txids: Vec<&str>) -> Transaction {
         Transaction {
             hash: hash.to_string(),
-            inputs: input_txids.iter().enumerate().map(|(i, txid)| TxInput {
-                txid: txid.to_string(),
-                index: i as u32,
-                owner: String::new(),
-                signature: String::new(),
-                pub_key: String::new(),
-                key_image: None,
-                ring_members: None,
-            }).collect(),
+            inputs: input_txids
+                .iter()
+                .enumerate()
+                .map(|(i, txid)| TxInput {
+                    txid: txid.to_string(),
+                    index: i as u32,
+                    owner: String::new(),
+                    signature: String::new(),
+                    pub_key: String::new(),
+                    key_image: None,
+                    ring_members: None,
+                })
+                .collect(),
             outputs: vec![TxOutput {
                 amount: 100,
                 address: "addr1".to_string(),

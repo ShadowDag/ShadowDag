@@ -38,8 +38,7 @@ impl Reward {
     #[must_use]
     pub const fn developer_portion(total: u64) -> u64 {
         // u128 math to preserve exactness and avoid overflow
-        ((total as u128 * Self::DEV_RATIO_NUM as u128)
-            / Self::DEV_RATIO_DEN as u128) as u64
+        ((total as u128 * Self::DEV_RATIO_NUM as u128) / Self::DEV_RATIO_DEN as u128) as u64
     }
 
     #[inline(always)]
@@ -152,8 +151,8 @@ impl Reward {
             return base;
         }
 
-        let min_reward = (Self::miner_portion(total) as u128
-            * Self::MIN_REWARD_PCT as u128 / 100) as u64;
+        let min_reward =
+            (Self::miner_portion(total) as u128 * Self::MIN_REWARD_PCT as u128 / 100) as u64;
 
         let decay_base = (100u128 - Self::LATE_PENALTY_PCT_PER_SEC as u128).max(1);
         let mut numerator = base as u128;
@@ -232,7 +231,12 @@ mod tests {
     fn delay_never_below_floor() {
         let min = Reward::miner_portion(TEST_REWARD) * Reward::MIN_REWARD_PCT / 100;
         let extreme = Reward::late_block_miner_reward(TEST_REWARD, 1000);
-        assert!(extreme >= min, "Reward {} should be >= floor {}", extreme, min);
+        assert!(
+            extreme >= min,
+            "Reward {} should be >= floor {}",
+            extreme,
+            min
+        );
     }
 
     #[test]

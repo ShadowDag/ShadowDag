@@ -4,10 +4,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use rocksdb::{
-    DB, Options, WriteOptions, ReadOptions,
-    WriteBatch, BlockBasedOptions, SliceTransform,
-    DBPinnableSlice, Cache, DBCompressionType,
-    Direction, IteratorMode,
+    BlockBasedOptions, Cache, DBCompressionType, DBPinnableSlice, Direction, IteratorMode, Options,
+    ReadOptions, SliceTransform, WriteBatch, WriteOptions, DB,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -36,7 +34,6 @@ pub struct DagValidatorStore {
 }
 
 impl DagValidatorStore {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
@@ -80,9 +77,7 @@ impl DagValidatorStore {
         opts.set_compression_type(DBCompressionType::Lz4);
 
         // prefix
-        opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(
-            VALIDATION_PREFIX.len(),
-        ));
+        opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(VALIDATION_PREFIX.len()));
         opts.set_memtable_prefix_bloom_ratio(0.1);
 
         // cache
@@ -96,8 +91,10 @@ impl DagValidatorStore {
 
         opts.set_block_based_table_factory(&block_opts);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         let mut write_opts = WriteOptions::default();
         write_opts.disable_wal(false); // ⚠️ mainnet = false
@@ -222,9 +219,7 @@ impl DagValidatorStore {
         for (k, v) in iter.flatten() {
             let key = &k[VALIDATION_PREFIX.len()..];
 
-            if let (Ok(k), Ok(v)) =
-                (std::str::from_utf8(key), std::str::from_utf8(&v))
-            {
+            if let (Ok(k), Ok(v)) = (std::str::from_utf8(key), std::str::from_utf8(&v)) {
                 result.push((k.to_string(), v.to_string()));
             }
         }
@@ -239,5 +234,4 @@ impl DagValidatorStore {
     fn pinned_to_string(data: DBPinnableSlice) -> Option<String> {
         std::str::from_utf8(&data).ok().map(|s| s.to_string())
     }
-
 }

@@ -3,7 +3,7 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options};
+use rocksdb::{Options, DB};
 use std::path::Path;
 
 use crate::errors::StorageError;
@@ -11,7 +11,6 @@ use crate::slog_error;
 
 pub struct TxIndex {
     db: DB,
-
 }
 
 impl TxIndex {
@@ -37,15 +36,13 @@ impl TxIndex {
 
     pub fn get_tx_block(&self, txid: &str) -> Option<String> {
         match self.db.get(txid) {
-            Ok(Some(data)) => {
-                match String::from_utf8(data.to_vec()) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        slog_error!("storage", "tx_index_utf8_error", txid => txid, error => e);
-                        None
-                    }
+            Ok(Some(data)) => match String::from_utf8(data.to_vec()) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    slog_error!("storage", "tx_index_utf8_error", txid => txid, error => e);
+                    None
                 }
-            }
+            },
             Ok(None) => None,
             Err(e) => {
                 slog_error!("storage", "tx_block_read_error_returns_none",
@@ -54,5 +51,4 @@ impl TxIndex {
             }
         }
     }
-
 }

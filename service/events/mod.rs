@@ -15,17 +15,17 @@ use crate::slog_error;
 #[derive(Debug, Clone)]
 pub enum NodeEvent {
     NewBlock {
-        hash:   String,
+        hash: String,
         height: u64,
     },
     NewTransaction {
         hash: String,
-        fee:  u64,
+        fee: u64,
     },
     BlockMined {
-        hash:   String,
+        hash: String,
         height: u64,
-        miner:  String,
+        miner: String,
         reward: u64,
     },
     DagTipChanged {
@@ -36,11 +36,11 @@ pub enum NodeEvent {
     },
     PeerDisconnected {
         address: String,
-        reason:  String,
+        reason: String,
     },
     SyncProgress {
         current: u64,
-        target:  u64,
+        target: u64,
     },
     SyncComplete {
         height: u64,
@@ -49,30 +49,30 @@ pub enum NodeEvent {
     ChainReorg {
         old_tip: String,
         new_tip: String,
-        depth:   u64,
+        depth: u64,
     },
 }
 
 impl NodeEvent {
     pub fn name(&self) -> &'static str {
         match self {
-            NodeEvent::NewBlock { .. }         => "new_block",
-            NodeEvent::NewTransaction { .. }   => "new_transaction",
-            NodeEvent::BlockMined { .. }       => "block_mined",
-            NodeEvent::DagTipChanged { .. }    => "dag_tip_changed",
-            NodeEvent::PeerConnected { .. }    => "peer_connected",
+            NodeEvent::NewBlock { .. } => "new_block",
+            NodeEvent::NewTransaction { .. } => "new_transaction",
+            NodeEvent::BlockMined { .. } => "block_mined",
+            NodeEvent::DagTipChanged { .. } => "dag_tip_changed",
+            NodeEvent::PeerConnected { .. } => "peer_connected",
             NodeEvent::PeerDisconnected { .. } => "peer_disconnected",
-            NodeEvent::SyncProgress { .. }     => "sync_progress",
-            NodeEvent::SyncComplete { .. }     => "sync_complete",
-            NodeEvent::MempoolFull             => "mempool_full",
-            NodeEvent::ChainReorg { .. }       => "chain_reorg",
+            NodeEvent::SyncProgress { .. } => "sync_progress",
+            NodeEvent::SyncComplete { .. } => "sync_complete",
+            NodeEvent::MempoolFull => "mempool_full",
+            NodeEvent::ChainReorg { .. } => "chain_reorg",
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct EventEntry {
-    pub event:     NodeEvent,
+    pub event: NodeEvent,
     pub timestamp: u64,
 }
 
@@ -92,7 +92,7 @@ pub type EventCallback = Box<dyn Fn(&NodeEvent) + Send + Sync>;
 
 pub struct EventBus {
     subscribers: HashMap<String, Vec<EventCallback>>,
-    history:     Vec<EventEntry>,
+    history: Vec<EventEntry>,
     max_history: usize,
 }
 
@@ -106,7 +106,7 @@ impl EventBus {
     pub fn new() -> Self {
         Self {
             subscribers: HashMap::new(),
-            history:     Vec::new(),
+            history: Vec::new(),
             max_history: 1_000,
         }
     }
@@ -148,18 +148,24 @@ impl EventBus {
     }
 
     pub fn emit_new_block(&mut self, hash: &str, height: u64) {
-        self.publish(NodeEvent::NewBlock { hash: hash.to_string(), height });
+        self.publish(NodeEvent::NewBlock {
+            hash: hash.to_string(),
+            height,
+        });
     }
 
     pub fn emit_new_tx(&mut self, hash: &str, fee: u64) {
-        self.publish(NodeEvent::NewTransaction { hash: hash.to_string(), fee });
+        self.publish(NodeEvent::NewTransaction {
+            hash: hash.to_string(),
+            fee,
+        });
     }
 
     pub fn emit_block_mined(&mut self, hash: &str, height: u64, miner: &str, reward: u64) {
         self.publish(NodeEvent::BlockMined {
-            hash:   hash.to_string(),
+            hash: hash.to_string(),
             height,
-            miner:  miner.to_string(),
+            miner: miner.to_string(),
             reward,
         });
     }
@@ -185,13 +191,15 @@ impl EventBus {
     }
 
     pub fn emit_peer_connected(&mut self, address: &str) {
-        self.publish(NodeEvent::PeerConnected { address: address.to_string() });
+        self.publish(NodeEvent::PeerConnected {
+            address: address.to_string(),
+        });
     }
 
     pub fn emit_peer_disconnected(&mut self, address: &str, reason: &str) {
         self.publish(NodeEvent::PeerDisconnected {
             address: address.to_string(),
-            reason:  reason.to_string(),
+            reason: reason.to_string(),
         });
     }
 
@@ -200,10 +208,15 @@ impl EventBus {
         &self.history[start..]
     }
 
-    pub fn event_count(&self) -> usize { self.history.len() }
+    pub fn event_count(&self) -> usize {
+        self.history.len()
+    }
 
     pub fn subscriber_count(&self, event_name: &str) -> usize {
-        self.subscribers.get(event_name).map(|v| v.len()).unwrap_or(0)
+        self.subscribers
+            .get(event_name)
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 }
 
@@ -223,9 +236,12 @@ mod tests {
         let mut bus = EventBus::new();
         let counter = Arc::new(AtomicU64::new(0));
         let c = Arc::clone(&counter);
-        bus.subscribe("new_block", Box::new(move |_| {
-            c.fetch_add(1, Ordering::SeqCst);
-        }));
+        bus.subscribe(
+            "new_block",
+            Box::new(move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
         bus.emit_new_block("hash1", 1);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
@@ -235,9 +251,12 @@ mod tests {
         let mut bus = EventBus::new();
         let counter = Arc::new(AtomicU64::new(0));
         let c = Arc::clone(&counter);
-        bus.subscribe("all", Box::new(move |_| {
-            c.fetch_add(1, Ordering::SeqCst);
-        }));
+        bus.subscribe(
+            "all",
+            Box::new(move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
         bus.emit_new_block("h1", 1);
         bus.emit_new_tx("t1", 100);
         assert_eq!(counter.load(Ordering::SeqCst), 2);

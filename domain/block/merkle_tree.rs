@@ -29,8 +29,8 @@
 // Hash: BLAKE2b-256 (32-byte output, same as Kaspa's transaction hashing)
 // ═══════════════════════════════════════════════════════════════════════════
 
-use blake2::{Blake2b, Digest};
 use blake2::digest::consts::U32;
+use blake2::{Blake2b, Digest};
 use blake2b_simd::Params;
 use rayon::prelude::*;
 
@@ -42,11 +42,11 @@ type Blake2b256 = Blake2b<U32>;
 
 /// Personalization strings for BLAKE2b (max 16 bytes)
 /// Kaspa uses no personalization — we use it for FREE domain separation
-const LEAF_PERSON:   &[u8; 16] = b"ShadowMerkleLeaf";
+const LEAF_PERSON: &[u8; 16] = b"ShadowMerkleLeaf";
 const BRANCH_PERSON: &[u8; 16] = b"ShadowMerkleBrch"; // Exactly 16 bytes
 
 /// Additional domain tag bytes (defense in depth)
-const LEAF_TAG:   u8 = 0x00;
+const LEAF_TAG: u8 = 0x00;
 const BRANCH_TAG: u8 = 0x01;
 
 /// Threshold for parallel computation (below this, sequential is faster)
@@ -83,9 +83,7 @@ impl MerkleTree {
             return hex::encode(hasher.finalize());
         }
 
-        let hashes: Vec<String> = transactions.iter()
-            .map(|tx| tx.hash.clone())
-            .collect();
+        let hashes: Vec<String> = transactions.iter().map(|tx| tx.hash.clone()).collect();
         // NO sort — order = block body order = execution order
         Self::compute_root(&hashes)
     }
@@ -111,16 +109,22 @@ impl MerkleTree {
         // Step 1: Hash each leaf (parallel for large blocks)
         let mut layer: Vec<[u8; 32]> = if tx_hashes.len() >= PARALLEL_THRESHOLD {
             // 🚀 Parallel: for 32 BPS with thousands of TX per block
-            tx_hashes.par_iter().map(|h| {
-                let raw = Self::strict_decode_hash(h);
-                Self::hash_leaf(&raw)
-            }).collect()
+            tx_hashes
+                .par_iter()
+                .map(|h| {
+                    let raw = Self::strict_decode_hash(h);
+                    Self::hash_leaf(&raw)
+                })
+                .collect()
         } else {
             // Sequential: for small blocks
-            tx_hashes.iter().map(|h| {
-                let raw = Self::strict_decode_hash(h);
-                Self::hash_leaf(&raw)
-            }).collect()
+            tx_hashes
+                .iter()
+                .map(|h| {
+                    let raw = Self::strict_decode_hash(h);
+                    Self::hash_leaf(&raw)
+                })
+                .collect()
         };
 
         // Step 2: Build tree bottom-up
@@ -133,9 +137,10 @@ impl MerkleTree {
 
             // Parallel branch hashing for large layers
             if layer.len() >= PARALLEL_THRESHOLD {
-                layer = layer.par_chunks(2).map(|pair| {
-                    Self::hash_branch(&pair[0], &pair[1])
-                }).collect();
+                layer = layer
+                    .par_chunks(2)
+                    .map(|pair| Self::hash_branch(&pair[0], &pair[1]))
+                    .collect();
             } else {
                 let mut next = Vec::with_capacity(layer.len() / 2);
                 for pair in layer.chunks(2) {
@@ -205,10 +210,13 @@ impl MerkleTree {
             return None;
         }
 
-        let mut layer: Vec<[u8; 32]> = tx_hashes.iter().map(|h| {
-            let raw = Self::strict_decode_hash(h);
-            Self::hash_leaf(&raw)
-        }).collect();
+        let mut layer: Vec<[u8; 32]> = tx_hashes
+            .iter()
+            .map(|h| {
+                let raw = Self::strict_decode_hash(h);
+                Self::hash_leaf(&raw)
+            })
+            .collect();
 
         let mut proof = Vec::new();
         let mut idx = index;
@@ -220,7 +228,11 @@ impl MerkleTree {
                 }
             }
 
-            let sibling_idx = if idx.is_multiple_of(2) { idx + 1 } else { idx - 1 };
+            let sibling_idx = if idx.is_multiple_of(2) {
+                idx + 1
+            } else {
+                idx - 1
+            };
             let is_right = idx.is_multiple_of(2); // sibling is on the right if we're on the left
             proof.push((layer[sibling_idx], is_right));
 
@@ -237,11 +249,7 @@ impl MerkleTree {
     }
 
     /// Verify a Merkle proof.
-    pub fn verify_proof(
-        tx_hash:     &str,
-        proof:       &[([u8; 32], bool)],
-        merkle_root: &str,
-    ) -> bool {
+    pub fn verify_proof(tx_hash: &str, proof: &[([u8; 32], bool)], merkle_root: &str) -> bool {
         let raw = Self::strict_decode_hash(tx_hash);
         let mut current = Self::hash_leaf(&raw);
 
@@ -262,6 +270,7 @@ impl MerkleTree {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -276,14 +285,20 @@ mod tests {
     fn empty_blocks_different_height_different_root() {
         let r1 = MerkleTree::build(&[], 1, &["aa".repeat(32)]);
         let r2 = MerkleTree::build(&[], 2, &["aa".repeat(32)]);
-        assert_ne!(r1, r2, "Empty blocks at different heights must have different roots");
+        assert_ne!(
+            r1, r2,
+            "Empty blocks at different heights must have different roots"
+        );
     }
 
     #[test]
     fn empty_blocks_different_parents_different_root() {
         let r1 = MerkleTree::build(&[], 1, &["aa".repeat(32)]);
         let r2 = MerkleTree::build(&[], 1, &["bb".repeat(32)]);
-        assert_ne!(r1, r2, "Empty blocks with different parents must have different roots");
+        assert_ne!(
+            r1, r2,
+            "Empty blocks with different parents must have different roots"
+        );
     }
 
     #[test]
@@ -350,15 +365,37 @@ mod tests {
 
         let tx_a = Transaction {
             hash: "bb".repeat(32),
-            inputs: vec![], outputs: vec![TxOutput { address: "x".into(), amount: 1, commitment: None, range_proof: None, ephemeral_pubkey: None }],
-            fee: 0, timestamp: 0, is_coinbase: false, tx_type: TxType::Transfer,
-            payload_hash: None, ..Default::default()
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                address: "x".into(),
+                amount: 1,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
+            fee: 0,
+            timestamp: 0,
+            is_coinbase: false,
+            tx_type: TxType::Transfer,
+            payload_hash: None,
+            ..Default::default()
         };
         let tx_b = Transaction {
             hash: "aa".repeat(32),
-            inputs: vec![], outputs: vec![TxOutput { address: "y".into(), amount: 2, commitment: None, range_proof: None, ephemeral_pubkey: None }],
-            fee: 0, timestamp: 0, is_coinbase: false, tx_type: TxType::Transfer,
-            payload_hash: None, ..Default::default()
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                address: "y".into(),
+                amount: 2,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
+            fee: 0,
+            timestamp: 0,
+            is_coinbase: false,
+            tx_type: TxType::Transfer,
+            payload_hash: None,
+            ..Default::default()
         };
 
         let parents = vec!["dd".repeat(32)];
@@ -382,7 +419,8 @@ mod tests {
             let proof = MerkleTree::generate_proof(&hashes, i).unwrap();
             assert!(
                 MerkleTree::verify_proof(&hashes[i], &proof, &root),
-                "Proof for index {} must verify", i
+                "Proof for index {} must verify",
+                i
             );
         }
     }
@@ -426,8 +464,11 @@ mod tests {
             .collect();
         let _root = MerkleTree::calculate_root(hashes);
         let elapsed = start.elapsed();
-        assert!(elapsed.as_millis() < 5_000,
-            "10K leaves should hash in <5000ms, took {}ms", elapsed.as_millis());
+        assert!(
+            elapsed.as_millis() < 5_000,
+            "10K leaves should hash in <5000ms, took {}ms",
+            elapsed.as_millis()
+        );
     }
 
     #[test]

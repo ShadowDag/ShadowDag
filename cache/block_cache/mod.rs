@@ -3,26 +3,26 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::collections::{HashMap, VecDeque};
 use parking_lot::RwLock;
+use std::collections::{HashMap, VecDeque};
 
 pub const DEFAULT_CACHE_SIZE: usize = 1_024;
-pub const MAX_CACHE_SIZE:     usize = 16_384;
+pub const MAX_CACHE_SIZE: usize = 16_384;
 
 #[derive(Debug, Clone)]
 pub struct CachedBlock {
-    pub hash:       String,
-    pub height:     u64,
-    pub raw_data:   Vec<u8>,
+    pub hash: String,
+    pub height: u64,
+    pub raw_data: Vec<u8>,
     pub access_count: u64,
 }
 
 struct BlockCacheInner {
-    entries:   HashMap<String, CachedBlock>,
+    entries: HashMap<String, CachedBlock>,
     lru_queue: VecDeque<String>,
-    capacity:  usize,
-    hits:      u64,
-    misses:    u64,
+    capacity: usize,
+    hits: u64,
+    misses: u64,
 }
 
 impl BlockCacheInner {
@@ -50,11 +50,11 @@ impl BlockCache {
     pub fn new(capacity: usize) -> Self {
         Self {
             inner: RwLock::new(BlockCacheInner {
-                entries:   HashMap::new(),
+                entries: HashMap::new(),
                 lru_queue: VecDeque::new(),
-                capacity:  capacity.clamp(1, MAX_CACHE_SIZE),
-                hits:      0,
-                misses:    0,
+                capacity: capacity.clamp(1, MAX_CACHE_SIZE),
+                hits: 0,
+                misses: 0,
             }),
         }
     }
@@ -79,12 +79,15 @@ impl BlockCache {
         }
 
         inner.lru_queue.push_back(hash.to_string());
-        inner.entries.insert(hash.to_string(), CachedBlock {
-            hash:         hash.to_string(),
-            height,
-            raw_data,
-            access_count: 0,
-        });
+        inner.entries.insert(
+            hash.to_string(),
+            CachedBlock {
+                hash: hash.to_string(),
+                height,
+                raw_data,
+                access_count: 0,
+            },
+        );
     }
 
     /// Get a block from cache, updating LRU order. Returns a clone.
@@ -128,20 +131,30 @@ impl BlockCache {
         inner.misses = 0;
     }
 
-    pub fn size(&self)      -> usize { self.inner.read().entries.len() }
-    pub fn capacity(&self)  -> usize { self.inner.read().capacity }
-    pub fn is_full(&self)   -> bool  {
+    pub fn size(&self) -> usize {
+        self.inner.read().entries.len()
+    }
+    pub fn capacity(&self) -> usize {
+        self.inner.read().capacity
+    }
+    pub fn is_full(&self) -> bool {
         let inner = self.inner.read();
         inner.entries.len() >= inner.capacity
     }
 
-    pub fn hits(&self)   -> u64 { self.inner.read().hits }
-    pub fn misses(&self) -> u64 { self.inner.read().misses }
+    pub fn hits(&self) -> u64 {
+        self.inner.read().hits
+    }
+    pub fn misses(&self) -> u64 {
+        self.inner.read().misses
+    }
 
     pub fn hit_rate(&self) -> f64 {
         let inner = self.inner.read();
         let total = inner.hits + inner.misses;
-        if total == 0 { return 0.0; }
+        if total == 0 {
+            return 0.0;
+        }
         inner.hits as f64 / total as f64
     }
 
@@ -163,7 +176,9 @@ unsafe impl Sync for BlockCache {}
 mod tests {
     use super::*;
 
-    fn block_data(n: u8) -> Vec<u8> { vec![n; 100] }
+    fn block_data(n: u8) -> Vec<u8> {
+        vec![n; 100]
+    }
 
     #[test]
     fn insert_and_contains() {
@@ -257,7 +272,9 @@ mod tests {
             }));
         }
 
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         assert!(cache.size() <= 100);
     }
 }

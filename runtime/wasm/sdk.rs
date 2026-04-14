@@ -20,10 +20,10 @@
 //   - estimate_fee()         → fee in satoshis
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
-use ed25519_dalek::{SigningKey, Signer, VerifyingKey, Verifier, Signature};
-use rand::rngs::OsRng;
 use crate::errors::VmError;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use rand::rngs::OsRng;
+use sha2::{Digest, Sha256};
 
 // Re-use the canonical network-prefix helpers from
 // `domain::address::address`. They're the single source of truth for
@@ -34,8 +34,8 @@ use crate::domain::address::address::{network_prefix, prefix_from_address};
 /// Keypair result (all hex-encoded)
 pub struct WasmKeypair {
     pub private_key: String,
-    pub public_key:  String,
-    pub address:     String,
+    pub public_key: String,
+    pub address: String,
 }
 
 /// Transaction hash result
@@ -69,7 +69,7 @@ pub fn generate_keypair(network: &str) -> Result<WasmKeypair, VmError> {
 
     Ok(WasmKeypair {
         private_key: sk_hex,
-        public_key:  pk_hex,
+        public_key: pk_hex,
         address,
     })
 }
@@ -114,10 +114,11 @@ pub fn validate_address(address: &str) -> bool {
     if address.len() < 43 || address.len() > 64 {
         return false;
     }
-    let valid_prefix = address.starts_with("SD1")
-        || address.starts_with("ST1")
-        || address.starts_with("SR1");
-    if !valid_prefix { return false; }
+    let valid_prefix =
+        address.starts_with("SD1") || address.starts_with("ST1") || address.starts_with("SR1");
+    if !valid_prefix {
+        return false;
+    }
 
     // Check hex portion
     let hex_part = &address[3..];
@@ -143,17 +144,13 @@ pub fn sign_message(private_key_hex: &str, message: &[u8]) -> Result<WasmSignatu
     let pk_hex = hex::encode(signing_key.verifying_key().to_bytes());
 
     Ok(WasmSignature {
-        signature:  hex::encode(signature.to_bytes()),
+        signature: hex::encode(signature.to_bytes()),
         public_key: pk_hex,
     })
 }
 
 /// Verify a signature
-pub fn verify_signature(
-    public_key_hex: &str,
-    message:        &[u8],
-    signature_hex:  &str,
-) -> bool {
+pub fn verify_signature(public_key_hex: &str, message: &[u8], signature_hex: &str) -> bool {
     let pk_bytes = match hex::decode(public_key_hex) {
         Ok(b) if b.len() == 32 => b,
         _ => return false,
@@ -182,9 +179,9 @@ pub fn verify_signature(
 
 /// Compute transaction hash from components
 pub fn compute_tx_hash(
-    inputs:    &[(String, u32)], // (txid, index)
-    outputs:   &[(String, u64)], // (address, amount)
-    fee:       u64,
+    inputs: &[(String, u32)],  // (txid, index)
+    outputs: &[(String, u64)], // (address, amount)
+    fee: u64,
     timestamp: u64,
 ) -> WasmTxHash {
     let mut h = Sha256::new();
@@ -205,7 +202,9 @@ pub fn compute_tx_hash(
         h.update(amount.to_le_bytes());
     }
 
-    WasmTxHash { hash: hex::encode(h.finalize()) }
+    WasmTxHash {
+        hash: hex::encode(h.finalize()),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -266,21 +265,33 @@ pub fn format_amount(satoshis: u64) -> String {
 
 /// Parse SDAG string to satoshis
 pub fn parse_amount(sdag_str: &str) -> Result<u64, VmError> {
-    let s = sdag_str.trim().trim_end_matches(" SDAG").trim_end_matches(" sdag");
+    let s = sdag_str
+        .trim()
+        .trim_end_matches(" SDAG")
+        .trim_end_matches(" sdag");
     let parts: Vec<&str> = s.split('.').collect();
     match parts.len() {
         1 => {
-            let whole: u64 = parts[0].parse().map_err(|e| VmError::Other(format!("{}", e)))?;
-            whole.checked_mul(100_000_000).ok_or(VmError::Other("Overflow".to_string()))
+            let whole: u64 = parts[0]
+                .parse()
+                .map_err(|e| VmError::Other(format!("{}", e)))?;
+            whole
+                .checked_mul(100_000_000)
+                .ok_or(VmError::Other("Overflow".to_string()))
         }
         2 => {
-            let whole: u64 = parts[0].parse().map_err(|e| VmError::Other(format!("{}", e)))?;
+            let whole: u64 = parts[0]
+                .parse()
+                .map_err(|e| VmError::Other(format!("{}", e)))?;
             if parts[1].len() > 8 {
                 return Err(VmError::Other("Max 8 decimal places".to_string()));
             }
             let frac_str = format!("{:0<8}", parts[1]);
-            let frac: u64 = frac_str[..8].parse().map_err(|e| VmError::Other(format!("{}", e)))?;
-            whole.checked_mul(100_000_000)
+            let frac: u64 = frac_str[..8]
+                .parse()
+                .map_err(|e| VmError::Other(format!("{}", e)))?;
+            whole
+                .checked_mul(100_000_000)
                 .and_then(|w| w.checked_add(frac))
                 .ok_or(VmError::Other("Overflow".to_string()))
         }
@@ -413,9 +424,15 @@ mod tests {
     #[test]
     fn address_network_prefixes() {
         let kp = generate_keypair("mainnet").unwrap();
-        assert!(generate_address(&kp.public_key, "mainnet").unwrap().starts_with("SD1"));
-        assert!(generate_address(&kp.public_key, "testnet").unwrap().starts_with("ST1"));
-        assert!(generate_address(&kp.public_key, "regtest").unwrap().starts_with("SR1"));
+        assert!(generate_address(&kp.public_key, "mainnet")
+            .unwrap()
+            .starts_with("SD1"));
+        assert!(generate_address(&kp.public_key, "testnet")
+            .unwrap()
+            .starts_with("ST1"));
+        assert!(generate_address(&kp.public_key, "regtest")
+            .unwrap()
+            .starts_with("SR1"));
     }
 
     #[test]
@@ -456,7 +473,11 @@ mod tests {
     fn verify_fails_wrong_message() {
         let kp = generate_keypair("mainnet").unwrap();
         let sig = sign_message(&kp.private_key, b"original").unwrap();
-        assert!(!verify_signature(&sig.public_key, b"tampered", &sig.signature));
+        assert!(!verify_signature(
+            &sig.public_key,
+            b"tampered",
+            &sig.signature
+        ));
     }
 
     #[test]
@@ -503,11 +524,17 @@ mod tests {
 
         let testnet = generate_stealth_address("ST1testnetbase").unwrap();
         assert!(testnet.starts_with("ST1s"), "got: {}", testnet);
-        assert!(!testnet.starts_with("SD1"), "testnet stealth must not be tagged mainnet");
+        assert!(
+            !testnet.starts_with("SD1"),
+            "testnet stealth must not be tagged mainnet"
+        );
 
         let regtest = generate_stealth_address("SR1regtestbase").unwrap();
         assert!(regtest.starts_with("SR1s"), "got: {}", regtest);
-        assert!(!regtest.starts_with("SD1"), "regtest stealth must not be tagged mainnet");
+        assert!(
+            !regtest.starts_with("SD1"),
+            "regtest stealth must not be tagged mainnet"
+        );
     }
 
     #[test]
@@ -545,9 +572,12 @@ mod tests {
 
     #[test]
     fn contract_call_encoding() {
-        let encoded = encode_contract_call("transfer(address,uint256)", &[&[0x01; 20], &42u64.to_be_bytes()]);
+        let encoded = encode_contract_call(
+            "transfer(address,uint256)",
+            &[&[0x01; 20], &42u64.to_be_bytes()],
+        );
         assert_eq!(encoded.len(), 4 + 32 + 32); // 4-byte selector + 2 args
-        // Selector is first 4 bytes of SHA256("transfer(address,uint256)")
+                                                // Selector is first 4 bytes of SHA256("transfer(address,uint256)")
         assert_eq!(encoded.len(), 68);
     }
 
@@ -570,11 +600,17 @@ mod tests {
 
         let testnet = compute_contract_address("ST1deployer", b"code", 1).unwrap();
         assert!(testnet.starts_with("ST1c"), "got: {}", testnet);
-        assert!(!testnet.starts_with("SD1"), "testnet contract must not be tagged mainnet");
+        assert!(
+            !testnet.starts_with("SD1"),
+            "testnet contract must not be tagged mainnet"
+        );
 
         let regtest = compute_contract_address("SR1deployer", b"code", 1).unwrap();
         assert!(regtest.starts_with("SR1c"), "got: {}", regtest);
-        assert!(!regtest.starts_with("SD1"), "regtest contract must not be tagged mainnet");
+        assert!(
+            !regtest.starts_with("SD1"),
+            "regtest contract must not be tagged mainnet"
+        );
     }
 
     #[test]

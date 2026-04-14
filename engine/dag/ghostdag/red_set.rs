@@ -3,18 +3,15 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{
-    DB, Options, WriteBatch, WriteOptions, ReadOptions,
-    SliceTransform
-};
-use std::collections::{HashSet, HashMap};
+use rocksdb::{Options, ReadOptions, SliceTransform, WriteBatch, WriteOptions, DB};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+pub use crate::engine::dag::ghostdag::ghostdag::GHOSTDAG_K;
 use crate::errors::{DagError, StorageError};
 use crate::slog_error;
-pub use crate::engine::dag::ghostdag::ghostdag::GHOSTDAG_K;
 
-const PFX_RED:  &[u8] = b"red:";
+const PFX_RED: &[u8] = b"red:";
 const PFX_RSET: &[u8] = b"rset:";
 
 pub struct RedSetStore {
@@ -28,10 +25,8 @@ impl RedSetStore {
         let mut opts = Options::default();
         opts.create_if_missing(true);
 
-        
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(5));
 
-        
         opts.increase_parallelism(4);
         opts.set_max_open_files(1000);
 
@@ -39,7 +34,6 @@ impl RedSetStore {
             Ok(db) => {
                 let mut write_opts = WriteOptions::default();
 
-                
                 write_opts.disable_wal(false);
 
                 let mut read_opts = ReadOptions::default();
@@ -61,7 +55,11 @@ impl RedSetStore {
     pub fn new_required(path: &str) -> Result<Self, DagError> {
         Self::new(path).ok_or_else(|| {
             slog_error!("ghostdag", "red_set_store_fatal_open", path => path);
-            StorageError::OpenFailed { path: path.to_string(), reason: "cannot open DB".to_string() }.into()
+            StorageError::OpenFailed {
+                path: path.to_string(),
+                reason: "cannot open DB".to_string(),
+            }
+            .into()
         })
     }
 
@@ -102,10 +100,7 @@ impl RedSetStore {
     pub fn exists(&self, hash: &str) -> bool {
         let key = Self::red_key(hash);
 
-        matches!(
-            self.db.get_pinned_opt(key, &self.read_opts),
-            Ok(Some(_))
-        )
+        matches!(self.db.get_pinned_opt(key, &self.read_opts), Ok(Some(_)))
     }
 
     #[inline(always)]
@@ -115,7 +110,9 @@ impl RedSetStore {
 
     #[inline(always)]
     pub fn add_to_red_set(&self, block: &str, member: &str) {
-        let _ = self.db.put_opt(Self::rset_key(block, member), b"1", &self.write_opts);
+        let _ = self
+            .db
+            .put_opt(Self::rset_key(block, member), b"1", &self.write_opts);
     }
 
     #[inline(always)]
@@ -177,7 +174,9 @@ impl RedSetStore {
                 Ok(kv) => kv,
                 Err(_) => break,
             };
-            if !k.starts_with(prefix) { break; }
+            if !k.starts_with(prefix) {
+                break;
+            }
             if let Ok(s) = std::str::from_utf8(&k[prefix.len()..]) {
                 set.insert(s.to_string());
             }

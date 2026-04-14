@@ -11,12 +11,12 @@
 // The corresponding public point V = v*G is what the sender uses for ECDH.
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::errors::CryptoError;
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
-use sha2::Sha256;
 use hmac::{Hmac, Mac};
-use crate::errors::CryptoError;
+use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -25,13 +25,13 @@ const VIEW_KEY_TAG: &[u8] = b"ShadowDAG_ViewKey_v1";
 #[derive(Clone, Debug)]
 pub struct ViewKey {
     /// The view private scalar on the curve
-    pub scalar:    Scalar,
+    pub scalar: Scalar,
     /// The corresponding public point V = scalar * G
-    pub public:    RistrettoPoint,
+    pub public: RistrettoPoint,
     /// Raw 32-byte view key (scalar encoding)
     pub key_bytes: [u8; 32],
     /// Hex-encoded view key
-    pub key:       String,
+    pub key: String,
 }
 
 impl ViewKey {
@@ -74,9 +74,9 @@ impl ViewKey {
     pub fn from_scalar(s: Scalar) -> Self {
         let key_bytes = s.to_bytes();
         Self {
-            scalar:    s,
-            public:    s * RISTRETTO_BASEPOINT_POINT,
-            key:       hex::encode(key_bytes),
+            scalar: s,
+            public: s * RISTRETTO_BASEPOINT_POINT,
+            key: hex::encode(key_bytes),
             key_bytes,
         }
     }
@@ -104,7 +104,7 @@ impl ViewKey {
             Err(_) => {
                 // Unreachable with HMAC-SHA256, but defensive: fall back to
                 // plain SHA-256 keyed hash so we never panic in production.
-                use sha2::{Sha256, Digest};
+                use sha2::{Digest, Sha256};
                 let mut h = Sha256::new();
                 h.update(VIEW_KEY_TAG);
                 h.update(data);
@@ -143,8 +143,8 @@ impl Drop for ViewKey {
         // Zero out key material
         self.key_bytes = [0u8; 32];
         self.key = String::new(); // Clear hex representation
-        // scalar is on the stack/register — can't fully zeroize Scalar in safe Rust
-        // but we clear the bytes representation above.
+                                  // scalar is on the stack/register — can't fully zeroize Scalar in safe Rust
+                                  // but we clear the bytes representation above.
     }
 }
 

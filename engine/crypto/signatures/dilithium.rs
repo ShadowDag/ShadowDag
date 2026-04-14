@@ -4,13 +4,10 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use pqcrypto_dilithium::dilithium3;
-use pqcrypto_traits::sign::{PublicKey, DetachedSignature};
+use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
 
 use rocksdb::{
-    DB, Options,
-    WriteOptions, ReadOptions,
-    SliceTransform, WriteBatch,
-    IteratorMode, Direction,
+    Direction, IteratorMode, Options, ReadOptions, SliceTransform, WriteBatch, WriteOptions, DB,
 };
 
 use std::path::Path;
@@ -30,12 +27,12 @@ const SIG_UPPER: &[u8] = b"sig:\xFF";
 pub struct DilithiumKeypair {
     pub public_key: dilithium3::PublicKey,
     pub secret_key: dilithium3::SecretKey,
-    pub pk_hex:     String,
+    pub pk_hex: String,
 }
 
 pub struct DilithiumSignatureData {
-    pub signature:  dilithium3::DetachedSignature,
-    pub sig_hex:    String,
+    pub signature: dilithium3::DetachedSignature,
+    pub sig_hex: String,
 }
 
 // ─────────────────────────────────────────
@@ -45,7 +42,6 @@ pub struct DilithiumSignatureData {
 pub struct DilithiumSigner;
 
 impl DilithiumSigner {
-
     #[inline(always)]
     pub fn generate_keypair() -> DilithiumKeypair {
         let (pk, sk) = dilithium3::keypair();
@@ -70,15 +66,15 @@ impl DilithiumSigner {
     #[inline(always)]
     pub fn verify(
         message: &[u8],
-        sig:     &dilithium3::DetachedSignature,
-        pk:      &dilithium3::PublicKey,
+        sig: &dilithium3::DetachedSignature,
+        pk: &dilithium3::PublicKey,
     ) -> bool {
         dilithium3::verify_detached_signature(sig, message, pk).is_ok()
     }
 
     #[inline(always)]
     pub fn sign_and_verify(message: &[u8]) -> bool {
-        let kp  = Self::generate_keypair();
+        let kp = Self::generate_keypair();
         let sig = Self::sign(message, &kp.secret_key);
         Self::verify(message, &sig.signature, &kp.public_key)
     }
@@ -100,7 +96,6 @@ pub struct DilithiumStore {
 }
 
 impl DilithiumStore {
-
     pub fn new(path: &str) -> Result<Self, crate::errors::StorageError> {
         let mut opts = Options::default();
 
@@ -110,16 +105,17 @@ impl DilithiumStore {
         opts.increase_parallelism(
             std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4) as i32
+                .unwrap_or(4) as i32,
         );
 
         opts.optimize_level_style_compaction(256 * 1024 * 1024);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| crate::errors::StorageError::OpenFailed {
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| {
+            crate::errors::StorageError::OpenFailed {
                 path: path.to_string(),
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         let mut write_opts = WriteOptions::default();
         write_opts.disable_wal(false);
@@ -128,7 +124,11 @@ impl DilithiumStore {
         read_opts.fill_cache(true);
         read_opts.set_prefix_same_as_start(true);
 
-        Ok(Self { db, write_opts, read_opts })
+        Ok(Self {
+            db,
+            write_opts,
+            read_opts,
+        })
     }
 
     // ─────────────────────────────────────────
@@ -157,7 +157,8 @@ impl DilithiumStore {
 
     pub fn get_signature(&self, key: &str) -> Option<String> {
         Self::with_key(SIG_PREFIX, key, |k| {
-            self.db.get_pinned_opt(k, &self.read_opts)
+            self.db
+                .get_pinned_opt(k, &self.read_opts)
                 .ok()
                 .flatten()
                 .and_then(|v| std::str::from_utf8(&v).ok().map(|s| s.to_string()))
@@ -172,7 +173,8 @@ impl DilithiumStore {
 
     pub fn get_signature_raw(&self, key: &str) -> Option<Vec<u8>> {
         Self::with_key(SIG_PREFIX, key, |k| {
-            self.db.get_pinned_opt(k, &self.read_opts)
+            self.db
+                .get_pinned_opt(k, &self.read_opts)
                 .ok()
                 .flatten()
                 .map(|v| v.to_vec())
@@ -188,7 +190,8 @@ impl DilithiumStore {
 
         for key in keys {
             let val = Self::with_key(SIG_PREFIX, key, |k| {
-                self.db.get_pinned_opt(k, &self.read_opts)
+                self.db
+                    .get_pinned_opt(k, &self.read_opts)
                     .ok()
                     .flatten()
                     .map(|v| v.to_vec())
@@ -206,7 +209,8 @@ impl DilithiumStore {
 
     pub fn signature_exists(&self, key: &str) -> bool {
         Self::with_key(SIG_PREFIX, key, |k| {
-            self.db.get_pinned_opt(k, &self.read_opts)
+            self.db
+                .get_pinned_opt(k, &self.read_opts)
                 .map(|v| v.is_some())
                 .unwrap_or(false)
         })
@@ -235,7 +239,9 @@ impl DilithiumStore {
     pub fn clear_signatures(&self) {
         let mut batch = WriteBatch::default();
 
-        let iter = self.db.iterator(IteratorMode::From(SIG_PREFIX, Direction::Forward));
+        let iter = self
+            .db
+            .iterator(IteratorMode::From(SIG_PREFIX, Direction::Forward));
 
         for item in iter {
             let (k, _) = match item {

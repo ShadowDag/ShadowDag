@@ -38,15 +38,9 @@ pub fn modexp_precompile(input: &[u8], gas_limit: u64) -> PrecompileResult {
     }
 
     // Parse lengths
-    let base_len = u64::from_le_bytes(
-        input[0..8].try_into().unwrap_or([0u8; 8])
-    ) as usize;
-    let exp_len = u64::from_le_bytes(
-        input[8..16].try_into().unwrap_or([0u8; 8])
-    ) as usize;
-    let mod_len = u64::from_le_bytes(
-        input[16..24].try_into().unwrap_or([0u8; 8])
-    ) as usize;
+    let base_len = u64::from_le_bytes(input[0..8].try_into().unwrap_or([0u8; 8])) as usize;
+    let exp_len = u64::from_le_bytes(input[8..16].try_into().unwrap_or([0u8; 8])) as usize;
+    let mod_len = u64::from_le_bytes(input[16..24].try_into().unwrap_or([0u8; 8])) as usize;
 
     // Safety: prevent absurdly large inputs
     if base_len > MAX_MODEXP_INPUT || exp_len > MAX_MODEXP_INPUT || mod_len > MAX_MODEXP_INPUT {
@@ -79,7 +73,10 @@ pub fn modexp_precompile(input: &[u8], gas_limit: u64) -> PrecompileResult {
             output: vec![],
             gas_used: gas_cost,
             success: false,
-            error: Some("modexp inputs limited to 128-bit (16 bytes); use U256 ops for larger values".into()),
+            error: Some(
+                "modexp inputs limited to 128-bit (16 bytes); use U256 ops for larger values"
+                    .into(),
+            ),
         };
     }
 
@@ -208,9 +205,9 @@ mod tests {
         input[0..8].copy_from_slice(&1u64.to_le_bytes()); // base_len = 1
         input[8..16].copy_from_slice(&1u64.to_le_bytes()); // exp_len = 1
         input[16..24].copy_from_slice(&2u64.to_le_bytes()); // mod_len = 2
-        input[24] = 2;     // base = 2
-        input[25] = 10;    // exp = 10
-        input[26] = 0x03;  // modulus = 1000 (0x03E8)
+        input[24] = 2; // base = 2
+        input[25] = 10; // exp = 10
+        input[26] = 0x03; // modulus = 1000 (0x03E8)
         input[27] = 0xE8;
 
         let result = modexp_precompile(&input, 1_000_000);
@@ -225,9 +222,9 @@ mod tests {
         input[0..8].copy_from_slice(&1u64.to_le_bytes());
         input[8..16].copy_from_slice(&1u64.to_le_bytes());
         input[16..24].copy_from_slice(&1u64.to_le_bytes());
-        input[24] = 5;  // base
-        input[25] = 3;  // exp
-        input[26] = 0;  // modulus = 0
+        input[24] = 5; // base
+        input[25] = 3; // exp
+        input[26] = 0; // modulus = 0
 
         let result = modexp_precompile(&input, 1_000_000);
         assert!(result.success);
@@ -241,9 +238,9 @@ mod tests {
         input[0..8].copy_from_slice(&1u64.to_le_bytes());
         input[8..16].copy_from_slice(&1u64.to_le_bytes());
         input[16..24].copy_from_slice(&1u64.to_le_bytes());
-        input[24] = 7;   // base
-        input[25] = 1;   // exp
-        input[26] = 10;  // modulus
+        input[24] = 7; // base
+        input[25] = 1; // exp
+        input[26] = 10; // modulus
 
         let result = modexp_precompile(&input, 1_000_000);
         assert!(result.success);

@@ -14,11 +14,17 @@ impl Emission {
     #[inline(always)]
     pub fn block_reward(height: u64) -> u64 {
         let reward = EmissionSchedule::block_reward(height);
-        if reward == 0 { return 0; }
+        if reward == 0 {
+            return 0;
+        }
 
         // MAX_SUPPLY enforcement
         let max_supply = crate::config::consensus::consensus_params::ConsensusParams::MAX_SUPPLY;
-        let emitted = if height == 0 { 0 } else { EmissionSchedule::total_emitted(height - 1) };
+        let emitted = if height == 0 {
+            0
+        } else {
+            EmissionSchedule::total_emitted(height - 1)
+        };
         if emitted >= max_supply {
             return 0; // Cap reached
         }

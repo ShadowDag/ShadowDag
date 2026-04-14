@@ -3,11 +3,7 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{
-    DB, Options,
-    WriteOptions, ReadOptions,
-    SliceTransform, WriteBatch,
-};
+use rocksdb::{Options, ReadOptions, SliceTransform, WriteBatch, WriteOptions, DB};
 
 use std::path::Path;
 
@@ -28,7 +24,6 @@ pub struct SchnorrStore {
 }
 
 impl SchnorrStore {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
@@ -41,16 +36,17 @@ impl SchnorrStore {
         opts.increase_parallelism(
             std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4) as i32
+                .unwrap_or(4) as i32,
         );
 
         opts.optimize_level_style_compaction(256 * 1024 * 1024);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| crate::errors::StorageError::OpenFailed {
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| {
+            crate::errors::StorageError::OpenFailed {
                 path: path.to_string(),
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         let mut write_opts = WriteOptions::default();
         write_opts.disable_wal(false);
@@ -61,7 +57,11 @@ impl SchnorrStore {
         read_opts.fill_cache(true);
         read_opts.set_prefix_same_as_start(true);
 
-        Ok(Self { db, write_opts, read_opts })
+        Ok(Self {
+            db,
+            write_opts,
+            read_opts,
+        })
     }
 
     // ─────────────────────────────────────────
@@ -115,7 +115,8 @@ impl SchnorrStore {
     #[must_use]
     pub fn get_signature_raw(&self, key: &str) -> Option<Vec<u8>> {
         Self::with_key(key, |k| {
-            self.db.get_pinned_opt(k, &self.read_opts)
+            self.db
+                .get_pinned_opt(k, &self.read_opts)
                 .ok()
                 .flatten()
                 .map(|v| v.to_vec())
@@ -126,7 +127,8 @@ impl SchnorrStore {
     #[must_use]
     pub fn get_signature_hex(&self, key: &str) -> Option<String> {
         Self::with_key(key, |k| {
-            self.db.get_pinned_opt(k, &self.read_opts)
+            self.db
+                .get_pinned_opt(k, &self.read_opts)
                 .ok()
                 .flatten()
                 .and_then(|v| std::str::from_utf8(&v).ok().map(|s| s.to_string()))
@@ -141,7 +143,8 @@ impl SchnorrStore {
     pub fn multi_get_signatures(&self, keys: &[&str]) -> Vec<Option<Vec<u8>>> {
         let db_keys = self.build_keys(keys);
 
-        self.db.multi_get(db_keys)
+        self.db
+            .multi_get(db_keys)
             .into_iter()
             .map(|res| match res {
                 Ok(Some(v)) => Some(v.to_vec()),
@@ -157,7 +160,8 @@ impl SchnorrStore {
     #[inline(always)]
     pub fn signature_exists(&self, key: &str) -> bool {
         Self::with_key(key, |k| {
-            self.db.get_pinned_opt(k, &self.read_opts)
+            self.db
+                .get_pinned_opt(k, &self.read_opts)
                 .map(|v| v.is_some())
                 .unwrap_or(false)
         })
@@ -194,7 +198,9 @@ impl SchnorrStore {
     pub fn clear_signatures(&self) {
         let iter = self.db.prefix_iterator(SIG_PREFIX);
         for (k, _) in iter.flatten() {
-            if !k.starts_with(SIG_PREFIX) { break; }
+            if !k.starts_with(SIG_PREFIX) {
+                break;
+            }
             let _ = self.db.delete(&*k);
         }
     }

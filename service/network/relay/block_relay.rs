@@ -3,17 +3,17 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options};
+use rocksdb::{Options, DB};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::errors::NetworkError;
 use crate::domain::block::block::Block;
-use crate::{slog_error, slog_warn};
-use crate::service::network::p2p::p2p::{P2PMessage, push_outbound};
-use crate::service::network::p2p::peer_manager::PeerManager;
+use crate::errors::NetworkError;
 use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
+use crate::service::network::p2p::p2p::{push_outbound, P2PMessage};
+use crate::service::network::p2p::peer_manager::PeerManager;
+use crate::{slog_error, slog_warn};
 
 pub const MAX_ORPHANS: usize = 1_024;
 
@@ -34,18 +34,18 @@ const PFX_ORPHAN: &[u8] = b"orphan:block:";
 const PFX_RELAY_BLOCK: &[u8] = b"relay:block:";
 const PFX_RELAY_PENDING: &[u8] = b"relay:pending:";
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone)]
 struct OrphanEntry {
-    block:       Block,
+    block: Block,
     received_at: u64,
 }
 
 pub struct BlockRelay {
-    db:           DB,
+    db: DB,
     _peer_manager: Arc<PeerManager>,
-    block_store:  Option<Arc<BlockStore>>,
+    block_store: Option<Arc<BlockStore>>,
 }
 
 impl BlockRelay {
@@ -57,12 +57,17 @@ impl BlockRelay {
     pub fn new(path: &str, peer_manager: Arc<PeerManager>) -> Result<Self, NetworkError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| NetworkError::Storage(crate::errors::StorageError::OpenFailed {
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| {
+            NetworkError::Storage(crate::errors::StorageError::OpenFailed {
                 path: path.to_string(),
                 reason: e.to_string(),
-            }))?;
-        Ok(Self { db, _peer_manager: peer_manager, block_store: None })
+            })
+        })?;
+        Ok(Self {
+            db,
+            _peer_manager: peer_manager,
+            block_store: None,
+        })
     }
 
     pub fn with_block_store(mut self, store: Arc<BlockStore>) -> Self {
@@ -106,13 +111,14 @@ impl BlockRelay {
         push_outbound(P2PMessage::Block { data: block_bytes });
 
         // Mark AFTER successful queue push (store timestamp for TTL pruning)
-        if let Err(e) = self.db.put(key.as_bytes(), &Self::now_bytes()) {
+        if let Err(e) = self.db.put(key.as_bytes(), Self::now_bytes()) {
             slog_error!("relay", "block_relay_db_put_error", error => e);
         }
 
         log::debug!(
             "[BlockRelay] Queued block {} (height {}) for broadcast",
-            &block.header.hash[..block.header.hash.len().min(8)], block.header.height
+            &block.header.hash[..block.header.hash.len().min(8)],
+            block.header.height
         );
     }
 
@@ -139,7 +145,7 @@ impl BlockRelay {
         // been validated yet. Callers must call mark_block_known() after
         // successful validation to promote from pending to known.
         // Store timestamp for TTL-based pruning of stale pending keys.
-        if let Err(e) = self.db.put(pending_key.as_bytes(), &Self::now_bytes()) {
+        if let Err(e) = self.db.put(pending_key.as_bytes(), Self::now_bytes()) {
             slog_warn!("relay", "receive_block_pending_put_error", hash => &block.header.hash, error => e);
         }
 
@@ -157,7 +163,8 @@ impl BlockRelay {
             // Genesis block: verify hash matches the network's known genesis
             // before relaying. A fake genesis with height=0 and no parents
             // could otherwise propagate across the network.
-            let known_genesis = crate::config::consensus::consensus_params::ConsensusParams::genesis_hash();
+            let known_genesis =
+                crate::config::consensus::consensus_params::ConsensusParams::genesis_hash();
             if !known_genesis.is_empty() && block.header.hash != known_genesis {
                 slog_warn!("relay", "fake_genesis_rejected",
                     claimed => &block.header.hash[..block.header.hash.len().min(16)],
@@ -174,14 +181,12 @@ impl BlockRelay {
             let _ = self.db.delete(pending_key.as_bytes());
             let _ = self.db.put(
                 format!("relay:block:{}", block.header.hash).as_bytes(),
-                &Self::now_bytes(),
+                Self::now_bytes(),
             );
             return true;
         }
 
-        let all_parents_known = block.header.parents.iter().all(|p| {
-            self.is_block_known(p)
-        });
+        let all_parents_known = block.header.parents.iter().all(|p| self.is_block_known(p));
 
         if all_parents_known {
             // Relay to other peers (gossip propagation).
@@ -311,9 +316,12 @@ impl BlockRelay {
                     continue;
                 }
 
-                let all_known = entry.block.header.parents.iter().all(|p| {
-                    resolved_hashes.contains(p) || self.is_block_known(p)
-                });
+                let all_known = entry
+                    .block
+                    .header
+                    .parents
+                    .iter()
+                    .all(|p| resolved_hashes.contains(p) || self.is_block_known(p));
 
                 if all_known {
                     let orphan_key = format!("orphan:block:{}", orphan_hash);
@@ -343,7 +351,7 @@ impl BlockRelay {
     /// Also cleans up the temporary "pending" marker set during receive_block().
     pub fn mark_block_known(&self, hash: &str) {
         let relay_key = format!("relay:block:{}", hash);
-        if let Err(e) = self.db.put(relay_key.as_bytes(), &Self::now_bytes()) {
+        if let Err(e) = self.db.put(relay_key.as_bytes(), Self::now_bytes()) {
             slog_error!("relay", "mark_block_known_error", hash => hash, error => e);
         }
         // Clean up pending marker (best-effort)
@@ -427,7 +435,8 @@ impl BlockRelay {
     }
 
     pub fn clear_orphan_pool(&self) {
-        let keys: Vec<Vec<u8>> = self.db
+        let keys: Vec<Vec<u8>> = self
+            .db
             .prefix_iterator(PFX_ORPHAN)
             .filter_map(|r| match r {
                 Ok((k, v)) => {
@@ -452,7 +461,8 @@ impl BlockRelay {
     }
 
     fn evict_oldest_orphan(&self) {
-        let oldest: Option<(u64, Vec<u8>)> = self.db
+        let oldest: Option<(u64, Vec<u8>)> = self
+            .db
             .prefix_iterator(PFX_ORPHAN)
             .filter_map(|r| match r {
                 Ok((k, v)) => {
@@ -541,40 +551,52 @@ impl BlockRelay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::domain::block::block::Block;
-    use crate::domain::block::block_header::BlockHeader;
     use crate::domain::block::block_body::BlockBody;
+    use crate::domain::block::block_header::BlockHeader;
     use crate::service::network::p2p::peer_manager::PeerManager;
+    use std::sync::Arc;
 
     fn make_relay() -> BlockRelay {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = format!("/tmp/test_relay_v8_{}_{}", std::process::id(), id);
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "test_relay_v9_{}_{}_{}",
+            std::process::id(),
+            id,
+            now_nanos
+        ));
+        let path_str = path.to_string_lossy().to_string();
         let pm = Arc::new(PeerManager::new_temp());
-        BlockRelay::new(&path, pm).expect("BlockRelay::new failed")
+        BlockRelay::new(&path_str, pm).expect("BlockRelay::new failed")
     }
 
     fn make_block(hash: &str, parents: Vec<&str>, height: u64) -> Block {
         Block {
             header: BlockHeader {
-                version:     1,
-                hash:        hash.to_string(),
-                parents:     parents.into_iter().map(|s| s.to_string()).collect(),
+                version: 1,
+                hash: hash.to_string(),
+                parents: parents.into_iter().map(|s| s.to_string()).collect(),
                 merkle_root: "root".to_string(),
-                timestamp:   1_735_689_600,
-                nonce:       0,
-                difficulty:  0,
+                timestamp: 1_735_689_600,
+                nonce: 0,
+                difficulty: 0,
                 height,
-                blue_score:      0,
+                blue_score: 0,
                 selected_parent: None,
                 utxo_commitment: None,
                 extra_nonce: 0,
                 receipt_root: None,
                 state_root: None,
             },
-            body: BlockBody { transactions: vec![] },
+            body: BlockBody {
+                transactions: vec![],
+            },
         }
     }
 
@@ -586,7 +608,10 @@ mod tests {
         let orphan = make_block("child_hash", vec!["unknown_parent"], 1);
         let result = relay.receive_block(orphan);
         assert!(!result, "Block with unknown parent must go to orphan pool");
-        assert!(relay.is_orphan("child_hash"), "Block must be in orphan pool");
+        assert!(
+            relay.is_orphan("child_hash"),
+            "Block must be in orphan pool"
+        );
     }
 
     #[test]
@@ -603,7 +628,10 @@ mod tests {
         let resolved = relay.resolve_orphans("parent_a");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].header.hash, "orphan_b");
-        assert!(!relay.is_orphan("orphan_b"), "Resolved block must be removed from pool");
+        assert!(
+            !relay.is_orphan("orphan_b"),
+            "Resolved block must be removed from pool"
+        );
     }
 
     #[test]
@@ -623,8 +651,14 @@ mod tests {
 
         let resolved = relay.resolve_orphans("root");
         let hashes: Vec<&str> = resolved.iter().map(|b| b.header.hash.as_str()).collect();
-        assert!(hashes.contains(&"child_a"), "child_a should resolve (parent root is known)");
-        assert!(hashes.contains(&"child_b"), "child_b should cascade-resolve (child_a now known)");
+        assert!(
+            hashes.contains(&"child_a"),
+            "child_a should resolve (parent root is known)"
+        );
+        assert!(
+            hashes.contains(&"child_b"),
+            "child_b should cascade-resolve (child_a now known)"
+        );
         assert!(!relay.is_orphan("child_a"));
         assert!(!relay.is_orphan("child_b"));
     }
@@ -642,7 +676,10 @@ mod tests {
         relay.add_to_orphan_pool(block);
 
         let resolved = relay.resolve_orphans("parent_x");
-        assert!(resolved.is_empty(), "Block with a missing parent must stay orphaned");
+        assert!(
+            resolved.is_empty(),
+            "Block with a missing parent must stay orphaned"
+        );
         assert!(relay.is_orphan("needs_both"));
     }
 
@@ -654,7 +691,10 @@ mod tests {
             vec![],
             0,
         );
-        assert!(relay.receive_block(genesis), "Genesis must be accepted immediately");
+        assert!(
+            relay.receive_block(genesis),
+            "Genesis must be accepted immediately"
+        );
     }
 
     #[test]

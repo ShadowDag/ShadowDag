@@ -15,7 +15,7 @@ pub trait KeyValueStore: Send + Sync {
 }
 
 use std::collections::HashMap;
-use std::sync::{RwLock, Arc};
+use std::sync::{Arc, RwLock};
 
 pub struct MemoryStore {
     data: RwLock<HashMap<Vec<u8>, Vec<u8>>>,
@@ -29,31 +29,40 @@ impl Default for MemoryStore {
 
 impl MemoryStore {
     pub fn new() -> Self {
-        Self { data: RwLock::new(HashMap::new()) }
+        Self {
+            data: RwLock::new(HashMap::new()),
+        }
     }
 }
 
 impl KeyValueStore for MemoryStore {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        let guard = self.data.read()
+        let guard = self
+            .data
+            .read()
             .map_err(|e| StorageError::LockPoisoned(e.to_string()))?;
         Ok(guard.get(key).cloned())
     }
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
-        self.data.write()
+        self.data
+            .write()
             .map_err(|e| StorageError::LockPoisoned(e.to_string()))?
             .insert(key.to_vec(), value.to_vec());
         Ok(())
     }
     fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
-        self.data.write()
+        self.data
+            .write()
             .map_err(|e| StorageError::LockPoisoned(e.to_string()))?
             .remove(key);
         Ok(())
     }
 }
 
-pub enum StorageBackend { Memory, RocksDB(String) }
+pub enum StorageBackend {
+    Memory,
+    RocksDB(String),
+}
 
 /// RocksDB-backed KeyValueStore implementation.
 /// Uses the REAL RocksDB — data persists across restarts.
@@ -65,8 +74,10 @@ impl RocksStore {
     pub fn new(path: &str) -> Result<Self, StorageError> {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
-        let db = rocksdb::DB::open(&opts, path)
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = rocksdb::DB::open(&opts, path).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
         Ok(Self { db: Arc::new(db) })
     }
 }
@@ -112,8 +123,7 @@ impl StorageManager {
     }
 
     pub fn memory() -> Self {
-        Self::new(StorageBackend::Memory)
-            .expect("MemoryStore creation cannot fail")
+        Self::new(StorageBackend::Memory).expect("MemoryStore creation cannot fail")
     }
 
     pub fn rocksdb(path: &str) -> Result<Self, StorageError> {

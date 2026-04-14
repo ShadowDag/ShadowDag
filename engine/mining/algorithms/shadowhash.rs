@@ -16,7 +16,7 @@
 // GPU miners can efficiently pipeline the stages.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest as Sha2Digest};
+use sha2::{Digest as Sha2Digest, Sha256};
 use sha3::Sha3_256;
 
 use crate::domain::block::block::Block;
@@ -43,32 +43,47 @@ pub fn shadow_hash(block: &Block) -> String {
 /// use shadow_hash_raw_full() with explicit extra_nonce.
 #[deprecated(note = "Use shadow_hash_raw_full() with explicit extra_nonce")]
 pub fn shadow_hash_raw(
-    version:     u32,
-    height:      u64,
-    timestamp:   u64,
-    nonce:       u64,
-    difficulty:  u64,
+    version: u32,
+    height: u64,
+    timestamp: u64,
+    nonce: u64,
+    difficulty: u64,
     merkle_root: &str,
-    parents:     &[String],
+    parents: &[String],
 ) -> String {
-    shadow_hash_raw_full(version, height, timestamp, nonce, 0, difficulty, merkle_root, parents)
+    shadow_hash_raw_full(
+        version,
+        height,
+        timestamp,
+        nonce,
+        0,
+        difficulty,
+        merkle_root,
+        parents,
+    )
 }
 
 /// Hash from raw header fields including extra_nonce.
 /// This is the canonical hash function — ALL validation must use this.
 #[allow(clippy::too_many_arguments)]
 pub fn shadow_hash_raw_full(
-    version:      u32,
-    height:       u64,
-    timestamp:    u64,
-    nonce:        u64,
-    extra_nonce:  u64,
-    difficulty:   u64,
-    merkle_root:  &str,
-    parents:      &[String],
+    version: u32,
+    height: u64,
+    timestamp: u64,
+    nonce: u64,
+    extra_nonce: u64,
+    difficulty: u64,
+    merkle_root: &str,
+    parents: &[String],
 ) -> String {
     let mut bytes = serialize_header_raw(
-        version, height, timestamp, nonce, difficulty, merkle_root, parents,
+        version,
+        height,
+        timestamp,
+        nonce,
+        difficulty,
+        merkle_root,
+        parents,
     );
     bytes.extend_from_slice(&extra_nonce.to_le_bytes());
     shadow_hash_bytes(&bytes)
@@ -95,7 +110,8 @@ fn shadow_hash_bytes(data: &[u8]) -> String {
 
     // Mix scratchpad entries (memory-hard: random access pattern)
     for round in 0..MIX_ROUNDS {
-        let idx = (round1[round % 32] as usize * 256 + round1[(round + 1) % 32] as usize) % (SCRATCHPAD_SIZE - 32);
+        let idx = (round1[round % 32] as usize * 256 + round1[(round + 1) % 32] as usize)
+            % (SCRATCHPAD_SIZE - 32);
         let mut mix = [0u8; 32];
         mix.copy_from_slice(&scratchpad[idx..idx + 32]);
 
@@ -118,14 +134,15 @@ fn shadow_hash_bytes(data: &[u8]) -> String {
     // ── Round 2.5: Anti-ASIC hardening (data-dependent branching) ──
     // Uses the 16KB scratchpad from anti_asic.rs with 256 branch-heavy rounds.
     // This makes ASIC pipelining impractical.
-    let anti_asic_hash = crate::engine::mining::algorithms::anti_asic::AntiAsic::harden_bytes(&round2);
+    let anti_asic_hash =
+        crate::engine::mining::algorithms::anti_asic::AntiAsic::harden_bytes(&round2);
 
     // ── Round 3: SHA3-256 combining all previous rounds ──
     let mut sha3 = Sha3_256::new();
-    sha3.update(round1);           // SHA-256 output
-    sha3.update(round2);           // Scratchpad compression
-    sha3.update(anti_asic_hash);   // Anti-ASIC 16KB hardening
-    sha3.update(data);              // Original header
+    sha3.update(round1); // SHA-256 output
+    sha3.update(round2); // Scratchpad compression
+    sha3.update(anti_asic_hash); // Anti-ASIC 16KB hardening
+    sha3.update(data); // Original header
     let round3 = sha3.finalize();
 
     hex::encode(round3)
@@ -160,13 +177,13 @@ fn serialize_header(block: &Block) -> Vec<u8> {
 
 /// Serialize raw header fields to bytes (deterministic)
 fn serialize_header_raw(
-    version:     u32,
-    height:      u64,
-    timestamp:   u64,
-    nonce:       u64,
-    difficulty:  u64,
+    version: u32,
+    height: u64,
+    timestamp: u64,
+    nonce: u64,
+    difficulty: u64,
     merkle_root: &str,
-    parents:     &[String],
+    parents: &[String],
 ) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
 
@@ -217,15 +234,15 @@ mod tests {
 
     #[test]
     fn hash_raw_is_deterministic() {
-        let h1 = shadow_hash_raw(1, 0, 1735689600, 42, 4, "merkle", &[]);
-        let h2 = shadow_hash_raw(1, 0, 1735689600, 42, 4, "merkle", &[]);
+        let h1 = shadow_hash_raw_full(1, 0, 1735689600, 42, 0, 4, "merkle", &[]);
+        let h2 = shadow_hash_raw_full(1, 0, 1735689600, 42, 0, 4, "merkle", &[]);
         assert_eq!(h1, h2);
     }
 
     #[test]
     fn different_nonce_different_hash() {
-        let h1 = shadow_hash_raw(1, 0, 1735689600, 1, 4, "merkle", &[]);
-        let h2 = shadow_hash_raw(1, 0, 1735689600, 2, 4, "merkle", &[]);
+        let h1 = shadow_hash_raw_full(1, 0, 1735689600, 1, 0, 4, "merkle", &[]);
+        let h2 = shadow_hash_raw_full(1, 0, 1735689600, 2, 0, 4, "merkle", &[]);
         assert_ne!(h1, h2);
     }
 
@@ -253,8 +270,8 @@ mod tests {
     #[test]
     fn shadow_hash_includes_memory_hard_mixing() {
         // Verify that different data produces very different hashes
-        let h1 = shadow_hash_raw(1, 0, 0, 0, 1, "a", &[]);
-        let h2 = shadow_hash_raw(1, 0, 0, 0, 1, "b", &[]);
+        let h1 = shadow_hash_raw_full(1, 0, 0, 0, 0, 1, "a", &[]);
+        let h2 = shadow_hash_raw_full(1, 0, 0, 0, 0, 1, "b", &[]);
         assert_ne!(h1, h2);
 
         // And they look random (no obvious patterns)

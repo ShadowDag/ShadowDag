@@ -18,11 +18,10 @@
 //   - When tokens < 1 → message throttled (not dropped — peer can retry)
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::time::{Instant, Duration};
 use crate::service::network::p2p::protocol::{
-    ProtocolSession, HandshakeState, DEFAULT_BPS,
-    HANDSHAKE_TIMEOUT_SECS, PUZZLE_TIMEOUT_SECS,
+    HandshakeState, ProtocolSession, DEFAULT_BPS, HANDSHAKE_TIMEOUT_SECS, PUZZLE_TIMEOUT_SECS,
 };
+use std::time::{Duration, Instant};
 
 /// Default message rate limit (messages per second).
 pub const MSG_PER_SECOND_LIMIT: u32 = 100;
@@ -40,16 +39,16 @@ const BANDWIDTH_WINDOW_SECS: u64 = 60;
 const MAX_BYTES_PER_WINDOW: u64 = 100 * 1024 * 1024;
 
 pub struct Peer {
-    pub address:    String,
-    pub connected:  bool,
-    pub node_id:    String,
+    pub address: String,
+    pub connected: bool,
+    pub node_id: String,
     pub shadow_node: bool,
 
     /// Messages-per-second limit for this peer.
     pub message_per_second_limit: u32,
 
     /// Token bucket: current available tokens.
-    tokens:     f64,
+    tokens: f64,
     /// Token bucket: last refill time.
     last_refill: Instant,
 
@@ -86,17 +85,17 @@ impl Peer {
         let node_id = format!("node-{}", address);
         Self {
             address,
-            connected:               false,
+            connected: false,
             node_id,
-            shadow_node:             false,
+            shadow_node: false,
             message_per_second_limit: msg_per_sec,
-            tokens:                  burst as f64,
-            last_refill:             Instant::now(),
-            handshake_timeout_ms:    HANDSHAKE_TIMEOUT_MS,
-            connected_at:            None,
-            protocol:                ProtocolSession::new(is_outbound, DEFAULT_BPS),
-            bytes_this_window:       0,
-            window_start:            Instant::now(),
+            tokens: burst as f64,
+            last_refill: Instant::now(),
+            handshake_timeout_ms: HANDSHAKE_TIMEOUT_MS,
+            connected_at: None,
+            protocol: ProtocolSession::new(is_outbound, DEFAULT_BPS),
+            bytes_this_window: 0,
+            window_start: Instant::now(),
         }
     }
 
@@ -150,11 +149,12 @@ impl Peer {
                 let elapsed = t.elapsed();
                 // Use the appropriate timeout based on protocol state
                 let timeout_secs = match self.protocol.state {
-                    HandshakeState::AwaitPuzzleSolution |
-                    HandshakeState::AwaitPuzzleChallenge => PUZZLE_TIMEOUT_SECS,
-                    HandshakeState::Established          => return false,
-                    HandshakeState::Disconnecting        => return true,
-                    _                                    => HANDSHAKE_TIMEOUT_SECS,
+                    HandshakeState::AwaitPuzzleSolution | HandshakeState::AwaitPuzzleChallenge => {
+                        PUZZLE_TIMEOUT_SECS
+                    }
+                    HandshakeState::Established => return false,
+                    HandshakeState::Disconnecting => return true,
+                    _ => HANDSHAKE_TIMEOUT_SECS,
                 };
                 elapsed > Duration::from_secs(timeout_secs)
             }
@@ -185,12 +185,11 @@ impl Peer {
     // ── Rate limiting (token bucket) ────────────────────────────────────
 
     fn refill_tokens(&mut self) {
-        let now     = Instant::now();
+        let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        let burst   = (self.message_per_second_limit * 2) as f64;
+        let burst = (self.message_per_second_limit * 2) as f64;
 
-        self.tokens  = (self.tokens + elapsed * self.message_per_second_limit as f64)
-                        .min(burst);
+        self.tokens = (self.tokens + elapsed * self.message_per_second_limit as f64).min(burst);
         self.last_refill = now;
     }
 
@@ -258,7 +257,6 @@ impl Peer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
 
     #[test]
     fn rate_limit_allows_burst() {
@@ -266,7 +264,9 @@ mod tests {
 
         let mut allowed = 0;
         for _ in 0..20 {
-            if peer.allow_message() { allowed += 1; }
+            if peer.allow_message() {
+                allowed += 1;
+            }
         }
         assert!(allowed > 0, "Peer should allow burst messages");
     }
@@ -279,7 +279,10 @@ mod tests {
             peer.allow_message();
         }
 
-        assert!(!peer.allow_message(), "Peer should be throttled after burst");
+        assert!(
+            !peer.allow_message(),
+            "Peer should be throttled after burst"
+        );
     }
 
     #[test]
@@ -297,7 +300,10 @@ mod tests {
         peer.connected_at = Some(Instant::now() - Duration::from_secs(60));
         peer.protocol.state = HandshakeState::Established;
         peer.on_handshake_complete();
-        assert!(!peer.is_handshake_timed_out(), "Established peer must not be timed out");
+        assert!(
+            !peer.is_handshake_timed_out(),
+            "Established peer must not be timed out"
+        );
     }
 
     #[test]
@@ -347,8 +353,14 @@ mod tests {
     fn connect_does_not_mark_connected() {
         let mut peer = Peer::new("127.0.0.1:9342".into());
         peer.connect();
-        assert!(!peer.connected, "connect() must NOT set connected=true before handshake");
-        assert!(peer.connected_at.is_some(), "connect() must record connection time");
+        assert!(
+            !peer.connected,
+            "connect() must NOT set connected=true before handshake"
+        );
+        assert!(
+            peer.connected_at.is_some(),
+            "connect() must record connection time"
+        );
     }
 
     #[test]
@@ -358,7 +370,10 @@ mod tests {
         assert!(!peer.connected);
         peer.protocol.state = HandshakeState::Established;
         peer.on_handshake_complete();
-        assert!(peer.connected, "on_handshake_complete() must set connected=true");
+        assert!(
+            peer.connected,
+            "on_handshake_complete() must set connected=true"
+        );
     }
 
     #[test]

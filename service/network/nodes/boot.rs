@@ -4,17 +4,18 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::config::genesis::genesis::create_genesis_block_for;
-use crate::config::node::node_config::{NodeConfig, NetworkMode};
+use crate::config::node::node_config::{NetworkMode, NodeConfig};
+use crate::domain::utxo::utxo_set::UtxoSet;
 use crate::engine::dag::core::dag_manager::DagManager;
 use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
 use crate::infrastructure::storage::rocksdb::core::db::NodeDB;
 use crate::infrastructure::storage::rocksdb::utxo::utxo_store::UtxoStore;
-use crate::domain::utxo::utxo_set::UtxoSet;
+use crate::runtime::node_runtime::runtime_manager::RuntimeManager;
 use crate::service::mempool::core::mempool_manager::MempoolManager;
 use crate::service::network::p2p::p2p::P2P;
+use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::service::network::relay::tx_relay::sync_mempool as relay_sync_mempool;
 use crate::service::network::rpc::rpc_server::RpcServer;
-use crate::runtime::node_runtime::runtime_manager::RuntimeManager;
 
 // ✅ إضافات جديدة فقط
 use crate::runtime::event_bus::event_bus::EventBus;
@@ -22,12 +23,12 @@ use crate::runtime::scheduler::task_scheduler::TaskScheduler;
 use crate::runtime::vm::contracts::contract_storage::ContractStorage;
 use crate::runtime::vm::gas::gas_meter::GasMeter;
 
-use crate::indexes::utxo_index::UtxoIndex;
 use crate::indexes::tx_index::TxIndex;
+use crate::indexes::utxo_index::UtxoIndex;
 
-use std::sync::{Arc, Mutex};
 use crate::errors::NodeError;
-use crate::{slog_info, slog_warn, slog_error};
+use crate::{slog_error, slog_info, slog_warn};
+use std::sync::{Arc, Mutex};
 
 /// DEPRECATED: Use DaemonNode::mainnet().start() instead.
 /// DaemonNode includes crash recovery, unified FullNode pipeline, and
@@ -82,11 +83,12 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
     let dag = match DagManager::new(db.clone()) {
         Some(d) => d,
         None => {
-            return Err(NodeError::Init("[boot] FATAL: cannot create DAG manager".to_string()));
+            return Err(NodeError::Init(
+                "[boot] FATAL: cannot create DAG manager".to_string(),
+            ));
         }
     };
-    let blocks = BlockStore::new(db.clone())
-        .map_err(NodeError::Storage)?;
+    let blocks = BlockStore::new(db.clone()).map_err(NodeError::Storage)?;
     let utxo_store = match UtxoStore::new(db.clone()) {
         Ok(s) => s,
         Err(e) => {
@@ -95,7 +97,9 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
         }
     };
     let utxo_store_arc = Arc::new(utxo_store);
-    let utxo_set = UtxoSet::new(utxo_store_arc.clone() as Arc<dyn crate::domain::traits::utxo_backend::UtxoBackend>);
+    let utxo_set = UtxoSet::new(
+        utxo_store_arc.clone() as Arc<dyn crate::domain::traits::utxo_backend::UtxoBackend>
+    );
 
     // Idempotent genesis: only create if no existing chain found
     // Use fail-closed get_best_hash_strict so a corrupt/unreadable
@@ -106,7 +110,8 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
         Err(e) => {
             slog_error!("boot", "best_hash_read_failed", error => &e.to_string());
             return Err(NodeError::Init(format!(
-                "cannot read best_hash (possible DB corruption): {}", e
+                "cannot read best_hash (possible DB corruption): {}",
+                e
             )));
         }
     };
@@ -127,7 +132,9 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
             return Err(NodeError::Init(e.to_string()));
         }
         if !blocks.update_best_hash(&genesis.header.hash) {
-            return Err(NodeError::Init("failed to persist genesis best_hash".to_string()));
+            return Err(NodeError::Init(
+                "failed to persist genesis best_hash".to_string(),
+            ));
         }
         slog_info!("boot", "genesis_created");
     } else {
@@ -140,25 +147,37 @@ pub fn boot_with_config(cfg: NodeConfig) -> Result<(), NodeError> {
         slog_info!("boot", "existing_chain_found", best => existing_best.unwrap_or_default());
     }
 
-    let mut p2p = P2P::new_with_config(&cfg)?;
+    let peer_manager = Arc::new(
+        PeerManager::new_default_path(&cfg.peers_path_str())
+            .map_err(|e| NodeError::Init(format!("Failed to init peer manager: {}", e)))?,
+    );
+
+    let mut p2p = P2P::new_with_config_and_peers(&cfg, peer_manager.clone())?;
 
     // NOTE: bootstrap_for_network + discover_peers are called inside P2P::start(),
     // so we do NOT duplicate them here.
 
     relay_sync_mempool(&p2p.peers);
 
-    let mempool = MempoolManager::new_with_peers_path(db.clone(), &cfg.peers_path_str())
+    let mempool = MempoolManager::new_with_peer_manager(db.clone(), peer_manager.clone())
         .map_err(|e| NodeError::Init(e.to_string()))?;
 
     // Use network-specific peers path to prevent cross-network contamination
-    let rpc = RpcServer::new_for_network(cfg.rpc_port, &cfg.peers_path_str(), db.clone(), Some(&cfg.data_dir))
-        .map_err(|e| NodeError::Init(format!("Failed to init RPC server: {}", e)))?;
+    let rpc = RpcServer::new_for_network_with_peer_manager(
+        cfg.rpc_port,
+        peer_manager.clone(),
+        db.clone(),
+        Some(&cfg.data_dir),
+    )
+    .map_err(|e| NodeError::Init(format!("Failed to init RPC server: {}", e)))?;
     rpc.set_network_name(&format!("shadowdag-{}", cfg.network.name()));
     rpc.set_network_ports(cfg.p2p_port, cfg.rpc_port);
-    rpc.start().map_err(|e| NodeError::Init(format!("RPC start failed: {}", e)))?;
+    rpc.start()
+        .map_err(|e| NodeError::Init(format!("RPC start failed: {}", e)))?;
     slog_info!("boot", "rpc_server_started", port => cfg.rpc_port);
 
-    p2p.start().map_err(|e| NodeError::Init(format!("P2P start failed: {}", e)))?;
+    p2p.start()
+        .map_err(|e| NodeError::Init(format!("P2P start failed: {}", e)))?;
     slog_info!("boot", "p2p_listener_started", address => p2p.listen_addr);
 
     // Initialize persistent indexes with shared DB (auto-recovers from disk)

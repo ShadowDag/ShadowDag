@@ -3,7 +3,7 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options, WriteBatch};
+use rocksdb::{Options, WriteBatch, DB};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
@@ -31,7 +31,8 @@ impl OrderingStore {
                 Err(StorageError::OpenFailed {
                     path: path.to_string(),
                     reason: e.to_string(),
-                }.into())
+                }
+                .into())
             }
         }
     }
@@ -130,7 +131,6 @@ impl OrderingStore {
 
                 Self::sort_vec(&mut next_level, &blue_cache);
 
-                
                 for item in next_level {
                     let si = *blue_cache.get(&item).unwrap_or(&0);
 
@@ -152,7 +152,8 @@ impl OrderingStore {
         if ordered.len() != blocks.len() {
             return Err(DagError::Other(format!(
                 "ordering incomplete: {} of {} blocks (cycle or corruption)",
-                ordered.len(), blocks.len()
+                ordered.len(),
+                blocks.len()
             )));
         }
 

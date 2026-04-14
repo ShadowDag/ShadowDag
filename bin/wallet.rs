@@ -27,13 +27,13 @@ use parking_lot::Mutex;
 
 static UNLOCK_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-use shadowdag::service::wallet::core::wallet::{Wallet, EncryptedSeed};
-use shadowdag::service::wallet::storage::wallet_db::WalletDB;
-use shadowdag::infrastructure::storage::rocksdb::utxo::utxo_store::UtxoStore;
 use shadowdag::config::node::node_config::NetworkMode;
 use shadowdag::domain::address::invisible_wallet::InvisibleWallet;
-use shadowdag::runtime::vm::contracts::contract_package::ContractPackage;
 use shadowdag::errors::WalletError;
+use shadowdag::infrastructure::storage::rocksdb::utxo::utxo_store::UtxoStore;
+use shadowdag::runtime::vm::contracts::contract_package::ContractPackage;
+use shadowdag::service::wallet::core::wallet::{EncryptedSeed, Wallet};
+use shadowdag::service::wallet::storage::wallet_db::WalletDB;
 use shadowdag::slog_error;
 
 const MAX_SDAG_SATS: u64 = 21_000_000_000 * 100_000_000; // 21B SDAG in satoshis
@@ -53,15 +53,21 @@ fn safe_sdag_to_sats(input: &str) -> Option<u64> {
         None => (input, ""),
     };
 
-    let whole: u64 = if whole_str.is_empty() { 0 } else {
+    let whole: u64 = if whole_str.is_empty() {
+        0
+    } else {
         whole_str.parse().ok()?
     };
 
     // Pad or truncate fractional part to exactly 8 digits
     let mut frac_padded = String::with_capacity(8);
     for (i, ch) in frac_str.chars().enumerate() {
-        if i >= 8 { break; }
-        if !ch.is_ascii_digit() { return None; }
+        if i >= 8 {
+            break;
+        }
+        if !ch.is_ascii_digit() {
+            return None;
+        }
         frac_padded.push(ch);
     }
     while frac_padded.len() < 8 {
@@ -129,15 +135,22 @@ fn utxo_db_path() -> String {
 }
 
 fn save_encrypted_seed(enc: &EncryptedSeed) -> Result<(), WalletError> {
-    let dir = seed_path().parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
-    std::fs::create_dir_all(&dir).map_err(|e| WalletError::Other(format!("Cannot create dir: {}", e)))?;
-    let data = bincode::serialize(enc).map_err(|e| WalletError::Other(format!("Serialize error: {}", e)))?;
-    std::fs::write(seed_path(), &data).map_err(|e| WalletError::Other(format!("Write error: {}", e)))?;
+    let dir = seed_path()
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| WalletError::Other(format!("Cannot create dir: {}", e)))?;
+    let data = bincode::serialize(enc)
+        .map_err(|e| WalletError::Other(format!("Serialize error: {}", e)))?;
+    std::fs::write(seed_path(), &data)
+        .map_err(|e| WalletError::Other(format!("Write error: {}", e)))?;
     Ok(())
 }
 
 fn load_encrypted_seed() -> Result<EncryptedSeed, WalletError> {
-    let data = std::fs::read(seed_path()).map_err(|e| WalletError::Other(format!("Cannot read seed file: {}", e)))?;
+    let data = std::fs::read(seed_path())
+        .map_err(|e| WalletError::Other(format!("Cannot read seed file: {}", e)))?;
     bincode::deserialize(&data).map_err(|e| WalletError::Other(format!("Deserialize error: {}", e)))
 }
 
@@ -196,9 +209,8 @@ fn load_and_unlock_wallet() -> Result<Wallet, WalletError> {
     // Now acquire the mutex only for the DB-touching critical section.
     let _guard = UNLOCK_MUTEX.lock();
 
-    let db = WalletDB::new(&wallet_db_path()).map_err(|e| {
-        WalletError::Other(format!("cannot open wallet DB: {}", e))
-    })?;
+    let db = WalletDB::new(&wallet_db_path())
+        .map_err(|e| WalletError::Other(format!("cannot open wallet DB: {}", e)))?;
 
     // We need the address to look up the wallet. We can try to load it by
     // creating a fresh wallet, unlocking, and checking if we have a persisted
@@ -231,9 +243,15 @@ fn load_and_unlock_wallet() -> Result<Wallet, WalletError> {
         }
         Ok(None) => {
             // Don't silently create a new wallet — warn the user
-            eprintln!("Warning: no wallet found for address {} (network: {})", addr, wallet_network());
+            eprintln!(
+                "Warning: no wallet found for address {} (network: {})",
+                addr,
+                wallet_network()
+            );
             eprintln!("If you created this wallet on a different network, set SHADOWDAG_NETWORK accordingly.");
-            Err(WalletError::Other("wallet not found for current network".into()))
+            Err(WalletError::Other(
+                "wallet not found for current network".into(),
+            ))
         }
         Err(e) => Err(e),
     };
@@ -252,19 +270,19 @@ fn main() {
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
     match command {
-        "new" | "create"  => cmd_new(&args),
+        "new" | "create" => cmd_new(&args),
         "balance" | "bal" => cmd_balance(&args),
         "send" | "transfer" => cmd_send(&args),
-        "info"            => cmd_info(),
-        "stealth"         => cmd_stealth(&args),
-        "invisible"       => cmd_invisible(&args),
-        "export"          => cmd_export(),
-        "deploy"          => cmd_deploy(&args),
-        "deploy-package"  => cmd_deploy_package(&args),
-        "call"            => cmd_call(&args),
-        "receipt"         => cmd_receipt(&args),
-        "logs"            => cmd_logs(&args),
-        "verify"          => cmd_verify(&args),
+        "info" => cmd_info(),
+        "stealth" => cmd_stealth(&args),
+        "invisible" => cmd_invisible(&args),
+        "export" => cmd_export(),
+        "deploy" => cmd_deploy(&args),
+        "deploy-package" => cmd_deploy_package(&args),
+        "call" => cmd_call(&args),
+        "receipt" => cmd_receipt(&args),
+        "logs" => cmd_logs(&args),
+        "verify" => cmd_verify(&args),
         "version" | "--version" | "-v" => println!("ShadowDAG Wallet v1.0.0"),
         "help" | "--help" | "-h" => print_help(),
         _ => print_help(),
@@ -281,8 +299,10 @@ fn cmd_new(args: &[String]) {
     // Warn if the specified network doesn't match the SHADOWDAG_NETWORK env var
     let env_network = wallet_network();
     if network != env_network {
-        eprintln!("NOTE: Creating wallet for '{}' but SHADOWDAG_NETWORK='{}'",
-                  network, env_network);
+        eprintln!(
+            "NOTE: Creating wallet for '{}' but SHADOWDAG_NETWORK='{}'",
+            network, env_network
+        );
     }
 
     println!("======================================================");
@@ -393,18 +413,16 @@ fn cmd_balance(args: &[String]) {
 
     let db_path = utxo_db_path();
     match UtxoStore::new(db_path.as_str()) {
-        Ok(store) => {
-            match store.get_balance(&address) {
-                Ok(balance) => {
-                    let sdag = balance as f64 / 100_000_000.0;
-                    println!("Address : {}", address);
-                    println!("Balance : {:.8} SDAG ({} sats)", sdag, balance);
-                }
-                Err(e) => {
-                    eprintln!("Error querying balance: {}", e);
-                }
+        Ok(store) => match store.get_balance(&address) {
+            Ok(balance) => {
+                let sdag = balance as f64 / 100_000_000.0;
+                println!("Address : {}", address);
+                println!("Balance : {:.8} SDAG ({} sats)", sdag, balance);
             }
-        }
+            Err(e) => {
+                eprintln!("Error querying balance: {}", e);
+            }
+        },
         Err(e) => {
             slog_error!("wallet", "utxo_db_open_failed", path => &db_path, error => &e.to_string());
             eprintln!("Make sure a ShadowDAG node has been run at least once,");
@@ -436,7 +454,10 @@ fn validate_address(addr: &str) -> Result<(), String> {
     if after_net.starts_with("1s") || after_net.starts_with("1c") || after_net.starts_with("1m") {
         let hex_part = &after_net[2..];
         if hex_part.len() != 40 {
-            return Err(format!("Typed address hex part must be 40 characters, got {}", hex_part.len()));
+            return Err(format!(
+                "Typed address hex part must be 40 characters, got {}",
+                hex_part.len()
+            ));
         }
         if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err("Address contains invalid hex characters".into());
@@ -446,7 +467,10 @@ fn validate_address(addr: &str) -> Result<(), String> {
 
     // Standard addresses: 2-char prefix + 74 hex (version + hash + checksum)
     if after_net.len() != 74 {
-        return Err(format!("Standard address hex part must be 74 characters, got {}", after_net.len()));
+        return Err(format!(
+            "Standard address hex part must be 74 characters, got {}",
+            after_net.len()
+        ));
     }
     if !after_net.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("Address contains invalid hex characters".into());
@@ -463,25 +487,35 @@ fn cmd_send(args: &[String]) {
             }
             addr.clone()
         }
-        None => { eprintln!("Usage: shadowdag-wallet send <to_address> <amount> [fee]"); return; }
+        None => {
+            eprintln!("Usage: shadowdag-wallet send <to_address> <amount> [fee]");
+            return;
+        }
     };
     let amount_str = match args.get(3) {
         Some(s) => s.as_str(),
-        None => { eprintln!("Usage: shadowdag-wallet send <to_address> <amount> [fee]"); return; }
+        None => {
+            eprintln!("Usage: shadowdag-wallet send <to_address> <amount> [fee]");
+            return;
+        }
     };
     let amount = match safe_sdag_to_sats(amount_str) {
         Some(a) => a,
-        None => { eprintln!("Error: invalid amount (must be 0 < amount <= 21,000,000,000)"); return; }
+        None => {
+            eprintln!("Error: invalid amount (must be 0 < amount <= 21,000,000,000)");
+            return;
+        }
     };
-    let fee: u64 = args.get(4)
-        .and_then(|s| safe_sdag_to_sats(s))
-        .unwrap_or(1); // default 1 sat fee
+    let fee: u64 = args.get(4).and_then(|s| safe_sdag_to_sats(s)).unwrap_or(1); // default 1 sat fee
 
     // Load and unlock wallet — signing keys are derived from the encrypted
     // seed after password authentication. Private keys never leave the wallet.
     let mut wallet = match load_and_unlock_wallet() {
         Ok(w) => w,
-        Err(e) => { eprintln!("Cannot load wallet: {}", e); return; }
+        Err(e) => {
+            eprintln!("Cannot load wallet: {}", e);
+            return;
+        }
     };
 
     let from_address = wallet.address();
@@ -517,16 +551,32 @@ fn cmd_info() {
         Ok(wallet) => {
             println!("ShadowDAG Wallet Info");
             println!("-----------------------------");
-            println!("  Network    : {}", if wallet.address().starts_with("ST") { "testnet" }
-                     else if wallet.address().starts_with("SR") { "regtest" } else { "mainnet" });
+            println!(
+                "  Network    : {}",
+                if wallet.address().starts_with("ST") {
+                    "testnet"
+                } else if wallet.address().starts_with("SR") {
+                    "regtest"
+                } else {
+                    "mainnet"
+                }
+            );
             println!("  Address    : {}", wallet.address());
             println!("  Accounts   : {}", wallet.accounts().len());
             for acc in wallet.accounts() {
-                println!("    Account #{}: {} ({} addresses)",
-                         acc.index, acc.label, acc.addresses.len());
+                println!(
+                    "    Account #{}: {} ({} addresses)",
+                    acc.index,
+                    acc.label,
+                    acc.addresses.len()
+                );
                 for addr in &acc.addresses {
-                    println!("      {} {}{}", addr.address, addr.label,
-                             if addr.is_change { " (change)" } else { "" });
+                    println!(
+                        "      {} {}{}",
+                        addr.address,
+                        addr.label,
+                        if addr.is_change { " (change)" } else { "" }
+                    );
                 }
             }
             println!("  Locked     : {}", wallet.is_locked());
@@ -586,7 +636,9 @@ fn cmd_export() {
     match load_and_unlock_wallet() {
         Ok(wallet) => {
             let address = wallet.address();
-            let pub_key = wallet.accounts().first()
+            let pub_key = wallet
+                .accounts()
+                .first()
                 .and_then(|a| a.addresses.first())
                 .map(|a| a.public_key.as_str())
                 .unwrap_or("");
@@ -606,7 +658,11 @@ fn cmd_export() {
                              addr.address, addr.public_key, addr.is_change, comma);
                 }
                 println!("      ]");
-                let comma = if i + 1 < wallet.accounts().len() { "," } else { "" };
+                let comma = if i + 1 < wallet.accounts().len() {
+                    ","
+                } else {
+                    ""
+                };
                 println!("    }}{}", comma);
             }
             println!("  ]");
@@ -622,14 +678,23 @@ fn cmd_export() {
 fn cmd_deploy(args: &[String]) {
     let bytecode_hex = match args.get(2) {
         Some(v) => v,
-        None => { eprintln!("Usage: wallet deploy <bytecode_hex> [gas_limit] [value]"); return; }
+        None => {
+            eprintln!("Usage: wallet deploy <bytecode_hex> [gas_limit] [value]");
+            return;
+        }
     };
-    let gas_limit: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10_000_000);
+    let gas_limit: u64 = args
+        .get(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000_000);
     let value: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let bytecode = match hex::decode(bytecode_hex) {
         Ok(b) => b,
-        Err(e) => { eprintln!("Invalid bytecode hex: {}", e); return; }
+        Err(e) => {
+            eprintln!("Invalid bytecode hex: {}", e);
+            return;
+        }
     };
 
     println!("Deploying contract...");
@@ -640,7 +705,10 @@ fn cmd_deploy(args: &[String]) {
     // Build TX
     let mut wallet = match load_and_unlock_wallet() {
         Ok(w) => w,
-        Err(e) => { eprintln!("Wallet error: {}", e); return; }
+        Err(e) => {
+            eprintln!("Wallet error: {}", e);
+            return;
+        }
     };
 
     match wallet.build_deploy_tx(0, bytecode, value, gas_limit, 1000) {
@@ -657,18 +725,30 @@ fn cmd_deploy(args: &[String]) {
 fn cmd_call(args: &[String]) {
     let contract_addr = match args.get(2) {
         Some(v) => v,
-        None => { eprintln!("Usage: wallet call <contract_address> <calldata_hex> [gas_limit] [value]"); return; }
+        None => {
+            eprintln!("Usage: wallet call <contract_address> <calldata_hex> [gas_limit] [value]");
+            return;
+        }
     };
     let calldata_hex = match args.get(3) {
         Some(v) => v,
-        None => { eprintln!("Usage: wallet call <contract_address> <calldata_hex> [gas_limit] [value]"); return; }
+        None => {
+            eprintln!("Usage: wallet call <contract_address> <calldata_hex> [gas_limit] [value]");
+            return;
+        }
     };
-    let gas_limit: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10_000_000);
+    let gas_limit: u64 = args
+        .get(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000_000);
     let value: u64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let calldata = match hex::decode(calldata_hex) {
         Ok(b) => b,
-        Err(e) => { eprintln!("Invalid calldata hex: {}", e); return; }
+        Err(e) => {
+            eprintln!("Invalid calldata hex: {}", e);
+            return;
+        }
     };
 
     println!("Calling contract {}...", contract_addr);
@@ -678,7 +758,10 @@ fn cmd_call(args: &[String]) {
 
     let mut wallet = match load_and_unlock_wallet() {
         Ok(w) => w,
-        Err(e) => { eprintln!("Wallet error: {}", e); return; }
+        Err(e) => {
+            eprintln!("Wallet error: {}", e);
+            return;
+        }
     };
 
     match wallet.build_call_tx(0, contract_addr, calldata, value, gas_limit, 1000) {
@@ -694,7 +777,10 @@ fn cmd_call(args: &[String]) {
 fn cmd_receipt(args: &[String]) {
     let tx_hash = match args.get(2) {
         Some(v) => v,
-        None => { eprintln!("Usage: wallet receipt <tx_hash>"); return; }
+        None => {
+            eprintln!("Usage: wallet receipt <tx_hash>");
+            return;
+        }
     };
     println!("Fetching receipt for {}...", tx_hash);
     println!("  Use RPC: get_transaction_receipt {}", tx_hash);
@@ -712,24 +798,36 @@ fn cmd_logs(args: &[String]) {
     }
     println!("\n  Use RPC: get_logs with filter parameters");
     println!("  curl -X POST http://localhost:9332 \\");
-    println!("    -d '{{\"jsonrpc\":\"2.0\",\"method\":\"get_logs\",\"params\":[\"{}\"],\"id\":1}}'", address);
+    println!(
+        "    -d '{{\"jsonrpc\":\"2.0\",\"method\":\"get_logs\",\"params\":[\"{}\"],\"id\":1}}'",
+        address
+    );
 }
 
 fn cmd_deploy_package(args: &[String]) {
     let package_path = match args.get(2) {
         Some(v) => v,
-        None => { eprintln!("Usage: wallet deploy-package <package.json> [gas_limit]"); return; }
+        None => {
+            eprintln!("Usage: wallet deploy-package <package.json> [gas_limit]");
+            return;
+        }
     };
     let gas_limit: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let json = match std::fs::read_to_string(package_path) {
         Ok(j) => j,
-        Err(e) => { eprintln!("Failed to read {}: {}", package_path, e); return; }
+        Err(e) => {
+            eprintln!("Failed to read {}: {}", package_path, e);
+            return;
+        }
     };
 
     let package = match ContractPackage::from_json(&json) {
         Ok(p) => p,
-        Err(e) => { eprintln!("Invalid package: {}", e); return; }
+        Err(e) => {
+            eprintln!("Invalid package: {}", e);
+            return;
+        }
     };
 
     if !package.verify() {
@@ -737,17 +835,32 @@ fn cmd_deploy_package(args: &[String]) {
         return;
     }
 
-    let effective_gas = if gas_limit > 0 { gas_limit } else { package.estimated_deploy_gas() };
+    let effective_gas = if gas_limit > 0 {
+        gas_limit
+    } else {
+        package.estimated_deploy_gas()
+    };
 
     println!("Deploying contract from package: {}", package.name);
-    println!("  Bytecode:    {} bytes (hash: {}...)", package.code_size(), &package.bytecode_hash[..16]);
+    println!(
+        "  Bytecode:    {} bytes (hash: {}...)",
+        package.code_size(),
+        &package.bytecode_hash[..16]
+    );
     println!("  VM version:  {}", package.vm_version);
-    println!("  Gas limit:   {} ({})", effective_gas, if gas_limit > 0 { "custom" } else { "estimated" });
+    println!(
+        "  Gas limit:   {} ({})",
+        effective_gas,
+        if gas_limit > 0 { "custom" } else { "estimated" }
+    );
     println!("  Verified:    bytecode integrity OK");
 
     let mut wallet = match load_and_unlock_wallet() {
         Ok(w) => w,
-        Err(e) => { eprintln!("Wallet error: {}", e); return; }
+        Err(e) => {
+            eprintln!("Wallet error: {}", e);
+            return;
+        }
     };
 
     match wallet.build_deploy_tx(0, package.bytecode.clone(), 0, effective_gas, 1000) {
@@ -764,28 +877,44 @@ fn cmd_deploy_package(args: &[String]) {
 fn cmd_verify(args: &[String]) {
     let address = match args.get(2) {
         Some(v) => v,
-        None => { eprintln!("Usage: wallet verify <contract_address> <package.json>"); return; }
+        None => {
+            eprintln!("Usage: wallet verify <contract_address> <package.json>");
+            return;
+        }
     };
     let package_path = match args.get(3) {
         Some(v) => v,
-        None => { eprintln!("Usage: wallet verify <contract_address> <package.json>"); return; }
+        None => {
+            eprintln!("Usage: wallet verify <contract_address> <package.json>");
+            return;
+        }
     };
 
     let json = match std::fs::read_to_string(package_path) {
         Ok(j) => j,
-        Err(e) => { eprintln!("Failed to read {}: {}", package_path, e); return; }
+        Err(e) => {
+            eprintln!("Failed to read {}: {}", package_path, e);
+            return;
+        }
     };
 
     let package = match ContractPackage::from_json(&json) {
         Ok(p) => p,
-        Err(e) => { eprintln!("Invalid package: {}", e); return; }
+        Err(e) => {
+            eprintln!("Invalid package: {}", e);
+            return;
+        }
     };
 
     println!("Verifying contract {} against {}...", address, package_path);
     println!("  Package name:     {}", package.name);
     println!("  Package hash:     {}...", &package.bytecode_hash[..16]);
     println!("  VM version:       {}", package.vm_version);
-    println!("\n  Use RPC: verify_contract {} '{}'", address, json.replace('\n', ""));
+    println!(
+        "\n  Use RPC: verify_contract {} '{}'",
+        address,
+        json.replace('\n', "")
+    );
     println!("\n  curl -X POST http://localhost:9332 \\");
     println!("    -d '{{\"jsonrpc\":\"2.0\",\"method\":\"verify_contract\",\"params\":[\"{}\",<package_json>],\"id\":1}}'", address);
 }
@@ -820,7 +949,9 @@ fn print_help() {
     println!("  help                    Show this help");
     println!();
     println!("ENVIRONMENT:");
-    println!("  SHADOWDAG_NETWORK       Network to use: mainnet, testnet, regtest (default: mainnet)");
+    println!(
+        "  SHADOWDAG_NETWORK       Network to use: mainnet, testnet, regtest (default: mainnet)"
+    );
     println!("  SHADOWDAG_WALLET_DB     Path to wallet database (default: ~/.shadowdag/wallet_db)");
     println!("  SHADOWDAG_WALLET_DIR    Path to wallet directory (default: ~/.shadowdag/)");
     println!("  SHADOWDAG_DB            Path to UTXO database (default: ~/.shadowdag/data/utxo)");

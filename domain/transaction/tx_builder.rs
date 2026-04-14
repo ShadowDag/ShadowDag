@@ -3,10 +3,10 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::time::{SystemTime, UNIX_EPOCH};
-use sha2::{Sha256, Digest};
-use ed25519_dalek::{SigningKey, Signer};
+use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
+use sha2::{Digest, Sha256};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
 use crate::domain::transaction::tx_validator::TxValidator;
@@ -14,8 +14,8 @@ use crate::errors::CryptoError;
 
 pub struct KeyPairHex {
     pub private_key_hex: String,
-    pub public_key_hex:  String,
-    pub address:         String,
+    pub public_key_hex: String,
+    pub address: String,
 }
 
 /// Generate a keypair with a network-specific address prefix.
@@ -23,7 +23,7 @@ pub struct KeyPairHex {
 ///   - "testnet" → ST1...
 ///   - "regtest" → SR1...
 pub fn generate_keypair_for_network(network: &str) -> KeyPairHex {
-    let signing_key   = SigningKey::generate(&mut OsRng);
+    let signing_key = SigningKey::generate(&mut OsRng);
     let verifying_key = signing_key.verifying_key();
 
     let sk_hex = hex::encode(signing_key.to_bytes());
@@ -37,11 +37,15 @@ pub fn generate_keypair_for_network(network: &str) -> KeyPairHex {
     let prefix = match network {
         "testnet" => "ST1",
         "regtest" => "SR1",
-        _         => "SD1",
+        _ => "SD1",
     };
     let address = format!("{}{}", prefix, hex::encode(&hash[..20]));
 
-    KeyPairHex { private_key_hex: sk_hex, public_key_hex: pk_hex, address }
+    KeyPairHex {
+        private_key_hex: sk_hex,
+        public_key_hex: pk_hex,
+        address,
+    }
 }
 
 /// Generate a keypair (defaults to mainnet for backward compatibility).
@@ -50,13 +54,20 @@ pub fn generate_keypair() -> KeyPairHex {
 }
 
 pub fn build_transaction(
-    inputs_refs:     Vec<(String, u32, String)>,
-    outputs:         Vec<(String, u64)>,
-    fee:             u64,
+    inputs_refs: Vec<(String, u32, String)>,
+    outputs: Vec<(String, u64)>,
+    fee: u64,
     private_key_hex: &str,
-    public_key_hex:  &str,
+    public_key_hex: &str,
 ) -> Result<Transaction, CryptoError> {
-    build_transaction_with_anchor(inputs_refs, outputs, fee, private_key_hex, public_key_hex, None)
+    build_transaction_with_anchor(
+        inputs_refs,
+        outputs,
+        fee,
+        private_key_hex,
+        public_key_hex,
+        None,
+    )
 }
 
 /// Build a transaction with an optional chain-state anchor (payload_hash).
@@ -65,11 +76,11 @@ pub fn build_transaction(
 /// that block's existence in the DAG. This prevents replay after deep reorgs
 /// that remove the anchor block. Wallets SHOULD pass a recent tip hash.
 pub fn build_transaction_with_anchor(
-    inputs_refs:       Vec<(String, u32, String)>,
-    outputs:           Vec<(String, u64)>,
-    fee:               u64,
-    private_key_hex:   &str,
-    public_key_hex:    &str,
+    inputs_refs: Vec<(String, u32, String)>,
+    outputs: Vec<(String, u64)>,
+    fee: u64,
+    private_key_hex: &str,
+    public_key_hex: &str,
     anchor_block_hash: Option<String>,
 ) -> Result<Transaction, CryptoError> {
     let timestamp = SystemTime::now()
@@ -77,28 +88,36 @@ pub fn build_transaction_with_anchor(
         .unwrap_or_default()
         .as_secs();
 
-    let tx_outputs: Vec<TxOutput> = outputs.into_iter()
-        .map(|(address, amount)| TxOutput { address, amount, commitment: None, range_proof: None, ephemeral_pubkey: None })
+    let tx_outputs: Vec<TxOutput> = outputs
+        .into_iter()
+        .map(|(address, amount)| TxOutput {
+            address,
+            amount,
+            commitment: None,
+            range_proof: None,
+            ephemeral_pubkey: None,
+        })
         .collect();
 
     let temp_hash = build_tx_hash_from_refs(&inputs_refs, &tx_outputs, fee, timestamp);
 
-    let mut tx_inputs: Vec<TxInput> = inputs_refs.iter()
+    let mut tx_inputs: Vec<TxInput> = inputs_refs
+        .iter()
         .map(|(txid, index, owner)| TxInput {
-            txid:      txid.clone(),
-            index:     *index,
-            owner:     owner.clone(),
+            txid: txid.clone(),
+            index: *index,
+            owner: owner.clone(),
             signature: String::new(),
-            pub_key:   public_key_hex.to_string(),
+            pub_key: public_key_hex.to_string(),
             key_image: None,
             ring_members: None,
         })
         .collect();
 
     let temp_tx = Transaction {
-        hash:      temp_hash.clone(),
-        inputs:    tx_inputs.clone(),
-        outputs:   tx_outputs.clone(),
+        hash: temp_hash.clone(),
+        inputs: tx_inputs.clone(),
+        outputs: tx_outputs.clone(),
         fee,
         timestamp,
         is_coinbase: false,
@@ -115,19 +134,20 @@ pub fn build_transaction_with_anchor(
 
     let sk_bytes: Vec<u8> = hex::decode(private_key_hex)
         .map_err(|e| CryptoError::InvalidKey(format!("invalid private key hex: {}", e)))?;
-    let sk_arr: [u8; 32] = sk_bytes.try_into()
+    let sk_arr: [u8; 32] = sk_bytes
+        .try_into()
         .map_err(|_| CryptoError::InvalidKey("private key must be 32 bytes".to_string()))?;
     let signing_key = SigningKey::from_bytes(&sk_arr);
-    let sig_hex     = hex::encode(signing_key.sign(&signing_msg).to_bytes());
+    let sig_hex = hex::encode(signing_key.sign(&signing_msg).to_bytes());
 
     for input in tx_inputs.iter_mut() {
         input.signature = sig_hex.clone();
-        input.pub_key   = public_key_hex.to_string();
+        input.pub_key = public_key_hex.to_string();
     }
 
     let final_tx = Transaction {
-        hash:    temp_hash,
-        inputs:  tx_inputs,
+        hash: temp_hash,
+        inputs: tx_inputs,
         outputs: tx_outputs,
         fee,
         timestamp,
@@ -146,24 +166,32 @@ pub fn build_transaction_with_anchor(
 
 pub fn build_coinbase(
     miner_address: String,
-    dev_address:   String,
-    block_reward:  u64,
-    miner_pct:     u64,
-    timestamp:     u64,
+    dev_address: String,
+    block_reward: u64,
+    miner_pct: u64,
+    timestamp: u64,
 ) -> Transaction {
-    build_coinbase_at_height(miner_address, dev_address, block_reward, miner_pct, timestamp, 0)
+    build_coinbase_at_height(
+        miner_address,
+        dev_address,
+        block_reward,
+        miner_pct,
+        timestamp,
+        0,
+    )
 }
 
 pub fn build_coinbase_at_height(
     miner_address: String,
-    dev_address:   String,
-    block_reward:  u64,
-    miner_pct:     u64,
-    timestamp:     u64,
-    height:        u64,
+    dev_address: String,
+    block_reward: u64,
+    miner_pct: u64,
+    timestamp: u64,
+    height: u64,
 ) -> Transaction {
     let miner_reward = ((block_reward as u128 * miner_pct as u128) / 100) as u64;
-    let dev_reward   = block_reward.checked_sub(miner_reward)
+    let dev_reward = block_reward
+        .checked_sub(miner_reward)
         .expect("miner_reward <= block_reward");
     debug_assert_eq!(miner_reward + dev_reward, block_reward);
 
@@ -180,8 +208,20 @@ pub fn build_coinbase_at_height(
     Transaction::new_coinbase(
         hash,
         vec![
-            TxOutput { address: miner_address, amount: miner_reward, commitment: None, range_proof: None, ephemeral_pubkey: None },
-            TxOutput { address: dev_address,   amount: dev_reward, commitment: None, range_proof: None, ephemeral_pubkey: None },
+            TxOutput {
+                address: miner_address,
+                amount: miner_reward,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            },
+            TxOutput {
+                address: dev_address,
+                amount: dev_reward,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            },
         ],
         0,
         timestamp,
@@ -189,9 +229,9 @@ pub fn build_coinbase_at_height(
 }
 
 pub fn build_tx_hash_from_refs(
-    inputs:    &[(String, u32, String)],
-    outputs:   &[TxOutput],
-    fee:       u64,
+    inputs: &[(String, u32, String)],
+    outputs: &[TxOutput],
+    fee: u64,
     timestamp: u64,
 ) -> String {
     let mut h = Sha256::new();
@@ -213,23 +253,26 @@ pub fn build_tx_hash_from_refs(
 #[allow(clippy::type_complexity)]
 pub fn build_batch_transactions(
     private_key_hex: &str,
-    public_key_hex:  &str,
+    public_key_hex: &str,
     batches: Vec<(Vec<(String, u32, String)>, Vec<(String, u64)>, u64)>,
 ) -> Vec<Result<Transaction, CryptoError>> {
-    batches.into_iter().map(|(inputs, outputs, fee)| {
-        build_transaction(inputs, outputs, fee, private_key_hex, public_key_hex)
-    }).collect()
+    batches
+        .into_iter()
+        .map(|(inputs, outputs, fee)| {
+            build_transaction(inputs, outputs, fee, private_key_hex, public_key_hex)
+        })
+        .collect()
 }
 
 /// Build a UTXO consolidation transaction.
 /// Merges many small UTXOs into a single output, reducing UTXO set bloat.
 /// This is critical for long-term chain health (10+ years).
 pub fn build_consolidation_tx(
-    utxo_refs:       Vec<(String, u32, String)>,
-    destination:     &str,
-    fee:             u64,
+    utxo_refs: Vec<(String, u32, String)>,
+    destination: &str,
+    fee: u64,
     private_key_hex: &str,
-    public_key_hex:  &str,
+    public_key_hex: &str,
 ) -> Result<Transaction, CryptoError> {
     if utxo_refs.is_empty() {
         return Err(CryptoError::Other("No UTXOs to consolidate".into()));
@@ -266,12 +309,18 @@ mod tests {
         let tx1 = build_coinbase_at_height(
             "shadow1miner".to_string(),
             "shadow1dev".to_string(),
-            10, 95, 1735689600, 1
+            10,
+            95,
+            1735689600,
+            1,
         );
         let tx2 = build_coinbase_at_height(
             "shadow1miner".to_string(),
             "shadow1dev".to_string(),
-            10, 95, 1735689600, 1
+            10,
+            95,
+            1735689600,
+            1,
         );
         assert_eq!(tx1.hash, tx2.hash, "Coinbase hash must be deterministic");
     }
@@ -279,10 +328,20 @@ mod tests {
     #[test]
     fn coinbase_hash_differs_by_height() {
         let tx1 = build_coinbase_at_height(
-            "shadow1miner".to_string(), "shadow1dev".to_string(), 10, 95, 1735689600, 1
+            "shadow1miner".to_string(),
+            "shadow1dev".to_string(),
+            10,
+            95,
+            1735689600,
+            1,
         );
         let tx2 = build_coinbase_at_height(
-            "shadow1miner".to_string(), "shadow1dev".to_string(), 10, 95, 1735689600, 2
+            "shadow1miner".to_string(),
+            "shadow1dev".to_string(),
+            10,
+            95,
+            1735689600,
+            2,
         );
         assert_ne!(tx1.hash, tx2.hash);
     }
@@ -290,20 +349,37 @@ mod tests {
     #[test]
     fn keypair_generates_valid_address() {
         let kp = generate_keypair();
-        assert!(kp.address.starts_with("SD1"), "Address must start with 'SD1'");
-        assert_eq!(kp.public_key_hex.len(), 64, "Public key must be 32 bytes hex");
-        assert_eq!(kp.private_key_hex.len(), 64, "Private key must be 32 bytes hex");
+        assert!(
+            kp.address.starts_with("SD1"),
+            "Address must start with 'SD1'"
+        );
+        assert_eq!(
+            kp.public_key_hex.len(),
+            64,
+            "Public key must be 32 bytes hex"
+        );
+        assert_eq!(
+            kp.private_key_hex.len(),
+            64,
+            "Private key must be 32 bytes hex"
+        );
     }
 
     #[test]
     fn keypair_testnet_prefix() {
         let kp = generate_keypair_for_network("testnet");
-        assert!(kp.address.starts_with("ST1"), "Testnet address must start with 'ST1'");
+        assert!(
+            kp.address.starts_with("ST1"),
+            "Testnet address must start with 'ST1'"
+        );
     }
 
     #[test]
     fn keypair_regtest_prefix() {
         let kp = generate_keypair_for_network("regtest");
-        assert!(kp.address.starts_with("SR1"), "Regtest address must start with 'SR1'");
+        assert!(
+            kp.address.starts_with("SR1"),
+            "Regtest address must start with 'SR1'"
+        );
     }
 }

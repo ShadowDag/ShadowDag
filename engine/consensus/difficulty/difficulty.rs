@@ -25,8 +25,8 @@ impl Difficulty {
 
     // scaled bounds (بدل float)
     const SCALE: u128 = 1000;
-    const MAX_ADJUST_UP_SCALED: u128 = 1250;   // 1.25
-    const MAX_ADJUST_DOWN_SCALED: u128 = 800;  // 0.80
+    const MAX_ADJUST_UP_SCALED: u128 = 1250; // 1.25
+    const MAX_ADJUST_DOWN_SCALED: u128 = 800; // 0.80
 
     // ─────────────────────────────────────────
     // CLAMP
@@ -55,8 +55,7 @@ impl Difficulty {
 
         let target = target as u128;
 
-        let numerator = (Self::MAX_DIFFICULTY as u128)
-            .saturating_add(target >> 1); // target / 2
+        let numerator = (Self::MAX_DIFFICULTY as u128).saturating_add(target >> 1); // target / 2
 
         let diff = numerator / target;
 
@@ -72,8 +71,7 @@ impl Difficulty {
 
         // diff guaranteed ≥ 1 بسبب clamp
 
-        let numerator = (Self::MAX_DIFFICULTY as u128)
-            .saturating_add(diff >> 1); // diff / 2
+        let numerator = (Self::MAX_DIFFICULTY as u128).saturating_add(diff >> 1); // diff / 2
 
         let target = numerator / diff;
 
@@ -84,17 +82,12 @@ impl Difficulty {
     // 🔥 ADJUST (CONSENSUS SAFE)
     // ─────────────────────────────────────────
     #[inline]
-    pub fn adjust(
-        current_difficulty: u64,
-        actual_time_ms: u64,
-        blocks: u64,
-    ) -> u64 {
+    pub fn adjust(current_difficulty: u64, actual_time_ms: u64, blocks: u64) -> u64 {
         if actual_time_ms == 0 || blocks == 0 {
             return Self::clamp(current_difficulty);
         }
 
-        let expected_time = blocks
-            .saturating_mul(Self::TARGET_BLOCK_INTERVAL_MS);
+        let expected_time = blocks.saturating_mul(Self::TARGET_BLOCK_INTERVAL_MS);
 
         if expected_time == 0 {
             return Self::clamp(current_difficulty);
@@ -104,13 +97,10 @@ impl Difficulty {
         let expected = expected_time as u128;
 
         // ratio_scaled = (actual * SCALE) / expected
-        let mut ratio_scaled = actual
-            .saturating_mul(Self::SCALE)
-            / expected;
+        let mut ratio_scaled = actual.saturating_mul(Self::SCALE) / expected;
 
         // clamp ratio
-        ratio_scaled = ratio_scaled
-            .clamp(Self::MAX_ADJUST_DOWN_SCALED, Self::MAX_ADJUST_UP_SCALED);
+        ratio_scaled = ratio_scaled.clamp(Self::MAX_ADJUST_DOWN_SCALED, Self::MAX_ADJUST_UP_SCALED);
 
         // (current * SCALE + ratio/2) / ratio
         let numerator = (current_difficulty as u128)
@@ -126,10 +116,7 @@ impl Difficulty {
     // 🔥 FAST PATH
     // ─────────────────────────────────────────
     #[inline(always)]
-    pub fn adjust_single(
-        current_difficulty: u64,
-        actual_block_time_ms: u64,
-    ) -> u64 {
+    pub fn adjust_single(current_difficulty: u64, actual_block_time_ms: u64) -> u64 {
         Self::adjust(current_difficulty, actual_block_time_ms, 1)
     }
 
@@ -137,15 +124,8 @@ impl Difficulty {
     // 🔥 WINDOW ADJUST
     // ─────────────────────────────────────────
     #[inline(always)]
-    pub fn adjust_window(
-        current_difficulty: u64,
-        total_time_ms: u64,
-    ) -> u64 {
-        Self::adjust(
-            current_difficulty,
-            total_time_ms,
-            Self::ADJUSTMENT_WINDOW,
-        )
+    pub fn adjust_window(current_difficulty: u64, total_time_ms: u64) -> u64 {
+        Self::adjust(current_difficulty, total_time_ms, Self::ADJUSTMENT_WINDOW)
     }
 
     // ─────────────────────────────────────────
@@ -190,11 +170,7 @@ impl Difficulty {
     ///   1. Exponential Moving Average (EMA) for stability
     ///   2. Timestamp-based micro-adjustments for responsiveness
     ///   3. Outlier rejection via trim-mean
-    pub fn adjust_advanced(
-        current_difficulty: u64,
-        timestamps: &[u64],
-        bps: u64,
-    ) -> u64 {
+    pub fn adjust_advanced(current_difficulty: u64, timestamps: &[u64], bps: u64) -> u64 {
         let len = timestamps.len();
         if len < 3 {
             return Self::clamp(current_difficulty);
@@ -260,10 +236,7 @@ mod tests {
 
     #[test]
     fn clamp_returns_max_when_exceeds() {
-        assert_eq!(
-            Difficulty::clamp(u64::MAX),
-            Difficulty::MAX_DIFFICULTY,
-        );
+        assert_eq!(Difficulty::clamp(u64::MAX), Difficulty::MAX_DIFFICULTY,);
     }
 
     #[test]
@@ -274,8 +247,14 @@ mod tests {
 
     #[test]
     fn clamp_at_exact_boundaries() {
-        assert_eq!(Difficulty::clamp(Difficulty::MIN_DIFFICULTY), Difficulty::MIN_DIFFICULTY);
-        assert_eq!(Difficulty::clamp(Difficulty::MAX_DIFFICULTY), Difficulty::MAX_DIFFICULTY);
+        assert_eq!(
+            Difficulty::clamp(Difficulty::MIN_DIFFICULTY),
+            Difficulty::MIN_DIFFICULTY
+        );
+        assert_eq!(
+            Difficulty::clamp(Difficulty::MAX_DIFFICULTY),
+            Difficulty::MAX_DIFFICULTY
+        );
     }
 
     // ─────────────────────────────────────────
@@ -325,7 +304,9 @@ mod tests {
         assert!(
             recovered.abs_diff(original_diff) <= 1,
             "roundtrip failed: {} -> target {} -> {}",
-            original_diff, target, recovered,
+            original_diff,
+            target,
+            recovered,
         );
     }
 
@@ -489,7 +470,7 @@ mod tests {
     #[test]
     fn adjust_advanced_returns_valid_difficulty() {
         // timestamps newest-first, 1-second intervals → on-target for bps=1
-        let ts: Vec<u64> = (0..20).rev().map(|i| i * 1).collect();
+        let ts: Vec<u64> = (0..20).rev().collect();
         let d = Difficulty::adjust_advanced(1000, &ts, 1);
         assert!(d >= Difficulty::MIN_DIFFICULTY);
         assert!(d <= Difficulty::MAX_DIFFICULTY);

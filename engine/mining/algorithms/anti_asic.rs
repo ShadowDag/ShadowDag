@@ -13,7 +13,7 @@
 //   4. Dynamic mixing (varies with block height)
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest as Sha2Digest};
+use sha2::{Digest as Sha2Digest, Sha256};
 use sha3::Sha3_256;
 
 /// Scratchpad size for memory-hard operations (16 KB)
@@ -74,7 +74,8 @@ impl AntiAsic {
                     // ADD with wrap
                     let next = (idx + 64) % (ANTI_ASIC_SCRATCHPAD - 32);
                     for j in 0..32 {
-                        scratchpad[idx + j] = scratchpad[idx + j].wrapping_add(scratchpad[next + j]);
+                        scratchpad[idx + j] =
+                            scratchpad[idx + j].wrapping_add(scratchpad[next + j]);
                     }
                 }
                 _ => {

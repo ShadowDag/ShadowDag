@@ -3,48 +3,48 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use serde::{Serialize, Deserialize};
 
 pub const MAX_RECENT_BLOCKS: usize = 100;
-pub const MAX_RECENT_TXS:    usize = 500;
+pub const MAX_RECENT_TXS: usize = 500;
 pub const MAX_SEARCH_RESULTS: usize = 50;
 
 #[derive(Debug, Clone)]
 pub struct ExplorerBlock {
-    pub hash:        String,
-    pub height:      u64,
-    pub timestamp:   u64,
-    pub tx_count:    usize,
-    pub size_bytes:  usize,
-    pub difficulty:  u64,
-    pub miner:       String,
-    pub blue_score:  u64,
-    pub total_fees:  u64,
+    pub hash: String,
+    pub height: u64,
+    pub timestamp: u64,
+    pub tx_count: usize,
+    pub size_bytes: usize,
+    pub difficulty: u64,
+    pub miner: String,
+    pub blue_score: u64,
+    pub total_fees: u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct ExplorerTx {
-    pub hash:        String,
-    pub block_hash:  String,
-    pub height:      u64,
-    pub timestamp:   u64,
-    pub fee:         u64,
-    pub input_count:  usize,
+    pub hash: String,
+    pub block_hash: String,
+    pub height: u64,
+    pub timestamp: u64,
+    pub fee: u64,
+    pub input_count: usize,
     pub output_count: usize,
     pub total_output: u64,
-    pub is_coinbase:  bool,
+    pub is_coinbase: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct NetworkStats {
-    pub best_height:      u64,
-    pub best_blue_score:  u64,
-    pub peer_count:       usize,
-    pub mempool_size:     usize,
-    pub total_supply:     u64,
-    pub dag_tips:         Vec<String>,
-    pub block_rate_bps:   f64,
+    pub best_height: u64,
+    pub best_blue_score: u64,
+    pub peer_count: usize,
+    pub mempool_size: usize,
+    pub total_supply: u64,
+    pub dag_tips: Vec<String>,
+    pub block_rate_bps: f64,
 }
 
 /// Contract information for the explorer page.
@@ -55,7 +55,7 @@ pub struct ContractExplorerInfo {
     pub name: Option<String>,
     pub code_size: usize,
     pub vm_version: u8,
-    pub abi: Option<String>,  // JSON
+    pub abi: Option<String>, // JSON
     pub methods: Vec<String>,
     pub events: Vec<String>,
     pub bytecode_hash: String,
@@ -72,8 +72,8 @@ pub struct ContractExplorerInfo {
 /// window. For full lookups, use `TxIndex` or `BlockStore` directly.
 pub struct ExplorerIndex {
     recent_blocks: VecDeque<ExplorerBlock>,
-    recent_txs:    VecDeque<ExplorerTx>,
-    pub stats:     NetworkStats,
+    recent_txs: VecDeque<ExplorerTx>,
+    pub stats: NetworkStats,
 }
 
 impl Default for ExplorerIndex {
@@ -86,15 +86,15 @@ impl ExplorerIndex {
     pub fn new() -> Self {
         Self {
             recent_blocks: VecDeque::new(),
-            recent_txs:    VecDeque::new(),
+            recent_txs: VecDeque::new(),
             stats: NetworkStats {
-                best_height:     0,
+                best_height: 0,
                 best_blue_score: 0,
-                peer_count:      0,
-                mempool_size:    0,
-                total_supply:    0,
-                dag_tips:        vec![],
-                block_rate_bps:  0.0,
+                peer_count: 0,
+                mempool_size: 0,
+                total_supply: 0,
+                dag_tips: vec![],
+                block_rate_bps: 0.0,
             },
         }
     }
@@ -148,18 +148,24 @@ impl ExplorerIndex {
         total_supply: u64,
         dag_tips: Vec<String>,
     ) {
-        self.stats.peer_count   = peer_count;
+        self.stats.peer_count = peer_count;
         self.stats.mempool_size = mempool_size;
         self.stats.total_supply = total_supply;
-        self.stats.dag_tips     = dag_tips;
+        self.stats.dag_tips = dag_tips;
     }
 
     pub fn recent_blocks(&self, count: usize) -> Vec<&ExplorerBlock> {
-        self.recent_blocks.iter().take(count.min(MAX_RECENT_BLOCKS)).collect()
+        self.recent_blocks
+            .iter()
+            .take(count.min(MAX_RECENT_BLOCKS))
+            .collect()
     }
 
     pub fn recent_txs(&self, count: usize) -> Vec<&ExplorerTx> {
-        self.recent_txs.iter().take(count.min(MAX_RECENT_TXS)).collect()
+        self.recent_txs
+            .iter()
+            .take(count.min(MAX_RECENT_TXS))
+            .collect()
     }
 
     pub fn find_block(&self, hash: &str) -> Option<&ExplorerBlock> {
@@ -174,8 +180,12 @@ impl ExplorerIndex {
         self.recent_blocks.iter().find(|b| b.height == height)
     }
 
-    pub fn cached_blocks(&self) -> usize { self.recent_blocks.len() }
-    pub fn cached_txs(&self)    -> usize { self.recent_txs.len() }
+    pub fn cached_blocks(&self) -> usize {
+        self.recent_blocks.len()
+    }
+    pub fn cached_txs(&self) -> usize {
+        self.recent_txs.len()
+    }
 
     /// Get contract information for the explorer.
     /// Returns verification status, ABI, methods, events, and metadata.
@@ -204,13 +214,13 @@ mod tests {
 
     fn sample_block(hash: &str, height: u64, ts: u64) -> ExplorerBlock {
         ExplorerBlock {
-            hash:       hash.to_string(),
+            hash: hash.to_string(),
             height,
-            timestamp:  ts,
-            tx_count:   5,
+            timestamp: ts,
+            tx_count: 5,
             size_bytes: 50_000,
             difficulty: 4,
-            miner:      "miner1".into(),
+            miner: "miner1".into(),
             blue_score: height * 2,
             total_fees: 5_000,
         }

@@ -22,10 +22,10 @@
 // ShadowDAG improvement: combines with Shadow Pool for double-layer privacy.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::collections::{HashMap, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Probability of continuing stem phase at each hop (0-100)
 pub const STEM_PROBABILITY: u8 = 90; // 90% chance to continue stem
@@ -58,24 +58,24 @@ pub enum RelayPhase {
 /// A transaction in the Dandelion pipeline
 #[derive(Debug, Clone)]
 pub struct DandelionTx {
-    pub tx_hash:   String,
-    pub phase:     RelayPhase,
+    pub tx_hash: String,
+    pub phase: RelayPhase,
     pub stem_peer: Option<String>, // Selected stem relay peer
-    pub created:   u64,
+    pub created: u64,
 }
 
 /// Dandelion++ relay engine
 pub struct DandelionRelay {
     /// Pending stem transactions
-    stem_pool:       HashMap<String, DandelionTx>,
+    stem_pool: HashMap<String, DandelionTx>,
     /// TXs already seen (prevent loops)
-    seen:            HashSet<String>,
+    seen: HashSet<String>,
     /// Current epoch's stem peer assignment (rotated every EPOCH_DURATION)
-    stem_peer_map:   HashMap<String, String>, // our_node → stem_peer
+    stem_peer_map: HashMap<String, String>, // our_node → stem_peer
     /// Epoch start time
-    epoch_start:     u64,
+    epoch_start: u64,
     /// RNG state
-    rng_counter:     u64,
+    rng_counter: u64,
 }
 
 impl Default for DandelionRelay {
@@ -87,11 +87,11 @@ impl Default for DandelionRelay {
 impl DandelionRelay {
     pub fn new() -> Self {
         Self {
-            stem_pool:     HashMap::with_capacity(256),
-            seen:          HashSet::with_capacity(4096),
+            stem_pool: HashMap::with_capacity(256),
+            seen: HashSet::with_capacity(4096),
             stem_peer_map: HashMap::new(),
-            epoch_start:   now_secs(),
-            rng_counter:   0,
+            epoch_start: now_secs(),
+            rng_counter: 0,
         }
     }
 
@@ -121,10 +121,7 @@ impl DandelionRelay {
         // Hard cap: if STILL over limit after expiry, force-fluff oldest entries
         if self.stem_pool.len() >= MAX_STEM_PENDING {
             let excess = self.stem_pool.len() - MAX_STEM_PENDING + 1;
-            let oldest_keys: Vec<String> = self.stem_pool.keys()
-                .take(excess)
-                .cloned()
-                .collect();
+            let oldest_keys: Vec<String> = self.stem_pool.keys().take(excess).cloned().collect();
             for key in oldest_keys {
                 self.stem_pool.remove(&key);
             }
@@ -136,10 +133,13 @@ impl DandelionRelay {
             if self.should_continue_stem() {
                 if let Some(stem_peer) = self.select_stem_peer_from(connected_peers) {
                     let dtx = DandelionTx {
-                        tx_hash:   tx_hash.to_string(),
-                        phase:     RelayPhase::Stem { hops: 1, entered_at: now_secs() },
+                        tx_hash: tx_hash.to_string(),
+                        phase: RelayPhase::Stem {
+                            hops: 1,
+                            entered_at: now_secs(),
+                        },
                         stem_peer: Some(stem_peer.clone()),
-                        created:   now_secs(),
+                        created: now_secs(),
                     };
                     self.stem_pool.insert(tx_hash.to_string(), dtx);
                     return RelayAction::StemTo(stem_peer);
@@ -152,10 +152,13 @@ impl DandelionRelay {
         // New TX from local wallet — always start in stem phase
         if let Some(stem_peer) = self.select_stem_peer_from(connected_peers) {
             let dtx = DandelionTx {
-                tx_hash:   tx_hash.to_string(),
-                phase:     RelayPhase::Stem { hops: 0, entered_at: now_secs() },
+                tx_hash: tx_hash.to_string(),
+                phase: RelayPhase::Stem {
+                    hops: 0,
+                    entered_at: now_secs(),
+                },
                 stem_peer: Some(stem_peer.clone()),
-                created:   now_secs(),
+                created: now_secs(),
             };
             self.stem_pool.insert(tx_hash.to_string(), dtx);
             RelayAction::StemTo(stem_peer)
@@ -183,14 +186,14 @@ impl DandelionRelay {
         }
 
         // Flush expired stems
-        let expired: Vec<String> = self.stem_pool.iter()
-            .filter(|(_, dtx)| {
-                match dtx.phase {
-                    RelayPhase::Stem { entered_at, hops, .. } => {
-                        now - entered_at >= STEM_TIMEOUT_SECS || hops >= MAX_STEM_HOPS
-                    }
-                    RelayPhase::Fluff => true,
-                }
+        let expired: Vec<String> = self
+            .stem_pool
+            .iter()
+            .filter(|(_, dtx)| match dtx.phase {
+                RelayPhase::Stem {
+                    entered_at, hops, ..
+                } => now - entered_at >= STEM_TIMEOUT_SECS || hops >= MAX_STEM_HOPS,
+                RelayPhase::Fluff => true,
             })
             .map(|(h, _)| h.clone())
             .collect();
@@ -233,8 +236,12 @@ impl DandelionRelay {
     }
 
     /// Stats
-    pub fn stem_count(&self) -> usize { self.stem_pool.len() }
-    pub fn seen_count(&self) -> usize { self.seen.len() }
+    pub fn stem_count(&self) -> usize {
+        self.stem_pool.len()
+    }
+    pub fn seen_count(&self) -> usize {
+        self.seen.len()
+    }
 
     // ── Internal ────────────────────────────────────────────────
 
@@ -256,11 +263,9 @@ impl DandelionRelay {
 
     fn flush_expired(&mut self) {
         let now = now_secs();
-        self.stem_pool.retain(|_, dtx| {
-            match dtx.phase {
-                RelayPhase::Stem { entered_at, .. } => now - entered_at < STEM_TIMEOUT_SECS,
-                RelayPhase::Fluff => false,
-            }
+        self.stem_pool.retain(|_, dtx| match dtx.phase {
+            RelayPhase::Stem { entered_at, .. } => now - entered_at < STEM_TIMEOUT_SECS,
+            RelayPhase::Fluff => false,
         });
     }
 
@@ -284,7 +289,10 @@ pub enum RelayAction {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -329,7 +337,10 @@ mod tests {
         relay.on_new_tx_with_peers("tx_old", None, &peers);
         // Manually age the TX
         if let Some(dtx) = relay.stem_pool.get_mut("tx_old") {
-            dtx.phase = RelayPhase::Stem { hops: MAX_STEM_HOPS + 1, entered_at: 0 };
+            dtx.phase = RelayPhase::Stem {
+                hops: MAX_STEM_HOPS + 1,
+                entered_at: 0,
+            };
         }
         let flushed = relay.tick();
         assert!(flushed.contains(&"tx_old".to_string()));
@@ -342,7 +353,10 @@ mod tests {
             relay.seen.insert(format!("tx_{}", i));
         }
         relay.prune_seen(5_000);
-        assert!(relay.seen_count() < 10_000, "Should have pruned some entries");
+        assert!(
+            relay.seen_count() < 10_000,
+            "Should have pruned some entries"
+        );
     }
 
     #[test]

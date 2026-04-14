@@ -6,28 +6,34 @@
 #[cfg(test)]
 mod tests {
     use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
-    use crate::service::mempool::core::mempool::{MAX_MEMPOOL_SIZE, MAX_TX_BYTE_SIZE, Mempool};
+    use crate::service::mempool::core::mempool::{Mempool, MAX_MEMPOOL_SIZE, MAX_TX_BYTE_SIZE};
 
     /// Convert a short test name to a deterministic 64-char hex hash.
     fn th(name: &str) -> String {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(name.as_bytes()))
     }
 
     fn make_tx(hash: &str, fee: u64) -> Transaction {
         use crate::domain::transaction::transaction::TxInput;
         Transaction {
-            hash:      th(hash),
-            inputs:    vec![TxInput {
-                txid:      th(&format!("prev_{}", hash)),
-                index:     0,
-                owner:     "addr1".to_string(),
+            hash: th(hash),
+            inputs: vec![TxInput {
+                txid: th(&format!("prev_{}", hash)),
+                index: 0,
+                owner: "addr1".to_string(),
                 signature: "sig".to_string(),
-                pub_key:   "pk".to_string(),
+                pub_key: "pk".to_string(),
                 key_image: None,
                 ring_members: None,
             }],
-            outputs:   vec![TxOutput { address: "addr1".into(), amount: 100, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            outputs: vec![TxOutput {
+                address: "addr1".into(),
+                amount: 100,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -42,17 +48,24 @@ mod tests {
 
     #[test]
     fn max_mempool_size_constant() {
-        assert_eq!(MAX_MEMPOOL_SIZE, 100_000, "MAX_MEMPOOL_SIZE from MempoolConfig");
+        assert_eq!(
+            MAX_MEMPOOL_SIZE, 100_000,
+            "MAX_MEMPOOL_SIZE from MempoolConfig"
+        );
     }
 
     #[test]
     fn max_tx_byte_size_constant() {
-        assert_eq!(MAX_TX_BYTE_SIZE, 100_000, "MAX_TX_BYTE_SIZE should be 100,000 bytes");
+        assert_eq!(
+            MAX_TX_BYTE_SIZE, 100_000,
+            "MAX_TX_BYTE_SIZE should be 100,000 bytes"
+        );
     }
 
     #[test]
     fn duplicate_tx_rejected() {
-        let mempool = Mempool::try_new(format!("/tmp/test_mempool_dup_{}", std::process::id())).expect("mp");
+        let mempool =
+            Mempool::try_new(format!("/tmp/test_mempool_dup_{}", std::process::id())).expect("mp");
         let tx = make_tx("dup_hash_001", 5);
         mempool.add_transaction_test(&tx.clone());
 
@@ -64,7 +77,8 @@ mod tests {
 
     #[test]
     fn fee_ordering_in_get_for_block() {
-        let mempool = Mempool::try_new(format!("/tmp/test_mempool_fee_{}", std::process::id())).expect("mp");
+        let mempool =
+            Mempool::try_new(format!("/tmp/test_mempool_fee_{}", std::process::id())).expect("mp");
         mempool.add_transaction_test(&make_tx("tx_fee_1", 1));
         mempool.add_transaction_test(&make_tx("tx_fee_5", 5));
         mempool.add_transaction_test(&make_tx("tx_fee_3", 3));
@@ -75,7 +89,10 @@ mod tests {
         assert!(selected.len() <= 3);
 
         for w in selected.windows(2) {
-            assert!(w[0].fee >= w[1].fee, "Transactions must be ordered by fee desc");
+            assert!(
+                w[0].fee >= w[1].fee,
+                "Transactions must be ordered by fee desc"
+            );
         }
     }
 }

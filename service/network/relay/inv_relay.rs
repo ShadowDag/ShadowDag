@@ -10,15 +10,12 @@
 // connection thread drains the queue and writes to its TCP socket.
 // ═══════════════════════════════════════════════════════════════════════════
 
+use once_cell::sync::Lazy;
 use std::collections::HashSet;
 use std::sync::Mutex;
-use once_cell::sync::Lazy;
 
+use crate::service::network::p2p::p2p::{push_outbound, InvItem as P2PInvItem, P2PMessage};
 use crate::service::network::p2p::peer_manager::PeerManager;
-use crate::service::network::p2p::p2p::{
-    push_outbound, P2PMessage,
-    InvItem as P2PInvItem,
-};
 
 /// Maximum inventory items per broadcast message.
 /// Must match protocol::MAX_INV_PER_MSG (5,000) — exceeding the wire
@@ -41,7 +38,7 @@ pub enum InvType {
 #[derive(Debug, Clone)]
 pub struct InvItem {
     pub inv_type: InvType,
-    pub hash:     String,
+    pub hash: String,
 }
 
 pub struct InvRelay;
@@ -62,8 +59,11 @@ impl InvRelay {
 
         // Deduplicate: skip items we've already broadcast recently
         let new_items: Vec<String> = if let Ok(mut seen) = SEEN_INV.lock() {
-            if seen.len() > 100_000 { seen.clear(); }
-            items.iter()
+            if seen.len() > 100_000 {
+                seen.clear();
+            }
+            items
+                .iter()
                 .filter(|h| seen.insert((*h).clone()))
                 .cloned()
                 .collect()
@@ -77,10 +77,13 @@ impl InvRelay {
 
         // Chunk into batches and push to outbound queue
         for chunk in new_items.chunks(MAX_INV_PER_MSG) {
-            let inv_items: Vec<P2PInvItem> = chunk.iter().map(|hash| P2PInvItem {
-                kind: "tx".to_string(),
-                hash: hash.clone(),
-            }).collect();
+            let inv_items: Vec<P2PInvItem> = chunk
+                .iter()
+                .map(|hash| P2PInvItem {
+                    kind: "tx".to_string(),
+                    hash: hash.clone(),
+                })
+                .collect();
 
             push_outbound(P2PMessage::Inv { items: inv_items });
         }
@@ -94,8 +97,11 @@ impl InvRelay {
 
         // Deduplicate
         let new_items: Vec<&InvItem> = if let Ok(mut seen) = SEEN_INV.lock() {
-            if seen.len() > 100_000 { seen.clear(); }
-            items.iter()
+            if seen.len() > 100_000 {
+                seen.clear();
+            }
+            items
+                .iter()
                 .filter(|i| seen.insert(i.hash.clone()))
                 .collect()
         } else {
@@ -106,19 +112,24 @@ impl InvRelay {
             return;
         }
 
-        let inv_items: Vec<P2PInvItem> = new_items.iter().map(|item| {
-            let kind = match item.inv_type {
-                InvType::Block       => "block",
-                InvType::Transaction => "tx",
-            };
-            P2PInvItem {
-                kind: kind.to_string(),
-                hash: item.hash.clone(),
-            }
-        }).collect();
+        let inv_items: Vec<P2PInvItem> = new_items
+            .iter()
+            .map(|item| {
+                let kind = match item.inv_type {
+                    InvType::Block => "block",
+                    InvType::Transaction => "tx",
+                };
+                P2PInvItem {
+                    kind: kind.to_string(),
+                    hash: item.hash.clone(),
+                }
+            })
+            .collect();
 
         for chunk in inv_items.chunks(MAX_INV_PER_MSG) {
-            push_outbound(P2PMessage::Inv { items: chunk.to_vec() });
+            push_outbound(P2PMessage::Inv {
+                items: chunk.to_vec(),
+            });
         }
     }
 
@@ -130,7 +141,9 @@ impl InvRelay {
         }
         // Check seen set — only request data for items we haven't seen
         if let Ok(mut seen) = SEEN_INV.lock() {
-            if seen.len() > 100_000 { seen.clear(); }
+            if seen.len() > 100_000 {
+                seen.clear();
+            }
             seen.insert(item.to_string())
         } else {
             true

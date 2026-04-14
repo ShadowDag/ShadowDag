@@ -7,29 +7,29 @@ pub mod pruning_engine;
 
 use std::collections::{HashMap, HashSet};
 
-pub const DEFAULT_PRUNE_DEPTH:  u64   = 1_000;
-pub const MIN_PRUNE_DEPTH:      u64   = 100;
-pub const PRUNE_BATCH_SIZE:     usize = 500;
+pub const DEFAULT_PRUNE_DEPTH: u64 = 1_000;
+pub const MIN_PRUNE_DEPTH: u64 = 100;
+pub const PRUNE_BATCH_SIZE: usize = 500;
 
 #[derive(Debug, Clone)]
 pub struct PruneRecord {
-    pub hash:     String,
-    pub height:   u64,
-    pub pruned:   bool,
+    pub hash: String,
+    pub height: u64,
+    pub pruned: bool,
 }
 
 pub struct PruningEngine {
-    pub depth:       u64,
+    pub depth: u64,
     pub pruned_count: u64,
-    prune_set:       HashSet<String>,
+    prune_set: HashSet<String>,
 }
 
 impl PruningEngine {
     pub fn new(depth: u64) -> Self {
         Self {
-            depth:        depth.max(MIN_PRUNE_DEPTH),
+            depth: depth.max(MIN_PRUNE_DEPTH),
             pruned_count: 0,
-            prune_set:    HashSet::new(),
+            prune_set: HashSet::new(),
         }
     }
 
@@ -44,10 +44,9 @@ impl PruningEngine {
         current_height: u64,
     ) -> Vec<String> {
         let cutoff = current_height.saturating_sub(self.depth);
-        let mut prunable: Vec<(String, u64)> = block_heights.iter()
-            .filter(|(hash, &height)| {
-                height < cutoff && !self.prune_set.contains(*hash)
-            })
+        let mut prunable: Vec<(String, u64)> = block_heights
+            .iter()
+            .filter(|(hash, &height)| height < cutoff && !self.prune_set.contains(*hash))
             .map(|(hash, &h)| (hash.clone(), h))
             .collect();
 
@@ -74,8 +73,12 @@ impl PruningEngine {
         self.depth = depth.max(MIN_PRUNE_DEPTH);
     }
 
-    pub fn pruned_count(&self) -> u64 { self.pruned_count }
-    pub fn prune_set_size(&self) -> usize { self.prune_set.len() }
+    pub fn pruned_count(&self) -> u64 {
+        self.pruned_count
+    }
+    pub fn prune_set_size(&self) -> usize {
+        self.prune_set.len()
+    }
 
     pub fn compact_prune_set(&mut self, known_hashes: &HashSet<String>) {
         self.prune_set.retain(|h| known_hashes.contains(h));
@@ -87,7 +90,9 @@ mod tests {
     use super::*;
 
     fn heights(data: &[(&str, u64)]) -> HashMap<String, u64> {
-        data.iter().map(|(h, height)| (h.to_string(), *height)).collect()
+        data.iter()
+            .map(|(h, height)| (h.to_string(), *height))
+            .collect()
     }
 
     #[test]

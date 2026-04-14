@@ -8,6 +8,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use proptest::prelude::*;
 
@@ -17,8 +18,8 @@ mod tests {
         fn total_output_never_overflows(
             amounts in prop::collection::vec(0u64..u64::MAX / 100, 1..20),
         ) {
-            let total = amounts.iter().fold(0u64, |acc, &a| acc.saturating_add(a));
-            prop_assert!(total <= u64::MAX);
+            let total = amounts.iter().try_fold(0u64, |acc, &a| acc.checked_add(a));
+            prop_assert!(total.is_some());
         }
 
         #[test]
@@ -93,8 +94,7 @@ mod tests {
             current in 0u64..10_000_000,
             depth in 100u64..10_000_000,
         ) {
-            use crate::engine::pruning::PruningEngine;
-            let engine = PruningEngine::new(depth);
+            let _engine = crate::engine::pruning::PruningEngine::new(depth);
             let cutoff = current.saturating_sub(depth);
             prop_assert!(cutoff <= current);
         }

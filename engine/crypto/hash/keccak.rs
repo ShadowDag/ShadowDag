@@ -3,13 +3,11 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::slog_error;
 use rocksdb::{
-    DB, Options, WriteOptions, ReadOptions,
-    WriteBatch, DBPinnableSlice,
-    IteratorMode, Direction,
+    DBPinnableSlice, Direction, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions, DB,
 };
 use std::path::Path;
-use crate::slog_error;
 
 pub struct KeccakStore {
     db: DB,
@@ -18,7 +16,6 @@ pub struct KeccakStore {
 }
 
 impl KeccakStore {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
@@ -29,16 +26,17 @@ impl KeccakStore {
         opts.increase_parallelism(
             std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4) as i32
+                .unwrap_or(4) as i32,
         );
 
         opts.optimize_level_style_compaction(256 * 1024 * 1024);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| crate::errors::StorageError::OpenFailed {
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| {
+            crate::errors::StorageError::OpenFailed {
                 path: path.to_string(),
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(false); // ⚡ speed
@@ -166,7 +164,8 @@ impl KeccakStore {
 
     #[inline(always)]
     pub fn exists_bytes(&self, key: &[u8]) -> bool {
-        self.db.get_pinned_opt(key, &self.read_opts)
+        self.db
+            .get_pinned_opt(key, &self.read_opts)
             .map(|v| v.is_some())
             .unwrap_or(false)
     }
@@ -200,10 +199,9 @@ impl KeccakStore {
         read_opts.fill_cache(true);
         read_opts.set_iterate_upper_bound(upper);
 
-        let iter = self.db.iterator_opt(
-            IteratorMode::From(prefix, Direction::Forward),
-            read_opts,
-        );
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix, Direction::Forward), read_opts);
 
         for (k, v) in iter.flatten() {
             results.push((k.to_vec(), v.to_vec()));

@@ -123,7 +123,12 @@ impl UtxoKey {
     /// Extract the output index (big-endian u32 at bytes[32..36]).
     #[inline]
     pub fn index(&self) -> u32 {
-        u32::from_be_bytes([self.bytes[32], self.bytes[33], self.bytes[34], self.bytes[35]])
+        u32::from_be_bytes([
+            self.bytes[32],
+            self.bytes[33],
+            self.bytes[34],
+            self.bytes[35],
+        ])
     }
 
     /// Extract the 32-byte hash portion.
@@ -137,7 +142,7 @@ impl UtxoKey {
         // The compiler can see the length is fixed from split_at on [u8; 36].
         match <&[u8; 32]>::try_from(hash) {
             Ok(arr) => arr,
-            Err(_) => unreachable!(),  // [u8; 36].split_at(32).0 is always 32 bytes
+            Err(_) => unreachable!(), // [u8; 36].split_at(32).0 is always 32 bytes
         }
     }
 
@@ -226,10 +231,14 @@ impl<'de> serde::Deserialize<'de> for UtxoKey {
             fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<UtxoKey, E> {
                 UtxoKey::from_slice(v).ok_or_else(|| E::invalid_length(v.len(), &"36"))
             }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<UtxoKey, A::Error> {
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<UtxoKey, A::Error> {
                 let mut bytes = [0u8; 36];
                 for (i, b) in bytes.iter_mut().enumerate() {
-                    *b = seq.next_element()?
+                    *b = seq
+                        .next_element()?
                         .ok_or_else(|| serde::de::Error::invalid_length(i, &"36"))?;
                 }
                 Ok(UtxoKey::from_bytes(bytes))
@@ -245,8 +254,14 @@ mod tests {
 
     #[test]
     fn canonical_deterministic() {
-        let a = UtxoKey::new("aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233", 7);
-        let b = UtxoKey::new("aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233", 7);
+        let a = UtxoKey::new(
+            "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233",
+            7,
+        );
+        let b = UtxoKey::new(
+            "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233",
+            7,
+        );
         assert_eq!(a, b);
         assert_eq!(a.as_bytes(), b.as_bytes());
     }

@@ -3,19 +3,19 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::collections::{HashSet, HashMap};
-use crate::service::mempool::core::mempool::Mempool;
 use crate::domain::transaction::transaction::Transaction;
-use crate::slog_warn;
+use crate::domain::transaction::tx_validator::TxValidator;
 use crate::domain::utxo::utxo_key::UtxoKey;
 use crate::domain::utxo::utxo_set::UtxoSet;
-use crate::domain::transaction::tx_validator::TxValidator;
 use crate::domain::utxo::utxo_validator::UtxoValidator;
+use crate::service::mempool::core::mempool::Mempool;
+use crate::slog_warn;
+use std::collections::{HashMap, HashSet};
 
 pub struct TxPool {
-    pub mempool:        Mempool,
-    pub spent_inputs:   HashSet<UtxoKey>,
-    pub seen_hashes:    HashSet<String>,
+    pub mempool: Mempool,
+    pub spent_inputs: HashSet<UtxoKey>,
+    pub seen_hashes: HashSet<String>,
     pub orphan_parents: HashMap<String, Vec<Transaction>>,
 }
 
@@ -23,8 +23,8 @@ impl TxPool {
     pub fn new(mempool: Mempool) -> Self {
         Self {
             mempool,
-            spent_inputs:   HashSet::new(),
-            seen_hashes:    HashSet::new(),
+            spent_inputs: HashSet::new(),
+            seen_hashes: HashSet::new(),
             orphan_parents: HashMap::new(),
         }
     }
@@ -127,9 +127,7 @@ impl TxPool {
 
     fn add_to_orphan_pool(&mut self, tx: &Transaction) {
         for input in &tx.inputs {
-            let bucket = self.orphan_parents
-                .entry(input.txid.clone())
-                .or_default();
+            let bucket = self.orphan_parents.entry(input.txid.clone()).or_default();
             // BUG FIX: Dedup check — skip if this tx hash is already in the
             // bucket. Without this, re-submitting the same orphan TX appends
             // duplicates, causing double-promotion and inflated orphan counts.
@@ -143,7 +141,8 @@ impl TxPool {
         if let Some(orphans) = self.orphan_parents.remove(parent_txid) {
             for orphan in orphans {
                 if UtxoValidator::validate(&orphan, utxo_set)
-                    && TxValidator::validate_tx(&orphan, utxo_set) {
+                    && TxValidator::validate_tx(&orphan, utxo_set)
+                {
                     if self.mempool.add_transaction(&orphan) {
                         self.mark_spent(&orphan);
                         self.seen_hashes.insert(orphan.hash.clone());

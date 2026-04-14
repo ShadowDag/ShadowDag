@@ -22,12 +22,12 @@
 //   Testnet: 17778
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::{slog_info, slog_error};
+use crate::{slog_error, slog_info};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 /// Default gRPC port
 pub const DEFAULT_GRPC_PORT: u16 = 17777;
@@ -43,83 +43,91 @@ pub const MAX_CONNECTIONS: usize = 256;
 #[repr(u8)]
 pub enum GrpcMethod {
     /// Stub: not yet implemented -- returns error when called.
-    GetBlock         = 0x01,
+    GetBlock = 0x01,
     /// Stub: not yet implemented -- returns error when called.
-    GetBlockByHash   = 0x02,
+    GetBlockByHash = 0x02,
     /// Stub: not yet implemented -- returns error when called.
-    GetBlockCount    = 0x03,
+    GetBlockCount = 0x03,
     /// Implemented: returns node info (name, version, network, features).
-    GetInfo          = 0x04,
+    GetInfo = 0x04,
     /// Stub: not yet implemented -- returns error when called.
-    SendTransaction  = 0x05,
+    SendTransaction = 0x05,
     /// Stub: not yet implemented -- returns error when called.
-    GetBalance       = 0x06,
+    GetBalance = 0x06,
     /// Stub: not yet implemented -- returns error when called.
-    GetMempool       = 0x07,
+    GetMempool = 0x07,
     /// Stub: not yet implemented -- returns error when called.
-    GetPeers         = 0x08,
+    GetPeers = 0x08,
     /// Stub: not yet implemented -- returns error when called.
-    GetDagInfo       = 0x09,
+    GetDagInfo = 0x09,
     /// Stub: not yet implemented -- returns error when called.
-    GetTips          = 0x0A,
+    GetTips = 0x0A,
     /// Stub: not yet implemented -- returns error when called.
-    GetUtxo          = 0x0B,
+    GetUtxo = 0x0B,
     /// Stub: not yet implemented -- returns error when called.
-    Subscribe        = 0x0C,
+    Subscribe = 0x0C,
     /// Implemented: returns BPS (blocks per second) configuration info.
-    GetBpsInfo       = 0x0D,
+    GetBpsInfo = 0x0D,
     /// Implemented: returns emission schedule info.
-    GetEmission      = 0x0E,
+    GetEmission = 0x0E,
     /// Stub: not yet implemented -- returns error when called.
     GetContractState = 0x0F,
     // ShadowDAG exclusive
     /// Stub: not yet implemented -- returns error when called.
-    GetPrivacyStats  = 0x10,
+    GetPrivacyStats = 0x10,
     /// Stub: not yet implemented -- returns error when called.
-    GetShadowPool    = 0x11,
+    GetShadowPool = 0x11,
     /// Stub: not yet implemented -- returns error when called.
-    GetVmGas         = 0x12,
-    Unknown          = 0xFF,
+    GetVmGas = 0x12,
+    Unknown = 0xFF,
 }
 
 impl GrpcMethod {
     pub fn from_byte(b: u8) -> Self {
         match b {
-            0x01 => Self::GetBlock,       0x02 => Self::GetBlockByHash,
-            0x03 => Self::GetBlockCount,  0x04 => Self::GetInfo,
-            0x05 => Self::SendTransaction,0x06 => Self::GetBalance,
-            0x07 => Self::GetMempool,     0x08 => Self::GetPeers,
-            0x09 => Self::GetDagInfo,     0x0A => Self::GetTips,
-            0x0B => Self::GetUtxo,        0x0C => Self::Subscribe,
-            0x0D => Self::GetBpsInfo,     0x0E => Self::GetEmission,
+            0x01 => Self::GetBlock,
+            0x02 => Self::GetBlockByHash,
+            0x03 => Self::GetBlockCount,
+            0x04 => Self::GetInfo,
+            0x05 => Self::SendTransaction,
+            0x06 => Self::GetBalance,
+            0x07 => Self::GetMempool,
+            0x08 => Self::GetPeers,
+            0x09 => Self::GetDagInfo,
+            0x0A => Self::GetTips,
+            0x0B => Self::GetUtxo,
+            0x0C => Self::Subscribe,
+            0x0D => Self::GetBpsInfo,
+            0x0E => Self::GetEmission,
             0x0F => Self::GetContractState,
-            0x10 => Self::GetPrivacyStats,0x11 => Self::GetShadowPool,
+            0x10 => Self::GetPrivacyStats,
+            0x11 => Self::GetShadowPool,
             0x12 => Self::GetVmGas,
-            _    => Self::Unknown,
+            _ => Self::Unknown,
         }
     }
 
     pub fn name(&self) -> &'static str {
         match self {
-            Self::GetBlock         => "GetBlock",
-            Self::GetBlockByHash   => "GetBlockByHash",
-            Self::GetBlockCount    => "GetBlockCount",
-            Self::GetInfo          => "GetInfo",
-            Self::SendTransaction  => "SendTransaction",
-            Self::GetBalance       => "GetBalance",
-            Self::GetMempool       => "GetMempool",
-            Self::GetPeers         => "GetPeers",
-            Self::GetDagInfo       => "GetDagInfo",
-            Self::GetTips          => "GetTips",
-            Self::GetUtxo          => "GetUtxo",
-            Self::Subscribe        => "Subscribe",
-            Self::GetBpsInfo       => "GetBpsInfo",
-            Self::GetEmission      => "GetEmission",
+            Self::GetBlock => "GetBlock",
+            Self::GetBlockByHash => "GetBlockByHash",
+            Self::GetBlockCount => "GetBlockCount",
+            Self::GetInfo => "GetInfo",
+            Self::SendTransaction => "SendTransaction",
+            Self::GetBalance => "GetBalance",
+            Self::GetMempool => "GetMempool",
+            Self::GetPeers => "GetPeers",
+            Self::GetDagInfo => "GetDagInfo",
+            Self::GetTips => "GetTips",
+            Self::GetUtxo => "GetUtxo",
+            Self::Subscribe => "Subscribe",
+            Self::GetBpsInfo => "GetBpsInfo",
+            Self::GetEmission => "GetEmission",
             Self::GetContractState => "GetContractState",
-            Self::GetPrivacyStats  => "GetPrivacyStats",
-            Self::GetShadowPool    => "GetShadowPool",
-            Self::GetVmGas         => "GetVmGas",
-            Self::Unknown          => "Unknown",
+            Self::GetPrivacyStats => "GetPrivacyStats",
+            Self::GetShadowPool => "GetShadowPool",
+            Self::GetVmGas => "GetVmGas",
+            Self::Unknown => "Unknown",
         }
     }
 }
@@ -127,26 +135,36 @@ impl GrpcMethod {
 /// gRPC request
 #[derive(Debug)]
 pub struct GrpcRequest {
-    pub method:  GrpcMethod,
+    pub method: GrpcMethod,
     pub payload: Vec<u8>,
-    pub req_id:  u64,
+    pub req_id: u64,
 }
 
 /// gRPC response
 #[derive(Debug)]
 pub struct GrpcResponse {
-    pub success:  bool,
-    pub payload:  Vec<u8>,
-    pub req_id:   u64,
-    pub error:    Option<String>,
+    pub success: bool,
+    pub payload: Vec<u8>,
+    pub req_id: u64,
+    pub error: Option<String>,
 }
 
 impl GrpcResponse {
     pub fn ok(req_id: u64, payload: Vec<u8>) -> Self {
-        Self { success: true, payload, req_id, error: None }
+        Self {
+            success: true,
+            payload,
+            req_id,
+            error: None,
+        }
     }
     pub fn err(req_id: u64, error: &str) -> Self {
-        Self { success: false, payload: vec![], req_id, error: Some(error.to_string()) }
+        Self {
+            success: false,
+            payload: vec![],
+            req_id,
+            error: Some(error.to_string()),
+        }
     }
 
     /// Serialize to wire format: [4B len][1B status][8B req_id][body]
@@ -155,7 +173,10 @@ impl GrpcResponse {
         let body = if self.success {
             self.payload.clone()
         } else {
-            self.error.clone().unwrap_or_else(|| "Unknown error".into()).into_bytes()
+            self.error
+                .clone()
+                .unwrap_or_else(|| "Unknown error".into())
+                .into_bytes()
         };
         let payload_len = 1 + 8 + body.len(); // status + req_id + body
         let mut buf = Vec::with_capacity(4 + payload_len);
@@ -170,19 +191,19 @@ impl GrpcResponse {
 /// Subscription for push notifications
 #[derive(Debug, Clone)]
 pub struct Subscription {
-    pub id:     u64,
+    pub id: u64,
     pub method: GrpcMethod,
     pub active: bool,
 }
 
 /// Server statistics
 pub struct GrpcStats {
-    pub total_requests:  AtomicU64,
-    pub total_errors:    AtomicU64,
-    pub active_conns:    AtomicU64,
-    pub subscriptions:   AtomicU64,
-    pub bytes_sent:      AtomicU64,
-    pub bytes_received:  AtomicU64,
+    pub total_requests: AtomicU64,
+    pub total_errors: AtomicU64,
+    pub active_conns: AtomicU64,
+    pub subscriptions: AtomicU64,
+    pub bytes_sent: AtomicU64,
+    pub bytes_received: AtomicU64,
 }
 
 impl Default for GrpcStats {
@@ -195,10 +216,10 @@ impl GrpcStats {
     pub fn new() -> Self {
         Self {
             total_requests: AtomicU64::new(0),
-            total_errors:   AtomicU64::new(0),
-            active_conns:   AtomicU64::new(0),
-            subscriptions:  AtomicU64::new(0),
-            bytes_sent:     AtomicU64::new(0),
+            total_errors: AtomicU64::new(0),
+            active_conns: AtomicU64::new(0),
+            subscriptions: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
         }
     }
@@ -221,9 +242,9 @@ pub type HandlerFn = Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
 
 /// gRPC Server
 pub struct GrpcServer {
-    port:     u16,
-    running:  Arc<AtomicBool>,
-    stats:    Arc<GrpcStats>,
+    port: u16,
+    running: Arc<AtomicBool>,
+    stats: Arc<GrpcStats>,
     handlers: Arc<RwLock<HashMap<u8, HandlerFn>>>,
     /// Holds the bound address so stop() can connect to unblock accept().
     bound_addr: std::sync::Mutex<Option<std::net::SocketAddr>>,
@@ -233,8 +254,8 @@ impl GrpcServer {
     pub fn new(port: u16) -> Self {
         Self {
             port,
-            running:  Arc::new(AtomicBool::new(false)),
-            stats:    Arc::new(GrpcStats::new()),
+            running: Arc::new(AtomicBool::new(false)),
+            stats: Arc::new(GrpcStats::new()),
             handlers: Arc::new(RwLock::new(HashMap::new())),
             bound_addr: std::sync::Mutex::new(None),
         }
@@ -242,9 +263,13 @@ impl GrpcServer {
 
     /// Register a handler for a method
     pub fn register_handler<F>(&self, method: GrpcMethod, handler: F)
-    where F: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static
+    where
+        F: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
     {
-        self.handlers.write().unwrap_or_else(|e| e.into_inner()).insert(method as u8, Arc::new(handler));
+        self.handlers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(method as u8, Arc::new(handler));
     }
 
     /// Register all default handlers
@@ -265,7 +290,9 @@ impl GrpcServer {
                 "max_bps": 32,
                 "max_tps": 320000,
                 "profiles": ["standard(1)", "high(10)", "ultra(32)"]
-            }).to_string().into_bytes()
+            })
+            .to_string()
+            .into_bytes()
         });
 
         self.register_handler(GrpcMethod::GetEmission, |_| {
@@ -292,7 +319,14 @@ impl GrpcServer {
             }
             None => {
                 self.stats.total_errors.fetch_add(1, Ordering::Relaxed);
-                GrpcResponse::err(req_id, &format!("Method {:?} ({}) is not yet implemented", method, method.name()))
+                GrpcResponse::err(
+                    req_id,
+                    &format!(
+                        "Method {:?} ({}) is not yet implemented",
+                        method,
+                        method.name()
+                    ),
+                )
             }
         }
     }
@@ -349,7 +383,14 @@ impl GrpcServer {
                     }
                     None => {
                         stats.total_errors.fetch_add(1, Ordering::Relaxed);
-                        GrpcResponse::err(req.req_id, &format!("Method {:?} ({}) is not yet implemented", req.method, req.method.name()))
+                        GrpcResponse::err(
+                            req.req_id,
+                            &format!(
+                                "Method {:?} ({}) is not yet implemented",
+                                req.method,
+                                req.method.name()
+                            ),
+                        )
                     }
                 }
             };
@@ -359,9 +400,13 @@ impl GrpcServer {
             if stream.write_all(&resp_bytes).is_err() {
                 break;
             }
-            stats.bytes_sent.fetch_add(resp_bytes.len() as u64, Ordering::Relaxed);
+            stats
+                .bytes_sent
+                .fetch_add(resp_bytes.len() as u64, Ordering::Relaxed);
 
-            stats.bytes_received.fetch_add((4 + msg_len) as u64, Ordering::Relaxed);
+            stats
+                .bytes_received
+                .fetch_add((4 + msg_len) as u64, Ordering::Relaxed);
         }
     }
 
@@ -398,7 +443,9 @@ impl GrpcServer {
         let _ = listener.set_ttl(30);
 
         for stream in listener.incoming() {
-            if !self.running.load(Ordering::Relaxed) { break; }
+            if !self.running.load(Ordering::Relaxed) {
+                break;
+            }
 
             match stream {
                 Ok(mut stream) => {
@@ -443,45 +490,62 @@ impl GrpcServer {
                     std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                     addr.port(),
                 );
-                let _ = TcpStream::connect_timeout(
-                    &loopback,
-                    std::time::Duration::from_millis(100),
-                );
+                let _ =
+                    TcpStream::connect_timeout(&loopback, std::time::Duration::from_millis(100));
             }
         }
 
         slog_info!("rpc", "grpc_server_stopped", stats => &self.stats.summary());
     }
 
-    pub fn is_running(&self) -> bool { self.running.load(Ordering::Relaxed) }
-    pub fn stats(&self) -> &GrpcStats { &self.stats }
-    pub fn port(&self) -> u16 { self.port }
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+    pub fn stats(&self) -> &GrpcStats {
+        &self.stats
+    }
+    pub fn port(&self) -> u16 {
+        self.port
+    }
 }
 
 /// Parse a raw binary request from wire format
 pub fn parse_request(data: &[u8]) -> Option<GrpcRequest> {
-    if data.len() < 13 { return None; } // 4B len + 1B method + 8B req_id
+    if data.len() < 13 {
+        return None;
+    } // 4B len + 1B method + 8B req_id
 
     let msg_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
     // msg_len must cover at least 1B method + 8B req_id = 9 bytes,
     // and must not exceed MAX_MESSAGE_SIZE.  Without the lower bound
     // the slice `data[13..4+msg_len]` underflows and panics.
-    if !(9..=MAX_MESSAGE_SIZE).contains(&msg_len) { return None; }
-    if data.len() < 4 + msg_len { return None; }
+    if !(9..=MAX_MESSAGE_SIZE).contains(&msg_len) {
+        return None;
+    }
+    if data.len() < 4 + msg_len {
+        return None;
+    }
 
     let method = GrpcMethod::from_byte(data[4]);
     let req_id = u64::from_be_bytes([
-        data[5], data[6], data[7], data[8],
-        data[9], data[10], data[11], data[12],
+        data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12],
     ]);
-    let payload = data[13..4+msg_len].to_vec();
+    let payload = data[13..4 + msg_len].to_vec();
 
-    Some(GrpcRequest { method, payload, req_id })
+    Some(GrpcRequest {
+        method,
+        payload,
+        req_id,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn method_from_byte() {
@@ -502,9 +566,7 @@ mod tests {
     #[test]
     fn handle_with_registered_handler() {
         let server = GrpcServer::new(17777);
-        server.register_handler(GrpcMethod::GetBlockCount, |_| {
-            100u64.to_be_bytes().to_vec()
-        });
+        server.register_handler(GrpcMethod::GetBlockCount, |_| 100u64.to_be_bytes().to_vec());
 
         let resp = server.handle_raw(0x03, &[], 1);
         assert!(resp.success);
@@ -573,5 +635,67 @@ mod tests {
         assert_eq!(GrpcMethod::GetBlock.name(), "GetBlock");
         assert_eq!(GrpcMethod::GetPrivacyStats.name(), "GetPrivacyStats");
         assert_eq!(GrpcMethod::GetVmGas.name(), "GetVmGas");
+    }
+
+    #[test]
+    fn grpc_tcp_roundtrip_start_handle_stop() {
+        // Reserve an ephemeral port first, then start the server on it.
+        // This keeps the test isolated and avoids hardcoded-port collisions.
+        let probe = TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        let port = probe.local_addr().expect("probe local addr").port();
+        drop(probe);
+
+        let server = Arc::new(GrpcServer::new(port));
+        server.register_defaults();
+
+        let runner = Arc::clone(&server);
+        let handle = std::thread::spawn(move || {
+            runner.start();
+        });
+
+        // Wait briefly for bind/start.
+        for _ in 0..50 {
+            if server.is_running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(server.is_running(), "gRPC server did not start");
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect gRPC");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+
+        // Request wire format: [4B len][1B method][8B req_id][payload]
+        // Use GetInfo (0x04) with empty payload => msg_len = 9.
+        let mut req = Vec::new();
+        req.extend_from_slice(&9u32.to_be_bytes());
+        req.push(0x04);
+        req.extend_from_slice(&7u64.to_be_bytes());
+        stream.write_all(&req).expect("write request");
+        stream.flush().expect("flush request");
+
+        // Response wire format: [4B len][1B status][8B req_id][body]
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).expect("read response len");
+        let resp_len = u32::from_be_bytes(len_buf) as usize;
+        assert!(resp_len >= 9, "response too short: {}", resp_len);
+
+        let mut resp = vec![0u8; resp_len];
+        stream.read_exact(&mut resp).expect("read response body");
+        assert_eq!(resp[0], 1, "response status must be success");
+
+        let req_id = u64::from_be_bytes([
+            resp[1], resp[2], resp[3], resp[4], resp[5], resp[6], resp[7], resp[8],
+        ]);
+        assert_eq!(req_id, 7, "response req_id mismatch");
+
+        let body = String::from_utf8(resp[9..].to_vec()).expect("utf8 response");
+        assert!(body.contains("ShadowDAG"), "unexpected body: {}", body);
+
+        server.stop();
+        handle.join().expect("join server thread");
+        assert!(!server.is_running(), "gRPC server did not stop");
     }
 }

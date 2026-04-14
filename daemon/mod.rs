@@ -18,35 +18,39 @@
 //     - Regular: FullNode::process_block() (full validation + parent check)
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use rocksdb::DB;
 
-use crate::{slog_info, slog_warn, slog_error};
+use crate::{slog_error, slog_info, slog_warn};
 
 use crate::config::genesis::genesis::create_genesis_block_for;
-use crate::config::node::node_config::{NodeConfig, NetworkMode};
+use crate::config::node::node_config::{NetworkMode, NodeConfig};
+use crate::domain::utxo::utxo_set::UtxoSet;
+use crate::engine::consensus::finality::FinalityManager;
 use crate::engine::dag::core::dag_manager::DagManager;
 use crate::engine::dag::ghostdag::ghostdag::GhostDag;
+use crate::engine::dag::security::dag_shield::DagShield;
 use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
 use crate::infrastructure::storage::rocksdb::core::db::NodeDB;
 use crate::infrastructure::storage::rocksdb::utxo::utxo_store::UtxoStore;
-use crate::domain::utxo::utxo_set::UtxoSet;
 use crate::runtime::node_runtime::lifecycle::Lifecycle;
 use crate::service::mempool::core::mempool_manager::MempoolManager;
 use crate::service::mempool::pools::tx_pool::TxPoolResult;
-use crate::service::network::nodes::full_node::FullNode;
-use crate::service::network::p2p::p2p::{P2P, P2PMessage, push_outbound, drain_pending_txs, drain_pending_blocks, requeue_pending_blocks, requeue_pending_txs, report_bad_peer, report_bad_peer_cat};
-use crate::engine::dag::security::dag_shield::DagShield;
 use crate::service::network::dos_guard::{BanCategory, MAX_TX_BYTES};
+use crate::service::network::nodes::full_node::FullNode;
+use crate::service::network::p2p::p2p::{
+    drain_pending_blocks, drain_pending_txs, push_outbound, report_bad_peer, report_bad_peer_cat,
+    requeue_pending_blocks, requeue_pending_txs, P2PMessage, P2P,
+};
+use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::service::network::rpc::rpc_server::RpcServer;
-use crate::engine::consensus::finality::FinalityManager;
 
-use crate::indexes::utxo_index::UtxoIndex;
-use crate::indexes::tx_index::TxIndex;
 use crate::errors::NodeError;
+use crate::indexes::tx_index::TxIndex;
+use crate::indexes::utxo_index::UtxoIndex;
 
 /// Sentinel substrings used to classify block-rejection errors.
 /// Centralised here so a single rename propagates to every check.
@@ -61,20 +65,21 @@ const BAN_SCORE_INVALID_BLOCK: u64 = 20;
 const BAN_SCORE_INVALID_TX: u64 = 5;
 
 pub struct DaemonNode {
-    cfg:         NodeConfig,
-    db:          Arc<DB>,
+    cfg: NodeConfig,
+    db: Arc<DB>,
     /// The unified block processing engine — ALL block operations go through here
-    full_node:   Arc<FullNode>,
+    full_node: Arc<FullNode>,
     /// Direct access to stores (for genesis init + RPC)
     block_store: Arc<BlockStore>,
-    utxo_set:    Arc<UtxoSet>,
-    dag:         Arc<DagManager>,
-    ghostdag:    Arc<GhostDag>,
-    mempool:     Arc<Mutex<MempoolManager>>,
+    utxo_set: Arc<UtxoSet>,
+    dag: Arc<DagManager>,
+    ghostdag: Arc<GhostDag>,
+    peer_manager: Arc<PeerManager>,
+    mempool: Arc<Mutex<MempoolManager>>,
     /// UTXO index (in-memory cache backed by RocksDB)
-    utxo_index:  Arc<Mutex<UtxoIndex>>,
+    utxo_index: Arc<Mutex<UtxoIndex>>,
     /// TX index (in-memory cache backed by RocksDB)
-    tx_index:    Arc<Mutex<TxIndex>>,
+    tx_index: Arc<Mutex<TxIndex>>,
     /// Dynamic finality manager — adjusts finality depth based on DAG health
     finality_manager: Mutex<FinalityManager>,
 }
@@ -90,27 +95,36 @@ impl DaemonNode {
         let dag = match DagManager::new(db.clone()) {
             Some(d) => Arc::new(d),
             None => {
-                return Err(NodeError::Init(format!("[daemon] FATAL: cannot create DAG manager at {}", db_path_str)));
+                return Err(NodeError::Init(format!(
+                    "[daemon] FATAL: cannot create DAG manager at {}",
+                    db_path_str
+                )));
             }
         };
 
-        let block_store = Arc::new(BlockStore::new(db.clone())
-            .map_err(|e| NodeError::Init(format!("[daemon] FATAL: cannot create block store: {}", e)))?);
+        let block_store = Arc::new(BlockStore::new(db.clone()).map_err(|e| {
+            NodeError::Init(format!("[daemon] FATAL: cannot create block store: {}", e))
+        })?);
 
-        let utxo_store = Arc::new(
-            UtxoStore::new(db.clone()).map_err(|e| {
-                NodeError::Init(format!("[daemon] FATAL: cannot create UTXO store: {}", e))
-            })?
-        );
-        let utxo_set = Arc::new(UtxoSet::new(utxo_store.clone() as Arc<dyn crate::domain::traits::utxo_backend::UtxoBackend>));
+        let utxo_store = Arc::new(UtxoStore::new(db.clone()).map_err(|e| {
+            NodeError::Init(format!("[daemon] FATAL: cannot create UTXO store: {}", e))
+        })?);
+        let utxo_set = Arc::new(UtxoSet::new(
+            utxo_store.clone() as Arc<dyn crate::domain::traits::utxo_backend::UtxoBackend>
+        ));
 
         // GhostDag shares the node's single RocksDB instance.
         // All GhostDag keys are namespaced with "gd:" to avoid collisions.
         let ghostdag = Arc::new(GhostDag::new_with_db(db.clone()));
 
+        let peer_manager = Arc::new(
+            PeerManager::new_default_path(&cfg.peers_path_str())
+                .map_err(|e| NodeError::Init(format!("Failed to init peer manager: {}", e)))?,
+        );
+
         let mempool = Arc::new(Mutex::new(
-            MempoolManager::new_with_peers_path(db.clone(), &cfg.peers_path_str())
-                .map_err(|e| NodeError::Init(format!("Failed to init mempool: {}", e)))?
+            MempoolManager::new_with_peer_manager(db.clone(), peer_manager.clone())
+                .map_err(|e| NodeError::Init(format!("Failed to init mempool: {}", e)))?,
         ));
 
         // Open persistent contract storage (from ~/.shadowdag/<network>/contracts/).
@@ -128,8 +142,11 @@ impl DaemonNode {
         })?;
         let contract_storage = Arc::new(
             crate::runtime::vm::contracts::contract_storage::ContractStorage::new(
-                contract_path_str
-            ).map_err(|e| NodeError::Init(format!("[daemon] contract storage init failed: {}", e)))?
+                contract_path_str,
+            )
+            .map_err(|e| {
+                NodeError::Init(format!("[daemon] contract storage init failed: {}", e))
+            })?,
         );
 
         // Create the unified block processing engine
@@ -159,6 +176,7 @@ impl DaemonNode {
             utxo_set,
             dag,
             ghostdag,
+            peer_manager,
             mempool,
             utxo_index,
             tx_index,
@@ -166,9 +184,15 @@ impl DaemonNode {
         })
     }
 
-    pub fn mainnet()  -> Result<Self, NodeError> { Self::new(NodeConfig::for_network(NetworkMode::Mainnet)) }
-    pub fn testnet()  -> Result<Self, NodeError> { Self::new(NodeConfig::for_network(NetworkMode::Testnet)) }
-    pub fn regtest()  -> Result<Self, NodeError> { Self::new(NodeConfig::for_network(NetworkMode::Regtest)) }
+    pub fn mainnet() -> Result<Self, NodeError> {
+        Self::new(NodeConfig::for_network(NetworkMode::Mainnet))
+    }
+    pub fn testnet() -> Result<Self, NodeError> {
+        Self::new(NodeConfig::for_network(NetworkMode::Testnet))
+    }
+    pub fn regtest() -> Result<Self, NodeError> {
+        Self::new(NodeConfig::for_network(NetworkMode::Regtest))
+    }
 
     pub fn start(&mut self) -> Result<(), NodeError> {
         Lifecycle::on_start();
@@ -203,8 +227,9 @@ impl DaemonNode {
             // Genesis goes through FullNode::process_genesis() — SAME pipeline
             // as all other blocks (validate, save, DAG, GHOSTDAG, UTXO, best_hash).
             // Only difference: parent validation skipped (genesis has no parents).
-            self.full_node.process_genesis(&genesis)
-                .map_err(|e| NodeError::Init(format!("[daemon] FATAL: genesis processing failed: {}", e)))?;
+            self.full_node.process_genesis(&genesis).map_err(|e| {
+                NodeError::Init(format!("[daemon] FATAL: genesis processing failed: {}", e))
+            })?;
             slog_info!("daemon", "genesis_created");
         } else {
             slog_info!("daemon", "existing_chain_found", best => existing_best.as_deref().unwrap_or_default());
@@ -233,7 +258,7 @@ impl DaemonNode {
         }
 
         // ── P2P ──────────────────────────────────────────────────
-        let mut p2p = P2P::new_with_config(&self.cfg)?;
+        let mut p2p = P2P::new_with_config_and_peers(&self.cfg, self.peer_manager.clone())?;
         p2p.peers.bootstrap_for_network(&self.cfg.network);
         let discovered = p2p.peers.discover_peers();
         if discovered.is_empty() {
@@ -243,19 +268,22 @@ impl DaemonNode {
         slog_info!("daemon", "p2p_bootstrapped", peers => p2p.peers.count());
 
         // ── RPC ──────────────────────────────────────────────────
-        let rpc = RpcServer::new_for_network(
+        let rpc = RpcServer::new_for_network_with_peer_manager(
             self.cfg.rpc_port,
-            &self.cfg.peers_path_str(),
+            self.peer_manager.clone(),
             self.db.clone(),
             Some(&self.cfg.data_dir),
-        ).map_err(|e| NodeError::Init(format!("Failed to init RPC server: {}", e)))?;
+        )
+        .map_err(|e| NodeError::Init(format!("Failed to init RPC server: {}", e)))?;
         rpc.set_network_name(self.cfg.network.name());
         rpc.set_network_ports(self.cfg.p2p_port, self.cfg.rpc_port);
-        rpc.start().map_err(|e| NodeError::Init(format!("RPC start failed: {}", e)))?;
+        rpc.start()
+            .map_err(|e| NodeError::Init(format!("RPC start failed: {}", e)))?;
         slog_info!("daemon", "rpc_started", port => self.cfg.rpc_port);
 
         // ── Start network ────────────────────────────────────────
-        p2p.start().map_err(|e| NodeError::Init(format!("P2P start failed: {}", e)))?;
+        p2p.start()
+            .map_err(|e| NodeError::Init(format!("P2P start failed: {}", e)))?;
         slog_info!("daemon", "p2p_listening", addr => p2p.listen_addr);
 
         slog_info!("daemon", "node_running", network => self.cfg.network.name());
@@ -276,8 +304,8 @@ impl DaemonNode {
 
         const POLL_INTERVAL: Duration = Duration::from_millis(50);
         const STATS_INTERVAL: Duration = Duration::from_secs(30);
-        const TX_BATCH_LIMIT: usize = 500;   // Max TXs per tick (backpressure)
-        const BLOCK_BATCH_LIMIT: usize = 50;  // Max blocks per tick
+        const TX_BATCH_LIMIT: usize = 500; // Max TXs per tick (backpressure)
+        const BLOCK_BATCH_LIMIT: usize = 50; // Max blocks per tick
 
         // Register Ctrl+C handler for graceful shutdown
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -342,7 +370,8 @@ impl DaemonNode {
 
                             // Notify finality manager with real DAG data
                             let is_blue = self.ghostdag.get_blue_score(&block.header.hash) > 0;
-                            let dag_width = self.block_store.blocks_at_height(block.header.height) as u64;
+                            let dag_width =
+                                self.block_store.blocks_at_height(block.header.height) as u64;
                             self.finality_manager.lock().on_block(
                                 block.header.height,
                                 &block.header.hash,
@@ -366,7 +395,12 @@ impl DaemonNode {
                                 && !err_msg.contains("dos_rejected")
                             {
                                 // Ban feedback: penalize peer that sent the bad block
-                                report_bad_peer_cat(peer_id, BAN_SCORE_INVALID_BLOCK, "invalid block rejected by consensus", BanCategory::Malformed);
+                                report_bad_peer_cat(
+                                    peer_id,
+                                    BAN_SCORE_INVALID_BLOCK,
+                                    "invalid block rejected by consensus",
+                                    BanCategory::Malformed,
+                                );
                                 slog_error!("daemon", "block_rejected_consensus", hash => hash_prefix, peer => peer_id, error => err_msg);
                             }
                         }
@@ -437,12 +471,22 @@ impl DaemonNode {
                                 // DoubleSpend may indicate misbehaviour but is
                                 // common during reorgs — use a low score (1) so
                                 // that sporadic duplicates don't trigger a ban.
-                                report_bad_peer_cat(&peer_id, 1, "double-spend tx", BanCategory::Resource);
+                                report_bad_peer_cat(
+                                    &peer_id,
+                                    1,
+                                    "double-spend tx",
+                                    BanCategory::Resource,
+                                );
                             }
                             // Invalid and Rejected are truly malformed/policy-violating.
                             TxPoolResult::Invalid | TxPoolResult::Rejected => {
                                 total_txs_rejected += 1;
-                                report_bad_peer_cat(&peer_id, BAN_SCORE_INVALID_TX, "invalid tx rejected by mempool", BanCategory::Malformed);
+                                report_bad_peer_cat(
+                                    &peer_id,
+                                    BAN_SCORE_INVALID_TX,
+                                    "invalid tx rejected by mempool",
+                                    BanCategory::Malformed,
+                                );
                             }
                         }
                     }
@@ -460,7 +504,9 @@ impl DaemonNode {
                     // Use a temporary PeerManager to add discovered addresses.
                     // The daemon's PeerManager is inside the P2P instance which
                     // may not be accessible here, so we use the global singleton.
-                    if let Ok(pm) = crate::service::network::p2p::peer_manager::PeerManager::new_default() {
+                    if let Ok(pm) =
+                        crate::service::network::p2p::peer_manager::PeerManager::new_default()
+                    {
                         for addr in &addrs {
                             let _ = pm.add_peer(addr);
                         }
@@ -509,7 +555,10 @@ impl DaemonNode {
 
     /// Process a new block through the FULL consensus pipeline.
     /// This is the ONLY way to add blocks — never bypass this.
-    pub fn process_block(&self, block: &crate::domain::block::block::Block) -> Result<(), NodeError> {
+    pub fn process_block(
+        &self,
+        block: &crate::domain::block::block::Block,
+    ) -> Result<(), NodeError> {
         self.full_node.process_block(block)
     }
 
@@ -556,12 +605,19 @@ impl DaemonNode {
         // Step A: Check BlockStore integrity
         // Use get_best_hash_strict() to distinguish "absent" from "corrupt/unreadable".
         // A corrupt read here must be fatal — recovery with stale data is dangerous.
-        let best_hash = self.block_store.get_best_hash_strict()
-            .map_err(|e| NodeError::Init(format!(
-                "FATAL: best_hash read failed during recovery (corrupt DB?): {}", e
-            )))?
+        let best_hash = self
+            .block_store
+            .get_best_hash_strict()
+            .map_err(|e| {
+                NodeError::Init(format!(
+                    "FATAL: best_hash read failed during recovery (corrupt DB?): {}",
+                    e
+                ))
+            })?
             .ok_or(NodeError::Init("No best hash found".to_string()))?;
-        let best_block = self.block_store.get_block(&best_hash)
+        let best_block = self
+            .block_store
+            .get_block(&best_hash)
             .ok_or(NodeError::Init("Best block not found in store".to_string()))?;
         slog_info!("daemon", "recovery_blockstore_ok",
             best => &best_hash[..std::cmp::min(16, best_hash.len())],
@@ -569,8 +625,8 @@ impl DaemonNode {
 
         // Step B: Check DAG + GHOSTDAG consistency
         let dag_ok = self.dag.block_exists(&best_hash);
-        let ghostdag_ok = self.ghostdag.get_blue_score(&best_hash) > 0
-            || best_block.header.height == 0;
+        let ghostdag_ok =
+            self.ghostdag.get_blue_score(&best_hash) > 0 || best_block.header.height == 0;
 
         if !dag_ok || !ghostdag_ok {
             if !dag_ok {
@@ -601,8 +657,13 @@ impl DaemonNode {
 
             // Try UTXO store commitment first (atomic with UTXO apply),
             // then BlockStore (legacy), then header field (oldest legacy).
-            let stored_commitment = self.utxo_set.get_commitment(&best_block.header.hash)
-                .or_else(|| self.block_store.get_utxo_commitment(&best_block.header.hash))
+            let stored_commitment = self
+                .utxo_set
+                .get_commitment(&best_block.header.hash)
+                .or_else(|| {
+                    self.block_store
+                        .get_utxo_commitment(&best_block.header.hash)
+                })
                 .or_else(|| best_block.header.utxo_commitment.clone())
                 .unwrap_or_default();
             let computed_commitment = self.utxo_set.compute_commitment_hash();
@@ -686,7 +747,8 @@ impl DaemonNode {
         }
         if failed > 0 {
             return Err(NodeError::Recovery(format!(
-                "DAG rebuild had {} failures out of {} blocks — partial state is dangerous", failed, total
+                "DAG rebuild had {} failures out of {} blocks — partial state is dangerous",
+                failed, total
             )));
         }
         slog_info!("daemon", "dag_rebuilt", total => total, failed => failed);
@@ -715,7 +777,8 @@ impl DaemonNode {
             match result {
                 Err(e) => {
                     failed += 1;
-                    let msg = e.downcast_ref::<String>()
+                    let msg = e
+                        .downcast_ref::<String>()
                         .map(|s| s.as_str())
                         .or_else(|| e.downcast_ref::<&str>().copied())
                         .unwrap_or("unknown panic");
@@ -738,7 +801,8 @@ impl DaemonNode {
         }
         if failed > 0 {
             return Err(NodeError::Recovery(format!(
-                "GHOSTDAG rebuild had {} failures out of {} blocks — partial state is dangerous", failed, total
+                "GHOSTDAG rebuild had {} failures out of {} blocks — partial state is dangerous",
+                failed, total
             )));
         }
 
@@ -752,7 +816,7 @@ impl DaemonNode {
                 slog_error!("daemon", "rebuild_ghostdag_best_hash_failed",
                     tip => &best_tip[..best_tip.len().min(16)]);
                 return Err(NodeError::Init(
-                    "failed to persist best_hash after GHOSTDAG rebuild".into()
+                    "failed to persist best_hash after GHOSTDAG rebuild".into(),
                 ));
             }
             slog_info!("daemon", "ghostdag_rebuilt",
@@ -778,18 +842,24 @@ impl DaemonNode {
     fn replay_blocks(&self) -> Result<(), NodeError> {
         slog_info!("daemon", "utxo_replay_start");
 
-        let best_tip = self.block_store.get_best_hash_strict()
-            .map_err(|e| NodeError::Init(format!(
-                "FATAL: best_hash read failed during replay (corrupt DB?): {}", e
-            )))?
+        let best_tip = self
+            .block_store
+            .get_best_hash_strict()
+            .map_err(|e| {
+                NodeError::Init(format!(
+                    "FATAL: best_hash read failed during replay (corrupt DB?): {}",
+                    e
+                ))
+            })?
             .ok_or_else(|| NodeError::Init("no best tip for replay".into()))?;
 
         // Walk selected-parent chain from best_tip back to genesis
         let mut chain = Vec::new();
         let mut cursor = best_tip;
         loop {
-            let block = self.block_store.get_block(&cursor)
-                .ok_or_else(|| NodeError::Init(format!("missing block {} during replay", cursor)))?;
+            let block = self.block_store.get_block(&cursor).ok_or_else(|| {
+                NodeError::Init(format!("missing block {} during replay", cursor))
+            })?;
             let parent = block.header.selected_parent.clone();
             chain.push(block);
             match parent {
@@ -800,10 +870,15 @@ impl DaemonNode {
         chain.reverse();
 
         for block in &chain {
-            self.utxo_set.apply_block_dag_ordered(
-                &block.body.transactions, block.header.height, &block.header.hash
-            ).map_err(|e| NodeError::Init(format!("replay failed for {}: {}",
-                block.header.hash, e)))?;
+            self.utxo_set
+                .apply_block_dag_ordered(
+                    &block.body.transactions,
+                    block.header.height,
+                    &block.header.hash,
+                )
+                .map_err(|e| {
+                    NodeError::Init(format!("replay failed for {}: {}", block.header.hash, e))
+                })?;
         }
 
         slog_info!("daemon", "utxo_replay_complete", blocks => chain.len());
@@ -858,9 +933,14 @@ mod tests {
             .as_nanos();
         let mut cfg = NodeConfig::for_network(network);
         cfg.data_dir = std::path::PathBuf::from(format!(
-            "{}/shadowdag_test_{}_{}", std::env::temp_dir().display(), cfg.network.short_name(), ts
+            "{}/shadowdag_test_{}_{}",
+            std::env::temp_dir().display(),
+            cfg.network.short_name(),
+            ts
         ));
-        DaemonNode::new(cfg).expect("failed to create DaemonNode for test — check NodeConfig and data_dir permissions")
+        DaemonNode::new(cfg).expect(
+            "failed to create DaemonNode for test — check NodeConfig and data_dir permissions",
+        )
     }
 
     #[test]

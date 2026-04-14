@@ -3,14 +3,14 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::collections::{HashSet, HashMap};
 use crate::domain::block::block::Block;
 use crate::domain::transaction::transaction::Transaction;
 use crate::domain::transaction::tx_hash::TxHash;
 use crate::domain::transaction::tx_validator::TxValidator;
 use crate::domain::utxo::utxo_key::UtxoKey;
-use crate::domain::utxo::utxo_set::{UtxoSet, COINBASE_MATURITY, utxo_key};
+use crate::domain::utxo::utxo_set::{utxo_key, UtxoSet, COINBASE_MATURITY};
 use crate::errors::StorageError;
+use std::collections::{HashMap, HashSet};
 
 pub struct UtxoValidator;
 
@@ -103,8 +103,7 @@ impl UtxoValidator {
         let transactions = &block.body.transactions;
 
         // Track which keys have been spent in this block (cross-tx double-spend)
-        let mut will_spend: HashSet<UtxoKey> =
-            HashSet::with_capacity(transactions.len() * 2);
+        let mut will_spend: HashSet<UtxoKey> = HashSet::with_capacity(transactions.len() * 2);
 
         // Staged outputs: outputs created by earlier txs in THIS block,
         // available for spending by later txs in the same block.
@@ -116,7 +115,8 @@ impl UtxoValidator {
             // Empty outputs check (applies to all tx including coinbase)
             if tx.outputs.is_empty() {
                 return Err(StorageError::Other(format!(
-                    "validate_block_utxos: tx {} has no outputs", tx.hash
+                    "validate_block_utxos: tx {} has no outputs",
+                    tx.hash
                 )));
             }
 
@@ -124,16 +124,20 @@ impl UtxoValidator {
             if tx.is_coinbase() {
                 if !tx.inputs.is_empty() {
                     return Err(StorageError::Other(format!(
-                        "validate_block_utxos: coinbase tx {} must have exactly 0 inputs", tx.hash
+                        "validate_block_utxos: coinbase tx {} must have exactly 0 inputs",
+                        tx.hash
                     )));
                 }
                 // Validate coinbase output amounts (overflow protection)
                 let mut coinbase_total: u64 = 0;
                 for (idx, output) in tx.outputs.iter().enumerate() {
-                    coinbase_total = coinbase_total.checked_add(output.amount)
-                        .ok_or_else(|| StorageError::Other(format!(
-                            "validate_block_utxos: coinbase output sum overflow (tx {})", tx.hash
-                        )))?;
+                    coinbase_total =
+                        coinbase_total.checked_add(output.amount).ok_or_else(|| {
+                            StorageError::Other(format!(
+                                "validate_block_utxos: coinbase output sum overflow (tx {})",
+                                tx.hash
+                            ))
+                        })?;
                     // Stage coinbase outputs for potential intra-block spending
                     let key = utxo_key(&tx.hash, idx as u32)?;
                     staged_outputs.insert(key, (output.address.clone(), output.amount, true));
@@ -144,13 +148,13 @@ impl UtxoValidator {
             // Non-coinbase must have inputs
             if tx.inputs.is_empty() {
                 return Err(StorageError::Other(format!(
-                    "validate_block_utxos: non-coinbase tx {} has no inputs", tx.hash
+                    "validate_block_utxos: non-coinbase tx {} has no inputs",
+                    tx.hash
                 )));
             }
 
             // Duplicate inputs within same tx + UTXO checks
-            let mut seen_in_tx: HashSet<UtxoKey> =
-                HashSet::with_capacity(tx.inputs.len());
+            let mut seen_in_tx: HashSet<UtxoKey> = HashSet::with_capacity(tx.inputs.len());
             let mut input_sum: u64 = 0;
 
             for input in &tx.inputs {
@@ -159,7 +163,8 @@ impl UtxoValidator {
                 // Duplicate input within same transaction
                 if !seen_in_tx.insert(key) {
                     return Err(StorageError::Other(format!(
-                        "validate_block_utxos: duplicate input {} within tx {}", key, tx.hash
+                        "validate_block_utxos: duplicate input {} within tx {}",
+                        key, tx.hash
                     )));
                 }
 
@@ -173,44 +178,46 @@ impl UtxoValidator {
 
                 // Input must exist in base UTXO set OR in staged outputs from
                 // earlier transactions in this same block.
-                let (owner, amount, _is_staged_coinbase) =
-                    if let Some(utxo) = utxo_set.get_utxo(&key) {
-                        // Found in base UTXO set
-                        if utxo.spent {
-                            return Err(StorageError::Other(format!(
-                                "validate_block_utxos: utxo {} already spent (tx {})", key, tx.hash
-                            )));
-                        }
+                let (owner, amount, _is_staged_coinbase) = if let Some(utxo) =
+                    utxo_set.get_utxo(&key)
+                {
+                    // Found in base UTXO set
+                    if utxo.spent {
+                        return Err(StorageError::Other(format!(
+                            "validate_block_utxos: utxo {} already spent (tx {})",
+                            key, tx.hash
+                        )));
+                    }
 
-                        // Coinbase maturity check (base UTXO set only)
-                        if let Some(created_height) = utxo_set.coinbase_created_height(&key) {
-                            let confirmations = block_height.saturating_sub(created_height);
-                            if confirmations < COINBASE_MATURITY {
-                                return Err(StorageError::Other(format!(
+                    // Coinbase maturity check (base UTXO set only)
+                    if let Some(created_height) = utxo_set.coinbase_created_height(&key) {
+                        let confirmations = block_height.saturating_sub(created_height);
+                        if confirmations < COINBASE_MATURITY {
+                            return Err(StorageError::Other(format!(
                                     "validate_block_utxos: coinbase utxo {} immature: {} confirmations < required {} (tx {})",
                                     key, confirmations, COINBASE_MATURITY, tx.hash
                                 )));
-                            }
                         }
+                    }
 
-                        (utxo.address.clone(), utxo.amount, false)
-                    } else if let Some((addr, amt, is_cb)) = staged_outputs.get(&key) {
-                        // Found in staged outputs from earlier tx in this block
-                        if *is_cb {
-                            // Coinbase outputs created in THIS block cannot be spent
-                            // in the same block — they need COINBASE_MATURITY confirmations
-                            return Err(StorageError::Other(format!(
+                    (utxo.address.clone(), utxo.amount, false)
+                } else if let Some((addr, amt, is_cb)) = staged_outputs.get(&key) {
+                    // Found in staged outputs from earlier tx in this block
+                    if *is_cb {
+                        // Coinbase outputs created in THIS block cannot be spent
+                        // in the same block — they need COINBASE_MATURITY confirmations
+                        return Err(StorageError::Other(format!(
                                 "validate_block_utxos: cannot spend coinbase output {} in same block (tx {})",
                                 key, tx.hash
                             )));
-                        }
-                        (addr.clone(), *amt, false)
-                    } else {
-                        return Err(StorageError::Other(format!(
+                    }
+                    (addr.clone(), *amt, false)
+                } else {
+                    return Err(StorageError::Other(format!(
                             "validate_block_utxos: utxo {} not found in UTXO set or earlier block txs (tx {})",
                             key, tx.hash
                         )));
-                    };
+                };
 
                 // Verify signature matches UTXO owner
                 let signing_msg = TxHash::signing_message(tx);
@@ -222,9 +229,12 @@ impl UtxoValidator {
                 }
 
                 // Overflow protection on input sum
-                input_sum = input_sum.checked_add(amount).ok_or_else(|| StorageError::Other(format!(
-                    "validate_block_utxos: input sum overflow at {} (tx {})", key, tx.hash
-                )))?;
+                input_sum = input_sum.checked_add(amount).ok_or_else(|| {
+                    StorageError::Other(format!(
+                        "validate_block_utxos: input sum overflow at {} (tx {})",
+                        key, tx.hash
+                    ))
+                })?;
 
                 will_spend.insert(key);
             }
@@ -232,9 +242,12 @@ impl UtxoValidator {
             // Overflow-safe output sum
             let mut output_sum: u64 = 0;
             for output in &tx.outputs {
-                output_sum = output_sum.checked_add(output.amount).ok_or_else(|| StorageError::Other(format!(
-                    "validate_block_utxos: output sum overflow (tx {})", tx.hash
-                )))?;
+                output_sum = output_sum.checked_add(output.amount).ok_or_else(|| {
+                    StorageError::Other(format!(
+                        "validate_block_utxos: output sum overflow (tx {})",
+                        tx.hash
+                    ))
+                })?;
             }
 
             // inputs >= outputs
@@ -246,9 +259,12 @@ impl UtxoValidator {
             }
 
             // Fee consistency check
-            let actual_fee = input_sum.checked_sub(output_sum).ok_or_else(|| StorageError::Other(format!(
-                "validate_block_utxos: fee underflow in tx {}", tx.hash
-            )))?;
+            let actual_fee = input_sum.checked_sub(output_sum).ok_or_else(|| {
+                StorageError::Other(format!(
+                    "validate_block_utxos: fee underflow in tx {}",
+                    tx.hash
+                ))
+            })?;
 
             if actual_fee != tx.fee {
                 return Err(StorageError::Other(format!(

@@ -15,37 +15,43 @@
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
-use crate::engine::privacy::stealth::view_key::ViewKey;
-use crate::domain::transaction::transaction::Transaction;
 use crate::domain::block::block::Block;
+use crate::domain::transaction::transaction::Transaction;
+use crate::engine::privacy::stealth::view_key::ViewKey;
 use crate::errors::CryptoError;
-use crate::{slog_warn, slog_error};
+use crate::{slog_error, slog_warn};
 
 /// Result of scanning a transaction
 #[derive(Debug, Clone)]
 pub struct ScanResult {
-    pub tx_hash:  String,
-    pub out_idx:  usize,
-    pub address:  String,
-    pub amount:   u64,
+    pub tx_hash: String,
+    pub out_idx: usize,
+    pub address: String,
+    pub amount: u64,
 }
 
 pub struct StealthScanner {
-    pub view_key:     ViewKey,
+    pub view_key: ViewKey,
     /// Optional spend public key for full ECDH scanning.
     pub spend_public: Option<RistrettoPoint>,
 }
 
 impl StealthScanner {
     pub fn new(view_key: ViewKey) -> Self {
-        Self { view_key, spend_public: None }
+        Self {
+            view_key,
+            spend_public: None,
+        }
     }
 
     /// Create a scanner with full ECDH capability.
     pub fn with_spend_public(view_key: ViewKey, spend_public: RistrettoPoint) -> Self {
-        Self { view_key, spend_public: Some(spend_public) }
+        Self {
+            view_key,
+            spend_public: Some(spend_public),
+        }
     }
 
     /// Full ECDH scan: given ephemeral pubkey R, check if an address is ours.
@@ -150,7 +156,7 @@ impl StealthScanner {
                         tx_hash: tx.hash.clone(),
                         out_idx: idx,
                         address: output.address.clone(),
-                        amount:  output.amount,
+                        amount: output.amount,
                     });
                 }
                 Ok(false) => {}
@@ -166,7 +172,10 @@ impl StealthScanner {
 
     /// Scan a block for all matching transactions.
     pub fn scan_block(&self, block: &Block) -> Vec<ScanResult> {
-        block.body.transactions.iter()
+        block
+            .body
+            .transactions
+            .iter()
             .flat_map(|tx| self.scan_transaction(tx))
             .collect()
     }
@@ -178,7 +187,8 @@ impl StealthScanner {
         let mut all_results = Vec::new();
 
         for chunk in blocks.chunks(SCAN_BATCH_SIZE) {
-            let batch_results: Vec<ScanResult> = chunk.iter()
+            let batch_results: Vec<ScanResult> = chunk
+                .iter()
                 .flat_map(|block| self.scan_block(block))
                 .collect();
             all_results.extend(batch_results);
@@ -189,14 +199,18 @@ impl StealthScanner {
 
     /// Scan a list of transactions.
     pub fn scan_block_transactions(&self, transactions: &[Transaction]) -> Vec<ScanResult> {
-        transactions.iter()
+        transactions
+            .iter()
             .flat_map(|tx| self.scan_transaction(tx))
             .collect()
     }
 
     /// Calculate total balance from scan results.
     pub fn total_balance(results: &[ScanResult]) -> u64 {
-        results.iter().try_fold(0u64, |acc, r| acc.checked_add(r.amount)).unwrap_or(u64::MAX)
+        results
+            .iter()
+            .try_fold(0u64, |acc, r| acc.checked_add(r.amount))
+            .unwrap_or(u64::MAX)
     }
 }
 
@@ -206,9 +220,9 @@ impl StealthScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curve25519_dalek::ristretto::CompressedRistretto;
-    use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
     use crate::domain::address::stealth_address::StealthAddress;
+    use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
+    use curve25519_dalek::ristretto::CompressedRistretto;
 
     fn make_scanner() -> StealthScanner {
         StealthScanner::new(ViewKey::from_private_key("test_key").unwrap())
@@ -237,7 +251,13 @@ mod tests {
         let tx = Transaction {
             hash: "tx1".to_string(),
             inputs: vec![],
-            outputs: vec![TxOutput { address: "SD1regular".into(), amount: 100, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            outputs: vec![TxOutput {
+                address: "SD1regular".into(),
+                amount: 100,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee: 1,
             timestamp: 1000,
             is_coinbase: false,
@@ -251,8 +271,18 @@ mod tests {
     #[test]
     fn total_balance_calculation() {
         let results = vec![
-            ScanResult { tx_hash: "a".into(), out_idx: 0, address: "x".into(), amount: 100 },
-            ScanResult { tx_hash: "b".into(), out_idx: 0, address: "y".into(), amount: 200 },
+            ScanResult {
+                tx_hash: "a".into(),
+                out_idx: 0,
+                address: "x".into(),
+                amount: 100,
+            },
+            ScanResult {
+                tx_hash: "b".into(),
+                out_idx: 0,
+                address: "y".into(),
+                amount: 200,
+            },
         ];
         assert_eq!(StealthScanner::total_balance(&results), 300);
     }
@@ -271,20 +301,27 @@ mod tests {
             &keys.spend_public,
             tx_hash,
             output_index,
-        ).unwrap();
+        )
+        .unwrap();
 
         let eph_bytes: [u8; 32] = hex::decode(&result.ephemeral_pubkey)
-            .unwrap().try_into().unwrap();
+            .unwrap()
+            .try_into()
+            .unwrap();
         let eph = CompressedRistretto::from_slice(&eph_bytes)
-            .unwrap().decompress().unwrap();
+            .unwrap()
+            .decompress()
+            .unwrap();
 
-        assert!(scanner.scan_with_ephemeral(&eph, &result.one_time_address, tx_hash, output_index).unwrap());
+        assert!(scanner
+            .scan_with_ephemeral(&eph, &result.one_time_address, tx_hash, output_index)
+            .unwrap());
     }
 
     #[test]
     fn ecdh_scan_rejects_other() {
         let alice = StealthAddress::generate_keys();
-        let bob   = StealthAddress::generate_keys();
+        let bob = StealthAddress::generate_keys();
 
         let vk = ViewKey::from_scalar(bob.view_private);
         let scanner = StealthScanner::with_spend_public(vk, bob.spend_public);
@@ -294,13 +331,85 @@ mod tests {
             &alice.spend_public,
             "test_tx",
             0,
-        ).unwrap();
+        )
+        .unwrap();
 
         let eph_bytes: [u8; 32] = hex::decode(&result.ephemeral_pubkey)
-            .unwrap().try_into().unwrap();
+            .unwrap()
+            .try_into()
+            .unwrap();
         let eph = CompressedRistretto::from_slice(&eph_bytes)
-            .unwrap().decompress().unwrap();
+            .unwrap()
+            .decompress()
+            .unwrap();
 
-        assert!(!scanner.scan_with_ephemeral(&eph, &result.one_time_address, "test_tx", 0).unwrap());
+        assert!(!scanner
+            .scan_with_ephemeral(&eph, &result.one_time_address, "test_tx", 0)
+            .unwrap());
+    }
+
+    #[test]
+    fn attacker_cannot_track_hidden_wallet_outputs_at_scale() {
+        let owner = StealthAddress::generate_keys();
+        let attacker = StealthAddress::generate_keys();
+
+        // Owner scanner: correct view key + correct spend public.
+        let owner_scanner = StealthScanner::with_spend_public(
+            ViewKey::from_scalar(owner.view_private),
+            owner.spend_public,
+        );
+
+        // Attacker scanner: wrong view key, but even if attacker knows owner's
+        // spend public, tracking should still fail without the correct view key.
+        let attacker_scanner = StealthScanner::with_spend_public(
+            ViewKey::from_scalar(attacker.view_private),
+            owner.spend_public,
+        );
+
+        let mut txs = Vec::new();
+        for i in 0..64usize {
+            let tx_hash = format!("hidden_tx_{:04}", i);
+            let out_idx = 0usize;
+            let stealth = StealthAddress::generate_full_with_context(
+                &owner.view_public,
+                &owner.spend_public,
+                &tx_hash,
+                out_idx,
+            )
+            .unwrap();
+
+            let tx = Transaction {
+                hash: tx_hash,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    address: stealth.one_time_address,
+                    amount: 100 + i as u64,
+                    commitment: None,
+                    range_proof: None,
+                    ephemeral_pubkey: Some(stealth.ephemeral_pubkey),
+                }],
+                fee: 0,
+                timestamp: i as u64,
+                is_coinbase: false,
+                tx_type: TxType::Transfer,
+                payload_hash: None,
+                ..Default::default()
+            };
+            txs.push(tx);
+        }
+
+        let owner_hits = owner_scanner.scan_block_transactions(&txs);
+        let attacker_hits = attacker_scanner.scan_block_transactions(&txs);
+
+        assert_eq!(
+            owner_hits.len(),
+            txs.len(),
+            "owner must detect all own stealth outputs"
+        );
+        assert_eq!(
+            attacker_hits.len(),
+            0,
+            "attacker must not track hidden wallet outputs"
+        );
     }
 }

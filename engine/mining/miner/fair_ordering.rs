@@ -17,7 +17,7 @@
 //   - Deterministic tiebreaker (TX hash) prevents arbitrary ordering
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 use crate::domain::transaction::transaction::Transaction;
 
@@ -30,11 +30,11 @@ pub const MAX_AGE_BONUS: u64 = 3_600;
 /// Fair ordering result
 #[derive(Debug, Clone)]
 pub struct OrderedTx {
-    pub tx_hash:       String,
-    pub fee:           u64,
-    pub age_bonus:     u64,
+    pub tx_hash: String,
+    pub fee: u64,
+    pub age_bonus: u64,
     pub effective_fee: u64,
-    pub order_key:     String, // Deterministic sort key
+    pub order_key: String, // Deterministic sort key
 }
 
 pub struct FairOrdering;
@@ -42,33 +42,34 @@ pub struct FairOrdering;
 impl FairOrdering {
     /// Order transactions fairly for block inclusion.
     /// Returns transactions sorted by effective fee (desc) then hash (deterministic).
-    pub fn order_for_block(
-        txs: &[Transaction],
-        current_time: u64,
-    ) -> Vec<OrderedTx> {
-        let mut ordered: Vec<OrderedTx> = txs.iter().map(|tx| {
-            let age_secs = current_time.saturating_sub(tx.timestamp);
-            let age_bonus = (age_secs * AGE_BONUS_PER_SEC).min(MAX_AGE_BONUS);
-            let effective_fee = tx.fee.saturating_add(age_bonus);
+    pub fn order_for_block(txs: &[Transaction], current_time: u64) -> Vec<OrderedTx> {
+        let mut ordered: Vec<OrderedTx> = txs
+            .iter()
+            .map(|tx| {
+                let age_secs = current_time.saturating_sub(tx.timestamp);
+                let age_bonus = (age_secs * AGE_BONUS_PER_SEC).min(MAX_AGE_BONUS);
+                let effective_fee = tx.fee.saturating_add(age_bonus);
 
-            // Deterministic order key: H(effective_fee || tx_hash)
-            let mut h = Sha256::new();
-            h.update(effective_fee.to_be_bytes());
-            h.update(tx.hash.as_bytes());
-            let order_key = hex::encode(h.finalize());
+                // Deterministic order key: H(effective_fee || tx_hash)
+                let mut h = Sha256::new();
+                h.update(effective_fee.to_be_bytes());
+                h.update(tx.hash.as_bytes());
+                let order_key = hex::encode(h.finalize());
 
-            OrderedTx {
-                tx_hash: tx.hash.clone(),
-                fee: tx.fee,
-                age_bonus,
-                effective_fee,
-                order_key,
-            }
-        }).collect();
+                OrderedTx {
+                    tx_hash: tx.hash.clone(),
+                    fee: tx.fee,
+                    age_bonus,
+                    effective_fee,
+                    order_key,
+                }
+            })
+            .collect();
 
         // Sort: highest effective fee first, then deterministic hash tiebreaker
         ordered.sort_by(|a, b| {
-            b.effective_fee.cmp(&a.effective_fee)
+            b.effective_fee
+                .cmp(&a.effective_fee)
                 .then_with(|| a.order_key.cmp(&b.order_key))
         });
 
@@ -126,7 +127,13 @@ mod tests {
         Transaction {
             hash: hash.to_string(),
             inputs: vec![],
-            outputs: vec![TxOutput { address: "addr".into(), amount: 100, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            outputs: vec![TxOutput {
+                address: "addr".into(),
+                amount: 100,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee,
             timestamp,
             is_coinbase: false,
@@ -152,8 +159,8 @@ mod tests {
     #[test]
     fn age_bonus_helps_old_txs() {
         let txs = vec![
-            make_tx("new_high", 100, 1000),  // New, high fee
-            make_tx("old_low", 50, 0),        // Old (1000s), low fee + age bonus
+            make_tx("new_high", 100, 1000), // New, high fee
+            make_tx("old_low", 50, 0),      // Old (1000s), low fee + age bonus
         ];
         let ordered = FairOrdering::order_for_block(&txs, 1000);
         // old_low gets +1000 age bonus → effective_fee = 1050 > 100
@@ -162,13 +169,13 @@ mod tests {
 
     #[test]
     fn deterministic_tiebreaker() {
-        let txs = vec![
-            make_tx("tx_b", 100, 1000),
-            make_tx("tx_a", 100, 1000),
-        ];
+        let txs = vec![make_tx("tx_b", 100, 1000), make_tx("tx_a", 100, 1000)];
         let o1 = FairOrdering::order_for_block(&txs, 1000);
         let o2 = FairOrdering::order_for_block(&txs, 1000);
-        assert_eq!(o1[0].tx_hash, o2[0].tx_hash, "Same fee must have deterministic order");
+        assert_eq!(
+            o1[0].tx_hash, o2[0].tx_hash,
+            "Same fee must have deterministic order"
+        );
     }
 
     #[test]

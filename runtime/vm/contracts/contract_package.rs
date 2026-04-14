@@ -9,9 +9,9 @@
 // with a contract: bytecode, ABI, VM version, and verification hashes.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use serde::{Serialize, Deserialize};
-use sha2::{Sha256, Digest};
 use crate::runtime::vm::contracts::contract_abi::ContractAbi;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// A self-contained contract deployment package.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,11 +144,11 @@ impl ContractPackage {
 
         match &self.source_hash {
             Some(s) => push_len_prefixed(&mut buf, s.as_bytes()),
-            None    => push_len_prefixed(&mut buf, &[]),
+            None => push_len_prefixed(&mut buf, &[]),
         }
         match &self.constructor_args {
             Some(v) => push_len_prefixed(&mut buf, v),
-            None    => push_len_prefixed(&mut buf, &[]),
+            None => push_len_prefixed(&mut buf, &[]),
         }
 
         buf.push(self.format_version);
@@ -334,19 +334,28 @@ mod tests {
         let tampered_json = serde_json::to_string(&json).unwrap();
 
         let result = ContractPackage::from_json(&tampered_json);
-        assert!(result.is_err(), "tampered package must not load via from_json");
+        assert!(
+            result.is_err(),
+            "tampered package must not load via from_json"
+        );
         let msg = result.unwrap_err();
         assert!(
             msg.contains("integrity check"),
-            "error must describe integrity failure, got: {}", msg
+            "error must describe integrity failure, got: {}",
+            msg
         );
 
         // The escape hatch still works for tooling that needs to
         // inspect bad packages directly.
         let unverified = ContractPackage::from_json_unverified(&tampered_json);
-        assert!(unverified.is_ok(), "from_json_unverified should still load the bytes");
-        assert!(!unverified.unwrap().verify(),
-            "the unverified load must still fail verify() so the caller sees it");
+        assert!(
+            unverified.is_ok(),
+            "from_json_unverified should still load the bytes"
+        );
+        assert!(
+            !unverified.unwrap().verify(),
+            "the unverified load must still fail verify() so the caller sees it"
+        );
     }
 
     #[test]
@@ -364,7 +373,10 @@ mod tests {
         let tampered_bytes = tampered_pkg.to_bytes().unwrap();
 
         let result = ContractPackage::from_bytes(&tampered_bytes);
-        assert!(result.is_err(), "tampered bytes must not load via from_bytes");
+        assert!(
+            result.is_err(),
+            "tampered bytes must not load via from_bytes"
+        );
         assert!(result.unwrap_err().contains("integrity check"));
     }
 
@@ -398,8 +410,10 @@ mod tests {
         let mut pkg = ContractPackage::new("Original", vec![0x10, 42, 0x00], abi);
         assert!(pkg.verify());
         pkg.name = "Tampered".to_string();
-        assert!(!pkg.verify(),
-            "name tampering must be caught by package_hash — previously it was not");
+        assert!(
+            !pkg.verify(),
+            "name tampering must be caught by package_hash — previously it was not"
+        );
     }
 
     #[test]
@@ -408,8 +422,10 @@ mod tests {
         let mut pkg = ContractPackage::new("Test", vec![0x10, 42, 0x00], abi);
         assert!(pkg.verify());
         pkg.vm_version = 99; // pretend to be v99
-        assert!(!pkg.verify(),
-            "vm_version tampering must be caught — previously it was not");
+        assert!(
+            !pkg.verify(),
+            "vm_version tampering must be caught — previously it was not"
+        );
     }
 
     #[test]
@@ -418,8 +434,7 @@ mod tests {
         let mut pkg = ContractPackage::new("Test", vec![0x10, 42, 0x00], abi);
         assert!(pkg.verify());
         pkg.format_version = 42;
-        assert!(!pkg.verify(),
-            "format_version tampering must be caught");
+        assert!(!pkg.verify(), "format_version tampering must be caught");
     }
 
     #[test]
@@ -430,8 +445,7 @@ mod tests {
         pkg.package_hash = pkg.compute_package_hash(); // re-seal after the legit change
         assert!(pkg.verify());
         pkg.source_hash = Some("tampered_source".into());
-        assert!(!pkg.verify(),
-            "source_hash tampering must be caught");
+        assert!(!pkg.verify(), "source_hash tampering must be caught");
     }
 
     #[test]
@@ -442,8 +456,7 @@ mod tests {
         pkg.package_hash = pkg.compute_package_hash();
         assert!(pkg.verify());
         pkg.constructor_args = Some(vec![0xff, 0xff, 0xff]);
-        assert!(!pkg.verify(),
-            "constructor_args tampering must be caught");
+        assert!(!pkg.verify(), "constructor_args tampering must be caught");
     }
 
     #[test]
@@ -460,8 +473,10 @@ mod tests {
             vec![],
             crate::runtime::vm::contracts::contract_abi::Mutability::Mutable,
         );
-        assert!(!pkg.verify(),
-            "abi tampering must be caught — previously a smuggled function would load cleanly");
+        assert!(
+            !pkg.verify(),
+            "abi tampering must be caught — previously a smuggled function would load cleanly"
+        );
     }
 
     #[test]
@@ -478,8 +493,10 @@ mod tests {
         let tampered = serde_json::to_string(&json).unwrap();
 
         let result = ContractPackage::from_json(&tampered);
-        assert!(result.is_err(),
-            "from_json must refuse a name-tampered package");
+        assert!(
+            result.is_err(),
+            "from_json must refuse a name-tampered package"
+        );
         assert!(result.unwrap_err().contains("integrity check"));
     }
 
@@ -501,12 +518,18 @@ mod tests {
 
         let loaded = ContractPackage::from_json(&legacy_json)
             .expect("legacy package without package_hash must still load");
-        assert!(loaded.package_hash.is_empty(),
-            "legacy package deserializes with empty package_hash");
-        assert!(!loaded.has_full_integrity(),
-            "legacy package has no full integrity flag");
-        assert!(loaded.verify(),
-            "legacy package still passes bytecode-only verify() for back-compat");
+        assert!(
+            loaded.package_hash.is_empty(),
+            "legacy package deserializes with empty package_hash"
+        );
+        assert!(
+            !loaded.has_full_integrity(),
+            "legacy package has no full integrity flag"
+        );
+        assert!(
+            loaded.verify(),
+            "legacy package still passes bytecode-only verify() for back-compat"
+        );
     }
 
     #[test]

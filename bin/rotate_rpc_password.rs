@@ -64,7 +64,7 @@
 //     rotated) is a no-op with a clean exit.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options};
+use rocksdb::{Options, DB};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -131,7 +131,10 @@ fn main() -> ExitCode {
     }
 
     if !db_path.join("CURRENT").exists() {
-        eprintln!("error: {} does not look like a RocksDB directory", db_path.display());
+        eprintln!(
+            "error: {} does not look like a RocksDB directory",
+            db_path.display()
+        );
         eprintln!("       (no CURRENT file found inside it)");
         return ExitCode::from(1);
     }
@@ -145,7 +148,11 @@ fn main() -> ExitCode {
         Ok(db) => db,
         Err(e) => {
             let msg = e.to_string();
-            eprintln!("error: failed to open RocksDB at {}: {}", db_path.display(), msg);
+            eprintln!(
+                "error: failed to open RocksDB at {}: {}",
+                db_path.display(),
+                msg
+            );
             if msg.to_lowercase().contains("lock") {
                 eprintln!();
                 eprintln!("hint: the node is still running and holds the exclusive RocksDB lock.");
@@ -181,7 +188,9 @@ fn main() -> ExitCode {
             if let Err(e) = db.flush() {
                 eprintln!("warning: flush after delete failed: {}", e);
                 eprintln!("         the delete is in the WAL but may not be in an SST yet;");
-                eprintln!("         this is still safe — RocksDB will replay the WAL on next open.");
+                eprintln!(
+                    "         this is still safe — RocksDB will replay the WAL on next open."
+                );
             }
             println!("✓ rpc:admin_password deleted from {}", db_path.display());
             println!();

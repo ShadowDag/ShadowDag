@@ -3,24 +3,25 @@
 //                     (c) ShadowDAG Project -- All Rights Reserved
 // =============================================================================
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use rocksdb::DB;
 use crate::domain::utxo::utxo_set::utxo_key;
-use crate::{slog_info, slog_warn, slog_error};
+use crate::{slog_error, slog_info, slog_warn};
+use rocksdb::DB;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 const PREFIX: &str = "uidx:";
 const ADDR_PREFIX: &str = "uidx:addr:";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UtxoRecord {
-    pub txid:       String,
-    pub vout:       u32,
-    pub address:    String,
-    pub amount:     u64,
+    pub txid: String,
+    pub vout: u32,
+    pub address: String,
+    pub amount: u64,
     pub block_hash: String,
-    pub height:     u64,
-    pub is_spent:   bool,
+    pub height: u64,
+    pub is_spent: bool,
 }
 
 impl UtxoRecord {
@@ -30,11 +31,11 @@ impl UtxoRecord {
 }
 
 pub struct UtxoIndex {
-    utxos:           HashMap<String, UtxoRecord>,
-    addr_index:      HashMap<String, HashSet<String>>,
-    pub total_utxos:     u64,
-    pub spent_utxos:     u64,
-    db:              Arc<DB>,
+    utxos: HashMap<String, UtxoRecord>,
+    addr_index: HashMap<String, HashSet<String>>,
+    pub total_utxos: u64,
+    pub spent_utxos: u64,
+    db: Arc<DB>,
 }
 
 impl Default for UtxoIndex {
@@ -48,22 +49,30 @@ impl UtxoIndex {
     ///
     /// Prefer `new_with_db` for shared-DB setups in production.
     pub fn try_new() -> Result<Self, crate::errors::StorageError> {
+        static NEXT_DB_ID: AtomicU64 = AtomicU64::new(0);
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
-        let unique = format!("shadowdag_uidx_{}_{:?}",
-            std::process::id(), std::thread::current().id());
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let unique = format!(
+            "shadowdag_uidx_{}_{}_{}",
+            std::process::id(),
+            now_nanos,
+            NEXT_DB_ID.fetch_add(1, Ordering::Relaxed)
+        );
         let tmp = std::env::temp_dir().join(unique);
-        let db = DB::open(&opts, &tmp)
-            .map_err(|e| crate::errors::StorageError::OpenFailed {
-                path: tmp.to_string_lossy().to_string(),
-                reason: e.to_string(),
-            })?;
+        let db = DB::open(&opts, &tmp).map_err(|e| crate::errors::StorageError::OpenFailed {
+            path: tmp.to_string_lossy().to_string(),
+            reason: e.to_string(),
+        })?;
         Ok(Self {
-            utxos:       HashMap::new(),
-            addr_index:  HashMap::new(),
+            utxos: HashMap::new(),
+            addr_index: HashMap::new(),
             total_utxos: 0,
             spent_utxos: 0,
-            db:          Arc::new(db),
+            db: Arc::new(db),
         })
     }
 
@@ -76,8 +85,11 @@ impl UtxoIndex {
         Self::try_new().unwrap_or_else(|e| {
             slog_warn!("index", "utxo_index_db_open_failed", error => &e.to_string());
             let fallback = std::env::temp_dir().join(format!(
-                "shadowdag_uidx_fb_{}", std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
+                "shadowdag_uidx_fb_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
             ));
             let mut opts = rocksdb::Options::default();
             opts.create_if_missing(true);
@@ -94,11 +106,11 @@ impl UtxoIndex {
                 }
             });
             Self {
-                utxos:       HashMap::new(),
-                addr_index:  HashMap::new(),
+                utxos: HashMap::new(),
+                addr_index: HashMap::new(),
                 total_utxos: 0,
                 spent_utxos: 0,
-                db:          Arc::new(db),
+                db: Arc::new(db),
             }
         })
     }
@@ -107,8 +119,8 @@ impl UtxoIndex {
     /// Automatically recovers state from DB so the caller cannot forget.
     pub fn new_with_db(db: Arc<DB>) -> Self {
         let mut s = Self {
-            utxos:       HashMap::new(),
-            addr_index:  HashMap::new(),
+            utxos: HashMap::new(),
+            addr_index: HashMap::new(),
             total_utxos: 0,
             spent_utxos: 0,
             db,
@@ -129,35 +141,31 @@ impl UtxoIndex {
     }
 
     fn write_record_to_db(&self, utxo: &UtxoRecord) -> Result<(), String> {
-        let utxo_key = utxo.key()
-            .map_err(|e| {
-                let msg = format!("bad_utxo_key: {}", e);
-                slog_error!("index", "bad_utxo_key", error => &msg);
-                msg
-            })?;
+        let utxo_key = utxo.key().map_err(|e| {
+            let msg = format!("bad_utxo_key: {}", e);
+            slog_error!("index", "bad_utxo_key", error => &msg);
+            msg
+        })?;
         let key = Self::db_key(&utxo_key);
-        let val = serde_json::to_vec(utxo)
-            .map_err(|e| {
-                let msg = format!("serialize: {}", e);
-                slog_error!("index", "utxo_index_serialize_error", error => &msg);
-                msg
-            })?;
-        self.db.put(&key, &val)
-            .map_err(|e| {
-                let msg = format!("db_put: {}", e);
-                slog_error!("index", "utxo_index_db_put_error", error => &msg);
-                msg
-            })
+        let val = serde_json::to_vec(utxo).map_err(|e| {
+            let msg = format!("serialize: {}", e);
+            slog_error!("index", "utxo_index_serialize_error", error => &msg);
+            msg
+        })?;
+        self.db.put(&key, &val).map_err(|e| {
+            let msg = format!("db_put: {}", e);
+            slog_error!("index", "utxo_index_db_put_error", error => &msg);
+            msg
+        })
     }
 
     fn delete_record_from_db(&self, utxo_key: &str) -> Result<(), String> {
         let key = Self::db_key(utxo_key);
-        self.db.delete(&key)
-            .map_err(|e| {
-                let msg = format!("db_delete: {}", e);
-                slog_error!("index", "utxo_index_db_delete_error", error => &msg);
-                msg
-            })
+        self.db.delete(&key).map_err(|e| {
+            let msg = format!("db_delete: {}", e);
+            slog_error!("index", "utxo_index_db_delete_error", error => &msg);
+            msg
+        })
     }
 
     /// Persist the addr -> keys set to DB.
@@ -192,7 +200,10 @@ impl UtxoIndex {
     pub fn insert(&mut self, utxo: UtxoRecord) -> bool {
         let key = match utxo.key() {
             Ok(k) => k,
-            Err(e) => { slog_error!("index", "insert_bad_utxo_key", error => &e.to_string()); return false; }
+            Err(e) => {
+                slog_error!("index", "insert_bad_utxo_key", error => &e.to_string());
+                return false;
+            }
         };
         let addr = utxo.address.clone();
 
@@ -342,7 +353,8 @@ impl UtxoIndex {
     }
 
     pub fn balance(&self, address: &str) -> u64 {
-        self.addr_index.get(address)
+        self.addr_index
+            .get(address)
             .map(|keys| {
                 let mut sum = 0u64;
                 for k in keys {
@@ -364,11 +376,14 @@ impl UtxoIndex {
     }
 
     pub fn utxos_for_address(&self, address: &str) -> Vec<&UtxoRecord> {
-        self.addr_index.get(address)
-            .map(|keys| keys.iter()
-                .filter_map(|k| self.utxos.get(k))
-                .filter(|u| !u.is_spent)
-                .collect())
+        self.addr_index
+            .get(address)
+            .map(|keys| {
+                keys.iter()
+                    .filter_map(|k| self.utxos.get(k))
+                    .filter(|u| !u.is_spent)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -376,7 +391,9 @@ impl UtxoIndex {
         self.utxos.values().filter(|u| !u.is_spent).count()
     }
 
-    pub fn address_count(&self) -> usize { self.addr_index.len() }
+    pub fn address_count(&self) -> usize {
+        self.addr_index.len()
+    }
 
     pub fn total_supply(&self) -> u64 {
         let mut sum = 0u64;
@@ -393,12 +410,16 @@ impl UtxoIndex {
     }
 
     pub fn rollback_block(&mut self, block_hash: &str) -> usize {
-        let to_remove: Vec<String> = self.utxos.values()
+        let to_remove: Vec<String> = self
+            .utxos
+            .values()
             .filter(|u| u.block_hash == block_hash)
             .filter_map(|u| u.key().ok())
             .collect();
         let count = to_remove.len();
-        for key in to_remove { self.remove(&key); }
+        for key in to_remove {
+            self.remove(&key);
+        }
         count
     }
 
@@ -454,7 +475,7 @@ mod tests {
 
     /// Convert a short test name to a deterministic 64-char hex hash.
     fn th(name: &str) -> String {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(name.as_bytes()))
     }
 
@@ -466,13 +487,13 @@ mod tests {
 
     fn utxo(txid: &str, vout: u32, addr: &str, amount: u64) -> UtxoRecord {
         UtxoRecord {
-            txid:       th(txid),
+            txid: th(txid),
             vout,
-            address:    addr.to_string(),
+            address: addr.to_string(),
             amount,
             block_hash: "block1".into(),
-            height:     1,
-            is_spent:   false,
+            height: 1,
+            is_spent: false,
         }
     }
 

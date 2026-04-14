@@ -11,12 +11,12 @@
 // and no state changes are persisted.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options, WriteBatch};
+use rocksdb::{Options, WriteBatch, DB};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use serde::{Serialize, Deserialize};
 
-use crate::errors::{VmError, StorageError};
+use crate::errors::{StorageError, VmError};
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
 use crate::slog_error;
 
@@ -154,8 +154,8 @@ impl PendingBatch {
     pub fn lookup(&self, key: &str) -> PendingLookup<'_> {
         match self.changes.get(key) {
             Some(Some(v)) => PendingLookup::Buffered(v),
-            Some(None)    => PendingLookup::Tombstoned,
-            None          => PendingLookup::NotBuffered,
+            Some(None) => PendingLookup::Tombstoned,
+            None => PendingLookup::NotBuffered,
         }
     }
 
@@ -194,7 +194,7 @@ impl PendingBatch {
 }
 
 pub struct ContractStorage {
-    db:   Arc<DB>,
+    db: Arc<DB>,
     path: String,
 }
 
@@ -217,7 +217,8 @@ impl ContractStorage {
     /// Returns `Err(StorageError::WriteFailed)` if the underlying DB write fails.
     pub fn set_state(&self, key: &str, value: &str) -> Result<(), StorageError> {
         let db_key = format!("contract:{}", key);
-        self.db.put(db_key.as_bytes(), value.as_bytes())
+        self.db
+            .put(db_key.as_bytes(), value.as_bytes())
             .map_err(|e| {
                 slog_error!("runtime", "contract_storage_put_error", error => &e.to_string());
                 StorageError::WriteFailed(e.to_string())
@@ -362,7 +363,7 @@ impl ContractStorage {
             let db_key = format!("contract:{}", key);
             match value {
                 Some(v) => wb.put(db_key.as_bytes(), v.as_bytes()),
-                None    => wb.delete(db_key.as_bytes()),
+                None => wb.delete(db_key.as_bytes()),
             }
         }
 
@@ -401,9 +402,10 @@ impl ContractStorage {
     /// Save undo data for a block so its contract state changes can be rolled back.
     pub fn save_undo(&self, block_hash: &str, undo: &ContractUndoData) -> Result<(), StorageError> {
         let key = format!("contract:undo:{}", block_hash);
-        let data = bincode::serialize(undo)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        self.db.put(key.as_bytes(), &data)
+        let data =
+            bincode::serialize(undo).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        self.db
+            .put(key.as_bytes(), &data)
             .map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
@@ -538,11 +540,9 @@ impl ContractStorage {
     /// undo record produces a structured error instead of being
     /// misreported as "no undo data available".
     pub fn rollback_block(&self, block_hash: &str) -> Result<(), StorageError> {
-        let undo = self
-            .load_undo_strict(block_hash)?
-            .ok_or_else(|| StorageError::KeyNotFound(
-                format!("no contract undo for {}", block_hash)
-            ))?;
+        let undo = self.load_undo_strict(block_hash)?.ok_or_else(|| {
+            StorageError::KeyNotFound(format!("no contract undo for {}", block_hash))
+        })?;
 
         let mut batch = WriteBatch::default();
 
@@ -581,8 +581,7 @@ impl ContractStorage {
                     for (slot_key_suffix, old_value) in details.slots {
                         // Slot keys are stored by `persist_with_undo` as
                         // `{addr}:{suffix}` → DB key `contract:{addr}:{suffix}`.
-                        let slot_db_key =
-                            format!("contract:{}:{}", addr, slot_key_suffix);
+                        let slot_db_key = format!("contract:{}:{}", addr, slot_key_suffix);
                         batch.put(slot_db_key.as_bytes(), old_value.as_bytes());
                     }
                 }
@@ -613,10 +612,9 @@ impl ContractStorage {
         let undo_key = format!("contract:undo:{}", block_hash);
         batch.delete(undo_key.as_bytes());
 
-        self.db.write(batch)
-            .map_err(|e| StorageError::WriteFailed(
-                format!("contract rollback failed: {}", e)
-            ))
+        self.db
+            .write(batch)
+            .map_err(|e| StorageError::WriteFailed(format!("contract rollback failed: {}", e)))
     }
 
     /// Prune undo data for finalized blocks (no longer needed for rollback).
@@ -705,9 +703,7 @@ mod tests {
 
     fn sample_undo() -> ContractUndoData {
         ContractUndoData {
-            modified_keys: vec![
-                ("account:SD1abc".to_string(), Some("10|1|xxx".to_string())),
-            ],
+            modified_keys: vec![("account:SD1abc".to_string(), Some("10|1|xxx".to_string()))],
             created_accounts: vec!["SD1new".to_string()],
             destroyed_accounts: vec![],
             receipt_root: None,
@@ -732,8 +728,7 @@ mod tests {
         assert!(matches!(s.load_undo_strict("absent"), Ok(None)));
 
         // Corrupt payload → Err (not None).
-        s.db
-            .put(b"contract:undo:corrupt_block", b"this-is-not-bincode")
+        s.db.put(b"contract:undo:corrupt_block", b"this-is-not-bincode")
             .expect("raw put");
 
         // Non-strict masks corruption as None (with log)
@@ -755,8 +750,7 @@ mod tests {
         assert!(matches!(s.has_undo_data_strict("block_present"), Ok(true)));
 
         // Corrupt payload → Err
-        s.db
-            .put(b"contract:undo:bad_block", b"not-bincode")
+        s.db.put(b"contract:undo:bad_block", b"not-bincode")
             .expect("raw put");
         assert!(s.has_undo_data_strict("bad_block").is_err());
         // Non-strict maps corruption to false (old behaviour's closest
@@ -770,11 +764,13 @@ mod tests {
         // Plant raw garbage under the undo key, then try to roll back.
         // Previously load_undo returned None and rollback_block reported
         // KeyNotFound — now it must surface the corruption.
-        s.db
-            .put(b"contract:undo:corrupt_rollback", b"garbage")
+        s.db.put(b"contract:undo:corrupt_rollback", b"garbage")
             .expect("raw put");
         let result = s.rollback_block("corrupt_rollback");
-        assert!(result.is_err(), "rollback must fail on corrupt undo, not treat it as missing");
+        assert!(
+            result.is_err(),
+            "rollback must fail on corrupt undo, not treat it as missing"
+        );
         let msg = format!("{}", result.unwrap_err());
         assert!(
             msg.contains("corrupt") || msg.contains("Serialization"),
@@ -797,7 +793,10 @@ mod tests {
                 "absent".to_string(),
             ])
             .unwrap();
-        assert_eq!(count, 2, "should prune the 2 existing blocks and skip the absent one");
+        assert_eq!(
+            count, 2,
+            "should prune the 2 existing blocks and skip the absent one"
+        );
 
         // After pruning, the records should actually be gone.
         assert!(matches!(s.has_undo_data_strict("a"), Ok(false)));
@@ -810,7 +809,9 @@ mod tests {
         // this test just verifies that a clean "nothing to prune" call
         // returns Ok(0) on the strict path (and 0 on the non-strict).
         let s = tmp_storage();
-        let count = s.prune_finalized_undo_data_strict(&["nonexistent".to_string()]).unwrap();
+        let count = s
+            .prune_finalized_undo_data_strict(&["nonexistent".to_string()])
+            .unwrap();
         assert_eq!(count, 0);
         assert_eq!(s.prune_finalized_undo_data(&["nonexistent".to_string()]), 0);
     }
@@ -831,16 +832,19 @@ mod tests {
         let s = tmp_storage();
         let mut batch = PendingBatch::new();
         batch.put("alpha".into(), "v1".into());
-        batch.put("beta".into(),  "v2".into());
+        batch.put("beta".into(), "v2".into());
         batch.delete("gamma".into());
         assert_eq!(batch.len(), 3);
 
         // Successful commit → batch is cleared AND the values are on disk.
         s.commit_batch(&mut batch).unwrap();
-        assert!(batch.is_empty(), "successful commit must clear the pending batch");
+        assert!(
+            batch.is_empty(),
+            "successful commit must clear the pending batch"
+        );
 
         assert_eq!(s.get_state("alpha"), Some("v1".into()));
-        assert_eq!(s.get_state("beta"),  Some("v2".into()));
+        assert_eq!(s.get_state("beta"), Some("v2".into()));
         assert_eq!(s.get_state("gamma"), None); // the delete landed as "no key"
     }
 
@@ -921,13 +925,19 @@ mod tests {
         s.db.put(b"contract:bad_key", bad).expect("raw put");
 
         // Non-strict masks corruption as None (with log).
-        assert_eq!(s.get_state("bad_key"), None,
-            "non-strict get_state must return None on UTF-8 corruption for backward compat");
+        assert_eq!(
+            s.get_state("bad_key"),
+            None,
+            "non-strict get_state must return None on UTF-8 corruption for backward compat"
+        );
 
         // Strict variant surfaces it as an explicit error.
         let strict = s.get_state_strict("bad_key");
-        assert!(strict.is_err(),
-            "get_state_strict must return Err on UTF-8 corruption, got {:?}", strict);
+        assert!(
+            strict.is_err(),
+            "get_state_strict must return Err on UTF-8 corruption, got {:?}",
+            strict
+        );
         let msg = format!("{}", strict.unwrap_err());
         assert!(
             msg.contains("not valid UTF-8") || msg.contains("Serialization"),

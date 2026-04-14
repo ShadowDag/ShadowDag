@@ -45,21 +45,18 @@ impl PowValidator {
         //    as produced by the ShadowHash pipeline)
         if !Self::is_valid_shadowhash_format(&computed_hash) {
             return PowResult::fail(
-                "hash is not a valid ShadowHash output (must be 64 lowercase hex chars)".to_string(),
+                "hash is not a valid ShadowHash output (must be 64 lowercase hex chars)"
+                    .to_string(),
             );
         }
 
         // 4. Difficulty == 0 is only valid for the genesis block (height 0)
         if block.header.difficulty == 0 && block.header.height > 0 {
-            return PowResult::fail(
-                "difficulty 0 is not valid for non-genesis blocks".to_string(),
-            );
+            return PowResult::fail("difficulty 0 is not valid for non-genesis blocks".to_string());
         }
 
         // 5. Validate difficulty range (allow 0 only for genesis, checked above)
-        if block.header.difficulty > 0
-            && block.header.difficulty < MIN_DIFFICULTY
-        {
+        if block.header.difficulty > 0 && block.header.difficulty < MIN_DIFFICULTY {
             return PowResult::fail(format!(
                 "difficulty {} below minimum {}",
                 block.header.difficulty, MIN_DIFFICULTY
@@ -80,7 +77,8 @@ impl PowValidator {
         {
             return PowResult::fail(format!(
                 "hash {} does not meet difficulty {} target",
-                &computed_hash[..16], block.header.difficulty
+                &computed_hash[..16],
+                block.header.difficulty
             ));
         }
 
@@ -116,10 +114,10 @@ impl PowValidator {
         }
 
         // Enforce difficulty bounds (MIN_DIFFICULTY..=MAX_DIFFICULTY)
-        if header.difficulty > 0 {
-            if header.difficulty < MIN_DIFFICULTY || header.difficulty > MAX_DIFFICULTY {
-                return false;
-            }
+        if header.difficulty > 0
+            && (header.difficulty < MIN_DIFFICULTY || header.difficulty > MAX_DIFFICULTY)
+        {
+            return false;
         }
 
         // If difficulty > 0, check target
@@ -218,13 +216,18 @@ impl PowValidator {
     /// Validate that a hash has the format produced by ShadowHash:
     /// exactly 64 lowercase hex characters.
     fn is_valid_shadowhash_format(hash: &str) -> bool {
-        hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        hash.len() == 64
+            && hash
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
     }
 
     /// Estimate hashrate from difficulty and block time.
     /// With proper target math: expected attempts = MAX_TARGET / target = difficulty.
     pub fn estimated_hashrate(difficulty: u64, block_time_secs: u64) -> f64 {
-        if block_time_secs == 0 { return 0.0; }
+        if block_time_secs == 0 {
+            return 0.0;
+        }
         // The expected number of hashes to find a valid block is proportional
         // to difficulty (since target = MAX_TARGET / difficulty).
         difficulty as f64 / block_time_secs as f64
@@ -233,17 +236,25 @@ impl PowValidator {
 
 #[derive(Debug)]
 pub struct PowResult {
-    pub valid:         bool,
-    pub reason:        Option<String>,
+    pub valid: bool,
+    pub reason: Option<String>,
     pub computed_hash: Option<String>,
 }
 
 impl PowResult {
     pub fn ok(hash: String) -> Self {
-        Self { valid: true, reason: None, computed_hash: Some(hash) }
+        Self {
+            valid: true,
+            reason: None,
+            computed_hash: Some(hash),
+        }
     }
     pub fn fail(reason: String) -> Self {
-        Self { valid: false, reason: Some(reason), computed_hash: None }
+        Self {
+            valid: false,
+            reason: Some(reason),
+            computed_hash: None,
+        }
     }
 }
 
@@ -305,7 +316,10 @@ mod tests {
         assert!(PowValidator::is_valid_shadowhash_format(&"a".repeat(64)));
         assert!(!PowValidator::is_valid_shadowhash_format(&"A".repeat(64)));
         assert!(!PowValidator::is_valid_shadowhash_format(&"a".repeat(63)));
-        assert!(!PowValidator::is_valid_shadowhash_format(&format!("{}g", "a".repeat(63))));
+        assert!(!PowValidator::is_valid_shadowhash_format(&format!(
+            "{}g",
+            "a".repeat(63)
+        )));
     }
 
     #[test]

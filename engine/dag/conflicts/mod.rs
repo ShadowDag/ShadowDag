@@ -14,10 +14,10 @@ pub enum ConflictStatus {
 
 #[derive(Debug, Clone)]
 pub struct ConflictEntry {
-    pub hash:     String,
-    pub parents:  Vec<String>,
-    pub status:   ConflictStatus,
-    pub inputs:   Vec<String>,
+    pub hash: String,
+    pub parents: Vec<String>,
+    pub status: ConflictStatus,
+    pub inputs: Vec<String>,
 }
 
 pub struct ConflictResolver {
@@ -50,12 +50,15 @@ impl ConflictResolver {
         let unique_inputs: HashSet<String> = inputs.iter().cloned().collect();
 
         if unique_inputs.is_empty() {
-            self.entries.insert(hash_str.clone(), ConflictEntry {
-                hash: hash_str,
-                parents,
-                status: ConflictStatus::Pending,
-                inputs,
-            });
+            self.entries.insert(
+                hash_str.clone(),
+                ConflictEntry {
+                    hash: hash_str,
+                    parents,
+                    status: ConflictStatus::Pending,
+                    inputs,
+                },
+            );
             return;
         }
 
@@ -66,12 +69,15 @@ impl ConflictResolver {
                 .insert(hash_str.clone());
         }
 
-        self.entries.insert(hash_str.clone(), ConflictEntry {
-            hash: hash_str,
-            parents,
-            status: ConflictStatus::Pending,
-            inputs,
-        });
+        self.entries.insert(
+            hash_str.clone(),
+            ConflictEntry {
+                hash: hash_str,
+                parents,
+                status: ConflictStatus::Pending,
+                inputs,
+            },
+        );
     }
 
     // 💣 clustering
@@ -195,8 +201,12 @@ impl ConflictResolver {
         blue_score_a: u64,
         blue_score_b: u64,
     ) -> String {
-        let winner = if blue_score_a >= blue_score_b { hash_a } else { hash_b };
-        let loser  = if winner == hash_a { hash_b } else { hash_a };
+        let winner = if blue_score_a >= blue_score_b {
+            hash_a
+        } else {
+            hash_b
+        };
+        let loser = if winner == hash_a { hash_b } else { hash_a };
 
         if let Some(e) = self.entries.get_mut(winner) {
             e.status = ConflictStatus::Blue;
@@ -213,27 +223,38 @@ impl ConflictResolver {
     }
 
     pub fn is_blue(&self, hash: &str) -> bool {
-        self.entries.get(hash)
+        self.entries
+            .get(hash)
             .map(|e| e.status == ConflictStatus::Blue)
             .unwrap_or(false)
     }
 
     pub fn is_red(&self, hash: &str) -> bool {
-        self.entries.get(hash)
+        self.entries
+            .get(hash)
             .map(|e| e.status == ConflictStatus::Red)
             .unwrap_or(false)
     }
 
     pub fn blue_count(&self) -> usize {
-        self.entries.values().filter(|e| e.status == ConflictStatus::Blue).count()
+        self.entries
+            .values()
+            .filter(|e| e.status == ConflictStatus::Blue)
+            .count()
     }
 
     pub fn red_count(&self) -> usize {
-        self.entries.values().filter(|e| e.status == ConflictStatus::Red).count()
+        self.entries
+            .values()
+            .filter(|e| e.status == ConflictStatus::Red)
+            .count()
     }
 
     pub fn pending_count(&self) -> usize {
-        self.entries.values().filter(|e| e.status == ConflictStatus::Pending).count()
+        self.entries
+            .values()
+            .filter(|e| e.status == ConflictStatus::Pending)
+            .count()
     }
 
     pub fn total_count(&self) -> usize {

@@ -4,14 +4,11 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use rocksdb::{
-    DB, Options,
-    WriteOptions, ReadOptions,
-    SliceTransform, WriteBatch,
-    IteratorMode, Direction,
+    Direction, IteratorMode, Options, ReadOptions, SliceTransform, WriteBatch, WriteOptions, DB,
 };
 
-use std::path::Path;
 use crate::slog_error;
+use std::path::Path;
 
 // ─────────────────────────────────────────
 // PREFIX
@@ -31,7 +28,6 @@ pub struct Ed25519Store {
 }
 
 impl Ed25519Store {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
@@ -44,16 +40,17 @@ impl Ed25519Store {
         opts.increase_parallelism(
             std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4) as i32
+                .unwrap_or(4) as i32,
         );
 
         opts.optimize_level_style_compaction(256 * 1024 * 1024);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| crate::errors::StorageError::OpenFailed {
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| {
+            crate::errors::StorageError::OpenFailed {
                 path: path.to_string(),
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         let mut write_opts = WriteOptions::default();
         write_opts.disable_wal(false);
@@ -64,7 +61,11 @@ impl Ed25519Store {
         read_opts.fill_cache(true);
         read_opts.set_prefix_same_as_start(true);
 
-        Ok(Self { db, write_opts, read_opts })
+        Ok(Self {
+            db,
+            write_opts,
+            read_opts,
+        })
     }
 
     // ─────────────────────────────────────────
@@ -113,14 +114,12 @@ impl Ed25519Store {
     #[inline(always)]
     #[must_use]
     pub fn get_signature(&self, key: &str) -> Option<String> {
-        Self::with_key(key, |k| {
-            match self.db.get_pinned_opt(k, &self.read_opts) {
-                Ok(Some(v)) => std::str::from_utf8(&v).ok().map(|s| s.to_string()),
-                Ok(None) => None,
-                Err(e) => {
-                    slog_error!("crypto", "ed25519_read_failed", error => e);
-                    None
-                }
+        Self::with_key(key, |k| match self.db.get_pinned_opt(k, &self.read_opts) {
+            Ok(Some(v)) => std::str::from_utf8(&v).ok().map(|s| s.to_string()),
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("crypto", "ed25519_read_failed", error => e);
+                None
             }
         })
     }
@@ -128,14 +127,12 @@ impl Ed25519Store {
     #[inline(always)]
     #[must_use]
     pub fn get_signature_raw(&self, key: &str) -> Option<Vec<u8>> {
-        Self::with_key(key, |k| {
-            match self.db.get_pinned_opt(k, &self.read_opts) {
-                Ok(Some(v)) => Some(v.to_vec()),
-                Ok(None) => None,
-                Err(e) => {
-                    slog_error!("crypto", "ed25519_read_raw_failed", error => e);
-                    None
-                }
+        Self::with_key(key, |k| match self.db.get_pinned_opt(k, &self.read_opts) {
+            Ok(Some(v)) => Some(v.to_vec()),
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("crypto", "ed25519_read_raw_failed", error => e);
+                None
             }
         })
     }
@@ -153,7 +150,8 @@ impl Ed25519Store {
             db_keys.push(Self::with_key(key, |k| k.to_vec()));
         }
 
-        self.db.multi_get(db_keys)
+        self.db
+            .multi_get(db_keys)
             .into_iter()
             .map(|res| match res {
                 Ok(opt) => opt.map(|v| v.to_vec()),
@@ -171,13 +169,11 @@ impl Ed25519Store {
 
     #[inline(always)]
     pub fn signature_exists(&self, key: &str) -> bool {
-        Self::with_key(key, |k| {
-            match self.db.get_pinned_opt(k, &self.read_opts) {
-                Ok(v) => v.is_some(),
-                Err(e) => {
-                    slog_error!("crypto", "ed25519_exists_failed", error => e);
-                    false
-                }
+        Self::with_key(key, |k| match self.db.get_pinned_opt(k, &self.read_opts) {
+            Ok(v) => v.is_some(),
+            Err(e) => {
+                slog_error!("crypto", "ed25519_exists_failed", error => e);
+                false
             }
         })
     }

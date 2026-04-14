@@ -67,7 +67,7 @@ impl TxPrioritizer {
 
     /// Sort with age weighting — older TXs with decent fees get priority boost.
     pub fn prioritize_with_age(
-        mut txs: Vec<(Transaction, u64)>,  // (tx, entry_timestamp)
+        mut txs: Vec<(Transaction, u64)>, // (tx, entry_timestamp)
         now: u64,
     ) -> Vec<Transaction> {
         txs.sort_by(|(a, a_time), (b, b_time)| {
@@ -93,7 +93,13 @@ mod tests {
     fn make_tx(fee: u64, output_count: usize) -> Transaction {
         Transaction {
             hash: format!("tx_{}", fee),
-            inputs: vec![TxInput::new("aa".repeat(32), 0, "owner".into(), "sig".into(), "pk".into())],
+            inputs: vec![TxInput::new(
+                "aa".repeat(32),
+                0,
+                "owner".into(),
+                "sig".into(),
+                "pk".into(),
+            )],
             outputs: (0..output_count)
                 .map(|i| TxOutput::new(format!("addr_{}", i), 1000))
                 .collect(),
@@ -109,12 +115,15 @@ mod tests {
     #[test]
     fn higher_fee_rate_wins_over_higher_absolute_fee() {
         // Small TX with moderate fee (high fee/byte)
-        let small = make_tx(500, 1);   // ~200 bytes → ~2.5 sat/byte
-        // Large TX with higher absolute fee but lower fee/byte
+        let small = make_tx(500, 1); // ~200 bytes → ~2.5 sat/byte
+                                     // Large TX with higher absolute fee but lower fee/byte
         let large = make_tx(1000, 50); // ~5000 bytes → ~0.2 sat/byte
 
         let sorted = TxPrioritizer::prioritize(vec![large.clone(), small.clone()]);
-        assert_eq!(sorted[0].hash, small.hash, "Small TX with higher fee-rate should come first");
+        assert_eq!(
+            sorted[0].hash, small.hash,
+            "Small TX with higher fee-rate should come first"
+        );
     }
 
     #[test]
@@ -122,12 +131,11 @@ mod tests {
         let tx = make_tx(100, 1);
         let now = 1700003600; // 1 hour later
 
-        let fresh = TxPrioritizer::score(&tx, now, now);           // just entered
-        let old   = TxPrioritizer::score(&tx, now - 3600, now);    // 1 hour old
+        let fresh = TxPrioritizer::score(&tx, now, now); // just entered
+        let old = TxPrioritizer::score(&tx, now - 3600, now); // 1 hour old
 
         assert!(old.score > fresh.score, "Old TX should have higher score");
         assert!(old.age_bonus > 0);
         assert_eq!(fresh.age_bonus, 0);
     }
 }
-

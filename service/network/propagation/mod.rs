@@ -8,9 +8,9 @@ pub mod dandelion;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-pub const SEEN_CACHE_MAX:     usize    = 100_000;
-pub const SEEN_CACHE_TTL_SEC: u64      = 300;
-pub const MAX_RELAY_PEERS:    usize    = 8;
+pub const SEEN_CACHE_MAX: usize = 100_000;
+pub const SEEN_CACHE_TTL_SEC: u64 = 300;
+pub const MAX_RELAY_PEERS: usize = 8;
 pub const COMPACT_BLOCK_THRESHOLD: u64 = 512_000;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -22,21 +22,21 @@ pub enum PropagationPriority {
 
 #[derive(Debug, Clone)]
 pub struct PropEntry {
-    pub hash:       String,
-    pub is_block:   bool,
-    pub added_at:   Instant,
+    pub hash: String,
+    pub is_block: bool,
+    pub added_at: Instant,
 }
 
 pub struct PropagationManager {
-    peer_seen:     HashMap<String, HashSet<String>>,
+    peer_seen: HashMap<String, HashSet<String>>,
 
-    global_seen:   HashSet<String>,
+    global_seen: HashSet<String>,
 
-    queue_high:    VecDeque<PropEntry>,
-    queue_normal:  VecDeque<PropEntry>,
-    queue_low:     VecDeque<PropEntry>,
+    queue_high: VecDeque<PropEntry>,
+    queue_normal: VecDeque<PropEntry>,
+    queue_low: VecDeque<PropEntry>,
     pub stats_relayed_blocks: u64,
-    pub stats_relayed_txs:    u64,
+    pub stats_relayed_txs: u64,
 }
 
 impl Default for PropagationManager {
@@ -48,31 +48,35 @@ impl Default for PropagationManager {
 impl PropagationManager {
     pub fn new() -> Self {
         Self {
-            peer_seen:            HashMap::new(),
-            global_seen:          HashSet::new(),
-            queue_high:           VecDeque::new(),
-            queue_normal:         VecDeque::new(),
-            queue_low:            VecDeque::new(),
+            peer_seen: HashMap::new(),
+            global_seen: HashSet::new(),
+            queue_high: VecDeque::new(),
+            queue_normal: VecDeque::new(),
+            queue_low: VecDeque::new(),
             stats_relayed_blocks: 0,
-            stats_relayed_txs:    0,
+            stats_relayed_txs: 0,
         }
     }
 
     pub fn announce_block(&mut self, hash: &str) {
-        if self.global_seen.contains(hash) { return; }
+        if self.global_seen.contains(hash) {
+            return;
+        }
         self.global_seen.insert(hash.to_string());
         self.queue_high.push_back(PropEntry {
-            hash:     hash.to_string(),
+            hash: hash.to_string(),
             is_block: true,
             added_at: Instant::now(),
         });
     }
 
     pub fn announce_tx(&mut self, hash: &str) {
-        if self.global_seen.contains(hash) { return; }
+        if self.global_seen.contains(hash) {
+            return;
+        }
         self.global_seen.insert(hash.to_string());
         self.queue_normal.push_back(PropEntry {
-            hash:     hash.to_string(),
+            hash: hash.to_string(),
             is_block: false,
             added_at: Instant::now(),
         });

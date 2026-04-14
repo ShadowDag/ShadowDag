@@ -3,14 +3,14 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use serde::{Serialize, Deserialize};
-use crate::domain::block::block_header::BlockHeader;
 use crate::domain::block::block_body::BlockBody;
+use crate::domain::block::block_header::BlockHeader;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Block {
     pub header: BlockHeader,
-    pub body:   BlockBody,
+    pub body: BlockBody,
 }
 
 impl Block {

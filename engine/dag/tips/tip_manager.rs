@@ -27,8 +27,8 @@
 use crate::errors::{DagError, StorageError};
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
 use crate::slog_info;
-use rocksdb::{DB, Options, IteratorMode, WriteBatch};
-use serde::{Serialize, Deserialize};
+use rocksdb::{IteratorMode, Options, WriteBatch, DB};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,11 +57,11 @@ const TIP_PREFIX: &[u8] = b"tm:tip:";
 /// Information about a DAG tip
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TipInfo {
-    pub hash:       String,
+    pub hash: String,
     pub blue_score: u64,
-    pub height:     u64,
-    pub timestamp:  u64,
-    pub added_at:   u64,
+    pub height: u64,
+    pub timestamp: u64,
+    pub added_at: u64,
 }
 
 impl TipInfo {
@@ -86,8 +86,8 @@ impl TipInfo {
 
 /// Thread-safe, RocksDB-backed tip manager
 pub struct TipManager {
-    db:       Arc<DB>,
-    tips:     RwLock<HashMap<String, TipInfo>>,
+    db: Arc<DB>,
+    tips: RwLock<HashMap<String, TipInfo>>,
     max_tips: usize,
 }
 
@@ -97,28 +97,35 @@ impl TipManager {
         opts.create_if_missing(true);
         opts.set_write_buffer_size(16 * 1024 * 1024);
 
-        let db = open_shared_db(source, &opts)
-            .map_err(|e| StorageError::OpenFailed { path: "TipManager".to_string(), reason: e.to_string() })?;
+        let db = open_shared_db(source, &opts).map_err(|e| StorageError::OpenFailed {
+            path: "TipManager".to_string(),
+            reason: e.to_string(),
+        })?;
 
         let mgr = Self {
             db,
-            tips:     RwLock::new(HashMap::new()),
+            tips: RwLock::new(HashMap::new()),
             max_tips: MAX_TIPS,
         };
         mgr.recover_from_db();
         Ok(mgr)
     }
 
-    pub fn with_max_tips<S: Into<SharedDbSource>>(source: S, max_tips: usize) -> Result<Self, DagError> {
+    pub fn with_max_tips<S: Into<SharedDbSource>>(
+        source: S,
+        max_tips: usize,
+    ) -> Result<Self, DagError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
 
-        let db = open_shared_db(source, &opts)
-            .map_err(|e| StorageError::OpenFailed { path: "TipManager".to_string(), reason: e.to_string() })?;
+        let db = open_shared_db(source, &opts).map_err(|e| StorageError::OpenFailed {
+            path: "TipManager".to_string(),
+            reason: e.to_string(),
+        })?;
 
         let mgr = Self {
             db,
-            tips:     RwLock::new(HashMap::new()),
+            tips: RwLock::new(HashMap::new()),
             max_tips: max_tips.max(MIN_TIPS),
         };
         mgr.recover_from_db();
@@ -132,8 +139,14 @@ impl TipManager {
         let mut tips = self.tips.write().unwrap_or_else(|e| e.into_inner());
         tips.clear();
 
-        for (k, v) in self.db.iterator(IteratorMode::From(TIP_PREFIX, rocksdb::Direction::Forward)).flatten() {
-            if !k.starts_with(TIP_PREFIX) { break; }
+        for (k, v) in self
+            .db
+            .iterator(IteratorMode::From(TIP_PREFIX, rocksdb::Direction::Forward))
+            .flatten()
+        {
+            if !k.starts_with(TIP_PREFIX) {
+                break;
+            }
             if let Ok(info) = bincode::deserialize::<TipInfo>(&v) {
                 tips.insert(info.hash.clone(), info);
             }
@@ -147,15 +160,15 @@ impl TipManager {
     // ── Persistence helpers ──────────────────────────────────────────────
 
     fn persist_tip(&self, info: &TipInfo) -> Result<(), StorageError> {
-        let data = bincode::serialize(info)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        self.db.put(key_tip(&info.hash), data)
+        let data =
+            bincode::serialize(info).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        self.db
+            .put(key_tip(&info.hash), data)
             .map_err(StorageError::RocksDb)
     }
 
     fn delete_tip_from_db(&self, hash: &str) -> Result<(), StorageError> {
-        self.db.delete(key_tip(hash))
-            .map_err(StorageError::RocksDb)
+        self.db.delete(key_tip(hash)).map_err(StorageError::RocksDb)
     }
 
     // ── Public API ───────────────────────────────────────────────────────
@@ -180,12 +193,22 @@ impl TipManager {
     /// Remove a tip (when it gets referenced as a parent)
     pub fn remove_tip(&self, hash: &str) -> Result<(), StorageError> {
         self.delete_tip_from_db(hash)?;
-        self.tips.write().unwrap_or_else(|e| e.into_inner()).remove(hash);
+        self.tips
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(hash);
         Ok(())
     }
 
     /// Called when a new block arrives: removes parents from tips, adds new block as tip
-    pub fn on_new_block(&self, block_hash: &str, parents: &[String], blue_score: u64, height: u64, timestamp: u64) -> Result<(), StorageError> {
+    pub fn on_new_block(
+        &self,
+        block_hash: &str,
+        parents: &[String],
+        blue_score: u64,
+        height: u64,
+        timestamp: u64,
+    ) -> Result<(), StorageError> {
         let mut tips = self.tips.write().unwrap_or_else(|e| e.into_inner());
         let mut batch = WriteBatch::default();
 
@@ -195,8 +218,8 @@ impl TipManager {
         }
 
         let info = TipInfo::new(block_hash.to_string(), blue_score, height, timestamp);
-        let data = bincode::serialize(&info)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let data =
+            bincode::serialize(&info).map_err(|e| StorageError::Serialization(e.to_string()))?;
         batch.put(key_tip(block_hash), data);
 
         // Write batch to DB FIRST — if this fails, memory stays consistent
@@ -239,7 +262,8 @@ impl TipManager {
 
         let mut sorted: Vec<&TipInfo> = tips.values().collect();
         sorted.sort_by(|a, b| {
-            b.blue_score.cmp(&a.blue_score)
+            b.blue_score
+                .cmp(&a.blue_score)
                 .then_with(|| a.hash.cmp(&b.hash))
         });
 
@@ -267,12 +291,14 @@ impl TipManager {
             let seed = Self::hash_seed(&sorted[0].hash);
 
             let mut rng_state = seed;
-            let total_weight: u64 = candidates.iter()
+            let total_weight: u64 = candidates
+                .iter()
                 .map(|t| t.blue_score.saturating_add(1))
                 .sum();
 
             if total_weight > 0 {
-                let mut available: Vec<(usize, u64)> = candidates.iter()
+                let mut available: Vec<(usize, u64)> = candidates
+                    .iter()
                     .enumerate()
                     .map(|(i, t)| (i, t.blue_score.saturating_add(1)))
                     .collect();
@@ -330,7 +356,8 @@ impl TipManager {
         // causing different selected parents → consensus fork.
         tips.values()
             .max_by(|a, b| {
-                a.blue_score.cmp(&b.blue_score)
+                a.blue_score
+                    .cmp(&b.blue_score)
                     .then_with(|| b.hash.cmp(&a.hash)) // lower hash wins tie
             })
             .cloned()
@@ -340,7 +367,11 @@ impl TipManager {
     pub fn get_tips(&self) -> Vec<TipInfo> {
         let tips = self.tips.read().unwrap_or_else(|e| e.into_inner());
         let mut v: Vec<TipInfo> = tips.values().cloned().collect();
-        v.sort_by(|a, b| b.blue_score.cmp(&a.blue_score).then_with(|| a.hash.cmp(&b.hash)));
+        v.sort_by(|a, b| {
+            b.blue_score
+                .cmp(&a.blue_score)
+                .then_with(|| a.hash.cmp(&b.hash))
+        });
         v
     }
 
@@ -359,7 +390,10 @@ impl TipManager {
 
     /// Check if a hash is a current tip
     pub fn is_tip(&self, hash: &str) -> bool {
-        self.tips.read().unwrap_or_else(|e| e.into_inner()).contains_key(hash)
+        self.tips
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(hash)
     }
 
     /// Remove stale tips (older than threshold)
@@ -371,13 +405,16 @@ impl TipManager {
             return Ok(0);
         }
 
-        let stale: Vec<String> = tips.values()
+        let stale: Vec<String> = tips
+            .values()
             .filter(|t| t.is_stale())
             .map(|t| t.hash.clone())
             .collect();
 
         for hash in &stale {
-            if tips.len() <= MIN_TIPS { break; }
+            if tips.len() <= MIN_TIPS {
+                break;
+            }
             self.delete_tip_from_db(hash)?;
             tips.remove(hash);
         }
@@ -392,7 +429,9 @@ impl TipManager {
 
     /// Get the highest blue score among all tips
     pub fn best_blue_score(&self) -> u64 {
-        self.tips.read().unwrap_or_else(|e| e.into_inner())
+        self.tips
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|t| t.blue_score)
             .max()
@@ -401,7 +440,9 @@ impl TipManager {
 
     /// Get the highest height among all tips
     pub fn best_height(&self) -> u64 {
-        self.tips.read().unwrap_or_else(|e| e.into_inner())
+        self.tips
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|t| t.height)
             .max()
@@ -414,9 +455,11 @@ impl TipManager {
     }
 
     fn evict_lowest_score(&self, tips: &mut HashMap<String, TipInfo>) -> Result<(), StorageError> {
-        if let Some(lowest) = tips.values()
+        if let Some(lowest) = tips
+            .values()
             .min_by(|a, b| {
-                a.blue_score.cmp(&b.blue_score)
+                a.blue_score
+                    .cmp(&b.blue_score)
                     .then_with(|| b.hash.cmp(&a.hash)) // higher hash evicted first
             })
             .map(|t| t.hash.clone())
@@ -429,7 +472,10 @@ impl TipManager {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -470,7 +516,8 @@ mod tests {
     fn on_new_block_updates_tips() {
         let mgr = TipManager::new(tmp_path().as_str()).unwrap();
         mgr.add_tip(tip("genesis", 0, 0)).unwrap();
-        mgr.on_new_block("block1", &["genesis".to_string()], 1, 1, 1000).unwrap();
+        mgr.on_new_block("block1", &["genesis".to_string()], 1, 1, 1000)
+            .unwrap();
 
         assert!(!mgr.is_tip("genesis"));
         assert!(mgr.is_tip("block1"));

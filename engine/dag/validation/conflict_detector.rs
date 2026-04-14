@@ -3,10 +3,7 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{
-    DB, Options, WriteOptions, ReadOptions,
-    WriteBatch, DBPinnableSlice,
-};
+use rocksdb::{DBPinnableSlice, Options, ReadOptions, WriteBatch, WriteOptions, DB};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -22,7 +19,6 @@ pub struct ConflictStore {
 }
 
 impl ConflictStore {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
@@ -33,8 +29,10 @@ impl ConflictStore {
         opts.increase_parallelism(4);
         opts.optimize_level_style_compaction(512 * 1024 * 1024);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         // Conflict detection is safety-critical — must survive crashes.
         let mut write_opts = WriteOptions::default();
@@ -243,5 +241,4 @@ impl ConflictStore {
             .unwrap_or(Some(0))
             .unwrap_or(0) as usize
     }
-
 }

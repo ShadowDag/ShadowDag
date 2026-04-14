@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::errors::ConsensusError;
-use crate::{slog_info, slog_warn, slog_error};
+use crate::{slog_error, slog_info, slog_warn};
 
 #[derive(Debug, Clone)]
 pub struct BlockConsensusData {
@@ -34,15 +34,13 @@ impl BlockConsensusData {
     }
 }
 
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ChainState {
     pub selected_tip: String,
     pub best_blue_score: u64,
     pub best_height: u64,
     pub finality_point: Option<String>,
 }
-
 
 const CS_PREFIX: &str = "cs:block:";
 const CS_CHAIN_KEY: &str = "cs:chain";
@@ -128,7 +126,8 @@ impl ConsensusState {
         if let Some(parent_hash) = &data.selected_parent {
             if !self.block_data.contains_key(parent_hash) {
                 return Err(ConsensusError::BlockValidation(format!(
-                    "Parent block '{}' not found for block '{}'", parent_hash, data.hash
+                    "Parent block '{}' not found for block '{}'",
+                    parent_hash, data.hash
                 )));
             }
         }
@@ -136,8 +135,7 @@ impl ConsensusState {
         let hash = data.hash.clone();
 
         let should_update = data.blue_score > self.chain.best_blue_score
-            || (data.blue_score == self.chain.best_blue_score
-                && hash < self.chain.selected_tip);
+            || (data.blue_score == self.chain.best_blue_score && hash < self.chain.selected_tip);
 
         // Persist block data to DB FIRST — if this fails, no memory mutation occurs
         self.persist_block_data(&data)?;
@@ -212,9 +210,7 @@ impl ConsensusState {
             if let Err(e) = db.put(CS_CHAIN_KEY.as_bytes(), val.as_bytes()) {
                 slog_error!("consensus", "persist_chain_state_failed", error => e);
                 return Err(ConsensusError::Storage(
-                    crate::errors::StorageError::WriteFailed(
-                        format!("persist_chain_state: {}", e)
-                    ),
+                    crate::errors::StorageError::WriteFailed(format!("persist_chain_state: {}", e)),
                 ));
             }
         }
@@ -272,9 +268,7 @@ impl ConsensusState {
             Err(e) => {
                 slog_error!("consensus", "recovery_chain_state_failed", error => e);
                 return Err(ConsensusError::Storage(
-                    crate::errors::StorageError::ReadFailed(
-                        format!("chain state recovery: {}", e)
-                    ),
+                    crate::errors::StorageError::ReadFailed(format!("chain state recovery: {}", e)),
                 ));
             }
         }
@@ -331,15 +325,18 @@ impl ConsensusState {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string())
                     .collect();
-                self.block_data.insert(hash.clone(), BlockConsensusData {
-                    hash,
-                    blue_score,
-                    selected_parent,
-                    blue_set,
-                    red_set,
-                    is_chain_block,
-                    height,
-                });
+                self.block_data.insert(
+                    hash.clone(),
+                    BlockConsensusData {
+                        hash,
+                        blue_score,
+                        selected_parent,
+                        blue_set,
+                        red_set,
+                        is_chain_block,
+                        height,
+                    },
+                );
             }
         }
 
@@ -347,12 +344,10 @@ impl ConsensusState {
         // Refuse to continue with a gap-filled state.
         if iter_errors > 0 {
             return Err(ConsensusError::Storage(
-                crate::errors::StorageError::ReadFailed(
-                    format!(
-                        "recovery encountered {} iterator errors — consensus state may be corrupt",
-                        iter_errors
-                    )
-                ),
+                crate::errors::StorageError::ReadFailed(format!(
+                    "recovery encountered {} iterator errors — consensus state may be corrupt",
+                    iter_errors
+                )),
             ));
         }
 
@@ -377,11 +372,16 @@ impl ConsensusState {
     }
 
     pub fn selected_parent(&self, hash: &str) -> Option<&str> {
-        self.block_data.get(hash).and_then(|d| d.selected_parent.as_deref())
+        self.block_data
+            .get(hash)
+            .and_then(|d| d.selected_parent.as_deref())
     }
 
     pub fn is_chain_block(&self, hash: &str) -> bool {
-        self.block_data.get(hash).map(|d| d.is_chain_block).unwrap_or(false)
+        self.block_data
+            .get(hash)
+            .map(|d| d.is_chain_block)
+            .unwrap_or(false)
     }
 
     pub fn is_blue(&self, hash: &str) -> bool {
@@ -389,7 +389,9 @@ impl ConsensusState {
     }
 
     pub fn selected_chain_path(&mut self) -> &Vec<String> {
-        if self.chain_path_cache.is_empty() || self.chain_path_cache.last() != Some(&self.chain.selected_tip) {
+        if self.chain_path_cache.is_empty()
+            || self.chain_path_cache.last() != Some(&self.chain.selected_tip)
+        {
             let mut path = Vec::new();
             let mut current = &self.chain.selected_tip;
             let mut visited = HashSet::new();
@@ -400,7 +402,11 @@ impl ConsensusState {
                     break;
                 }
                 path.push(current.clone());
-                if let Some(parent) = self.block_data.get(current).and_then(|d| d.selected_parent.as_ref()) {
+                if let Some(parent) = self
+                    .block_data
+                    .get(current)
+                    .and_then(|d| d.selected_parent.as_ref())
+                {
                     current = parent;
                 } else {
                     break;
@@ -466,7 +472,11 @@ impl ConsensusState {
 
         // Check if the block's height is below the finality point's height
         let fp_height = self.block_data.get(fp).map(|d| d.height).unwrap_or(0);
-        let block_height = self.block_data.get(block_hash).map(|d| d.height).unwrap_or(u64::MAX);
+        let block_height = self
+            .block_data
+            .get(block_hash)
+            .map(|d| d.height)
+            .unwrap_or(u64::MAX);
 
         // Must be at or below finality height AND on the selected chain
         if block_height > fp_height {
@@ -481,14 +491,19 @@ impl ConsensusState {
             if h == block_hash {
                 return true;
             }
-            cur = self.block_data.get(h).and_then(|d| d.selected_parent.as_deref());
+            cur = self
+                .block_data
+                .get(h)
+                .and_then(|d| d.selected_parent.as_deref());
         }
         false
     }
 
     /// Get the finality point height (0 if no finality point set).
     pub fn finality_height(&self) -> u64 {
-        self.chain.finality_point.as_ref()
+        self.chain
+            .finality_point
+            .as_ref()
             .and_then(|fp| self.block_data.get(fp))
             .map(|d| d.height)
             .unwrap_or(0)
@@ -518,10 +533,7 @@ impl ConsensusState {
         // 2. Finality point must exist in block_data (if set)
         if let Some(fp) = &self.chain.finality_point {
             if !self.block_data.contains_key(fp) {
-                issues.push(format!(
-                    "Finality point '{}' not found in block_data",
-                    fp
-                ));
+                issues.push(format!("Finality point '{}' not found in block_data", fp));
             }
         }
 
@@ -625,7 +637,10 @@ mod tests {
             height: 2,
         });
         let path = state.selected_chain_path();
-        assert_eq!(path, &vec!["g".to_string(), "b1".to_string(), "b2".to_string()]);
+        assert_eq!(
+            path,
+            &vec!["g".to_string(), "b1".to_string(), "b2".to_string()]
+        );
     }
 
     #[test]
@@ -641,11 +656,19 @@ mod tests {
         state.init_with_genesis("g");
         for i in 1..=10 {
             let hash = format!("b{}", i);
-            let parent = if i == 1 { "g".to_string() } else { format!("b{}", i - 1) };
+            let parent = if i == 1 {
+                "g".to_string()
+            } else {
+                format!("b{}", i - 1)
+            };
             let _ = state.insert_block_data(BlockConsensusData {
-                hash, blue_score: i, selected_parent: Some(parent),
-                blue_set: HashSet::new(), red_set: HashSet::new(),
-                is_chain_block: true, height: i,
+                hash,
+                blue_score: i,
+                selected_parent: Some(parent),
+                blue_set: HashSet::new(),
+                red_set: HashSet::new(),
+                is_chain_block: true,
+                height: i,
             });
         }
         // Finality at depth 5: chain has 11 blocks (g + b1..b10)
@@ -661,18 +684,26 @@ mod tests {
         state.init_with_genesis("g");
         for i in 1..=10 {
             let hash = format!("b{}", i);
-            let parent = if i == 1 { "g".to_string() } else { format!("b{}", i - 1) };
+            let parent = if i == 1 {
+                "g".to_string()
+            } else {
+                format!("b{}", i - 1)
+            };
             let _ = state.insert_block_data(BlockConsensusData {
-                hash, blue_score: i, selected_parent: Some(parent),
-                blue_set: HashSet::new(), red_set: HashSet::new(),
-                is_chain_block: true, height: i,
+                hash,
+                blue_score: i,
+                selected_parent: Some(parent),
+                blue_set: HashSet::new(),
+                red_set: HashSet::new(),
+                is_chain_block: true,
+                height: i,
             });
         }
         state.update_finality(5);
         // Finality point = b6 (height 6). idx = 11 - 5 = 6.
-        assert!(state.is_finalized("g"));   // height 0 <= 6 ✓
-        assert!(state.is_finalized("b1"));  // height 1 <= 6 ✓
-        assert!(state.is_finalized("b6"));  // IS the finality point ✓
+        assert!(state.is_finalized("g")); // height 0 <= 6 ✓
+        assert!(state.is_finalized("b1")); // height 1 <= 6 ✓
+        assert!(state.is_finalized("b6")); // IS the finality point ✓
         assert!(!state.is_finalized("b7")); // height 7 > 6 ✗
         assert!(!state.is_finalized("b10")); // height 10 > 6 ✗
     }
@@ -683,11 +714,19 @@ mod tests {
         state.init_with_genesis("g");
         for i in 1..=5 {
             let hash = format!("b{}", i);
-            let parent = if i == 1 { "g".to_string() } else { format!("b{}", i - 1) };
+            let parent = if i == 1 {
+                "g".to_string()
+            } else {
+                format!("b{}", i - 1)
+            };
             let _ = state.insert_block_data(BlockConsensusData {
-                hash, blue_score: i, selected_parent: Some(parent),
-                blue_set: HashSet::new(), red_set: HashSet::new(),
-                is_chain_block: true, height: i,
+                hash,
+                blue_score: i,
+                selected_parent: Some(parent),
+                blue_set: HashSet::new(),
+                red_set: HashSet::new(),
+                is_chain_block: true,
+                height: i,
             });
         }
         assert_eq!(state.finality_height(), 0); // No finality point yet
@@ -711,7 +750,10 @@ mod tests {
         });
         assert!(result.is_err(), "Missing parent must return an error");
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("Parent block 'x' not found"),
-            "Error message should mention missing parent, got: {}", err);
+        assert!(
+            err.to_string().contains("Parent block 'x' not found"),
+            "Error message should mention missing parent, got: {}",
+            err
+        );
     }
 }

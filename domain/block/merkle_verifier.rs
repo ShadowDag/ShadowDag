@@ -11,19 +11,15 @@ use blake2b_simd::Params;
 use crate::domain::block::merkle_proof::MerkleProof;
 
 /// Must match merkle_tree.rs exactly
-const LEAF_PERSON:   &[u8; 16] = b"ShadowMerkleLeaf";
+const LEAF_PERSON: &[u8; 16] = b"ShadowMerkleLeaf";
 const BRANCH_PERSON: &[u8; 16] = b"ShadowMerkleBrch";
-const LEAF_TAG:   u8 = 0x00;
+const LEAF_TAG: u8 = 0x00;
 const BRANCH_TAG: u8 = 0x01;
 
 pub struct MerkleVerifier;
 
 impl MerkleVerifier {
-    pub fn verify(
-        tx_hash: String,
-        proof: &MerkleProof,
-        merkle_root: String,
-    ) -> bool {
+    pub fn verify(tx_hash: String, proof: &MerkleProof, merkle_root: String) -> bool {
         let raw = match Self::strict_decode_hash(&tx_hash) {
             Some(bytes) => bytes,
             None => return false,
@@ -90,11 +86,14 @@ impl MerkleVerifier {
     /// Decode hex hash to bytes, returning None on invalid input
     #[inline]
     fn strict_decode_hash(hex_str: &str) -> Option<Vec<u8>> {
-        crate::domain::types::hash::parse_hash256(hex_str).ok().map(|b| b.to_vec())
+        crate::domain::types::hash::parse_hash256(hex_str)
+            .ok()
+            .map(|b| b.to_vec())
     }
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::domain::block::merkle_tree::MerkleTree;
@@ -112,14 +111,13 @@ mod tests {
         // Generate proof from MerkleTree, convert to MerkleProof format
         for i in 0..hashes.len() {
             let proof_pairs = MerkleTree::generate_proof(&hashes, i).unwrap();
-            let proof = MerkleProof::new(
-                proof_pairs.iter().map(|(h, _)| hex::encode(h)).collect(),
-                i,
-            );
+            let proof =
+                MerkleProof::new(proof_pairs.iter().map(|(h, _)| hex::encode(h)).collect(), i);
 
             assert!(
                 MerkleVerifier::verify(hashes[i].clone(), &proof, root.clone()),
-                "Verifier must match tree for index {}", i
+                "Verifier must match tree for index {}",
+                i
             );
         }
     }
@@ -129,10 +127,7 @@ mod tests {
         let hashes = vec!["aa".repeat(32), "bb".repeat(32)];
         let root = MerkleTree::calculate_root(hashes.clone());
         let proof_pairs = MerkleTree::generate_proof(&hashes, 0).unwrap();
-        let proof = MerkleProof::new(
-            proof_pairs.iter().map(|(h, _)| hex::encode(h)).collect(),
-            0,
-        );
+        let proof = MerkleProof::new(proof_pairs.iter().map(|(h, _)| hex::encode(h)).collect(), 0);
 
         assert!(
             !MerkleVerifier::verify("ff".repeat(32), &proof, root),
@@ -144,10 +139,7 @@ mod tests {
     fn verifier_rejects_wrong_root() {
         let hashes = vec!["aa".repeat(32), "bb".repeat(32)];
         let proof_pairs = MerkleTree::generate_proof(&hashes, 0).unwrap();
-        let proof = MerkleProof::new(
-            proof_pairs.iter().map(|(h, _)| hex::encode(h)).collect(),
-            0,
-        );
+        let proof = MerkleProof::new(proof_pairs.iter().map(|(h, _)| hex::encode(h)).collect(), 0);
 
         assert!(
             !MerkleVerifier::verify(hashes[0].clone(), &proof, "ff".repeat(32)),
@@ -158,6 +150,10 @@ mod tests {
     #[test]
     fn verifier_rejects_malformed_hex() {
         let proof = MerkleProof::new(vec![], 0);
-        assert!(!MerkleVerifier::verify("not_valid_hex".to_string(), &proof, "aa".repeat(32)));
+        assert!(!MerkleVerifier::verify(
+            "not_valid_hex".to_string(),
+            &proof,
+            "aa".repeat(32)
+        ));
     }
 }

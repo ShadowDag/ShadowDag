@@ -3,12 +3,12 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options};
+use rocksdb::{Options, DB};
 use std::sync::Arc;
 
 use crate::domain::block::block::Block;
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
-use crate::{slog_error};
+use crate::slog_error;
 
 const BLK_PREFIX: &str = "blk:";
 const BLK_BEST_HASH: &[u8] = b"blk:best_hash";
@@ -22,11 +22,10 @@ impl BlockStore {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_write_buffer_size(64 * 1024 * 1024);
-        let db = open_shared_db(source, &opts)
-            .map_err(|e| {
-                slog_error!("storage", "block_store_unavailable", error => e);
-                e
-            })?;
+        let db = open_shared_db(source, &opts).map_err(|e| {
+            slog_error!("storage", "block_store_unavailable", error => e);
+            e
+        })?;
         Ok(Self { db })
     }
 
@@ -81,15 +80,13 @@ impl BlockStore {
         let hash = &block.header.hash;
         let block_key = format!("{}{}", BLK_PREFIX, hash);
         match bincode::serialize(block) {
-            Ok(data) => {
-                match self.db.put(block_key.as_bytes(), &data) {
-                    Ok(_) => true,
-                    Err(e) => {
-                        slog_error!("storage", "block_update_write_failed", hash => hash, error => e);
-                        false
-                    }
+            Ok(data) => match self.db.put(block_key.as_bytes(), &data) {
+                Ok(_) => true,
+                Err(e) => {
+                    slog_error!("storage", "block_update_write_failed", hash => hash, error => e);
+                    false
                 }
-            }
+            },
             Err(e) => {
                 slog_error!("storage", "block_update_serialize_error", hash => hash, error => e);
                 false
@@ -161,8 +158,8 @@ impl BlockStore {
         let key = format!("{}{}", BLK_PREFIX, hash);
         match self.db.get(key.as_bytes()) {
             Ok(Some(_)) => true,
-            Ok(None)    => false,
-            Err(e)      => {
+            Ok(None) => false,
+            Err(e) => {
                 slog_error!("storage", "block_exists_read_failed_may_be_false_negative",
                     hash => hash, error => e);
                 false // TODO: Consider Result<bool> return type
@@ -238,11 +235,21 @@ impl BlockStore {
             };
             let key_str = String::from_utf8_lossy(&k).to_string();
             // Skip metadata keys (best_hash, height index, h2h index, utxo_commit)
-            if !key_str.starts_with(BLK_PREFIX) { break; }
-            if key_str == "blk:best_hash" { continue; }
-            if key_str.contains(":height:") { continue; }
-            if key_str.contains(":h2h:") { continue; }
-            if key_str.contains(":utxo_commit:") { continue; }
+            if !key_str.starts_with(BLK_PREFIX) {
+                break;
+            }
+            if key_str == "blk:best_hash" {
+                continue;
+            }
+            if key_str.contains(":height:") {
+                continue;
+            }
+            if key_str.contains(":h2h:") {
+                continue;
+            }
+            if key_str.contains(":utxo_commit:") {
+                continue;
+            }
             match bincode::deserialize::<Block>(&v) {
                 Ok(block) => blocks.push(block),
                 Err(e) => {
@@ -259,7 +266,9 @@ impl BlockStore {
         // Sort by height descending (most recent first), with hash tiebreaker
         // for deterministic ordering among blocks at the same height.
         blocks.sort_by(|a, b| {
-            b.header.height.cmp(&a.header.height)
+            b.header
+                .height
+                .cmp(&a.header.height)
                 .then_with(|| a.header.hash.cmp(&b.header.hash))
         });
         blocks.truncate(limit);
@@ -268,7 +277,8 @@ impl BlockStore {
 
     pub fn count(&self) -> usize {
         let prefix = BLK_PREFIX.as_bytes();
-        self.db.prefix_iterator(prefix)
+        self.db
+            .prefix_iterator(prefix)
             .filter_map(|r| match r {
                 Ok(v) => Some(v),
                 Err(e) => {
@@ -325,7 +335,9 @@ impl BlockStore {
         }
 
         blocks.sort_by(|a, b| {
-            a.header.height.cmp(&b.header.height)
+            a.header
+                .height
+                .cmp(&b.header.height)
                 .then_with(|| a.header.hash.cmp(&b.header.hash))
         });
         blocks
@@ -365,7 +377,9 @@ impl BlockStore {
 
     /// Get ONE block hash at height (returns first found — use get_block_hashes_at_height
     /// for all blocks). Kept for backward compatibility.
-    #[deprecated(note = "Returns only first hash at height. Use get_block_hashes_at_height() for DAG")]
+    #[deprecated(
+        note = "Returns only first hash at height. Use get_block_hashes_at_height() for DAG"
+    )]
     pub fn get_block_hash_at_height(&self, height: u64) -> Option<String> {
         self.get_block_hashes_at_height(height).into_iter().next()
     }
@@ -446,7 +460,10 @@ impl BlockStore {
                 break;
             }
             // Skip metadata and height index keys
-            if key_str == "blk:best_hash" || key_str.contains(":height:") || key_str.contains(":utxo_commit:") {
+            if key_str == "blk:best_hash"
+                || key_str.contains(":height:")
+                || key_str.contains(":utxo_commit:")
+            {
                 continue;
             }
 
@@ -498,7 +515,8 @@ impl BlockStore {
         // Get height from the block itself, or fall back to the h2h
         // index (which survives pruning). Without this fallback,
         // delete_block on a pruned block leaves a stale height index.
-        let height = self.get_block(hash)
+        let height = self
+            .get_block(hash)
             .map(|b| b.header.height)
             .or_else(|| self.get_block_height_from_index(hash));
 
@@ -531,8 +549,8 @@ impl BlockStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::block::block_header::BlockHeader;
     use crate::domain::block::block_body::BlockBody;
+    use crate::domain::block::block_header::BlockHeader;
     use crate::infrastructure::storage::rocksdb::core::db::NodeDB;
 
     fn tmp_path() -> String {
@@ -563,7 +581,9 @@ mod tests {
                 receipt_root: None,
                 state_root: None,
             },
-            body: BlockBody { transactions: vec![] },
+            body: BlockBody {
+                transactions: vec![],
+            },
         }
     }
 
@@ -670,8 +690,12 @@ mod tests {
         assert!(store.block_exists("h3"));
 
         // Height indices preserved for pruned blocks
-        assert!(store.get_block_hashes_at_height(0).contains(&"h0".to_string()));
-        assert!(store.get_block_hashes_at_height(1).contains(&"h1".to_string()));
+        assert!(store
+            .get_block_hashes_at_height(0)
+            .contains(&"h0".to_string()));
+        assert!(store
+            .get_block_hashes_at_height(1)
+            .contains(&"h1".to_string()));
     }
 
     #[test]

@@ -6,8 +6,8 @@
 // Build Manifest -- reproducible build metadata for contract verification.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use serde::{Serialize, Deserialize};
-use sha2::{Sha256, Digest};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Build manifest for reproducible contract compilation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,7 +41,8 @@ impl BuildManifest {
             bytecode_hash: String::new(),
             build_timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default().as_secs(),
+                .unwrap_or_default()
+                .as_secs(),
             manifest_version: 1,
         }
     }
@@ -50,7 +51,8 @@ impl BuildManifest {
     pub fn add_source(&mut self, filename: &str, content: &[u8]) {
         let mut h = Sha256::new();
         h.update(content);
-        self.source_files.push((filename.to_string(), hex::encode(h.finalize())));
+        self.source_files
+            .push((filename.to_string(), hex::encode(h.finalize())));
     }
 
     /// Set the final bytecode hash.

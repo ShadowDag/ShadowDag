@@ -11,18 +11,18 @@
 //
 // ═══════════════════════════════════════════════════════════════════════════
 
+use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
-use sha2::{Sha256, Digest};
 
+use crate::config::node::node_config::NetworkMode;
+use crate::domain::block::block::Block;
+use crate::domain::block::block_body::BlockBody;
+use crate::domain::block::block_header::BlockHeader;
+use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
 use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
 use crate::engine::mining::pow::pow_validator::PowValidator;
-use crate::domain::block::block::Block;
-use crate::domain::block::block_header::BlockHeader;
-use crate::domain::block::block_body::BlockBody;
-use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
-use crate::config::node::node_config::NetworkMode;
 use crate::errors::ConsensusError;
-use crate::{slog_warn, slog_error};
+use crate::{slog_error, slog_warn};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //                         CHAIN IDENTITY
@@ -32,50 +32,47 @@ use crate::{slog_warn, slog_error};
 pub const CHAIN_MAGIC: [u8; 4] = [0x53, 0x44, 0x41, 0x47]; // "SDAG"
 
 /// Genesis message embedded in the coinbase (like Bitcoin's "The Times...")
-pub const GENESIS_MESSAGE: &str =
-    "ShadowDAG/Genesis/2026-01-01/Privacy-is-a-right-not-a-privilege";
+pub const GENESIS_MESSAGE: &str = "ShadowDAG/Genesis/2026-01-01/Privacy-is-a-right-not-a-privilege";
 
 // ═══════════════════════════════════════════════════════════════════════════
 //                      MAINNET GENESIS CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub const GENESIS_VERSION:     u32 = 1;
-pub const GENESIS_HEIGHT:      u64 = 0;
-pub const GENESIS_TIMESTAMP:   u64 = 1_735_689_600; // 2025-01-01 00:00:00 UTC
-pub const GENESIS_DIFFICULTY:  u64 = 8192;
+pub const GENESIS_VERSION: u32 = 1;
+pub const GENESIS_HEIGHT: u64 = 0;
+pub const GENESIS_TIMESTAMP: u64 = 1_735_689_600; // 2025-01-01 00:00:00 UTC
+pub const GENESIS_DIFFICULTY: u64 = 8192;
 
 /// Developer wallet address — receives 5% of every block reward
-pub const OWNER_REWARD_ADDRESS: &str =
-    "SD1a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b";
+pub const OWNER_REWARD_ADDRESS: &str = "SD1a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b";
 
 /// Genesis miner address — receives the first coinbase reward (95%)
-pub const GENESIS_MINER_ADDRESS: &str =
-    "SD1ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00";
+pub const GENESIS_MINER_ADDRESS: &str = "SD1ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00";
 
 /// Block reward in base units (10 SDAG = 10 * 10^8 satoshis)
 pub const GENESIS_REWARD: u64 = 1_000_000_000; // 10.00000000 SDAG
 
 /// Miner gets 95%, Developer gets 5%
 pub const MINER_REWARD_PCT: u64 = 95;
-pub const DEV_REWARD_PCT:   u64 = 5;
+pub const DEV_REWARD_PCT: u64 = 5;
 
 // ── HARDCODED PoW RESULTS (mined with ShadowHash algorithm) ──────────────
 // These were mined by running `mine-genesis` binary.
 // Every node verifies these on startup. If they don't match, the node panics.
 pub const MAINNET_GENESIS_NONCE: u64 = 8888;
-pub const MAINNET_GENESIS_HASH:  &str =
+pub const MAINNET_GENESIS_HASH: &str =
     "0003402066a8335bd50d10054a36a5b82c2a6e5690cf80449a02fa8867e82851";
-pub const MAINNET_MERKLE_ROOT:   &str =
+pub const MAINNET_MERKLE_ROOT: &str =
     "647b7531e64ef4511202ca43c87729d1bdb1594933325c8f79b3cf172febba7e";
 pub const MAINNET_COINBASE_HASH: &str =
     "647b7531e64ef4511202ca43c87729d1bdb1594933325c8f79b3cf172febba7e";
 
 pub const TESTNET_GENESIS_NONCE: u64 = 11242;
-pub const TESTNET_GENESIS_HASH:  &str =
+pub const TESTNET_GENESIS_HASH: &str =
     "000e9dbf3c0ad3fe540ccec65cd72d09dfa0a32aff8d4f3a3b2e67d98ea73068";
 
 pub const REGTEST_GENESIS_NONCE: u64 = 0;
-pub const REGTEST_GENESIS_HASH:  &str =
+pub const REGTEST_GENESIS_HASH: &str =
     "ec4447ead9c537678a2293f09f652affb8194e713a0f117b548f47015a1d0a4f";
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -94,77 +91,72 @@ pub const REGTEST_GENESIS_HASH:  &str =
 // Re-mine with `mine-genesis --network testnet` after changing any constant.
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub const TESTNET_TIMESTAMP:     u64 = 1_735_776_000; // 2025-01-02 00:00:00 UTC
-pub const TESTNET_DIFFICULTY:    u64 = 4096;
-pub const TESTNET_REWARD:        u64 = 1_000_000_000;
-pub const TESTNET_MESSAGE:       &str =
-    "ShadowDAG/Testnet/2026-01-02/Testing-the-shadows";
-pub const TESTNET_MINER_ADDRESS: &str =
-    "ST1ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00";
-pub const TESTNET_DEV_ADDRESS:   &str =
-    "ST1a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b";
+pub const TESTNET_TIMESTAMP: u64 = 1_735_776_000; // 2025-01-02 00:00:00 UTC
+pub const TESTNET_DIFFICULTY: u64 = 4096;
+pub const TESTNET_REWARD: u64 = 1_000_000_000;
+pub const TESTNET_MESSAGE: &str = "ShadowDAG/Testnet/2026-01-02/Testing-the-shadows";
+pub const TESTNET_MINER_ADDRESS: &str = "ST1ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00";
+pub const TESTNET_DEV_ADDRESS: &str = "ST1a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b";
 
 // ═══════════════════════════════════════════════════════════════════════════
 //                      REGTEST GENESIS CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub const REGTEST_TIMESTAMP:     u64 = 0;
-pub const REGTEST_DIFFICULTY:    u64 = 1;
-pub const REGTEST_REWARD:        u64 = 1_000_000_000;
-pub const REGTEST_MESSAGE:       &str = "ShadowDAG/Regtest/Genesis";
-pub const REGTEST_MINER_ADDRESS: &str =
-    "SR1ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00";
-pub const REGTEST_DEV_ADDRESS:   &str =
-    "SR1a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b";
+pub const REGTEST_TIMESTAMP: u64 = 0;
+pub const REGTEST_DIFFICULTY: u64 = 1;
+pub const REGTEST_REWARD: u64 = 1_000_000_000;
+pub const REGTEST_MESSAGE: &str = "ShadowDAG/Regtest/Genesis";
+pub const REGTEST_MINER_ADDRESS: &str = "SR1ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00";
+pub const REGTEST_DEV_ADDRESS: &str = "SR1a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b";
 
 // ═══════════════════════════════════════════════════════════════════════════
 //                       GENESIS PARAMETERS
 // ═══════════════════════════════════════════════════════════════════════════
 
 struct GenesisParams {
-    timestamp:    u64,
-    difficulty:   u64,
-    reward:       u64,
-    message:      &'static str,
-    miner_addr:   &'static str,
-    dev_addr:     &'static str,
-    chain_id:     u32,
+    timestamp: u64,
+    difficulty: u64,
+    reward: u64,
+    message: &'static str,
+    miner_addr: &'static str,
+    dev_addr: &'static str,
+    chain_id: u32,
 }
 
 impl GenesisParams {
     fn mainnet() -> Self {
         Self {
-            timestamp:  GENESIS_TIMESTAMP,
+            timestamp: GENESIS_TIMESTAMP,
             difficulty: GENESIS_DIFFICULTY,
-            reward:     GENESIS_REWARD,
-            message:    GENESIS_MESSAGE,
+            reward: GENESIS_REWARD,
+            message: GENESIS_MESSAGE,
             miner_addr: GENESIS_MINER_ADDRESS,
-            dev_addr:   OWNER_REWARD_ADDRESS,
-            chain_id:   0xDA0C_0001,
+            dev_addr: OWNER_REWARD_ADDRESS,
+            chain_id: 0xDA0C_0001,
         }
     }
 
     fn testnet() -> Self {
         Self {
-            timestamp:  TESTNET_TIMESTAMP,
+            timestamp: TESTNET_TIMESTAMP,
             difficulty: TESTNET_DIFFICULTY,
-            reward:     TESTNET_REWARD,
-            message:    TESTNET_MESSAGE,
+            reward: TESTNET_REWARD,
+            message: TESTNET_MESSAGE,
             miner_addr: TESTNET_MINER_ADDRESS,
-            dev_addr:   TESTNET_DEV_ADDRESS,
-            chain_id:   0xDA0C_0002,
+            dev_addr: TESTNET_DEV_ADDRESS,
+            chain_id: 0xDA0C_0002,
         }
     }
 
     fn regtest() -> Self {
         Self {
-            timestamp:  REGTEST_TIMESTAMP,
+            timestamp: REGTEST_TIMESTAMP,
             difficulty: REGTEST_DIFFICULTY,
-            reward:     REGTEST_REWARD,
-            message:    REGTEST_MESSAGE,
+            reward: REGTEST_REWARD,
+            message: REGTEST_MESSAGE,
             miner_addr: REGTEST_MINER_ADDRESS,
-            dev_addr:   REGTEST_DEV_ADDRESS,
-            chain_id:   0xDA0C_0003,
+            dev_addr: REGTEST_DEV_ADDRESS,
+            chain_id: 0xDA0C_0003,
         }
     }
 }
@@ -177,7 +169,7 @@ impl GenesisParams {
 /// This is the very first transaction on the blockchain.
 fn build_coinbase(p: &GenesisParams) -> Transaction {
     let miner_reward = (p.reward * MINER_REWARD_PCT) / 100;
-    let dev_reward   = p.reward - miner_reward;
+    let dev_reward = p.reward - miner_reward;
 
     // Deterministic coinbase hash: H(chain_id || "genesis_coinbase" || message || timestamp || height)
     let mut h = Sha256::new();
@@ -192,13 +184,13 @@ fn build_coinbase(p: &GenesisParams) -> Transaction {
     let tx_hash = hex::encode(h.finalize());
 
     Transaction {
-        hash:      tx_hash,
-        inputs:    vec![], // Coinbase has no inputs
-        outputs:   vec![
+        hash: tx_hash,
+        inputs: vec![], // Coinbase has no inputs
+        outputs: vec![
             // Output 0: Miner reward (95%)
             TxOutput {
                 address: p.miner_addr.to_string(),
-                amount:  miner_reward,
+                amount: miner_reward,
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
@@ -206,14 +198,14 @@ fn build_coinbase(p: &GenesisParams) -> Transaction {
             // Output 1: Developer reward (5%)
             TxOutput {
                 address: p.dev_addr.to_string(),
-                amount:  dev_reward,
+                amount: dev_reward,
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
             },
         ],
-        fee:        0,
-        timestamp:  p.timestamp,
+        fee: 0,
+        timestamp: p.timestamp,
         is_coinbase: true,
         tx_type: TxType::Transfer,
         payload_hash: None,
@@ -313,7 +305,7 @@ fn mine_genesis(p: &GenesisParams, merkle_root: &str) -> (u64, String) {
 /// Build a complete genesis block.
 /// Uses hardcoded PoW results for fast startup. Falls back to mining if needed.
 fn build_block(p: GenesisParams) -> Block {
-    let coinbase    = build_coinbase(&p);
+    let coinbase = build_coinbase(&p);
     let merkle_root = compute_merkle_root(std::slice::from_ref(&coinbase.hash));
 
     // Use hardcoded PoW results for fast startup (pre-mined with ShadowHash).
@@ -322,8 +314,14 @@ fn build_block(p: GenesisParams) -> Block {
     let (nonce, hash) = match p.chain_id {
         0xDA0C_0001 => {
             let hash = shadow_hash_raw_full(
-                GENESIS_VERSION, GENESIS_HEIGHT, p.timestamp,
-                MAINNET_GENESIS_NONCE, 0, p.difficulty, &merkle_root, &[],
+                GENESIS_VERSION,
+                GENESIS_HEIGHT,
+                p.timestamp,
+                MAINNET_GENESIS_NONCE,
+                0,
+                p.difficulty,
+                &merkle_root,
+                &[],
             );
             if hash == MAINNET_GENESIS_HASH {
                 (MAINNET_GENESIS_NONCE, hash)
@@ -334,8 +332,14 @@ fn build_block(p: GenesisParams) -> Block {
         }
         0xDA0C_0002 => {
             let hash = shadow_hash_raw_full(
-                GENESIS_VERSION, GENESIS_HEIGHT, p.timestamp,
-                TESTNET_GENESIS_NONCE, 0, p.difficulty, &merkle_root, &[],
+                GENESIS_VERSION,
+                GENESIS_HEIGHT,
+                p.timestamp,
+                TESTNET_GENESIS_NONCE,
+                0,
+                p.difficulty,
+                &merkle_root,
+                &[],
             );
             if hash == TESTNET_GENESIS_HASH {
                 (TESTNET_GENESIS_NONCE, hash)
@@ -346,8 +350,14 @@ fn build_block(p: GenesisParams) -> Block {
         }
         0xDA0C_0003 => {
             let hash = shadow_hash_raw_full(
-                GENESIS_VERSION, GENESIS_HEIGHT, p.timestamp,
-                REGTEST_GENESIS_NONCE, 0, p.difficulty, &merkle_root, &[],
+                GENESIS_VERSION,
+                GENESIS_HEIGHT,
+                p.timestamp,
+                REGTEST_GENESIS_NONCE,
+                0,
+                p.difficulty,
+                &merkle_root,
+                &[],
             );
             if hash == REGTEST_GENESIS_HASH {
                 (REGTEST_GENESIS_NONCE, hash)
@@ -361,20 +371,20 @@ fn build_block(p: GenesisParams) -> Block {
 
     Block {
         header: BlockHeader {
-            version:         GENESIS_VERSION,
+            version: GENESIS_VERSION,
             hash,
-            parents:         vec![], // Genesis has no parents (it's the root of the DAG)
+            parents: vec![], // Genesis has no parents (it's the root of the DAG)
             merkle_root,
-            timestamp:       p.timestamp,
+            timestamp: p.timestamp,
             nonce,
-            difficulty:      p.difficulty,
-            height:          GENESIS_HEIGHT,
-            blue_score:      0,
+            difficulty: p.difficulty,
+            height: GENESIS_HEIGHT,
+            blue_score: 0,
             selected_parent: None,
             utxo_commitment: None,
-            extra_nonce:     0,
-            receipt_root:    None,
-            state_root:      None,
+            extra_nonce: 0,
+            receipt_root: None,
+            state_root: None,
         },
         body: BlockBody {
             transactions: vec![coinbase],
@@ -425,7 +435,8 @@ pub fn genesis_hash_for(network: &NetworkMode) -> String {
         NetworkMode::Testnet => &GENESIS_HASH_TESTNET,
         NetworkMode::Regtest => &GENESIS_HASH_REGTEST,
     };
-    lock.get_or_init(|| create_genesis_block_for(network).header.hash).clone()
+    lock.get_or_init(|| create_genesis_block_for(network).header.hash)
+        .clone()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -457,12 +468,18 @@ pub fn verify_genesis_detailed(block: &Block, network: &NetworkMode) -> Result<(
 
     // 2. Height must be 0
     if block.header.height != 0 {
-        return Err(ConsensusError::Genesis(format!("height must be 0, got {}", block.header.height)));
+        return Err(ConsensusError::Genesis(format!(
+            "height must be 0, got {}",
+            block.header.height
+        )));
     }
 
     // 3. No parents (it's the DAG root)
     if !block.header.parents.is_empty() {
-        return Err(ConsensusError::Genesis(format!("must have no parents, got {}", block.header.parents.len())));
+        return Err(ConsensusError::Genesis(format!(
+            "must have no parents, got {}",
+            block.header.parents.len()
+        )));
     }
 
     // 4. Version must match
@@ -491,27 +508,41 @@ pub fn verify_genesis_detailed(block: &Block, network: &NetworkMode) -> Result<(
 
     // 7. Nonce must match (proves PoW was done)
     if block.header.nonce != expected.header.nonce {
-        return Err(ConsensusError::Genesis(format!("nonce mismatch: got {} expected {}", block.header.nonce, expected.header.nonce)));
+        return Err(ConsensusError::Genesis(format!(
+            "nonce mismatch: got {} expected {}",
+            block.header.nonce, expected.header.nonce
+        )));
     }
 
     // 8. Must have exactly one transaction (coinbase)
     if block.body.transactions.len() != 1 {
-        return Err(ConsensusError::Genesis(format!("must have 1 tx, got {}", block.body.transactions.len())));
+        return Err(ConsensusError::Genesis(format!(
+            "must have 1 tx, got {}",
+            block.body.transactions.len()
+        )));
     }
 
     // 9. Coinbase must have no inputs
     if !block.body.transactions[0].inputs.is_empty() {
-        return Err(ConsensusError::Genesis("coinbase must have no inputs".to_string()));
+        return Err(ConsensusError::Genesis(
+            "coinbase must have no inputs".to_string(),
+        ));
     }
 
     // 10. Coinbase must have exactly 2 outputs (miner + developer)
     if block.body.transactions[0].outputs.len() != 2 {
-        return Err(ConsensusError::Genesis(format!("coinbase must have 2 outputs, got {}", block.body.transactions[0].outputs.len())));
+        return Err(ConsensusError::Genesis(format!(
+            "coinbase must have 2 outputs, got {}",
+            block.body.transactions[0].outputs.len()
+        )));
     }
 
     // 11. Verify the PoW hash meets the difficulty target
     if !PowValidator::hash_meets_target(&block.header.hash, block.header.difficulty) {
-        return Err(ConsensusError::InvalidPow(format!("hash {} does not meet difficulty {}", &block.header.hash, block.header.difficulty)));
+        return Err(ConsensusError::InvalidPow(format!(
+            "hash {} does not meet difficulty {}",
+            &block.header.hash, block.header.difficulty
+        )));
     }
 
     // 12. Verify reward split (95% miner, 5% developer)
@@ -521,16 +552,22 @@ pub fn verify_genesis_detailed(block: &Block, network: &NetworkMode) -> Result<(
         NetworkMode::Regtest => GenesisParams::regtest(),
     };
     let expected_miner_reward = (params.reward * MINER_REWARD_PCT) / 100;
-    let expected_dev_reward   = params.reward - expected_miner_reward;
+    let expected_dev_reward = params.reward - expected_miner_reward;
 
     let miner_out = &block.body.transactions[0].outputs[0];
-    let dev_out   = &block.body.transactions[0].outputs[1];
+    let dev_out = &block.body.transactions[0].outputs[1];
 
     if miner_out.amount != expected_miner_reward {
-        return Err(ConsensusError::Genesis(format!("miner reward mismatch: got {} expected {}", miner_out.amount, expected_miner_reward)));
+        return Err(ConsensusError::Genesis(format!(
+            "miner reward mismatch: got {} expected {}",
+            miner_out.amount, expected_miner_reward
+        )));
     }
     if dev_out.amount != expected_dev_reward {
-        return Err(ConsensusError::Genesis(format!("dev reward mismatch: got {} expected {}", dev_out.amount, expected_dev_reward)));
+        return Err(ConsensusError::Genesis(format!(
+            "dev reward mismatch: got {} expected {}",
+            dev_out.amount, expected_dev_reward
+        )));
     }
 
     // 13. Re-verify PoW independently
@@ -603,8 +640,14 @@ mod tests {
     fn genesis_is_deterministic() {
         let g1 = create_genesis_block();
         let g2 = create_genesis_block();
-        assert_eq!(g1.header.hash, g2.header.hash, "Genesis must be deterministic");
-        assert_eq!(g1.header.nonce, g2.header.nonce, "Nonce must be deterministic");
+        assert_eq!(
+            g1.header.hash, g2.header.hash,
+            "Genesis must be deterministic"
+        );
+        assert_eq!(
+            g1.header.nonce, g2.header.nonce,
+            "Nonce must be deterministic"
+        );
         assert_eq!(g1.header.merkle_root, g2.header.merkle_root);
     }
 
@@ -623,30 +666,45 @@ mod tests {
     #[test]
     fn genesis_has_coinbase_with_two_outputs() {
         let g = create_genesis_block();
-        assert_eq!(g.body.transactions.len(), 1, "Genesis must have exactly 1 tx");
-        assert!(g.body.transactions[0].inputs.is_empty(), "Coinbase has no inputs");
-        assert_eq!(g.body.transactions[0].outputs.len(), 2, "Must have miner + dev outputs");
+        assert_eq!(
+            g.body.transactions.len(),
+            1,
+            "Genesis must have exactly 1 tx"
+        );
+        assert!(
+            g.body.transactions[0].inputs.is_empty(),
+            "Coinbase has no inputs"
+        );
+        assert_eq!(
+            g.body.transactions[0].outputs.len(),
+            2,
+            "Must have miner + dev outputs"
+        );
     }
 
     #[test]
     fn genesis_reward_split_is_correct() {
         let g = create_genesis_block();
         let miner_out = &g.body.transactions[0].outputs[0];
-        let dev_out   = &g.body.transactions[0].outputs[1];
+        let dev_out = &g.body.transactions[0].outputs[1];
 
         let expected_miner = (GENESIS_REWARD * MINER_REWARD_PCT) / 100;
-        let expected_dev   = GENESIS_REWARD - expected_miner;
+        let expected_dev = GENESIS_REWARD - expected_miner;
 
         assert_eq!(miner_out.amount, expected_miner, "Miner must get 95%");
         assert_eq!(dev_out.amount, expected_dev, "Developer must get 5%");
-        assert_eq!(miner_out.amount + dev_out.amount, GENESIS_REWARD, "Total must equal reward");
+        assert_eq!(
+            miner_out.amount + dev_out.amount,
+            GENESIS_REWARD,
+            "Total must equal reward"
+        );
     }
 
     #[test]
     fn genesis_addresses_are_correct() {
         let g = create_genesis_block();
         let miner_out = &g.body.transactions[0].outputs[0];
-        let dev_out   = &g.body.transactions[0].outputs[1];
+        let dev_out = &g.body.transactions[0].outputs[1];
 
         assert_eq!(miner_out.address, GENESIS_MINER_ADDRESS);
         assert_eq!(dev_out.address, OWNER_REWARD_ADDRESS);
@@ -658,7 +716,8 @@ mod tests {
         assert!(
             PowValidator::hash_meets_target(&g.header.hash, g.header.difficulty),
             "Genesis hash {} must meet difficulty {}",
-            g.header.hash, g.header.difficulty
+            g.header.hash,
+            g.header.difficulty
         );
     }
 
@@ -675,7 +734,10 @@ mod tests {
             &g.header.merkle_root,
             &g.header.parents,
         );
-        assert_eq!(g.header.hash, recomputed, "Hash must be independently recomputable");
+        assert_eq!(
+            g.header.hash, recomputed,
+            "Hash must be independently recomputable"
+        );
     }
 
     #[test]
@@ -744,8 +806,10 @@ mod tests {
     #[test]
     fn verify_cross_network_fails() {
         let mainnet_block = create_genesis_block_for(&NetworkMode::Mainnet);
-        assert!(!verify_genesis_for(&mainnet_block, &NetworkMode::Testnet),
-            "Mainnet genesis must NOT pass testnet verification");
+        assert!(
+            !verify_genesis_for(&mainnet_block, &NetworkMode::Testnet),
+            "Mainnet genesis must NOT pass testnet verification"
+        );
     }
 
     #[test]
@@ -768,7 +832,10 @@ mod tests {
     #[test]
     fn genesis_fee_is_zero() {
         let g = create_genesis_block();
-        assert_eq!(g.body.transactions[0].fee, 0, "Genesis coinbase fee must be 0");
+        assert_eq!(
+            g.body.transactions[0].fee, 0,
+            "Genesis coinbase fee must be 0"
+        );
     }
 
     #[test]

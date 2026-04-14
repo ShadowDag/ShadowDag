@@ -6,25 +6,25 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-pub const MSG_RATE_PER_SEC:   u64   = 200;
+pub const MSG_RATE_PER_SEC: u64 = 200;
 
-pub const INV_RATE_PER_SEC:   u64   = 100;
+pub const INV_RATE_PER_SEC: u64 = 100;
 
-pub const TX_RATE_PER_SEC:    u64   = 50;
+pub const TX_RATE_PER_SEC: u64 = 50;
 
 /// Block rate limit — MUST scale with BPS.
 /// At 1 BPS: 60 * 2 = 120/min (2x headroom)
 /// At 10 BPS: 600 * 2 = 1200/min
 /// At 32 BPS: 1920 * 2 = 3840/min
 /// Default uses 32 BPS max for compatibility.
-pub const BLOCK_RATE_PER_MIN: u64   = 3840;
+pub const BLOCK_RATE_PER_MIN: u64 = 3840;
 
-pub const BURST_SIZE:         f64   = 20.0;
+pub const BURST_SIZE: f64 = 20.0;
 
 #[derive(Debug)]
 pub struct TokenBucket {
-    tokens:      f64,
-    capacity:    f64,
+    tokens: f64,
+    capacity: f64,
     refill_rate: f64,
     last_refill: Instant,
 }
@@ -33,8 +33,8 @@ impl TokenBucket {
     pub fn new(rate_per_sec: u64) -> Self {
         let cap = BURST_SIZE.max(rate_per_sec as f64 * 0.1);
         Self {
-            tokens:      cap,
-            capacity:    cap,
+            tokens: cap,
+            capacity: cap,
             refill_rate: rate_per_sec as f64,
             last_refill: Instant::now(),
         }
@@ -74,11 +74,11 @@ impl TokenBucket {
 }
 
 pub struct PeerRateLimits {
-    pub msg_bucket:   TokenBucket,
-    pub inv_bucket:   TokenBucket,
-    pub tx_bucket:    TokenBucket,
+    pub msg_bucket: TokenBucket,
+    pub inv_bucket: TokenBucket,
+    pub tx_bucket: TokenBucket,
     pub block_bucket: TokenBucket,
-    pub last_active:  Instant,
+    pub last_active: Instant,
 }
 
 impl Default for PeerRateLimits {
@@ -90,11 +90,11 @@ impl Default for PeerRateLimits {
 impl PeerRateLimits {
     pub fn new() -> Self {
         Self {
-            msg_bucket:   TokenBucket::new(MSG_RATE_PER_SEC),
-            inv_bucket:   TokenBucket::new(INV_RATE_PER_SEC),
-            tx_bucket:    TokenBucket::new(TX_RATE_PER_SEC),
+            msg_bucket: TokenBucket::new(MSG_RATE_PER_SEC),
+            inv_bucket: TokenBucket::new(INV_RATE_PER_SEC),
+            tx_bucket: TokenBucket::new(TX_RATE_PER_SEC),
             block_bucket: TokenBucket::new(BLOCK_RATE_PER_MIN / 60 + 1),
-            last_active:  Instant::now(),
+            last_active: Instant::now(),
         }
     }
 
@@ -119,13 +119,13 @@ impl Default for RateLimiter {
 
 impl RateLimiter {
     pub fn new() -> Self {
-        Self { limits: HashMap::new() }
+        Self {
+            limits: HashMap::new(),
+        }
     }
 
     fn entry(&mut self, peer: &str) -> &mut PeerRateLimits {
-        self.limits
-            .entry(peer.to_string())
-            .or_default()
+        self.limits.entry(peer.to_string()).or_default()
     }
 
     pub fn allow_message(&mut self, peer: &str) -> bool {
@@ -168,7 +168,6 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn token_bucket_allows_initial_burst() {

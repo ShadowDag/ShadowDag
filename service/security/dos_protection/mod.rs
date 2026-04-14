@@ -6,24 +6,24 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const MAX_CONNECTIONS_PER_IP:  usize = 4;
-pub const MAX_MSG_SIZE_BYTES:      usize = 4 * 1024 * 1024;
-pub const MSG_FLOOD_THRESHOLD:     u64   = 500;
-pub const BLOCK_FLOOD_THRESHOLD:   u64   = 20;
-pub const BAN_SCORE_THRESHOLD:     u64   = 100;
-pub const BAN_DURATION_SECS:       u64   = 86_400;
-pub const IDLE_ENTRY_EXPIRY_SECS:  u64   = 3_600;
+pub const MAX_CONNECTIONS_PER_IP: usize = 4;
+pub const MAX_MSG_SIZE_BYTES: usize = 4 * 1024 * 1024;
+pub const MSG_FLOOD_THRESHOLD: u64 = 500;
+pub const BLOCK_FLOOD_THRESHOLD: u64 = 20;
+pub const BAN_SCORE_THRESHOLD: u64 = 100;
+pub const BAN_DURATION_SECS: u64 = 86_400;
+pub const IDLE_ENTRY_EXPIRY_SECS: u64 = 3_600;
 
 #[derive(Debug, Clone)]
 pub struct IpStats {
-    pub connections:      usize,
-    pub msg_count:        u64,
-    pub block_count:      u64,
-    pub invalid_count:    u64,
-    pub ban_score:        u64,
-    pub ban_expiry:       u64,
-    pub window_start:     Instant,
-    pub last_seen:        u64,
+    pub connections: usize,
+    pub msg_count: u64,
+    pub block_count: u64,
+    pub invalid_count: u64,
+    pub ban_score: u64,
+    pub ban_expiry: u64,
+    pub window_start: Instant,
+    pub last_seen: u64,
 }
 
 impl Default for IpStats {
@@ -33,14 +33,14 @@ impl Default for IpStats {
             .unwrap_or_default()
             .as_secs();
         Self {
-            connections:  0,
-            msg_count:    0,
-            block_count:  0,
+            connections: 0,
+            msg_count: 0,
+            block_count: 0,
             invalid_count: 0,
-            ban_score:    0,
-            ban_expiry:   0,
+            ban_score: 0,
+            ban_expiry: 0,
             window_start: Instant::now(),
-            last_seen:    now,
+            last_seen: now,
         }
     }
 }
@@ -56,7 +56,7 @@ impl IpStats {
 
     fn refresh_window(&mut self) {
         if self.window_start.elapsed() >= Duration::from_secs(1) {
-            self.msg_count   = 0;
+            self.msg_count = 0;
             self.block_count = 0;
             self.window_start = Instant::now();
         }
@@ -64,7 +64,7 @@ impl IpStats {
 }
 
 pub struct DosProtection {
-    ip_stats:  HashMap<String, IpStats>,
+    ip_stats: HashMap<String, IpStats>,
 }
 
 impl Default for DosProtection {
@@ -75,7 +75,9 @@ impl Default for DosProtection {
 
 impl DosProtection {
     pub fn new() -> Self {
-        Self { ip_stats: HashMap::new() }
+        Self {
+            ip_stats: HashMap::new(),
+        }
     }
 
     fn entry(&mut self, ip: &str) -> &mut IpStats {
@@ -113,7 +115,9 @@ impl DosProtection {
         }
         let flood = {
             let stats = self.entry(ip);
-            if stats.is_banned() { return false; }
+            if stats.is_banned() {
+                return false;
+            }
             stats.refresh_window();
             stats.msg_count += 1;
             stats.msg_count > MSG_FLOOD_THRESHOLD
@@ -126,7 +130,9 @@ impl DosProtection {
     }
 
     pub fn allow_block(&mut self, ip: &str) -> bool {
-        if self.entry(ip).is_banned() { return false; }
+        if self.entry(ip).is_banned() {
+            return false;
+        }
         let flood = {
             let stats = self.entry(ip);
             stats.refresh_window();
@@ -169,7 +175,10 @@ impl DosProtection {
     }
 
     pub fn is_banned(&self, ip: &str) -> bool {
-        self.ip_stats.get(ip).map(|s| s.is_banned()).unwrap_or(false)
+        self.ip_stats
+            .get(ip)
+            .map(|s| s.is_banned())
+            .unwrap_or(false)
     }
 
     pub fn ban_score(&self, ip: &str) -> u64 {
@@ -184,7 +193,7 @@ impl DosProtection {
         for stats in self.ip_stats.values_mut() {
             if stats.ban_expiry > 0 && stats.ban_expiry <= now {
                 stats.ban_expiry = 0;
-                stats.ban_score  = 0;
+                stats.ban_score = 0;
             }
         }
         // Remove entries that are no longer banned and have no active connections,
@@ -206,7 +215,8 @@ impl DosProtection {
     }
 
     pub fn ip_count(&self) -> usize {
-        self.ip_stats.values()
+        self.ip_stats
+            .values()
             .filter(|s| s.ban_score > 0 || s.ban_expiry > 0 || s.connections > 0)
             .count()
     }

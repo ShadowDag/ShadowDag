@@ -6,8 +6,8 @@
 // Health Check & Monitoring — Node health status and system metrics.
 // ═══════════════════════════════════════════════════════════════════════════
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
 /// Node health status
 #[derive(Debug, Clone, PartialEq)]
@@ -20,13 +20,15 @@ pub enum HealthStatus {
 }
 
 impl HealthStatus {
-    pub fn is_healthy(&self) -> bool { matches!(self, HealthStatus::Healthy) }
+    pub fn is_healthy(&self) -> bool {
+        matches!(self, HealthStatus::Healthy)
+    }
     pub fn http_code(&self) -> u16 {
         match self {
-            HealthStatus::Healthy      => 200,
-            HealthStatus::Degraded{..} => 200,
-            HealthStatus::Starting     => 503,
-            _                          => 503,
+            HealthStatus::Healthy => 200,
+            HealthStatus::Degraded { .. } => 200,
+            HealthStatus::Starting => 503,
+            _ => 503,
         }
     }
 }
@@ -34,19 +36,19 @@ impl HealthStatus {
 /// System metrics snapshot
 #[derive(Debug, Clone)]
 pub struct SystemMetrics {
-    pub uptime_secs:       u64,
-    pub block_height:      u64,
-    pub dag_tips:          u64,
-    pub peer_count:        u64,
-    pub mempool_size:      u64,
-    pub blocks_per_sec:    f64,
-    pub txs_per_sec:       f64,
-    pub db_size_bytes:     u64,
-    pub memory_used_mb:    u64,
-    pub sync_progress:     f64, // 0.0 to 1.0
-    pub is_synced:         bool,
-    pub version:           String,
-    pub network:           String,
+    pub uptime_secs: u64,
+    pub block_height: u64,
+    pub dag_tips: u64,
+    pub peer_count: u64,
+    pub mempool_size: u64,
+    pub blocks_per_sec: f64,
+    pub txs_per_sec: f64,
+    pub db_size_bytes: u64,
+    pub memory_used_mb: u64,
+    pub sync_progress: f64, // 0.0 to 1.0
+    pub is_synced: bool,
+    pub version: String,
+    pub network: String,
 }
 
 impl SystemMetrics {
@@ -65,7 +67,8 @@ impl SystemMetrics {
             "is_synced":      self.is_synced,
             "version":        self.version,
             "network":        self.network,
-        }).to_string()
+        })
+        .to_string()
     }
 
     pub fn to_prometheus(&self) -> String {
@@ -79,39 +82,45 @@ impl SystemMetrics {
         out.push_str(&format!("shadowdag_tps {:.2}\n", self.txs_per_sec));
         out.push_str(&format!("shadowdag_db_bytes {}\n", self.db_size_bytes));
         out.push_str(&format!("shadowdag_memory_mb {}\n", self.memory_used_mb));
-        out.push_str(&format!("shadowdag_sync_progress {:.4}\n", self.sync_progress));
-        out.push_str(&format!("shadowdag_synced {}\n", if self.is_synced { 1 } else { 0 }));
+        out.push_str(&format!(
+            "shadowdag_sync_progress {:.4}\n",
+            self.sync_progress
+        ));
+        out.push_str(&format!(
+            "shadowdag_synced {}\n",
+            if self.is_synced { 1 } else { 0 }
+        ));
         out
     }
 }
 
 /// Health checker
 pub struct HealthChecker {
-    start_time:     Instant,
-    status:         std::sync::RwLock<HealthStatus>,
-    block_height:   AtomicU64,
-    dag_tips:       AtomicU64,
-    peer_count:     AtomicU64,
-    mempool_size:   AtomicU64,
-    total_blocks:   AtomicU64,
-    total_txs:      AtomicU64,
-    is_synced:      AtomicBool,
-    network:        String,
+    start_time: Instant,
+    status: std::sync::RwLock<HealthStatus>,
+    block_height: AtomicU64,
+    dag_tips: AtomicU64,
+    peer_count: AtomicU64,
+    mempool_size: AtomicU64,
+    total_blocks: AtomicU64,
+    total_txs: AtomicU64,
+    is_synced: AtomicBool,
+    network: String,
 }
 
 impl HealthChecker {
     pub fn new(network: &str) -> Self {
         Self {
-            start_time:   Instant::now(),
-            status:       std::sync::RwLock::new(HealthStatus::Starting),
+            start_time: Instant::now(),
+            status: std::sync::RwLock::new(HealthStatus::Starting),
             block_height: AtomicU64::new(0),
-            dag_tips:     AtomicU64::new(0),
-            peer_count:   AtomicU64::new(0),
+            dag_tips: AtomicU64::new(0),
+            peer_count: AtomicU64::new(0),
             mempool_size: AtomicU64::new(0),
             total_blocks: AtomicU64::new(0),
-            total_txs:    AtomicU64::new(0),
-            is_synced:    AtomicBool::new(false),
-            network:      network.to_string(),
+            total_txs: AtomicU64::new(0),
+            is_synced: AtomicBool::new(false),
+            network: network.to_string(),
         }
     }
 
@@ -120,22 +129,36 @@ impl HealthChecker {
     }
 
     pub fn set_degraded(&self, reason: &str) {
-        *self.status.write().unwrap_or_else(|e| e.into_inner()) = HealthStatus::Degraded { reason: reason.to_string() };
+        *self.status.write().unwrap_or_else(|e| e.into_inner()) = HealthStatus::Degraded {
+            reason: reason.to_string(),
+        };
     }
 
     pub fn set_unhealthy(&self, reason: &str) {
-        *self.status.write().unwrap_or_else(|e| e.into_inner()) = HealthStatus::Unhealthy { reason: reason.to_string() };
+        *self.status.write().unwrap_or_else(|e| e.into_inner()) = HealthStatus::Unhealthy {
+            reason: reason.to_string(),
+        };
     }
 
-    pub fn update_block_height(&self, h: u64) { self.block_height.store(h, Ordering::Relaxed); }
-    pub fn update_dag_tips(&self, t: u64)     { self.dag_tips.store(t, Ordering::Relaxed); }
-    pub fn update_peer_count(&self, c: u64)   { self.peer_count.store(c, Ordering::Relaxed); }
-    pub fn update_mempool_size(&self, s: u64)  { self.mempool_size.store(s, Ordering::Relaxed); }
+    pub fn update_block_height(&self, h: u64) {
+        self.block_height.store(h, Ordering::Relaxed);
+    }
+    pub fn update_dag_tips(&self, t: u64) {
+        self.dag_tips.store(t, Ordering::Relaxed);
+    }
+    pub fn update_peer_count(&self, c: u64) {
+        self.peer_count.store(c, Ordering::Relaxed);
+    }
+    pub fn update_mempool_size(&self, s: u64) {
+        self.mempool_size.store(s, Ordering::Relaxed);
+    }
     pub fn on_block(&self, tx_count: u64) {
         self.total_blocks.fetch_add(1, Ordering::Relaxed);
         self.total_txs.fetch_add(tx_count, Ordering::Relaxed);
     }
-    pub fn set_synced(&self, synced: bool) { self.is_synced.store(synced, Ordering::Relaxed); }
+    pub fn set_synced(&self, synced: bool) {
+        self.is_synced.store(synced, Ordering::Relaxed);
+    }
 
     /// Auto-check health based on metrics
     pub fn auto_check(&self) {
@@ -151,32 +174,49 @@ impl HealthChecker {
         }
     }
 
-    pub fn status(&self) -> HealthStatus { self.status.read().unwrap_or_else(|e| e.into_inner()).clone() }
+    pub fn status(&self) -> HealthStatus {
+        self.status
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
 
     pub fn metrics(&self) -> SystemMetrics {
         let uptime = self.start_time.elapsed().as_secs();
         let total_blocks = self.total_blocks.load(Ordering::Relaxed);
         let total_txs = self.total_txs.load(Ordering::Relaxed);
-        let bps = if uptime > 0 { total_blocks as f64 / uptime as f64 } else { 0.0 };
-        let tps = if uptime > 0 { total_txs as f64 / uptime as f64 } else { 0.0 };
+        let bps = if uptime > 0 {
+            total_blocks as f64 / uptime as f64
+        } else {
+            0.0
+        };
+        let tps = if uptime > 0 {
+            total_txs as f64 / uptime as f64
+        } else {
+            0.0
+        };
 
         // Best-effort process memory query — returns 0 if unavailable.
         let memory_used_mb = Self::process_memory_mb();
 
         SystemMetrics {
-            uptime_secs:    uptime,
-            block_height:   self.block_height.load(Ordering::Relaxed),
-            dag_tips:       self.dag_tips.load(Ordering::Relaxed), // fed by daemon via update_dag_tips()
-            peer_count:     self.peer_count.load(Ordering::Relaxed),
-            mempool_size:   self.mempool_size.load(Ordering::Relaxed),
+            uptime_secs: uptime,
+            block_height: self.block_height.load(Ordering::Relaxed),
+            dag_tips: self.dag_tips.load(Ordering::Relaxed), // fed by daemon via update_dag_tips()
+            peer_count: self.peer_count.load(Ordering::Relaxed),
+            mempool_size: self.mempool_size.load(Ordering::Relaxed),
             blocks_per_sec: bps,
-            txs_per_sec:    tps,
-            db_size_bytes:  0, // TODO(#59): stub — wire RocksDB's GetApproximateSizes or live_files_metadata when DB handle is plumbed in
-            memory_used_mb, // best-effort from /proc/self/statm or platform equivalent
-            sync_progress:  if self.is_synced.load(Ordering::Relaxed) { 1.0 } else { 0.5 }, // TODO(#59): stub — compute from header chain progress
-            is_synced:      self.is_synced.load(Ordering::Relaxed),
-            version:        env!("CARGO_PKG_VERSION").to_string(),
-            network:        self.network.clone(),
+            txs_per_sec: tps,
+            db_size_bytes: 0, // TODO(#59): stub — wire RocksDB's GetApproximateSizes or live_files_metadata when DB handle is plumbed in
+            memory_used_mb,   // best-effort from /proc/self/statm or platform equivalent
+            sync_progress: if self.is_synced.load(Ordering::Relaxed) {
+                1.0
+            } else {
+                0.5
+            }, // TODO(#59): stub — compute from header chain progress
+            is_synced: self.is_synced.load(Ordering::Relaxed),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            network: self.network.clone(),
         }
     }
 
@@ -217,7 +257,8 @@ impl HealthChecker {
         let body = serde_json::json!({
             "status": format!("{:?}", status),
             "healthy": status.is_healthy(),
-        }).to_string();
+        })
+        .to_string();
         (code, body)
     }
 }

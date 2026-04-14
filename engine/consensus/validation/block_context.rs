@@ -3,9 +3,9 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use core::ops::Deref;
-use core::hash::{Hash, Hasher};
 use crate::domain::block::block::Block;
+use core::hash::{Hash, Hasher};
+use core::ops::Deref;
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy)]
@@ -14,16 +14,11 @@ pub struct BlockContext<'a> {
 }
 
 impl<'a> BlockContext<'a> {
-
-
-
     #[inline(always)]
     #[must_use]
     pub const fn new(block: &'a Block) -> Self {
         Self { block }
     }
-
-
 
     #[inline(always)]
     #[must_use]
@@ -55,8 +50,6 @@ impl<'a> BlockContext<'a> {
     }
 }
 
-
-
 impl<'a> Deref for BlockContext<'a> {
     type Target = Block;
 
@@ -65,8 +58,6 @@ impl<'a> Deref for BlockContext<'a> {
         self.block
     }
 }
-
-
 
 impl<'a> AsRef<Block> for BlockContext<'a> {
     #[inline(always)]
@@ -102,13 +93,10 @@ impl<'a> Hash for BlockContext<'a> {
     }
 }
 
-
-
 impl<'a> PartialEq for BlockContext<'a> {
     #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
-        core::ptr::eq(self.block, other.block)
-            || self.block.header.hash == other.block.header.hash
+        core::ptr::eq(self.block, other.block) || self.block.header.hash == other.block.header.hash
     }
 }
 

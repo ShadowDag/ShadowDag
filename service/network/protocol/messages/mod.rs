@@ -3,14 +3,14 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use serde::{Deserialize, Serialize};
 use crate::errors::NetworkError;
+use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32     = 1;
-pub const NETWORK_MAGIC:    [u8; 4] = [0x53, 0x44, 0x41, 0x47];
-pub const MAX_INV_ITEMS:    usize   = 50_000;
-pub const MAX_HEADERS_ITEMS: usize  = 2_000;
-pub const MAX_ADDR_ITEMS:   usize   = 1_000;
+pub const PROTOCOL_VERSION: u32 = 1;
+pub const NETWORK_MAGIC: [u8; 4] = [0x53, 0x44, 0x41, 0x47];
+pub const MAX_INV_ITEMS: usize = 50_000;
+pub const MAX_HEADERS_ITEMS: usize = 2_000;
+pub const MAX_ADDR_ITEMS: usize = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InvType {
@@ -27,54 +27,82 @@ pub struct InvItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddrEntry {
-    pub address:  String,
+    pub address: String,
     pub services: u64,
-    pub time:     u64,
+    pub time: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockHeaderMsg {
-    pub hash:       String,
-    pub height:     u64,
-    pub parents:    Vec<String>,
-    pub timestamp:  u64,
+    pub hash: String,
+    pub height: u64,
+    pub parents: Vec<String>,
+    pub timestamp: u64,
     pub difficulty: u64,
-    pub nonce:      u64,
+    pub nonce: u64,
     pub blue_score: u64,
-    pub merkle:     String,
+    pub merkle: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", content = "data")]
 pub enum NetworkMessage {
     Version {
-        version:      u32,
-        user_agent:   String,
-        best_height:  u64,
-        timestamp:    u64,
-        services:     u64,
-        relay:        bool,
+        version: u32,
+        user_agent: String,
+        best_height: u64,
+        timestamp: u64,
+        services: u64,
+        relay: bool,
     },
     VerAck,
 
     GetAddr,
-    Addr { entries: Vec<AddrEntry> },
+    Addr {
+        entries: Vec<AddrEntry>,
+    },
 
-    Inv     { items: Vec<InvItem> },
-    GetData { items: Vec<InvItem> },
-    NotFound { items: Vec<InvItem> },
+    Inv {
+        items: Vec<InvItem>,
+    },
+    GetData {
+        items: Vec<InvItem>,
+    },
+    NotFound {
+        items: Vec<InvItem>,
+    },
 
-    GetHeaders { locator: Vec<String>, stop_hash: String },
-    Headers    { headers: Vec<BlockHeaderMsg> },
-    GetBlocks  { locator: Vec<String>, stop_hash: String },
-    Block      { raw: String },
+    GetHeaders {
+        locator: Vec<String>,
+        stop_hash: String,
+    },
+    Headers {
+        headers: Vec<BlockHeaderMsg>,
+    },
+    GetBlocks {
+        locator: Vec<String>,
+        stop_hash: String,
+    },
+    Block {
+        raw: String,
+    },
 
-    Tx { raw: String },
+    Tx {
+        raw: String,
+    },
 
-    Ping { nonce: u64 },
-    Pong { nonce: u64 },
+    Ping {
+        nonce: u64,
+    },
+    Pong {
+        nonce: u64,
+    },
 
-    Reject { hash: String, code: u8, reason: String },
+    Reject {
+        hash: String,
+        code: u8,
+        reason: String,
+    },
 
     MemPool,
 }
@@ -83,61 +111,79 @@ impl NetworkMessage {
     pub fn name(&self) -> &'static str {
         match self {
             NetworkMessage::Version { .. } => "version",
-            NetworkMessage::VerAck         => "verack",
-            NetworkMessage::GetAddr        => "getaddr",
-            NetworkMessage::Addr { .. }    => "addr",
-            NetworkMessage::Inv { .. }     => "inv",
+            NetworkMessage::VerAck => "verack",
+            NetworkMessage::GetAddr => "getaddr",
+            NetworkMessage::Addr { .. } => "addr",
+            NetworkMessage::Inv { .. } => "inv",
             NetworkMessage::GetData { .. } => "getdata",
-            NetworkMessage::NotFound { .. }=> "notfound",
+            NetworkMessage::NotFound { .. } => "notfound",
             NetworkMessage::GetHeaders { .. } => "getheaders",
             NetworkMessage::Headers { .. } => "headers",
-            NetworkMessage::GetBlocks { .. }  => "getblocks",
-            NetworkMessage::Block { .. }   => "block",
-            NetworkMessage::Tx { .. }      => "tx",
-            NetworkMessage::Ping { .. }    => "ping",
-            NetworkMessage::Pong { .. }    => "pong",
-            NetworkMessage::Reject { .. }  => "reject",
-            NetworkMessage::MemPool        => "mempool",
+            NetworkMessage::GetBlocks { .. } => "getblocks",
+            NetworkMessage::Block { .. } => "block",
+            NetworkMessage::Tx { .. } => "tx",
+            NetworkMessage::Ping { .. } => "ping",
+            NetworkMessage::Pong { .. } => "pong",
+            NetworkMessage::Reject { .. } => "reject",
+            NetworkMessage::MemPool => "mempool",
         }
     }
 
     pub fn is_data_message(&self) -> bool {
-        matches!(self,
-            NetworkMessage::Block { .. } | NetworkMessage::Tx { .. } |
-            NetworkMessage::Headers { .. }
+        matches!(
+            self,
+            NetworkMessage::Block { .. }
+                | NetworkMessage::Tx { .. }
+                | NetworkMessage::Headers { .. }
         )
     }
 
-    pub fn ping(nonce: u64) -> Self { NetworkMessage::Ping { nonce } }
-    pub fn pong(nonce: u64) -> Self { NetworkMessage::Pong { nonce } }
-    pub fn get_addr()       -> Self { NetworkMessage::GetAddr }
-    pub fn verack()         -> Self { NetworkMessage::VerAck }
-    pub fn mempool()        -> Self { NetworkMessage::MemPool }
+    pub fn ping(nonce: u64) -> Self {
+        NetworkMessage::Ping { nonce }
+    }
+    pub fn pong(nonce: u64) -> Self {
+        NetworkMessage::Pong { nonce }
+    }
+    pub fn get_addr() -> Self {
+        NetworkMessage::GetAddr
+    }
+    pub fn verack() -> Self {
+        NetworkMessage::VerAck
+    }
+    pub fn mempool() -> Self {
+        NetworkMessage::MemPool
+    }
 
     pub fn version(height: u64, agent: &str) -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
         NetworkMessage::Version {
-            version:     PROTOCOL_VERSION,
-            user_agent:  agent.to_string(),
+            version: PROTOCOL_VERSION,
+            user_agent: agent.to_string(),
             best_height: height,
-            timestamp:   SystemTime::now()
-                             .duration_since(UNIX_EPOCH)
-                             .map(|d| d.as_secs())
-                             .unwrap_or(0),
-            services:    1,
-            relay:       true,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            services: 1,
+            relay: true,
         }
     }
 
     pub fn inv_block(hash: &str) -> Self {
         NetworkMessage::Inv {
-            items: vec![InvItem { kind: InvType::Block, hash: hash.to_string() }],
+            items: vec![InvItem {
+                kind: InvType::Block,
+                hash: hash.to_string(),
+            }],
         }
     }
 
     pub fn inv_tx(hash: &str) -> Self {
         NetworkMessage::Inv {
-            items: vec![InvItem { kind: InvType::Transaction, hash: hash.to_string() }],
+            items: vec![InvItem {
+                kind: InvType::Transaction,
+                hash: hash.to_string(),
+            }],
         }
     }
 
@@ -167,13 +213,17 @@ impl NetworkMessage {
             return Err(NetworkError::Serialization("Frame too short".to_string()));
         }
         if data[..4] != NETWORK_MAGIC {
-            return Err(NetworkError::Serialization("Invalid network magic".to_string()));
+            return Err(NetworkError::Serialization(
+                "Invalid network magic".to_string(),
+            ));
         }
         let len = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
         if data.len() < 8 + len {
-            return Err(NetworkError::Serialization(
-                format!("Incomplete frame: need {} got {}", 8 + len, data.len())
-            ));
+            return Err(NetworkError::Serialization(format!(
+                "Incomplete frame: need {} got {}",
+                8 + len,
+                data.len()
+            )));
         }
         Self::deserialize(&data[8..8 + len])
     }
@@ -187,7 +237,7 @@ mod tests {
     fn ping_pong_roundtrip() {
         let ping = NetworkMessage::ping(42);
         let data = ping.to_wire_frame().unwrap();
-        let out  = NetworkMessage::from_wire_frame(&data).unwrap();
+        let out = NetworkMessage::from_wire_frame(&data).unwrap();
         assert_eq!(out.name(), "ping");
     }
 

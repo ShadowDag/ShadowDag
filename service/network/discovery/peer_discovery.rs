@@ -22,7 +22,8 @@ impl PeerDiscovery {
 
     pub fn bootstrap_testnet(&self) {
         use crate::config::network::bootstrap_nodes::BootstrapNodes;
-        self.peer_manager.bootstrap_with_seeds(&BootstrapNodes::testnet());
+        self.peer_manager
+            .bootstrap_with_seeds(&BootstrapNodes::testnet());
     }
 
     pub fn bootstrap_with_seeds(&self, seeds: &[&str]) {
@@ -55,12 +56,14 @@ impl PeerDiscovery {
         if current >= max_active {
             return;
         }
-        let needed     = max_active - current;
+        let needed = max_active - current;
         let candidates = self.peer_manager.get_addr_list_limited(needed * 2);
 
         let mut added = 0usize;
         for addr in candidates {
-            if added >= needed { break; }
+            if added >= needed {
+                break;
+            }
             if !self.peer_manager.peer_exists(&addr) && !self.peer_manager.is_banned(&addr) {
                 let _ = self.peer_manager.add_peer(&addr);
                 added += 1;

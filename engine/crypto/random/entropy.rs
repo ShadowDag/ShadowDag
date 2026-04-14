@@ -3,15 +3,12 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::errors::StorageError;
 use rocksdb::{
-    DB, Options,
-    WriteOptions, ReadOptions,
-    DBPinnableSlice, WriteBatch,
-    SliceTransform,
-    IteratorMode, Direction,
+    DBPinnableSlice, Direction, IteratorMode, Options, ReadOptions, SliceTransform, WriteBatch,
+    WriteOptions, DB,
 };
 use std::path::Path;
-use crate::errors::StorageError;
 
 // ─────────────────────────────────────────
 // PREFIX
@@ -29,7 +26,6 @@ pub struct EntropyStore {
 }
 
 impl EntropyStore {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
@@ -42,16 +38,17 @@ impl EntropyStore {
         opts.increase_parallelism(
             std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4) as i32
+                .unwrap_or(4) as i32,
         );
 
         opts.optimize_level_style_compaction(256 * 1024 * 1024);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| crate::errors::StorageError::OpenFailed {
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| {
+            crate::errors::StorageError::OpenFailed {
                 path: path.to_string(),
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(false);
@@ -93,7 +90,8 @@ impl EntropyStore {
     #[inline(always)]
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
         Self::with_key(key, |k| {
-            self.db.put_opt(k, value, &self.write_opts)
+            self.db
+                .put_opt(k, value, &self.write_opts)
                 .map_err(|e| StorageError::WriteFailed(format!("DB put: {}", e)))
         })
     }
@@ -104,7 +102,8 @@ impl EntropyStore {
     #[inline(always)]
     pub fn get(&self, key: &[u8]) -> Result<Option<DBPinnableSlice<'_>>, StorageError> {
         Self::with_key(key, |k| {
-            self.db.get_pinned_opt(k, &self.read_opts)
+            self.db
+                .get_pinned_opt(k, &self.read_opts)
                 .map_err(|e| StorageError::Other(format!("DB get: {}", e)))
         })
     }
@@ -114,8 +113,7 @@ impl EntropyStore {
     // ─────────────────────────────────────────
     #[inline(always)]
     pub fn get_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        Ok(self.get(key)?
-            .map(|v| v.to_vec()))
+        Ok(self.get(key)?.map(|v| v.to_vec()))
     }
 
     // ─────────────────────────────────────────
@@ -139,7 +137,8 @@ impl EntropyStore {
     #[inline(always)]
     pub fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
         Self::with_key(key, |k| {
-            self.db.delete_opt(k, &self.write_opts)
+            self.db
+                .delete_opt(k, &self.write_opts)
                 .map_err(|e| StorageError::WriteFailed(format!("DB delete: {}", e)))
         })
     }
@@ -162,7 +161,8 @@ impl EntropyStore {
             Self::with_key(key, |k| batch.put(k, *value));
         }
 
-        self.db.write_opt(batch, &self.write_opts)
+        self.db
+            .write_opt(batch, &self.write_opts)
             .map_err(|e| StorageError::WriteFailed(format!("DB batch_put: {}", e)))
     }
 
@@ -176,18 +176,15 @@ impl EntropyStore {
             Self::with_key(key, |k| batch.delete(k));
         }
 
-        self.db.write_opt(batch, &self.write_opts)
+        self.db
+            .write_opt(batch, &self.write_opts)
             .map_err(|e| StorageError::WriteFailed(format!("DB batch_delete: {}", e)))
     }
 
     // ─────────────────────────────────────────
     // MULTI GET
     // ─────────────────────────────────────────
-    pub fn multi_get(
-        &self,
-        keys: &[&[u8]],
-    ) -> Result<Vec<Option<Vec<u8>>>, StorageError> {
-
+    pub fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, StorageError> {
         let mut prefixed = Vec::with_capacity(keys.len());
 
         for k in keys {
@@ -199,7 +196,8 @@ impl EntropyStore {
 
         let results = self.db.multi_get(prefixed);
 
-        Ok(results.into_iter()
+        Ok(results
+            .into_iter()
             .map(|r| r.ok().flatten().map(|v| v.to_vec()))
             .collect())
     }
@@ -268,7 +266,8 @@ impl EntropyStore {
             count += 1;
 
             if count >= DELETE_BATCH_SIZE {
-                self.db.write_opt(batch, &self.write_opts)
+                self.db
+                    .write_opt(batch, &self.write_opts)
                     .map_err(|e| StorageError::WriteFailed(format!("DB clear batch: {}", e)))?;
                 batch = WriteBatch::default();
                 count = 0;
@@ -276,7 +275,8 @@ impl EntropyStore {
         }
 
         if count > 0 {
-            self.db.write_opt(batch, &self.write_opts)
+            self.db
+                .write_opt(batch, &self.write_opts)
                 .map_err(|e| StorageError::WriteFailed(format!("DB final clear: {}", e)))?;
         }
 

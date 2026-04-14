@@ -3,15 +3,13 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use dashmap::DashSet;
 use rocksdb::{
-    DB, Options, IteratorMode, Direction,
-    WriteBatch, WriteOptions, ReadOptions,
-    SliceTransform,
+    Direction, IteratorMode, Options, ReadOptions, SliceTransform, WriteBatch, WriteOptions, DB,
 };
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
-use dashmap::DashSet;
-use std::collections::HashSet;
 
 use crate::errors::{DagError, StorageError};
 use crate::slog_error;
@@ -35,12 +33,12 @@ impl HeaderSync {
         opts.increase_parallelism(4);
         opts.optimize_level_style_compaction(512 * 1024 * 1024);
 
-        opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(
-            HEADER_PREFIX.len(),
-        ));
+        opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(HEADER_PREFIX.len()));
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         let mut write_opts = WriteOptions::default();
         write_opts.disable_wal(false);
@@ -184,14 +182,13 @@ impl HeaderSync {
     pub fn get_headers(&self) -> Vec<String> {
         let mut headers = Vec::with_capacity(1024);
 
-        let iter = self.db.iterator_opt(
-            IteratorMode::From(HEADER_PREFIX, Direction::Forward),
-            {
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(HEADER_PREFIX, Direction::Forward), {
                 let mut opts = ReadOptions::default();
                 opts.set_prefix_same_as_start(true);
                 opts
-            },
-        );
+            });
 
         for item in iter {
             let (key, _) = match item {
@@ -217,14 +214,13 @@ impl HeaderSync {
     // CACHE WARMUP
     // ─────────────────────────────────────────
     pub fn load_cache_from_db(&self, limit: usize) {
-        let iter = self.db.iterator_opt(
-            IteratorMode::From(HEADER_PREFIX, Direction::Forward),
-            {
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(HEADER_PREFIX, Direction::Forward), {
                 let mut opts = ReadOptions::default();
                 opts.set_prefix_same_as_start(true);
                 opts
-            },
-        );
+            });
 
         let mut loaded = 0;
 
@@ -265,11 +261,15 @@ impl HeaderSync {
         // giving a false impression of completion.
         let total = self.header_count();
         HeaderSyncStatus {
-            headers_synced:              total,
-            headers_validated_estimate:  total,
-            bodies_pending_estimate:     0,
-            estimates_only:              true,
-            mode:                        if total > 0 { SyncMode::HeaderFirst } else { SyncMode::Full },
+            headers_synced: total,
+            headers_validated_estimate: total,
+            bodies_pending_estimate: 0,
+            estimates_only: true,
+            mode: if total > 0 {
+                SyncMode::HeaderFirst
+            } else {
+                SyncMode::Full
+            },
         }
     }
 
@@ -299,14 +299,13 @@ impl HeaderSync {
 
     /// Count actual persisted headers in DB, not just cached ones.
     pub fn header_count_from_db(&self) -> usize {
-        let iter = self.db.iterator_opt(
-            IteratorMode::From(HEADER_PREFIX, Direction::Forward),
-            {
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(HEADER_PREFIX, Direction::Forward), {
                 let mut opts = ReadOptions::default();
                 opts.set_prefix_same_as_start(true);
                 opts
-            },
-        );
+            });
 
         let mut count = 0;
         for item in iter {
@@ -332,13 +331,13 @@ impl HeaderSync {
 
 #[derive(Debug, Clone)]
 pub struct HeaderSyncStatus {
-    pub headers_synced:             usize,
+    pub headers_synced: usize,
     pub headers_validated_estimate: usize,
-    pub bodies_pending_estimate:    usize,
+    pub bodies_pending_estimate: usize,
     /// True when real per-header tracking is not yet implemented.
     /// Consumers should treat validated/pending as rough estimates.
-    pub estimates_only:             bool,
-    pub mode:                       SyncMode,
+    pub estimates_only: bool,
+    pub mode: SyncMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

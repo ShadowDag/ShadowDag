@@ -43,11 +43,11 @@ impl HashMix {
 
     /// Mix raw header values (used during mining when we don't have a Block)
     pub fn mix_raw(
-        version:     u32,
-        height:      u64,
-        timestamp:   u64,
-        nonce:       u64,
-        difficulty:  u64,
+        version: u32,
+        height: u64,
+        timestamp: u64,
+        nonce: u64,
+        difficulty: u64,
         merkle_root: &str,
     ) -> String {
         format!(
@@ -61,8 +61,8 @@ impl HashMix {
 mod tests {
     use super::*;
     use crate::domain::block::block::Block;
-    use crate::domain::block::block_header::BlockHeader;
     use crate::domain::block::block_body::BlockBody;
+    use crate::domain::block::block_header::BlockHeader;
 
     fn make_block() -> Block {
         Block {
@@ -82,7 +82,9 @@ mod tests {
                 receipt_root: None,
                 state_root: None,
             },
-            body: BlockBody { transactions: vec![] },
+            body: BlockBody {
+                transactions: vec![],
+            },
         }
     }
 

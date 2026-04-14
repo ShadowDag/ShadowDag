@@ -7,33 +7,42 @@
 // deduplication to prevent redundant network traffic.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options};
+use rocksdb::{Options, DB};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::errors::NetworkError;
 use crate::domain::transaction::transaction::Transaction;
-use crate::{slog_error, slog_warn};
+use crate::errors::NetworkError;
 use crate::service::mempool::core::mempool::Mempool;
-use crate::service::network::p2p::p2p::{P2PMessage, push_outbound};
+use crate::service::network::p2p::p2p::{push_outbound, P2PMessage};
 use crate::service::network::p2p::peer_manager::PeerManager;
+use crate::{slog_error, slog_warn};
 
 pub struct TxRelay {
-    db:           DB,
-    mempool:      Arc<Mempool>,
+    db: DB,
+    mempool: Arc<Mempool>,
     _peer_manager: Arc<PeerManager>,
 }
 
 impl TxRelay {
-    pub fn new(path: &str, mempool: Arc<Mempool>, peer_manager: Arc<PeerManager>) -> Result<Self, NetworkError> {
+    pub fn new(
+        path: &str,
+        mempool: Arc<Mempool>,
+        peer_manager: Arc<PeerManager>,
+    ) -> Result<Self, NetworkError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| NetworkError::Storage(crate::errors::StorageError::OpenFailed {
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| {
+            NetworkError::Storage(crate::errors::StorageError::OpenFailed {
                 path: path.to_string(),
                 reason: e.to_string(),
-            }))?;
-        Ok(Self { db, mempool, _peer_manager: peer_manager })
+            })
+        })?;
+        Ok(Self {
+            db,
+            mempool,
+            _peer_manager: peer_manager,
+        })
     }
 
     /// Broadcast a transaction to all connected peers (with dedup)
@@ -43,7 +52,7 @@ impl TxRelay {
         // Skip if already relayed
         match self.db.get(key.as_bytes()) {
             Ok(Some(_)) => return, // Already relayed
-            Ok(None) => {} // Not yet seen — proceed
+            Ok(None) => {}         // Not yet seen — proceed
             Err(e) => {
                 slog_warn!("relay", "tx_dedup_db_error", hash => &tx.hash, error => &format!("{}", e));
                 // Fail-open: proceed with relay on DB error (better than dropping valid TXs)
@@ -68,7 +77,10 @@ impl TxRelay {
             slog_error!("relay", "tx_relay_db_put_error", error => e);
         }
 
-        log::debug!("[TxRelay] Queued tx {} for broadcast", &tx.hash[..tx.hash.len().min(8)]);
+        log::debug!(
+            "[TxRelay] Queued tx {} for broadcast",
+            &tx.hash[..tx.hash.len().min(8)]
+        );
     }
 
     /// Receive a transaction from a peer — validate BEFORE relay.
@@ -80,7 +92,7 @@ impl TxRelay {
         // Skip if already seen
         match self.db.get(key.as_bytes()) {
             Ok(Some(_)) => return, // Already relayed
-            Ok(None) => {} // Not yet seen — proceed
+            Ok(None) => {}         // Not yet seen — proceed
             Err(e) => {
                 slog_warn!("relay", "tx_dedup_db_error", hash => &tx.hash, error => &format!("{}", e));
                 // Fail-open: proceed with relay on DB error (better than dropping valid TXs)

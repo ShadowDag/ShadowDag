@@ -69,10 +69,10 @@ pub const EMA_LONG_ALPHA_DEN: u64 = 50;
 
 /// Blending weights: T_avg = short*70% + long*30% (scaled to 100)
 pub const BLEND_SHORT_WEIGHT: u64 = 70;
-pub const BLEND_LONG_WEIGHT:  u64 = 30;
+pub const BLEND_LONG_WEIGHT: u64 = 30;
 
 /// Maximum adjustment factor (4x up or 4x down)
-pub const MAX_ADJUST_UP:   u64 = 4;
+pub const MAX_ADJUST_UP: u64 = 4;
 pub const MAX_ADJUST_DOWN: u64 = 4;
 
 /// Anti-spike: ignore block times below target/10
@@ -103,8 +103,8 @@ const SCALE: u128 = 1_000_000;
 
 #[derive(Debug, Clone)]
 pub struct BlockTimeRecord {
-    pub height:     u64,
-    pub timestamp:  u64, // milliseconds
+    pub height: u64,
+    pub timestamp: u64, // milliseconds
     pub difficulty: u64,
 }
 
@@ -117,7 +117,7 @@ struct DualEma {
     /// Short EMA value (scaled by SCALE)
     short: u128,
     /// Long EMA value (scaled by SCALE)
-    long:  u128,
+    long: u128,
     /// Whether initialized
     initialized: bool,
 }
@@ -126,7 +126,7 @@ impl DualEma {
     fn new() -> Self {
         Self {
             short: TARGET_BLOCK_TIME_MS as u128 * SCALE,
-            long:  TARGET_BLOCK_TIME_MS as u128 * SCALE,
+            long: TARGET_BLOCK_TIME_MS as u128 * SCALE,
             initialized: false,
         }
     }
@@ -148,32 +148,39 @@ impl DualEma {
         // EMA_new = EMA_old + (1/10) * (t - EMA_old)
         //         = EMA_old + (t - EMA_old) / 10
         if t >= self.short {
-            self.short = self.short + (t - self.short) * EMA_SHORT_ALPHA_NUM as u128 / EMA_SHORT_ALPHA_DEN as u128;
+            self.short = self.short
+                + (t - self.short) * EMA_SHORT_ALPHA_NUM as u128 / EMA_SHORT_ALPHA_DEN as u128;
         } else {
-            self.short = self.short - (self.short - t) * EMA_SHORT_ALPHA_NUM as u128 / EMA_SHORT_ALPHA_DEN as u128;
+            self.short = self.short
+                - (self.short - t) * EMA_SHORT_ALPHA_NUM as u128 / EMA_SHORT_ALPHA_DEN as u128;
         }
 
         // Long EMA: α = 1/50
         if t >= self.long {
-            self.long = self.long + (t - self.long) * EMA_LONG_ALPHA_NUM as u128 / EMA_LONG_ALPHA_DEN as u128;
+            self.long = self.long
+                + (t - self.long) * EMA_LONG_ALPHA_NUM as u128 / EMA_LONG_ALPHA_DEN as u128;
         } else {
-            self.long = self.long - (self.long - t) * EMA_LONG_ALPHA_NUM as u128 / EMA_LONG_ALPHA_DEN as u128;
+            self.long = self.long
+                - (self.long - t) * EMA_LONG_ALPHA_NUM as u128 / EMA_LONG_ALPHA_DEN as u128;
         }
     }
 
     /// Get blended T_avg = short*70% + long*30% (in milliseconds)
     fn blended_ms(&self) -> u64 {
-        let blended = (self.short * BLEND_SHORT_WEIGHT as u128
-                     + self.long * BLEND_LONG_WEIGHT as u128)
-                     / 100;
+        let blended =
+            (self.short * BLEND_SHORT_WEIGHT as u128 + self.long * BLEND_LONG_WEIGHT as u128) / 100;
         (blended / SCALE).max(1) as u64
     }
 
     /// Get short EMA in milliseconds
-    fn short_ms(&self) -> u64 { (self.short / SCALE).max(1) as u64 }
+    fn short_ms(&self) -> u64 {
+        (self.short / SCALE).max(1) as u64
+    }
 
     /// Get long EMA in milliseconds
-    fn long_ms(&self) -> u64 { (self.long / SCALE).max(1) as u64 }
+    fn long_ms(&self) -> u64 {
+        (self.long / SCALE).max(1) as u64
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -184,32 +191,32 @@ pub struct DifficultyEngine {
     /// Short window (recent blocks for reactivity)
     short_window: VecDeque<BlockTimeRecord>,
     /// Long window (historical blocks for stability)
-    long_window:  VecDeque<BlockTimeRecord>,
+    long_window: VecDeque<BlockTimeRecord>,
     /// Dual EMA tracker
-    ema:          DualEma,
+    ema: DualEma,
     /// Last accepted timestamp (for validation)
-    last_ts:      u64,
+    last_ts: u64,
     /// Current difficulty
     pub current_difficulty: u64,
     /// Statistics
-    pub blocks_processed:   u64,
-    pub adjustments_made:   u64,
-    pub cliff_detections:   u64,
-    pub spikes_filtered:    u64,
+    pub blocks_processed: u64,
+    pub adjustments_made: u64,
+    pub cliff_detections: u64,
+    pub spikes_filtered: u64,
 }
 
 impl DifficultyEngine {
     pub fn new(initial_difficulty: u64) -> Self {
         Self {
-            short_window:       VecDeque::with_capacity(SHORT_WINDOW + 1),
-            long_window:        VecDeque::with_capacity(LONG_WINDOW + 1),
-            ema:                DualEma::new(),
-            last_ts:            0,
+            short_window: VecDeque::with_capacity(SHORT_WINDOW + 1),
+            long_window: VecDeque::with_capacity(LONG_WINDOW + 1),
+            ema: DualEma::new(),
+            last_ts: 0,
             current_difficulty: clamp(initial_difficulty),
-            blocks_processed:   0,
-            adjustments_made:   0,
-            cliff_detections:   0,
-            spikes_filtered:    0,
+            blocks_processed: 0,
+            adjustments_made: 0,
+            cliff_detections: 0,
+            spikes_filtered: 0,
         }
     }
 
@@ -345,7 +352,9 @@ impl DifficultyEngine {
     ///   4. Forward jump from last_ts clamped (prevents window inflation)
     fn validate_timestamp(&self, timestamp: u64) -> bool {
         // Don't reject if this is the first block
-        if self.last_ts == 0 { return true; }
+        if self.last_ts == 0 {
+            return true;
+        }
 
         let wall_clock = now_ms();
 
@@ -390,7 +399,9 @@ impl DifficultyEngine {
     /// For DAG: compute median timestamp from multiple parent blocks
     /// This prevents any single miner from manipulating timestamps
     pub fn median_timestamp(timestamps: &mut [u64]) -> u64 {
-        if timestamps.is_empty() { return 0; }
+        if timestamps.is_empty() {
+            return 0;
+        }
         timestamps.sort_unstable();
         let mid = timestamps.len() / 2;
         if timestamps.len().is_multiple_of(2) {
@@ -404,12 +415,24 @@ impl DifficultyEngine {
     // QUERIES
     // ─────────────────────────────────────────────────────────────
 
-    pub fn difficulty(&self) -> u64 { self.current_difficulty }
-    pub fn ema_short_ms(&self) -> u64 { self.ema.short_ms() }
-    pub fn ema_long_ms(&self) -> u64 { self.ema.long_ms() }
-    pub fn ema_blended_ms(&self) -> u64 { self.ema.blended_ms() }
-    pub fn short_window_size(&self) -> usize { self.short_window.len() }
-    pub fn long_window_size(&self) -> usize { self.long_window.len() }
+    pub fn difficulty(&self) -> u64 {
+        self.current_difficulty
+    }
+    pub fn ema_short_ms(&self) -> u64 {
+        self.ema.short_ms()
+    }
+    pub fn ema_long_ms(&self) -> u64 {
+        self.ema.long_ms()
+    }
+    pub fn ema_blended_ms(&self) -> u64 {
+        self.ema.blended_ms()
+    }
+    pub fn short_window_size(&self) -> usize {
+        self.short_window.len()
+    }
+    pub fn long_window_size(&self) -> usize {
+        self.long_window.len()
+    }
 
     /// Human-readable status
     pub fn status(&self) -> String {
@@ -441,7 +464,9 @@ impl DifficultyEngine {
     }
 
     pub fn record_block_time(&mut self, timestamp: u64) -> bool {
-        if !self.validate_timestamp(timestamp) { return false; }
+        if !self.validate_timestamp(timestamp) {
+            return false;
+        }
         let block_time = if self.last_ts > 0 {
             timestamp.saturating_sub(self.last_ts)
         } else {
@@ -480,7 +505,11 @@ mod tests {
     use super::*;
 
     fn make_record(height: u64, timestamp: u64, difficulty: u64) -> BlockTimeRecord {
-        BlockTimeRecord { height, timestamp, difficulty }
+        BlockTimeRecord {
+            height,
+            timestamp,
+            difficulty,
+        }
     }
 
     /// Base timestamp for tests — uses wall clock so anti-timewarp rules pass.
@@ -516,8 +545,11 @@ mod tests {
         }
         // EMA should be close to 1000ms
         let blended = engine.ema_blended_ms();
-        assert!((800..=1200).contains(&blended),
-            "Blended EMA {} should be near 1000ms", blended);
+        assert!(
+            (800..=1200).contains(&blended),
+            "Blended EMA {} should be near 1000ms",
+            blended
+        );
     }
 
     #[test]
@@ -529,8 +561,11 @@ mod tests {
             ts += 500;
             engine.on_new_block(make_record(i, ts, engine.difficulty()));
         }
-        assert!(engine.difficulty() > 1000,
-            "Difficulty {} should increase when blocks are fast", engine.difficulty());
+        assert!(
+            engine.difficulty() > 1000,
+            "Difficulty {} should increase when blocks are fast",
+            engine.difficulty()
+        );
     }
 
     #[test]
@@ -542,8 +577,11 @@ mod tests {
             ts += 3000;
             engine.on_new_block(make_record(i, ts, engine.difficulty()));
         }
-        assert!(engine.difficulty() < 1000,
-            "Difficulty {} should decrease when blocks are slow", engine.difficulty());
+        assert!(
+            engine.difficulty() < 1000,
+            "Difficulty {} should decrease when blocks are slow",
+            engine.difficulty()
+        );
     }
 
     // ── Anti-Spike Tests ────────────────────────────────────────
@@ -552,8 +590,10 @@ mod tests {
     fn spike_filtered() {
         let mut engine = DifficultyEngine::new(1000);
         let filtered = engine.filter_block_time(10); // 10ms = absurdly fast
-        assert!(filtered >= TARGET_BLOCK_TIME_MS / SPIKE_THRESHOLD_DIV,
-            "Spike should be filtered to minimum");
+        assert!(
+            filtered >= TARGET_BLOCK_TIME_MS / SPIKE_THRESHOLD_DIV,
+            "Spike should be filtered to minimum"
+        );
         assert_eq!(engine.spikes_filtered, 1);
     }
 
@@ -561,8 +601,10 @@ mod tests {
     fn max_spacing_capped() {
         let mut engine = DifficultyEngine::new(1000);
         let filtered = engine.filter_block_time(999_999); // absurdly slow
-        assert!(filtered <= TARGET_BLOCK_TIME_MS * MAX_BLOCK_SPACING_MUL,
-            "Max spacing should be capped");
+        assert!(
+            filtered <= TARGET_BLOCK_TIME_MS * MAX_BLOCK_SPACING_MUL,
+            "Max spacing should be capped"
+        );
     }
 
     #[test]
@@ -608,8 +650,12 @@ mod tests {
         let old = engine.difficulty();
         engine.on_new_block(make_record(1, ts, old));
         // Difficulty should increase but not more than 4x
-        assert!(engine.difficulty() <= old * MAX_ADJUST_UP,
-            "Difficulty {} should be <= {} (4x old)", engine.difficulty(), old * MAX_ADJUST_UP);
+        assert!(
+            engine.difficulty() <= old * MAX_ADJUST_UP,
+            "Difficulty {} should be <= {} (4x old)",
+            engine.difficulty(),
+            old * MAX_ADJUST_UP
+        );
     }
 
     // ── Cliff Detection Tests ───────────────────────────────────
@@ -629,8 +675,10 @@ mod tests {
             engine.on_new_block(make_record(i, ts, engine.difficulty()));
         }
 
-        assert!(engine.cliff_detections > 0 || engine.difficulty() < 1000,
-            "Should detect cliff or reduce difficulty");
+        assert!(
+            engine.cliff_detections > 0 || engine.difficulty() < 1000,
+            "Should detect cliff or reduce difficulty"
+        );
     }
 
     // ── DAG Median Timestamp ────────────────────────────────────
@@ -684,10 +732,18 @@ mod tests {
         }
 
         let final_diff = engine.difficulty();
-        let ratio = if final_diff > initial { final_diff * 100 / initial } else { initial * 100 / final_diff };
-        assert!(ratio < 120, // Within 20% of initial
+        let ratio = if final_diff > initial {
+            final_diff * 100 / initial
+        } else {
+            initial * 100 / final_diff
+        };
+        assert!(
+            ratio < 120, // Within 20% of initial
             "Difficulty should be stable at target rate: initial={} final={} ratio={}%",
-            initial, final_diff, ratio);
+            initial,
+            final_diff,
+            ratio
+        );
     }
 
     #[test]
@@ -708,9 +764,12 @@ mod tests {
         }
 
         // Short EMA should react more than long EMA
-        assert!(engine.ema_short_ms() < engine.ema_long_ms(),
+        assert!(
+            engine.ema_short_ms() < engine.ema_long_ms(),
             "Short EMA ({}) should react faster than long EMA ({})",
-            engine.ema_short_ms(), engine.ema_long_ms());
+            engine.ema_short_ms(),
+            engine.ema_long_ms()
+        );
     }
 
     // ── Status ──────────────────────────────────────────────────

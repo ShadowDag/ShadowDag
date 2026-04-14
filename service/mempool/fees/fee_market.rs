@@ -3,12 +3,12 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::service::mempool::core::mempool::Mempool;
 use crate::config::consensus::consensus_params::ConsensusParams;
+use crate::service::mempool::core::mempool::Mempool;
 
 /// EIP-1559 style base fee parameters
 const BASE_FEE_MAX_CHANGE_DENOMINATOR: u64 = 8; // Max 12.5% change per block
-const ELASTICITY_MULTIPLIER: u64 = 2;           // Target = max_gas / 2
+const ELASTICITY_MULTIPLIER: u64 = 2; // Target = max_gas / 2
 const MIN_BASE_FEE: u64 = 1;
 
 pub struct FeeMarket;
@@ -16,8 +16,8 @@ pub struct FeeMarket;
 impl FeeMarket {
     /// Suggest a fee based on current mempool congestion (simple mode)
     pub fn suggested_fee(mempool: &Mempool) -> u64 {
-        let count   = mempool.count();
-        let max     = ConsensusParams::MAX_MEMPOOL_SIZE;
+        let count = mempool.count();
+        let max = ConsensusParams::MAX_MEMPOOL_SIZE;
         let min_fee = ConsensusParams::MIN_FEE;
         let congestion = (count * 100) / max.max(1);
 
@@ -49,16 +49,14 @@ impl FeeMarket {
         if parent_gas_used > target_gas {
             // Block was more than 50% full → increase base fee
             let gas_delta = parent_gas_used - target_gas;
-            let fee_delta = parent_base_fee
-                .saturating_mul(gas_delta)
+            let fee_delta = parent_base_fee.saturating_mul(gas_delta)
                 / target_gas.max(1)
                 / BASE_FEE_MAX_CHANGE_DENOMINATOR;
             parent_base_fee.saturating_add(fee_delta.max(1))
         } else {
             // Block was less than 50% full → decrease base fee
             let gas_delta = target_gas - parent_gas_used;
-            let fee_delta = parent_base_fee
-                .saturating_mul(gas_delta)
+            let fee_delta = parent_base_fee.saturating_mul(gas_delta)
                 / target_gas.max(1)
                 / BASE_FEE_MAX_CHANGE_DENOMINATOR;
             parent_base_fee.saturating_sub(fee_delta).max(MIN_BASE_FEE)
@@ -77,9 +75,9 @@ impl FeeMarket {
         let congestion = Self::congestion_ratio(mempool);
         let base = ConsensusParams::MIN_FEE;
         FeeEstimate {
-            low:      base,
-            medium:   base.saturating_mul(2 + congestion as u64),
-            high:     base.saturating_mul(5 + congestion as u64 * 2),
+            low: base,
+            medium: base.saturating_mul(2 + congestion as u64),
+            high: base.saturating_mul(5 + congestion as u64 * 2),
             base_fee: base,
             congestion_pct: congestion,
         }
@@ -108,10 +106,10 @@ impl FeeMarket {
 /// Fee estimation result with multiple priority levels
 #[derive(Debug, Clone)]
 pub struct FeeEstimate {
-    pub low:            u64,
-    pub medium:         u64,
-    pub high:           u64,
-    pub base_fee:       u64,
+    pub low: u64,
+    pub medium: u64,
+    pub high: u64,
+    pub base_fee: u64,
     pub congestion_pct: u32,
 }
 

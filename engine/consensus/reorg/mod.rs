@@ -33,18 +33,18 @@ pub const FINALITY_DEPTH: u64 = 200;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReorgEvent {
-    pub old_tip:         String,
-    pub new_tip:         String,
+    pub old_tip: String,
+    pub new_tip: String,
     pub common_ancestor: String,
-    pub depth:           u64,
-    pub blocks_removed:  Vec<String>,
-    pub blocks_added:    Vec<String>,
+    pub depth: u64,
+    pub blocks_removed: Vec<String>,
+    pub blocks_added: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReorgResult {
     NoReorg,
-    Extended(ReorgEvent),  // Chain grew without fork (depth=0, no blocks removed)
+    Extended(ReorgEvent), // Chain grew without fork (depth=0, no blocks removed)
     Reorged(ReorgEvent),
     TooDeep { depth: u64 },
 }
@@ -83,7 +83,8 @@ pub struct CumulativeWork {
 impl CumulativeWork {
     pub fn from_difficulties(difficulties: &[u64]) -> Self {
         Self {
-            total_difficulty: difficulties.iter()
+            total_difficulty: difficulties
+                .iter()
                 .try_fold(0u64, |acc, &d| acc.checked_add(d))
                 .unwrap_or(u64::MAX),
             block_count: difficulties.len() as u64,
@@ -96,9 +97,9 @@ impl CumulativeWork {
 }
 
 pub struct ReorgManager {
-    pub max_depth:   u64,
+    pub max_depth: u64,
     pub reorg_count: u64,
-    pub last_reorg:  Option<ReorgEvent>,
+    pub last_reorg: Option<ReorgEvent>,
 }
 
 impl Default for ReorgManager {
@@ -110,18 +111,13 @@ impl Default for ReorgManager {
 impl ReorgManager {
     pub fn new() -> Self {
         Self {
-            max_depth:   MAX_REORG_DEPTH,
+            max_depth: MAX_REORG_DEPTH,
             reorg_count: 0,
-            last_reorg:  None,
+            last_reorg: None,
         }
     }
 
-    pub fn detect(
-        &mut self,
-        old_chain: &[String],
-        new_chain: &[String],
-    ) -> ReorgResult {
-
+    pub fn detect(&mut self, old_chain: &[String], new_chain: &[String]) -> ReorgResult {
         if old_chain.is_empty() || new_chain.is_empty() {
             return ReorgResult::NoReorg;
         }
@@ -140,18 +136,22 @@ impl ReorgManager {
         // 2. Fast path (extension — chain grew, no fork)
         if j > i && new_chain[..i] == *old_chain {
             return ReorgResult::Extended(ReorgEvent {
-                old_tip:         old_tip.clone(),
-                new_tip:         new_tip.clone(),
+                old_tip: old_tip.clone(),
+                new_tip: new_tip.clone(),
                 common_ancestor: old_tip.clone(),
-                depth:           0,
-                blocks_removed:  Vec::new(),
-                blocks_added:    new_chain[i..].to_vec(),
+                depth: 0,
+                blocks_removed: Vec::new(),
+                blocks_added: new_chain[i..].to_vec(),
             });
         }
 
         // 3. Align heights
-        while i > j { i -= 1; }
-        while j > i { j -= 1; }
+        while i > j {
+            i -= 1;
+        }
+        while j > i {
+            j -= 1;
+        }
 
         // 4. Walk + early depth stop
         let mut depth = 0;
@@ -182,7 +182,7 @@ impl ReorgManager {
         let common_ancestor = &old_chain[ancestor_idx_old];
 
         let removed_slice = &old_chain[ancestor_idx_old + 1..];
-        let added_slice   = &new_chain[ancestor_idx_new + 1..];
+        let added_slice = &new_chain[ancestor_idx_new + 1..];
 
         let depth = removed_slice.len() as u64;
 
@@ -191,12 +191,12 @@ impl ReorgManager {
         }
 
         let event = ReorgEvent {
-            old_tip:         old_tip.clone(),
-            new_tip:         new_tip.clone(),
+            old_tip: old_tip.clone(),
+            new_tip: new_tip.clone(),
             common_ancestor: common_ancestor.clone(),
             depth,
-            blocks_removed:  removed_slice.to_vec(),
-            blocks_added:    added_slice.to_vec(),
+            blocks_removed: removed_slice.to_vec(),
+            blocks_added: added_slice.to_vec(),
         };
 
         self.reorg_count += 1;
@@ -252,9 +252,7 @@ impl ReorgManager {
         //    it is safe and deterministic because all block hashes use the
         //    same lowercase hex encoding, so lexicographic order on strings
         //    is consistent across all nodes.
-        if new_work.total_difficulty == old_work.total_difficulty
-            && new_tip_hash >= old_tip_hash
-        {
+        if new_work.total_difficulty == old_work.total_difficulty && new_tip_hash >= old_tip_hash {
             return Err(ReorgRejection::InsufficientWork {
                 old: old_work.total_difficulty,
                 new: new_work.total_difficulty,
@@ -298,19 +296,19 @@ impl ReorgManager {
                 // 0 cumulative work, letting any reorg pass unchecked.
                 if old_difficulties.len() != old_chain.len() {
                     return Err(ReorgRejection::DepthExceeded {
-                        depth: depth,
+                        depth,
                         max: self.max_depth,
                     });
                 }
                 if new_difficulties.len() != new_chain.len() {
                     return Err(ReorgRejection::DepthExceeded {
-                        depth: depth,
+                        depth,
                         max: self.max_depth,
                     });
                 }
                 if old_difficulties.is_empty() && !event.blocks_removed.is_empty() {
                     return Err(ReorgRejection::DepthExceeded {
-                        depth: depth,
+                        depth,
                         max: self.max_depth,
                     });
                 }
@@ -347,7 +345,9 @@ impl ReorgManager {
 
                 Ok(result)
             }
-            ReorgResult::TooDeep { depth: actual_depth } => {
+            ReorgResult::TooDeep {
+                depth: actual_depth,
+            } => {
                 // Already rejected by depth — surface as our typed error
                 // with the real depth that was detected
                 Err(ReorgRejection::DepthExceeded {
@@ -362,7 +362,7 @@ impl ReorgManager {
     pub fn apply_plan(event: &ReorgEvent) -> ReorgPlan {
         ReorgPlan {
             rollback: event.blocks_removed.iter().rev().cloned().collect(),
-            apply:    event.blocks_added.clone(),
+            apply: event.blocks_added.clone(),
         }
     }
 
@@ -380,7 +380,7 @@ impl ReorgManager {
 #[derive(Debug, Clone)]
 pub struct ReorgPlan {
     pub rollback: Vec<String>,
-    pub apply:    Vec<String>,
+    pub apply: Vec<String>,
 }
 
 #[cfg(test)]
@@ -410,7 +410,7 @@ mod tests {
                 assert_eq!(e.common_ancestor, "b1");
                 assert_eq!(e.depth, 1);
                 assert_eq!(e.blocks_removed, vec!["b2_old"]);
-                assert_eq!(e.blocks_added,   vec!["b2_new"]);
+                assert_eq!(e.blocks_added, vec!["b2_new"]);
             }
             _ => panic!("expected reorg"),
         }
@@ -426,36 +426,46 @@ mod tests {
         let mut new_chain = vec!["old_0".to_string()];
         new_chain.extend((0..8).map(|i| format!("new_{}", i)));
 
-        assert!(matches!(mgr.detect(&old, &new_chain), ReorgResult::TooDeep { .. }));
+        assert!(matches!(
+            mgr.detect(&old, &new_chain),
+            ReorgResult::TooDeep { .. }
+        ));
     }
 
     #[test]
     fn apply_plan_reverses_rollback() {
         let event = ReorgEvent {
-            old_tip:         "b2".into(),
-            new_tip:         "b2n".into(),
+            old_tip: "b2".into(),
+            new_tip: "b2n".into(),
             common_ancestor: "b1".into(),
-            depth:           1,
-            blocks_removed:  vec!["b2".into()],
-            blocks_added:    vec!["b2n".into()],
+            depth: 1,
+            blocks_removed: vec!["b2".into()],
+            blocks_added: vec!["b2n".into()],
         };
 
         let plan = ReorgManager::apply_plan(&event);
 
         assert_eq!(plan.rollback, vec!["b2"]);
-        assert_eq!(plan.apply,    vec!["b2n"]);
+        assert_eq!(plan.apply, vec!["b2n"]);
     }
 
     #[test]
     fn finality_depth_equals_max_reorg() {
         // FINALITY_DEPTH and MAX_REORG_DEPTH (in FullNode) should be consistent.
         // FINALITY_DEPTH defines when blocks become irreversible.
-        assert!(FINALITY_DEPTH <= MAX_REORG_DEPTH,
+        let finality_depth = std::hint::black_box(FINALITY_DEPTH);
+        let max_reorg_depth = std::hint::black_box(MAX_REORG_DEPTH);
+        assert!(
+            finality_depth <= max_reorg_depth,
             "FINALITY_DEPTH ({}) must not exceed MAX_REORG_DEPTH ({})",
-            FINALITY_DEPTH, MAX_REORG_DEPTH);
-        assert!(FINALITY_DEPTH >= 100,
+            FINALITY_DEPTH,
+            MAX_REORG_DEPTH
+        );
+        assert!(
+            finality_depth >= 100,
             "FINALITY_DEPTH ({}) too low — minimum 100 for DAG safety",
-            FINALITY_DEPTH);
+            FINALITY_DEPTH
+        );
     }
 
     #[test]
@@ -514,7 +524,10 @@ mod tests {
         let new_diff = vec![1, 1, 100]; // equal work
 
         let result = mgr.detect_with_work(&old, &new, &old_diff, &new_diff);
-        assert!(result.is_ok(), "lower-hash new tip should win the tiebreaker");
+        assert!(
+            result.is_ok(),
+            "lower-hash new tip should win the tiebreaker"
+        );
         match result.unwrap() {
             ReorgResult::Reorged(e) => {
                 assert_eq!(e.new_tip, "aaa_new");
@@ -535,7 +548,10 @@ mod tests {
         let new_diff = vec![1, 1, 100]; // equal work
 
         let result = mgr.detect_with_work(&old, &new, &old_diff, &new_diff);
-        assert!(result.is_err(), "higher-hash new tip should lose the tiebreaker");
+        assert!(
+            result.is_err(),
+            "higher-hash new tip should lose the tiebreaker"
+        );
         match result.unwrap_err() {
             ReorgRejection::InsufficientWork { .. } => {} // expected
             other => panic!("expected InsufficientWork, got {:?}", other),

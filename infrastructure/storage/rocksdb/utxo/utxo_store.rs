@@ -3,7 +3,7 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, IteratorMode, Options, WriteBatch};
+use rocksdb::{IteratorMode, Options, WriteBatch, DB};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -13,7 +13,7 @@ use crate::domain::utxo::utxo_key::UtxoKey;
 use crate::domain::utxo::utxo_set::utxo_key;
 use crate::errors::StorageError;
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
-use crate::{slog_info, slog_warn, slog_error};
+use crate::{slog_error, slog_info, slog_warn};
 
 #[derive(Clone)]
 pub struct UtxoStore {
@@ -36,11 +36,10 @@ impl UtxoStore {
     }
 
     pub fn add_utxo(&self, key: &UtxoKey, utxo: &Utxo) -> Result<(), StorageError> {
-        let data = bincode::serialize(utxo)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let data =
+            bincode::serialize(utxo).map_err(|e| StorageError::Serialization(e.to_string()))?;
 
-        self.db
-            .put(key.as_bytes(), &data)?;
+        self.db.put(key.as_bytes(), &data)?;
 
         let mut addr_key = Vec::with_capacity(5 + utxo.address.len() + 1 + 36);
         addr_key.extend_from_slice(b"addr:");
@@ -48,16 +47,13 @@ impl UtxoStore {
         addr_key.extend_from_slice(b":");
         addr_key.extend_from_slice(key.as_bytes());
 
-        self.db
-            .put(&addr_key, key.as_bytes())?;
+        self.db.put(&addr_key, key.as_bytes())?;
 
         Ok(())
     }
 
     pub fn get_utxo(&self, key: &UtxoKey) -> Result<Option<Utxo>, StorageError> {
-        let value = self
-            .db
-            .get(key.as_bytes())?;
+        let value = self.db.get(key.as_bytes())?;
 
         match value {
             Some(bytes) => {
@@ -76,18 +72,20 @@ impl UtxoStore {
     /// process blocks sequentially, so concurrent calls to spend_utxo
     /// with the same key cannot interleave between get and put.
     pub fn spend_utxo(&self, key: &UtxoKey) -> Result<(), StorageError> {
-        let raw = self.db.get(key.as_bytes())?
+        let raw = self
+            .db
+            .get(key.as_bytes())?
             .ok_or_else(|| StorageError::KeyNotFound(key.to_string()))?;
-        let mut utxo: Utxo = bincode::deserialize(&raw)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let mut utxo: Utxo =
+            bincode::deserialize(&raw).map_err(|e| StorageError::Serialization(e.to_string()))?;
 
         if utxo.spent {
             return Err(StorageError::WriteFailed("utxo already spent".to_string()));
         }
 
         utxo.spent = true;
-        let data = bincode::serialize(&utxo)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let data =
+            bincode::serialize(&utxo).map_err(|e| StorageError::Serialization(e.to_string()))?;
         let mut batch = WriteBatch::default();
         batch.put(key.as_bytes(), &data);
 
@@ -104,10 +102,7 @@ impl UtxoStore {
     }
 
     pub fn exists(&self, key: &UtxoKey) -> Result<bool, StorageError> {
-        Ok(self
-            .db
-            .get(key.as_bytes())?
-            .is_some())
+        Ok(self.db.get(key.as_bytes())?.is_some())
     }
 
     pub fn get_balance(&self, address: &str) -> Result<u64, StorageError> {
@@ -144,13 +139,18 @@ impl UtxoStore {
 
             // Detect duplicate inputs within the same transaction
             if !spent_in_tx.insert(key.as_bytes().to_vec()) {
-                return Err(StorageError::WriteFailed("duplicate input in transaction".to_string()));
+                return Err(StorageError::WriteFailed(
+                    "duplicate input in transaction".to_string(),
+                ));
             }
-            let mut utxo = self.get_utxo(&key)?
+            let mut utxo = self
+                .get_utxo(&key)?
                 .ok_or_else(|| StorageError::KeyNotFound(format!("input utxo {}", key)))?;
 
             if utxo.spent {
-                return Err(StorageError::WriteFailed("double spend detected".to_string()));
+                return Err(StorageError::WriteFailed(
+                    "double spend detected".to_string(),
+                ));
             }
 
             utxo.spent = true;
@@ -364,12 +364,14 @@ impl UtxoStore {
     }
 
     pub fn unspend_utxo(&self, key: &UtxoKey) -> Result<(), StorageError> {
-        let mut utxo = self.get_utxo(key)?
+        let mut utxo = self
+            .get_utxo(key)?
             .ok_or_else(|| StorageError::KeyNotFound(key.to_string()))?;
         if utxo.amount == 0 {
-            return Err(StorageError::WriteFailed(
-                format!("refusing to restore zero-amount UTXO {}", key),
-            ));
+            return Err(StorageError::WriteFailed(format!(
+                "refusing to restore zero-amount UTXO {}",
+                key
+            )));
         }
         utxo.spent = false;
         self.add_utxo(key, &utxo)
@@ -425,7 +427,10 @@ impl crate::domain::traits::utxo_backend::UtxoBackend for UtxoStore {
         self.db.delete(key).map_err(StorageError::from)
     }
 
-    fn write_batch(&self, ops: Vec<crate::domain::traits::utxo_backend::BatchWrite>) -> Result<(), StorageError> {
+    fn write_batch(
+        &self,
+        ops: Vec<crate::domain::traits::utxo_backend::BatchWrite>,
+    ) -> Result<(), StorageError> {
         use crate::domain::traits::utxo_backend::BatchWrite;
         let mut batch = WriteBatch::default();
         for op in ops {

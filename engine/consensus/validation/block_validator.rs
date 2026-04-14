@@ -3,26 +3,29 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::collections::HashSet as FxHashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config::consensus::consensus_params::ConsensusParams;
+use crate::config::genesis::genesis::{
+    compute_merkle_root, genesis_hash_for, REGTEST_DEV_ADDRESS, TESTNET_DEV_ADDRESS,
+};
+use crate::config::node::node_config::NetworkMode;
 use crate::domain::block::block::Block;
+use crate::domain::block::merkle_tree::MerkleTree;
 use crate::domain::transaction::transaction::{Transaction, TxType};
 use crate::domain::transaction::tx_validator::TxValidator;
-use crate::domain::utxo::utxo_set::{UtxoSet, utxo_key};
 #[cfg(test)]
 use crate::domain::utxo::utxo_key::UtxoKey;
-use crate::engine::mining::pow::pow_validator::PowValidator;
-use crate::engine::dag::security::dos_protection::MAX_DAG_PARENTS;
-use crate::engine::dag::security::dag_shield::DagShield;
-use crate::config::genesis::genesis::genesis_hash_for;
-use crate::config::node::node_config::NetworkMode;
+use crate::domain::utxo::utxo_set::{utxo_key, UtxoSet};
 use crate::engine::consensus::chain_manager::ChainManager;
-use crate::domain::block::merkle_tree::MerkleTree;
-use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
 use crate::engine::dag::core::dag_manager::DagManager;
+use crate::engine::dag::security::dag_shield::DagShield;
+use crate::engine::dag::security::dos_protection::MAX_DAG_PARENTS;
+use crate::engine::mining::pow::pow_validator::PowValidator;
 use crate::engine::privacy::ringct::ring_validator::RingValidator;
 use crate::errors::ConsensusError;
+use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
 
 // ─────────────────────────────────────────
 
@@ -67,26 +70,39 @@ pub struct UtxoChangeKey {
 // ─────────────────────────────────────────
 
 pub struct BlockValidationResult {
-    pub valid:   bool,
-    pub reason:  Option<String>,
+    pub valid: bool,
+    pub reason: Option<String>,
     pub changes: Vec<UtxoChange>,
 }
 
 pub enum UtxoChange {
-    Spend  { key: UtxoChangeKey },
-    Create { key: UtxoChangeKey, address: String, amount: u64 },
+    Spend {
+        key: UtxoChangeKey,
+    },
+    Create {
+        key: UtxoChangeKey,
+        address: String,
+        amount: u64,
+    },
 }
 
 impl BlockValidationResult {
-
     pub fn ok(changes: Vec<UtxoChange>) -> Self {
-        Self { valid: true, reason: None, changes }
+        Self {
+            valid: true,
+            reason: None,
+            changes,
+        }
     }
 
     /// Structural validation passed — UTXO changes computed separately
     /// by UtxoValidator (the single source of truth).
     pub fn ok_no_changes() -> Self {
-        Self { valid: true, reason: None, changes: vec![] }
+        Self {
+            valid: true,
+            reason: None,
+            changes: vec![],
+        }
     }
 
     pub fn fail(reason: &str) -> Self {
@@ -105,7 +121,11 @@ impl BlockValidationResult {
                         let _ = utxo_set.spend_utxo(&k);
                     }
                 }
-                UtxoChange::Create { key, address, amount } => {
+                UtxoChange::Create {
+                    key,
+                    address,
+                    amount,
+                } => {
                     if let Ok(k) = utxo_key(&key.txid, key.index) {
                         utxo_set.add_utxo(&k, address.clone(), *amount, address.clone());
                     }
@@ -120,29 +140,31 @@ impl BlockValidationResult {
 pub struct BlockValidator;
 
 impl BlockValidator {
-
-    pub fn validate_block_full(
-        block:    &Block,
-        utxo_set: &UtxoSet,
-    ) -> BlockValidationResult {
+    pub fn validate_block_full(block: &Block, utxo_set: &UtxoSet) -> BlockValidationResult {
         Self::validate_block_full_with_network(block, utxo_set, &NetworkMode::Mainnet)
     }
 
     pub fn validate_block_full_with_network(
-        block:    &Block,
+        block: &Block,
         utxo_set: &UtxoSet,
-        network:  &NetworkMode,
+        network: &NetworkMode,
     ) -> BlockValidationResult {
         Self::validate_block_full_with_context(block, utxo_set, &[], network)
     }
 
     pub fn validate_block_full_with_context(
-        block:               &Block,
-        utxo_set:            &UtxoSet,
+        block: &Block,
+        utxo_set: &UtxoSet,
         ancestor_timestamps: &[u64],
-        network:             &NetworkMode,
+        network: &NetworkMode,
     ) -> BlockValidationResult {
-        Self::validate_block_full_with_difficulty(block, utxo_set, ancestor_timestamps, network, None)
+        Self::validate_block_full_with_difficulty(
+            block,
+            utxo_set,
+            ancestor_timestamps,
+            network,
+            None,
+        )
     }
 
     /// Full validation with optional expected difficulty enforcement.
@@ -177,7 +199,8 @@ impl BlockValidator {
         if block.body.transactions.len() > MAX_TXS_PER_BLOCK_VALIDATION {
             return Err(ConsensusError::BlockValidation(format!(
                 "too many transactions: {} > {}",
-                block.body.transactions.len(), MAX_TXS_PER_BLOCK_VALIDATION
+                block.body.transactions.len(),
+                MAX_TXS_PER_BLOCK_VALIDATION
             )));
         }
         if block.header.version == 0 {
@@ -190,21 +213,30 @@ impl BlockValidator {
 
         // DagShield = unified fast filter (DoS + Spam + Flood + Selfish mining)
         if let Err(rej) = DagShield::validate_block(block) {
-            return Err(ConsensusError::BlockValidation(
-                format!("DagShield: {}", rej.reason)
-            ));
+            return Err(ConsensusError::BlockValidation(format!(
+                "DagShield: {}",
+                rej.reason
+            )));
         }
         if block.body.transactions.is_empty() {
             return Err(ConsensusError::BlockValidation("no transactions".into()));
         }
         if block.body.transactions.len() == 1 && !block.body.transactions[0].is_coinbase() {
-            return Err(ConsensusError::BlockValidation("invalid single tx block".into()));
+            return Err(ConsensusError::BlockValidation(
+                "invalid single tx block".into(),
+            ));
         }
         // Verify exactly one coinbase transaction
-        let coinbase_count = block.body.transactions.iter().filter(|tx| tx.is_coinbase()).count();
+        let coinbase_count = block
+            .body
+            .transactions
+            .iter()
+            .filter(|tx| tx.is_coinbase())
+            .count();
         if coinbase_count != 1 {
             return Err(ConsensusError::BlockValidation(format!(
-                "expected exactly 1 coinbase TX, found {}", coinbase_count
+                "expected exactly 1 coinbase TX, found {}",
+                coinbase_count
             )));
         }
         // Duplicate TX check (cheap — hash set, no crypto)
@@ -212,7 +244,10 @@ impl BlockValidator {
             std::collections::HashSet::with_capacity(block.body.transactions.len());
         for tx in &block.body.transactions {
             if !seen.insert(&tx.hash) {
-                return Err(ConsensusError::BlockValidation(format!("duplicate tx {}", &tx.hash[..16.min(tx.hash.len())])));
+                return Err(ConsensusError::BlockValidation(format!(
+                    "duplicate tx {}",
+                    &tx.hash[..16.min(tx.hash.len())]
+                )));
             }
         }
         Ok(())
@@ -230,7 +265,11 @@ impl BlockValidator {
         Self::validate_timestamp(block, ancestor_timestamps)?;
 
         // Merkle root — header must commit to actual TX body
-        let computed_merkle = MerkleTree::build(&block.body.transactions, block.header.height, &block.header.parents);
+        let computed_merkle = MerkleTree::build(
+            &block.body.transactions,
+            block.header.height,
+            &block.header.parents,
+        );
         if computed_merkle != block.header.merkle_root {
             return Err(ConsensusError::BlockValidation(format!(
                 "merkle root mismatch: header={} computed={}",
@@ -244,7 +283,7 @@ impl BlockValidator {
             // Here we only verify the format is valid (64 hex chars = SHA-256).
             if claimed_root.len() != 64 || !claimed_root.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Err(ConsensusError::BlockValidation(
-                    "invalid receipt_root format (must be 64 hex chars)".into()
+                    "invalid receipt_root format (must be 64 hex chars)".into(),
                 ));
             }
         }
@@ -253,7 +292,7 @@ impl BlockValidator {
         if let Some(ref claimed_root) = block.header.state_root {
             if claimed_root.len() != 64 || !claimed_root.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Err(ConsensusError::BlockValidation(
-                    "invalid state_root format (must be 64 hex chars)".into()
+                    "invalid state_root format (must be 64 hex chars)".into(),
                 ));
             }
         }
@@ -262,14 +301,23 @@ impl BlockValidator {
         for (i, tx) in block.body.transactions.iter().enumerate() {
             if !tx.is_coinbase() {
                 if !TxValidator::validate_structure_for_network(tx, network) {
-                    return Err(ConsensusError::BlockValidation(format!("tx {} structural validation failed", i)));
+                    return Err(ConsensusError::BlockValidation(format!(
+                        "tx {} structural validation failed",
+                        i
+                    )));
                 }
                 if !TxValidator::verify_signatures_for_network(tx, network) {
-                    return Err(ConsensusError::BlockValidation(format!("tx {} signature verification failed", i)));
+                    return Err(ConsensusError::BlockValidation(format!(
+                        "tx {} signature verification failed",
+                        i
+                    )));
                 }
                 // Ring signature verification for confidential (privacy) transactions
                 if tx.is_confidential() && !RingValidator::validate(tx) {
-                    return Err(ConsensusError::BlockValidation(format!("tx {} ring signature verification failed", i)));
+                    return Err(ConsensusError::BlockValidation(format!(
+                        "tx {} ring signature verification failed",
+                        i
+                    )));
                 }
                 // Validate swap/dex transaction payloads
                 if tx.tx_type == TxType::SwapTx {
@@ -289,36 +337,24 @@ impl BlockValidator {
     pub fn validate_consensus_layer(
         block: &Block,
         expected_difficulty: Option<u64>,
+        network: &NetworkMode,
     ) -> Result<(), ConsensusError> {
         if let Some(expected) = expected_difficulty {
-            // NOTE: This +/-4x tolerance is intentionally looser than
-            // RetargetEngine::validate_difficulty() (strict equality).
-            // The retarget engine validates blocks on the SELECTED chain
-            // where difficulty matches exactly. This layer validates ALL
-            // incoming blocks including side-chain blocks that may have
-            // been mined at a different epoch's difficulty. The +/-4x
-            // factor matches ADJUSTMENT_FACTOR_MAX (max single-epoch
-            // change). Blocks accepted here are re-validated by the
-            // retarget engine when they join the selected chain.
-            //
-            // Allow blocks whose difficulty is within a factor of 4 of expected.
-            // Side-chain blocks may have been mined at a different difficulty
-            // epoch. The strict check would reject valid blocks from forks
-            // that diverged before a retarget boundary. The factor of 4
-            // matches ADJUSTMENT_FACTOR_MAX from difficulty_adjustment.rs.
-            let min_allowed = expected / 4;
-            let max_allowed = expected.saturating_mul(4);
-            if block.header.difficulty < min_allowed || block.header.difficulty > max_allowed {
+            // Consensus-hard rule: when expected difficulty is provided by
+            // retarget context, the claimed block difficulty must match exactly.
+            // Allowing a wide range enables low-difficulty side-chain spam that
+            // can later compete in fork choice despite underpriced work.
+            if block.header.difficulty != expected {
                 return Err(ConsensusError::BlockValidation(format!(
-                    "difficulty {} outside allowed range [{}, {}] (expected ~{})",
-                    block.header.difficulty, min_allowed, max_allowed, expected
+                    "difficulty mismatch: claimed {} expected {}",
+                    block.header.difficulty, expected
                 )));
             }
         }
 
         ChainManager::validate_checkpoint(block.header.height, &block.header.hash)?;
         // PoW already validated before L2 (early rejection optimization)
-        Self::validate_coinbase(block)?;
+        Self::validate_coinbase_for_network(block, network)?;
         Ok(())
     }
 
@@ -329,11 +365,11 @@ impl BlockValidator {
     ///   L3 Consensus(diff+checks) → chain-level rules
     ///   L4 Execution(UTXO)        → handled separately by UtxoValidator
     pub fn validate_block_full_with_difficulty(
-        block:               &Block,
-        _utxo_set:            &UtxoSet,
+        block: &Block,
+        _utxo_set: &UtxoSet,
         ancestor_timestamps: &[u64],
-        network:             &NetworkMode,
-        expected_difficulty:  Option<u64>,
+        network: &NetworkMode,
+        expected_difficulty: Option<u64>,
     ) -> BlockValidationResult {
         // L1: Network layer — always runs, even for genesis.
         // Format, size, and DoS checks apply to ALL blocks regardless of height.
@@ -363,7 +399,7 @@ impl BlockValidator {
         }
 
         // L3: Consensus layer — difficulty, checkpoints, coinbase
-        if let Err(reason) = Self::validate_consensus_layer(block, expected_difficulty) {
+        if let Err(reason) = Self::validate_consensus_layer(block, expected_difficulty, network) {
             return BlockValidationResult::fail(&reason.to_string());
         }
 
@@ -407,7 +443,6 @@ impl BlockValidator {
     /// (NTP is assumed). The DAG-based rules (R3–R6) provide secondary
     /// protection independent of wall-clock accuracy.
     fn validate_timestamp(block: &Block, ancestors: &[u64]) -> Result<(), ConsensusError> {
-
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -419,7 +454,8 @@ impl BlockValidator {
         if ts > now + MAX_FUTURE_SECS {
             return Err(ConsensusError::Timestamp(format!(
                 "timestamp {}s in future (max {}s)",
-                ts.saturating_sub(now), MAX_FUTURE_SECS
+                ts.saturating_sub(now),
+                MAX_FUTURE_SECS
             )));
         }
 
@@ -429,7 +465,8 @@ impl BlockValidator {
         if ts < now.saturating_sub(MAX_PAST_BLOCK_SECS) {
             return Err(ConsensusError::Timestamp(format!(
                 "timestamp {}s behind wall clock (max {}s)",
-                now.saturating_sub(ts), MAX_PAST_BLOCK_SECS
+                now.saturating_sub(ts),
+                MAX_PAST_BLOCK_SECS
             )));
         }
 
@@ -438,7 +475,8 @@ impl BlockValidator {
             let mtp = Self::median_time_past(ancestors);
             if ts <= mtp {
                 return Err(ConsensusError::Timestamp(format!(
-                    "timestamp {} ≤ MTP {}", ts, mtp
+                    "timestamp {} ≤ MTP {}",
+                    ts, mtp
                 )));
             }
 
@@ -464,7 +502,8 @@ impl BlockValidator {
             if ts > max_parent_ts + MAX_TIMESTAMP_JUMP_SECS {
                 return Err(ConsensusError::Timestamp(format!(
                     "timestamp jump {}s from parent (max {}s)",
-                    ts.saturating_sub(max_parent_ts), MAX_TIMESTAMP_JUMP_SECS
+                    ts.saturating_sub(max_parent_ts),
+                    MAX_TIMESTAMP_JUMP_SECS
                 )));
             }
 
@@ -538,17 +577,21 @@ impl BlockValidator {
             let size = tx.canonical_bytes().len();
             if size > MAX_TX_BYTES_IN_BLOCK {
                 return Err(ConsensusError::BlockValidation(format!(
-                    "tx too large: {} > {} bytes", size, MAX_TX_BYTES_IN_BLOCK
+                    "tx too large: {} > {} bytes",
+                    size, MAX_TX_BYTES_IN_BLOCK
                 )));
             }
         }
 
         // ── Full serialized block size (precise but expensive) ──────
-        let full_size = bincode::serialize(block).map(|b| b.len()).unwrap_or(0);
+        let full_size = bincode::serialize(block).map(|b| b.len()).map_err(|e| {
+            ConsensusError::BlockValidation(format!("block serialization failed: {}", e))
+        })?;
         if full_size > MAX_BLOCK_BYTES {
-            return Err(ConsensusError::BlockValidation(
-                format!("block too large: {} > {} bytes", full_size, MAX_BLOCK_BYTES),
-            ));
+            return Err(ConsensusError::BlockValidation(format!(
+                "block too large: {} > {} bytes",
+                full_size, MAX_BLOCK_BYTES
+            )));
         }
 
         Ok(())
@@ -558,11 +601,10 @@ impl BlockValidator {
 
     #[cfg(test)]
     fn validate_transactions_atomic(
-        block:    &Block,
+        block: &Block,
         utxo_set: &UtxoSet,
-        network:  &NetworkMode,
+        network: &NetworkMode,
     ) -> Result<Vec<UtxoChange>, ConsensusError> {
-
         let tx_count = block.body.transactions.len();
         let mut changes = Vec::with_capacity(tx_count * 4);
 
@@ -576,12 +618,14 @@ impl BlockValidator {
         let mut created = FxHashSet::with_capacity(tx_count.saturating_mul(4));
 
         for (i, tx) in block.body.transactions.iter().enumerate() {
-
             if tx.is_coinbase() {
                 // Coinbase: just register outputs, no inputs to validate
                 for (idx, out) in tx.outputs.iter().enumerate() {
                     let key_str = utxo_key(&tx.hash, idx as u32)?;
-                    let key = UtxoChangeKey { txid: tx.hash.clone(), index: idx as u32 };
+                    let key = UtxoChangeKey {
+                        txid: tx.hash.clone(),
+                        index: idx as u32,
+                    };
 
                     if !created.insert(key.clone()) {
                         return Err(ConsensusError::BlockValidation("duplicate output".into()));
@@ -599,28 +643,39 @@ impl BlockValidator {
 
             // Structural validation (size, hash, limits) — no UTXO lookup needed
             if !TxValidator::validate_structure_for_network(tx, network) {
-                return Err(ConsensusError::BlockValidation(format!("tx {} structural validation failed", i)));
+                return Err(ConsensusError::BlockValidation(format!(
+                    "tx {} structural validation failed",
+                    i
+                )));
             }
 
             // Validate inputs: check base UTXO set first, then staged outputs
             for input in &tx.inputs {
                 let key_str = utxo_key(&input.txid, input.index)?;
-                let key = UtxoChangeKey { txid: input.txid.clone(), index: input.index };
+                let key = UtxoChangeKey {
+                    txid: input.txid.clone(),
+                    index: input.index,
+                };
 
                 // Intra-block double-spend check
                 if !spent.insert(key.clone()) {
-                    return Err(ConsensusError::BlockValidation(format!("double spend in tx {}", i)));
+                    return Err(ConsensusError::BlockValidation(format!(
+                        "double spend in tx {}",
+                        i
+                    )));
                 }
 
                 // Input must exist in base UTXO set OR in staged outputs from earlier txs
-                let exists_in_base = utxo_set.get_utxo(&key_str)
+                let exists_in_base = utxo_set
+                    .get_utxo(&key_str)
                     .map(|u| !u.spent)
                     .unwrap_or(false);
                 let exists_in_staged = staged_outputs.contains_key(&key_str);
 
                 if !exists_in_base && !exists_in_staged {
                     return Err(ConsensusError::BlockValidation(format!(
-                        "tx {} input {} not found in UTXO set or earlier block txs", i, key_str
+                        "tx {} input {} not found in UTXO set or earlier block txs",
+                        i, key_str
                     )));
                 }
 
@@ -630,7 +685,10 @@ impl BlockValidator {
             // Register this tx's outputs as available for subsequent txs
             for (idx, out) in tx.outputs.iter().enumerate() {
                 let key_str = utxo_key(&tx.hash, idx as u32)?;
-                let key = UtxoChangeKey { txid: tx.hash.clone(), index: idx as u32 };
+                let key = UtxoChangeKey {
+                    txid: tx.hash.clone(),
+                    index: idx as u32,
+                };
 
                 if !created.insert(key.clone()) {
                     return Err(ConsensusError::BlockValidation("duplicate output".into()));
@@ -658,14 +716,17 @@ impl BlockValidator {
         if result.valid {
             Ok(())
         } else {
-            Err(ConsensusError::InvalidPow(result.reason.unwrap_or_else(|| "PoW validation failed".to_string())))
+            Err(ConsensusError::InvalidPow(
+                result
+                    .reason
+                    .unwrap_or_else(|| "PoW validation failed".to_string()),
+            ))
         }
     }
 
     // ─────────────────────────────────────────
 
     fn validate_parents(block: &Block) -> Result<(), ConsensusError> {
-
         let parents = &block.header.parents;
 
         if block.header.height > 0 && parents.is_empty() {
@@ -695,7 +756,8 @@ impl BlockValidator {
         if let Some(ref sp) = block.header.selected_parent {
             if !block.header.parents.contains(sp) {
                 return Err(ConsensusError::BlockValidation(format!(
-                    "selected_parent {} is not in parents list", &sp[..sp.len().min(16)]
+                    "selected_parent {} is not in parents list",
+                    &sp[..sp.len().min(16)]
                 )));
             }
         }
@@ -728,18 +790,20 @@ impl BlockValidator {
 
         for parent_hash in &block.header.parents {
             // Parent height must be retrievable (survives pruning via h2h index)
-            let parent_height = block_store.get_block_height(parent_hash)
-                .ok_or_else(|| {
-                    // Check DAG for existence — but even if the parent is in the
-                    // DAG, we REJECT it because height data is required for the
-                    // height rule below. A parent in the DAG but missing from
-                    // both BlockStore and height index means we cannot verify
-                    // the height rule, so the block must be rejected.
-                    if dag_manager.block_exists(parent_hash) {
-                        return ConsensusError::BlockValidation(format!("parent {} in DAG but height unknown", parent_hash));
-                    }
-                    ConsensusError::BlockValidation(format!("parent {} not found", parent_hash))
-                })?;
+            let parent_height = block_store.get_block_height(parent_hash).ok_or_else(|| {
+                // Check DAG for existence — but even if the parent is in the
+                // DAG, we REJECT it because height data is required for the
+                // height rule below. A parent in the DAG but missing from
+                // both BlockStore and height index means we cannot verify
+                // the height rule, so the block must be rejected.
+                if dag_manager.block_exists(parent_hash) {
+                    return ConsensusError::BlockValidation(format!(
+                        "parent {} in DAG but height unknown",
+                        parent_hash
+                    ));
+                }
+                ConsensusError::BlockValidation(format!("parent {} not found", parent_hash))
+            })?;
 
             if parent_height > max_parent_height {
                 max_parent_height = parent_height;
@@ -747,10 +811,9 @@ impl BlockValidator {
         }
 
         // DAG height rule: height = max(parent_heights) + 1
-        let expected_height = max_parent_height.checked_add(1)
-            .ok_or_else(|| ConsensusError::BlockValidation(
-                "parent height would overflow u64".to_string()
-            ))?;
+        let expected_height = max_parent_height.checked_add(1).ok_or_else(|| {
+            ConsensusError::BlockValidation("parent height would overflow u64".to_string())
+        })?;
         if block.header.height != expected_height {
             return Err(ConsensusError::BlockValidation(format!(
                 "height mismatch: block claims height={} but max(parent_heights)+1={}",
@@ -763,12 +826,24 @@ impl BlockValidator {
 
     // ─────────────────────────────────────────
 
-    fn validate_coinbase(block: &Block) -> Result<(), ConsensusError> {
+    fn dev_reward_address_for_network(network: &NetworkMode) -> &'static str {
+        match network {
+            NetworkMode::Mainnet => ConsensusParams::OWNER_REWARD_ADDRESS,
+            NetworkMode::Testnet => TESTNET_DEV_ADDRESS,
+            NetworkMode::Regtest => REGTEST_DEV_ADDRESS,
+        }
+    }
+
+    fn validate_coinbase_for_network(
+        block: &Block,
+        network: &NetworkMode,
+    ) -> Result<(), ConsensusError> {
         use crate::config::consensus::emission_schedule::EmissionSchedule;
-        use crate::config::consensus::consensus_params::ConsensusParams;
 
         let txs = &block.body.transactions;
-        let cb = txs.first().ok_or_else(|| ConsensusError::BlockValidation("no txs".into()))?;
+        let cb = txs
+            .first()
+            .ok_or_else(|| ConsensusError::BlockValidation("no txs".into()))?;
 
         // 1. First TX must be coinbase (no inputs)
         if !cb.is_coinbase() {
@@ -810,11 +885,13 @@ impl BlockValidator {
             ));
         }
 
-        let actual_total: u64 = cb.outputs.iter()
+        let actual_total: u64 = cb
+            .outputs
+            .iter()
             .try_fold(0u64, |acc, o| acc.checked_add(o.amount))
-            .ok_or_else(|| ConsensusError::BlockValidation(
-                "coinbase output sum overflow".into()
-            ))?;
+            .ok_or_else(|| {
+                ConsensusError::BlockValidation("coinbase output sum overflow".into())
+            })?;
 
         if actual_total < expected_reward {
             return Err(ConsensusError::BlockValidation(format!(
@@ -825,35 +902,47 @@ impl BlockValidator {
 
         // Upper bound: can't exceed emission + ALL declared fees
         // (even if some txs will be skipped, coinbase can't exceed this)
-        let total_declared_fees: u64 = block.body.transactions.iter()
+        let total_declared_fees: u64 = block
+            .body
+            .transactions
+            .iter()
             .filter(|tx| !tx.is_coinbase())
             .map(|tx| tx.fee)
             .try_fold(0u64, |acc, f| acc.checked_add(f))
-            .ok_or_else(|| ConsensusError::BlockValidation("transaction fee sum overflow".into()))?;
-        let max_allowed = expected_reward.checked_add(total_declared_fees)
+            .ok_or_else(|| {
+                ConsensusError::BlockValidation("transaction fee sum overflow".into())
+            })?;
+        let max_allowed = expected_reward
+            .checked_add(total_declared_fees)
             .ok_or_else(|| ConsensusError::BlockValidation("reward + fees overflow".into()))?;
 
         if actual_total > max_allowed {
             return Err(ConsensusError::BlockValidation(format!(
                 "coinbase {} exceeds max {} (emission {} + declared_fees {}) at height {}",
-                actual_total, max_allowed, expected_reward, total_declared_fees, block.header.height
+                actual_total,
+                max_allowed,
+                expected_reward,
+                total_declared_fees,
+                block.header.height
             )));
         }
 
         // Dev reward address must match configured address
-        if cb.outputs[1].address != ConsensusParams::OWNER_REWARD_ADDRESS {
+        let expected_dev = Self::dev_reward_address_for_network(network);
+        if cb.outputs[1].address != expected_dev {
             return Err(ConsensusError::BlockValidation(format!(
                 "dev reward address mismatch: got {}, expected {}",
-                cb.outputs[1].address, ConsensusParams::OWNER_REWARD_ADDRESS
+                cb.outputs[1].address, expected_dev
             )));
         }
 
         // Outputs must sum to declared actual_total (internal consistency)
-        let output_sum: u64 = cb.outputs[0].amount
+        let output_sum: u64 = cb.outputs[0]
+            .amount
             .checked_add(cb.outputs[1].amount)
-            .ok_or_else(|| ConsensusError::BlockValidation(
-                "coinbase output split overflow".into()
-            ))?;
+            .ok_or_else(|| {
+                ConsensusError::BlockValidation("coinbase output split overflow".into())
+            })?;
         if output_sum != actual_total {
             return Err(ConsensusError::BlockValidation(format!(
                 "coinbase output sum {} != declared total {}",
@@ -863,16 +952,22 @@ impl BlockValidator {
 
         // 5. Coinbase fee must be 0
         if cb.fee != 0 {
-            return Err(ConsensusError::BlockValidation("coinbase fee must be 0".into()));
+            return Err(ConsensusError::BlockValidation(
+                "coinbase fee must be 0".into(),
+            ));
         }
 
         Ok(())
     }
 
+    #[cfg(test)]
+    fn validate_coinbase(block: &Block) -> Result<(), ConsensusError> {
+        Self::validate_coinbase_for_network(block, &NetworkMode::Mainnet)
+    }
+
     // ─────────────────────────────────────────
 
     fn validate_genesis(block: &Block, network: &NetworkMode) -> BlockValidationResult {
-
         if block.header.hash != genesis_hash_for(network) {
             return BlockValidationResult::fail("genesis mismatch");
         }
@@ -881,18 +976,21 @@ impl BlockValidator {
             return BlockValidationResult::fail("genesis has parents");
         }
 
-        // Verify merkle root matches body
-        let computed_merkle = MerkleTree::build(
-            &block.body.transactions,
-            block.header.height,
-            &block.header.parents,
-        );
+        // Verify genesis merkle root with the same consensus path used by
+        // genesis construction (tx-hash based merkle).
+        let tx_hashes: Vec<String> = block
+            .body
+            .transactions
+            .iter()
+            .map(|tx| tx.hash.clone())
+            .collect();
+        let computed_merkle = compute_merkle_root(&tx_hashes);
         if computed_merkle != block.header.merkle_root {
             return BlockValidationResult::fail("genesis merkle mismatch");
         }
 
         // Validate coinbase structure
-        if let Err(e) = Self::validate_coinbase(block) {
+        if let Err(e) = Self::validate_coinbase_for_network(block, network) {
             return BlockValidationResult::fail(&format!("genesis coinbase invalid: {}", e));
         }
 
@@ -903,12 +1001,14 @@ impl BlockValidator {
             if !tx.is_coinbase() {
                 if !TxValidator::validate_structure_for_network(tx, network) {
                     return BlockValidationResult::fail(&format!(
-                        "genesis tx {} structural validation failed", i
+                        "genesis tx {} structural validation failed",
+                        i
                     ));
                 }
                 if !TxValidator::verify_signatures(tx) {
                     return BlockValidationResult::fail(&format!(
-                        "genesis tx {} signature verification failed", i
+                        "genesis tx {} signature verification failed",
+                        i
                     ));
                 }
             }
@@ -918,7 +1018,6 @@ impl BlockValidator {
 
         for tx in &block.body.transactions {
             for (i, output) in tx.outputs.iter().enumerate() {
-
                 let key = UtxoChangeKey {
                     txid: tx.hash.clone(),
                     index: i as u32,
@@ -946,27 +1045,37 @@ impl BlockValidator {
     /// participants' public keys.
     fn validate_swap_tx(tx: &Transaction) -> Result<(), ConsensusError> {
         // 1. Must have payload_hash (HTLC secret hash)
-        let secret_hash = tx.payload_hash.as_ref()
-            .ok_or_else(|| ConsensusError::BlockValidation("SwapTx missing payload_hash (HTLC secret hash)".into()))?;
+        let secret_hash = tx.payload_hash.as_ref().ok_or_else(|| {
+            ConsensusError::BlockValidation("SwapTx missing payload_hash (HTLC secret hash)".into())
+        })?;
         // 2. payload_hash must be 64 hex chars (32 bytes SHA256)
         if secret_hash.len() != 64 || !secret_hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(ConsensusError::BlockValidation("SwapTx payload_hash must be 64 hex chars".into()));
+            return Err(ConsensusError::BlockValidation(
+                "SwapTx payload_hash must be 64 hex chars".into(),
+            ));
         }
         // 3. Must have at least one output (the HTLC lock)
         if tx.outputs.is_empty() {
-            return Err(ConsensusError::BlockValidation("SwapTx must have at least one output".into()));
+            return Err(ConsensusError::BlockValidation(
+                "SwapTx must have at least one output".into(),
+            ));
         }
         // 3b. First output must lock funds to an HTLC address (P2SH prefix "SD1h")
         if let Some(first_output) = tx.outputs.first() {
-            if !first_output.address.starts_with(crate::domain::address::address::P2SH_PREFIX) {
+            if !first_output
+                .address
+                .starts_with(crate::domain::address::address::P2SH_PREFIX)
+            {
                 return Err(ConsensusError::BlockValidation(
-                    "SwapTx first output must lock funds to HTLC address (SD1h prefix)".into()
+                    "SwapTx first output must lock funds to HTLC address (SD1h prefix)".into(),
                 ));
             }
         }
         // 4. Must not be coinbase
         if tx.is_coinbase {
-            return Err(ConsensusError::BlockValidation("SwapTx cannot be coinbase".into()));
+            return Err(ConsensusError::BlockValidation(
+                "SwapTx cannot be coinbase".into(),
+            ));
         }
         Ok(())
     }
@@ -981,19 +1090,26 @@ impl BlockValidator {
     /// engine can match.
     fn validate_dex_order_tx(tx: &Transaction) -> Result<(), ConsensusError> {
         // 1. Must have payload_hash (order data)
-        let order_data = tx.payload_hash.as_ref()
-            .ok_or_else(|| ConsensusError::BlockValidation("DexOrder missing payload_hash (order data)".into()))?;
+        let order_data = tx.payload_hash.as_ref().ok_or_else(|| {
+            ConsensusError::BlockValidation("DexOrder missing payload_hash (order data)".into())
+        })?;
         // 2. payload_hash must be non-empty hex
         if order_data.is_empty() || !order_data.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(ConsensusError::BlockValidation("DexOrder payload_hash must be valid hex".into()));
+            return Err(ConsensusError::BlockValidation(
+                "DexOrder payload_hash must be valid hex".into(),
+            ));
         }
         // 3. Must not be coinbase
         if tx.is_coinbase {
-            return Err(ConsensusError::BlockValidation("DexOrder cannot be coinbase".into()));
+            return Err(ConsensusError::BlockValidation(
+                "DexOrder cannot be coinbase".into(),
+            ));
         }
         // 4. Must have at least one input (placing an order requires funds)
         if tx.inputs.is_empty() {
-            return Err(ConsensusError::BlockValidation("DexOrder must have at least one input".into()));
+            return Err(ConsensusError::BlockValidation(
+                "DexOrder must have at least one input".into(),
+            ));
         }
         Ok(())
     }
@@ -1006,13 +1122,13 @@ impl BlockValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use crate::domain::block::block_header::BlockHeader;
-    use crate::domain::block::block_body::BlockBody;
-    use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput};
     use crate::config::consensus::consensus_params::ConsensusParams;
     use crate::config::consensus::emission_schedule::EmissionSchedule;
+    use crate::domain::block::block_body::BlockBody;
+    use crate::domain::block::block_header::BlockHeader;
+    use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput};
     use crate::domain::transaction::tx_hash::TxHash;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     // ─────────────────────────────────────────
     //  Helpers
@@ -1053,8 +1169,11 @@ mod tests {
         let mut tx = Transaction::new(
             String::new(), // placeholder
             vec![TxInput::new(
-                "dd".repeat(32), 0,
-                "owner".into(), "sig".into(), "pub".into(),
+                "dd".repeat(32),
+                0,
+                "owner".into(),
+                "sig".into(),
+                "pub".into(),
             )],
             vec![TxOutput::new("dest_addr".into(), 100)],
             1,
@@ -1063,7 +1182,12 @@ mod tests {
         // Differentiate TXs by using the seed in the input txid
         if !seed.is_empty() {
             // Use different input txids to create distinct TX hashes
-            let padded = format!("{:0>64}", seed.chars().filter(|c| c.is_ascii_hexdigit()).collect::<String>());
+            let padded = format!(
+                "{:0>64}",
+                seed.chars()
+                    .filter(|c| c.is_ascii_hexdigit())
+                    .collect::<String>()
+            );
             if padded.len() >= 64 {
                 tx.inputs[0].txid = padded[..64].to_string();
             }
@@ -1092,20 +1216,20 @@ mod tests {
 
         Block {
             header: BlockHeader {
-                version:          1,
-                hash:             "cc".repeat(32),
+                version: 1,
+                hash: "cc".repeat(32),
                 parents,
-                merkle_root:      merkle,
-                timestamp:        ts,
-                nonce:            42,
-                difficulty:       1,
+                merkle_root: merkle,
+                timestamp: ts,
+                nonce: 42,
+                difficulty: 1,
                 height,
-                blue_score:       0,
-                selected_parent:  None,
-                utxo_commitment:  None,
-                extra_nonce:      0,
-                receipt_root:     None,
-                state_root:       None,
+                blue_score: 0,
+                selected_parent: None,
+                utxo_commitment: None,
+                extra_nonce: 0,
+                receipt_root: None,
+                state_root: None,
             },
             body: BlockBody { transactions: txs },
         }
@@ -1177,7 +1301,8 @@ mod tests {
         // DagShield's SpamFilter or BlockValidator's own check catches duplicates
         assert!(
             err_msg.contains("duplicate tx") || err_msg.contains("DagShield"),
-            "expected duplicate/DagShield error, got: {}", err_msg,
+            "expected duplicate/DagShield error, got: {}",
+            err_msg,
         );
     }
 
@@ -1271,7 +1396,10 @@ mod tests {
 
         let result = BlockValidator::validate_timestamp(&block, &[]);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("behind wall clock"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("behind wall clock"));
     }
 
     #[test]
@@ -1313,11 +1441,12 @@ mod tests {
         let mut block = make_valid_block(5);
         block.header.merkle_root = "ff".repeat(32); // wrong merkle root
 
-        let result = BlockValidator::validate_structural_layer(
-            &block, &[], &NetworkMode::Mainnet,
-        );
+        let result = BlockValidator::validate_structural_layer(&block, &[], &NetworkMode::Mainnet);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("merkle root mismatch"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("merkle root mismatch"));
     }
 
     #[test]
@@ -1327,9 +1456,9 @@ mod tests {
         let cb = make_coinbase(5);
         let block = make_block(5, vec![cb]);
         // With empty ancestors, timestamp validation only checks R1+R2
-        assert!(BlockValidator::validate_structural_layer(
-            &block, &[], &NetworkMode::Mainnet,
-        ).is_ok());
+        assert!(
+            BlockValidator::validate_structural_layer(&block, &[], &NetworkMode::Mainnet,).is_ok()
+        );
     }
 
     // ─────────────────────────────────────────
@@ -1350,7 +1479,10 @@ mod tests {
 
         let result = BlockValidator::validate_coinbase(&block);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("first not coinbase"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("first not coinbase"));
     }
 
     #[test]
@@ -1362,7 +1494,10 @@ mod tests {
 
         let result = BlockValidator::validate_coinbase(&block);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("first not coinbase"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("first not coinbase"));
     }
 
     #[test]
@@ -1394,7 +1529,10 @@ mod tests {
 
         let result = BlockValidator::validate_coinbase(&block);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exactly 2 outputs"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("exactly 2 outputs"));
     }
 
     #[test]
@@ -1437,7 +1575,10 @@ mod tests {
 
         let result = BlockValidator::validate_coinbase(&block);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("dev reward address mismatch"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("dev reward address mismatch"));
     }
 
     #[test]
@@ -1460,7 +1601,10 @@ mod tests {
 
         let result = BlockValidator::validate_coinbase(&block);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("coinbase fee must be 0"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("coinbase fee must be 0"));
     }
 
     // ─────────────────────────────────────────
@@ -1473,9 +1617,8 @@ mod tests {
         let utxo_set = UtxoSet::new_empty();
         let block = make_valid_block(5);
 
-        let result = BlockValidator::validate_transactions_atomic(
-            &block, &utxo_set, &NetworkMode::Mainnet,
-        );
+        let result =
+            BlockValidator::validate_transactions_atomic(&block, &utxo_set, &NetworkMode::Mainnet);
         // The regular TX uses fake data — fails at structural or UTXO level
         assert!(result.is_err(), "block with unresolvable inputs must fail");
     }
@@ -1487,9 +1630,8 @@ mod tests {
         let cb = make_coinbase(5);
         let block = make_block(5, vec![cb]);
 
-        let result = BlockValidator::validate_transactions_atomic(
-            &block, &utxo_set, &NetworkMode::Mainnet,
-        );
+        let result =
+            BlockValidator::validate_transactions_atomic(&block, &utxo_set, &NetworkMode::Mainnet);
         assert!(result.is_ok());
         let changes = result.unwrap();
         // Coinbase creates 2 outputs
@@ -1503,23 +1645,34 @@ mod tests {
         let cb = make_coinbase(5);
         let tx1 = Transaction::new(
             "tx_ds_1".into(),
-            vec![TxInput::new("dd".repeat(32), 0, "o".into(), "s".into(), "p".into())],
+            vec![TxInput::new(
+                "dd".repeat(32),
+                0,
+                "o".into(),
+                "s".into(),
+                "p".into(),
+            )],
             vec![TxOutput::new("a".into(), 50)],
             1,
             now_secs(),
         );
         let tx2 = Transaction::new(
             "tx_ds_2".into(),
-            vec![TxInput::new("dd".repeat(32), 0, "o".into(), "s".into(), "p".into())],
+            vec![TxInput::new(
+                "dd".repeat(32),
+                0,
+                "o".into(),
+                "s".into(),
+                "p".into(),
+            )],
             vec![TxOutput::new("b".into(), 50)],
             1,
             now_secs(),
         );
         let block = make_block(5, vec![cb, tx1, tx2]);
 
-        let result = BlockValidator::validate_transactions_atomic(
-            &block, &utxo_set, &NetworkMode::Mainnet,
-        );
+        let result =
+            BlockValidator::validate_transactions_atomic(&block, &utxo_set, &NetworkMode::Mainnet);
         // First tx fails on missing UTXO or second tx fails on double spend
         assert!(result.is_err());
     }
@@ -1536,34 +1689,41 @@ mod tests {
         // so block_validator's validate_genesis rejects it.
         let cb = make_coinbase(0);
         let parents: Vec<String> = vec![];
-        let merkle = MerkleTree::build(&[cb.clone()], 0, &parents);
+        let merkle = MerkleTree::build(std::slice::from_ref(&cb), 0, &parents);
         let block = Block {
             header: BlockHeader {
-                version:         1,
-                hash:            "11".repeat(32), // wrong genesis hash
+                version: 1,
+                hash: "11".repeat(32), // wrong genesis hash
                 parents,
-                merkle_root:     merkle,
-                timestamp:       now_secs(),
-                nonce:           0,
-                difficulty:      1,
-                height:          0,
-                blue_score:      0,
+                merkle_root: merkle,
+                timestamp: now_secs(),
+                nonce: 0,
+                difficulty: 1,
+                height: 0,
+                blue_score: 0,
                 selected_parent: None,
                 utxo_commitment: None,
-                extra_nonce:     0,
-                receipt_root:    None,
-                state_root:      None,
+                extra_nonce: 0,
+                receipt_root: None,
+                state_root: None,
             },
-            body: BlockBody { transactions: vec![cb] },
+            body: BlockBody {
+                transactions: vec![cb],
+            },
         };
 
         let utxo_set = UtxoSet::new_empty();
         let result = BlockValidator::validate_block_full_with_network(
-            &block, &utxo_set, &NetworkMode::Mainnet,
+            &block,
+            &utxo_set,
+            &NetworkMode::Mainnet,
         );
         assert!(!result.valid, "wrong genesis hash must fail");
         assert!(
-            result.reason.as_ref().is_some_and(|r| r.contains("genesis mismatch")),
+            result
+                .reason
+                .as_ref()
+                .is_some_and(|r| r.contains("genesis mismatch")),
             "unexpected reason: {:?}",
             result.reason
         );

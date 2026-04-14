@@ -13,10 +13,13 @@
 // Port: 18787 (configurable)
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}};
-use tokio::sync::broadcast;
 use crate::slog_warn;
+use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
+use tokio::sync::broadcast;
 
 /// Subscription types for real-time event streaming
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -33,24 +36,24 @@ impl SubscriptionType {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "new_block" | "newBlock"           => Some(Self::NewBlock),
-            "new_transaction" | "newTx"        => Some(Self::NewTransaction),
-            "dag_tips" | "dagTips"             => Some(Self::DagTipsChanged),
-            "utxo_changed" | "utxoChanged"     => Some(Self::UtxoChanged),
-            "virtual_chain" | "virtualChain"   => Some(Self::VirtualChainChanged),
-            "pruning" | "pruningCompleted"     => Some(Self::PruningCompleted),
+            "new_block" | "newBlock" => Some(Self::NewBlock),
+            "new_transaction" | "newTx" => Some(Self::NewTransaction),
+            "dag_tips" | "dagTips" => Some(Self::DagTipsChanged),
+            "utxo_changed" | "utxoChanged" => Some(Self::UtxoChanged),
+            "virtual_chain" | "virtualChain" => Some(Self::VirtualChainChanged),
+            "pruning" | "pruningCompleted" => Some(Self::PruningCompleted),
             _ => None,
         }
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::NewBlock            => "new_block",
-            Self::NewTransaction      => "new_transaction",
-            Self::DagTipsChanged      => "dag_tips",
-            Self::UtxoChanged         => "utxo_changed",
+            Self::NewBlock => "new_block",
+            Self::NewTransaction => "new_transaction",
+            Self::DagTipsChanged => "dag_tips",
+            Self::UtxoChanged => "utxo_changed",
             Self::VirtualChainChanged => "virtual_chain",
-            Self::PruningCompleted    => "pruning",
+            Self::PruningCompleted => "pruning",
         }
     }
 }
@@ -59,22 +62,22 @@ impl SubscriptionType {
 #[derive(Debug, Clone)]
 pub struct WsEvent {
     pub event_type: SubscriptionType,
-    pub payload:    String, // JSON string
+    pub payload: String, // JSON string
 }
 
 /// Subscription tracking
 pub struct WsSubscription {
-    pub id:         u64,
-    pub sub_type:   SubscriptionType,
+    pub id: u64,
+    pub sub_type: SubscriptionType,
 }
 
 /// WebSocket RPC server configuration and event bus
 pub struct WsServer {
-    pub port:            u16,
-    next_sub_id:         AtomicU64,
-    subscriptions:       Arc<Mutex<HashMap<u64, Vec<WsSubscription>>>>,
-    event_tx:            broadcast::Sender<WsEvent>,
-    _event_rx:           broadcast::Receiver<WsEvent>,
+    pub port: u16,
+    next_sub_id: AtomicU64,
+    subscriptions: Arc<Mutex<HashMap<u64, Vec<WsSubscription>>>>,
+    event_tx: broadcast::Sender<WsEvent>,
+    _event_rx: broadcast::Receiver<WsEvent>,
     pub max_subscriptions_per_conn: usize,
 }
 
@@ -83,10 +86,10 @@ impl WsServer {
         let (tx, rx) = broadcast::channel(1024);
         Self {
             port,
-            next_sub_id:         AtomicU64::new(1),
-            subscriptions:       Arc::new(Mutex::new(HashMap::new())),
-            event_tx:            tx,
-            _event_rx:           rx,
+            next_sub_id: AtomicU64::new(1),
+            subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            event_tx: tx,
+            _event_rx: rx,
             max_subscriptions_per_conn: 10,
         }
     }
@@ -107,7 +110,8 @@ impl WsServer {
     /// Connection handlers should call this for every event received from
     /// the broadcast channel and drop events that return `false`.
     pub fn should_deliver(&self, conn_id: u64, event_type: SubscriptionType) -> bool {
-        self.subscriptions.lock()
+        self.subscriptions
+            .lock()
             .map(|subs| {
                 subs.get(&conn_id)
                     .map(|conn_subs| conn_subs.iter().any(|s| s.sub_type == event_type))
@@ -124,17 +128,23 @@ impl WsServer {
     /// `event_type` at all, avoiding unnecessary broadcast traffic.
     pub fn publish(&self, event_type: SubscriptionType, payload: String) {
         // Only send if at least one connection has subscribed to this event type
-        let has_subscribers = self.subscriptions.lock()
-            .map(|subs| subs.values().any(|conn_subs|
-                conn_subs.iter().any(|s| s.sub_type == event_type)
-            ))
+        let has_subscribers = self
+            .subscriptions
+            .lock()
+            .map(|subs| {
+                subs.values()
+                    .any(|conn_subs| conn_subs.iter().any(|s| s.sub_type == event_type))
+            })
             .unwrap_or(false);
 
         if !has_subscribers {
             return; // No subscribers for this event type — skip broadcast
         }
 
-        let event = WsEvent { event_type, payload };
+        let event = WsEvent {
+            event_type,
+            payload,
+        };
         if let Err(_e) = self.event_tx.send(event) {
             slog_warn!("rpc", "ws_event_dropped", event_type => format!("{:?}", event_type));
         }
@@ -148,7 +158,10 @@ impl WsServer {
             return None; // Limit reached — don't allocate sub_id
         }
         let sub_id = self.next_sub_id.fetch_add(1, Ordering::SeqCst);
-        conn_subs.push(WsSubscription { id: sub_id, sub_type });
+        conn_subs.push(WsSubscription {
+            id: sub_id,
+            sub_type,
+        });
         Some(sub_id)
     }
 
@@ -200,7 +213,8 @@ impl WsServer {
             "hash": hash,
             "height": height,
             "tx_count": tx_count,
-        }).to_string();
+        })
+        .to_string();
         self.publish(SubscriptionType::NewBlock, payload);
     }
 
@@ -209,7 +223,8 @@ impl WsServer {
         let payload = serde_json::json!({
             "txid": txid,
             "fee": fee,
-        }).to_string();
+        })
+        .to_string();
         self.publish(SubscriptionType::NewTransaction, payload);
     }
 
@@ -218,7 +233,8 @@ impl WsServer {
         let payload = serde_json::json!({
             "tip_count": tip_count,
             "best_hash": best_hash,
-        }).to_string();
+        })
+        .to_string();
         self.publish(SubscriptionType::DagTipsChanged, payload);
     }
 
@@ -227,7 +243,8 @@ impl WsServer {
         let payload = serde_json::json!({
             "pruned_count": pruned_count,
             "lowest_height": lowest_height,
-        }).to_string();
+        })
+        .to_string();
         self.publish(SubscriptionType::PruningCompleted, payload);
     }
 
@@ -251,7 +268,8 @@ mod tests {
     #[test]
     fn subscription_lifecycle() {
         let server = WsServer::new(18787);
-        let sub_id = server.add_subscription(1, SubscriptionType::NewBlock)
+        let sub_id = server
+            .add_subscription(1, SubscriptionType::NewBlock)
             .expect("subscription should succeed");
         assert!(sub_id > 0);
         assert_eq!(server.subscription_count(), 1);
@@ -279,12 +297,18 @@ mod tests {
         let server = WsServer::new(18787);
         let mut accepted = 0;
         for _ in 0..15 {
-            if server.add_subscription(1, SubscriptionType::NewBlock).is_some() {
+            if server
+                .add_subscription(1, SubscriptionType::NewBlock)
+                .is_some()
+            {
                 accepted += 1;
             }
         }
         assert_eq!(accepted, server.max_subscriptions_per_conn);
-        assert_eq!(server.subscription_count(), server.max_subscriptions_per_conn);
+        assert_eq!(
+            server.subscription_count(),
+            server.max_subscriptions_per_conn
+        );
     }
 
     #[test]
@@ -328,8 +352,14 @@ mod tests {
 
     #[test]
     fn subscription_type_parsing() {
-        assert_eq!(SubscriptionType::from_str("new_block"), Some(SubscriptionType::NewBlock));
-        assert_eq!(SubscriptionType::from_str("newTx"), Some(SubscriptionType::NewTransaction));
+        assert_eq!(
+            SubscriptionType::from_str("new_block"),
+            Some(SubscriptionType::NewBlock)
+        );
+        assert_eq!(
+            SubscriptionType::from_str("newTx"),
+            Some(SubscriptionType::NewTransaction)
+        );
         assert_eq!(SubscriptionType::from_str("invalid"), None);
     }
 }

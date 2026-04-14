@@ -4,7 +4,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::domain::transaction::transaction::Transaction;
-use crate::domain::utxo::utxo_set::{UtxoSet, utxo_key};
+use crate::domain::utxo::utxo_set::{utxo_key, UtxoSet};
 use crate::errors::StorageError;
 
 /// Maximum allowed fee (prevents absurd fee attacks)
@@ -20,26 +20,33 @@ impl TxFee {
 
         for input in &tx.inputs {
             let key = utxo_key(&input.txid, input.index)?;
-            let utxo = utxo_set.get_utxo(&key)
-                .ok_or_else(|| StorageError::KeyNotFound(format!("input utxo {} not found", key)))?;
-            input_sum = input_sum.checked_add(utxo.amount)
+            let utxo = utxo_set.get_utxo(&key).ok_or_else(|| {
+                StorageError::KeyNotFound(format!("input utxo {} not found", key))
+            })?;
+            input_sum = input_sum
+                .checked_add(utxo.amount)
                 .ok_or_else(|| StorageError::Other("Input sum overflow".to_string()))?;
         }
 
         for output in &tx.outputs {
-            output_sum = output_sum.checked_add(output.amount)
+            output_sum = output_sum
+                .checked_add(output.amount)
                 .ok_or_else(|| StorageError::Other("Output sum overflow".to_string()))?;
         }
 
         if input_sum < output_sum {
             return Err(StorageError::Other(format!(
-                "Outputs ({}) exceed inputs ({})", output_sum, input_sum
+                "Outputs ({}) exceed inputs ({})",
+                output_sum, input_sum
             )));
         }
 
         let fee = input_sum - output_sum;
         if fee > MAX_FEE {
-            return Err(StorageError::Other(format!("Fee {} exceeds maximum {}", fee, MAX_FEE)));
+            return Err(StorageError::Other(format!(
+                "Fee {} exceeds maximum {}",
+                fee, MAX_FEE
+            )));
         }
 
         Ok(fee)

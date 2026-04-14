@@ -7,16 +7,16 @@
 // for hierarchical deterministic (HD) wallet support.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
-use hmac::{Hmac, Mac};
 use curve25519_dalek::scalar::Scalar;
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
 /// Domain separation tags for different derivation contexts
-const TAG_VIEW_KEY:    &[u8] = b"ShadowDAG_DeriveView_v1";
-const TAG_CHILD_KEY:   &[u8] = b"ShadowDAG_DeriveChild_v1";
-const TAG_ADDRESS:     &[u8] = b"ShadowDAG_DeriveAddr_v1";
+const TAG_VIEW_KEY: &[u8] = b"ShadowDAG_DeriveView_v1";
+const TAG_CHILD_KEY: &[u8] = b"ShadowDAG_DeriveChild_v1";
+const TAG_ADDRESS: &[u8] = b"ShadowDAG_DeriveAddr_v1";
 
 pub struct KeyDerivation;
 
@@ -39,8 +39,7 @@ impl KeyDerivation {
         // Scalar encoding.  This avoids the skip-ahead loop that caused
         // derive_child(k, 0) == derive_child(k, 1) when index 0 happened
         // to produce a non-canonical result and wrapped to index 1.
-        let mut mac = HmacSha256::new_from_slice(parent_key)
-            .expect("HMAC key length");
+        let mut mac = HmacSha256::new_from_slice(parent_key).expect("HMAC key length");
         mac.update(TAG_CHILD_KEY);
         mac.update(&index.to_be_bytes());
         let result = mac.finalize().into_bytes();
@@ -62,8 +61,7 @@ impl KeyDerivation {
     /// Derive a view key from a master private key.
     /// Returns bytes guaranteed to be a canonical Scalar encoding.
     pub fn derive_view_key(master_key: &[u8; 32]) -> [u8; 32] {
-        let mut mac = HmacSha256::new_from_slice(master_key)
-            .expect("HMAC key length");
+        let mut mac = HmacSha256::new_from_slice(master_key).expect("HMAC key length");
         mac.update(b"shadowdag_view_key_v2");
         let result = mac.finalize().into_bytes();
         let mut raw = [0u8; 32];
@@ -74,8 +72,7 @@ impl KeyDerivation {
     /// Derive a spend key from a master private key.
     /// Returns bytes guaranteed to be a canonical Scalar encoding.
     pub fn derive_spend_key(master_key: &[u8; 32]) -> [u8; 32] {
-        let mut mac = HmacSha256::new_from_slice(master_key)
-            .expect("HMAC key length");
+        let mut mac = HmacSha256::new_from_slice(master_key).expect("HMAC key length");
         mac.update(b"shadowdag_spend_key_v2");
         let result = mac.finalize().into_bytes();
         let mut raw = [0u8; 32];

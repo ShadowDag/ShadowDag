@@ -3,7 +3,7 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options};
+use rocksdb::{Options, DB};
 use std::path::Path;
 
 use crate::errors::StorageError;
@@ -11,7 +11,6 @@ use crate::slog_error;
 
 pub struct BlockIndex {
     db: DB,
-
 }
 
 impl BlockIndex {
@@ -33,11 +32,10 @@ impl BlockIndex {
     /// block processing; silently ignoring it would leave the height index
     /// inconsistent with the header store.
     pub fn set_height(&self, hash: &str, height: u64) -> Result<(), StorageError> {
-        self.db.put(hash, height.to_be_bytes())
-            .map_err(|e| {
-                slog_error!("storage", "height_index_write_failed", hash => hash, error => &e);
-                StorageError::WriteFailed(e.to_string())
-            })
+        self.db.put(hash, height.to_be_bytes()).map_err(|e| {
+            slog_error!("storage", "height_index_write_failed", hash => hash, error => &e);
+            StorageError::WriteFailed(e.to_string())
+        })
     }
 
     pub fn get_height(&self, hash: &str) -> Option<u64> {
@@ -58,5 +56,4 @@ impl BlockIndex {
             }
         }
     }
-
 }

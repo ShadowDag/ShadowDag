@@ -3,16 +3,14 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::errors::StorageError;
+use crate::slog_error;
 use rocksdb::{
-    DB, Options, WriteOptions, ReadOptions,
-    WriteBatch, DBPinnableSlice,
-    BlockBasedOptions, Cache, SliceTransform,
-    IteratorMode, Direction,
+    BlockBasedOptions, Cache, DBPinnableSlice, Direction, IteratorMode, Options, ReadOptions,
+    SliceTransform, WriteBatch, WriteOptions, DB,
 };
 use std::path::Path;
 use std::sync::Arc;
-use crate::errors::StorageError;
-use crate::slog_error;
 
 // prefix
 const KEY_PREFIX: &[u8] = b"kp:";
@@ -30,7 +28,6 @@ pub struct KeyPairStore {
 }
 
 impl KeyPairStore {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
@@ -52,11 +49,13 @@ impl KeyPairStore {
 
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(PREFIX_LEN));
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         let write_opts = WriteOptions::default();
-        let read_opts  = ReadOptions::default();
+        let read_opts = ReadOptions::default();
 
         let mut _iter_read_opts = ReadOptions::default();
         _iter_read_opts.set_prefix_same_as_start(true);
@@ -198,10 +197,7 @@ impl KeyPairStore {
             return None;
         }
 
-        Some((
-            data[4..4 + pub_len].to_vec(),
-            data[4 + pub_len..].to_vec(),
-        ))
+        Some((data[4..4 + pub_len].to_vec(), data[4 + pub_len..].to_vec()))
     }
 
     // ─────────────────────────────────────────
@@ -223,7 +219,6 @@ impl KeyPairStore {
     // MULTI GET
     // ─────────────────────────────────────────
     pub fn multi_get(&self, ids: &[Vec<u8>]) -> Vec<Option<(Vec<u8>, Vec<u8>)>> {
-
         let mut keys = Vec::with_capacity(ids.len());
         keys.reserve_exact(ids.len());
 
@@ -234,14 +229,18 @@ impl KeyPairStore {
             keys.push(k);
         }
 
-        self.db.multi_get_opt(keys, &self.read_opts)
+        self.db
+            .multi_get_opt(keys, &self.read_opts)
             .into_iter()
             .map(|res| res.ok().flatten().and_then(|v| Self::decode_pair(&v)))
             .collect()
     }
 
     pub fn batch_exists(&self, ids: &[Vec<u8>]) -> Vec<bool> {
-        self.multi_get(ids).into_iter().map(|v| v.is_some()).collect()
+        self.multi_get(ids)
+            .into_iter()
+            .map(|v| v.is_some())
+            .collect()
     }
 
     // ─────────────────────────────────────────
@@ -259,13 +258,11 @@ impl KeyPairStore {
     // BATCH STORE
     // ─────────────────────────────────────────
     pub fn batch_store(&self, items: &[(Vec<u8>, Vec<u8>, Vec<u8>)]) {
-
         let mut batch = WriteBatch::default();
         let mut key_buf = Vec::with_capacity(128);
         let mut val_buf = Vec::with_capacity(256);
 
         for (id, pub_key, priv_key) in items {
-
             key_buf.clear();
             key_buf.extend_from_slice(KEY_PREFIX);
             key_buf.extend_from_slice(id);
@@ -288,7 +285,6 @@ impl KeyPairStore {
     // BATCH DELETE
     // ─────────────────────────────────────────
     pub fn batch_delete(&self, ids: &[Vec<u8>]) {
-
         let mut batch = WriteBatch::default();
         let mut key_buf = Vec::with_capacity(128);
 
@@ -362,7 +358,9 @@ impl KeyPairStore {
         );
 
         for item in iter {
-            if item.is_err() { break; }
+            if item.is_err() {
+                break;
+            }
             total += 1;
         }
 
@@ -371,12 +369,13 @@ impl KeyPairStore {
 
     pub fn is_empty(&self) -> bool {
         matches!(
-            self.db.iterator_opt(
-                IteratorMode::From(KEY_PREFIX, Direction::Forward),
-                Self::new_iter_opts(),
-            ).next(),
+            self.db
+                .iterator_opt(
+                    IteratorMode::From(KEY_PREFIX, Direction::Forward),
+                    Self::new_iter_opts(),
+                )
+                .next(),
             None | Some(Err(_))
         )
     }
-
 }

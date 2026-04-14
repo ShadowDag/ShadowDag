@@ -12,34 +12,38 @@
 //   shadowdag-miner --network=testnet           # Mine on testnet
 // ═══════════════════════════════════════════════════════════════════════════
 
-use shadowdag::engine::mining::algorithms::shadowhash::{shadow_hash_raw_full, meets_difficulty};
-use shadowdag::config::genesis::genesis::create_genesis_block_for;
+use sha2::{Digest, Sha256};
 use shadowdag::config::consensus::consensus_params::ConsensusParams;
 use shadowdag::config::consensus::emission_schedule::EmissionSchedule;
+use shadowdag::config::genesis::genesis::{
+    create_genesis_block_for, REGTEST_DEV_ADDRESS, TESTNET_DEV_ADDRESS,
+};
 use shadowdag::config::node::node_config::NetworkMode;
 use shadowdag::domain::block::block::Block;
-use shadowdag::domain::block::block_header::BlockHeader;
 use shadowdag::domain::block::block_body::BlockBody;
+use shadowdag::domain::block::block_header::BlockHeader;
 use shadowdag::domain::block::merkle_tree::MerkleTree;
 use shadowdag::domain::transaction::transaction::{Transaction, TxOutput, TxType};
-use sha2::{Sha256, Digest};
+use shadowdag::engine::mining::algorithms::shadowhash::{meets_difficulty, shadow_hash_raw_full};
+use shadowdag::errors::NodeError;
+use shadowdag::{slog_error, slog_fatal, slog_info, slog_warn};
+use std::io::{BufRead, Read, Write};
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH, Instant};
-use std::io::{Read, Write, BufRead};
-use std::net::TcpStream;
-use shadowdag::errors::NodeError;
-use shadowdag::{slog_info, slog_warn, slog_error, slog_fatal};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 fn main() {
     shadowdag::telemetry::logging::structured::init();
     let args: Vec<String> = std::env::args().collect();
 
     if has_flag(&args, "--help") || has_flag(&args, "-h") {
-        print_help(); return;
+        print_help();
+        return;
     }
     if has_flag(&args, "--version") || has_flag(&args, "-v") {
-        println!("ShadowDAG Miner v1.0.0"); return;
+        println!("ShadowDAG Miner v1.0.0");
+        return;
     }
 
     if let Err(e) = run_miner(&args) {
@@ -65,13 +69,18 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
     };
     let network_str = parse_flag(args, "--network", "mainnet");
     let network: NetworkMode = network_str.parse().map_err(|_| {
-        NodeError::Init(format!("invalid --network '{}'. Use: mainnet, testnet, or regtest", network_str))
+        NodeError::Init(format!(
+            "invalid --network '{}'. Use: mainnet, testnet, or regtest",
+            network_str
+        ))
     })?;
     let default_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let threads: usize = parse_flag(args, "--threads",
-        &default_threads.to_string()).parse().unwrap_or(4).clamp(1, 256);
+    let threads: usize = parse_flag(args, "--threads", &default_threads.to_string())
+        .parse()
+        .unwrap_or(4)
+        .clamp(1, 256);
 
     let rpc_port = match network {
         NetworkMode::Testnet => 19332,
@@ -80,7 +89,12 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
     };
     let rpc_addr = parse_flag(args, "--rpc", &format!("127.0.0.1:{}", rpc_port));
 
-    let owner_address = ConsensusParams::OWNER_REWARD_ADDRESS.to_string();
+    let owner_address = match network {
+        NetworkMode::Mainnet => ConsensusParams::OWNER_REWARD_ADDRESS,
+        NetworkMode::Testnet => TESTNET_DEV_ADDRESS,
+        NetworkMode::Regtest => REGTEST_DEV_ADDRESS,
+    }
+    .to_string();
     let genesis = create_genesis_block_for(&network);
 
     // Initialize rayon thread pool — fail loudly if it can't be built
@@ -125,7 +139,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
             }
         };
 
-        let height    = template.height;
+        let height = template.height;
         let prev_hash = template.prev_hash;
         let difficulty = template.difficulty;
 
@@ -160,8 +174,20 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
             hash: cb_hash,
             inputs: vec![],
             outputs: vec![
-                TxOutput { address: miner_address.clone(), amount: miner_reward, commitment: None, range_proof: None, ephemeral_pubkey: None },
-                TxOutput { address: owner_address.clone(), amount: dev_reward, commitment: None, range_proof: None, ephemeral_pubkey: None },
+                TxOutput {
+                    address: miner_address.clone(),
+                    amount: miner_reward,
+                    commitment: None,
+                    range_proof: None,
+                    ephemeral_pubkey: None,
+                },
+                TxOutput {
+                    address: owner_address.clone(),
+                    amount: dev_reward,
+                    commitment: None,
+                    range_proof: None,
+                    ephemeral_pubkey: None,
+                },
             ],
             fee: 0,
             timestamp,
@@ -216,11 +242,11 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
                     }
 
                     let hash = shadow_hash_raw_full(
-                        1,              // version
+                        1, // version
                         height,
                         timestamp,
                         nonce,
-                        0,              // extra_nonce
+                        0, // extra_nonce
                         t_difficulty,
                         &t_merkle,
                         &t_parents,
@@ -275,7 +301,12 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         let fees_sdag = template.total_fees as f64 / 100_000_000.0;
         println!(
             "⛏  Block #{} mined! hash={}... nonce={} time={:.1}s rate={:.0} H/s fees={:.8} SDAG",
-            height, &hash[..16], nonce, elapsed, hashrate, fees_sdag
+            height,
+            &hash[..16],
+            nonce,
+            elapsed,
+            hashrate,
+            fees_sdag
         );
 
         // ═══ STEP 4: Build full block and submit ═══
@@ -319,7 +350,11 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         // Stats every 10 blocks
         if total_mined.is_multiple_of(10) {
             let session_secs = session_start.elapsed().as_secs_f64();
-            let avg_rate = if session_secs > 0.0 { total_mined as f64 / session_secs * 60.0 } else { 0.0 };
+            let avg_rate = if session_secs > 0.0 {
+                total_mined as f64 / session_secs * 60.0
+            } else {
+                0.0
+            };
             let reward_sdag = emission as f64 / 100_000_000.0;
             println!(
                 "📊 Stats: {} mined, {} accepted | {:.1} blocks/min | reward={:.2} SDAG | height={}",
@@ -334,11 +369,11 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 struct BlockTemplate {
-    height:        u64,
-    prev_hash:     String,
+    height: u64,
+    prev_hash: String,
     parent_hashes: Vec<String>,
-    difficulty:    u64,
-    total_fees:    u64,
+    difficulty: u64,
+    total_fees: u64,
 }
 
 enum SubmitResult {
@@ -356,8 +391,12 @@ fn rpc_call(addr: &str, method: &str, params: &str) -> Option<String> {
     );
 
     let mut stream = TcpStream::connect(addr).ok()?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(10))).ok();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .ok();
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+        .ok();
 
     let request = format!(
         "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -378,12 +417,16 @@ fn rpc_call(addr: &str, method: &str, params: &str) -> Option<String> {
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
-            Ok(0) => break,  // EOF
+            Ok(0) => break, // EOF
             Ok(_) => {
                 let trimmed = line.trim();
-                if trimmed.is_empty() { break; } // End of headers
+                if trimmed.is_empty() {
+                    break;
+                } // End of headers
                 header_count += 1;
-                if header_count > 100 { break; }
+                if header_count > 100 {
+                    break;
+                }
                 // Case-insensitive Content-Length matching
                 if trimmed.len() > 15 && trimmed[..15].eq_ignore_ascii_case("content-length:") {
                     content_length = trimmed[15..].trim().parse().unwrap_or(0);
@@ -425,19 +468,37 @@ fn rpc_get_template(addr: &str) -> Option<BlockTemplate> {
     let result = parsed.get("result")?;
 
     let height = result.get("height").and_then(|v| v.as_u64())?;
-    let prev_hash = result.get("prev_hash").and_then(|v| v.as_str())?.to_string();
-    let difficulty = result.get("difficulty").and_then(|v| v.as_u64()).unwrap_or(1);
-    let total_fees = result.get("total_fees").and_then(|v| v.as_u64()).unwrap_or(0);
+    let prev_hash = result
+        .get("prev_hash")
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let difficulty = result
+        .get("difficulty")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+    let total_fees = result
+        .get("total_fees")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     // Parse DAG parent hashes -- the tips the miner must reference
-    let parent_hashes = result.get("parent_hashes")
+    let parent_hashes = result
+        .get("parent_hashes")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect::<Vec<String>>())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<String>>()
+        })
         .unwrap_or_else(|| vec![prev_hash.clone()]);
 
-    Some(BlockTemplate { height, prev_hash, parent_hashes, difficulty, total_fees })
+    Some(BlockTemplate {
+        height,
+        prev_hash,
+        parent_hashes,
+        difficulty,
+        total_fees,
+    })
 }
 
 fn rpc_submit_block(addr: &str, block: &Block) -> SubmitResult {
@@ -478,11 +539,10 @@ fn rpc_submit_block(addr: &str, block: &Block) -> SubmitResult {
                     // Check if the response contains a non-null error field
                     match parsed.get("error") {
                         Some(err) if !err.is_null() => {
-                            let reason = err.get("message")
+                            let reason = err
+                                .get("message")
                                 .and_then(|m| m.as_str())
-                                .unwrap_or_else(|| {
-                                    err.as_str().unwrap_or("unknown error")
-                                })
+                                .unwrap_or_else(|| err.as_str().unwrap_or("unknown error"))
                                 .to_string();
                             SubmitResult::Rejected(reason)
                         }
@@ -491,9 +551,7 @@ fn rpc_submit_block(addr: &str, block: &Block) -> SubmitResult {
                 }
                 Err(_) => {
                     // Unparseable response -- treat as rejection
-                    SubmitResult::Rejected(
-                        response[..response.len().min(200)].to_string()
-                    )
+                    SubmitResult::Rejected(response[..response.len().min(200)].to_string())
                 }
             }
         }
@@ -560,4 +618,3 @@ fn parse_flag_opt(args: &[String], name: &str) -> Result<Option<String>, String>
 fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
-

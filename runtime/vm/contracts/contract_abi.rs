@@ -9,10 +9,10 @@
 // return types, and events. Used for encoding/decoding contract calls.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use serde::{Serialize, Deserialize};
-use sha2::{Sha256, Digest};
 use crate::errors::VmError;
 use crate::slog_error;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// ABI parameter types
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -29,13 +29,13 @@ pub enum AbiType {
 impl AbiType {
     pub fn name(&self) -> &str {
         match self {
-            AbiType::Uint64     => "uint64",
-            AbiType::Int64      => "int64",
-            AbiType::Bool       => "bool",
-            AbiType::String     => "string",
-            AbiType::Bytes      => "bytes",
-            AbiType::Address    => "address",
-            AbiType::Array(_)   => "array",
+            AbiType::Uint64 => "uint64",
+            AbiType::Int64 => "int64",
+            AbiType::Bool => "bool",
+            AbiType::String => "string",
+            AbiType::Bytes => "bytes",
+            AbiType::Address => "address",
+            AbiType::Array(_) => "array",
         }
     }
 
@@ -60,12 +60,12 @@ impl AbiType {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self, VmError> {
         match s {
-            "uint64" | "uint"   => Ok(AbiType::Uint64),
-            "int64"  | "int"    => Ok(AbiType::Int64),
-            "bool"              => Ok(AbiType::Bool),
-            "string"            => Ok(AbiType::String),
-            "bytes"             => Ok(AbiType::Bytes),
-            "address"           => Ok(AbiType::Address),
+            "uint64" | "uint" => Ok(AbiType::Uint64),
+            "int64" | "int" => Ok(AbiType::Int64),
+            "bool" => Ok(AbiType::Bool),
+            "string" => Ok(AbiType::String),
+            "bytes" => Ok(AbiType::Bytes),
+            "address" => Ok(AbiType::Address),
             other => Err(VmError::ContractError(format!(
                 "unknown ABI type '{}': expected one of \
                  uint64/uint, int64/int, bool, string, bytes, address",
@@ -78,20 +78,20 @@ impl AbiType {
 /// A function parameter
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AbiParam {
-    pub name:     String,
+    pub name: String,
     pub abi_type: AbiType,
-    pub indexed:  bool, // For events
+    pub indexed: bool, // For events
 }
 
 /// A function in the ABI
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AbiFunction {
-    pub name:       String,
-    pub inputs:     Vec<AbiParam>,
-    pub outputs:    Vec<AbiParam>,
+    pub name: String,
+    pub inputs: Vec<AbiParam>,
+    pub outputs: Vec<AbiParam>,
     pub mutability: Mutability,
     /// 4-byte function selector (first 4 bytes of SHA-256 of signature)
-    pub selector:   [u8; 4],
+    pub selector: [u8; 4],
 }
 
 /// Function mutability
@@ -110,15 +110,17 @@ pub enum Mutability {
 /// An event in the ABI
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AbiEvent {
-    pub name:      String,
-    pub params:    Vec<AbiParam>,
+    pub name: String,
+    pub params: Vec<AbiParam>,
     pub anonymous: bool,
 }
 
 impl AbiEvent {
     /// Compute the canonical event signature: EventName(type1,type2,...).
     pub fn signature(&self) -> String {
-        let params: Vec<String> = self.params.iter()
+        let params: Vec<String> = self
+            .params
+            .iter()
             .map(|p| p.abi_type.name().to_string())
             .collect();
         format!("{}({})", self.name, params.join(","))
@@ -135,26 +137,32 @@ pub struct DecodedEvent {
 /// Complete contract ABI
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContractAbi {
-    pub name:         String,
-    pub version:      String,
-    pub functions:    Vec<AbiFunction>,
-    pub events:       Vec<AbiEvent>,
-    pub constructor:  Option<AbiFunction>,
+    pub name: String,
+    pub version: String,
+    pub functions: Vec<AbiFunction>,
+    pub events: Vec<AbiEvent>,
+    pub constructor: Option<AbiFunction>,
 }
 
 impl ContractAbi {
     pub fn new(name: &str) -> Self {
         Self {
-            name:        name.to_string(),
-            version:     "1.0.0".to_string(),
-            functions:   Vec::new(),
-            events:      Vec::new(),
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            functions: Vec::new(),
+            events: Vec::new(),
             constructor: None,
         }
     }
 
     /// Add a function to the ABI
-    pub fn add_function(&mut self, name: &str, inputs: Vec<AbiParam>, outputs: Vec<AbiParam>, mutability: Mutability) {
+    pub fn add_function(
+        &mut self,
+        name: &str,
+        inputs: Vec<AbiParam>,
+        outputs: Vec<AbiParam>,
+        mutability: Mutability,
+    ) {
         let selector = Self::compute_selector(name, &inputs);
         self.functions.push(AbiFunction {
             name: name.to_string(),
@@ -205,8 +213,14 @@ impl ContractAbi {
     /// (function call data) and [`Self::compute_event_topic0`] (event
     /// topic0) so they cannot drift apart.
     fn compute_signature_hash(name: &str, params: &[AbiParam]) -> [u8; 32] {
-        let sig = format!("{}({})", name,
-            params.iter().map(|p| p.abi_type.name().to_string()).collect::<Vec<_>>().join(",")
+        let sig = format!(
+            "{}({})",
+            name,
+            params
+                .iter()
+                .map(|p| p.abi_type.name().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         );
         let mut h = Sha256::new();
         h.update(sig.as_bytes());
@@ -232,11 +246,16 @@ impl ContractAbi {
     /// size. For variable-length types (String, Bytes, Array) any non-empty
     /// value is accepted.
     pub fn encode_call(&self, function_name: &str, args: &[Vec<u8>]) -> Result<Vec<u8>, VmError> {
-        let func = self.find_by_name(function_name)
-            .ok_or_else(|| VmError::ContractError(format!("Function '{}' not found in ABI", function_name)))?;
+        let func = self.find_by_name(function_name).ok_or_else(|| {
+            VmError::ContractError(format!("Function '{}' not found in ABI", function_name))
+        })?;
 
         if args.len() != func.inputs.len() {
-            return Err(VmError::ContractError(format!("Expected {} args, got {}", func.inputs.len(), args.len())));
+            return Err(VmError::ContractError(format!(
+                "Expected {} args, got {}",
+                func.inputs.len(),
+                args.len()
+            )));
         }
 
         // Validate each argument matches its declared ABI type's expected size
@@ -246,7 +265,11 @@ impl ContractAbi {
                 if arg.len() != size {
                     return Err(VmError::ContractError(format!(
                         "Argument '{}' (index {}) expected {} bytes for type {}, got {}",
-                        param.name, i, size, param.abi_type.name(), arg.len()
+                        param.name,
+                        i,
+                        size,
+                        param.abi_type.name(),
+                        arg.len()
                     )));
                 }
             }
@@ -265,19 +288,21 @@ impl ContractAbi {
     /// variable-length types.
     fn expected_arg_size(abi_type: &AbiType) -> Option<usize> {
         match abi_type {
-            AbiType::Uint64  => Some(8),
-            AbiType::Int64   => Some(8),
-            AbiType::Bool    => Some(1),
+            AbiType::Uint64 => Some(8),
+            AbiType::Int64 => Some(8),
+            AbiType::Bool => Some(1),
             AbiType::Address => None, // addresses are variable-length strings in ShadowDAG
-            AbiType::String  => None,
-            AbiType::Bytes   => None,
+            AbiType::String => None,
+            AbiType::Bytes => None,
             AbiType::Array(_) => None,
         }
     }
 
     /// Decode function selector from call data
     pub fn decode_selector(data: &[u8]) -> Option<[u8; 4]> {
-        if data.len() < 4 { return None; }
+        if data.len() < 4 {
+            return None;
+        }
         Some([data[0], data[1], data[2], data[3]])
     }
 
@@ -305,13 +330,19 @@ impl ContractAbi {
 
     /// Deserialize ABI from JSON
     pub fn from_json(json: &str) -> Result<Self, VmError> {
-        serde_json::from_str(json).map_err(|e| VmError::ContractError(format!("ABI parse error: {}", e)))
+        serde_json::from_str(json)
+            .map_err(|e| VmError::ContractError(format!("ABI parse error: {}", e)))
     }
 
     /// Decode return data bytes according to a function's output types.
     /// Returns a vector of (name, hex_value) pairs.
-    pub fn decode_return(&self, function_name: &str, data: &[u8]) -> Result<Vec<(String, String)>, String> {
-        let func = self.find_by_name(function_name)
+    pub fn decode_return(
+        &self,
+        function_name: &str,
+        data: &[u8],
+    ) -> Result<Vec<(String, String)>, String> {
+        let func = self
+            .find_by_name(function_name)
             .ok_or_else(|| format!("function '{}' not found", function_name))?;
 
         let mut results = Vec::new();
@@ -322,9 +353,12 @@ impl ContractAbi {
             match size {
                 Some(s) => {
                     if offset + s > data.len() {
-                        return Err(format!("insufficient return data for param '{}'", param.name));
+                        return Err(format!(
+                            "insufficient return data for param '{}'",
+                            param.name
+                        ));
                     }
-                    results.push((param.name.clone(), hex::encode(&data[offset..offset+s])));
+                    results.push((param.name.clone(), hex::encode(&data[offset..offset + s])));
                     offset += s;
                 }
                 None => {
@@ -400,7 +434,9 @@ impl ContractAbi {
         // Strict equality against the full 32-byte event selector.
         // See the compute_event_topic0 doc for why this is NOT the
         // 4-byte function selector.
-        let event = self.events.iter()
+        let event = self
+            .events
+            .iter()
             .find(|e| {
                 let selector = hex::encode(Self::compute_event_topic0(&e.name, &e.params));
                 selector == topic0_norm
@@ -409,7 +445,7 @@ impl ContractAbi {
 
         // Independent cursors for topics and data.
         let mut topic_cursor = 1usize; // skip topic0 (event selector)
-        let mut data_offset  = 0usize;
+        let mut data_offset = 0usize;
         let mut decoded = Vec::with_capacity(event.params.len());
 
         for param in &event.params {
@@ -419,7 +455,10 @@ impl ContractAbi {
                     return Err(format!(
                         "event '{}' declares indexed param '{}' but log has no \
                          matching topic (topic_cursor={}, topics.len()={})",
-                        event.name, param.name, topic_cursor, topics.len()
+                        event.name,
+                        param.name,
+                        topic_cursor,
+                        topics.len()
                     ));
                 }
                 let v = topics[topic_cursor].clone();
@@ -435,7 +474,11 @@ impl ContractAbi {
                                 "event '{}' data too short for non-indexed \
                                  param '{}' (need {} bytes at offset {}, \
                                  data.len()={})",
-                                event.name, param.name, s, data_offset, data.len()
+                                event.name,
+                                param.name,
+                                s,
+                                data_offset,
+                                data.len()
                             ));
                         }
                         let encoded = hex::encode(&data[data_offset..data_offset + s]);
@@ -469,24 +512,61 @@ mod tests {
 
     fn make_abi() -> ContractAbi {
         let mut abi = ContractAbi::new("TestToken");
-        abi.add_function("transfer",
+        abi.add_function(
+            "transfer",
             vec![
-                AbiParam { name: "to".into(), abi_type: AbiType::Address, indexed: false },
-                AbiParam { name: "amount".into(), abi_type: AbiType::Uint64, indexed: false },
+                AbiParam {
+                    name: "to".into(),
+                    abi_type: AbiType::Address,
+                    indexed: false,
+                },
+                AbiParam {
+                    name: "amount".into(),
+                    abi_type: AbiType::Uint64,
+                    indexed: false,
+                },
             ],
-            vec![AbiParam { name: "success".into(), abi_type: AbiType::Bool, indexed: false }],
+            vec![AbiParam {
+                name: "success".into(),
+                abi_type: AbiType::Bool,
+                indexed: false,
+            }],
             Mutability::Mutable,
         );
-        abi.add_function("balance_of",
-            vec![AbiParam { name: "owner".into(), abi_type: AbiType::Address, indexed: false }],
-            vec![AbiParam { name: "balance".into(), abi_type: AbiType::Uint64, indexed: false }],
+        abi.add_function(
+            "balance_of",
+            vec![AbiParam {
+                name: "owner".into(),
+                abi_type: AbiType::Address,
+                indexed: false,
+            }],
+            vec![AbiParam {
+                name: "balance".into(),
+                abi_type: AbiType::Uint64,
+                indexed: false,
+            }],
             Mutability::View,
         );
-        abi.add_event("Transfer", vec![
-            AbiParam { name: "from".into(), abi_type: AbiType::Address, indexed: true },
-            AbiParam { name: "to".into(), abi_type: AbiType::Address, indexed: true },
-            AbiParam { name: "amount".into(), abi_type: AbiType::Uint64, indexed: false },
-        ]);
+        abi.add_event(
+            "Transfer",
+            vec![
+                AbiParam {
+                    name: "from".into(),
+                    abi_type: AbiType::Address,
+                    indexed: true,
+                },
+                AbiParam {
+                    name: "to".into(),
+                    abi_type: AbiType::Address,
+                    indexed: true,
+                },
+                AbiParam {
+                    name: "amount".into(),
+                    abi_type: AbiType::Uint64,
+                    indexed: false,
+                },
+            ],
+        );
         abi
     }
 
@@ -524,23 +604,29 @@ mod tests {
     #[test]
     fn encode_call() {
         let abi = make_abi();
-        let data = abi.encode_call("transfer", &[
-            b"SD1address".to_vec(),
-            1000u64.to_be_bytes().to_vec(),
-        ]).unwrap();
+        let data = abi
+            .encode_call(
+                "transfer",
+                &[b"SD1address".to_vec(), 1000u64.to_be_bytes().to_vec()],
+            )
+            .unwrap();
         assert!(data.len() >= 4);
     }
 
     #[test]
     fn encode_wrong_args_fails() {
         let abi = make_abi();
-        assert!(abi.encode_call("transfer", &[b"only_one".to_vec()]).is_err());
+        assert!(abi
+            .encode_call("transfer", &[b"only_one".to_vec()])
+            .is_err());
     }
 
     #[test]
     fn json_roundtrip() {
         let abi = make_abi();
-        let json = abi.to_json().expect("to_json must succeed on a well-formed ABI");
+        let json = abi
+            .to_json()
+            .expect("to_json must succeed on a well-formed ABI");
         let restored = ContractAbi::from_json(&json).unwrap();
         assert_eq!(restored.name, "TestToken");
         assert_eq!(restored.functions.len(), 2);
@@ -557,7 +643,10 @@ mod tests {
         // never returned.
         let abi = make_abi();
         let json = abi.to_json().unwrap();
-        assert!(!json.is_empty(), "to_json must not return an empty string on success");
+        assert!(
+            !json.is_empty(),
+            "to_json must not return an empty string on success"
+        );
         assert!(json.starts_with('{'), "to_json must return JSON object");
     }
 
@@ -571,12 +660,12 @@ mod tests {
     #[test]
     fn abi_type_from_str_resolves_known_types() {
         assert_eq!(AbiType::from_str("uint64").unwrap(), AbiType::Uint64);
-        assert_eq!(AbiType::from_str("uint").unwrap(),   AbiType::Uint64);
-        assert_eq!(AbiType::from_str("int64").unwrap(),  AbiType::Int64);
-        assert_eq!(AbiType::from_str("int").unwrap(),    AbiType::Int64);
-        assert_eq!(AbiType::from_str("bool").unwrap(),   AbiType::Bool);
+        assert_eq!(AbiType::from_str("uint").unwrap(), AbiType::Uint64);
+        assert_eq!(AbiType::from_str("int64").unwrap(), AbiType::Int64);
+        assert_eq!(AbiType::from_str("int").unwrap(), AbiType::Int64);
+        assert_eq!(AbiType::from_str("bool").unwrap(), AbiType::Bool);
         assert_eq!(AbiType::from_str("string").unwrap(), AbiType::String);
-        assert_eq!(AbiType::from_str("bytes").unwrap(),  AbiType::Bytes);
+        assert_eq!(AbiType::from_str("bytes").unwrap(), AbiType::Bytes);
         assert_eq!(AbiType::from_str("address").unwrap(), AbiType::Address);
     }
 
@@ -596,8 +685,16 @@ mod tests {
         // can fix the typo, and list the accepted alternatives.
         let err = AbiType::from_str("uint66").unwrap_err();
         let msg = format!("{}", err);
-        assert!(msg.contains("uint66"), "error must include the offending name, got: {}", msg);
-        assert!(msg.contains("uint64"), "error must list the accepted alternatives, got: {}", msg);
+        assert!(
+            msg.contains("uint66"),
+            "error must include the offending name, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("uint64"),
+            "error must list the accepted alternatives, got: {}",
+            msg
+        );
     }
 
     // ─── decode_event regression tests ──────────────────────────────
@@ -612,10 +709,21 @@ mod tests {
     /// This is the exact shape the old decoder silently mis-swapped.
     fn abi_with_non_leading_indexed_event() -> ContractAbi {
         let mut abi = ContractAbi::new("NonLeadingIndexedTest");
-        abi.add_event("NonLeadingIndexed", vec![
-            AbiParam { name: "amount".into(), abi_type: AbiType::Uint64,  indexed: false },
-            AbiParam { name: "from".into(),   abi_type: AbiType::Address, indexed: true  },
-        ]);
+        abi.add_event(
+            "NonLeadingIndexed",
+            vec![
+                AbiParam {
+                    name: "amount".into(),
+                    abi_type: AbiType::Uint64,
+                    indexed: false,
+                },
+                AbiParam {
+                    name: "from".into(),
+                    abi_type: AbiType::Address,
+                    indexed: true,
+                },
+            ],
+        );
         abi
     }
 
@@ -623,7 +731,11 @@ mod tests {
     /// name. Mirrors what `event_log::EventCollector` would emit as
     /// topic0 on a LOG1+ for this event.
     fn event_topic0_hex(abi: &ContractAbi, event_name: &str) -> String {
-        let ev = abi.events.iter().find(|e| e.name == event_name).expect("event present");
+        let ev = abi
+            .events
+            .iter()
+            .find(|e| e.name == event_name)
+            .expect("event present");
         hex::encode(ContractAbi::compute_event_topic0(&ev.name, &ev.params))
     }
 
@@ -675,24 +787,30 @@ mod tests {
         // (1) empty topic0 → must NOT match anything
         {
             let topics = vec!["".to_string(), topic1.clone()];
-            assert!(abi.decode_event(&topics, &amount_bytes).is_err(),
-                "empty topic0 must not match any event");
+            assert!(
+                abi.decode_event(&topics, &amount_bytes).is_err(),
+                "empty topic0 must not match any event"
+            );
         }
 
         // (2) short topic0 that is a prefix of the real selector → must NOT match
         {
             let short = real_topic0[..8].to_string();
             let topics = vec![short, topic1.clone()];
-            assert!(abi.decode_event(&topics, &amount_bytes).is_err(),
-                "byte-prefix of the real selector must not match the event");
+            assert!(
+                abi.decode_event(&topics, &amount_bytes).is_err(),
+                "byte-prefix of the real selector must not match the event"
+            );
         }
 
         // (3) long topic0 that the real selector is a prefix of → must NOT match
         {
             let long = format!("{}deadbeef", real_topic0);
             let topics = vec![long, topic1.clone()];
-            assert!(abi.decode_event(&topics, &amount_bytes).is_err(),
-                "super-string of the real selector must not match the event");
+            assert!(
+                abi.decode_event(&topics, &amount_bytes).is_err(),
+                "super-string of the real selector must not match the event"
+            );
         }
 
         // (4) the real full-length topic0 → matches
@@ -724,10 +842,21 @@ mod tests {
         // decoder walks `data` by `expected_arg_size` so each
         // fixed-width non-indexed param slices its own segment.
         let mut abi = ContractAbi::new("TwoFixedDataFields");
-        abi.add_event("TwoFixed", vec![
-            AbiParam { name: "a".into(), abi_type: AbiType::Uint64, indexed: false },
-            AbiParam { name: "b".into(), abi_type: AbiType::Uint64, indexed: false },
-        ]);
+        abi.add_event(
+            "TwoFixed",
+            vec![
+                AbiParam {
+                    name: "a".into(),
+                    abi_type: AbiType::Uint64,
+                    indexed: false,
+                },
+                AbiParam {
+                    name: "b".into(),
+                    abi_type: AbiType::Uint64,
+                    indexed: false,
+                },
+            ],
+        );
 
         let topic0 = event_topic0_hex(&abi, "TwoFixed");
         // 16 bytes: first 8 = 1u64, next 8 = 2u64
@@ -737,8 +866,14 @@ mod tests {
 
         let topics = vec![topic0];
         let decoded = abi.decode_event(&topics, &data).unwrap();
-        assert_eq!(decoded.params[0], ("a".into(), hex::encode(1u64.to_be_bytes())));
-        assert_eq!(decoded.params[1], ("b".into(), hex::encode(2u64.to_be_bytes())));
+        assert_eq!(
+            decoded.params[0],
+            ("a".into(), hex::encode(1u64.to_be_bytes()))
+        );
+        assert_eq!(
+            decoded.params[1],
+            ("b".into(), hex::encode(2u64.to_be_bytes()))
+        );
     }
 
     #[test]
@@ -746,9 +881,14 @@ mod tests {
         // Fail-loud when the encoded data is shorter than the fixed
         // non-indexed params can consume.
         let mut abi = ContractAbi::new("Short");
-        abi.add_event("Short", vec![
-            AbiParam { name: "a".into(), abi_type: AbiType::Uint64, indexed: false },
-        ]);
+        abi.add_event(
+            "Short",
+            vec![AbiParam {
+                name: "a".into(),
+                abi_type: AbiType::Uint64,
+                indexed: false,
+            }],
+        );
         let topic0 = event_topic0_hex(&abi, "Short");
 
         // 4 bytes — not enough for a uint64 (8 bytes)
@@ -763,9 +903,14 @@ mod tests {
         // Event declares an indexed param but the log doesn't include
         // the matching topic.
         let mut abi = ContractAbi::new("MissingTopic");
-        abi.add_event("MissingTopic", vec![
-            AbiParam { name: "from".into(), abi_type: AbiType::Address, indexed: true },
-        ]);
+        abi.add_event(
+            "MissingTopic",
+            vec![AbiParam {
+                name: "from".into(),
+                abi_type: AbiType::Address,
+                indexed: true,
+            }],
+        );
         let topic0 = event_topic0_hex(&abi, "MissingTopic");
 
         let topics = vec![topic0]; // no topic1 even though `from` is indexed

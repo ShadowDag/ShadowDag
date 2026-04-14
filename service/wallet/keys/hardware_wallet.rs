@@ -14,8 +14,8 @@
 //   - Generic FIDO2/U2F devices (for 2FA signing)
 // ═══════════════════════════════════════════════════════════════════════════
 
-use serde::{Serialize, Deserialize};
 use crate::errors::WalletError;
+use serde::{Deserialize, Serialize};
 
 /// Supported hardware wallet types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,11 +28,11 @@ pub enum HardwareWalletType {
 /// Hardware wallet device info
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardwareDevice {
-    pub device_type:  HardwareWalletType,
-    pub device_id:    String,
-    pub firmware:     String,
-    pub connected:    bool,
-    pub app_version:  String,
+    pub device_type: HardwareWalletType,
+    pub device_id: String,
+    pub firmware: String,
+    pub connected: bool,
+    pub app_version: String,
 }
 
 /// Hardware wallet manager
@@ -42,7 +42,9 @@ pub struct HardwareWalletManager {
 
 impl HardwareWalletManager {
     pub fn new() -> Self {
-        Self { devices: Vec::new() }
+        Self {
+            devices: Vec::new(),
+        }
     }
 
     /// Enumerate connected hardware wallets
@@ -62,11 +64,16 @@ impl HardwareWalletManager {
     /// it will communicate with Ledger/Trezor devices over USB HID to
     /// retrieve the public key at the given derivation path.
     #[allow(unused)]
-    pub fn get_public_key(&self, device_id: &str, _derivation_path: &str) -> Result<Vec<u8>, WalletError> {
+    pub fn get_public_key(
+        &self,
+        device_id: &str,
+        _derivation_path: &str,
+    ) -> Result<Vec<u8>, WalletError> {
         match self.get_device(device_id) {
-            Some(_d) if _d.connected => {
-                Err(WalletError::Other(format!("Device {} requires user confirmation on screen", device_id)))
-            }
+            Some(_d) if _d.connected => Err(WalletError::Other(format!(
+                "Device {} requires user confirmation on screen",
+                device_id
+            ))),
             Some(_) => Err(WalletError::Other("Device not connected".to_string())),
             None => Err(WalletError::Other("Device not found".to_string())),
         }
@@ -85,9 +92,10 @@ impl HardwareWalletManager {
         _derivation_path: &str,
     ) -> Result<Vec<u8>, WalletError> {
         match self.get_device(device_id) {
-            Some(d) if d.connected => {
-                Err(WalletError::Other(format!("Confirm transaction on {} screen", d.device_id)))
-            }
+            Some(d) if d.connected => Err(WalletError::Other(format!(
+                "Confirm transaction on {} screen",
+                d.device_id
+            ))),
             Some(_) => Err(WalletError::Other("Device not connected".to_string())),
             None => Err(WalletError::Other("Device not found".to_string())),
         }
@@ -96,9 +104,9 @@ impl HardwareWalletManager {
     /// Supported derivation paths for ShadowDAG
     pub fn derivation_paths() -> Vec<&'static str> {
         vec![
-            "m/44'/9999'/0'/0/0",  // ShadowDAG standard
-            "m/44'/9999'/0'/1/0",  // ShadowDAG change
-            "m/44'/9999'/1'/0/0",  // ShadowDAG account 1
+            "m/44'/9999'/0'/0/0", // ShadowDAG standard
+            "m/44'/9999'/0'/1/0", // ShadowDAG change
+            "m/44'/9999'/1'/0/0", // ShadowDAG account 1
         ]
     }
 
@@ -109,7 +117,11 @@ impl HardwareWalletManager {
 
     /// Supported device types
     pub fn supported_types() -> Vec<HardwareWalletType> {
-        vec![HardwareWalletType::Ledger, HardwareWalletType::Trezor, HardwareWalletType::Generic]
+        vec![
+            HardwareWalletType::Ledger,
+            HardwareWalletType::Trezor,
+            HardwareWalletType::Generic,
+        ]
     }
 }
 

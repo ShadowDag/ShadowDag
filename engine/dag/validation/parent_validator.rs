@@ -4,11 +4,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use rocksdb::{
-    DB, Options,
-    WriteOptions, ReadOptions,
-    WriteBatch, DBPinnableSlice,
-    IteratorMode, Direction,
-    BlockBasedOptions, SliceTransform, Cache,
+    BlockBasedOptions, Cache, DBPinnableSlice, Direction, IteratorMode, Options, ReadOptions,
+    SliceTransform, WriteBatch, WriteOptions, DB,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -29,7 +26,6 @@ pub struct ParentValidatorStore {
 }
 
 impl ParentValidatorStore {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
@@ -46,21 +42,19 @@ impl ParentValidatorStore {
         opts.optimize_level_style_compaction(512 * 1024 * 1024);
 
         // prefix extractor
-        opts.set_prefix_extractor(
-            SliceTransform::create_fixed_prefix(PARENT_PREFIX.len())
-        );
+        opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(PARENT_PREFIX.len()));
 
         // cache + bloom
         let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(
-            &Cache::new_lru_cache(128 * 1024 * 1024)
-        );
+        block_opts.set_block_cache(&Cache::new_lru_cache(128 * 1024 * 1024));
         block_opts.set_bloom_filter(10.0, false);
 
         opts.set_block_based_table_factory(&block_opts);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         // Parent validation is consensus-critical — durable writes.
         let mut write_opts = WriteOptions::default();
@@ -107,11 +101,10 @@ impl ParentValidatorStore {
     // STORE
     // ─────────────────────────────────────────
     pub fn store_parent_check(&self, key: &str, value: &str) {
-        if let Err(e) = self.db.put_opt(
-            Self::make_key(key),
-            value.as_bytes(),
-            &self.write_opts,
-        ) {
+        if let Err(e) = self
+            .db
+            .put_opt(Self::make_key(key), value.as_bytes(), &self.write_opts)
+        {
             slog_error!("dag", "parent_validator_put_failed", error => e);
         }
     }
@@ -135,7 +128,8 @@ impl ParentValidatorStore {
     // GET
     // ─────────────────────────────────────────
     pub fn get_parent_check(&self, key: &str) -> Option<String> {
-        self.db.get_pinned_opt(Self::make_key(key), &self.read_opts)
+        self.db
+            .get_pinned_opt(Self::make_key(key), &self.read_opts)
             .ok()
             .flatten()
             .and_then(|v| std::str::from_utf8(&v).ok().map(|s| s.to_string()))
@@ -145,7 +139,8 @@ impl ParentValidatorStore {
     // RAW GET
     // ─────────────────────────────────────────
     pub fn get_raw(&self, key: &str) -> Option<DBPinnableSlice<'_>> {
-        self.db.get_pinned_opt(Self::make_key(key), &self.read_opts)
+        self.db
+            .get_pinned_opt(Self::make_key(key), &self.read_opts)
             .ok()
             .flatten()
     }
@@ -154,7 +149,8 @@ impl ParentValidatorStore {
     // EXISTS
     // ─────────────────────────────────────────
     pub fn exists(&self, key: &str) -> bool {
-        self.db.get_pinned_opt(Self::make_key(key), &self.read_opts)
+        self.db
+            .get_pinned_opt(Self::make_key(key), &self.read_opts)
             .map(|v| v.is_some())
             .unwrap_or(false)
     }
@@ -175,7 +171,7 @@ impl ParentValidatorStore {
             result.push(
                 res.ok()
                     .flatten()
-                    .and_then(|v| std::str::from_utf8(&v).ok().map(|s| s.to_string()))
+                    .and_then(|v| std::str::from_utf8(&v).ok().map(|s| s.to_string())),
             );
         }
 
@@ -197,7 +193,9 @@ impl ParentValidatorStore {
     pub fn delete_all(&self) {
         let iter = self.db.prefix_iterator(PARENT_PREFIX);
         for (k, _) in iter.flatten() {
-            if !k.starts_with(PARENT_PREFIX) { break; }
+            if !k.starts_with(PARENT_PREFIX) {
+                break;
+            }
             let _ = self.db.delete(&*k);
         }
     }

@@ -25,8 +25,8 @@ pub mod config {
         pub mod genesis;
     }
     pub mod network {
-        pub mod network_params;
         pub mod bootstrap_nodes;
+        pub mod network_params;
     }
     pub mod checkpoints;
     pub mod node {
@@ -77,13 +77,13 @@ pub mod domain {
         pub mod utxo_validator;
     }
     pub mod traits {
-        pub mod utxo_backend;
-        pub mod pow_checker;
-        pub mod content_hasher;
-        pub mod tx_pool;
-        pub mod peer_info;
-        pub mod sync_peers;
         pub mod block_processor;
+        pub mod content_hasher;
+        pub mod peer_info;
+        pub mod pow_checker;
+        pub mod sync_peers;
+        pub mod tx_pool;
+        pub mod utxo_backend;
     }
 }
 
@@ -111,11 +111,11 @@ pub mod engine {
             pub mod block_validator;
             pub mod consensus_validator;
         }
-        pub mod state;
-        pub mod reorg;
-        pub mod finality;
-        pub mod chain_manager;
         pub mod block_processor;
+        pub mod chain_manager;
+        pub mod finality;
+        pub mod reorg;
+        pub mod state;
     }
     pub mod crypto {
         pub mod hash {
@@ -179,8 +179,8 @@ pub mod engine {
         pub mod simulator {
             pub mod network_simulator;
         }
-        pub mod traversal;
         pub mod conflicts;
+        pub mod traversal;
     }
     pub mod mining {
         pub mod algorithms {
@@ -194,9 +194,9 @@ pub mod engine {
             pub mod opencl_miner;
         }
         pub mod miner {
-            pub mod miner;
             pub mod block_template;
             pub mod fair_ordering;
+            pub mod miner;
             pub mod miner_controller;
             pub mod miner_stats;
         }
@@ -236,11 +236,11 @@ pub mod engine {
             pub mod view_key;
         }
     }
-    pub mod orphans;
     pub mod anti_double_spend;
-    pub mod tx_validation;
+    pub mod orphans;
     pub mod pruning;
     pub mod state_snapshot;
+    pub mod tx_validation;
     // Swap and DEX modules — wired into consensus via TxType::SwapTx
     // and TxType::DexOrder. Validation rules in block_validator.rs and
     // mempool.rs enforce payload, fee, and structural requirements.
@@ -305,13 +305,13 @@ pub mod runtime {
     }
     pub mod vm {
         pub mod contracts {
+            pub mod build_manifest;
             pub mod contract;
             pub mod contract_abi;
             pub mod contract_deployer;
             pub mod contract_package;
             pub mod contract_storage;
             pub mod contract_verifier;
-            pub mod build_manifest;
             pub mod deployment_manifest;
             pub mod token_standard;
         }
@@ -339,16 +339,16 @@ pub mod runtime {
             pub mod gas_rules;
         }
         pub mod testing {
-            pub mod test_runner;
-            pub mod script_runner;
             pub mod invariant_checker;
             pub mod observability;
+            pub mod script_runner;
+            pub mod test_runner;
         }
         pub mod precompiles {
-            pub mod precompile_registry;
             pub mod crypto_precompiles;
             pub mod hash_precompiles;
             pub mod math_precompiles;
+            pub mod precompile_registry;
         }
     }
     pub mod wasm {
@@ -372,8 +372,8 @@ pub mod service {
             pub mod orphan_pool;
             pub mod tx_pool;
         }
-        pub mod index;
         pub mod eviction;
+        pub mod index;
     }
     pub mod network {
         pub mod discovery {
@@ -388,12 +388,12 @@ pub mod service {
         }
         pub mod p2p {
             pub mod connection_puzzle;
+            pub mod message;
             pub mod p2p;
             pub mod peer;
             pub mod peer_diversity;
             pub mod peer_manager;
             pub mod protocol;
-            pub mod message;
         }
         pub mod relay {
             pub mod block_relay;
@@ -402,22 +402,22 @@ pub mod service {
             pub mod tx_relay;
         }
         pub mod rpc {
-            pub mod rpc_server;
             pub mod grpc_server;
-            pub mod ws_server;
             pub mod health;
+            pub mod rpc_server;
+            pub mod ws_server;
         }
         pub mod address_manager;
-        pub mod sync;
-        pub mod connection_manager;
-        pub mod propagation;
-        pub mod reputation;
-        pub mod rate_limiter;
-        pub mod bootstrap;
-        pub mod sync_engine;
-        pub mod gossip;
         pub mod block_sync;
+        pub mod bootstrap;
+        pub mod connection_manager;
         pub mod dos_guard;
+        pub mod gossip;
+        pub mod propagation;
+        pub mod rate_limiter;
+        pub mod reputation;
+        pub mod sync;
+        pub mod sync_engine;
         pub mod protocol {
             pub mod messages;
         }
@@ -429,10 +429,10 @@ pub mod service {
             pub mod wallet_sync;
         }
         pub mod keys {
+            pub mod hardware_wallet;
             pub mod hd_wallet;
             pub mod key_manager;
             pub mod multisig;
-            pub mod hardware_wallet;
         }
         pub mod storage {
             pub mod address_book;
@@ -449,10 +449,10 @@ pub mod service {
 }
 
 pub mod indexes {
-    pub mod utxo_index;
-    pub mod tx_index;
     pub mod explorer;
     pub mod receipt_index;
+    pub mod tx_index;
+    pub mod utxo_index;
 }
 
 pub mod cache {

@@ -5,9 +5,9 @@
 
 use std::collections::HashSet;
 
-use crate::engine::dag::ghostdag::ghostdag::GhostDag;
-use crate::engine::consensus::chain_manager::ChainManager;
 use crate::domain::utxo::utxo_set::UtxoSet;
+use crate::engine::consensus::chain_manager::ChainManager;
+use crate::engine::dag::ghostdag::ghostdag::GhostDag;
 use crate::errors::ConsensusError;
 use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
 use crate::slog_error;
@@ -15,17 +15,12 @@ use crate::slog_error;
 pub struct BlockProcessor;
 
 impl BlockProcessor {
-
     // ─────────────────────────────────────────
     // REORG CHECK
     // ─────────────────────────────────────────
 
     #[inline(always)]
-    pub fn is_reorg_needed(
-        current_tip:   &str,
-        candidate_tip: &str,
-        ghostdag:      &GhostDag,
-    ) -> bool {
+    pub fn is_reorg_needed(current_tip: &str, candidate_tip: &str, ghostdag: &GhostDag) -> bool {
         ChainManager::is_better_chain(candidate_tip, current_tip, ghostdag)
     }
 
@@ -43,12 +38,11 @@ impl BlockProcessor {
     /// Callers should treat `None` as an error when a fork point is expected
     /// to exist (e.g., during reorgs on the same network).
     pub fn find_fork_point(
-        tip_a:     &str,
-        tip_b:     &str,
-        ghostdag:  &GhostDag,
+        tip_a: &str,
+        tip_b: &str,
+        ghostdag: &GhostDag,
         max_depth: usize,
     ) -> Option<String> {
-
         if tip_a == tip_b {
             return Some(tip_a.to_owned());
         }
@@ -62,21 +56,20 @@ impl BlockProcessor {
 
             match ghostdag.get_selected_parent(&current) {
                 Some(p) => current = p,
-                None    => break,
+                None => break,
             }
         }
 
         let mut current = tip_b.to_owned();
 
         for _ in 0..max_depth {
-
             if visited.contains(&current) {
                 return Some(current);
             }
 
             match ghostdag.get_selected_parent(&current) {
                 Some(p) => current = p,
-                None    => break,
+                None => break,
             }
         }
 
@@ -88,14 +81,13 @@ impl BlockProcessor {
     // ─────────────────────────────────────────
 
     pub fn handle_reorg(
-        old_tip:     &str,
-        new_tip:     &str,
-        utxo_set:    &UtxoSet,
+        old_tip: &str,
+        new_tip: &str,
+        utxo_set: &UtxoSet,
         block_store: &BlockStore,
-        ghostdag:    &GhostDag,
-        max_depth:   usize,
+        ghostdag: &GhostDag,
+        max_depth: usize,
     ) -> Result<String, ConsensusError> {
-
         if old_tip == new_tip {
             return Ok(old_tip.to_owned());
         }
@@ -115,12 +107,15 @@ impl BlockProcessor {
         if new_score == old_score && new_tip >= old_tip {
             return Err(ConsensusError::ReorgRejected(format!(
                 "new tip blue_score {} == old tip {} but hash {} >= {} — tie lost",
-                new_score, old_score, &new_tip[..16.min(new_tip.len())], &old_tip[..16.min(old_tip.len())]
+                new_score,
+                old_score,
+                &new_tip[..16.min(new_tip.len())],
+                &old_tip[..16.min(old_tip.len())]
             )));
         }
 
-        let fork = Self::find_fork_point(old_tip, new_tip, ghostdag, max_depth)
-            .ok_or_else(|| {
+        let fork =
+            Self::find_fork_point(old_tip, new_tip, ghostdag, max_depth).ok_or_else(|| {
                 ConsensusError::ReorgRejected(format!(
                     "[BlockProcessor] no fork between {} and {}",
                     &old_tip[..old_tip.len().min(8)],
@@ -169,13 +164,16 @@ impl BlockProcessor {
         // ───────── ROLLBACK ─────────
 
         for hash in &rollback_chain {
-
-            let block = block_store.get_block(hash)
+            let block = block_store
+                .get_block(hash)
                 .ok_or_else(|| ConsensusError::Other(format!("missing block {}", hash)))?;
 
             #[allow(deprecated)]
-            utxo_set.rollback_block(&block.body.transactions)
-                .map_err(|e| ConsensusError::ReorgRejected(format!("rollback failed at {}: {}", hash, e)))?;
+            utxo_set
+                .rollback_block(&block.body.transactions)
+                .map_err(|e| {
+                    ConsensusError::ReorgRejected(format!("rollback failed at {}: {}", hash, e))
+                })?;
         }
 
         // ───────── APPLY ─────────
@@ -183,14 +181,15 @@ impl BlockProcessor {
         let mut applied: Vec<String> = Vec::with_capacity(apply_chain.len());
 
         for hash in &apply_chain {
-
-            let block = block_store.get_block(hash)
+            let block = block_store
+                .get_block(hash)
                 .ok_or_else(|| ConsensusError::Other(format!("missing block {}", hash)))?;
 
             let height = block.header.height;
 
-            if let Err(e) = utxo_set.apply_block(&block.body.transactions, height, &block.header.hash) {
-
+            if let Err(e) =
+                utxo_set.apply_block(&block.body.transactions, height, &block.header.hash)
+            {
                 let original_error = format!("apply failed at {}: {}", hash, e);
 
                 // rollback partial apply
@@ -210,7 +209,11 @@ impl BlockProcessor {
                 // restore old chain
                 for h in rollback_chain.iter().rev() {
                     if let Some(b) = block_store.get_block(h) {
-                        if let Err(re) = utxo_set.apply_block(&b.body.transactions, b.header.height, &b.header.hash) {
+                        if let Err(re) = utxo_set.apply_block(
+                            &b.body.transactions,
+                            b.header.height,
+                            &b.header.hash,
+                        ) {
                             slog_error!("consensus", "critical_restore_failed_during_reorg", error => re);
                             restore_failed = true;
                             restore_err_msg = format!("{}", re);
@@ -248,19 +251,12 @@ impl BlockProcessor {
     /// block has no selected parent (e.g., genesis). Callers that require a
     /// complete path should verify that the last element's parent equals `stop`.
     #[inline(always)]
-    fn collect_chain(
-        tip:      &str,
-        stop:     &str,
-        ghostdag: &GhostDag,
-        max_depth: usize,
-    ) -> Vec<String> {
-
+    fn collect_chain(tip: &str, stop: &str, ghostdag: &GhostDag, max_depth: usize) -> Vec<String> {
         let mut chain = Vec::with_capacity(max_depth);
 
         let mut current = tip.to_owned();
 
         for _ in 0..max_depth {
-
             if current == stop {
                 break;
             }
@@ -269,7 +265,7 @@ impl BlockProcessor {
 
             match ghostdag.get_selected_parent(&current) {
                 Some(p) => current = p,
-                None    => break,
+                None => break,
             }
         }
 
@@ -293,8 +289,7 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
 
-        GhostDag::new(&format!("/tmp/test_bp_{}", ts))
-            .expect("test GhostDag DB open failed")
+        GhostDag::new(&format!("/tmp/test_bp_{}", ts)).expect("test GhostDag DB open failed")
     }
 
     fn set_sp(gd: &GhostDag, child: &str, parent: &str) {

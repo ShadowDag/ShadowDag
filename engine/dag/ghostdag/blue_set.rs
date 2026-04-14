@@ -4,16 +4,15 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, Options,
-    WriteBatch, ReadOptions, WriteOptions, SliceTransform,
-    DBCompressionType,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, Options, ReadOptions,
+    SliceTransform, WriteBatch, WriteOptions, DB,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::errors::{DagError, StorageError};
-use crate::{slog_warn, slog_error};
 pub use crate::engine::dag::ghostdag::ghostdag::GHOSTDAG_K;
+use crate::errors::{DagError, StorageError};
+use crate::{slog_error, slog_warn};
 
 const CF_BLUE: &str = "blue_cf";
 const CF_BSET: &str = "bset_cf";
@@ -30,11 +29,9 @@ pub struct BlueSetStore {
 fn bset_prefix_extractor() -> SliceTransform {
     SliceTransform::create(
         "bset_prefix",
-        |key: &[u8]| {
-            match key.iter().position(|&b| b == 0) {
-                Some(pos) => &key[..=pos],
-                None => key,
-            }
+        |key: &[u8]| match key.iter().position(|&b| b == 0) {
+            Some(pos) => &key[..=pos],
+            None => key,
         },
         Some(|key: &[u8]| key.starts_with(b"bset:")),
     )
@@ -85,8 +82,12 @@ impl BlueSetStore {
             ColumnFamilyDescriptor::new(CF_BSET, cf_bset_opts),
         ];
 
-        let db = DB::open_cf_descriptors(&opts, Path::new(path), cfs)
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open_cf_descriptors(&opts, Path::new(path), cfs).map_err(|e| {
+            StorageError::OpenFailed {
+                path: path.to_string(),
+                reason: e.to_string(),
+            }
+        })?;
 
         // Blue set is consensus-critical — determines block ordering.
         let mut write_opts = WriteOptions::default();
@@ -146,9 +147,15 @@ impl BlueSetStore {
     pub fn store_blue(&self, hash: &str) {
         let cf = match self.blue_cf() {
             Some(cf) => cf,
-            None => { slog_error!("ghostdag", "store_blue_no_cf"); return; }
+            None => {
+                slog_error!("ghostdag", "store_blue_no_cf");
+                return;
+            }
         };
-        if let Err(e) = self.db.put_cf_opt(cf, Self::key_blue(hash), [1], &self.write_opts) {
+        if let Err(e) = self
+            .db
+            .put_cf_opt(cf, Self::key_blue(hash), [1], &self.write_opts)
+        {
             slog_error!("ghostdag", "store_blue_failed", error => e);
         }
     }
@@ -164,7 +171,10 @@ impl BlueSetStore {
     pub fn remove_blue(&self, hash: &str) {
         let cf = match self.blue_cf() {
             Some(cf) => cf,
-            None => { slog_error!("ghostdag", "remove_blue_no_cf"); return; }
+            None => {
+                slog_error!("ghostdag", "remove_blue_no_cf");
+                return;
+            }
         };
         if let Err(e) = self.db.delete_cf(cf, Self::key_blue(hash)) {
             slog_error!("ghostdag", "remove_blue_failed", error => e);
@@ -174,9 +184,15 @@ impl BlueSetStore {
     pub fn add_to_blue_set(&self, block: &str, member: &str) {
         let cf = match self.bset_cf() {
             Some(cf) => cf,
-            None => { slog_error!("ghostdag", "add_to_blue_set_no_cf"); return; }
+            None => {
+                slog_error!("ghostdag", "add_to_blue_set_no_cf");
+                return;
+            }
         };
-        if let Err(e) = self.db.put_cf_opt(cf, Self::key_bset(block, member), [1], &self.write_opts) {
+        if let Err(e) = self
+            .db
+            .put_cf_opt(cf, Self::key_bset(block, member), [1], &self.write_opts)
+        {
             slog_error!("ghostdag", "add_to_blue_set_failed", error => e);
         }
     }
@@ -188,7 +204,10 @@ impl BlueSetStore {
     pub fn store_blue_set(&self, block: &str, members: &HashSet<String>) {
         let cf = match self.bset_cf() {
             Some(cf) => cf,
-            None => { slog_error!("ghostdag", "store_blue_set_no_cf"); return; }
+            None => {
+                slog_error!("ghostdag", "store_blue_set_no_cf");
+                return;
+            }
         };
         let mut batch = WriteBatch::default();
 
@@ -217,16 +236,13 @@ impl BlueSetStore {
         all_blocks: &HashMap<String, Vec<String>>,
         ghostdag: &crate::engine::dag::ghostdag::ghostdag::GhostDag,
     ) -> HashSet<String> {
-        let mut blue_set =
-            ghostdag.build_blue_set_for_past(block_hash, parents, all_blocks);
+        let mut blue_set = ghostdag.build_blue_set_for_past(block_hash, parents, all_blocks);
 
         // Size guard: truncate oversized blue sets to prevent CPU blowup
         if blue_set.len() > MAX_BLUE_SET_SIZE {
             slog_warn!("ghostdag", "blue_set_too_large",
                 size => blue_set.len(), max => MAX_BLUE_SET_SIZE);
-            let truncated: HashSet<String> = blue_set.into_iter()
-                .take(MAX_BLUE_SET_SIZE)
-                .collect();
+            let truncated: HashSet<String> = blue_set.into_iter().take(MAX_BLUE_SET_SIZE).collect();
             blue_set = truncated;
         }
 
@@ -256,7 +272,10 @@ impl BlueSetStore {
 
         let cf = match self.bset_cf() {
             Some(cf) => cf,
-            None => { slog_error!("ghostdag", "scan_set_no_cf"); return set; }
+            None => {
+                slog_error!("ghostdag", "scan_set_no_cf");
+                return set;
+            }
         };
 
         let mut ro = ReadOptions::default();

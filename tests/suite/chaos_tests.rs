@@ -2,15 +2,12 @@
 
 #[cfg(test)]
 mod chaos {
-    use crate::runtime::vm::core::execution_env::*;
     use crate::runtime::vm::contracts::contract_storage::ContractStorage;
-    use crate::domain::transaction::tx_receipt::TxReceipt;
+    use crate::runtime::vm::core::execution_env::*;
 
     const PUSH1: u8 = 0x10;
     const SSTORE: u8 = 0x51;
     const STOP: u8 = 0x00;
-    const REVERT: u8 = 0xB7;
-    const CALL: u8 = 0xB0;
     const JUMP: u8 = 0x80;
     const JUMPDEST: u8 = 0x82;
     const LOG0: u8 = 0xA0;
@@ -31,9 +28,15 @@ mod chaos {
         env.state.set_code("loop", code).unwrap();
 
         let ctx = CallContext {
-            address: "loop".into(), code_address: "loop".into(),
-            caller: "user".into(), value: 0, gas_limit: 1000,
-            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
+            address: "loop".into(),
+            code_address: "loop".into(),
+            caller: "user".into(),
+            value: 0,
+            gas_limit: 1000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Failure { .. }), "Should OOG");
@@ -50,12 +53,21 @@ mod chaos {
         // 100KB calldata
         let calldata = vec![0xAB; 100_000];
         let ctx = CallContext {
-            address: "c".into(), code_address: "c".into(),
-            caller: "u".into(), value: 0, gas_limit: 10_000_000,
-            calldata, is_static: false, depth: 0, is_delegate: false,
+            address: "c".into(),
+            code_address: "c".into(),
+            caller: "u".into(),
+            value: 0,
+            gas_limit: 10_000_000,
+            calldata,
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
-        assert!(matches!(result, CallOutcome::Success { .. }), "Large calldata should work");
+        assert!(
+            matches!(result, CallOutcome::Success { .. }),
+            "Large calldata should work"
+        );
     }
 
     #[test]
@@ -65,7 +77,8 @@ mod chaos {
         let path = {
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default().as_nanos();
+                .unwrap_or_default()
+                .as_nanos();
             format!("{}/shadowdag_chaos_{}", std::env::temp_dir().display(), ts)
         };
 
@@ -73,11 +86,19 @@ mod chaos {
         {
             let storage = ContractStorage::new(&path).unwrap();
             let mut env = make_env();
-            env.state.set_code("contract", vec![PUSH1, 42, PUSH1, 0, SSTORE, STOP]).unwrap();
+            env.state
+                .set_code("contract", vec![PUSH1, 42, PUSH1, 0, SSTORE, STOP])
+                .unwrap();
             let ctx = CallContext {
-                address: "contract".into(), code_address: "contract".into(),
-                caller: "u".into(), value: 0, gas_limit: 1_000_000,
-                calldata: vec![], is_static: false, depth: 0, is_delegate: false,
+                address: "contract".into(),
+                code_address: "contract".into(),
+                caller: "u".into(),
+                value: 0,
+                gas_limit: 1_000_000,
+                calldata: vec![],
+                is_static: false,
+                depth: 0,
+                is_delegate: false,
             };
             env.execute_frame(&ctx);
             env.persist_to_storage(&storage).unwrap();
@@ -104,9 +125,15 @@ mod chaos {
         // Block 1: execute on chain A
         let snap = env.state.snapshot();
         let ctx = CallContext {
-            address: "c".into(), code_address: "c".into(),
-            caller: "u".into(), value: 0, gas_limit: 1_000_000,
-            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
+            address: "c".into(),
+            code_address: "c".into(),
+            caller: "u".into(),
+            value: 0,
+            gas_limit: 1_000_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
         };
         env.execute_frame(&ctx);
         let root_chain_a = env.state.state_root();
@@ -116,7 +143,10 @@ mod chaos {
         let root_after_reorg = env.state.state_root();
 
         // State should differ — chain A had writes, reorg undid them
-        assert_ne!(root_chain_a, root_after_reorg, "Reorg should change state_root");
+        assert_ne!(
+            root_chain_a, root_after_reorg,
+            "Reorg should change state_root"
+        );
     }
 
     #[test]
@@ -127,9 +157,15 @@ mod chaos {
 
         // Execute same TX twice
         let ctx = CallContext {
-            address: "c".into(), code_address: "c".into(),
-            caller: "u".into(), value: 0, gas_limit: 1_000_000,
-            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
+            address: "c".into(),
+            code_address: "c".into(),
+            caller: "u".into(),
+            value: 0,
+            gas_limit: 1_000_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
         };
         env.execute_frame(&ctx);
         let root1 = env.state.state_root();
@@ -139,7 +175,10 @@ mod chaos {
 
         // Same operation twice should be deterministic
         // (both succeed and write same value)
-        assert_eq!(root1, root2, "Duplicate TX should not change state_root (idempotent store)");
+        assert_eq!(
+            root1, root2,
+            "Duplicate TX should not change state_root (idempotent store)"
+        );
     }
 
     #[test]
@@ -155,9 +194,15 @@ mod chaos {
         env.state.set_code("spammer", code).unwrap();
 
         let ctx = CallContext {
-            address: "spammer".into(), code_address: "spammer".into(),
-            caller: "u".into(), value: 0, gas_limit: 10_000_000,
-            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
+            address: "spammer".into(),
+            code_address: "spammer".into(),
+            caller: "u".into(),
+            value: 0,
+            gas_limit: 10_000_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         match result {
@@ -173,13 +218,20 @@ mod chaos {
         let mut env = make_env();
         // Try calling at maximum depth
         let ctx = CallContext {
-            address: "c".into(), code_address: "c".into(),
-            caller: "u".into(), value: 0, gas_limit: 1_000_000,
-            calldata: vec![], is_static: false,
+            address: "c".into(),
+            code_address: "c".into(),
+            caller: "u".into(),
+            value: 0,
+            gas_limit: 1_000_000,
+            calldata: vec![],
+            is_static: false,
             depth: 1025, // Over limit
             is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
-        assert!(matches!(result, CallOutcome::Failure { .. }), "Over max depth should fail");
+        assert!(
+            matches!(result, CallOutcome::Failure { .. }),
+            "Over max depth should fail"
+        );
     }
 }

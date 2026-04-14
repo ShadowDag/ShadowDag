@@ -7,7 +7,7 @@ use crate::config::network::bootstrap_nodes::BootstrapNodes;
 use crate::config::node::node_config::NetworkMode;
 
 pub const DNS_LOOKUP_TIMEOUT_SECS: u64 = 10;
-pub const MAX_SEEDS_PER_QUERY:     usize = 32;
+pub const MAX_SEEDS_PER_QUERY: usize = 32;
 
 pub struct BootstrapManager;
 
@@ -53,19 +53,25 @@ mod tests {
     #[test]
     fn mainnet_seeds_use_port_9333() {
         let seeds = BootstrapManager::seeds_for(&NetworkMode::Mainnet);
-        for s in seeds { assert!(s.ends_with(":9333")); }
+        for s in seeds {
+            assert!(s.ends_with(":9333"));
+        }
     }
 
     #[test]
     fn testnet_seeds_use_port_19333() {
         let seeds = BootstrapManager::seeds_for(&NetworkMode::Testnet);
-        for s in seeds { assert!(s.ends_with(":19333")); }
+        for s in seeds {
+            assert!(s.ends_with(":19333"));
+        }
     }
 
     #[test]
     fn regtest_uses_localhost() {
         let seeds = BootstrapManager::seeds_for(&NetworkMode::Regtest);
-        for s in seeds { assert!(s.starts_with("127.0.0.1")); }
+        for s in seeds {
+            assert!(s.starts_with("127.0.0.1"));
+        }
     }
 
     #[test]

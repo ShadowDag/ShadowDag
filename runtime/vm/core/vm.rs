@@ -37,14 +37,14 @@
 // Stack elements are 256-bit unsigned integers (U256).
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 use crate::errors::VmError;
-use crate::slog_warn;
+use crate::runtime::vm::contracts::contract_storage::{ContractStorage, PendingBatch};
 use crate::runtime::vm::core::u256::U256;
 use crate::runtime::vm::core::vm_context::VMContext;
-use crate::runtime::vm::contracts::contract_storage::{ContractStorage, PendingBatch};
 use crate::runtime::vm::gas::gas_meter::{GasMeter, GasResult};
+use crate::slog_warn;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //                          OPCODES
@@ -55,161 +55,207 @@ use crate::runtime::vm::gas::gas_meter::{GasMeter, GasResult};
 #[repr(u8)]
 pub enum OpCode {
     // -- Control --
-    STOP        = 0x00, // Halt execution (success)
-    NOP         = 0x01, // No operation
+    STOP = 0x00, // Halt execution (success)
+    NOP = 0x01,  // No operation
 
     // -- Stack --
-    PUSH1       = 0x10, // Push 1 byte onto stack
-    PUSH2       = 0x11, // Push 2 bytes (u16) onto stack
-    PUSH4       = 0x12, // Push 4 bytes (u32) onto stack
-    PUSH8       = 0x13, // Push 8 bytes (u64) onto stack
-    PUSH16      = 0x14, // Push 16 bytes (u128) onto stack
-    PUSH32      = 0x15, // Push 32 bytes onto stack
-    POP         = 0x16, // Remove top of stack
-    DUP         = 0x17, // Duplicate top of stack
-    SWAP        = 0x18, // Swap top two elements
+    PUSH1 = 0x10,  // Push 1 byte onto stack
+    PUSH2 = 0x11,  // Push 2 bytes (u16) onto stack
+    PUSH4 = 0x12,  // Push 4 bytes (u32) onto stack
+    PUSH8 = 0x13,  // Push 8 bytes (u64) onto stack
+    PUSH16 = 0x14, // Push 16 bytes (u128) onto stack
+    PUSH32 = 0x15, // Push 32 bytes onto stack
+    POP = 0x16,    // Remove top of stack
+    DUP = 0x17,    // Duplicate top of stack
+    SWAP = 0x18,   // Swap top two elements
 
     // -- Arithmetic --
-    ADD         = 0x20, // a + b
-    SUB         = 0x21, // a - b
-    MUL         = 0x22, // a * b
-    DIV         = 0x23, // a / b (integer division)
-    MOD         = 0x24, // a % b
-    EXP         = 0x25, // a ** b (bounded)
-    ADDMOD      = 0x26, // (a + b) % N
-    MULMOD      = 0x27, // (a * b) % N
+    ADD = 0x20,    // a + b
+    SUB = 0x21,    // a - b
+    MUL = 0x22,    // a * b
+    DIV = 0x23,    // a / b (integer division)
+    MOD = 0x24,    // a % b
+    EXP = 0x25,    // a ** b (bounded)
+    ADDMOD = 0x26, // (a + b) % N
+    MULMOD = 0x27, // (a * b) % N
 
     // -- Comparison --
-    EQ          = 0x30, // a == b -> 1 or 0
-    LT          = 0x31, // a < b  -> 1 or 0
-    GT          = 0x32, // a > b  -> 1 or 0
-    ISZERO      = 0x33, // a == 0 -> 1 or 0
+    EQ = 0x30,     // a == b -> 1 or 0
+    LT = 0x31,     // a < b  -> 1 or 0
+    GT = 0x32,     // a > b  -> 1 or 0
+    ISZERO = 0x33, // a == 0 -> 1 or 0
 
     // -- Bitwise --
-    AND         = 0x40, // a & b
-    OR          = 0x41, // a | b
-    XOR         = 0x42, // a ^ b
-    NOT         = 0x43, // ~a
-    SHL         = 0x44, // a << b
-    SHR         = 0x45, // a >> b
+    AND = 0x40, // a & b
+    OR = 0x41,  // a | b
+    XOR = 0x42, // a ^ b
+    NOT = 0x43, // ~a
+    SHL = 0x44, // a << b
+    SHR = 0x45, // a >> b
 
     // -- Storage --
-    SLOAD       = 0x50, // Load from contract storage
-    SSTORE      = 0x51, // Store to contract storage
-    SDELETE     = 0x52, // Delete from contract storage
+    SLOAD = 0x50,   // Load from contract storage
+    SSTORE = 0x51,  // Store to contract storage
+    SDELETE = 0x52, // Delete from contract storage
 
     // -- Crypto --
-    SHA256      = 0x60, // SHA-256 hash of top stack element
-    KECCAK      = 0x61, // Keccak-256 hash
+    SHA256 = 0x60, // SHA-256 hash of top stack element
+    KECCAK = 0x61, // Keccak-256 hash
 
     // -- Context --
-    CALLER      = 0x70, // Push caller address
-    CALLVALUE   = 0x71, // Push sent value (amount)
-    TIMESTAMP   = 0x72, // Push current block timestamp
-    BLOCKHASH   = 0x73, // Push current block hash
-    BALANCE     = 0x74, // Push balance of address
+    CALLER = 0x70,    // Push caller address
+    CALLVALUE = 0x71, // Push sent value (amount)
+    TIMESTAMP = 0x72, // Push current block timestamp
+    BLOCKHASH = 0x73, // Push current block hash
+    BALANCE = 0x74,   // Push balance of address
 
     // -- Context (extended) --
-    PC          = 0x02, // Program counter
-    GAS         = 0x03, // Remaining gas
-    GASLIMIT    = 0x04, // Gas limit
-    ADDRESS     = 0x7A, // Current contract address
+    PC = 0x02,       // Program counter
+    GAS = 0x03,      // Remaining gas
+    GASLIMIT = 0x04, // Gas limit
+    ADDRESS = 0x7A,  // Current contract address
 
     // -- Flow Control --
-    JUMP        = 0x80, // Unconditional jump
-    JUMPI       = 0x81, // Conditional jump (jump if top != 0)
-    JUMPDEST    = 0x82, // Mark valid jump destination
+    JUMP = 0x80,     // Unconditional jump
+    JUMPI = 0x81,    // Conditional jump (jump if top != 0)
+    JUMPDEST = 0x82, // Mark valid jump destination
 
     // -- Memory --
-    MLOAD       = 0x90, // Load from memory
-    MSTORE      = 0x91, // Store to memory
-    MSTORE8     = 0x92, // Store single byte to memory
-    MSIZE       = 0x93, // Current memory size (rounded to 32)
+    MLOAD = 0x90,   // Load from memory
+    MSTORE = 0x91,  // Store to memory
+    MSTORE8 = 0x92, // Store single byte to memory
+    MSIZE = 0x93,   // Current memory size (rounded to 32)
 
     // -- Logging --
-    LOG         = 0xA0, // Emit log event (0 topics)
-    LOG1        = 0xA1, // Emit log event (1 topic)
-    LOG2        = 0xA2, // Emit log event (2 topics)
-    LOG3        = 0xA3, // Emit log event (3 topics)
-    LOG4        = 0xA4, // Emit log event (4 topics)
+    LOG = 0xA0,  // Emit log event (0 topics)
+    LOG1 = 0xA1, // Emit log event (1 topic)
+    LOG2 = 0xA2, // Emit log event (2 topics)
+    LOG3 = 0xA3, // Emit log event (3 topics)
+    LOG4 = 0xA4, // Emit log event (4 topics)
 
     // -- System --
-    CALL         = 0xB0, // Call another contract
-    CALLCODE     = 0xB1, // Call with caller's storage
+    CALL = 0xB0,         // Call another contract
+    CALLCODE = 0xB1,     // Call with caller's storage
     DELEGATECALL = 0xB2, // Delegate call (caller + value preserved)
-    STATICCALL   = 0xB3, // Read-only call (no state changes)
-    CREATE       = 0xB4, // Create new contract
-    CREATE2      = 0xB5, // Deterministic CREATE
-    RETURN       = 0xB6, // Return data and stop
-    REVERT       = 0xB7, // Revert all changes and stop
+    STATICCALL = 0xB3,   // Read-only call (no state changes)
+    CREATE = 0xB4,       // Create new contract
+    CREATE2 = 0xB5,      // Deterministic CREATE
+    RETURN = 0xB6,       // Return data and stop
+    REVERT = 0xB7,       // Revert all changes and stop
     SELFDESTRUCT = 0xB8, // Destroy contract
 
     // -- Call data --
-    CALLDATALOAD   = 0xC0, // Load 32 bytes from calldata
-    CALLDATASIZE   = 0xC1, // Push calldata length
-    CALLDATACOPY   = 0xC2, // Copy calldata to memory
-    CODESIZE       = 0xC3, // Push current code length
-    CODECOPY       = 0xC4, // Copy code to memory
-    EXTCODESIZE    = 0xC5, // Push external contract code size
+    CALLDATALOAD = 0xC0,   // Load 32 bytes from calldata
+    CALLDATASIZE = 0xC1,   // Push calldata length
+    CALLDATACOPY = 0xC2,   // Copy calldata to memory
+    CODESIZE = 0xC3,       // Push current code length
+    CODECOPY = 0xC4,       // Copy code to memory
+    EXTCODESIZE = 0xC5,    // Push external contract code size
     RETURNDATASIZE = 0xC6, // Push last return data length
     RETURNDATACOPY = 0xC7, // Copy return data to memory
 
     // -- Extended stack --
-    DUP2  = 0xD0, // Duplicate 2nd from top
-    DUP3  = 0xD1, // Duplicate 3rd from top
-    DUP4  = 0xD2, // Duplicate 4th from top
-    DUP5  = 0xD3, // Duplicate 5th from top
-    DUP6  = 0xD4, // Duplicate 6th from top
-    DUP7  = 0xD5, // Duplicate 7th from top
-    DUP8  = 0xD6, // Duplicate 8th from top
+    DUP2 = 0xD0,  // Duplicate 2nd from top
+    DUP3 = 0xD1,  // Duplicate 3rd from top
+    DUP4 = 0xD2,  // Duplicate 4th from top
+    DUP5 = 0xD3,  // Duplicate 5th from top
+    DUP6 = 0xD4,  // Duplicate 6th from top
+    DUP7 = 0xD5,  // Duplicate 7th from top
+    DUP8 = 0xD6,  // Duplicate 8th from top
     SWAP2 = 0xD7, // Swap top with 3rd from top
     SWAP3 = 0xD8, // Swap top with 4th from top
     SWAP4 = 0xD9, // Swap top with 5th from top
 
     // -- Invalid --
-    INVALID     = 0xFF, // Invalid opcode (always fails)
+    INVALID = 0xFF, // Invalid opcode (always fails)
 }
 
 impl OpCode {
     pub fn from_byte(b: u8) -> Self {
         match b {
-            0x00 => OpCode::STOP, 0x01 => OpCode::NOP,
-            0x02 => OpCode::PC, 0x03 => OpCode::GAS, 0x04 => OpCode::GASLIMIT,
-            0x10 => OpCode::PUSH1, 0x11 => OpCode::PUSH2,
-            0x12 => OpCode::PUSH4, 0x13 => OpCode::PUSH8,
-            0x14 => OpCode::PUSH16, 0x15 => OpCode::PUSH32,
-            0x16 => OpCode::POP, 0x17 => OpCode::DUP,
+            0x00 => OpCode::STOP,
+            0x01 => OpCode::NOP,
+            0x02 => OpCode::PC,
+            0x03 => OpCode::GAS,
+            0x04 => OpCode::GASLIMIT,
+            0x10 => OpCode::PUSH1,
+            0x11 => OpCode::PUSH2,
+            0x12 => OpCode::PUSH4,
+            0x13 => OpCode::PUSH8,
+            0x14 => OpCode::PUSH16,
+            0x15 => OpCode::PUSH32,
+            0x16 => OpCode::POP,
+            0x17 => OpCode::DUP,
             0x18 => OpCode::SWAP,
-            0x20 => OpCode::ADD, 0x21 => OpCode::SUB, 0x22 => OpCode::MUL,
-            0x23 => OpCode::DIV, 0x24 => OpCode::MOD, 0x25 => OpCode::EXP,
-            0x26 => OpCode::ADDMOD, 0x27 => OpCode::MULMOD,
-            0x30 => OpCode::EQ, 0x31 => OpCode::LT, 0x32 => OpCode::GT,
+            0x20 => OpCode::ADD,
+            0x21 => OpCode::SUB,
+            0x22 => OpCode::MUL,
+            0x23 => OpCode::DIV,
+            0x24 => OpCode::MOD,
+            0x25 => OpCode::EXP,
+            0x26 => OpCode::ADDMOD,
+            0x27 => OpCode::MULMOD,
+            0x30 => OpCode::EQ,
+            0x31 => OpCode::LT,
+            0x32 => OpCode::GT,
             0x33 => OpCode::ISZERO,
-            0x40 => OpCode::AND, 0x41 => OpCode::OR, 0x42 => OpCode::XOR,
-            0x43 => OpCode::NOT, 0x44 => OpCode::SHL, 0x45 => OpCode::SHR,
-            0x50 => OpCode::SLOAD, 0x51 => OpCode::SSTORE, 0x52 => OpCode::SDELETE,
-            0x60 => OpCode::SHA256, 0x61 => OpCode::KECCAK,
-            0x70 => OpCode::CALLER, 0x71 => OpCode::CALLVALUE,
-            0x72 => OpCode::TIMESTAMP, 0x73 => OpCode::BLOCKHASH,
-            0x74 => OpCode::BALANCE, 0x7A => OpCode::ADDRESS,
-            0x80 => OpCode::JUMP, 0x81 => OpCode::JUMPI, 0x82 => OpCode::JUMPDEST,
-            0x90 => OpCode::MLOAD, 0x91 => OpCode::MSTORE,
-            0x92 => OpCode::MSTORE8, 0x93 => OpCode::MSIZE,
+            0x40 => OpCode::AND,
+            0x41 => OpCode::OR,
+            0x42 => OpCode::XOR,
+            0x43 => OpCode::NOT,
+            0x44 => OpCode::SHL,
+            0x45 => OpCode::SHR,
+            0x50 => OpCode::SLOAD,
+            0x51 => OpCode::SSTORE,
+            0x52 => OpCode::SDELETE,
+            0x60 => OpCode::SHA256,
+            0x61 => OpCode::KECCAK,
+            0x70 => OpCode::CALLER,
+            0x71 => OpCode::CALLVALUE,
+            0x72 => OpCode::TIMESTAMP,
+            0x73 => OpCode::BLOCKHASH,
+            0x74 => OpCode::BALANCE,
+            0x7A => OpCode::ADDRESS,
+            0x80 => OpCode::JUMP,
+            0x81 => OpCode::JUMPI,
+            0x82 => OpCode::JUMPDEST,
+            0x90 => OpCode::MLOAD,
+            0x91 => OpCode::MSTORE,
+            0x92 => OpCode::MSTORE8,
+            0x93 => OpCode::MSIZE,
             0xA0 => OpCode::LOG,
-            0xA1 => OpCode::LOG1, 0xA2 => OpCode::LOG2,
-            0xA3 => OpCode::LOG3, 0xA4 => OpCode::LOG4,
-            0xB0 => OpCode::CALL, 0xB1 => OpCode::CALLCODE, 0xB2 => OpCode::DELEGATECALL,
-            0xB3 => OpCode::STATICCALL, 0xB4 => OpCode::CREATE, 0xB5 => OpCode::CREATE2,
-            0xB6 => OpCode::RETURN, 0xB7 => OpCode::REVERT, 0xB8 => OpCode::SELFDESTRUCT,
-            0xC0 => OpCode::CALLDATALOAD, 0xC1 => OpCode::CALLDATASIZE,
-            0xC2 => OpCode::CALLDATACOPY, 0xC3 => OpCode::CODESIZE,
-            0xC4 => OpCode::CODECOPY, 0xC5 => OpCode::EXTCODESIZE,
-            0xC6 => OpCode::RETURNDATASIZE, 0xC7 => OpCode::RETURNDATACOPY,
-            0xD0 => OpCode::DUP2, 0xD1 => OpCode::DUP3, 0xD2 => OpCode::DUP4,
-            0xD3 => OpCode::DUP5, 0xD4 => OpCode::DUP6, 0xD5 => OpCode::DUP7,
+            0xA1 => OpCode::LOG1,
+            0xA2 => OpCode::LOG2,
+            0xA3 => OpCode::LOG3,
+            0xA4 => OpCode::LOG4,
+            0xB0 => OpCode::CALL,
+            0xB1 => OpCode::CALLCODE,
+            0xB2 => OpCode::DELEGATECALL,
+            0xB3 => OpCode::STATICCALL,
+            0xB4 => OpCode::CREATE,
+            0xB5 => OpCode::CREATE2,
+            0xB6 => OpCode::RETURN,
+            0xB7 => OpCode::REVERT,
+            0xB8 => OpCode::SELFDESTRUCT,
+            0xC0 => OpCode::CALLDATALOAD,
+            0xC1 => OpCode::CALLDATASIZE,
+            0xC2 => OpCode::CALLDATACOPY,
+            0xC3 => OpCode::CODESIZE,
+            0xC4 => OpCode::CODECOPY,
+            0xC5 => OpCode::EXTCODESIZE,
+            0xC6 => OpCode::RETURNDATASIZE,
+            0xC7 => OpCode::RETURNDATACOPY,
+            0xD0 => OpCode::DUP2,
+            0xD1 => OpCode::DUP3,
+            0xD2 => OpCode::DUP4,
+            0xD3 => OpCode::DUP5,
+            0xD4 => OpCode::DUP6,
+            0xD5 => OpCode::DUP7,
             0xD6 => OpCode::DUP8,
-            0xD7 => OpCode::SWAP2, 0xD8 => OpCode::SWAP3, 0xD9 => OpCode::SWAP4,
-            _    => OpCode::INVALID,
+            0xD7 => OpCode::SWAP2,
+            0xD8 => OpCode::SWAP3,
+            0xD9 => OpCode::SWAP4,
+            _ => OpCode::INVALID,
         }
     }
 
@@ -223,23 +269,58 @@ impl OpCode {
             OpCode::STOP | OpCode::JUMPDEST => 0,
 
             // Very cheap (2 gas) -- stack ops and context reads
-            OpCode::NOP | OpCode::POP | OpCode::DUP | OpCode::SWAP |
-            OpCode::DUP2 | OpCode::DUP3 | OpCode::DUP4 | OpCode::DUP5 |
-            OpCode::DUP6 | OpCode::DUP7 | OpCode::DUP8 |
-            OpCode::SWAP2 | OpCode::SWAP3 | OpCode::SWAP4 |
-            OpCode::CALLER | OpCode::CALLVALUE | OpCode::TIMESTAMP |
-            OpCode::BLOCKHASH | OpCode::BALANCE | OpCode::ADDRESS |
-            OpCode::PC | OpCode::GAS | OpCode::GASLIMIT => 2,
+            OpCode::NOP
+            | OpCode::POP
+            | OpCode::DUP
+            | OpCode::SWAP
+            | OpCode::DUP2
+            | OpCode::DUP3
+            | OpCode::DUP4
+            | OpCode::DUP5
+            | OpCode::DUP6
+            | OpCode::DUP7
+            | OpCode::DUP8
+            | OpCode::SWAP2
+            | OpCode::SWAP3
+            | OpCode::SWAP4
+            | OpCode::CALLER
+            | OpCode::CALLVALUE
+            | OpCode::TIMESTAMP
+            | OpCode::BLOCKHASH
+            | OpCode::BALANCE
+            | OpCode::ADDRESS
+            | OpCode::PC
+            | OpCode::GAS
+            | OpCode::GASLIMIT => 2,
 
             // Cheap (3 gas) -- push, simple arithmetic, comparison, bitwise, memory, calldata
-            OpCode::PUSH1 | OpCode::PUSH2 | OpCode::PUSH4 | OpCode::PUSH8 |
-            OpCode::PUSH16 | OpCode::PUSH32 |
-            OpCode::ADD | OpCode::SUB | OpCode::EQ | OpCode::LT | OpCode::GT |
-            OpCode::ISZERO | OpCode::AND | OpCode::OR | OpCode::XOR | OpCode::NOT |
-            OpCode::MLOAD | OpCode::MSTORE | OpCode::MSTORE8 | OpCode::MSIZE |
-            OpCode::CALLDATALOAD | OpCode::CALLDATASIZE | OpCode::CALLDATACOPY |
-            OpCode::CODESIZE | OpCode::CODECOPY | OpCode::RETURNDATASIZE |
-            OpCode::RETURNDATACOPY => 3,
+            OpCode::PUSH1
+            | OpCode::PUSH2
+            | OpCode::PUSH4
+            | OpCode::PUSH8
+            | OpCode::PUSH16
+            | OpCode::PUSH32
+            | OpCode::ADD
+            | OpCode::SUB
+            | OpCode::EQ
+            | OpCode::LT
+            | OpCode::GT
+            | OpCode::ISZERO
+            | OpCode::AND
+            | OpCode::OR
+            | OpCode::XOR
+            | OpCode::NOT
+            | OpCode::MLOAD
+            | OpCode::MSTORE
+            | OpCode::MSTORE8
+            | OpCode::MSIZE
+            | OpCode::CALLDATALOAD
+            | OpCode::CALLDATASIZE
+            | OpCode::CALLDATACOPY
+            | OpCode::CODESIZE
+            | OpCode::CODECOPY
+            | OpCode::RETURNDATASIZE
+            | OpCode::RETURNDATACOPY => 3,
 
             // Medium (5 gas) -- mul, div, mod, shifts
             OpCode::MUL | OpCode::DIV | OpCode::MOD | OpCode::SHL | OpCode::SHR => 5,
@@ -270,8 +351,7 @@ impl OpCode {
             OpCode::LOG4 => 375 + 1500, // base + 4 topics
 
             // Calls (700 gas)
-            OpCode::CALL | OpCode::CALLCODE | OpCode::DELEGATECALL |
-            OpCode::STATICCALL => 700,
+            OpCode::CALL | OpCode::CALLCODE | OpCode::DELEGATECALL | OpCode::STATICCALL => 700,
 
             // Return / Revert (1 gas -- prevents free infinite loops)
             OpCode::RETURN | OpCode::REVERT => 1,
@@ -300,49 +380,92 @@ impl OpCode {
     /// `validate_v1_bytecode`.
     pub fn name(&self) -> &'static str {
         match self {
-            OpCode::STOP => "STOP", OpCode::NOP => "NOP",
-            OpCode::PC => "PC", OpCode::GAS => "GAS", OpCode::GASLIMIT => "GASLIMIT",
-            OpCode::PUSH1 => "PUSH1", OpCode::PUSH2 => "PUSH2",
-            OpCode::PUSH4 => "PUSH4", OpCode::PUSH8 => "PUSH8",
-            OpCode::PUSH16 => "PUSH16", OpCode::PUSH32 => "PUSH32",
-            OpCode::POP => "POP", OpCode::DUP => "DUP", OpCode::SWAP => "SWAP",
-            OpCode::ADD => "ADD", OpCode::SUB => "SUB", OpCode::MUL => "MUL",
-            OpCode::DIV => "DIV", OpCode::MOD => "MOD", OpCode::EXP => "EXP",
-            OpCode::ADDMOD => "ADDMOD", OpCode::MULMOD => "MULMOD",
-            OpCode::EQ => "EQ", OpCode::LT => "LT", OpCode::GT => "GT",
+            OpCode::STOP => "STOP",
+            OpCode::NOP => "NOP",
+            OpCode::PC => "PC",
+            OpCode::GAS => "GAS",
+            OpCode::GASLIMIT => "GASLIMIT",
+            OpCode::PUSH1 => "PUSH1",
+            OpCode::PUSH2 => "PUSH2",
+            OpCode::PUSH4 => "PUSH4",
+            OpCode::PUSH8 => "PUSH8",
+            OpCode::PUSH16 => "PUSH16",
+            OpCode::PUSH32 => "PUSH32",
+            OpCode::POP => "POP",
+            OpCode::DUP => "DUP",
+            OpCode::SWAP => "SWAP",
+            OpCode::ADD => "ADD",
+            OpCode::SUB => "SUB",
+            OpCode::MUL => "MUL",
+            OpCode::DIV => "DIV",
+            OpCode::MOD => "MOD",
+            OpCode::EXP => "EXP",
+            OpCode::ADDMOD => "ADDMOD",
+            OpCode::MULMOD => "MULMOD",
+            OpCode::EQ => "EQ",
+            OpCode::LT => "LT",
+            OpCode::GT => "GT",
             OpCode::ISZERO => "ISZERO",
-            OpCode::AND => "AND", OpCode::OR => "OR", OpCode::XOR => "XOR",
-            OpCode::NOT => "NOT", OpCode::SHL => "SHL", OpCode::SHR => "SHR",
-            OpCode::SLOAD => "SLOAD", OpCode::SSTORE => "SSTORE",
+            OpCode::AND => "AND",
+            OpCode::OR => "OR",
+            OpCode::XOR => "XOR",
+            OpCode::NOT => "NOT",
+            OpCode::SHL => "SHL",
+            OpCode::SHR => "SHR",
+            OpCode::SLOAD => "SLOAD",
+            OpCode::SSTORE => "SSTORE",
             OpCode::SDELETE => "SDELETE",
-            OpCode::SHA256 => "SHA256", OpCode::KECCAK => "KECCAK",
-            OpCode::CALLER => "CALLER", OpCode::CALLVALUE => "CALLVALUE",
-            OpCode::TIMESTAMP => "TIMESTAMP", OpCode::BLOCKHASH => "BLOCKHASH",
-            OpCode::BALANCE => "BALANCE", OpCode::ADDRESS => "ADDRESS",
-            OpCode::JUMP => "JUMP", OpCode::JUMPI => "JUMPI",
+            OpCode::SHA256 => "SHA256",
+            OpCode::KECCAK => "KECCAK",
+            OpCode::CALLER => "CALLER",
+            OpCode::CALLVALUE => "CALLVALUE",
+            OpCode::TIMESTAMP => "TIMESTAMP",
+            OpCode::BLOCKHASH => "BLOCKHASH",
+            OpCode::BALANCE => "BALANCE",
+            OpCode::ADDRESS => "ADDRESS",
+            OpCode::JUMP => "JUMP",
+            OpCode::JUMPI => "JUMPI",
             OpCode::JUMPDEST => "JUMPDEST",
-            OpCode::MLOAD => "MLOAD", OpCode::MSTORE => "MSTORE",
-            OpCode::MSTORE8 => "MSTORE8", OpCode::MSIZE => "MSIZE",
+            OpCode::MLOAD => "MLOAD",
+            OpCode::MSTORE => "MSTORE",
+            OpCode::MSTORE8 => "MSTORE8",
+            OpCode::MSIZE => "MSIZE",
             // The 0xA0 mnemonic in v1_spec is "LOG0" (matching the
             // EVM "LOGn" family); the vm.rs enum variant is named LOG
             // for historical reasons but its on-the-wire mnemonic is
             // LOG0 so the assembler/disassembler stay v1-compatible.
-            OpCode::LOG => "LOG0", OpCode::LOG1 => "LOG1",
-            OpCode::LOG2 => "LOG2", OpCode::LOG3 => "LOG3", OpCode::LOG4 => "LOG4",
-            OpCode::CALL => "CALL", OpCode::CALLCODE => "CALLCODE",
-            OpCode::DELEGATECALL => "DELEGATECALL", OpCode::STATICCALL => "STATICCALL",
-            OpCode::CREATE => "CREATE", OpCode::CREATE2 => "CREATE2",
-            OpCode::RETURN => "RETURN", OpCode::REVERT => "REVERT",
+            OpCode::LOG => "LOG0",
+            OpCode::LOG1 => "LOG1",
+            OpCode::LOG2 => "LOG2",
+            OpCode::LOG3 => "LOG3",
+            OpCode::LOG4 => "LOG4",
+            OpCode::CALL => "CALL",
+            OpCode::CALLCODE => "CALLCODE",
+            OpCode::DELEGATECALL => "DELEGATECALL",
+            OpCode::STATICCALL => "STATICCALL",
+            OpCode::CREATE => "CREATE",
+            OpCode::CREATE2 => "CREATE2",
+            OpCode::RETURN => "RETURN",
+            OpCode::REVERT => "REVERT",
             OpCode::SELFDESTRUCT => "SELFDESTRUCT",
-            OpCode::CALLDATALOAD => "CALLDATALOAD", OpCode::CALLDATASIZE => "CALLDATASIZE",
-            OpCode::CALLDATACOPY => "CALLDATACOPY", OpCode::CODESIZE => "CODESIZE",
-            OpCode::CODECOPY => "CODECOPY", OpCode::EXTCODESIZE => "EXTCODESIZE",
+            OpCode::CALLDATALOAD => "CALLDATALOAD",
+            OpCode::CALLDATASIZE => "CALLDATASIZE",
+            OpCode::CALLDATACOPY => "CALLDATACOPY",
+            OpCode::CODESIZE => "CODESIZE",
+            OpCode::CODECOPY => "CODECOPY",
+            OpCode::EXTCODESIZE => "EXTCODESIZE",
             OpCode::RETURNDATASIZE => "RETURNDATASIZE",
             OpCode::RETURNDATACOPY => "RETURNDATACOPY",
-            OpCode::DUP2 => "DUP2", OpCode::DUP3 => "DUP3", OpCode::DUP4 => "DUP4",
-            OpCode::DUP5 => "DUP5", OpCode::DUP6 => "DUP6", OpCode::DUP7 => "DUP7",
+            OpCode::DUP2 => "DUP2",
+            OpCode::DUP3 => "DUP3",
+            OpCode::DUP4 => "DUP4",
+            OpCode::DUP5 => "DUP5",
+            OpCode::DUP6 => "DUP6",
+            OpCode::DUP7 => "DUP7",
             OpCode::DUP8 => "DUP8",
-            OpCode::SWAP2 => "SWAP2", OpCode::SWAP3 => "SWAP3", OpCode::SWAP4 => "SWAP4",
+            OpCode::SWAP2 => "SWAP2",
+            OpCode::SWAP3 => "SWAP3",
+            OpCode::SWAP4 => "SWAP4",
             OpCode::INVALID => "INVALID",
         }
     }
@@ -351,13 +474,13 @@ impl OpCode {
     /// Only PUSHn opcodes carry operand data; everything else is 0.
     pub fn operand_size(&self) -> usize {
         match self {
-            OpCode::PUSH1  => 1,
-            OpCode::PUSH2  => 2,
-            OpCode::PUSH4  => 4,
-            OpCode::PUSH8  => 8,
+            OpCode::PUSH1 => 1,
+            OpCode::PUSH2 => 2,
+            OpCode::PUSH4 => 4,
+            OpCode::PUSH8 => 8,
             OpCode::PUSH16 => 16,
             OpCode::PUSH32 => 32,
-            _              => 0,
+            _ => 0,
         }
     }
 }
@@ -368,17 +491,29 @@ impl OpCode {
 
 #[derive(Debug, Clone)]
 pub enum ExecutionResult {
-    Success { gas_used: u64, return_data: Vec<u8>, logs: Vec<LogEntry> },
-    Revert  { gas_used: u64, reason: String },
-    OutOfGas { gas_used: u64 },
-    Error   { gas_used: u64, message: String },
+    Success {
+        gas_used: u64,
+        return_data: Vec<u8>,
+        logs: Vec<LogEntry>,
+    },
+    Revert {
+        gas_used: u64,
+        reason: String,
+    },
+    OutOfGas {
+        gas_used: u64,
+    },
+    Error {
+        gas_used: u64,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub contract: String,
-    pub topics:   Vec<U256>,
-    pub data:     Vec<u8>,
+    pub topics: Vec<U256>,
+    pub data: Vec<u8>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -463,11 +598,11 @@ impl VM {
     #[allow(clippy::too_many_arguments)]
     pub fn execute_bytecode(
         &self,
-        bytecode:   &[u8],
-        gas_limit:  u64,
-        caller:     &str,
-        value:      u64,
-        timestamp:  u64,
+        bytecode: &[u8],
+        gas_limit: u64,
+        caller: &str,
+        value: u64,
+        timestamp: u64,
         block_hash: &str,
         contract_addr: &str,
         input_data: &[u8],
@@ -492,7 +627,9 @@ impl VM {
         // Charge gas for initial memory allocation (issue #94)
         let init_mem_cost = (init_mem_size as u64 / 32) * MEMORY_GAS_PER_WORD;
         if let GasResult::OutOfGas { .. } = gas.consume(init_mem_cost) {
-            return ExecutionResult::OutOfGas { gas_used: gas.gas_used() };
+            return ExecutionResult::OutOfGas {
+                gas_used: gas.gas_used(),
+            };
         }
 
         // Copy input_data into the start of VM memory (Fix #39)
@@ -515,7 +652,9 @@ impl VM {
             if let GasResult::OutOfGas { .. } = gas.consume(cost) {
                 // Discard all pending state changes
                 pending.discard();
-                return ExecutionResult::OutOfGas { gas_used: gas.gas_used() };
+                return ExecutionResult::OutOfGas {
+                    gas_used: gas.gas_used(),
+                };
             }
 
             match op {
@@ -534,7 +673,10 @@ impl VM {
                     };
                 }
 
-                OpCode::NOP => { pc += 1; continue; }
+                OpCode::NOP => {
+                    pc += 1;
+                    continue;
+                }
 
                 // -- PUSH --
                 // Bounds checks use `pc + N >= len` which is correct: the highest
@@ -549,22 +691,22 @@ impl VM {
                         return Self::err(gas.gas_used(), "Stack overflow");
                     }
                     stack.push(U256::from_u64(bytecode[pc + 1] as u64));
-                    pc += 2; continue;
+                    pc += 2;
+                    continue;
                 }
                 OpCode::PUSH2 => {
                     if pc + 2 >= bytecode.len() {
                         pending.discard();
                         return Self::err(gas.gas_used(), "PUSH2 truncated");
                     }
-                    let val = u16::from_be_bytes([
-                        bytecode[pc+1], bytecode[pc+2],
-                    ]);
+                    let val = u16::from_be_bytes([bytecode[pc + 1], bytecode[pc + 2]]);
                     if stack.len() >= MAX_STACK_SIZE {
                         pending.discard();
                         return Self::err(gas.gas_used(), "Stack overflow");
                     }
                     stack.push(U256::from_u64(val as u64));
-                    pc += 3; continue;
+                    pc += 3;
+                    continue;
                 }
                 OpCode::PUSH4 => {
                     if pc + 4 >= bytecode.len() {
@@ -572,14 +714,18 @@ impl VM {
                         return Self::err(gas.gas_used(), "PUSH4 truncated");
                     }
                     let val = u32::from_be_bytes([
-                        bytecode[pc+1], bytecode[pc+2], bytecode[pc+3], bytecode[pc+4]
+                        bytecode[pc + 1],
+                        bytecode[pc + 2],
+                        bytecode[pc + 3],
+                        bytecode[pc + 4],
                     ]);
                     if stack.len() >= MAX_STACK_SIZE {
                         pending.discard();
                         return Self::err(gas.gas_used(), "Stack overflow");
                     }
                     stack.push(U256::from_u64(val as u64));
-                    pc += 5; continue;
+                    pc += 5;
+                    continue;
                 }
                 OpCode::PUSH8 => {
                     if pc + 8 >= bytecode.len() {
@@ -587,13 +733,14 @@ impl VM {
                         return Self::err(gas.gas_used(), "PUSH8 truncated");
                     }
                     let mut arr = [0u8; 8];
-                    arr.copy_from_slice(&bytecode[pc+1..pc+9]);
+                    arr.copy_from_slice(&bytecode[pc + 1..pc + 9]);
                     if stack.len() >= MAX_STACK_SIZE {
                         pending.discard();
                         return Self::err(gas.gas_used(), "Stack overflow");
                     }
                     stack.push(U256::from_u64(u64::from_be_bytes(arr)));
-                    pc += 9; continue;
+                    pc += 9;
+                    continue;
                 }
                 OpCode::PUSH16 => {
                     if pc + 16 >= bytecode.len() {
@@ -602,13 +749,14 @@ impl VM {
                     }
                     let mut arr = [0u8; 32];
                     // Place 16 bytes right-aligned in 32-byte array for U256
-                    arr[16..32].copy_from_slice(&bytecode[pc+1..pc+17]);
+                    arr[16..32].copy_from_slice(&bytecode[pc + 1..pc + 17]);
                     if stack.len() >= MAX_STACK_SIZE {
                         pending.discard();
                         return Self::err(gas.gas_used(), "Stack overflow");
                     }
                     stack.push(U256::from_be_bytes(&arr));
-                    pc += 17; continue;
+                    pc += 17;
+                    continue;
                 }
                 OpCode::PUSH32 => {
                     if pc + 32 >= bytecode.len() {
@@ -616,13 +764,14 @@ impl VM {
                         return Self::err(gas.gas_used(), "PUSH32 truncated");
                     }
                     let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&bytecode[pc+1..pc+33]);
+                    arr.copy_from_slice(&bytecode[pc + 1..pc + 33]);
                     if stack.len() >= MAX_STACK_SIZE {
                         pending.discard();
                         return Self::err(gas.gas_used(), "Stack overflow");
                     }
                     stack.push(U256::from_be_bytes(&arr));
-                    pc += 33; continue;
+                    pc += 33;
+                    continue;
                 }
 
                 OpCode::POP => {
@@ -658,32 +807,50 @@ impl VM {
 
                 // -- ARITHMETIC --
                 OpCode::ADD => {
-                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     let r = a.wrapping_add(b);
                     stack.push(r);
                 }
                 OpCode::SUB => {
-                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     let r = a.wrapping_sub(b);
                     stack.push(r);
                 }
                 OpCode::MUL => {
-                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     let r = a.wrapping_mul(b);
                     stack.push(r);
                 }
                 OpCode::DIV => {
-                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     let r = a.checked_div(b);
                     stack.push(r);
                 }
                 OpCode::MOD => {
-                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     let r = a.checked_mod(b);
                     stack.push(r);
                 }
                 OpCode::ADDMOD => {
-                    let (a, b, n) = match Self::pop3(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (a, b, n) = match Self::pop3(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     let r = if n == U256::ZERO {
                         U256::ZERO
                     } else {
@@ -692,7 +859,10 @@ impl VM {
                     stack.push(r);
                 }
                 OpCode::MULMOD => {
-                    let (a, b, n) = match Self::pop3(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (a, b, n) = match Self::pop3(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     let r = if n == U256::ZERO {
                         U256::ZERO
                     } else {
@@ -701,52 +871,85 @@ impl VM {
                     stack.push(r);
                 }
                 OpCode::EXP => {
-                    let (base, exp) = match Self::pop2(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (base, exp) = match Self::pop2(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     let r = base.wrapping_pow(exp);
                     stack.push(r);
                 }
 
                 // -- COMPARISON --
                 OpCode::EQ => {
-                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     stack.push(if a == b { U256::ONE } else { U256::ZERO });
                 }
                 OpCode::LT => {
-                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     stack.push(if a < b { U256::ONE } else { U256::ZERO });
                 }
                 OpCode::GT => {
-                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     stack.push(if a > b { U256::ONE } else { U256::ZERO });
                 }
                 OpCode::ISZERO => {
-                    let a = match Self::pop1(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let a = match Self::pop1(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     stack.push(if a.is_zero() { U256::ONE } else { U256::ZERO });
                 }
 
                 // -- BITWISE --
                 OpCode::AND => {
-                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     stack.push(a.bitand(b));
                 }
                 OpCode::OR => {
-                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     stack.push(a.bitor(b));
                 }
                 OpCode::XOR => {
-                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     stack.push(a.bitxor(b));
                 }
                 OpCode::NOT => {
-                    let a = match Self::pop1(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let a = match Self::pop1(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     stack.push(a.bitnot());
                 }
                 OpCode::SHL => {
-                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     stack.push(b.shl(a.as_u64() as u32));
                 }
                 OpCode::SHR => {
-                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     stack.push(b.shr(a.as_u64() as u32));
                 }
 
@@ -766,29 +969,38 @@ impl VM {
                 //   2. self.context.get(key) → committed on-disk value
                 //   3. U256::ZERO if both miss
                 OpCode::SLOAD => {
-                    let slot = match Self::pop1(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let slot = match Self::pop1(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     let key = format!("{}:slot:{}", contract_addr, slot);
 
                     use crate::runtime::vm::contracts::contract_storage::PendingLookup;
                     let val = match pending.lookup(&key) {
                         PendingLookup::Buffered(v) => Self::parse_storage_u256(v, &key),
-                        PendingLookup::Tombstoned  => U256::ZERO,
-                        PendingLookup::NotBuffered => {
-                            self.context.get(&key)
-                                .map(|s| Self::parse_storage_u256(&s, &key))
-                                .unwrap_or(U256::ZERO)
-                        }
+                        PendingLookup::Tombstoned => U256::ZERO,
+                        PendingLookup::NotBuffered => self
+                            .context
+                            .get(&key)
+                            .map(|s| Self::parse_storage_u256(&s, &key))
+                            .unwrap_or(U256::ZERO),
                     };
                     stack.push(val);
                 }
                 OpCode::SSTORE => {
-                    let (slot, val) = match Self::pop2(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (slot, val) = match Self::pop2(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     let key = format!("{}:slot:{}", contract_addr, slot);
                     // Buffer the write -- not committed until STOP/RETURN
                     pending.put(key, val.to_string());
                 }
                 OpCode::SDELETE => {
-                    let slot = match Self::pop1(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let slot = match Self::pop1(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     let key = format!("{}:slot:{}", contract_addr, slot);
                     // Buffer the delete
                     pending.delete(key);
@@ -798,7 +1010,10 @@ impl VM {
 
                 // -- CRYPTO --
                 OpCode::SHA256 => {
-                    let val = match Self::pop1(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let val = match Self::pop1(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     let mut h = Sha256::new();
                     h.update(val.to_be_bytes());
                     let hash = h.finalize();
@@ -807,7 +1022,10 @@ impl VM {
                     stack.push(U256::from_be_bytes(&arr));
                 }
                 OpCode::KECCAK => {
-                    let val = match Self::pop1(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let val = match Self::pop1(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     use sha3::Keccak256;
                     let mut h = Keccak256::new();
                     h.update(val.to_be_bytes());
@@ -818,10 +1036,16 @@ impl VM {
                 }
 
                 // -- CONTEXT --
-                OpCode::CALLER     => { stack.push(U256::from_u64(Self::addr_to_u64(caller))); }
-                OpCode::CALLVALUE  => { stack.push(U256::from_u64(value)); }
-                OpCode::TIMESTAMP  => { stack.push(U256::from_u64(timestamp)); }
-                OpCode::BLOCKHASH  => {
+                OpCode::CALLER => {
+                    stack.push(U256::from_u64(Self::addr_to_u64(caller)));
+                }
+                OpCode::CALLVALUE => {
+                    stack.push(U256::from_u64(value));
+                }
+                OpCode::TIMESTAMP => {
+                    stack.push(U256::from_u64(timestamp));
+                }
+                OpCode::BLOCKHASH => {
                     // Parse full 256-bit block hash instead of truncating to 64-bit
                     let val = if block_hash.len() == 64 {
                         U256::from_hex(block_hash).unwrap_or(U256::ZERO)
@@ -836,8 +1060,11 @@ impl VM {
                     };
                     stack.push(val);
                 }
-                OpCode::BALANCE    => {
-                    let addr = match Self::pop1(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                OpCode::BALANCE => {
+                    let addr = match Self::pop1(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     let addr_key = format!("balance:{}", addr.as_u64());
                     let bal = match self.context.get(&addr_key) {
                         Some(val) => match val.parse::<u64>() {
@@ -855,7 +1082,10 @@ impl VM {
 
                 // -- FLOW CONTROL --
                 OpCode::JUMP => {
-                    let dest_val = match Self::pop1(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let dest_val = match Self::pop1(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     if dest_val >= U256::from_u64(bytecode.len() as u64) {
                         pending.discard();
                         return Self::err(gas.gas_used(), "Jump destination out of bounds");
@@ -865,10 +1095,14 @@ impl VM {
                         pending.discard();
                         return Self::err(gas.gas_used(), "Invalid jump destination");
                     }
-                    pc = dest; continue;
+                    pc = dest;
+                    continue;
                 }
                 OpCode::JUMPI => {
-                    let (dest_val, cond) = match Self::pop2(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (dest_val, cond) = match Self::pop2(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     if !cond.is_zero() {
                         if dest_val >= U256::from_u64(bytecode.len() as u64) {
                             pending.discard();
@@ -879,19 +1113,28 @@ impl VM {
                             pending.discard();
                             return Self::err(gas.gas_used(), "Invalid jump destination");
                         }
-                        pc = dest; continue;
+                        pc = dest;
+                        continue;
                     }
                 }
                 OpCode::JUMPDEST => { /* valid jump target marker */ }
 
                 // -- MEMORY (with expansion gas) --
                 OpCode::MLOAD => {
-                    let offset = match Self::pop1(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e }.as_usize();
+                    let offset = match Self::pop1(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    }
+                    .as_usize();
                     if offset + 32 > memory.len() {
-                        if let Some(expansion_gas) = Self::memory_expansion_cost(memory.len(), offset + 32) {
+                        if let Some(expansion_gas) =
+                            Self::memory_expansion_cost(memory.len(), offset + 32)
+                        {
                             if let GasResult::OutOfGas { .. } = gas.consume(expansion_gas) {
                                 pending.discard();
-                                return ExecutionResult::OutOfGas { gas_used: gas.gas_used() };
+                                return ExecutionResult::OutOfGas {
+                                    gas_used: gas.gas_used(),
+                                };
                             }
                         }
                         Self::expand_memory(&mut memory, offset + 32);
@@ -899,37 +1142,51 @@ impl VM {
                     // If memory expansion or read fails, return error instead of silent ZERO
                     if offset + 32 <= memory.len() {
                         let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&memory[offset..offset+32]);
+                        arr.copy_from_slice(&memory[offset..offset + 32]);
                         stack.push(U256::from_be_bytes(&arr));
                     } else {
                         pending.discard();
-                        return ExecutionResult::OutOfGas { gas_used: gas.gas_used() };
+                        return ExecutionResult::OutOfGas {
+                            gas_used: gas.gas_used(),
+                        };
                     }
                 }
                 OpCode::MSTORE => {
-                    let (offset_val, val) = match Self::pop2(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (offset_val, val) = match Self::pop2(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     let offset = offset_val.as_usize();
                     if offset + 32 > memory.len() {
-                        if let Some(expansion_gas) = Self::memory_expansion_cost(memory.len(), offset + 32) {
+                        if let Some(expansion_gas) =
+                            Self::memory_expansion_cost(memory.len(), offset + 32)
+                        {
                             if let GasResult::OutOfGas { .. } = gas.consume(expansion_gas) {
                                 pending.discard();
-                                return ExecutionResult::OutOfGas { gas_used: gas.gas_used() };
+                                return ExecutionResult::OutOfGas {
+                                    gas_used: gas.gas_used(),
+                                };
                             }
                         }
                         Self::expand_memory(&mut memory, offset + 32);
                     }
                     // If memory expansion failed, return error instead of silently skipping write
                     if offset + 32 <= memory.len() {
-                        memory[offset..offset+32].copy_from_slice(&val.to_be_bytes());
+                        memory[offset..offset + 32].copy_from_slice(&val.to_be_bytes());
                     } else {
                         pending.discard();
-                        return ExecutionResult::OutOfGas { gas_used: gas.gas_used() };
+                        return ExecutionResult::OutOfGas {
+                            gas_used: gas.gas_used(),
+                        };
                     }
                 }
 
                 // -- LOG --
                 OpCode::LOG => {
-                    let val = match Self::pop1(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let val = match Self::pop1(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     logs.push(LogEntry {
                         contract: contract_addr.to_string(),
                         topics: Vec::new(),
@@ -937,14 +1194,16 @@ impl VM {
                     });
                 }
 
-
                 // -- RETURN / REVERT --
                 OpCode::RETURN => {
                     if stack.len() < 2 {
                         pending.discard();
                         return Self::err(gas.gas_used(), "Stack underflow");
                     }
-                    let (off_val, size_val) = match Self::pop2(&mut stack, &gas, &mut pending) { Ok(v) => v, Err(e) => return e };
+                    let (off_val, size_val) = match Self::pop2(&mut stack, &gas, &mut pending) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     let offset = off_val.as_usize();
                     let size = size_val.as_usize();
                     if let Some(end) = offset.checked_add(size) {
@@ -988,48 +1247,61 @@ impl VM {
                 // Gas is already charged above via gas.consume(cost), so a
                 // bytecode that hits one of these stubs still pays the
                 // declared opcode cost — it just doesn't get the work done.
-
                 OpCode::CALL => {
                     pending.discard();
-                    return Self::err(gas.gas_used(),
+                    return Self::err(
+                        gas.gas_used(),
                         "CALL is not implemented in the legacy VM engine; \
-                         route this bytecode through ExecutionEnvironment::execute_frame");
+                         route this bytecode through ExecutionEnvironment::execute_frame",
+                    );
                 }
                 OpCode::CALLCODE => {
                     pending.discard();
-                    return Self::err(gas.gas_used(),
+                    return Self::err(
+                        gas.gas_used(),
                         "CALLCODE is not implemented in the legacy VM engine; \
-                         route this bytecode through ExecutionEnvironment::execute_frame");
+                         route this bytecode through ExecutionEnvironment::execute_frame",
+                    );
                 }
                 OpCode::DELEGATECALL => {
                     pending.discard();
-                    return Self::err(gas.gas_used(),
+                    return Self::err(
+                        gas.gas_used(),
                         "DELEGATECALL is not implemented in the legacy VM engine; \
-                         route this bytecode through ExecutionEnvironment::execute_frame");
+                         route this bytecode through ExecutionEnvironment::execute_frame",
+                    );
                 }
                 OpCode::STATICCALL => {
                     pending.discard();
-                    return Self::err(gas.gas_used(),
+                    return Self::err(
+                        gas.gas_used(),
                         "STATICCALL is not implemented in the legacy VM engine; \
-                         route this bytecode through ExecutionEnvironment::execute_frame");
+                         route this bytecode through ExecutionEnvironment::execute_frame",
+                    );
                 }
                 OpCode::CREATE => {
                     pending.discard();
-                    return Self::err(gas.gas_used(),
+                    return Self::err(
+                        gas.gas_used(),
                         "CREATE is not implemented in the legacy VM engine; \
-                         route this bytecode through ExecutionEnvironment::execute_frame");
+                         route this bytecode through ExecutionEnvironment::execute_frame",
+                    );
                 }
                 OpCode::CREATE2 => {
                     pending.discard();
-                    return Self::err(gas.gas_used(),
+                    return Self::err(
+                        gas.gas_used(),
                         "CREATE2 is not implemented in the legacy VM engine; \
-                         route this bytecode through ExecutionEnvironment::execute_frame");
+                         route this bytecode through ExecutionEnvironment::execute_frame",
+                    );
                 }
                 OpCode::SELFDESTRUCT => {
                     pending.discard();
-                    return Self::err(gas.gas_used(),
+                    return Self::err(
+                        gas.gas_used(),
                         "SELFDESTRUCT is not implemented in the legacy VM engine; \
-                         route this bytecode through ExecutionEnvironment::execute_frame");
+                         route this bytecode through ExecutionEnvironment::execute_frame",
+                    );
                 }
 
                 OpCode::INVALID => {
@@ -1040,7 +1312,10 @@ impl VM {
                 // Extended opcodes (handled in ExecutionEnvironment)
                 _ => {
                     pending.discard();
-                    return Self::err(gas.gas_used(), &format!("Opcode {:?} only supported in ExecutionEnvironment", op));
+                    return Self::err(
+                        gas.gas_used(),
+                        &format!("Opcode {:?} only supported in ExecutionEnvironment", op),
+                    );
                 }
             }
 
@@ -1112,7 +1387,11 @@ impl VM {
         U256::ZERO
     }
 
-    fn pop1(stack: &mut Vec<U256>, gas: &GasMeter, pending: &mut PendingBatch) -> Result<U256, ExecutionResult> {
+    fn pop1(
+        stack: &mut Vec<U256>,
+        gas: &GasMeter,
+        pending: &mut PendingBatch,
+    ) -> Result<U256, ExecutionResult> {
         match stack.pop() {
             Some(v) => Ok(v),
             None => {
@@ -1125,7 +1404,11 @@ impl VM {
         }
     }
 
-    fn pop2(stack: &mut Vec<U256>, gas: &GasMeter, pending: &mut PendingBatch) -> Result<(U256, U256), ExecutionResult> {
+    fn pop2(
+        stack: &mut Vec<U256>,
+        gas: &GasMeter,
+        pending: &mut PendingBatch,
+    ) -> Result<(U256, U256), ExecutionResult> {
         if stack.len() < 2 {
             pending.discard();
             return Err(ExecutionResult::Error {
@@ -1139,7 +1422,11 @@ impl VM {
         Ok((a, b))
     }
 
-    fn pop3(stack: &mut Vec<U256>, gas: &GasMeter, pending: &mut PendingBatch) -> Result<(U256, U256, U256), ExecutionResult> {
+    fn pop3(
+        stack: &mut Vec<U256>,
+        gas: &GasMeter,
+        pending: &mut PendingBatch,
+    ) -> Result<(U256, U256, U256), ExecutionResult> {
         if stack.len() < 3 {
             pending.discard();
             return Err(ExecutionResult::Error {
@@ -1155,7 +1442,10 @@ impl VM {
     }
 
     fn err(gas_used: u64, msg: &str) -> ExecutionResult {
-        ExecutionResult::Error { gas_used, message: msg.to_string() }
+        ExecutionResult::Error {
+            gas_used,
+            message: msg.to_string(),
+        }
     }
 
     fn find_jump_dests(bytecode: &[u8]) -> Vec<usize> {
@@ -1168,12 +1458,12 @@ impl VM {
             // Skip push operands; use saturating_add to prevent usize overflow
             // on malformed bytecode where a PUSH appears near the end (issue #80)
             let advance = match bytecode[i] {
-                b if b == OpCode::PUSH1  as u8 => 2,   // 1 + 1
-                b if b == OpCode::PUSH2  as u8 => 3,   // 1 + 2
-                b if b == OpCode::PUSH4  as u8 => 5,   // 1 + 4
-                b if b == OpCode::PUSH8  as u8 => 9,   // 1 + 8
-                b if b == OpCode::PUSH16 as u8 => 17,  // 1 + 16
-                b if b == OpCode::PUSH32 as u8 => 33,  // 1 + 32
+                b if b == OpCode::PUSH1 as u8 => 2,   // 1 + 1
+                b if b == OpCode::PUSH2 as u8 => 3,   // 1 + 2
+                b if b == OpCode::PUSH4 as u8 => 5,   // 1 + 4
+                b if b == OpCode::PUSH8 as u8 => 9,   // 1 + 8
+                b if b == OpCode::PUSH16 as u8 => 17, // 1 + 16
+                b if b == OpCode::PUSH32 as u8 => 33, // 1 + 32
                 _ => 1,
             };
             i = i.saturating_add(advance);
@@ -1198,7 +1488,9 @@ impl VM {
     }
 
     fn expand_memory(memory: &mut Vec<u8>, needed: usize) {
-        if needed > MAX_MEMORY_SIZE { return; }
+        if needed > MAX_MEMORY_SIZE {
+            return;
+        }
         let new_size = needed.div_ceil(32) * 32; // Round up to 32-byte words
         if new_size > memory.len() {
             memory.resize(new_size, 0);
@@ -1229,14 +1521,24 @@ mod tests {
         // failed the whole vm.rs test module on Windows before any
         // assertion could run. Nanosecond suffix keeps runs unique.
         let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let dir = std::env::temp_dir().join(format!("shadowdag_test_vm_{}", ts));
-        VM::new(dir.to_str().expect("tempdir path is not valid UTF-8"))
-            .expect("VM::new failed")
+        VM::new(dir.to_str().expect("tempdir path is not valid UTF-8")).expect("VM::new failed")
     }
 
     fn exec(vm: &VM, bytecode: &[u8], gas: u64) -> ExecutionResult {
-        vm.execute_bytecode(bytecode, gas, "SD1caller", 0, 1000, "blockhash", "SD1contract", &[])
+        vm.execute_bytecode(
+            bytecode,
+            gas,
+            "SD1caller",
+            0,
+            1000,
+            "blockhash",
+            "SD1contract",
+            &[],
+        )
     }
 
     #[test]
@@ -1529,7 +1831,11 @@ mod tests {
         let bytecode = vec![0x10, 5, 0x10, 3, 0x26, 0x00];
         match exec(&vm, &bytecode, 10000) {
             ExecutionResult::Error { message, .. } => {
-                assert!(message.contains("underflow"), "Expected underflow, got: {}", message);
+                assert!(
+                    message.contains("underflow"),
+                    "Expected underflow, got: {}",
+                    message
+                );
             }
             other => panic!("Expected error, got {:?}", other),
         }
@@ -1562,28 +1868,27 @@ mod tests {
         let vm = make_vm();
         let bytecode = vec![
             // SSTORE slot 7 = 99
-            0x10, 7,         // PUSH1 7   (slot — bottom)
-            0x10, 99,        // PUSH1 99  (val  — top)
-            0x51,            // SSTORE → pending: slot 7 = 99
-
+            0x10, 7, // PUSH1 7   (slot — bottom)
+            0x10, 99,   // PUSH1 99  (val  — top)
+            0x51, // SSTORE → pending: slot 7 = 99
             // mem[0..32] = SLOAD(7) — must see the pending 99, not 0
-            0x10, 0,         // PUSH1 0   (mem offset, will be `a`)
-            0x10, 7,         // PUSH1 7   (slot for SLOAD)
-            0x50,            // SLOAD     → pops 7, pushes value (99)
-                             // stack: [0, 99]
-            0x91,            // MSTORE    → (offset=0, val=99); mem[0..32]=99 BE
-
+            0x10, 0, // PUSH1 0   (mem offset, will be `a`)
+            0x10, 7,    // PUSH1 7   (slot for SLOAD)
+            0x50, // SLOAD     → pops 7, pushes value (99)
+            // stack: [0, 99]
+            0x91, // MSTORE    → (offset=0, val=99); mem[0..32]=99 BE
             // RETURN mem[0..32]
-            0x10, 0,         // PUSH1 0   (return offset)
-            0x10, 32,        // PUSH1 32  (return size)
-            0xB6,            // RETURN
+            0x10, 0, // PUSH1 0   (return offset)
+            0x10, 32,   // PUSH1 32  (return size)
+            0xB6, // RETURN
         ];
         match exec(&vm, &bytecode, 100_000) {
             ExecutionResult::Success { return_data, .. } => {
                 // Big-endian U256 of 99 → last byte is 99, all others 0.
                 assert_eq!(return_data.len(), 32, "expected 32-byte RETURN payload");
                 assert_eq!(
-                    return_data[31], 99,
+                    return_data[31],
+                    99,
                     "SLOAD must read its own pending SSTORE: expected 99 in last byte, got {:?}",
                     &return_data[..]
                 );
@@ -1607,24 +1912,19 @@ mod tests {
         let vm = make_vm();
         let bytecode = vec![
             // SSTORE slot 5 = 77 first
-            0x10, 5,         // PUSH1 5   (slot)
-            0x10, 77,        // PUSH1 77  (val)
-            0x51,            // SSTORE    → pending: slot 5 = 77
-
+            0x10, 5, // PUSH1 5   (slot)
+            0x10, 77,   // PUSH1 77  (val)
+            0x51, // SSTORE    → pending: slot 5 = 77
             // SDELETE slot 5
-            0x10, 5,         // PUSH1 5   (slot)
-            0x52,            // SDELETE   → pending: slot 5 = tombstone
-
+            0x10, 5,    // PUSH1 5   (slot)
+            0x52, // SDELETE   → pending: slot 5 = tombstone
             // mem[0..32] = SLOAD(5)
-            0x10, 0,         // PUSH1 0   (mem offset, will be `a`)
-            0x10, 5,         // PUSH1 5   (slot for SLOAD)
-            0x50,            // SLOAD     → reads tombstone, pushes 0
-            0x91,            // MSTORE    → mem[0..32] = 0
-
+            0x10, 0, // PUSH1 0   (mem offset, will be `a`)
+            0x10, 5,    // PUSH1 5   (slot for SLOAD)
+            0x50, // SLOAD     → reads tombstone, pushes 0
+            0x91, // MSTORE    → mem[0..32] = 0
             // RETURN mem[0..32]
-            0x10, 0,
-            0x10, 32,
-            0xB6,            // RETURN
+            0x10, 0, 0x10, 32, 0xB6, // RETURN
         ];
         match exec(&vm, &bytecode, 100_000) {
             ExecutionResult::Success { return_data, .. } => {
@@ -1654,12 +1954,12 @@ mod tests {
         //      destructuring `(slot, val) = pop2()`) wrote the value
         //      to the wrong slot. Correct order is slot first, val
         //      second.
-        let mut bytecode = vec![0x10, 1];          // PUSH1 1     (slot — bottom)
-        bytecode.push(0x13);                       // PUSH8       (val opcode)
+        let mut bytecode = vec![0x10, 1]; // PUSH1 1     (slot — bottom)
+        bytecode.push(0x13); // PUSH8       (val opcode)
         bytecode.extend_from_slice(&u64::MAX.to_be_bytes());
-        bytecode.push(0x51);                       // SSTORE
+        bytecode.push(0x51); // SSTORE
         bytecode.extend_from_slice(&[0x10, 1, 0x50]); // PUSH1 1, SLOAD
-        bytecode.push(0x00);                       // STOP
+        bytecode.push(0x00); // STOP
         match exec(&vm, &bytecode, 100000) {
             ExecutionResult::Success { .. } => {}
             other => panic!("Expected success, got {:?}", other),
@@ -1711,17 +2011,22 @@ mod tests {
             };
             assert!(
                 msg.contains(name),
-                "{} stub error must name the opcode, got: {}", name, msg
+                "{} stub error must name the opcode, got: {}",
+                name,
+                msg
             );
             assert!(
                 msg.contains("legacy VM engine"),
-                "{} stub error must mention 'legacy VM engine', got: {}", name, msg
+                "{} stub error must mention 'legacy VM engine', got: {}",
+                name,
+                msg
             );
             assert!(
                 msg.contains("ExecutionEnvironment"),
-                "{} stub error must redirect to ExecutionEnvironment, got: {}", name, msg
+                "{} stub error must redirect to ExecutionEnvironment, got: {}",
+                name,
+                msg
             );
         }
     }
-
 }

@@ -3,14 +3,13 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{
-    DB, Options, WriteOptions, ReadOptions,
-    BlockBasedOptions, Cache, SliceTransform, WriteBatch,
-    IteratorMode, Direction,
-};
-use std::path::Path;
 use crate::errors::StorageError;
 use crate::slog_error;
+use rocksdb::{
+    BlockBasedOptions, Cache, Direction, IteratorMode, Options, ReadOptions, SliceTransform,
+    WriteBatch, WriteOptions, DB,
+};
+use std::path::Path;
 
 // prefix
 const KEY_PREFIX: &[u8] = b"pk:";
@@ -25,7 +24,6 @@ pub struct PublicKeyStore {
 }
 
 impl PublicKeyStore {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
@@ -37,7 +35,7 @@ impl PublicKeyStore {
         opts.increase_parallelism(
             std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4) as i32
+                .unwrap_or(4) as i32,
         );
 
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(PREFIX_LEN));
@@ -51,8 +49,10 @@ impl PublicKeyStore {
 
         opts.set_block_based_table_factory(&block_opts);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(false);
@@ -147,7 +147,8 @@ impl PublicKeyStore {
     #[inline(always)]
     pub fn load_raw(&self, key_id: &str) -> Option<Vec<u8>> {
         Self::build_key(key_id, |k| {
-            self.db.get_pinned_opt(k, &self.read_opts)
+            self.db
+                .get_pinned_opt(k, &self.read_opts)
                 .ok()
                 .flatten()
                 .map(|v| v.as_ref().to_vec())
@@ -167,7 +168,8 @@ impl PublicKeyStore {
             });
         }
 
-        self.db.multi_get_opt(real_keys, &self.read_opts)
+        self.db
+            .multi_get_opt(real_keys, &self.read_opts)
             .into_iter()
             .map(|r| r.ok().flatten().map(|v| v.to_vec()))
             .collect()
@@ -179,7 +181,8 @@ impl PublicKeyStore {
     #[inline(always)]
     pub fn exists(&self, key_id: &str) -> bool {
         Self::build_key(key_id, |k| {
-            self.db.get_pinned_opt(k, &self.read_opts_no_cache)
+            self.db
+                .get_pinned_opt(k, &self.read_opts_no_cache)
                 .map(|opt| opt.is_some())
                 .unwrap_or(false)
         })
@@ -222,10 +225,9 @@ impl PublicKeyStore {
         let mut opts = ReadOptions::default();
         opts.set_iterate_upper_bound(PREFIX_UPPER_BOUND);
 
-        let iter = self.db.iterator_opt(
-            IteratorMode::From(KEY_PREFIX, Direction::Forward),
-            opts,
-        );
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(KEY_PREFIX, Direction::Forward), opts);
 
         let mut result = Vec::with_capacity(128);
 
@@ -255,10 +257,9 @@ impl PublicKeyStore {
         let mut opts = ReadOptions::default();
         opts.set_iterate_upper_bound(PREFIX_UPPER_BOUND);
 
-        let iter = self.db.iterator_opt(
-            IteratorMode::From(KEY_PREFIX, Direction::Forward),
-            opts,
-        );
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(KEY_PREFIX, Direction::Forward), opts);
 
         let mut result = Vec::with_capacity(128);
 

@@ -5,9 +5,9 @@
 
 #[cfg(test)]
 mod soak {
+    use crate::domain::transaction::tx_receipt::{compute_receipt_root, TxReceipt};
     use crate::runtime::vm::core::execution_env::*;
     use crate::runtime::vm::testing::invariant_checker::InvariantChecker;
-    use crate::domain::transaction::tx_receipt::{TxReceipt, compute_receipt_root};
 
     const PUSH1: u8 = 0x10;
     const SSTORE: u8 = 0x51;
@@ -32,9 +32,9 @@ mod soak {
 
         // Deploy a counter contract
         let counter_code = vec![
-            PUSH1, 0, SLOAD,   // load current value
-            PUSH1, 1, ADD,     // add 1
-            PUSH1, 0, SSTORE,  // store back
+            PUSH1, 0, SLOAD, // load current value
+            PUSH1, 1, ADD, // add 1
+            PUSH1, 0, SSTORE, // store back
             STOP,
         ];
         env.state.set_code("counter", counter_code).unwrap();
@@ -72,10 +72,12 @@ mod soak {
 
             // Check invariants
             let result = InvariantChecker::check_block(
-                block, &block_hash,
+                block,
+                &block_hash,
                 Some(&receipt_root),
                 Some(&env.state.state_root()),
-                &receipts, &env,
+                &receipts,
+                &env,
             );
 
             if !result.is_clean() {
@@ -89,7 +91,10 @@ mod soak {
 
         // Verify counter reached 100
         let val = env.state.storage_load("counter", "slot:0");
-        assert!(val.is_some(), "Counter should have a value after 100 blocks");
+        assert!(
+            val.is_some(),
+            "Counter should have a value after 100 blocks"
+        );
     }
 
     /// Simulate blocks with mixed success/revert transactions.
@@ -127,9 +132,12 @@ mod soak {
             let receipt_root = compute_receipt_root(&receipts);
 
             let result = InvariantChecker::check_block(
-                block, &format!("{:064x}", block),
-                Some(&receipt_root), None,
-                &receipts, &env,
+                block,
+                &format!("{:064x}", block),
+                Some(&receipt_root),
+                None,
+                &receipts,
+                &env,
             );
 
             if !result.is_clean() {
@@ -175,7 +183,11 @@ mod soak {
 
             // State should be back to snapshot
             let root_after = env.state.state_root();
-            assert!(!root_after.is_empty(), "State root should exist after reorg cycle {}", cycle);
+            assert!(
+                !root_after.is_empty(),
+                "State root should exist after reorg cycle {}",
+                cycle
+            );
         }
     }
 
@@ -212,8 +224,11 @@ mod soak {
             }
 
             // All nodes must agree
-            assert!(roots.windows(2).all(|w| w[0] == w[1]),
-                "Block {}: state_root divergence between nodes", block);
+            assert!(
+                roots.windows(2).all(|w| w[0] == w[1]),
+                "Block {}: state_root divergence between nodes",
+                block
+            );
         }
     }
 }

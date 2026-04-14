@@ -112,7 +112,10 @@ impl CallStack {
         }
 
         if frame.code.len() > MAX_CODE_SIZE {
-            return Err(VmError::CodeTooLarge { size: frame.code.len(), limit: MAX_CODE_SIZE });
+            return Err(VmError::CodeTooLarge {
+                size: frame.code.len(),
+                limit: MAX_CODE_SIZE,
+            });
         }
 
         self.frames.push(frame);
@@ -162,8 +165,9 @@ impl CallStack {
         code: Vec<u8>,
         calldata: Vec<u8>,
     ) -> Result<CallFrame, VmError> {
-        let current = self.current()
-            .ok_or(VmError::Other("no current frame for creating sub-call".to_string()))?;
+        let current = self.current().ok_or(VmError::Other(
+            "no current frame for creating sub-call".to_string(),
+        ))?;
 
         if self.depth() >= self.max_depth {
             return Err(VmError::StackOverflow(self.depth()));
@@ -212,8 +216,9 @@ impl CallStack {
         code: Vec<u8>,
         calldata: Vec<u8>,
     ) -> Result<CallFrame, VmError> {
-        let current = self.current()
-            .ok_or(VmError::Other("no current frame for delegate call".to_string()))?;
+        let current = self.current().ok_or(VmError::Other(
+            "no current frame for delegate call".to_string(),
+        ))?;
 
         let mut frame = self.create_call(
             current.address.clone(), // Keep caller's address for storage
@@ -241,7 +246,12 @@ mod tests {
     fn basic_push_pop() {
         let mut cs = CallStack::new();
         let frame = CallFrame::new(
-            "contract_a".into(), "user".into(), 100, 1_000_000, vec![0x00], vec![],
+            "contract_a".into(),
+            "user".into(),
+            100,
+            1_000_000,
+            vec![0x00],
+            vec![],
         );
         cs.push(frame).unwrap();
         assert_eq!(cs.depth(), 1);
@@ -255,37 +265,49 @@ mod tests {
         let mut cs = CallStack::new();
         for i in 0..MAX_CALL_DEPTH {
             let frame = CallFrame::new(
-                format!("contract_{}", i), "user".into(), 0, 1000, vec![0x00], vec![],
+                format!("contract_{}", i),
+                "user".into(),
+                0,
+                1000,
+                vec![0x00],
+                vec![],
             );
             cs.push(frame).unwrap();
         }
         // One more should fail
-        let frame = CallFrame::new("overflow".into(), "user".into(), 0, 1000, vec![0x00], vec![]);
+        let frame = CallFrame::new(
+            "overflow".into(),
+            "user".into(),
+            0,
+            1000,
+            vec![0x00],
+            vec![],
+        );
         assert!(cs.push(frame).is_err());
     }
 
     #[test]
     fn sub_call_inherits_static() {
         let mut cs = CallStack::new();
-        let mut frame = CallFrame::new(
-            "a".into(), "user".into(), 0, 1_000_000, vec![], vec![],
-        );
+        let mut frame = CallFrame::new("a".into(), "user".into(), 0, 1_000_000, vec![], vec![]);
         frame.is_static = true;
         cs.push(frame).unwrap();
 
-        let sub = cs.create_call("b".into(), 0, 500_000, vec![], vec![]).unwrap();
+        let sub = cs
+            .create_call("b".into(), 0, 500_000, vec![], vec![])
+            .unwrap();
         assert!(sub.is_static); // Inherited
     }
 
     #[test]
     fn gas_capped_at_63_64() {
         let mut cs = CallStack::new();
-        let frame = CallFrame::new(
-            "a".into(), "user".into(), 0, 640_000, vec![], vec![],
-        );
+        let frame = CallFrame::new("a".into(), "user".into(), 0, 640_000, vec![], vec![]);
         cs.push(frame).unwrap();
 
-        let sub = cs.create_call("b".into(), 0, 1_000_000, vec![], vec![]).unwrap();
+        let sub = cs
+            .create_call("b".into(), 0, 1_000_000, vec![], vec![])
+            .unwrap();
         // Should be capped at 630000 (640000 - 640000/64 = 630000)
         assert!(sub.gas_limit <= 630_000);
     }

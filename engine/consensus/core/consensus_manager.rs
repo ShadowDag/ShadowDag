@@ -3,7 +3,7 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options, ReadOptions, WriteOptions, WriteBatch};
+use rocksdb::{Options, ReadOptions, WriteBatch, WriteOptions, DB};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -20,7 +20,6 @@ pub struct ConsensusManagerStore {
 }
 
 impl ConsensusManagerStore {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
@@ -31,8 +30,10 @@ impl ConsensusManagerStore {
         opts.increase_parallelism(4);
         opts.optimize_level_style_compaction(512 * 1024 * 1024);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         // Consensus state is safety-critical — sync writes to disk.
         // set_sync(true) = fsync after every write. Slower but crash-safe.
@@ -81,7 +82,10 @@ impl ConsensusManagerStore {
             Ok(None) => Ok(None),
             Err(e) => {
                 slog_error!("consensus", "consensus_mgr_read_failed", key => key, error => e);
-                Err(StorageError::ReadFailed(format!("consensus_manager read '{}': {}", key, e)).into())
+                Err(
+                    StorageError::ReadFailed(format!("consensus_manager read '{}': {}", key, e))
+                        .into(),
+                )
             }
         }
     }
@@ -122,17 +126,20 @@ impl ConsensusManagerStore {
             Ok(None) => {
                 if let Err(e) = self.db.put_opt(&*buf, hash.as_bytes(), &self.write_opts) {
                     slog_error!("consensus", "store_tip_write_failed", key => key, error => e);
-                    return Err(StorageError::WriteFailed(
-                        format!("store_tip_if_absent write '{}': {}", key, e)
-                    ).into());
+                    return Err(StorageError::WriteFailed(format!(
+                        "store_tip_if_absent write '{}': {}",
+                        key, e
+                    ))
+                    .into());
                 }
                 Ok(true)
             }
             Err(e) => {
                 slog_error!("consensus", "store_tip_read_failed", key => key, error => e);
-                Err(StorageError::ReadFailed(
-                    format!("store_tip_if_absent read '{}': {}", key, e)
-                ).into())
+                Err(
+                    StorageError::ReadFailed(format!("store_tip_if_absent read '{}': {}", key, e))
+                        .into(),
+                )
             }
         }
     }
@@ -183,15 +190,14 @@ impl ConsensusManagerStore {
     // ─────────────────────────────────────────
     #[inline(always)]
     pub fn get_tip(&self, key: &str) -> Result<Option<String>, ConsensusError> {
-        self.with_value(key, |data| {
-            match std::str::from_utf8(data) {
-                Ok(s) => Some(s.to_owned()),
-                Err(_) => {
-                    slog_error!("consensus", "tip_utf8_corrupt", key => key);
-                    None
-                }
+        self.with_value(key, |data| match std::str::from_utf8(data) {
+            Ok(s) => Some(s.to_owned()),
+            Err(_) => {
+                slog_error!("consensus", "tip_utf8_corrupt", key => key);
+                None
             }
-        }).map(|opt| opt.flatten())
+        })
+        .map(|opt| opt.flatten())
     }
 
     // ─────────────────────────────────────────
@@ -288,7 +294,9 @@ mod tests {
     #[test]
     fn store_tip_batch_writes_all() {
         let store = ConsensusManagerStore::new(&tmp_path()).unwrap();
-        store.store_tip_batch(&[("a", "h1"), ("b", "h2"), ("c", "h3")]).unwrap();
+        store
+            .store_tip_batch(&[("a", "h1"), ("b", "h2"), ("c", "h3")])
+            .unwrap();
         assert_eq!(store.get_tip("a").unwrap(), Some("h1".to_string()));
         assert_eq!(store.get_tip("b").unwrap(), Some("h2".to_string()));
         assert_eq!(store.get_tip("c").unwrap(), Some("h3".to_string()));

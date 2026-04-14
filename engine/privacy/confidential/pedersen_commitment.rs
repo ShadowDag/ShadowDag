@@ -3,17 +3,17 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::errors::CryptoError;
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
-use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
-use sha2::{Sha512, Digest};
 use rand::rngs::OsRng;
-use crate::errors::CryptoError;
+use sha2::{Digest, Sha512};
 
 pub struct CommitmentResult {
     pub commitment_hex: String,
-    pub blinding_hex:   String,
-    pub is_valid:       bool,
+    pub blinding_hex: String,
+    pub is_valid: bool,
 }
 
 pub struct PedersenCommitment;
@@ -33,12 +33,11 @@ impl PedersenCommitment {
 
         // Standard Pedersen: C = v*H + r*G
         // H = value generator (nothing-up-my-sleeve), G = blinding generator (basepoint)
-        let commitment: RistrettoPoint =
-            v * h_point + r * RISTRETTO_BASEPOINT_POINT;
+        let commitment: RistrettoPoint = v * h_point + r * RISTRETTO_BASEPOINT_POINT;
 
-        let compressed     = commitment.compress();
+        let compressed = commitment.compress();
         let commitment_hex = hex::encode(compressed.as_bytes());
-        let blinding_hex   = hex::encode(r.as_bytes());
+        let blinding_hex = hex::encode(r.as_bytes());
 
         CommitmentResult {
             commitment_hex,
@@ -48,7 +47,7 @@ impl PedersenCommitment {
     }
 
     pub fn verify(commitment_hex: &str, amount: u64, blinding_hex: &str) -> bool {
-        let v     = Scalar::from(amount);
+        let v = Scalar::from(amount);
         let r_bytes = match hex::decode(blinding_hex) {
             Ok(b) if b.len() == 32 => b,
             _ => return false,
@@ -64,11 +63,10 @@ impl PedersenCommitment {
         let r = Scalar::from_canonical_bytes(r_arr).unwrap();
 
         // Standard Pedersen: C = v*H + r*G (must match commit_with_blinding)
-        let h_point     = Self::_h_point();
+        let h_point = Self::_h_point();
         let expected: RistrettoPoint = v * h_point + r * RISTRETTO_BASEPOINT_POINT;
         let expected_hex = hex::encode(expected.compress().as_bytes());
 
-        
         expected_hex == commitment_hex
     }
 
@@ -100,21 +98,26 @@ impl PedersenCommitment {
     /// canonical scalar (i.e. >= the curve group order L).  This rejects the
     /// ~0.4 % of inputs that `from_bytes_mod_order` would silently reduce,
     /// eliminating the inflation risk from non-canonical scalars.
-    pub fn deterministic_blinding(master_secret: &[u8], amount: u64, output_index: u32) -> Result<Scalar, CryptoError> {
-        use sha2::{Sha256, Digest as _};
+    pub fn deterministic_blinding(
+        master_secret: &[u8],
+        amount: u64,
+        output_index: u32,
+    ) -> Result<Scalar, CryptoError> {
+        use sha2::{Digest as _, Sha256};
         let mut h = Sha256::new();
         h.update(b"ShadowDAG_Blinding_v2");
         h.update(master_secret);
         h.update(amount.to_le_bytes());
         h.update(output_index.to_le_bytes());
         let hash: [u8; 32] = h.finalize().into();
-        Option::from(Scalar::from_canonical_bytes(hash))
-            .ok_or(CryptoError::NonCanonicalScalar)
+        Option::from(Scalar::from_canonical_bytes(hash)).ok_or(CryptoError::NonCanonicalScalar)
     }
 
     fn _from_hex(hex_str: &str) -> Option<RistrettoPoint> {
         let bytes = hex::decode(hex_str).ok()?;
-        if bytes.len() != 32 { return None; }
+        if bytes.len() != 32 {
+            return None;
+        }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
         CompressedRistretto(arr).decompress()

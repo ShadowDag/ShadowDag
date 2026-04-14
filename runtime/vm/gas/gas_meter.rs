@@ -209,7 +209,10 @@ mod tests {
         let mut meter = GasMeter::new(100);
         meter.consume(80);
         match meter.consume(30) {
-            GasResult::OutOfGas { available, required } => {
+            GasResult::OutOfGas {
+                available,
+                required,
+            } => {
                 assert_eq!(available, 20);
                 assert_eq!(required, 30);
             }
@@ -224,8 +227,14 @@ mod tests {
         let mut meter = GasMeter::new(1000);
         meter.consume(500);
         match meter.consume(u64::MAX) {
-            GasResult::OutOfGas { available, required } => {
-                assert_eq!(available, 500, "available must reflect gas remaining before overflow");
+            GasResult::OutOfGas {
+                available,
+                required,
+            } => {
+                assert_eq!(
+                    available, 500,
+                    "available must reflect gas remaining before overflow"
+                );
                 assert_eq!(required, u64::MAX);
             }
             _ => panic!("Expected OutOfGas on overflow"),

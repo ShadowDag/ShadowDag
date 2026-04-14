@@ -3,31 +3,31 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use ed25519_dalek::{VerifyingKey, Signature, Verifier};
-use sha2::{Sha256, Digest};
 
+use crate::config::node::node_config::NetworkMode;
 use crate::domain::transaction::transaction::{Transaction, TxInput, TxType};
 use crate::domain::transaction::tx_hash::TxHash;
 use crate::domain::utxo::utxo::Utxo;
 use crate::domain::utxo::utxo_key::UtxoKey;
-use crate::domain::utxo::utxo_set::{UtxoSet, utxo_key};
-use crate::config::node::node_config::NetworkMode;
+use crate::domain::utxo::utxo_set::{utxo_key, UtxoSet};
 use crate::engine::privacy::ringct::ring_validator::RingValidator;
-use crate::errors::{StorageError, ConsensusError};
+use crate::errors::{ConsensusError, StorageError};
 
-pub const MIN_TX_FEE:        u64   = 1;
-pub const MAX_TX_INPUTS:     usize = 50;
-pub const MAX_TX_OUTPUTS:    usize = 100;
-pub const MAX_TX_BYTES:      usize = 100 * 1024;
-pub const MAX_OUTPUT_AMOUNT: u64   = 21_000_000_000;
-pub const DUST_LIMIT:        u64   = 546;
-pub const SIGNATURE_BYTES:   usize = 64;
-pub const PUBKEY_BYTES:      usize = 32;
+pub const MIN_TX_FEE: u64 = 1;
+pub const MAX_TX_INPUTS: usize = 50;
+pub const MAX_TX_OUTPUTS: usize = 100;
+pub const MAX_TX_BYTES: usize = 100 * 1024;
+pub const MAX_OUTPUT_AMOUNT: u64 = 21_000_000_000;
+pub const DUST_LIMIT: u64 = 546;
+pub const SIGNATURE_BYTES: usize = 64;
+pub const PUBKEY_BYTES: usize = 32;
 
 /// Maximum age of a TX timestamp before it's rejected (24 hours).
 /// Prevents replay of stale signed TXs after long delays.
-pub const MAX_TX_AGE_SECS:      u64 = 24 * 3_600;
+pub const MAX_TX_AGE_SECS: u64 = 24 * 3_600;
 /// Maximum how far in the future a TX timestamp can be (15 seconds).
 ///
 /// CLOCK REQUIREMENT: All nodes MUST synchronize their clocks via NTP
@@ -36,35 +36,47 @@ pub const MAX_TX_AGE_SECS:      u64 = 24 * 3_600;
 /// allows nodes with drifted clocks to disagree on TX validity, causing
 /// mempool divergence and stale transactions sitting in some mempools
 /// but rejected by others.
-pub const MAX_TX_FUTURE_SECS:   u64 = 15;
+pub const MAX_TX_FUTURE_SECS: u64 = 15;
 /// Maximum age of the block referenced by payload_hash (48 hours in blocks).
 /// At 10 BPS this is ~1.7M blocks. We check existence, not depth.
 pub const PAYLOAD_HASH_HEX_LEN: usize = 64;
 
 const ED25519_L: [u8; 32] = [
-    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58,
-    0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
 ];
 
 /// Structural validation only (no utxo set required).
 /// Checks: non-empty outputs, non-empty hash, size limits, hash integrity, output amounts.
 /// Also enforces: non-coinbase tx must have >= 1 input, coinbase tx must have 0 inputs.
 pub fn validate_tx(tx: &Transaction) -> bool {
-    if tx.outputs.is_empty() { return false; }
-    if tx.hash.is_empty() { return false; }
+    if tx.outputs.is_empty() {
+        return false;
+    }
+    if tx.hash.is_empty() {
+        return false;
+    }
 
     // Coinbase must have exactly 0 inputs; non-coinbase must have >= 1 input
-    if tx.is_coinbase() && !tx.inputs.is_empty() { return false; }
-    if !tx.is_coinbase() && tx.inputs.is_empty() { return false; }
+    if tx.is_coinbase() && !tx.inputs.is_empty() {
+        return false;
+    }
+    if !tx.is_coinbase() && tx.inputs.is_empty() {
+        return false;
+    }
 
     // Use canonical_bytes for size check — matches the encoding used for
     // TX hashing, preventing size-check / hash-check mismatches.
-    if tx.canonical_bytes().len() > MAX_TX_BYTES { return false; }
+    if tx.canonical_bytes().len() > MAX_TX_BYTES {
+        return false;
+    }
 
-    if tx.inputs.len() > MAX_TX_INPUTS { return false; }
-    if tx.outputs.len() > MAX_TX_OUTPUTS { return false; }
+    if tx.inputs.len() > MAX_TX_INPUTS {
+        return false;
+    }
+    if tx.outputs.len() > MAX_TX_OUTPUTS {
+        return false;
+    }
 
     TxValidator::sum_outputs(tx).is_some()
 }
@@ -72,15 +84,19 @@ pub fn validate_tx(tx: &Transaction) -> bool {
 pub struct TxValidator;
 
 impl TxValidator {
-
     pub fn validate_tx(tx: &Transaction, utxo_set: &UtxoSet) -> bool {
-
         // 🔥 FAST FAIL قبل serialize
-        if tx.outputs.is_empty() { return false; }
-        if tx.hash.is_empty() { return false; }
+        if tx.outputs.is_empty() {
+            return false;
+        }
+        if tx.hash.is_empty() {
+            return false;
+        }
 
         // Use canonical_bytes for size — matches TX hash encoding
-        if tx.canonical_bytes().len() > MAX_TX_BYTES { return false; }
+        if tx.canonical_bytes().len() > MAX_TX_BYTES {
+            return false;
+        }
 
         if !TxHash::verify(tx) {
             return false;
@@ -106,10 +122,9 @@ impl TxValidator {
         }
 
         let mut seen_inputs: HashSet<UtxoKey> = HashSet::with_capacity(tx.inputs.len());
-        let mut input_sum:   u64             = 0;
+        let mut input_sum: u64 = 0;
 
         for input in &tx.inputs {
-
             let key = match utxo_key(&input.txid, input.index) {
                 Ok(k) => k,
                 Err(_) => return false,
@@ -146,7 +161,7 @@ impl TxValidator {
 
         let output_sum = match Self::sum_outputs(tx) {
             Some(s) => s,
-            None    => return false,
+            None => return false,
         };
 
         if tx.fee < MIN_TX_FEE {
@@ -178,24 +193,46 @@ impl TxValidator {
     /// Structural validation only (no UTXO lookups) — network-aware hash verification.
     /// Used by block validator for staged UTXO validation where inputs are checked separately.
     pub fn validate_structure_for_network(tx: &Transaction, network: &NetworkMode) -> bool {
-        if tx.outputs.is_empty() { return false; }
-        if tx.hash.is_empty() { return false; }
+        if tx.outputs.is_empty() {
+            return false;
+        }
+        if tx.hash.is_empty() {
+            return false;
+        }
 
-        if tx.canonical_bytes().len() > MAX_TX_BYTES { return false; }
+        if tx.canonical_bytes().len() > MAX_TX_BYTES {
+            return false;
+        }
 
-        if !TxHash::verify_for_network(tx, network) { return false; }
-        if tx.inputs.len() > MAX_TX_INPUTS { return false; }
-        if tx.outputs.len() > MAX_TX_OUTPUTS { return false; }
+        if !TxHash::verify_for_network(tx, network) {
+            return false;
+        }
+        if tx.inputs.len() > MAX_TX_INPUTS {
+            return false;
+        }
+        if tx.outputs.len() > MAX_TX_OUTPUTS {
+            return false;
+        }
 
-        if tx.is_coinbase() && !tx.inputs.is_empty() { return false; }
-        if !tx.is_coinbase() && tx.inputs.is_empty() { return false; }
+        if tx.is_coinbase() && !tx.inputs.is_empty() {
+            return false;
+        }
+        if !tx.is_coinbase() && tx.inputs.is_empty() {
+            return false;
+        }
 
         // payload_hash format validation (if present)
-        if Self::validate_payload_hash_format(tx).is_err() { return false; }
+        if Self::validate_payload_hash_format(tx).is_err() {
+            return false;
+        }
 
         // Contract-specific payload validation
-        if Self::validate_contract_create_payload(tx).is_err() { return false; }
-        if Self::validate_contract_call_payload(tx).is_err() { return false; }
+        if Self::validate_contract_create_payload(tx).is_err() {
+            return false;
+        }
+        if Self::validate_contract_call_payload(tx).is_err() {
+            return false;
+        }
 
         // Check for duplicate inputs within same tx
         let mut seen: HashSet<UtxoKey> = HashSet::with_capacity(tx.inputs.len());
@@ -204,7 +241,9 @@ impl TxValidator {
                 Ok(k) => k,
                 Err(_) => return false,
             };
-            if !seen.insert(key) { return false; }
+            if !seen.insert(key) {
+                return false;
+            }
         }
 
         // Output amounts valid
@@ -212,33 +251,63 @@ impl TxValidator {
     }
 
     /// Network-aware validation — uses the correct chain_id for hash/signature checks.
-    pub fn validate_tx_for_network(tx: &Transaction, utxo_set: &UtxoSet, network: &NetworkMode) -> bool {
+    pub fn validate_tx_for_network(
+        tx: &Transaction,
+        utxo_set: &UtxoSet,
+        network: &NetworkMode,
+    ) -> bool {
         // structural fast-fail (same as validate_tx)
-        if tx.outputs.is_empty() { return false; }
-        if tx.hash.is_empty() { return false; }
+        if tx.outputs.is_empty() {
+            return false;
+        }
+        if tx.hash.is_empty() {
+            return false;
+        }
 
-        if tx.canonical_bytes().len() > MAX_TX_BYTES { return false; }
+        if tx.canonical_bytes().len() > MAX_TX_BYTES {
+            return false;
+        }
 
         if !TxHash::verify_for_network(tx, network) {
             return false;
         }
 
-        if tx.inputs.len() > MAX_TX_INPUTS { return false; }
-        if tx.outputs.len() > MAX_TX_OUTPUTS { return false; }
+        if tx.inputs.len() > MAX_TX_INPUTS {
+            return false;
+        }
+        if tx.outputs.len() > MAX_TX_OUTPUTS {
+            return false;
+        }
 
-        if tx.is_coinbase() && !tx.inputs.is_empty() { return false; }
-        if tx.is_coinbase() { return Self::validate_outputs_only(tx); }
-        if tx.inputs.is_empty() { return false; }
+        if tx.is_coinbase() && !tx.inputs.is_empty() {
+            return false;
+        }
+        if tx.is_coinbase() {
+            return Self::validate_outputs_only(tx);
+        }
+        if tx.inputs.is_empty() {
+            return false;
+        }
 
         // Anti-replay: timestamp range check
-        if Self::validate_tx_timestamp(tx).is_err() { return false; }
+        if Self::validate_tx_timestamp(tx).is_err() {
+            return false;
+        }
         // Payload hash format
-        if Self::validate_payload_hash_format(tx).is_err() { return false; }
+        if Self::validate_payload_hash_format(tx).is_err() {
+            return false;
+        }
         // Contract-specific payload validation
-        if Self::validate_contract_create_payload(tx).is_err() { return false; }
-        if Self::validate_contract_call_payload(tx).is_err() { return false; }
+        if Self::validate_contract_create_payload(tx).is_err() {
+            return false;
+        }
+        if Self::validate_contract_call_payload(tx).is_err() {
+            return false;
+        }
         // Ring signature for confidential TXs
-        if tx.is_confidential() && !RingValidator::validate(tx) { return false; }
+        if tx.is_confidential() && !RingValidator::validate(tx) {
+            return false;
+        }
 
         let mut seen_inputs: HashSet<UtxoKey> = HashSet::with_capacity(tx.inputs.len());
         let mut input_sum: u64 = 0;
@@ -250,7 +319,9 @@ impl TxValidator {
                 Err(_) => return false,
             };
 
-            if seen_inputs.contains(&key) { return false; }
+            if seen_inputs.contains(&key) {
+                return false;
+            }
             seen_inputs.insert(key);
 
             let utxo = match utxo_set.get_utxo(&key) {
@@ -258,7 +329,9 @@ impl TxValidator {
                 None => return false,
             };
 
-            if utxo.spent { return false; }
+            if utxo.spent {
+                return false;
+            }
 
             if !Self::verify_input_ownership(input, &utxo, &signing_msg) {
                 return false;
@@ -275,7 +348,9 @@ impl TxValidator {
             None => return false,
         };
 
-        if tx.fee < MIN_TX_FEE { return false; }
+        if tx.fee < MIN_TX_FEE {
+            return false;
+        }
 
         let required = match output_sum.checked_add(tx.fee) {
             Some(r) => r,
@@ -340,27 +415,43 @@ impl TxValidator {
         // Size limit — use canonical_bytes (matches TX hash encoding)
         let canonical_size = tx.canonical_bytes().len();
         if canonical_size > MAX_TX_BYTES {
-            return Err(StorageError::Other(format!("transaction exceeds max size ({} > {})", canonical_size, MAX_TX_BYTES)));
+            return Err(StorageError::Other(format!(
+                "transaction exceeds max size ({} > {})",
+                canonical_size, MAX_TX_BYTES
+            )));
         }
 
         if tx.inputs.len() > MAX_TX_INPUTS {
-            return Err(StorageError::Other(format!("too many inputs ({} > {})", tx.inputs.len(), MAX_TX_INPUTS)));
+            return Err(StorageError::Other(format!(
+                "too many inputs ({} > {})",
+                tx.inputs.len(),
+                MAX_TX_INPUTS
+            )));
         }
         if tx.outputs.len() > MAX_TX_OUTPUTS {
-            return Err(StorageError::Other(format!("too many outputs ({} > {})", tx.outputs.len(), MAX_TX_OUTPUTS)));
+            return Err(StorageError::Other(format!(
+                "too many outputs ({} > {})",
+                tx.outputs.len(),
+                MAX_TX_OUTPUTS
+            )));
         }
 
         // ── [7] coinbase must have 0 inputs; non-coinbase must have >= 1 ──
         if tx.is_coinbase() && !tx.inputs.is_empty() {
-            return Err(StorageError::Other("coinbase transaction must have exactly 0 inputs".into()));
+            return Err(StorageError::Other(
+                "coinbase transaction must have exactly 0 inputs".into(),
+            ));
         }
         if !tx.is_coinbase() && tx.inputs.is_empty() {
-            return Err(StorageError::Other("non-coinbase transaction has no inputs".into()));
+            return Err(StorageError::Other(
+                "non-coinbase transaction has no inputs".into(),
+            ));
         }
 
         // ── output validation (overflow-safe) ───────────────────────────
-        let output_sum = Self::sum_outputs(tx)
-            .ok_or_else(|| StorageError::Other("output amount invalid (dust/overflow/exceeds max)".to_string()))?;
+        let output_sum = Self::sum_outputs(tx).ok_or_else(|| {
+            StorageError::Other("output amount invalid (dust/overflow/exceeds max)".to_string())
+        })?;
 
         // Coinbase: only output validation needed
         if tx.is_coinbase() {
@@ -376,29 +467,41 @@ impl TxValidator {
 
             // [1] Duplicate inputs within same tx
             if !seen_inputs.insert(key) {
-                return Err(StorageError::Other(format!("duplicate input {} in transaction {}", key, tx.hash)));
+                return Err(StorageError::Other(format!(
+                    "duplicate input {} in transaction {}",
+                    key, tx.hash
+                )));
             }
 
             // [2] Input UTXO must exist
-            let utxo = utxo_set.get_utxo(&key)
-                .ok_or_else(|| StorageError::KeyNotFound(format!("input utxo {} not found (tx {})", key, tx.hash)))?;
+            let utxo = utxo_set.get_utxo(&key).ok_or_else(|| {
+                StorageError::KeyNotFound(format!("input utxo {} not found (tx {})", key, tx.hash))
+            })?;
 
             // [3] Input UTXO must be unspent
             if utxo.spent {
-                return Err(StorageError::Other(format!("input utxo {} already spent (tx {})", key, tx.hash)));
+                return Err(StorageError::Other(format!(
+                    "input utxo {} already spent (tx {})",
+                    key, tx.hash
+                )));
             }
 
             // [NEW] Verify signature matches UTXO owner
             let signing_msg = TxHash::signing_message(tx);
             if !Self::verify_input_ownership(input, &utxo, &signing_msg) {
                 return Err(StorageError::Other(format!(
-                    "input {} signature does not match UTXO owner (tx {})", key, tx.hash
+                    "input {} signature does not match UTXO owner (tx {})",
+                    key, tx.hash
                 )));
             }
 
             // [5] Overflow protection
-            input_sum = input_sum.checked_add(utxo.amount)
-                .ok_or_else(|| StorageError::Other(format!("input sum overflow at utxo {} (tx {})", key, tx.hash)))?;
+            input_sum = input_sum.checked_add(utxo.amount).ok_or_else(|| {
+                StorageError::Other(format!(
+                    "input sum overflow at utxo {} (tx {})",
+                    key, tx.hash
+                ))
+            })?;
         }
 
         // ── [4][6] amount and fee checks ────────────────────────────────
@@ -411,7 +514,8 @@ impl TxValidator {
         }
 
         // [6] Negative fee detection: fee field must match actual fee
-        let actual_fee = input_sum.checked_sub(output_sum)
+        let actual_fee = input_sum
+            .checked_sub(output_sum)
             .ok_or_else(|| StorageError::Other(format!("fee underflow in tx {}", tx.hash)))?;
 
         if actual_fee < MIN_TX_FEE {
@@ -436,13 +540,12 @@ impl TxValidator {
         // Mandatory check: ring signatures must be valid in the consensus path.
         // block_validator already checks this, but tx_validator must also enforce
         // it so that mempool admission and standalone TX validation are safe.
-        if tx.is_confidential()
-            && !RingValidator::validate(tx) {
-                return Err(StorageError::Other(format!(
-                    "ring signature verification failed for confidential tx {}",
-                    tx.hash
-                )));
-            }
+        if tx.is_confidential() && !RingValidator::validate(tx) {
+            return Err(StorageError::Other(format!(
+                "ring signature verification failed for confidential tx {}",
+                tx.hash
+            )));
+        }
 
         Ok(())
     }
@@ -461,9 +564,10 @@ impl TxValidator {
 
         // Decode public key
         let pk_arr: [u8; 32] = match hex::decode(&input.pub_key) {
-            Ok(b) if b.len() == PUBKEY_BYTES => {
-                match b.try_into() { Ok(a) => a, Err(_) => return false }
-            }
+            Ok(b) if b.len() == PUBKEY_BYTES => match b.try_into() {
+                Ok(a) => a,
+                Err(_) => return false,
+            },
             _ => return false,
         };
 
@@ -497,9 +601,10 @@ impl TxValidator {
 
         // Decode and verify signature
         let sig_bytes: [u8; 64] = match hex::decode(&input.signature) {
-            Ok(b) if b.len() == SIGNATURE_BYTES => {
-                match b.try_into() { Ok(a) => a, Err(_) => return false }
-            }
+            Ok(b) if b.len() == SIGNATURE_BYTES => match b.try_into() {
+                Ok(a) => a,
+                Err(_) => return false,
+            },
             _ => return false,
         };
 
@@ -516,16 +621,21 @@ impl TxValidator {
 
     /// Verify input ownership against a known owner address (for staged/intra-block UTXOs).
     /// Same logic as verify_input_ownership but takes an address string instead of a Utxo.
-    pub fn verify_input_ownership_by_address(input: &TxInput, owner_address: &str, signing_msg: &[u8]) -> bool {
+    pub fn verify_input_ownership_by_address(
+        input: &TxInput,
+        owner_address: &str,
+        signing_msg: &[u8],
+    ) -> bool {
         if input.signature.is_empty() || input.pub_key.is_empty() {
             return false;
         }
 
         // Decode public key
         let pk_arr: [u8; 32] = match hex::decode(&input.pub_key) {
-            Ok(b) if b.len() == PUBKEY_BYTES => {
-                match b.try_into() { Ok(a) => a, Err(_) => return false }
-            }
+            Ok(b) if b.len() == PUBKEY_BYTES => match b.try_into() {
+                Ok(a) => a,
+                Err(_) => return false,
+            },
             _ => return false,
         };
 
@@ -558,9 +668,10 @@ impl TxValidator {
 
         // Decode and verify signature
         let sig_bytes: [u8; 64] = match hex::decode(&input.signature) {
-            Ok(b) if b.len() == SIGNATURE_BYTES => {
-                match b.try_into() { Ok(a) => a, Err(_) => return false }
-            }
+            Ok(b) if b.len() == SIGNATURE_BYTES => match b.try_into() {
+                Ok(a) => a,
+                Err(_) => return false,
+            },
             _ => return false,
         };
 
@@ -583,18 +694,25 @@ impl TxValidator {
     /// the signing message so that testnet/regtest signatures are verified
     /// against the right message.
     pub fn verify_signatures_for_network(tx: &Transaction, network: &NetworkMode) -> bool {
-        if tx.inputs.is_empty() { return true; }
+        if tx.inputs.is_empty() {
+            return true;
+        }
 
         let msg = TxHash::signing_message_for_network(tx, network);
 
         for input in &tx.inputs {
-            if input.signature.is_empty() { return false; }
-            if input.pub_key.is_empty() { return false; }
+            if input.signature.is_empty() {
+                return false;
+            }
+            if input.pub_key.is_empty() {
+                return false;
+            }
 
             let sig_bytes: [u8; 64] = match hex::decode(&input.signature) {
-                Ok(b) if b.len() == SIGNATURE_BYTES => {
-                    match b.try_into() { Ok(a) => a, Err(_) => return false }
-                }
+                Ok(b) if b.len() == SIGNATURE_BYTES => match b.try_into() {
+                    Ok(a) => a,
+                    Err(_) => return false,
+                },
                 _ => return false,
             };
 
@@ -603,9 +721,10 @@ impl TxValidator {
             }
 
             let pk_arr: [u8; 32] = match hex::decode(&input.pub_key) {
-                Ok(b) if b.len() == PUBKEY_BYTES => {
-                    match b.try_into() { Ok(a) => a, Err(_) => return false }
-                }
+                Ok(b) if b.len() == PUBKEY_BYTES => match b.try_into() {
+                    Ok(a) => a,
+                    Err(_) => return false,
+                },
                 _ => return false,
             };
 
@@ -645,14 +764,18 @@ impl TxValidator {
         if tx.timestamp > now + MAX_TX_FUTURE_SECS {
             return Err(ConsensusError::Timestamp(format!(
                 "tx timestamp {} is {}s in the future (max {}s)",
-                tx.timestamp, tx.timestamp - now, MAX_TX_FUTURE_SECS
+                tx.timestamp,
+                tx.timestamp - now,
+                MAX_TX_FUTURE_SECS
             )));
         }
 
         if now > tx.timestamp && (now - tx.timestamp) > MAX_TX_AGE_SECS {
             return Err(ConsensusError::Timestamp(format!(
                 "tx timestamp {} is {}s old (max {}s)",
-                tx.timestamp, now - tx.timestamp, MAX_TX_AGE_SECS
+                tx.timestamp,
+                now - tx.timestamp,
+                MAX_TX_AGE_SECS
             )));
         }
 
@@ -667,7 +790,8 @@ impl TxValidator {
             if ph.len() != PAYLOAD_HASH_HEX_LEN {
                 return Err(ConsensusError::BlockValidation(format!(
                     "payload_hash length {} != expected {}",
-                    ph.len(), PAYLOAD_HASH_HEX_LEN
+                    ph.len(),
+                    PAYLOAD_HASH_HEX_LEN
                 )));
             }
             if !ph.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -682,12 +806,18 @@ impl TxValidator {
     /// Check that S < L (Ed25519 group order).
     /// Ed25519 scalars are little-endian, so we compare from byte 31 (MSB) down to byte 0 (LSB).
     pub fn s_is_canonical(s_bytes: &[u8]) -> bool {
-        if s_bytes.len() < 32 { return false; }
+        if s_bytes.len() < 32 {
+            return false;
+        }
 
         // Compare from MSB (byte 31) to LSB (byte 0) for little-endian scalar
         for i in (0..32).rev() {
-            if s_bytes[i] < ED25519_L[i] { return true; }
-            if s_bytes[i] > ED25519_L[i] { return false; }
+            if s_bytes[i] < ED25519_L[i] {
+                return true;
+            }
+            if s_bytes[i] > ED25519_L[i] {
+                return false;
+            }
         }
         false // Equal to L is not canonical
     }
@@ -700,8 +830,12 @@ impl TxValidator {
         let mut total: u64 = 0;
 
         for output in &tx.outputs {
-            if output.amount < DUST_LIMIT { return None; }
-            if output.amount > MAX_OUTPUT_AMOUNT { return None; }
+            if output.amount < DUST_LIMIT {
+                return None;
+            }
+            if output.amount > MAX_OUTPUT_AMOUNT {
+                return None;
+            }
 
             total = total.checked_add(output.amount)?;
         }
@@ -717,15 +851,22 @@ impl TxValidator {
         }
         let hash = match &tx.payload_hash {
             Some(h) => h,
-            None => return Err(ConsensusError::BlockValidation("SwapTx requires payload_hash".into())),
+            None => {
+                return Err(ConsensusError::BlockValidation(
+                    "SwapTx requires payload_hash".into(),
+                ))
+            }
         };
         if hash.len() != 64 {
-            return Err(ConsensusError::BlockValidation(
-                format!("SwapTx payload_hash length {} != 64", hash.len())
-            ));
+            return Err(ConsensusError::BlockValidation(format!(
+                "SwapTx payload_hash length {} != 64",
+                hash.len()
+            )));
         }
         if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(ConsensusError::BlockValidation("SwapTx payload_hash contains non-hex chars".into()));
+            return Err(ConsensusError::BlockValidation(
+                "SwapTx payload_hash contains non-hex chars".into(),
+            ));
         }
         Ok(())
     }
@@ -737,13 +878,21 @@ impl TxValidator {
         }
         let data = match &tx.payload_hash {
             Some(d) => d,
-            None => return Err(ConsensusError::BlockValidation("DexOrder requires payload_hash".into())),
+            None => {
+                return Err(ConsensusError::BlockValidation(
+                    "DexOrder requires payload_hash".into(),
+                ))
+            }
         };
         if data.is_empty() {
-            return Err(ConsensusError::BlockValidation("DexOrder payload_hash is empty".into()));
+            return Err(ConsensusError::BlockValidation(
+                "DexOrder payload_hash is empty".into(),
+            ));
         }
         if !data.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(ConsensusError::BlockValidation("DexOrder payload_hash contains non-hex chars".into()));
+            return Err(ConsensusError::BlockValidation(
+                "DexOrder payload_hash contains non-hex chars".into(),
+            ));
         }
         Ok(())
     }
@@ -759,42 +908,55 @@ impl TxValidator {
         // gas_limit is required and must be > 0
         match tx.gas_limit {
             Some(gl) if gl > 0 => {}
-            Some(_) => return Err(ConsensusError::BlockValidation(
-                "contract create requires gas_limit > 0".into()
-            )),
-            None => return Err(ConsensusError::BlockValidation(
-                "contract create requires gas_limit".into()
-            )),
+            Some(_) => {
+                return Err(ConsensusError::BlockValidation(
+                    "contract create requires gas_limit > 0".into(),
+                ))
+            }
+            None => {
+                return Err(ConsensusError::BlockValidation(
+                    "contract create requires gas_limit".into(),
+                ))
+            }
         }
 
         // vm_version must be Some(1) for v1 chain
         match tx.vm_version {
             Some(1) => {}
-            Some(v) => return Err(ConsensusError::BlockValidation(
-                format!("contract create vm_version {} unsupported (expected 1)", v)
-            )),
-            None => return Err(ConsensusError::BlockValidation(
-                "contract create requires vm_version".into()
-            )),
+            Some(v) => {
+                return Err(ConsensusError::BlockValidation(format!(
+                    "contract create vm_version {} unsupported (expected 1)",
+                    v
+                )))
+            }
+            None => {
+                return Err(ConsensusError::BlockValidation(
+                    "contract create requires vm_version".into(),
+                ))
+            }
         }
 
         // deploy_code is required and must be non-empty
         match &tx.deploy_code {
             Some(code) if !code.is_empty() => {}
-            Some(_) => return Err(ConsensusError::BlockValidation(
-                "contract create requires non-empty deploy_code".into()
-            )),
+            Some(_) => {
+                return Err(ConsensusError::BlockValidation(
+                    "contract create requires non-empty deploy_code".into(),
+                ))
+            }
             None => {
                 // Fall back to legacy payload_hash for backward compatibility
                 let ph = match &tx.payload_hash {
                     Some(h) => h,
-                    None => return Err(ConsensusError::BlockValidation(
-                        "contract create requires deploy_code or bytecode payload".into()
-                    )),
+                    None => {
+                        return Err(ConsensusError::BlockValidation(
+                            "contract create requires deploy_code or bytecode payload".into(),
+                        ))
+                    }
                 };
                 if ph.is_empty() || ph == &"0".repeat(64) {
                     return Err(ConsensusError::BlockValidation(
-                        "contract create requires non-zero bytecode payload".into()
+                        "contract create requires non-zero bytecode payload".into(),
                     ));
                 }
             }
@@ -814,50 +976,64 @@ impl TxValidator {
         // gas_limit is required and must be > 0
         match tx.gas_limit {
             Some(gl) if gl > 0 => {}
-            Some(_) => return Err(ConsensusError::BlockValidation(
-                "contract call requires gas_limit > 0".into()
-            )),
-            None => return Err(ConsensusError::BlockValidation(
-                "contract call requires gas_limit".into()
-            )),
+            Some(_) => {
+                return Err(ConsensusError::BlockValidation(
+                    "contract call requires gas_limit > 0".into(),
+                ))
+            }
+            None => {
+                return Err(ConsensusError::BlockValidation(
+                    "contract call requires gas_limit".into(),
+                ))
+            }
         }
 
         // vm_version must be Some(1) for v1 chain
         match tx.vm_version {
             Some(1) => {}
-            Some(v) => return Err(ConsensusError::BlockValidation(
-                format!("contract call vm_version {} unsupported (expected 1)", v)
-            )),
-            None => return Err(ConsensusError::BlockValidation(
-                "contract call requires vm_version".into()
-            )),
+            Some(v) => {
+                return Err(ConsensusError::BlockValidation(format!(
+                    "contract call vm_version {} unsupported (expected 1)",
+                    v
+                )))
+            }
+            None => {
+                return Err(ConsensusError::BlockValidation(
+                    "contract call requires vm_version".into(),
+                ))
+            }
         }
 
         // contract_address is required and must start with SD1c
         match &tx.contract_address {
             Some(addr) if addr.starts_with("SD1c") => {}
-            Some(addr) => return Err(ConsensusError::BlockValidation(
-                format!("contract call target {} must start with SD1c", addr)
-            )),
+            Some(addr) => {
+                return Err(ConsensusError::BlockValidation(format!(
+                    "contract call target {} must start with SD1c",
+                    addr
+                )))
+            }
             None => {
                 // Fall back to legacy first-output check
                 if let Some(output) = tx.outputs.first() {
                     if !output.address.starts_with("SD1c") {
                         return Err(ConsensusError::BlockValidation(
-                            "contract call target must be SD1c address".into()
+                            "contract call target must be SD1c address".into(),
                         ));
                     }
                 }
                 // Also require legacy payload_hash
                 let ph = match &tx.payload_hash {
                     Some(h) => h,
-                    None => return Err(ConsensusError::BlockValidation(
-                        "contract call requires calldata or contract_address".into()
-                    )),
+                    None => {
+                        return Err(ConsensusError::BlockValidation(
+                            "contract call requires calldata or contract_address".into(),
+                        ))
+                    }
                 };
                 if ph.is_empty() || ph == &"0".repeat(64) {
                     return Err(ConsensusError::BlockValidation(
-                        "contract call requires non-zero calldata payload".into()
+                        "contract call requires non-zero calldata payload".into(),
                     ));
                 }
             }

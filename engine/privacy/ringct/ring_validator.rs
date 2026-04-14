@@ -4,9 +4,9 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::domain::transaction::transaction::Transaction;
-use crate::slog_error;
 #[allow(deprecated)]
 use crate::engine::privacy::ringct::ring_signature::RingSignature;
+use crate::slog_error;
 
 /// Validates ring signature aspects of a transaction.
 ///
@@ -97,14 +97,15 @@ impl RingValidator {
         // 6. Ring size validation (minimum mixin for privacy)
         // Each input must have ring_members with at least MIN_RING_SIZE entries.
         // For confidential TXs, ring_members MUST be present (not None).
-        const MIN_RING_SIZE: usize = 4;  // Minimum 4 decoys for meaningful privacy
+        const MIN_RING_SIZE: usize = 4; // Minimum 4 decoys for meaningful privacy
         const MAX_RING_SIZE: usize = 64; // Cap to prevent DoS
         for input in &tx.inputs {
             if tx.tx_type == crate::domain::transaction::transaction::TxType::Confidential {
                 match &input.ring_members {
-                    Some(members) if members.len() >= MIN_RING_SIZE && members.len() <= MAX_RING_SIZE => {}
+                    Some(members)
+                        if members.len() >= MIN_RING_SIZE && members.len() <= MAX_RING_SIZE => {}
                     Some(_members) => return false, // Wrong size
-                    None => return false, // Missing for confidential TX
+                    None => return false,           // Missing for confidential TX
                 }
             } else if let Some(ref members) = input.ring_members {
                 // Non-confidential with ring_members -- still validate size
@@ -134,7 +135,10 @@ impl RingValidator {
         true
     }
 
-    #[deprecated(since = "1.0.0", note = "Use validate() instead. quick_validate skips ring signature verification!")]
+    #[deprecated(
+        since = "1.0.0",
+        note = "Use validate() instead. quick_validate skips ring signature verification!"
+    )]
     pub fn quick_validate(tx: &Transaction) -> bool {
         Self::validate(tx)
     }
@@ -157,14 +161,19 @@ mod tests {
 
     /// Construct a confidential TX with N inputs, each having a key image and ring members.
     fn make_confidential_tx(num_inputs: usize) -> Transaction {
-        let inputs: Vec<TxInput> = (0..num_inputs).map(|i| {
-            TxInput::new_confidential(
-                format!("prev_{}", i), i as u32,
-                "owner".into(), "sig".into(), "pk".into(),
-                hex_key_image(i as u8 + 1),
-                min_ring_members(),
-            )
-        }).collect();
+        let inputs: Vec<TxInput> = (0..num_inputs)
+            .map(|i| {
+                TxInput::new_confidential(
+                    format!("prev_{}", i),
+                    i as u32,
+                    "owner".into(),
+                    "sig".into(),
+                    "pk".into(),
+                    hex_key_image(i as u8 + 1),
+                    min_ring_members(),
+                )
+            })
+            .collect();
 
         Transaction {
             hash: "test_confidential_tx".to_string(),

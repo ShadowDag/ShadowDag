@@ -6,7 +6,7 @@
 #[derive(Debug, Clone)]
 pub struct MerkleProof {
     pub hashes: Vec<String>,
-    pub index:  usize,
+    pub index: usize,
 }
 
 impl MerkleProof {

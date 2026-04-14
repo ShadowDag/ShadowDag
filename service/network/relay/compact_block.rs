@@ -19,7 +19,7 @@
 //   - Prefill threshold: auto-detect which TXs to prefill
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 use crate::domain::block::block::Block;
@@ -36,13 +36,13 @@ pub const MAX_PREFILLED: usize = 100;
 #[derive(Debug, Clone)]
 pub struct CompactBlock {
     /// Full block header
-    pub header:         BlockHeader,
+    pub header: BlockHeader,
     /// Nonce used for short ID calculation (prevents grinding attacks)
-    pub nonce:          u64,
+    pub nonce: u64,
     /// Short TX IDs (6 bytes each)
-    pub short_ids:      Vec<[u8; SHORT_ID_BYTES]>,
+    pub short_ids: Vec<[u8; SHORT_ID_BYTES]>,
     /// Prefilled transactions (coinbase + new TXs peer likely doesn't have)
-    pub prefilled_txs:  Vec<(u16, Transaction)>, // (index, tx)
+    pub prefilled_txs: Vec<(u16, Transaction)>, // (index, tx)
 }
 
 impl CompactBlock {
@@ -88,10 +88,7 @@ impl CompactBlock {
     }
 
     /// Reconstruct full block from compact block + mempool
-    pub fn reconstruct(
-        &self,
-        mempool_txs: &[Transaction],
-    ) -> Result<Block, Vec<usize>> {
+    pub fn reconstruct(&self, mempool_txs: &[Transaction]) -> Result<Block, Vec<usize>> {
         let mut transactions: Vec<Option<Transaction>> = vec![None; self.short_ids.len()];
         let mut missing_indices = Vec::new();
 
@@ -105,12 +102,15 @@ impl CompactBlock {
 
         // Match remaining by short ID from mempool
         for (i, short_id) in self.short_ids.iter().enumerate() {
-            if transactions[i].is_some() { continue; }
+            if transactions[i].is_some() {
+                continue;
+            }
 
             // Collect ALL mempool TXs matching this short_id to detect
             // collisions.  With 6-byte (48-bit) IDs collisions are rare,
             // but when they happen we cannot tell which TX is correct.
-            let matches: Vec<&Transaction> = mempool_txs.iter()
+            let matches: Vec<&Transaction> = mempool_txs
+                .iter()
                 .filter(|tx| Self::compute_short_id(&tx.hash, self.nonce) == *short_id)
                 .collect();
             match matches.len() {
@@ -138,13 +138,11 @@ impl CompactBlock {
             return Err(missing_indices);
         }
 
-        let txs: Vec<Transaction> = transactions.into_iter()
-            .flatten()
-            .collect();
+        let txs: Vec<Transaction> = transactions.into_iter().flatten().collect();
 
         Ok(Block {
             header: self.header.clone(),
-            body:   crate::domain::block::block_body::BlockBody { transactions: txs },
+            body: crate::domain::block::block_body::BlockBody { transactions: txs },
         })
     }
 
@@ -176,12 +174,18 @@ impl CompactBlock {
             + 8  // nonce
             + self.short_ids.len() * SHORT_ID_BYTES
             + self.prefilled_txs.len() * 256; // avg tx size estimate
-        if full_block_size == 0 { return 0.0; }
+        if full_block_size == 0 {
+            return 0.0;
+        }
         (1.0 - compact_size as f64 / full_block_size as f64) * 100.0
     }
 
-    pub fn short_id_count(&self) -> usize { self.short_ids.len() }
-    pub fn prefilled_count(&self) -> usize { self.prefilled_txs.len() }
+    pub fn short_id_count(&self) -> usize {
+        self.short_ids.len()
+    }
+    pub fn prefilled_count(&self) -> usize {
+        self.prefilled_txs.len()
+    }
 }
 
 #[cfg(test)]
@@ -194,7 +198,13 @@ mod tests {
         Transaction {
             hash: hash.to_string(),
             inputs: vec![],
-            outputs: vec![TxOutput { address: "addr".into(), amount: 100, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            outputs: vec![TxOutput {
+                address: "addr".into(),
+                amount: 100,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee: 1,
             timestamp: 1000,
             is_coinbase: false,
@@ -208,11 +218,20 @@ mod tests {
         let txs: Vec<Transaction> = tx_hashes.iter().map(|h| make_tx(h)).collect();
         Block {
             header: BlockHeader {
-                version: 1, hash: "block_hash".into(), parents: vec![],
-                merkle_root: "mr".into(), timestamp: 1000, nonce: 0,
-                difficulty: 4, height: 1, blue_score: 0, selected_parent: None,
-                utxo_commitment: None, extra_nonce: 0,
-                receipt_root: None, state_root: None,
+                version: 1,
+                hash: "block_hash".into(),
+                parents: vec![],
+                merkle_root: "mr".into(),
+                timestamp: 1000,
+                nonce: 0,
+                difficulty: 4,
+                height: 1,
+                blue_score: 0,
+                selected_parent: None,
+                utxo_commitment: None,
+                extra_nonce: 0,
+                receipt_root: None,
+                state_root: None,
             },
             body: BlockBody { transactions: txs },
         }
@@ -261,11 +280,22 @@ mod tests {
     #[test]
     fn bandwidth_savings() {
         let block = make_block(&["cb", "tx1", "tx2", "tx3", "tx4", "tx5"]);
-        let peer_has: HashSet<String> = ["tx1".into(), "tx2".into(), "tx3".into(), "tx4".into(), "tx5".into()].into();
+        let peer_has: HashSet<String> = [
+            "tx1".into(),
+            "tx2".into(),
+            "tx3".into(),
+            "tx4".into(),
+            "tx5".into(),
+        ]
+        .into();
         let compact = CompactBlock::from_block(&block, &peer_has);
 
         let savings = compact.savings_percent(10_000);
-        assert!(savings > 50.0, "Should save >50% bandwidth, got {:.1}%", savings);
+        assert!(
+            savings > 50.0,
+            "Should save >50% bandwidth, got {:.1}%",
+            savings
+        );
     }
 
     #[test]
@@ -274,6 +304,10 @@ mod tests {
         let compact = CompactBlock::from_block(&block, &HashSet::new());
 
         let unique: HashSet<[u8; 6]> = compact.short_ids.iter().cloned().collect();
-        assert_eq!(unique.len(), compact.short_ids.len(), "Short IDs must be unique within a block");
+        assert_eq!(
+            unique.len(),
+            compact.short_ids.len(),
+            "Short IDs must be unique within a block"
+        );
     }
 }

@@ -3,12 +3,12 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options, WriteOptions, DBRecoveryMode};
+use rocksdb::{DBRecoveryMode, Options, WriteOptions, DB};
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::errors::StorageError;
-use crate::{slog_warn, slog_error};
+use crate::{slog_error, slog_warn};
 
 pub enum SharedDbSource {
     Path(String),
@@ -39,7 +39,10 @@ impl From<Arc<DB>> for SharedDbSource {
     }
 }
 
-pub fn open_shared_db<S: Into<SharedDbSource>>(source: S, opts: &Options) -> Result<Arc<DB>, rocksdb::Error> {
+pub fn open_shared_db<S: Into<SharedDbSource>>(
+    source: S,
+    opts: &Options,
+) -> Result<Arc<DB>, rocksdb::Error> {
     match source.into() {
         SharedDbSource::Shared(db) => Ok(db),
         SharedDbSource::Path(path) => {
@@ -67,8 +70,10 @@ pub struct NodeDB {
 impl NodeDB {
     pub fn new(path: &str) -> Result<Self, StorageError> {
         let opts = Self::safe_options(path);
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
         Ok(Self { db: Arc::new(db) })
     }
 
@@ -99,11 +104,15 @@ impl NodeDB {
         }
 
         // Only reach here for corruption errors — attempt repair
-        DB::repair(&opts, Path::new(path))
-            .map_err(|re| StorageError::OpenFailed { path: path.to_string(), reason: format!("repair failed: {}", re) })?;
+        DB::repair(&opts, Path::new(path)).map_err(|re| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: format!("repair failed: {}", re),
+        })?;
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: format!("open after repair failed: {}", e) })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: format!("open after repair failed: {}", e),
+        })?;
         Ok(Self { db: Arc::new(db) })
     }
 
@@ -114,7 +123,10 @@ impl NodeDB {
         opts.create_if_missing(false);
         DB::open(&opts, Path::new(path))
             .map(|db| Self { db: Arc::new(db) })
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })
+            .map_err(|e| StorageError::OpenFailed {
+                path: path.to_string(),
+                reason: e.to_string(),
+            })
     }
 
     fn safe_options(path: &str) -> Options {
@@ -193,7 +205,8 @@ impl NodeDB {
 
     /// Read with full error propagation.
     pub fn get_result(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        self.db.get(key)
+        self.db
+            .get(key)
             .map(|v| v.map(|d| d.to_vec()))
             .map_err(|e| {
                 slog_error!("storage", "db_read_failed", error => e);
@@ -222,10 +235,13 @@ mod tests {
     use super::*;
 
     fn tmp_path() -> String {
-        format!("/tmp/test_nodedb_{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos())
+        format!(
+            "/tmp/test_nodedb_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        )
     }
 
     #[test]
@@ -238,7 +254,10 @@ mod tests {
     #[test]
     fn try_open_fails_on_nonexistent_path() {
         let result = NodeDB::try_open(&tmp_path());
-        assert!(result.is_err(), "try_open should fail when DB does not exist");
+        assert!(
+            result.is_err(),
+            "try_open should fail when DB does not exist"
+        );
     }
 
     #[test]
@@ -249,7 +268,10 @@ mod tests {
         drop(_db);
         // Now try_open should succeed
         let result = NodeDB::try_open(&path);
-        assert!(result.is_ok(), "try_open should succeed when DB already exists");
+        assert!(
+            result.is_ok(),
+            "try_open should succeed when DB already exists"
+        );
     }
 
     #[test]

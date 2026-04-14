@@ -25,7 +25,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
-use crate::{slog_info, slog_warn, slog_error};
+use crate::{slog_error, slog_info, slog_warn};
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -64,7 +64,7 @@ const PFX_CHECKPOINT: &[u8] = b"chkpt:";
 #[derive(Debug, Clone)]
 pub struct AutoCheckpoint {
     pub height: u64,
-    pub hash:   String,
+    pub hash: String,
 }
 
 /// Epoch-level DAG health metrics.
@@ -239,13 +239,7 @@ impl FinalityManager {
     /// - `hash`: block hash
     /// - `is_blue`: whether GHOSTDAG classified this block as blue
     /// - `dag_width_at_height`: number of blocks at this height level
-    pub fn on_block(
-        &mut self,
-        height: u64,
-        hash: &str,
-        is_blue: bool,
-        dag_width_at_height: u64,
-    ) {
+    pub fn on_block(&mut self, height: u64, hash: &str, is_blue: bool, dag_width_at_height: u64) {
         // Accumulate epoch metrics
         self.epoch_total_count += 1;
         if is_blue {
@@ -398,7 +392,9 @@ impl FinalityManager {
 
     /// Stronger check: verifies both height AND hash match a checkpoint.
     pub fn is_checkpointed_exact(&self, height: u64, hash: &str) -> bool {
-        self.checkpoints.iter().any(|cp| cp.height == height && cp.hash == hash)
+        self.checkpoints
+            .iter()
+            .any(|cp| cp.height == height && cp.hash == hash)
     }
 }
 

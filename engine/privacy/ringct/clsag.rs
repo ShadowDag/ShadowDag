@@ -7,11 +7,11 @@
 //! - Linkable: same key used twice produces the same Key Image (prevents double-spend)
 //! - Key Image: I = x * H_p(P) where H_p is hash-to-point
 
+use crate::errors::CryptoError;
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 use sha2::{Digest, Sha512};
-use crate::errors::CryptoError;
 
 /// A CLSAG ring signature.
 pub struct CLSAGSignature {

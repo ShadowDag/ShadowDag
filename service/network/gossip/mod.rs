@@ -3,28 +3,28 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::collections::{HashMap, HashSet, VecDeque, BinaryHeap};
+use serde::{Deserialize, Serialize};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use serde::{Serialize, Deserialize};
 
 use crate::service::network::p2p::peer_manager::PeerManager;
 
-pub const GOSSIP_FANOUT:         usize = 8;
-pub const SEEN_SET_MAX:          usize = 65_536;
-pub const GLOBAL_SEEN_MAX:       usize = 262_144;
-pub const INV_TTL_SECS:          u64   = 600;
-pub const MAX_INV_BATCH:         usize = 512;
-pub const BCAST_RETRY_MAX:       u32   = 3;
-pub const BCAST_RETRY_DELAY_MS:  u64   = 500;
-pub const TRICKLE_INTERVAL_SECS: u64   = 1;
-pub const PEER_QUEUE_DEPTH:      usize = 2_048;
+pub const GOSSIP_FANOUT: usize = 8;
+pub const SEEN_SET_MAX: usize = 65_536;
+pub const GLOBAL_SEEN_MAX: usize = 262_144;
+pub const INV_TTL_SECS: u64 = 600;
+pub const MAX_INV_BATCH: usize = 512;
+pub const BCAST_RETRY_MAX: u32 = 3;
+pub const BCAST_RETRY_DELAY_MS: u64 = 500;
+pub const TRICKLE_INTERVAL_SECS: u64 = 1;
+pub const PEER_QUEUE_DEPTH: usize = 2_048;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum MsgPriority {
-    Low    = 0,
+    Low = 0,
     Normal = 1,
-    High   = 2,
+    High = 2,
     Critical = 3,
 }
 
@@ -40,18 +40,28 @@ pub enum InvType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InvEntry {
-    pub kind:  InvType,
-    pub hash:  String,
-    pub seen:  u64,
+    pub kind: InvType,
+    pub hash: String,
+    pub seen: u64,
 }
 
 impl InvEntry {
-    pub fn new_tx(hash: &str)    -> Self { Self::new(InvType::Tx,       hash) }
-    pub fn new_block(hash: &str) -> Self { Self::new(InvType::Block,    hash) }
-    pub fn new_dag(hash: &str)   -> Self { Self::new(InvType::DagBlock, hash) }
+    pub fn new_tx(hash: &str) -> Self {
+        Self::new(InvType::Tx, hash)
+    }
+    pub fn new_block(hash: &str) -> Self {
+        Self::new(InvType::Block, hash)
+    }
+    pub fn new_dag(hash: &str) -> Self {
+        Self::new(InvType::DagBlock, hash)
+    }
 
     fn new(kind: InvType, hash: &str) -> Self {
-        Self { kind, hash: hash.to_string(), seen: unix_now() }
+        Self {
+            kind,
+            hash: hash.to_string(),
+            seen: unix_now(),
+        }
     }
 
     pub fn is_expired(&self) -> bool {
@@ -61,13 +71,15 @@ impl InvEntry {
 
 #[derive(Debug, Clone)]
 struct QueueEntry {
-    priority:  MsgPriority,
-    entry:     InvEntry,
-    _retries:   u32,
+    priority: MsgPriority,
+    entry: InvEntry,
+    _retries: u32,
 }
 
 impl PartialEq for QueueEntry {
-    fn eq(&self, other: &Self) -> bool { self.priority == other.priority }
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority
+    }
 }
 impl Eq for QueueEntry {}
 impl PartialOrd for QueueEntry {
@@ -82,14 +94,18 @@ impl Ord for QueueEntry {
 }
 
 struct SeenRing {
-    set:   HashSet<String>,
+    set: HashSet<String>,
     queue: VecDeque<String>,
-    cap:   usize,
+    cap: usize,
 }
 
 impl SeenRing {
     fn new(cap: usize) -> Self {
-        Self { set: HashSet::new(), queue: VecDeque::new(), cap }
+        Self {
+            set: HashSet::new(),
+            queue: VecDeque::new(),
+            cap,
+        }
     }
 
     fn contains(&self, hash: &str) -> bool {
@@ -97,7 +113,9 @@ impl SeenRing {
     }
 
     fn insert(&mut self, hash: String) -> bool {
-        if self.set.contains(&hash) { return false; }
+        if self.set.contains(&hash) {
+            return false;
+        }
         if self.set.len() >= self.cap {
             if let Some(old) = self.queue.pop_front() {
                 self.set.remove(&old);
@@ -110,8 +128,8 @@ impl SeenRing {
 }
 
 struct PeerGossipState {
-    seen:       SeenRing,
-    queue:      BinaryHeap<QueueEntry>,
+    seen: SeenRing,
+    queue: BinaryHeap<QueueEntry>,
     last_trickle: u64,
 }
 
@@ -126,22 +144,22 @@ impl PeerGossipState {
 }
 
 pub struct GossipManager {
-    peers:       Arc<PeerManager>,
+    peers: Arc<PeerManager>,
     global_seen: Arc<Mutex<SeenRing>>,
-    peer_state:  Arc<RwLock<HashMap<String, PeerGossipState>>>,
+    peer_state: Arc<RwLock<HashMap<String, PeerGossipState>>>,
 
     pending_blocks: Arc<Mutex<HashMap<String, InvEntry>>>,
-    pending_txs:    Arc<Mutex<HashMap<String, InvEntry>>>,
+    pending_txs: Arc<Mutex<HashMap<String, InvEntry>>>,
 }
 
 impl GossipManager {
     pub fn new(peers: Arc<PeerManager>) -> Self {
         Self {
             peers,
-            global_seen:    Arc::new(Mutex::new(SeenRing::new(GLOBAL_SEEN_MAX))),
-            peer_state:     Arc::new(RwLock::new(HashMap::new())),
+            global_seen: Arc::new(Mutex::new(SeenRing::new(GLOBAL_SEEN_MAX))),
+            peer_state: Arc::new(RwLock::new(HashMap::new())),
             pending_blocks: Arc::new(Mutex::new(HashMap::new())),
-            pending_txs:    Arc::new(Mutex::new(HashMap::new())),
+            pending_txs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -157,16 +175,29 @@ impl GossipManager {
 
     pub fn announce_block(&self, hash: &str) {
         let entry = InvEntry::new_block(hash);
-        if !self.global_seen.lock().unwrap_or_else(|e| e.into_inner()).insert(hash.to_string()) {
+        if !self
+            .global_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(hash.to_string())
+        {
             return;
         }
-        self.pending_blocks.lock().unwrap_or_else(|e| e.into_inner()).insert(hash.to_string(), entry.clone());
+        self.pending_blocks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(hash.to_string(), entry.clone());
         self.fan_out_inv(entry, MsgPriority::Critical);
     }
 
     pub fn announce_dag_block(&self, hash: &str) {
         let entry = InvEntry::new_dag(hash);
-        if !self.global_seen.lock().unwrap_or_else(|e| e.into_inner()).insert(hash.to_string()) {
+        if !self
+            .global_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(hash.to_string())
+        {
             return;
         }
         self.fan_out_inv(entry, MsgPriority::Critical);
@@ -174,10 +205,18 @@ impl GossipManager {
 
     pub fn announce_tx(&self, hash: &str) {
         let entry = InvEntry::new_tx(hash);
-        if !self.global_seen.lock().unwrap_or_else(|e| e.into_inner()).insert(hash.to_string()) {
+        if !self
+            .global_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(hash.to_string())
+        {
             return;
         }
-        self.pending_txs.lock().unwrap_or_else(|e| e.into_inner()).insert(hash.to_string(), entry.clone());
+        self.pending_txs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(hash.to_string(), entry.clone());
         self.trickle_inv(entry);
     }
 
@@ -203,7 +242,10 @@ impl GossipManager {
     }
 
     pub fn already_seen(&self, hash: &str) -> bool {
-        self.global_seen.lock().unwrap_or_else(|e| e.into_inner()).contains(hash)
+        self.global_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(hash)
     }
 
     fn fan_out_inv(&self, entry: InvEntry, priority: MsgPriority) {
@@ -212,15 +254,23 @@ impl GossipManager {
         let mut sent = 0usize;
 
         for peer in &peer_list {
-            if sent >= GOSSIP_FANOUT { break; }
-            let ps = states.entry(peer.addr.clone()).or_insert_with(PeerGossipState::new);
-            if ps.seen.contains(&entry.hash) { continue; }
-            if ps.queue.len() >= PEER_QUEUE_DEPTH { continue; }
+            if sent >= GOSSIP_FANOUT {
+                break;
+            }
+            let ps = states
+                .entry(peer.addr.clone())
+                .or_insert_with(PeerGossipState::new);
+            if ps.seen.contains(&entry.hash) {
+                continue;
+            }
+            if ps.queue.len() >= PEER_QUEUE_DEPTH {
+                continue;
+            }
             ps.seen.insert(entry.hash.clone());
             ps.queue.push(QueueEntry {
                 priority: priority.clone(),
-                entry:    entry.clone(),
-                _retries:  0,
+                entry: entry.clone(),
+                _retries: 0,
             });
             sent += 1;
         }
@@ -232,15 +282,21 @@ impl GossipManager {
         let mut states = self.peer_state.write().unwrap_or_else(|e| e.into_inner());
 
         for peer in peer_list.iter().take(GOSSIP_FANOUT) {
-            let ps = states.entry(peer.addr.clone()).or_insert_with(PeerGossipState::new);
+            let ps = states
+                .entry(peer.addr.clone())
+                .or_insert_with(PeerGossipState::new);
 
-            if now - ps.last_trickle < TRICKLE_INTERVAL_SECS { continue; }
-            if ps.seen.contains(&entry.hash) { continue; }
+            if now - ps.last_trickle < TRICKLE_INTERVAL_SECS {
+                continue;
+            }
+            if ps.seen.contains(&entry.hash) {
+                continue;
+            }
             ps.seen.insert(entry.hash.clone());
             ps.queue.push(QueueEntry {
                 priority: MsgPriority::Normal,
-                entry:    entry.clone(),
-                _retries:  0,
+                entry: entry.clone(),
+                _retries: 0,
             });
             ps.last_trickle = now;
         }
@@ -250,21 +306,24 @@ impl GossipManager {
         let mut states = self.peer_state.write().unwrap_or_else(|e| e.into_inner());
         let ps = match states.get_mut(addr) {
             Some(ps) => ps,
-            None     => return vec![],
+            None => return vec![],
         };
         let mut out = Vec::new();
         while out.len() < limit {
             match ps.queue.pop() {
                 Some(qe) if !qe.entry.is_expired() => out.push(qe.entry),
-                Some(_)  => {  }
-                None     => break,
+                Some(_) => {}
+                None => break,
             }
         }
         out
     }
 
     pub fn tick_evict_expired(&self) {
-        let mut blocks = self.pending_blocks.lock().unwrap_or_else(|e| e.into_inner());
+        let mut blocks = self
+            .pending_blocks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         blocks.retain(|_, v| !v.is_expired());
         let mut txs = self.pending_txs.lock().unwrap_or_else(|e| e.into_inner());
         txs.retain(|_, v| !v.is_expired());
@@ -276,8 +335,16 @@ impl GossipManager {
         GossipStats {
             registered_peers: states.len(),
             total_queued_inv: total_queued,
-            pending_blocks:   self.pending_blocks.lock().unwrap_or_else(|e| e.into_inner()).len(),
-            pending_txs:      self.pending_txs.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            pending_blocks: self
+                .pending_blocks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            pending_txs: self
+                .pending_txs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
         }
     }
 }
@@ -286,19 +353,22 @@ impl GossipManager {
 pub struct GossipStats {
     pub registered_peers: usize,
     pub total_queued_inv: usize,
-    pub pending_blocks:   usize,
-    pub pending_txs:      usize,
+    pub pending_blocks: usize,
+    pub pending_txs: usize,
 }
 
 fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use crate::service::network::p2p::peer_manager::PeerManager;
+    use std::fs;
 
     fn make_gossip(label: &str) -> GossipManager {
         let path = format!("/tmp/gossip_{}", label);

@@ -6,10 +6,10 @@
 
 use crate::domain::address::address::network_prefix;
 use crate::errors::VmError;
-use crate::runtime::vm::core::execution_env::*;
 use crate::runtime::vm::core::assembler::Assembler;
-use crate::runtime::vm::core::v1_spec;
+use crate::runtime::vm::core::execution_env::*;
 use crate::runtime::vm::core::source_map::SourceMap;
+use crate::runtime::vm::core::v1_spec;
 
 /// Default caller identity used by `run_test` when the test case does
 /// not specify one. Tests that care about authorization (owner-only
@@ -138,7 +138,9 @@ impl TestRunner {
     /// later assertions would run against an unfunded account with
     /// no obvious failure cause.
     pub fn fund_account(&mut self, address: &str, balance: u64) -> Result<(), String> {
-        self.env.state.set_balance(address, balance)
+        self.env
+            .state
+            .set_balance(address, balance)
             .map_err(|e| format!("fund_account '{}' with {} failed: {}", address, balance, e))
     }
 
@@ -166,7 +168,9 @@ impl TestRunner {
         }
 
         let addr = format!("{}c_test_{}", self.network_prefix, self.deploy_counter);
-        self.env.state.set_code(&addr, bytecode)
+        self.env
+            .state
+            .set_code(&addr, bytecode)
             .map_err(|e| format!("set_code({}) failed: {}", addr, e))?;
         self.contract_addr = addr.clone();
         self.deploy_counter += 1;
@@ -193,7 +197,11 @@ impl TestRunner {
         // used "test_caller" regardless, so tests that wanted to
         // verify owner-only paths had no way to simulate a different
         // caller without reaching into `env_mut()` manually.
-        let caller = test.caller.as_deref().unwrap_or(DEFAULT_TEST_CALLER).to_string();
+        let caller = test
+            .caller
+            .as_deref()
+            .unwrap_or(DEFAULT_TEST_CALLER)
+            .to_string();
 
         let ctx = CallContext {
             address: self.contract_addr.clone(),
@@ -210,15 +218,16 @@ impl TestRunner {
         let outcome = self.env.execute_frame(&ctx);
 
         let (success, gas_used, return_data, logs) = match &outcome {
-            CallOutcome::Success { gas_used, return_data, logs } => {
-                (true, *gas_used, return_data.clone(), logs.clone())
-            }
-            CallOutcome::Revert { gas_used, return_data } => {
-                (false, *gas_used, return_data.clone(), vec![])
-            }
-            CallOutcome::Failure { gas_used } => {
-                (false, *gas_used, vec![], vec![])
-            }
+            CallOutcome::Success {
+                gas_used,
+                return_data,
+                logs,
+            } => (true, *gas_used, return_data.clone(), logs.clone()),
+            CallOutcome::Revert {
+                gas_used,
+                return_data,
+            } => (false, *gas_used, return_data.clone(), vec![]),
+            CallOutcome::Failure { gas_used } => (false, *gas_used, vec![], vec![]),
         };
 
         let mut errors = Vec::new();
@@ -235,8 +244,11 @@ impl TestRunner {
         // Assert return data
         if let Some(ref expected) = test.expect_return {
             if return_data != *expected {
-                errors.push(format!("return data mismatch: expected {} got {}",
-                    hex::encode(expected), hex::encode(&return_data)));
+                errors.push(format!(
+                    "return data mismatch: expected {} got {}",
+                    hex::encode(expected),
+                    hex::encode(&return_data)
+                ));
             }
         }
 
@@ -246,19 +258,31 @@ impl TestRunner {
             match actual {
                 Some(ref v) => {
                     let norm_actual = v.trim_start_matches("0x").trim_start_matches('0');
-                    let norm_expected = expected_val.trim_start_matches("0x").trim_start_matches('0');
+                    let norm_expected = expected_val
+                        .trim_start_matches("0x")
+                        .trim_start_matches('0');
                     if norm_actual != norm_expected {
-                        errors.push(format!("storage {}: expected '{}' got '{}'", slot_key, expected_val, v));
+                        errors.push(format!(
+                            "storage {}: expected '{}' got '{}'",
+                            slot_key, expected_val, v
+                        ));
                     }
                 }
-                None => errors.push(format!("storage {}: expected '{}' but slot is empty", slot_key, expected_val)),
+                None => errors.push(format!(
+                    "storage {}: expected '{}' but slot is empty",
+                    slot_key, expected_val
+                )),
             }
         }
 
         // Assert log count
         if let Some(expected_count) = test.expect_log_count {
             if logs.len() != expected_count {
-                errors.push(format!("log count: expected {} got {}", expected_count, logs.len()));
+                errors.push(format!(
+                    "log count: expected {} got {}",
+                    expected_count,
+                    logs.len()
+                ));
             }
         }
 
@@ -270,7 +294,11 @@ impl TestRunner {
         }
 
         let passed = errors.is_empty();
-        let message = if errors.is_empty() { None } else { Some(errors.join("; ")) };
+        let message = if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("; "))
+        };
 
         let result = TestResult {
             name: test.name.clone(),
@@ -318,7 +346,9 @@ impl TestRunner {
     /// a partially-mutated state while the test continued with
     /// assertions built on the assumption of a clean revert.
     pub fn revert_to(&mut self, id: usize) -> Result<(), String> {
-        self.env.state.rollback(id)
+        self.env
+            .state
+            .rollback(id)
             .map_err(|e| format!("revert_to snapshot {} failed: {}", id, e))
     }
 
@@ -338,7 +368,9 @@ impl TestRunner {
 }
 
 impl Default for TestRunner {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -349,10 +381,15 @@ mod tests {
     fn test_runner_deploy_and_call() {
         let mut runner = TestRunner::new();
         // PUSH1 42, PUSH1 0, SSTORE, STOP
-        let addr = runner.deploy_bytecode(vec![0x10, 42, 0x10, 0, 0x51, 0x00], "deployer").unwrap();
+        let addr = runner
+            .deploy_bytecode(vec![0x10, 42, 0x10, 0, 0x51, 0x00], "deployer")
+            .unwrap();
         // Default runner is regtest → SR1c prefix.
-        assert!(addr.starts_with("SR1c_test_"),
-            "default (regtest) runner must produce SR1c-prefixed addresses, got: {}", addr);
+        assert!(
+            addr.starts_with("SR1c_test_"),
+            "default (regtest) runner must produce SR1c-prefixed addresses, got: {}",
+            addr
+        );
 
         let result = runner.run_test(&TestCase {
             name: "store_42".into(),
@@ -367,7 +404,9 @@ mod tests {
     fn test_runner_revert_assertion() {
         let mut runner = TestRunner::new();
         // PUSH1 0, PUSH1 0, REVERT
-        runner.deploy_bytecode(vec![0x10, 0, 0x10, 0, 0xB7], "d").unwrap();
+        runner
+            .deploy_bytecode(vec![0x10, 0, 0x10, 0, 0xB7], "d")
+            .unwrap();
 
         let result = runner.run_test(&TestCase {
             name: "expect_revert".into(),
@@ -382,7 +421,9 @@ mod tests {
     fn test_runner_gas_assertion() {
         let mut runner = TestRunner::new();
         // PUSH1 1, PUSH1 2, ADD, STOP
-        runner.deploy_bytecode(vec![0x10, 1, 0x10, 2, 0x20, 0x00], "d").unwrap();
+        runner
+            .deploy_bytecode(vec![0x10, 1, 0x10, 2, 0x20, 0x00], "d")
+            .unwrap();
 
         let result = runner.run_test(&TestCase {
             name: "gas_check".into(),
@@ -395,7 +436,9 @@ mod tests {
     #[test]
     fn test_runner_snapshot_revert() {
         let mut runner = TestRunner::new();
-        runner.deploy_bytecode(vec![0x10, 99, 0x10, 0, 0x51, 0x00], "d").unwrap();
+        runner
+            .deploy_bytecode(vec![0x10, 99, 0x10, 0, 0x51, 0x00], "d")
+            .unwrap();
 
         // Take snapshot
         let snap = runner.snapshot();
@@ -407,10 +450,15 @@ mod tests {
         });
 
         // Revert to snapshot
-        runner.revert_to(snap).expect("revert must succeed on a valid snapshot id");
+        runner
+            .revert_to(snap)
+            .expect("revert must succeed on a valid snapshot id");
 
         // State should be clean
-        let val = runner.env().state.storage_load(runner.contract_addr(), "slot:0");
+        let val = runner
+            .env()
+            .state
+            .storage_load(runner.contract_addr(), "slot:0");
         assert!(val.is_none(), "State should be reverted");
     }
 
@@ -418,22 +466,37 @@ mod tests {
     fn test_runner_return_data_assertion() {
         let mut runner = TestRunner::new();
         // PUSH2 0xBEEF, PUSH1 0, MSTORE, PUSH1 2, PUSH1 30, RETURN
-        runner.deploy_bytecode(vec![0x11, 0xBE, 0xEF, 0x10, 0, 0x91, 0x10, 2, 0x10, 30, 0xB6], "d").unwrap();
+        runner
+            .deploy_bytecode(
+                vec![0x11, 0xBE, 0xEF, 0x10, 0, 0x91, 0x10, 2, 0x10, 30, 0xB6],
+                "d",
+            )
+            .unwrap();
 
         let result = runner.run_test(&TestCase {
             name: "check_return".into(),
             expect_return: Some(vec![0xBE, 0xEF]),
             ..Default::default()
         });
-        assert!(result.passed, "Return data should match: {:?}", result.message);
+        assert!(
+            result.passed,
+            "Return data should match: {:?}",
+            result.message
+        );
     }
 
     #[test]
     fn test_runner_print_summary() {
         let mut runner = TestRunner::new();
         runner.deploy_bytecode(vec![0x00], "d").unwrap(); // STOP
-        runner.run_test(&TestCase { name: "test1".into(), ..Default::default() });
-        runner.run_test(&TestCase { name: "test2".into(), ..Default::default() });
+        runner.run_test(&TestCase {
+            name: "test1".into(),
+            ..Default::default()
+        });
+        runner.run_test(&TestCase {
+            name: "test2".into(),
+            ..Default::default()
+        });
         runner.print_summary();
         assert_eq!(runner.results().len(), 2);
     }
@@ -449,18 +512,27 @@ mod tests {
         // migrated to.
         let mut testnet = TestRunner::for_network("testnet").unwrap();
         let addr = testnet.deploy_bytecode(vec![0x00], "d").unwrap();
-        assert!(addr.starts_with("ST1c_test_"),
-            "testnet must produce ST1c-prefixed addresses, got: {}", addr);
+        assert!(
+            addr.starts_with("ST1c_test_"),
+            "testnet must produce ST1c-prefixed addresses, got: {}",
+            addr
+        );
 
         let mut mainnet = TestRunner::for_network("mainnet").unwrap();
         let addr = mainnet.deploy_bytecode(vec![0x00], "d").unwrap();
-        assert!(addr.starts_with("SD1c_test_"),
-            "mainnet must produce SD1c-prefixed addresses, got: {}", addr);
+        assert!(
+            addr.starts_with("SD1c_test_"),
+            "mainnet must produce SD1c-prefixed addresses, got: {}",
+            addr
+        );
 
         let mut regtest = TestRunner::for_network("regtest").unwrap();
         let addr = regtest.deploy_bytecode(vec![0x00], "d").unwrap();
-        assert!(addr.starts_with("SR1c_test_"),
-            "regtest must produce SR1c-prefixed addresses, got: {}", addr);
+        assert!(
+            addr.starts_with("SR1c_test_"),
+            "regtest must produce SR1c-prefixed addresses, got: {}",
+            addr
+        );
     }
 
     #[test]
@@ -483,12 +555,17 @@ mod tests {
 
         // A test run increments results.len() but must NOT affect
         // the next deploy's counter.
-        runner.run_test(&TestCase { name: "noop".into(), ..Default::default() });
+        runner.run_test(&TestCase {
+            name: "noop".into(),
+            ..Default::default()
+        });
         assert_eq!(runner.results().len(), 1);
 
         let b = runner.deploy_bytecode(vec![0x00], "d").unwrap();
-        assert_eq!(b, "SR1c_test_1",
-            "second deploy must get index 1, not 2 or higher");
+        assert_eq!(
+            b, "SR1c_test_1",
+            "second deploy must get index 1, not 2 or higher"
+        );
     }
 
     // ─── Fail-loud regression tests ─────────────────────────────────
@@ -498,7 +575,9 @@ mod tests {
         // Signature change: fund_account now returns Result<(), String>.
         // The happy path must succeed for any valid (address, balance).
         let mut runner = TestRunner::new();
-        runner.fund_account("alice", 1_000).expect("fund must succeed on a clean runner");
+        runner
+            .fund_account("alice", 1_000)
+            .expect("fund must succeed on a clean runner");
     }
 
     #[test]
@@ -509,8 +588,10 @@ mod tests {
         let mut runner = TestRunner::new();
         // snapshot ids start at 0; anything much larger is invalid.
         let result = runner.revert_to(9_999_999);
-        assert!(result.is_err(),
-            "revert_to must surface invalid-snapshot errors, not swallow them");
+        assert!(
+            result.is_err(),
+            "revert_to must surface invalid-snapshot errors, not swallow them"
+        );
     }
 
     // ─── Caller-per-TestCase regression test ───────────────────────

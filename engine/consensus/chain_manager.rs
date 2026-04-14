@@ -3,25 +3,19 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::engine::dag::ghostdag::ghostdag::GhostDag;
 use crate::config::checkpoints::Checkpoints;
+use crate::engine::dag::ghostdag::ghostdag::GhostDag;
 use crate::errors::ConsensusError;
 
 pub struct ChainManager;
 
 impl ChainManager {
-
     // ─────────────────────────────────────────
     // CHAIN COMPARISON
     // ─────────────────────────────────────────
 
     #[inline(always)]
-    pub fn is_better_chain(
-        candidate: &str,
-        current:   &str,
-        ghostdag:  &GhostDag,
-    ) -> bool {
-
+    pub fn is_better_chain(candidate: &str, current: &str, ghostdag: &GhostDag) -> bool {
         if candidate == current {
             return false;
         }
@@ -31,8 +25,8 @@ impl ChainManager {
 
         match score_c.cmp(&score_k) {
             core::cmp::Ordering::Greater => true,
-            core::cmp::Ordering::Less    => false,
-            core::cmp::Ordering::Equal   => candidate < current, // deterministic tie-break
+            core::cmp::Ordering::Less => false,
+            core::cmp::Ordering::Equal => candidate < current, // deterministic tie-break
         }
     }
 
@@ -41,18 +35,13 @@ impl ChainManager {
     // ─────────────────────────────────────────
 
     #[inline(always)]
-    pub fn best_tip<'a>(
-        tips: &'a [String],
-        ghostdag: &GhostDag,
-    ) -> Option<&'a str> {
-
+    pub fn best_tip<'a>(tips: &'a [String], ghostdag: &GhostDag) -> Option<&'a str> {
         let first = tips.first()?;
 
         let mut best = first;
         let mut best_score = ghostdag.get_blue_score(best);
 
         for tip in &tips[1..] {
-
             let score = ghostdag.get_blue_score(tip);
 
             if score > best_score {
@@ -117,11 +106,7 @@ impl ChainManager {
     // ─────────────────────────────────────────
 
     #[inline(always)]
-    pub fn validate_checkpoint(
-        height: u64,
-        hash:   &str,
-    ) -> Result<(), ConsensusError> {
-
+    pub fn validate_checkpoint(height: u64, hash: &str) -> Result<(), ConsensusError> {
         if Checkpoints::is_valid(height, hash) {
             return Ok(());
         }
@@ -149,8 +134,7 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
 
-        GhostDag::new(&format!("/tmp/test_cm_{}", ts))
-            .expect("test GhostDag DB open failed")
+        GhostDag::new(&format!("/tmp/test_cm_{}", ts)).expect("test GhostDag DB open failed")
     }
 
     #[test]
@@ -192,11 +176,7 @@ mod tests {
         gd.store_blue_score("T2", 30);
         gd.store_blue_score("T3", 20);
 
-        let tips = vec![
-            "T1".to_string(),
-            "T2".to_string(),
-            "T3".to_string(),
-        ];
+        let tips = vec!["T1".to_string(), "T2".to_string(), "T3".to_string()];
 
         assert_eq!(ChainManager::best_tip(&tips, &gd), Some("T2"));
     }

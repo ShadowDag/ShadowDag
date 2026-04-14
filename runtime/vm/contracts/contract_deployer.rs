@@ -18,9 +18,9 @@
 // the wrong network.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
 use crate::domain::address::address::prefix_from_address;
 use crate::errors::VmError;
+use sha2::{Digest, Sha256};
 
 /// Gas cost for contract creation
 pub const CREATE_BASE_GAS: u64 = 32_000;
@@ -76,11 +76,7 @@ impl ContractDeployer {
     ///
     /// The generated address inherits the deployer's network:
     /// `{net}c` || hex(SHA-256("ShadowDAG_CREATE" || deployer || nonce))[0..40]
-    pub fn create(
-        deployer: &str,
-        nonce: u64,
-        init_code: &[u8],
-    ) -> Result<DeployResult, VmError> {
+    pub fn create(deployer: &str, nonce: u64, init_code: &[u8]) -> Result<DeployResult, VmError> {
         // Resolve the network FIRST — a bogus deployer should fail
         // before we spend cycles validating the init code.
         let net_prefix = Self::deployer_prefix(deployer)?;
@@ -90,7 +86,10 @@ impl ContractDeployer {
             return Err(VmError::ContractError("empty init code".to_string()));
         }
         if init_code.len() > MAX_INIT_CODE_SIZE {
-            return Err(VmError::CodeTooLarge { size: init_code.len(), limit: MAX_INIT_CODE_SIZE });
+            return Err(VmError::CodeTooLarge {
+                size: init_code.len(),
+                limit: MAX_INIT_CODE_SIZE,
+            });
         }
 
         // Compute address
@@ -129,7 +128,10 @@ impl ContractDeployer {
             return Err(VmError::ContractError("empty init code".to_string()));
         }
         if init_code.len() > MAX_INIT_CODE_SIZE {
-            return Err(VmError::CodeTooLarge { size: init_code.len(), limit: MAX_INIT_CODE_SIZE });
+            return Err(VmError::CodeTooLarge {
+                size: init_code.len(),
+                limit: MAX_INIT_CODE_SIZE,
+            });
         }
 
         // Hash init code
@@ -252,10 +254,15 @@ impl ContractDeployer {
     /// Validate runtime code after init execution
     pub fn validate_runtime_code(code: &[u8]) -> Result<(), VmError> {
         if code.is_empty() {
-            return Err(VmError::ContractError("contract returned empty runtime code".to_string()));
+            return Err(VmError::ContractError(
+                "contract returned empty runtime code".to_string(),
+            ));
         }
         if code.len() > MAX_CODE_SIZE {
-            return Err(VmError::CodeTooLarge { size: code.len(), limit: MAX_CODE_SIZE });
+            return Err(VmError::CodeTooLarge {
+                size: code.len(),
+                limit: MAX_CODE_SIZE,
+            });
         }
         // EIP-3541: reject code starting with 0xEF
         if code[0] == 0xEF {
@@ -316,7 +323,8 @@ mod tests {
     fn create2_predict_matches() {
         let salt = [0xBB; 32];
         let code = vec![0x60, 0x00];
-        let predicted = ContractDeployer::predict_create2_address(MAINNET_DEPLOYER, salt, &code).unwrap();
+        let predicted =
+            ContractDeployer::predict_create2_address(MAINNET_DEPLOYER, salt, &code).unwrap();
         let deployed = ContractDeployer::create2(MAINNET_DEPLOYER, salt, &code).unwrap();
         assert_eq!(predicted, deployed.address);
     }
@@ -333,14 +341,20 @@ mod tests {
         // silently mis-tagged all non-mainnet deployments.
         let r = ContractDeployer::create(TESTNET_DEPLOYER, 0, &[0x00]).unwrap();
         assert!(r.address.starts_with("ST1c"), "got: {}", r.address);
-        assert!(!r.address.starts_with("SD1"), "testnet contract must not be tagged mainnet");
+        assert!(
+            !r.address.starts_with("SD1"),
+            "testnet contract must not be tagged mainnet"
+        );
     }
 
     #[test]
     fn regtest_deployer_produces_sr1c_address() {
         let r = ContractDeployer::create(REGTEST_DEPLOYER, 0, &[0x00]).unwrap();
         assert!(r.address.starts_with("SR1c"), "got: {}", r.address);
-        assert!(!r.address.starts_with("SD1"), "regtest contract must not be tagged mainnet");
+        assert!(
+            !r.address.starts_with("SD1"),
+            "regtest contract must not be tagged mainnet"
+        );
     }
 
     #[test]
@@ -453,19 +467,19 @@ mod tests {
         let salt: [u8; 32] = [0x11; 32];
         let code = vec![0x60, 0x00, 0x60, 0x20];
 
-        let predicted = ContractDeployer::predict_create2_address(
-            MAINNET_DEPLOYER, salt, &code,
-        ).unwrap();
-        let deployed = ContractDeployer::create2(
-            MAINNET_DEPLOYER, salt, &code,
-        ).unwrap();
-        let computed = ContractDeployer::compute_create2_address(
-            MAINNET_DEPLOYER, &salt, &code,
-        ).unwrap();
+        let predicted =
+            ContractDeployer::predict_create2_address(MAINNET_DEPLOYER, salt, &code).unwrap();
+        let deployed = ContractDeployer::create2(MAINNET_DEPLOYER, salt, &code).unwrap();
+        let computed =
+            ContractDeployer::compute_create2_address(MAINNET_DEPLOYER, &salt, &code).unwrap();
 
-        assert_eq!(predicted, deployed.address,
-            "predict_create2_address must match create2 for the same inputs");
-        assert_eq!(deployed.address, computed,
-            "compute_create2_address must match create2 for the same 32-byte salt");
+        assert_eq!(
+            predicted, deployed.address,
+            "predict_create2_address must match create2 for the same inputs"
+        );
+        assert_eq!(
+            deployed.address, computed,
+            "compute_create2_address must match create2 for the same 32-byte salt"
+        );
     }
 }

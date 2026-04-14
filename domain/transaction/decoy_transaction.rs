@@ -3,27 +3,35 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rand::Rng;
 use rand::seq::SliceRandom;
+use rand::Rng;
 
 use crate::domain::transaction::transaction::Transaction;
 
 #[derive(Clone)]
 pub struct DecoyTransaction {
-    pub tx:         Transaction,
+    pub tx: Transaction,
 
-    pub is_decoy:   bool,
+    pub is_decoy: bool,
 
     pub ring_index: usize,
 }
 
 impl DecoyTransaction {
     pub fn new_real(tx: Transaction, ring_index: usize) -> Self {
-        Self { tx, is_decoy: false, ring_index }
+        Self {
+            tx,
+            is_decoy: false,
+            ring_index,
+        }
     }
 
     pub fn new_decoy(tx: Transaction, ring_index: usize) -> Self {
-        Self { tx, is_decoy: true, ring_index }
+        Self {
+            tx,
+            is_decoy: true,
+            ring_index,
+        }
     }
 
     pub fn is_fake(&self) -> bool {
@@ -32,16 +40,12 @@ impl DecoyTransaction {
 }
 
 pub struct Ring {
-    pub members:   Vec<DecoyTransaction>,
+    pub members: Vec<DecoyTransaction>,
     pub ring_size: usize,
 }
 
 impl Ring {
-    pub fn generate(
-        real_tx:   Transaction,
-        pool:      &[Transaction],
-        ring_size: usize,
-    ) -> Self {
+    pub fn generate(real_tx: Transaction, pool: &[Transaction], ring_size: usize) -> Self {
         let mut rng = rand::thread_rng();
 
         let actual_size = ring_size.max(1).min(pool.len() + 1);
@@ -49,9 +53,8 @@ impl Ring {
 
         // Randomly sample decoys from pool instead of taking first N
         let decoys_needed = actual_size.saturating_sub(1);
-        let mut candidates: Vec<&Transaction> = pool.iter()
-            .filter(|tx| tx.hash != real_tx.hash)
-            .collect();
+        let mut candidates: Vec<&Transaction> =
+            pool.iter().filter(|tx| tx.hash != real_tx.hash).collect();
         candidates.shuffle(&mut rng);
         for (i, tx) in candidates.into_iter().take(decoys_needed).enumerate() {
             members.push(DecoyTransaction::new_decoy(tx.clone(), i));
@@ -77,9 +80,7 @@ impl Ring {
     }
 
     pub fn get_real(&self) -> Option<&Transaction> {
-        self.members.iter()
-            .find(|m| !m.is_decoy)
-            .map(|m| &m.tx)
+        self.members.iter().find(|m| !m.is_decoy).map(|m| &m.tx)
     }
 
     pub fn len(&self) -> usize {
@@ -98,13 +99,19 @@ mod tests {
 
     fn make_tx(hash: &str) -> Transaction {
         Transaction {
-            hash:      hash.to_string(),
-            inputs:    vec![],
-            outputs:   vec![TxOutput { address: "addr".into(), amount: 10, commitment: None, range_proof: None, ephemeral_pubkey: None }],
-            fee:       1,
+            hash: hash.to_string(),
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                address: "addr".into(),
+                amount: 10,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
+            fee: 1,
             timestamp: 1735689600,
             is_coinbase: false,
-            tx_type:   TxType::Transfer,
+            tx_type: TxType::Transfer,
             payload_hash: None,
             ..Default::default()
         }

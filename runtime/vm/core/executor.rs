@@ -6,15 +6,15 @@
 // Executor — Manages contract deployment, execution, and state transitions.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 use crate::domain::address::address::prefix_from_address;
 use crate::errors::VmError;
+use crate::runtime::vm::core::execution_env::{
+    BlockContext, CallContext, CallOutcome, ExecutionEnvironment,
+};
 use crate::runtime::vm::core::vm::ExecutionResult;
 use crate::runtime::vm::core::vm_context::VMContext;
-use crate::runtime::vm::core::execution_env::{
-    ExecutionEnvironment, BlockContext, CallContext, CallOutcome,
-};
 use crate::slog_error;
 /// Default gas limit per contract execution
 pub const DEFAULT_GAS_LIMIT: u64 = 10_000_000;
@@ -36,7 +36,10 @@ impl Executor {
     /// Prefer [`Self::new_with_network`] when the caller knows the
     /// actual network (RPC endpoints, test harnesses, etc.).
     pub fn new(context: VMContext) -> Self {
-        Self { context, network: "mainnet".to_string() }
+        Self {
+            context,
+            network: "mainnet".to_string(),
+        }
     }
 
     /// Create an Executor with an explicit network identifier.
@@ -84,13 +87,13 @@ impl Executor {
     #[allow(clippy::too_many_arguments)]
     pub fn deploy(
         &self,
-        bytecode:  &[u8],
-        deployer:  &str,
-        value:     u64,
+        bytecode: &[u8],
+        deployer: &str,
+        value: u64,
         gas_limit: u64,
         timestamp: u64,
         block_hash: &str,
-        nonce:     u64,
+        nonce: u64,
     ) -> Result<(String, ExecutionResult), VmError> {
         self.deploy_impl(
             bytecode, deployer, value, gas_limit, timestamp, block_hash, nonce,
@@ -124,13 +127,13 @@ impl Executor {
     #[allow(clippy::too_many_arguments)]
     pub fn simulate_deploy(
         &self,
-        bytecode:  &[u8],
-        deployer:  &str,
-        value:     u64,
+        bytecode: &[u8],
+        deployer: &str,
+        value: u64,
         gas_limit: u64,
         timestamp: u64,
         block_hash: &str,
-        nonce:     u64,
+        nonce: u64,
     ) -> Result<(String, ExecutionResult), VmError> {
         self.deploy_impl(
             bytecode, deployer, value, gas_limit, timestamp, block_hash, nonce,
@@ -150,20 +153,23 @@ impl Executor {
     #[allow(clippy::too_many_arguments)]
     fn deploy_impl(
         &self,
-        bytecode:  &[u8],
-        deployer:  &str,
-        value:     u64,
+        bytecode: &[u8],
+        deployer: &str,
+        value: u64,
         gas_limit: u64,
         timestamp: u64,
         block_hash: &str,
-        nonce:     u64,
-        persist:   bool,
+        nonce: u64,
+        persist: bool,
     ) -> Result<(String, ExecutionResult), VmError> {
         if bytecode.is_empty() {
             return Err(VmError::ContractError("Empty bytecode".to_string()));
         }
         if bytecode.len() > MAX_CONTRACT_SIZE {
-            return Err(VmError::CodeTooLarge { size: bytecode.len(), limit: MAX_CONTRACT_SIZE });
+            return Err(VmError::CodeTooLarge {
+                size: bytecode.len(),
+                limit: MAX_CONTRACT_SIZE,
+            });
         }
 
         // Reject bytecode containing unimplemented opcodes
@@ -217,7 +223,11 @@ impl Executor {
         // runtime code (if any) and — if `persist` is set — commit the
         // state changes to RocksDB.
         let result = match outcome {
-            CallOutcome::Success { gas_used, return_data, logs } => {
+            CallOutcome::Success {
+                gas_used,
+                return_data,
+                logs,
+            } => {
                 // If the constructor RETURNed a non-empty payload, that
                 // payload IS the runtime code. Validate and install it.
                 // Otherwise keep the init code as the runtime code —
@@ -250,17 +260,20 @@ impl Executor {
                     self.context.set(&vm_key, &vm_version.to_string())?;
                 }
 
-                ExecutionResult::Success { gas_used, return_data, logs }
-            }
-            CallOutcome::Revert { gas_used, return_data } => {
-                ExecutionResult::Revert {
+                ExecutionResult::Success {
                     gas_used,
-                    reason: String::from_utf8_lossy(&return_data).to_string(),
+                    return_data,
+                    logs,
                 }
             }
-            CallOutcome::Failure { gas_used } => {
-                ExecutionResult::OutOfGas { gas_used }
-            }
+            CallOutcome::Revert {
+                gas_used,
+                return_data,
+            } => ExecutionResult::Revert {
+                gas_used,
+                reason: String::from_utf8_lossy(&return_data).to_string(),
+            },
+            CallOutcome::Failure { gas_used } => ExecutionResult::OutOfGas { gas_used },
         };
 
         Ok((contract_addr, result))
@@ -275,14 +288,20 @@ impl Executor {
         &self,
         contract_addr: &str,
         input_data: &[u8],
-        caller:     &str,
-        value:      u64,
-        gas_limit:  u64,
-        timestamp:  u64,
+        caller: &str,
+        value: u64,
+        gas_limit: u64,
+        timestamp: u64,
         block_hash: &str,
     ) -> ExecutionResult {
         self.call_impl(
-            contract_addr, input_data, caller, value, gas_limit, timestamp, block_hash,
+            contract_addr,
+            input_data,
+            caller,
+            value,
+            gas_limit,
+            timestamp,
+            block_hash,
             /* persist = */ true,
         )
     }
@@ -305,14 +324,20 @@ impl Executor {
         &self,
         contract_addr: &str,
         input_data: &[u8],
-        caller:     &str,
-        value:      u64,
-        gas_limit:  u64,
-        timestamp:  u64,
+        caller: &str,
+        value: u64,
+        gas_limit: u64,
+        timestamp: u64,
         block_hash: &str,
     ) -> ExecutionResult {
         self.call_impl(
-            contract_addr, input_data, caller, value, gas_limit, timestamp, block_hash,
+            contract_addr,
+            input_data,
+            caller,
+            value,
+            gas_limit,
+            timestamp,
+            block_hash,
             /* persist = */ false,
         )
     }
@@ -326,21 +351,23 @@ impl Executor {
         &self,
         contract_addr: &str,
         input_data: &[u8],
-        caller:     &str,
-        value:      u64,
-        gas_limit:  u64,
-        timestamp:  u64,
+        caller: &str,
+        value: u64,
+        gas_limit: u64,
+        timestamp: u64,
         block_hash: &str,
-        persist:    bool,
+        persist: bool,
     ) -> ExecutionResult {
         // Load contract bytecode from storage
         let code_key = format!("code:{}", contract_addr);
         let bytecode_hex = match self.context.get(&code_key) {
             Some(hex) => hex,
-            None => return ExecutionResult::Error {
-                gas_used: 0,
-                message: format!("Contract {} not found", contract_addr),
-            },
+            None => {
+                return ExecutionResult::Error {
+                    gas_used: 0,
+                    message: format!("Contract {} not found", contract_addr),
+                }
+            }
         };
 
         let bytecode = match hex::decode(&bytecode_hex) {
@@ -375,19 +402,13 @@ impl Executor {
         if let Err(e) = env.load_contract_from_storage(self.context.storage(), contract_addr) {
             return ExecutionResult::Error {
                 gas_used: 0,
-                message: format!(
-                    "failed to load contract '{}' state: {}",
-                    contract_addr, e
-                ),
+                message: format!("failed to load contract '{}' state: {}", contract_addr, e),
             };
         }
         if let Err(e) = env.load_contract_from_storage(self.context.storage(), caller) {
             return ExecutionResult::Error {
                 gas_used: 0,
-                message: format!(
-                    "failed to load caller '{}' state: {}",
-                    caller, e
-                ),
+                message: format!("failed to load caller '{}' state: {}", caller, e),
             };
         }
 
@@ -430,7 +451,11 @@ impl Executor {
         // (only when `persist` is set — simulate_call skips this step
         // so RPC traffic cannot commit state to the shared contract DB).
         match outcome {
-            CallOutcome::Success { gas_used, return_data, logs } => {
+            CallOutcome::Success {
+                gas_used,
+                return_data,
+                logs,
+            } => {
                 if persist {
                     if let Err(e) = env.persist_to_storage(self.context.storage()) {
                         return ExecutionResult::Error {
@@ -439,17 +464,20 @@ impl Executor {
                         };
                     }
                 }
-                ExecutionResult::Success { gas_used, return_data, logs }
-            }
-            CallOutcome::Revert { gas_used, return_data } => {
-                ExecutionResult::Revert {
+                ExecutionResult::Success {
                     gas_used,
-                    reason: String::from_utf8_lossy(&return_data).to_string(),
+                    return_data,
+                    logs,
                 }
             }
-            CallOutcome::Failure { gas_used } => {
-                ExecutionResult::OutOfGas { gas_used }
-            }
+            CallOutcome::Revert {
+                gas_used,
+                return_data,
+            } => ExecutionResult::Revert {
+                gas_used,
+                reason: String::from_utf8_lossy(&return_data).to_string(),
+            },
+            CallOutcome::Failure { gas_used } => ExecutionResult::OutOfGas { gas_used },
         }
     }
 
@@ -518,7 +546,8 @@ impl Executor {
     /// inline data bytes following PUSHn instructions are skipped so that
     /// embedded constants are not mistaken for opcodes.
     fn validate_supported_opcodes(bytecode: &[u8]) -> Result<(), VmError> {
-        if let Err((_pos, byte)) = crate::runtime::vm::core::v1_spec::validate_v1_bytecode(bytecode) {
+        if let Err((_pos, byte)) = crate::runtime::vm::core::v1_spec::validate_v1_bytecode(bytecode)
+        {
             return Err(VmError::InvalidOpcode(byte));
         }
         Ok(())
@@ -572,11 +601,13 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("shadowdag_exec_{}_{}",ts, id));
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("shadowdag_exec_{}_{}", ts, id));
         let _ = std::fs::remove_dir_all(&dir);
-        let storage = ContractStorage::new(dir.to_str().unwrap())
-            .expect("ContractStorage::new failed");
+        let storage =
+            ContractStorage::new(dir.to_str().unwrap()).expect("ContractStorage::new failed");
         let ctx = VMContext::new(storage);
         Executor::new(ctx)
     }
@@ -586,7 +617,9 @@ mod tests {
         let exec = make_executor();
         // Simple contract: PUSH1 42, STOP
         let bytecode = vec![0x10, 42, 0x00];
-        let (addr, result) = exec.deploy(&bytecode, "SD1deployer", 0, 100000, 1000, "bh", 0).unwrap();
+        let (addr, result) = exec
+            .deploy(&bytecode, "SD1deployer", 0, 100000, 1000, "bh", 0)
+            .unwrap();
 
         assert!(addr.starts_with("SD1c"));
         assert!(exec.contract_exists(&addr));
@@ -617,7 +650,9 @@ mod tests {
     fn get_code_returns_bytecode() {
         let exec = make_executor();
         let bytecode = vec![0x10, 1, 0x10, 2, 0x20, 0x00];
-        let (addr, _) = exec.deploy(&bytecode, "SD1dep", 0, 100000, 2000, "bh", 0).unwrap();
+        let (addr, _) = exec
+            .deploy(&bytecode, "SD1dep", 0, 100000, 2000, "bh", 0)
+            .unwrap();
         let code = exec.get_code(&addr).unwrap();
         assert_eq!(code, bytecode);
     }
@@ -626,8 +661,14 @@ mod tests {
     fn deploy_mainnet_deployer_yields_mainnet_contract_address() {
         let exec = make_executor();
         let bytecode = vec![0x10, 42, 0x00];
-        let (addr, _) = exec.deploy(&bytecode, "SD1mainnetdeployer", 0, 100000, 3000, "bh", 0).unwrap();
-        assert!(addr.starts_with("SD1c"), "mainnet deployer must produce SD1c address, got: {}", addr);
+        let (addr, _) = exec
+            .deploy(&bytecode, "SD1mainnetdeployer", 0, 100000, 3000, "bh", 0)
+            .unwrap();
+        assert!(
+            addr.starts_with("SD1c"),
+            "mainnet deployer must produce SD1c address, got: {}",
+            addr
+        );
     }
 
     #[test]
@@ -638,9 +679,19 @@ mod tests {
         // deployer's network.
         let exec = make_executor();
         let bytecode = vec![0x10, 42, 0x00];
-        let (addr, _) = exec.deploy(&bytecode, "ST1testnetdeployer", 0, 100000, 3000, "bh", 0).unwrap();
-        assert!(addr.starts_with("ST1c"), "testnet deployer must produce ST1c address, got: {}", addr);
-        assert!(!addr.starts_with("SD1"), "testnet contract must not be tagged mainnet: {}", addr);
+        let (addr, _) = exec
+            .deploy(&bytecode, "ST1testnetdeployer", 0, 100000, 3000, "bh", 0)
+            .unwrap();
+        assert!(
+            addr.starts_with("ST1c"),
+            "testnet deployer must produce ST1c address, got: {}",
+            addr
+        );
+        assert!(
+            !addr.starts_with("SD1"),
+            "testnet contract must not be tagged mainnet: {}",
+            addr
+        );
     }
 
     #[test]
@@ -666,11 +717,11 @@ mod tests {
         let exec = make_executor();
         let init_code: Vec<u8> = vec![
             0x11, 0xCA, 0xFE, // PUSH2 0xCAFE
-            0x10, 0x00,       // PUSH1 0
-            0x91,             // MSTORE
-            0x10, 0x02,       // PUSH1 2 (length)
-            0x10, 0x1E,       // PUSH1 30 (offset)
-            0xB6,             // RETURN
+            0x10, 0x00, // PUSH1 0
+            0x91, // MSTORE
+            0x10, 0x02, // PUSH1 2 (length)
+            0x10, 0x1E, // PUSH1 30 (offset)
+            0xB6, // RETURN
         ];
         let (addr, result) = exec
             .deploy(&init_code, "SD1ctordeployer", 0, 100000, 5000, "bh", 0)
@@ -679,7 +730,8 @@ mod tests {
         match &result {
             ExecutionResult::Success { return_data, .. } => {
                 assert_eq!(
-                    return_data, &vec![0xCA, 0xFE],
+                    return_data,
+                    &vec![0xCA, 0xFE],
                     "constructor return_data must be [0xCA, 0xFE]"
                 );
             }
@@ -693,10 +745,12 @@ mod tests {
             .get_code(&addr)
             .expect("contract code must be retrievable after deploy");
         assert_eq!(
-            stored_code, vec![0xCA, 0xFE],
+            stored_code,
+            vec![0xCA, 0xFE],
             "runtime code must be the constructor's RETURN data, not the init code; \
              got {} bytes (init_code was {} bytes)",
-            stored_code.len(), init_code.len()
+            stored_code.len(),
+            init_code.len()
         );
     }
 
@@ -714,23 +768,38 @@ mod tests {
             .expect("deploy of raw runtime code must succeed");
         match &result {
             ExecutionResult::Success { return_data, .. } => {
-                assert!(return_data.is_empty(),
-                    "STOP path produces no return_data, got: {:?}", return_data);
+                assert!(
+                    return_data.is_empty(),
+                    "STOP path produces no return_data, got: {:?}",
+                    return_data
+                );
             }
             other => panic!("expected Success, got: {:?}", other),
         }
         let stored_code = exec.get_code(&addr).unwrap();
-        assert_eq!(stored_code, bytecode,
-            "empty-return deploy must keep init code as runtime code");
+        assert_eq!(
+            stored_code, bytecode,
+            "empty-return deploy must keep init code as runtime code"
+        );
     }
 
     #[test]
     fn deploy_regtest_deployer_yields_regtest_contract_address() {
         let exec = make_executor();
         let bytecode = vec![0x10, 42, 0x00];
-        let (addr, _) = exec.deploy(&bytecode, "SR1regtestdeployer", 0, 100000, 3000, "bh", 0).unwrap();
-        assert!(addr.starts_with("SR1c"), "regtest deployer must produce SR1c address, got: {}", addr);
-        assert!(!addr.starts_with("SD1"), "regtest contract must not be tagged mainnet: {}", addr);
+        let (addr, _) = exec
+            .deploy(&bytecode, "SR1regtestdeployer", 0, 100000, 3000, "bh", 0)
+            .unwrap();
+        assert!(
+            addr.starts_with("SR1c"),
+            "regtest deployer must produce SR1c address, got: {}",
+            addr
+        );
+        assert!(
+            !addr.starts_with("SD1"),
+            "regtest contract must not be tagged mainnet: {}",
+            addr
+        );
     }
 
     #[test]
@@ -761,13 +830,18 @@ mod tests {
         // Plant a "code:{addr}" entry with non-hex data directly via the
         // context. execute() is the simple-KV backdoor for this store.
         let addr = "SD1cCORRUPT_TEST";
-        exec.execute(&format!("code:{}", addr), "not-valid-hex").unwrap();
+        exec.execute(&format!("code:{}", addr), "not-valid-hex")
+            .unwrap();
 
         // Non-strict masks the corruption as None (but logs it)
         assert!(exec.get_code(addr).is_none());
         // Strict surfaces it as an explicit error
         let strict = exec.get_code_strict(addr);
-        assert!(strict.is_err(), "strict get_code must expose corruption, got: {:?}", strict);
+        assert!(
+            strict.is_err(),
+            "strict get_code must expose corruption, got: {:?}",
+            strict
+        );
     }
 
     // ─── Dry-run variants (RPC path) ──────────────────────────────────

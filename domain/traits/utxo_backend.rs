@@ -53,7 +53,9 @@ pub trait UtxoBackend: Send + Sync {
 
     // ── Maintenance ─────────────────────────────────────────────────
     /// Prune spent UTXOs to reclaim storage. Returns count pruned.
-    fn prune_spent(&self) -> Result<u64, StorageError> { Ok(0) }
+    fn prune_spent(&self) -> Result<u64, StorageError> {
+        Ok(0)
+    }
 
     /// Compact underlying storage after pruning
     fn compact(&self) {}

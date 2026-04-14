@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use crate::domain::transaction::transaction::Transaction;
 use crate::domain::utxo::utxo::Utxo;
 use crate::domain::utxo::utxo_key::UtxoKey;
-use crate::domain::utxo::utxo_set::{BlockUndoData, UtxoSet, utxo_key};
+use crate::domain::utxo::utxo_set::{utxo_key, BlockUndoData, UtxoSet};
 use crate::slog_warn;
 
 pub struct UtxoSpend;

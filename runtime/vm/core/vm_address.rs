@@ -76,12 +76,16 @@ impl VmAddressBody {
         let body_hex = match s.as_bytes()[3] {
             b'c' | b't' | b's' | b'k' | b'h' => {
                 // 4-char prefix + 40-char body
-                if s.len() != 44 { return None; }
+                if s.len() != 44 {
+                    return None;
+                }
                 &s[4..]
             }
             _ => {
                 // 3-char prefix + 40-char body
-                if s.len() != 43 { return None; }
+                if s.len() != 43 {
+                    return None;
+                }
                 &s[3..]
             }
         };
@@ -243,7 +247,10 @@ mod tests {
 
         // synthetic path — must be deterministic and equal the derived value
         let body_synthetic = VmAddressBody::from_any("caller");
-        assert_eq!(body_synthetic, VmAddressBody::derive_from_nonstandard("caller"));
+        assert_eq!(
+            body_synthetic,
+            VmAddressBody::derive_from_nonstandard("caller")
+        );
     }
 
     #[test]
@@ -262,7 +269,11 @@ mod tests {
         let u = body.to_u256();
         let bytes = u.to_be_bytes();
         assert_eq!(&bytes[0..12], &[0u8; 12], "high 12 bytes must be zero");
-        assert_eq!(&bytes[12..32], &[0xFFu8; 20], "low 20 bytes must be the body");
+        assert_eq!(
+            &bytes[12..32],
+            &[0xFFu8; 20],
+            "low 20 bytes must be the body"
+        );
     }
 
     #[test]

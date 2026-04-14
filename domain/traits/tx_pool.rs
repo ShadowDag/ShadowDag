@@ -21,9 +21,5 @@ pub trait TxPool: Send + Sync {
 
     /// Get transactions for block building, validated against the UTXO set.
     /// Returns up to `max_count` transactions ordered by fee priority.
-    fn get_transactions_for_block(
-        &self,
-        utxo_set: &UtxoSet,
-        max_count: usize,
-    ) -> Vec<Transaction>;
+    fn get_transactions_for_block(&self, utxo_set: &UtxoSet, max_count: usize) -> Vec<Transaction>;
 }

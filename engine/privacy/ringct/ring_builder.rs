@@ -10,7 +10,7 @@
 
 use rand::rngs::OsRng;
 use rand::RngCore;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 use crate::engine::privacy::ringct::ring_signature::RingMember;
 
@@ -119,7 +119,11 @@ static GAMMA_CDF: [u64; GAMMA_TABLE_SIZE] = {
             u64::MAX
         } else {
             let val = f_corrected << 8;
-            if val > u64::MAX as u128 { u64::MAX } else { val as u64 }
+            if val > u64::MAX as u128 {
+                u64::MAX
+            } else {
+                val as u64
+            }
         };
 
         table[i] = threshold;
@@ -193,7 +197,8 @@ impl RingBuilder {
         let decoys_needed = ring_size - 1;
 
         // Filter out the signer from the UTXO set
-        let candidates: Vec<&[u8; 32]> = utxo_pubkeys.iter()
+        let candidates: Vec<&[u8; 32]> = utxo_pubkeys
+            .iter()
             .filter(|pk| pk.as_slice() != signer_pubkey.as_slice())
             .collect();
 
@@ -328,7 +333,11 @@ mod tests {
             positions.insert(pos);
         }
         // Should hit at least 3 different positions in 50 tries
-        assert!(positions.len() >= 3, "Position should be random, got {:?}", positions);
+        assert!(
+            positions.len() >= 3,
+            "Position should be random, got {:?}",
+            positions
+        );
     }
 
     #[test]
@@ -345,7 +354,11 @@ mod tests {
 
     #[test]
     fn too_small_ring_invalid() {
-        let ring = vec![RingMember::new([1u8; 32]), RingMember::new([2u8; 32]), RingMember::new([3u8; 32])];
+        let ring = vec![
+            RingMember::new([1u8; 32]),
+            RingMember::new([2u8; 32]),
+            RingMember::new([3u8; 32]),
+        ];
         assert!(!RingBuilder::validate_ring(&ring)); // 3 < MIN_RING_SIZE (4)
     }
 
@@ -370,7 +383,8 @@ mod tests {
         let ring = RingBuilder::build_from_utxo_set(&signer, &utxos, 11);
         // All non-signer members should be from the UTXO set
         let utxo_set: std::collections::HashSet<_> = utxos.iter().map(hex::encode).collect();
-        let from_utxo = ring.iter()
+        let from_utxo = ring
+            .iter()
             .filter(|m| m.public_key != signer)
             .filter(|m| utxo_set.contains(&hex::encode(m.public_key)))
             .count();
@@ -390,18 +404,24 @@ mod tests {
         for _ in 0..20 {
             let ring = RingBuilder::build_from_utxo_set(&signer, &utxos, 11);
             for m in &ring {
-                if m.public_key == signer { continue; }
+                if m.public_key == signer {
+                    continue;
+                }
                 if let Some(idx) = utxos.iter().position(|pk| *pk == m.public_key) {
                     total_decoys += 1;
-                    if idx >= 500 { recent_count += 1; }
+                    if idx >= 500 {
+                        recent_count += 1;
+                    }
                 }
             }
         }
         // With gamma(19.28), vast majority should be recent
         let recent_ratio = recent_count as f64 / total_decoys as f64;
-        assert!(recent_ratio > 0.7,
+        assert!(
+            recent_ratio > 0.7,
             "Gamma distribution should favor recent outputs, got {:.1}% recent",
-            recent_ratio * 100.0);
+            recent_ratio * 100.0
+        );
     }
 
     #[test]
@@ -424,7 +444,11 @@ mod tests {
                 i
             );
         }
-        assert_eq!(GAMMA_CDF[GAMMA_TABLE_SIZE - 1], u64::MAX, "CDF must reach 1.0");
+        assert_eq!(
+            GAMMA_CDF[GAMMA_TABLE_SIZE - 1],
+            u64::MAX,
+            "CDF must reach 1.0"
+        );
     }
 
     #[test]

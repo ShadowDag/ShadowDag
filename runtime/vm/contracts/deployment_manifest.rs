@@ -6,8 +6,8 @@
 // Deployment Manifest -- per-network contract registry.
 // =============================================================================
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use serde::{Serialize, Deserialize};
 
 use crate::domain::address::address::network_prefix;
 use crate::errors::VmError;
@@ -138,9 +138,9 @@ impl DeploymentManifest {
     /// classified at all.
     pub fn add_deployment(&mut self, contract: DeployedContract) -> Result<(), VmError> {
         self.check_address_matches_network(&contract.address)
-            .map_err(|e| VmError::ContractError(format!(
-                "cannot add deployment '{}': {}", contract.name, e
-            )))?;
+            .map_err(|e| {
+                VmError::ContractError(format!("cannot add deployment '{}': {}", contract.name, e))
+            })?;
         self.contracts.insert(contract.name.clone(), contract);
         Ok(())
     }
@@ -162,12 +162,13 @@ impl DeploymentManifest {
             return Err("contract address is empty".to_string());
         }
         // Expected prefix for the manifest's network (e.g. "SD1").
-        let expected = network_prefix(&self.network)
-            .ok_or_else(|| format!(
+        let expected = network_prefix(&self.network).ok_or_else(|| {
+            format!(
                 "manifest has unknown network '{}' — cannot validate address prefix \
                  (manifest should have been constructed via DeploymentManifest::new)",
                 self.network
-            ))?;
+            )
+        })?;
         if !address.starts_with(expected) {
             return Err(format!(
                 "address '{}' does not match manifest network '{}' (expected \
@@ -217,8 +218,8 @@ impl DeploymentManifest {
     /// the `chain_id` / `rpc_url` could drift arbitrarily from the
     /// `network` string.
     pub fn from_json(json: &str) -> Result<Self, String> {
-        let mut parsed: Self = serde_json::from_str(json)
-            .map_err(|e| format!("manifest JSON parse error: {}", e))?;
+        let mut parsed: Self =
+            serde_json::from_str(json).map_err(|e| format!("manifest JSON parse error: {}", e))?;
         parsed.validate_loaded()?;
         Ok(parsed)
     }
@@ -231,11 +232,13 @@ impl DeploymentManifest {
     /// name (`"local"` → `"regtest"`).
     fn validate_loaded(&mut self) -> Result<(), String> {
         // (1) Canonicalize the network.
-        let canonical = canonical_network(&self.network).ok_or_else(|| format!(
-            "manifest has unknown network '{}': expected one of \
+        let canonical = canonical_network(&self.network).ok_or_else(|| {
+            format!(
+                "manifest has unknown network '{}': expected one of \
              mainnet, testnet, regtest (or 'local' as alias for regtest)",
-            self.network
-        ))?;
+                self.network
+            )
+        })?;
         self.network = canonical.to_string();
 
         // (2) Verify chain_id matches the canonical value for the
@@ -264,10 +267,7 @@ impl DeploymentManifest {
         //     manifest.
         for (name, contract) in &self.contracts {
             self.check_address_matches_network(&contract.address)
-                .map_err(|e| format!(
-                    "manifest contract '{}' has invalid address: {}",
-                    name, e
-                ))?;
+                .map_err(|e| format!("manifest contract '{}' has invalid address: {}", name, e))?;
         }
 
         Ok(())
@@ -309,7 +309,8 @@ mod tests {
             verified: true,
             deployed_at: 1700000000,
             package_file: Some("token.pkg.json".into()),
-        }).expect("ST1c prefix matches testnet manifest");
+        })
+        .expect("ST1c prefix matches testnet manifest");
 
         assert!(m.is_deployed("MyToken"));
         assert_eq!(m.get_address("MyToken"), Some("ST1c_abc123"));
@@ -345,9 +346,13 @@ mod tests {
         let msg = format!("{}", err);
         assert!(
             msg.contains("unknown deployment network"),
-            "error must describe the problem, got: {}", msg
+            "error must describe the problem, got: {}",
+            msg
         );
-        assert!(msg.contains("mainmet"), "error must include the offending name");
+        assert!(
+            msg.contains("mainmet"),
+            "error must include the offending name"
+        );
 
         assert!(DeploymentManifest::new("").is_err());
         assert!(DeploymentManifest::new("devnet").is_err());
@@ -377,7 +382,8 @@ mod tests {
             verified: false,
             deployed_at: 0,
             package_file: None,
-        }).expect("SD1c prefix matches mainnet manifest");
+        })
+        .expect("SD1c prefix matches mainnet manifest");
 
         let json = m.to_json().unwrap();
         let loaded = DeploymentManifest::from_json(&json).unwrap();
@@ -396,55 +402,66 @@ mod tests {
         // must NOT accumulate mainnet-tagged addresses even if a
         // caller hands them in directly.
         let mut m = DeploymentManifest::new("testnet").unwrap();
-        let err = m.add_deployment(DeployedContract {
-            name: "Drift".into(),
-            address: "SD1c_from_mainnet".into(), // wrong network
-            bytecode_hash: "hash".into(),
-            deploy_height: 1,
-            deploy_tx: "tx".into(),
-            vm_version: 1,
-            verified: false,
-            deployed_at: 0,
-            package_file: None,
-        }).unwrap_err();
+        let err = m
+            .add_deployment(DeployedContract {
+                name: "Drift".into(),
+                address: "SD1c_from_mainnet".into(), // wrong network
+                bytecode_hash: "hash".into(),
+                deploy_height: 1,
+                deploy_tx: "tx".into(),
+                vm_version: 1,
+                verified: false,
+                deployed_at: 0,
+                package_file: None,
+            })
+            .unwrap_err();
         let msg = format!("{}", err);
-        assert!(msg.contains("does not match manifest network"),
-            "error must explain the prefix mismatch, got: {}", msg);
-        assert!(!m.is_deployed("Drift"),
-            "refused deployment must NOT be recorded");
+        assert!(
+            msg.contains("does not match manifest network"),
+            "error must explain the prefix mismatch, got: {}",
+            msg
+        );
+        assert!(
+            !m.is_deployed("Drift"),
+            "refused deployment must NOT be recorded"
+        );
     }
 
     #[test]
     fn add_deployment_rejects_empty_address() {
         let mut m = DeploymentManifest::new("mainnet").unwrap();
-        let err = m.add_deployment(DeployedContract {
-            name: "Empty".into(),
-            address: "".into(),
-            bytecode_hash: "h".into(),
-            deploy_height: 0,
-            deploy_tx: "tx".into(),
-            vm_version: 1,
-            verified: false,
-            deployed_at: 0,
-            package_file: None,
-        }).unwrap_err();
+        let err = m
+            .add_deployment(DeployedContract {
+                name: "Empty".into(),
+                address: "".into(),
+                bytecode_hash: "h".into(),
+                deploy_height: 0,
+                deploy_tx: "tx".into(),
+                vm_version: 1,
+                verified: false,
+                deployed_at: 0,
+                package_file: None,
+            })
+            .unwrap_err();
         assert!(format!("{}", err).contains("empty"));
     }
 
     #[test]
     fn add_deployment_rejects_unknown_prefix() {
         let mut m = DeploymentManifest::new("mainnet").unwrap();
-        let err = m.add_deployment(DeployedContract {
-            name: "Wrong".into(),
-            address: "BTC1foreign".into(), // not ours at all
-            bytecode_hash: "h".into(),
-            deploy_height: 0,
-            deploy_tx: "tx".into(),
-            vm_version: 1,
-            verified: false,
-            deployed_at: 0,
-            package_file: None,
-        }).unwrap_err();
+        let err = m
+            .add_deployment(DeployedContract {
+                name: "Wrong".into(),
+                address: "BTC1foreign".into(), // not ours at all
+                bytecode_hash: "h".into(),
+                deploy_height: 0,
+                deploy_tx: "tx".into(),
+                vm_version: 1,
+                verified: false,
+                deployed_at: 0,
+                package_file: None,
+            })
+            .unwrap_err();
         assert!(format!("{}", err).contains("does not match manifest network"));
     }
 
@@ -465,8 +482,11 @@ mod tests {
             "migration_version": 0
         }"#;
         let err = DeploymentManifest::from_json(tampered).unwrap_err();
-        assert!(err.contains("unknown network"),
-            "from_json must refuse a typo'd network, got: {}", err);
+        assert!(
+            err.contains("unknown network"),
+            "from_json must refuse a typo'd network, got: {}",
+            err
+        );
     }
 
     // Canonical chain_id decimal values, for readers: these are just
@@ -494,8 +514,11 @@ mod tests {
             "migration_version": 0
         }"#;
         let err = DeploymentManifest::from_json(tampered).unwrap_err();
-        assert!(err.contains("chain_id mismatch"),
-            "from_json must refuse a drifted chain_id, got: {}", err);
+        assert!(
+            err.contains("chain_id mismatch"),
+            "from_json must refuse a drifted chain_id, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -524,9 +547,11 @@ mod tests {
             "migration_version": 0
         }"#;
         let err = DeploymentManifest::from_json(tampered).unwrap_err();
-        assert!(err.contains("does not match manifest network")
-             || err.contains("invalid address"),
-            "from_json must refuse a cross-network contract entry, got: {}", err);
+        assert!(
+            err.contains("does not match manifest network") || err.contains("invalid address"),
+            "from_json must refuse a cross-network contract entry, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -543,8 +568,10 @@ mod tests {
             "migration_version": 0
         }"#;
         let loaded = DeploymentManifest::from_json(stored).unwrap();
-        assert_eq!(loaded.network, "regtest",
-            "from_json must canonicalize 'local' to 'regtest'");
+        assert_eq!(
+            loaded.network, "regtest",
+            "from_json must canonicalize 'local' to 'regtest'"
+        );
         assert_eq!(loaded.chain_id, 0xDA0C_0003);
     }
 
@@ -564,7 +591,8 @@ mod tests {
             verified: false,
             deployed_at: 0,
             package_file: None,
-        }).unwrap();
+        })
+        .unwrap();
         let json = m.to_json().unwrap();
         let loaded = DeploymentManifest::from_json(&json).unwrap();
         assert_eq!(loaded.network, "regtest");

@@ -121,18 +121,16 @@ impl DagTraversal {
         match order {
             TraversalOrder::BreadthFirst => self.bfs(hash),
             TraversalOrder::DepthFirst => self.dfs(hash),
-            TraversalOrder::TopologicalSort => {
-                match self.topo(hash) {
-                    Ok(mut r) => {
-                        r.retain(|h| h != hash);
-                        r
-                    }
-                    Err(e) => {
-                        slog_warn!("dag", "topo_sort_failed_in_ancestors", error => e.to_string());
-                        Vec::new()
-                    }
+            TraversalOrder::TopologicalSort => match self.topo(hash) {
+                Ok(mut r) => {
+                    r.retain(|h| h != hash);
+                    r
                 }
-            }
+                Err(e) => {
+                    slog_warn!("dag", "topo_sort_failed_in_ancestors", error => e.to_string());
+                    Vec::new()
+                }
+            },
         }
     }
 
@@ -235,7 +233,8 @@ impl DagTraversal {
         if result.len() != all.len() {
             return Err(DagError::Other(format!(
                 "topological sort incomplete: {} of {} nodes (possible cycle or corruption)",
-                result.len(), all.len()
+                result.len(),
+                all.len()
             )));
         }
 
@@ -313,8 +312,9 @@ impl DagTraversal {
                     // then lowest hash (lexicographic) breaks ties.
                     let dominated = match &best {
                         None => true,
-                        Some(bh) => node.height > best_height
-                            || (node.height == best_height && h < *bh),
+                        Some(bh) => {
+                            node.height > best_height || (node.height == best_height && h < *bh)
+                        }
                     };
                     if dominated {
                         best_height = node.height;
@@ -357,9 +357,9 @@ mod tests {
 
     fn node(hash: &str, parents: &[&str]) -> DagNode {
         DagNode {
-            hash:    hash.to_string(),
+            hash: hash.to_string(),
             parents: parents.iter().map(|s| s.to_string()).collect(),
-            height:  0,
+            height: 0,
         }
     }
 

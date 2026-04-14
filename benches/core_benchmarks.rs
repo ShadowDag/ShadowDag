@@ -8,21 +8,27 @@
 // Run: cargo bench
 // ═══════════════════════════════════════════════════════════════════════════
 
-use criterion::{criterion_group, criterion_main, Criterion, black_box};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
-use shadowdag::engine::mining::algorithms::shadowhash::{shadow_hash_raw, shadow_hash_str, SCRATCHPAD_SIZE};
-use shadowdag::engine::mining::pow::pow_validator::PowValidator;
-use shadowdag::engine::consensus::difficulty::difficulty::Difficulty;
-use shadowdag::engine::dag::core::bps_engine::BpsParams;
 use shadowdag::config::consensus::emission_schedule::EmissionSchedule;
 use shadowdag::domain::block::merkle_tree::MerkleTree;
+use shadowdag::domain::transaction::transaction::Transaction;
+use shadowdag::engine::consensus::difficulty::difficulty::Difficulty;
+use shadowdag::engine::dag::core::bps_engine::BpsParams;
+use shadowdag::engine::mining::algorithms::shadowhash::{shadow_hash_raw_full, shadow_hash_str};
+use shadowdag::engine::mining::pow::pow_validator::PowValidator;
 
 fn bench_shadowhash(c: &mut Criterion) {
     c.bench_function("shadowhash_raw", |b| {
         b.iter(|| {
-            shadow_hash_raw(
-                black_box(1), black_box(100), black_box(1735689600),
-                black_box(42), black_box(4), black_box("merkle_root_hash"),
+            shadow_hash_raw_full(
+                black_box(1),
+                black_box(100),
+                black_box(1735689600),
+                black_box(42),
+                black_box(0),
+                black_box(4),
+                black_box("merkle_root_hash"),
                 black_box(&[]),
             )
         })
@@ -68,15 +74,29 @@ fn bench_emission_reward(c: &mut Criterion) {
 
 fn bench_merkle_tree_100(c: &mut Criterion) {
     let hashes: Vec<String> = (0..100).map(|i| format!("{:064x}", i)).collect();
+    let txs: Vec<Transaction> = hashes
+        .into_iter()
+        .map(|hash| Transaction {
+            hash,
+            ..Transaction::default()
+        })
+        .collect();
     c.bench_function("merkle_tree_100_txs", |b| {
-        b.iter(|| MerkleTree::calculate_root(black_box(hashes.clone())))
+        b.iter(|| MerkleTree::build(black_box(&txs), black_box(1), black_box(&[])))
     });
 }
 
 fn bench_merkle_tree_1000(c: &mut Criterion) {
     let hashes: Vec<String> = (0..1000).map(|i| format!("{:064x}", i)).collect();
+    let txs: Vec<Transaction> = hashes
+        .into_iter()
+        .map(|hash| Transaction {
+            hash,
+            ..Transaction::default()
+        })
+        .collect();
     c.bench_function("merkle_tree_1000_txs", |b| {
-        b.iter(|| MerkleTree::calculate_root(black_box(hashes.clone())))
+        b.iter(|| MerkleTree::build(black_box(&txs), black_box(1), black_box(&[])))
     });
 }
 

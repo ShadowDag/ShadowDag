@@ -3,15 +3,15 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options, IteratorMode, WriteBatch};
-use std::collections::{HashSet, HashMap, VecDeque};
+use rocksdb::{IteratorMode, Options, WriteBatch, DB};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::domain::block::block::Block;
 use crate::engine::dag::security::dos_protection::MAX_DAG_PARENTS;
 use crate::engine::mining::pow::pow_validator::PowValidator;
-use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
 use crate::errors::{DagError, StorageError};
+use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
 use crate::{slog_error, slog_warn};
 
 // Block data is stored in BlockStore (blk: prefix). DAG only stores topology:
@@ -67,7 +67,6 @@ pub struct DagManager {
 }
 
 impl DagManager {
-
     pub fn new<S: Into<SharedDbSource>>(source: S) -> Option<Self> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -83,11 +82,9 @@ impl DagManager {
     }
 
     pub fn new_required(path: &str) -> Result<Self, crate::errors::StorageError> {
-        Self::new(path).ok_or_else(|| {
-            crate::errors::StorageError::OpenFailed {
-                path: path.to_string(),
-                reason: "DagManager::new returned None".to_string(),
-            }
+        Self::new(path).ok_or_else(|| crate::errors::StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: "DagManager::new returned None".to_string(),
         })
     }
 
@@ -99,6 +96,19 @@ impl DagManager {
     /// Prevents any block from becoming a "hotspot" that slows traversal.
     /// At 10 BPS with MAX_PARENTS=80, realistic max is ~80-160 children.
     const MAX_CHILDREN_PER_BLOCK: usize = 256;
+
+    #[inline]
+    fn mark_block_rejected() {
+        crate::telemetry::metrics::registry::global()
+            .counter("dag.blocks_rejected")
+            .inc();
+    }
+
+    #[inline]
+    fn reject(err: DagError) -> Result<(), DagError> {
+        Self::mark_block_rejected();
+        Err(err)
+    }
 
     // ADD BLOCK (delegates to add_block_validated with validated=false)
     pub fn add_block(&self, block: &Block) -> Result<(), DagError> {
@@ -120,7 +130,7 @@ impl DagManager {
         let hash = block.header.hash.as_str();
 
         if self.block_exists(hash) {
-            return Err(DagError::DuplicateBlock(hash.to_string()));
+            return Self::reject(DagError::DuplicateBlock(hash.to_string()));
         }
 
         // ── Full consensus validation (when not pre-validated) ──────────
@@ -128,7 +138,7 @@ impl DagManager {
             // 1. PoW validation — recompute hash and check difficulty target
             let pow_result = PowValidator::validate(block);
             if !pow_result.valid {
-                return Err(DagError::Other(format!(
+                return Self::reject(DagError::Other(format!(
                     "PoW validation failed: {}",
                     pow_result.reason.unwrap_or_else(|| "unknown".to_string())
                 )));
@@ -140,9 +150,11 @@ impl DagManager {
                 .unwrap_or_default()
                 .as_secs();
             if block.header.timestamp > now + Self::MAX_FUTURE_TIMESTAMP {
-                return Err(DagError::Other(format!(
+                return Self::reject(DagError::Other(format!(
                     "block timestamp {} is too far in the future (now={}, max_drift={}s)",
-                    block.header.timestamp, now, Self::MAX_FUTURE_TIMESTAMP
+                    block.header.timestamp,
+                    now,
+                    Self::MAX_FUTURE_TIMESTAMP
                 )));
             }
         }
@@ -153,7 +165,9 @@ impl DagManager {
         // GENESIS
         if block.header.height == 0 {
             if !block.header.parents.is_empty() {
-                return Err(DagError::InvalidParent("genesis block must have no parents".into()));
+                return Self::reject(DagError::InvalidParent(
+                    "genesis block must have no parents".into(),
+                ));
             }
 
             batch.put(key_exists(hash), b"1");
@@ -161,17 +175,20 @@ impl DagManager {
 
             self.db.write(batch).map_err(StorageError::RocksDb)?;
             let _ = self.increment_block_count();
+            crate::telemetry::metrics::registry::global()
+                .counter("dag.blocks_accepted")
+                .inc();
             return Ok(());
         }
 
         let parents = &block.header.parents;
 
         if parents.is_empty() {
-            return Err(DagError::InvalidParent("missing parents".to_string()));
+            return Self::reject(DagError::InvalidParent("missing parents".to_string()));
         }
 
         if parents.len() > MAX_DAG_PARENTS {
-            return Err(DagError::TooManyParents(parents.len(), MAX_DAG_PARENTS));
+            return Self::reject(DagError::TooManyParents(parents.len(), MAX_DAG_PARENTS));
         }
 
         let mut seen: HashSet<&str> = HashSet::with_capacity(parents.len());
@@ -180,29 +197,31 @@ impl DagManager {
             let p = parent.as_str();
 
             if p == hash {
-                return Err(DagError::SelfParent(hash.to_string()));
+                return Self::reject(DagError::SelfParent(hash.to_string()));
             }
 
             if !seen.insert(p) {
-                return Err(DagError::DuplicateParents(p.to_string()));
+                return Self::reject(DagError::DuplicateParents(p.to_string()));
             }
 
             if !self.block_exists(p) {
-                return Err(DagError::OrphanBlock(hash.to_string(), p.to_string()));
+                return Self::reject(DagError::OrphanBlock(hash.to_string(), p.to_string()));
             }
 
             // Conservative: if walk limit exceeded, treat as cycle (reject block)
             if self.would_create_cycle(hash, p).unwrap_or(true) {
-                return Err(DagError::Other(format!("cycle detected via {}", p)));
+                return Self::reject(DagError::Other(format!("cycle detected via {}", p)));
             }
 
             // Fanout limit: reject if parent already has too many children.
             // This prevents any block from becoming a traversal bottleneck.
             let child_count = self.get_children(p).len();
             if child_count >= Self::MAX_CHILDREN_PER_BLOCK {
-                return Err(DagError::Other(format!(
+                return Self::reject(DagError::Other(format!(
                     "parent {} already has {} children (max {})",
-                    p, child_count, Self::MAX_CHILDREN_PER_BLOCK
+                    p,
+                    child_count,
+                    Self::MAX_CHILDREN_PER_BLOCK
                 )));
             }
         }
@@ -215,8 +234,8 @@ impl DagManager {
         // which documents that parent validation is handled here, not in the store.
         for i in 1..parents.len() {
             if parents[i] <= parents[i - 1] {
-                return Err(DagError::Other(
-                    "parents must be sorted in strictly ascending lexicographic order".into()
+                return Self::reject(DagError::Other(
+                    "parents must be sorted in strictly ascending lexicographic order".into(),
                 ));
             }
         }
@@ -239,14 +258,68 @@ impl DagManager {
         let _ = self.increment_block_count();
 
         // Metrics: track block acceptance
-        crate::telemetry::metrics::registry::global().counter("dag.blocks_accepted").inc();
+        crate::telemetry::metrics::registry::global()
+            .counter("dag.blocks_accepted")
+            .inc();
 
+        Ok(())
+    }
+
+    /// Remove a block's topology entries from DAG storage.
+    ///
+    /// This is intended for rollback of a just-inserted block when a later
+    /// pipeline stage (for example, GHOSTDAG insertion) fails.
+    ///
+    /// Safety rule: the block must be a tip (no children). Removing a block
+    /// with children would orphan descendants and is rejected.
+    pub fn remove_block_topology(&self, hash: &str) -> Result<(), DagError> {
+        if !self.block_exists(hash) {
+            return Ok(());
+        }
+
+        let parents = self.get_parents(hash);
+        let children = self.get_children(hash);
+        if !children.is_empty() {
+            return Err(DagError::Other(format!(
+                "cannot remove non-tip block {} ({} children)",
+                hash,
+                children.len()
+            )));
+        }
+
+        // Determine which parents become tips after this child is removed.
+        let mut restore_parent_tips: Vec<String> = Vec::new();
+        for p in &parents {
+            let has_other_children = self.get_children(p).iter().any(|c| c != hash);
+            if !has_other_children {
+                restore_parent_tips.push(p.clone());
+            }
+        }
+
+        let mut batch = WriteBatch::default();
+        batch.delete(key_exists(hash));
+        batch.delete(key_tip(hash));
+
+        for p in &parents {
+            batch.delete(key_parent(hash, p));
+            batch.delete(key_child(p, hash));
+        }
+
+        for p in &restore_parent_tips {
+            batch.put(key_tip(p), b"1");
+        }
+
+        let current = self.read_block_count();
+        batch.put(META_BLOCK_COUNT, current.saturating_sub(1).to_le_bytes());
+
+        self.db.write(batch).map_err(StorageError::RocksDb)?;
         Ok(())
     }
 
     // FAST EXISTS — uses lightweight exists: marker instead of full block data
     pub fn block_exists(&self, hash: &str) -> bool {
-        self.db.get_pinned(key_exists(hash))
+        self.db
+            .get_pinned(key_exists(hash))
             .map(|v| v.is_some())
             .unwrap_or(false)
     }
@@ -315,10 +388,10 @@ impl DagManager {
         let mut walked = 0;
 
         while let Some(current) = queue.pop_front() {
-
             if walked >= MAX_ANCESTOR_WALK {
                 return Err(DagError::Other(format!(
-                    "cycle detection walk limit {} exceeded", MAX_ANCESTOR_WALK
+                    "cycle detection walk limit {} exceeded",
+                    MAX_ANCESTOR_WALK
                 )));
             }
             walked += 1;
@@ -368,7 +441,7 @@ impl DagManager {
                     }
                 }
             }
-            _ => 0
+            _ => 0,
         }
     }
 
@@ -382,8 +455,7 @@ impl DagManager {
         let current = self.read_block_count();
         let mut batch = rocksdb::WriteBatch::default();
         batch.put(META_BLOCK_COUNT, (current + 1).to_le_bytes());
-        self.db.write(batch)
-            .map_err(StorageError::RocksDb)?;
+        self.db.write(batch).map_err(StorageError::RocksDb)?;
         Ok(())
     }
 
@@ -417,7 +489,6 @@ impl DagManager {
         parents: &[String],
         ghostdag: &crate::engine::dag::ghostdag::ghostdag::GhostDag,
     ) -> Option<String> {
-
         let mut best: Option<(&String, u64)> = None;
 
         for p in parents {
@@ -440,17 +511,19 @@ impl DagManager {
         let mut result = Vec::new();
         let prefix_bytes = prefix.as_bytes();
 
-        for (k, _) in self.db.iterator(
-            IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward)
-        ).flatten() {
-
+        for (k, _) in self
+            .db
+            .iterator(IteratorMode::From(
+                prefix_bytes,
+                rocksdb::Direction::Forward,
+            ))
+            .flatten()
+        {
             if !k.starts_with(prefix_bytes) {
                 break;
             }
 
-            result.push(
-                String::from_utf8_lossy(&k[prefix_bytes.len()..]).into_owned()
-            );
+            result.push(String::from_utf8_lossy(&k[prefix_bytes.len()..]).into_owned());
         }
 
         result

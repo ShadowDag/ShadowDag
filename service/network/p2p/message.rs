@@ -3,7 +3,7 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 // PeerAddress is defined in domain/types/peer_address.rs and re-exported here
 // for backward compatibility.
@@ -15,11 +15,11 @@ pub use crate::domain::types::peer_address::PeerAddress;
 #[serde(tag = "type", content = "payload")]
 pub enum NetworkMessage {
     Version {
-        version:    u32,
-        height:     u64,
-        timestamp:  u64,
+        version: u32,
+        height: u64,
+        timestamp: u64,
         user_agent: String,
-        chain_id:   u32,
+        chain_id: u32,
     },
 
     VerAck,
@@ -28,25 +28,46 @@ pub enum NetworkMessage {
 
     PeerList(Vec<PeerAddress>),
 
-    Inv { items: Vec<InvItem> },
+    Inv {
+        items: Vec<InvItem>,
+    },
 
-    GetData { items: Vec<InvItem> },
+    GetData {
+        items: Vec<InvItem>,
+    },
 
-    GetHeaders { from_hash: String, count: u32 },
+    GetHeaders {
+        from_hash: String,
+        count: u32,
+    },
 
-    Headers { hashes: Vec<String> },
+    Headers {
+        hashes: Vec<String>,
+    },
 
-    GetBlock { hash: String },
+    GetBlock {
+        hash: String,
+    },
 
-    Block { data: String },
+    Block {
+        data: String,
+    },
 
-    Tx { data: String },
+    Tx {
+        data: String,
+    },
 
-    Ping { nonce: u64 },
+    Ping {
+        nonce: u64,
+    },
 
-    Pong { nonce: u64 },
+    Pong {
+        nonce: u64,
+    },
 
-    Reject { reason: String },
+    Reject {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -58,10 +79,16 @@ pub struct InvItem {
 
 impl InvItem {
     pub fn block(hash: impl Into<String>) -> Self {
-        Self { kind: "block".into(), hash: hash.into() }
+        Self {
+            kind: "block".into(),
+            hash: hash.into(),
+        }
     }
     pub fn tx(hash: impl Into<String>) -> Self {
-        Self { kind: "tx".into(), hash: hash.into() }
+        Self {
+            kind: "tx".into(),
+            hash: hash.into(),
+        }
     }
 }
 

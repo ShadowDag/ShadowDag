@@ -18,48 +18,48 @@
 // as both the reference implementation and the built-in token engine.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::collections::BTreeMap;
-use sha2::{Sha256, Digest};
 use crate::domain::address::address::prefix_from_address;
 use crate::errors::VmError;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 /// Token transfer event
 #[derive(Debug, Clone)]
 pub struct TransferEvent {
-    pub from:   String,
-    pub to:     String,
+    pub from: String,
+    pub to: String,
     pub amount: u64,
 }
 
 /// Approval event
 #[derive(Debug, Clone)]
 pub struct ApprovalEvent {
-    pub owner:   String,
+    pub owner: String,
     pub spender: String,
-    pub amount:  u64,
+    pub amount: u64,
 }
 
 /// Token metadata
 #[derive(Debug, Clone)]
 pub struct TokenInfo {
-    pub name:         String,
-    pub symbol:       String,
-    pub decimals:     u8,
+    pub name: String,
+    pub symbol: String,
+    pub decimals: u8,
     pub total_supply: u64,
-    pub owner:        String,
+    pub owner: String,
     pub contract_addr: String,
-    pub mintable:     bool,
-    pub burnable:     bool,
+    pub mintable: bool,
+    pub burnable: bool,
 }
 
 /// SRC-20 Token Contract
 pub struct SRC20Token {
-    pub info:       TokenInfo,
-    balances:       BTreeMap<String, u64>,
-    allowances:     BTreeMap<String, BTreeMap<String, u64>>, // owner -> spender -> amount
-    events:         Vec<TransferEvent>,
+    pub info: TokenInfo,
+    balances: BTreeMap<String, u64>,
+    allowances: BTreeMap<String, BTreeMap<String, u64>>, // owner -> spender -> amount
+    events: Vec<TransferEvent>,
     approval_events: Vec<ApprovalEvent>,
-    paused:         bool,
+    paused: bool,
 }
 
 impl SRC20Token {
@@ -81,11 +81,11 @@ impl SRC20Token {
     /// mainnet-tagged tokens even when deployed on testnet or
     /// regtest. That was the last mainnet-bias hole in the VM.
     pub fn new(
-        name:     &str,
-        symbol:   &str,
+        name: &str,
+        symbol: &str,
         decimals: u8,
         initial_supply: u64,
-        owner:    &str,
+        owner: &str,
     ) -> Result<Self, VmError> {
         let contract_addr = Self::compute_address(name, symbol, owner)?;
 
@@ -94,14 +94,14 @@ impl SRC20Token {
 
         let mut token = Self {
             info: TokenInfo {
-                name:          name.to_string(),
-                symbol:        symbol.to_string(),
+                name: name.to_string(),
+                symbol: symbol.to_string(),
                 decimals,
-                total_supply:  initial_supply,
-                owner:         owner.to_string(),
+                total_supply: initial_supply,
+                owner: owner.to_string(),
                 contract_addr,
-                mintable:      true,
-                burnable:      true,
+                mintable: true,
+                burnable: true,
             },
             balances,
             allowances: BTreeMap::new(),
@@ -111,8 +111,8 @@ impl SRC20Token {
         };
 
         token.events.push(TransferEvent {
-            from:   "0x0".to_string(), // Mint from zero address
-            to:     owner.to_string(),
+            from: "0x0".to_string(), // Mint from zero address
+            to: owner.to_string(),
             amount: initial_supply,
         });
 
@@ -122,16 +122,24 @@ impl SRC20Token {
     // ── ERC-20 Standard Functions ────────────────────────────────
 
     /// Get token name
-    pub fn name(&self) -> &str { &self.info.name }
+    pub fn name(&self) -> &str {
+        &self.info.name
+    }
 
     /// Get token symbol
-    pub fn symbol(&self) -> &str { &self.info.symbol }
+    pub fn symbol(&self) -> &str {
+        &self.info.symbol
+    }
 
     /// Get decimals
-    pub fn decimals(&self) -> u8 { self.info.decimals }
+    pub fn decimals(&self) -> u8 {
+        self.info.decimals
+    }
 
     /// Get total supply
-    pub fn total_supply(&self) -> u64 { self.info.total_supply }
+    pub fn total_supply(&self) -> u64 {
+        self.info.total_supply
+    }
 
     /// Get balance of an address
     pub fn balance_of(&self, address: &str) -> u64 {
@@ -144,7 +152,9 @@ impl SRC20Token {
             return Err(VmError::ContractError("Token is paused".to_string()));
         }
         if from == to {
-            return Err(VmError::ContractError("Cannot transfer to self".to_string()));
+            return Err(VmError::ContractError(
+                "Cannot transfer to self".to_string(),
+            ));
         }
         if amount == 0 {
             return Err(VmError::ContractError("Amount must be > 0".to_string()));
@@ -159,10 +169,12 @@ impl SRC20Token {
         }
 
         // Safe math
-        let new_from = from_balance.checked_sub(amount)
+        let new_from = from_balance
+            .checked_sub(amount)
             .ok_or(VmError::ContractError("Underflow".to_string()))?;
         let to_balance = self.balance_of(to);
-        let new_to = to_balance.checked_add(amount)
+        let new_to = to_balance
+            .checked_add(amount)
             .ok_or(VmError::ContractError("Overflow".to_string()))?;
 
         self.balances.insert(from.to_string(), new_from);
@@ -170,7 +182,7 @@ impl SRC20Token {
 
         self.events.push(TransferEvent {
             from: from.to_string(),
-            to:   to.to_string(),
+            to: to.to_string(),
             amount,
         });
 
@@ -189,7 +201,7 @@ impl SRC20Token {
             .insert(spender.to_string(), amount);
 
         self.approval_events.push(ApprovalEvent {
-            owner:   owner.to_string(),
+            owner: owner.to_string(),
             spender: spender.to_string(),
             amount,
         });
@@ -210,9 +222,9 @@ impl SRC20Token {
     pub fn transfer_from(
         &mut self,
         spender: &str,
-        from:    &str,
-        to:      &str,
-        amount:  u64,
+        from: &str,
+        to: &str,
+        amount: u64,
     ) -> Result<(), VmError> {
         let allowed = self.allowance(from, spender);
         if allowed < amount {
@@ -246,9 +258,14 @@ impl SRC20Token {
             return Err(VmError::ContractError("Token is not mintable".to_string()));
         }
 
-        let new_supply = self.info.total_supply.checked_add(amount)
+        let new_supply = self
+            .info
+            .total_supply
+            .checked_add(amount)
             .ok_or(VmError::ContractError("Supply overflow".to_string()))?;
-        let new_balance = self.balance_of(to).checked_add(amount)
+        let new_balance = self
+            .balance_of(to)
+            .checked_add(amount)
             .ok_or(VmError::ContractError("Balance overflow".to_string()))?;
 
         self.info.total_supply = new_supply;
@@ -256,7 +273,7 @@ impl SRC20Token {
 
         self.events.push(TransferEvent {
             from: "0x0".to_string(),
-            to:   to.to_string(),
+            to: to.to_string(),
             amount,
         });
 
@@ -281,7 +298,10 @@ impl SRC20Token {
 
         let balance = self.balance_of(caller);
         if balance < amount {
-            return Err(VmError::ContractError(format!("Cannot burn {} — only has {}", amount, balance)));
+            return Err(VmError::ContractError(format!(
+                "Cannot burn {} — only has {}",
+                amount, balance
+            )));
         }
 
         // Checked supply subtraction. If this underflows, the token's
@@ -303,8 +323,8 @@ impl SRC20Token {
         self.info.total_supply = new_supply;
 
         self.events.push(TransferEvent {
-            from:   caller.to_string(),
-            to:     "0x0".to_string(),
+            from: caller.to_string(),
+            to: "0x0".to_string(),
             amount,
         });
 
@@ -345,13 +365,16 @@ impl SRC20Token {
     /// caller knows the transaction accomplished nothing.
     pub fn transfer_ownership(&mut self, caller: &str, new_owner: &str) -> Result<(), VmError> {
         if caller != self.info.owner {
-            return Err(VmError::ContractError("Only owner can transfer ownership".to_string()));
+            return Err(VmError::ContractError(
+                "Only owner can transfer ownership".to_string(),
+            ));
         }
         if new_owner.is_empty() {
             return Err(VmError::ContractError(
                 "Cannot transfer ownership to an empty address — owner checks \
                  would become ambiguous and the token's authorization model \
-                 would be unresolvable".to_string(),
+                 would be unresolvable"
+                    .to_string(),
             ));
         }
         if new_owner == self.info.owner {
@@ -364,7 +387,9 @@ impl SRC20Token {
     }
 
     /// Get all transfer events
-    pub fn events(&self) -> &[TransferEvent] { &self.events }
+    pub fn events(&self) -> &[TransferEvent] {
+        &self.events
+    }
 
     /// Get holder count
     pub fn holder_count(&self) -> usize {
@@ -373,7 +398,9 @@ impl SRC20Token {
 
     /// Get top holders
     pub fn top_holders(&self, limit: usize) -> Vec<(String, u64)> {
-        let mut holders: Vec<_> = self.balances.iter()
+        let mut holders: Vec<_> = self
+            .balances
+            .iter()
             .filter(|(_, &b)| b > 0)
             .map(|(a, &b)| (a.clone(), b))
             .collect();
@@ -410,7 +437,11 @@ impl SRC20Token {
         h.update(name.as_bytes());
         h.update(symbol.as_bytes());
         h.update(owner.as_bytes());
-        Ok(format!("{}t{}", net_prefix, hex::encode(&h.finalize()[..20])))
+        Ok(format!(
+            "{}t{}",
+            net_prefix,
+            hex::encode(&h.finalize()[..20])
+        ))
     }
 }
 
@@ -470,7 +501,9 @@ mod tests {
         token.approve("SD1owner", "SD1spender", 300).unwrap();
         assert_eq!(token.allowance("SD1owner", "SD1spender"), 300);
 
-        token.transfer_from("SD1spender", "SD1owner", "SD1bob", 200).unwrap();
+        token
+            .transfer_from("SD1spender", "SD1owner", "SD1bob", 200)
+            .unwrap();
         assert_eq!(token.balance_of("SD1bob"), 200);
         assert_eq!(token.allowance("SD1owner", "SD1spender"), 100);
     }
@@ -479,7 +512,9 @@ mod tests {
     fn transfer_from_exceeds_allowance() {
         let mut token = create_token();
         token.approve("SD1owner", "SD1spender", 100).unwrap();
-        assert!(token.transfer_from("SD1spender", "SD1owner", "SD1bob", 500).is_err());
+        assert!(token
+            .transfer_from("SD1spender", "SD1owner", "SD1bob", 500)
+            .is_err());
     }
 
     #[test]
@@ -537,10 +572,15 @@ mod tests {
         );
         // Crucially, the token state must be UNCHANGED by the failed
         // burn — no partial debit, no partial supply change.
-        assert_eq!(token.balance_of("SD1owner"), 1_000_000,
-            "failed burn must not debit the caller");
-        assert_eq!(token.info.total_supply, 500,
-            "failed burn must not mutate total_supply");
+        assert_eq!(
+            token.balance_of("SD1owner"),
+            1_000_000,
+            "failed burn must not debit the caller"
+        );
+        assert_eq!(
+            token.info.total_supply, 500,
+            "failed burn must not mutate total_supply"
+        );
     }
 
     #[test]
@@ -579,7 +619,9 @@ mod tests {
     #[test]
     fn transfer_ownership() {
         let mut token = create_token();
-        token.transfer_ownership("SD1owner", "SD1new_owner").unwrap();
+        token
+            .transfer_ownership("SD1owner", "SD1new_owner")
+            .unwrap();
         assert_eq!(token.info.owner, "SD1new_owner");
         // Old owner can't pause anymore
         assert!(token.pause("SD1owner").is_err());
@@ -609,7 +651,7 @@ mod tests {
         token.transfer("SD1owner", "SD1bob", 300).unwrap();
         let top = token.top_holders(2);
         assert_eq!(top[0].0, "SD1owner"); // Highest balance
-        assert_eq!(top[1].0, "SD1bob");   // Second highest
+        assert_eq!(top[1].0, "SD1bob"); // Second highest
     }
 
     #[test]
@@ -625,7 +667,9 @@ mod tests {
         token.approve("SD1alice", "SD1bob", 500).unwrap();
 
         // Bob transfers from Alice to Charlie
-        token.transfer_from("SD1bob", "SD1alice", "SD1charlie", 300).unwrap();
+        token
+            .transfer_from("SD1bob", "SD1alice", "SD1charlie", 300)
+            .unwrap();
 
         // Verify balances
         assert_eq!(token.balance_of("SD1bank"), 9_997_000);
@@ -653,9 +697,11 @@ mod tests {
         // derivation was made dynamic. This guards against a future
         // "simplification" that drops the mainnet prefix by accident.
         let token = SRC20Token::new("T", "T", 0, 1, "SD1owner").unwrap();
-        assert!(token.info.contract_addr.starts_with("SD1t"),
+        assert!(
+            token.info.contract_addr.starts_with("SD1t"),
             "mainnet owner must produce SD1t-prefixed contract address, got: {}",
-            token.info.contract_addr);
+            token.info.contract_addr
+        );
     }
 
     #[test]
@@ -664,23 +710,31 @@ mod tests {
         // must produce a testnet-tagged token address. The old code
         // would have silently produced SD1t regardless.
         let token = SRC20Token::new("T", "T", 0, 1, "ST1testowner").unwrap();
-        assert!(token.info.contract_addr.starts_with("ST1t"),
+        assert!(
+            token.info.contract_addr.starts_with("ST1t"),
             "testnet owner must produce ST1t-prefixed contract address, got: {}",
-            token.info.contract_addr);
-        assert!(!token.info.contract_addr.starts_with("SD1"),
+            token.info.contract_addr
+        );
+        assert!(
+            !token.info.contract_addr.starts_with("SD1"),
             "testnet owner must NOT leak SD1 (mainnet) tag, got: {}",
-            token.info.contract_addr);
+            token.info.contract_addr
+        );
     }
 
     #[test]
     fn regtest_owner_produces_sr1t_token_address() {
         let token = SRC20Token::new("T", "T", 0, 1, "SR1regowner").unwrap();
-        assert!(token.info.contract_addr.starts_with("SR1t"),
+        assert!(
+            token.info.contract_addr.starts_with("SR1t"),
             "regtest owner must produce SR1t-prefixed contract address, got: {}",
-            token.info.contract_addr);
-        assert!(!token.info.contract_addr.starts_with("SD1"),
+            token.info.contract_addr
+        );
+        assert!(
+            !token.info.contract_addr.starts_with("SD1"),
             "regtest owner must NOT leak SD1 (mainnet) tag, got: {}",
-            token.info.contract_addr);
+            token.info.contract_addr
+        );
     }
 
     #[test]
@@ -714,8 +768,11 @@ mod tests {
             Ok(_) => panic!("BTC1foreign must be refused"),
             Err(e) => {
                 let msg = format!("{}", e);
-                assert!(msg.contains("unknown network prefix"),
-                    "error must explain the problem, got: {}", msg);
+                assert!(
+                    msg.contains("unknown network prefix"),
+                    "error must explain the problem, got: {}",
+                    msg
+                );
             }
         }
 

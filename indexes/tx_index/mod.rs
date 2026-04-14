@@ -3,38 +3,44 @@
 //                     (c) ShadowDAG Project -- All Rights Reserved
 // =============================================================================
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use crate::{slog_error, slog_info, slog_warn};
 use rocksdb::DB;
-use crate::{slog_info, slog_warn, slog_error};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 const PREFIX: &str = "tidx:";
 const BLOCK_PREFIX: &str = "tidx:blk:";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TxRecord {
-    pub hash:        String,
-    pub block_hash:  String,
-    pub height:      u64,
-    pub timestamp:   u64,
-    pub fee:         u64,
-    pub input_count:  usize,
+    pub hash: String,
+    pub block_hash: String,
+    pub height: u64,
+    pub timestamp: u64,
+    pub fee: u64,
+    pub input_count: usize,
     pub output_count: usize,
-    pub is_coinbase:  bool,
-    pub size_bytes:   usize,
+    pub is_coinbase: bool,
+    pub size_bytes: usize,
 }
 
 impl TxRecord {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        hash: &str, block_hash: &str, height: u64,
-        timestamp: u64, fee: u64,
-        input_count: usize, output_count: usize,
-        is_coinbase: bool, size_bytes: usize,
+        hash: &str,
+        block_hash: &str,
+        height: u64,
+        timestamp: u64,
+        fee: u64,
+        input_count: usize,
+        output_count: usize,
+        is_coinbase: bool,
+        size_bytes: usize,
     ) -> Self {
         Self {
-            hash:         hash.to_string(),
-            block_hash:   block_hash.to_string(),
+            hash: hash.to_string(),
+            block_hash: block_hash.to_string(),
             height,
             timestamp,
             fee,
@@ -47,10 +53,10 @@ impl TxRecord {
 }
 
 pub struct TxIndex {
-    records:        HashMap<String, TxRecord>,
-    block_tx_map:   HashMap<String, Vec<String>>,
+    records: HashMap<String, TxRecord>,
+    block_tx_map: HashMap<String, Vec<String>>,
     pub total_indexed: u64,
-    db:             Arc<DB>,
+    db: Arc<DB>,
 }
 
 impl Default for TxIndex {
@@ -62,19 +68,29 @@ impl Default for TxIndex {
 impl TxIndex {
     /// Open a TxIndex with a temp DB. Returns Result instead of panicking.
     pub fn try_new() -> Result<Self, crate::errors::StorageError> {
+        static NEXT_DB_ID: AtomicU64 = AtomicU64::new(0);
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
-        let unique = format!("shadowdag_tidx_{}_{:?}",
-            std::process::id(), std::thread::current().id());
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let unique = format!(
+            "shadowdag_tidx_{}_{}_{}",
+            std::process::id(),
+            now_nanos,
+            NEXT_DB_ID.fetch_add(1, Ordering::Relaxed)
+        );
         let tmp = std::env::temp_dir().join(unique);
-        let db = DB::open(&opts, &tmp)
-            .map_err(|e| crate::errors::StorageError::OpenFailed {
-                path: tmp.to_string_lossy().to_string(),
-                reason: e.to_string(),
-            })?;
+        let db = DB::open(&opts, &tmp).map_err(|e| crate::errors::StorageError::OpenFailed {
+            path: tmp.to_string_lossy().to_string(),
+            reason: e.to_string(),
+        })?;
         Ok(Self {
-            records: HashMap::new(), block_tx_map: HashMap::new(),
-            total_indexed: 0, db: Arc::new(db),
+            records: HashMap::new(),
+            block_tx_map: HashMap::new(),
+            total_indexed: 0,
+            db: Arc::new(db),
         })
     }
 
@@ -83,14 +99,18 @@ impl TxIndex {
         Self::try_new().unwrap_or_else(|e| {
             slog_warn!("index", "tx_index_db_open_failed", error => &e.to_string());
             let fallback = std::env::temp_dir().join(format!(
-                "shadowdag_tidx_fb_{}", std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
+                "shadowdag_tidx_fb_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
             ));
             let mut opts = rocksdb::Options::default();
             opts.create_if_missing(true);
             let db = DB::open(&opts, &fallback).unwrap_or_else(|e2| {
                 slog_error!("index", "tx_index_fallback_failed", error => &e2.to_string());
-                let last = std::env::temp_dir().join(format!("shadowdag_tidx_lr_{}", std::process::id()));
+                let last =
+                    std::env::temp_dir().join(format!("shadowdag_tidx_lr_{}", std::process::id()));
                 DB::open(&opts, &last).unwrap_or_else(|e3| {
                     slog_error!("index", "tx_index_all_attempts_failed", error => &e3.to_string());
                     // Create with destroy_on_drop semantics — node runs degraded
@@ -105,7 +125,12 @@ impl TxIndex {
                     }
                 })
             });
-            Self { records: HashMap::new(), block_tx_map: HashMap::new(), total_indexed: 0, db: Arc::new(db) }
+            Self {
+                records: HashMap::new(),
+                block_tx_map: HashMap::new(),
+                total_indexed: 0,
+                db: Arc::new(db),
+            }
         })
     }
 
@@ -113,8 +138,8 @@ impl TxIndex {
     /// Automatically recovers state from DB so the caller cannot forget.
     pub fn new_with_db(db: Arc<DB>) -> Self {
         let mut s = Self {
-            records:       HashMap::new(),
-            block_tx_map:  HashMap::new(),
+            records: HashMap::new(),
+            block_tx_map: HashMap::new(),
             total_indexed: 0,
             db,
         };
@@ -135,28 +160,25 @@ impl TxIndex {
 
     fn write_record_to_db(&self, record: &TxRecord) -> Result<(), String> {
         let key = Self::db_key(&record.hash);
-        let val = serde_json::to_vec(record)
-            .map_err(|e| {
-                let msg = format!("serialize: {}", e);
-                slog_error!("index", "tx_index_serialize_error", error => &msg);
-                msg
-            })?;
-        self.db.put(&key, &val)
-            .map_err(|e| {
-                let msg = format!("db_put: {}", e);
-                slog_error!("index", "tx_index_db_put_error", error => &msg);
-                msg
-            })
+        let val = serde_json::to_vec(record).map_err(|e| {
+            let msg = format!("serialize: {}", e);
+            slog_error!("index", "tx_index_serialize_error", error => &msg);
+            msg
+        })?;
+        self.db.put(&key, &val).map_err(|e| {
+            let msg = format!("db_put: {}", e);
+            slog_error!("index", "tx_index_db_put_error", error => &msg);
+            msg
+        })
     }
 
     fn delete_record_from_db(&self, hash: &str) -> Result<(), String> {
         let key = Self::db_key(hash);
-        self.db.delete(&key)
-            .map_err(|e| {
-                let msg = format!("db_delete: {}", e);
-                slog_error!("index", "tx_index_db_delete_error", error => &msg);
-                msg
-            })
+        self.db.delete(&key).map_err(|e| {
+            let msg = format!("db_delete: {}", e);
+            slog_error!("index", "tx_index_db_delete_error", error => &msg);
+            msg
+        })
     }
 
     fn write_block_map_to_db(&self, block_hash: &str) {
@@ -199,7 +221,7 @@ impl TxIndex {
 
     pub fn insert(&mut self, record: TxRecord) -> bool {
         let block_hash = record.block_hash.clone();
-        let hash       = record.hash.clone();
+        let hash = record.hash.clone();
 
         // Persist to RocksDB first — don't update memory if DB write fails
         if let Err(e) = self.write_record_to_db(&record) {
@@ -250,10 +272,9 @@ impl TxIndex {
     }
 
     pub fn txs_in_block(&self, block_hash: &str) -> Vec<&TxRecord> {
-        self.block_tx_map.get(block_hash)
-            .map(|hashes| hashes.iter()
-                .filter_map(|h| self.records.get(h))
-                .collect())
+        self.block_tx_map
+            .get(block_hash)
+            .map(|hashes| hashes.iter().filter_map(|h| self.records.get(h)).collect())
             .unwrap_or_default()
     }
 
@@ -310,11 +331,18 @@ impl TxIndex {
         rolled
     }
 
-    pub fn count(&self) -> usize         { self.records.len() }
-    pub fn block_count(&self) -> usize   { self.block_tx_map.len() }
+    pub fn count(&self) -> usize {
+        self.records.len()
+    }
+    pub fn block_count(&self) -> usize {
+        self.block_tx_map.len()
+    }
 
     pub fn block_fees(&self, block_hash: &str) -> u64 {
-        self.txs_in_block(block_hash).iter().map(|r| r.fee).fold(0u64, |a, f| a.saturating_add(f))
+        self.txs_in_block(block_hash)
+            .iter()
+            .map(|r| r.fee)
+            .fold(0u64, |a, f| a.saturating_add(f))
     }
 
     /// Rebuild the in-memory cache from RocksDB on startup.

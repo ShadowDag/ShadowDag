@@ -1,0 +1,30 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.46s
+     Running `target\debug\shadowdag-node.exe --network=regtest --rpc-port=29432 --p2p-port=29433 --data-dir=C:\Users\bader\OneDrive\سطح المكتب\ShadowDag\.tmp\live_peer_fix\data`
+[1776193808.470] INFO  [node] config version=1.0.0 network=shadowdag-regtest p2p_port=29433 rpc_port=29432 data_dir=C:\Users\bader\OneDrive\سطح genesis=ec4447ead9c53767 emission=Height: 0 | Step: 0 | Reward: 1000000000 sat (100.00%) | Miner: 950000000 | Dev: 50000000 | Next reduction in: 25920000 blocks
+[1776193808.609] INFO  [index] utxo_index_recovered utxos=0
+[1776193808.610] INFO  [index] tx_index_recovered records=0
+[1776193808.611] INFO  [lifecycle] node_start timestamp=1776193808 pid=28052
+[1776193808.611] INFO  [daemon] banner network=shadowdag-regtest data_dir=C:\Users\bader\OneDrive\سطح p2p_port=29433 rpc_port=29432
+[1776193808.699] INFO  [daemon] genesis_hash hash=ec4447ead9c537678a2293f09f652affb8194e713a0f117b548f47015a1d0a4f
+[1776193808.793] INFO  [daemon] genesis_created
+[1776193808.794] INFO  [p2p] network_init network=shadowdag-regtest port=29433 magic=53445254
+[1776193808.795] INFO  [daemon] p2p_bootstrapped peers=2
+[1776193808.796] WARN  [rpc] first_run_admin_password_generated hint=bd0c...
+╔══════════════════════════════════════════════════════╗
+║  RPC Admin Password generated (first run)           ║
+║  Hint: bd0c...                                           ║
+║  Full password saved to:                            ║
+║  C:\Users\bader\OneDrive\سطح\rpc_password  ║
+╚══════════════════════════════════════════════════════╝
+[1776193808.882] INFO  [daemon] rpc_started port=29432
+[1776193808.884] INFO  [p2p] network_start listen_addr=0.0.0.0:29433
+[1776193808.886] INFO  [p2p] listener_bound addr=0.0.0.0:29433
+[1776193808.886] INFO  [p2p] connecting_to_peers count=2
+[1776193808.888] INFO  [p2p] peers_connected count=2
+[1776193808.888] INFO  [p2p] requesting_headers_sync_genesis
+[1776193808.889] INFO  [daemon] p2p_listening addr=0.0.0.0:29433
+[1776193808.889] INFO  [daemon] node_running network=shadowdag-regtest
+[1776193808.889] INFO  [node] all_services_started
+[1776193808.890] INFO  [daemon] event_loop_started poll_interval_ms=50
+[1776193810.916] ERROR [p2p] outbound_connect_failed addr=127.0.0.1:29334 error=No connection could be made because the target machine actively refused it. (os error 10061)
+[1776193810.916] ERROR [p2p] outbound_connect_failed addr=127.0.0.1:29333 error=No connection could be made because the target machine actively refused it. (os error 10061)

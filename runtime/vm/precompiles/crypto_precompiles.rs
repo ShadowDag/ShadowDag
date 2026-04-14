@@ -6,8 +6,8 @@
 // Cryptographic precompiles — signature verification, key recovery, commitments.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
-use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use sha2::{Digest, Sha256};
 
 use super::precompile_registry::PrecompileResult;
 
@@ -146,7 +146,10 @@ pub fn pedersen_commit(input: &[u8], _gas_limit: u64) -> PrecompileResult {
     let gas_used = GAS_PEDERSEN_COMMIT;
 
     if input.len() < 40 {
-        return PrecompileResult::err("pedersen: input must be 40 bytes (8 value + 32 blinding)", gas_used);
+        return PrecompileResult::err(
+            "pedersen: input must be 40 bytes (8 value + 32 blinding)",
+            gas_used,
+        );
     }
 
     let value_bytes = &input[0..8];
@@ -165,8 +168,8 @@ pub fn pedersen_commit(input: &[u8], _gas_limit: u64) -> PrecompileResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
     use ed25519_dalek::Signer;
+    use ed25519_dalek::SigningKey;
 
     #[test]
     fn ecrecover_valid_signature() {
@@ -195,7 +198,7 @@ mod tests {
     fn ecrecover_invalid_signature() {
         let mut input = vec![0u8; 128];
         input[32] = 1; // Need a non-zero pubkey
-        // This will fail since the signature is invalid
+                       // This will fail since the signature is invalid
         let result = ecrecover(&input, 100_000);
         // Either error or zero output
         assert!(!result.success || result.output == vec![0u8; 32]);

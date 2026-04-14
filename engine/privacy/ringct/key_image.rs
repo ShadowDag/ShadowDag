@@ -12,7 +12,7 @@
 // I = H(private_key || domain_tag) mapped to a curve point
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 use crate::slog_error;
@@ -22,7 +22,7 @@ use crate::slog_error;
 /// Also has in-memory cache for fast lookups.
 pub struct KeyImageStore {
     cache: HashSet<String>,
-    db:    Option<rocksdb::DB>,
+    db: Option<rocksdb::DB>,
 }
 
 impl Default for KeyImageStore {
@@ -33,7 +33,10 @@ impl Default for KeyImageStore {
 
 impl KeyImageStore {
     pub fn new() -> Self {
-        Self { cache: HashSet::new(), db: None }
+        Self {
+            cache: HashSet::new(),
+            db: None,
+        }
     }
 
     /// Maximum key images in memory cache (rest are in RocksDB)
@@ -49,10 +52,14 @@ impl KeyImageStore {
         if let Some(ref db) = db {
             let iter = db.prefix_iterator(b"ki:");
             for item in iter {
-                if cache.len() >= Self::MAX_CACHE { break; } // Cap cache loading
+                if cache.len() >= Self::MAX_CACHE {
+                    break;
+                } // Cap cache loading
                 if let Ok((k, _)) = item {
                     let k_str = String::from_utf8_lossy(&k);
-                    if !k_str.starts_with("ki:") { break; }
+                    if !k_str.starts_with("ki:") {
+                        break;
+                    }
                     cache.insert(k_str[3..].to_string());
                 }
             }
@@ -62,7 +69,9 @@ impl KeyImageStore {
 
     /// Check if a key image has been seen (double-spend attempt)
     pub fn is_spent(&self, key_image: &str) -> bool {
-        if self.cache.contains(key_image) { return true; }
+        if self.cache.contains(key_image) {
+            return true;
+        }
         // Fallback to DB if not in cache
         if let Some(ref db) = self.db {
             let key = format!("ki:{}", key_image);
@@ -77,8 +86,15 @@ impl KeyImageStore {
         // Evict from cache if too large (DB remains authoritative)
         if self.cache.len() >= Self::MAX_CACHE {
             // Remove ~10% oldest entries
-            let to_remove: Vec<String> = self.cache.iter().take(Self::MAX_CACHE / 10).cloned().collect();
-            for k in to_remove { self.cache.remove(&k); }
+            let to_remove: Vec<String> = self
+                .cache
+                .iter()
+                .take(Self::MAX_CACHE / 10)
+                .cloned()
+                .collect();
+            for k in to_remove {
+                self.cache.remove(&k);
+            }
         }
         let is_new = self.cache.insert(key_image.to_string());
         if is_new {
@@ -112,7 +128,9 @@ impl KeyImageStore {
         None
     }
 
-    pub fn count(&self) -> usize { self.cache.len() }
+    pub fn count(&self) -> usize {
+        self.cache.len()
+    }
 
     /// Compact the underlying RocksDB to reclaim disk space.
     /// Should be called periodically (e.g., weekly) for long-running nodes.

@@ -6,12 +6,12 @@
 // Contract Verification -- matches deployed bytecode against a ContractPackage.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
-use serde::{Serialize, Deserialize};
+use crate::errors::StorageError;
 use crate::runtime::vm::contracts::contract_package::ContractPackage;
 use crate::runtime::vm::contracts::contract_storage::ContractStorage;
-use crate::errors::StorageError;
 use crate::slog_error;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Verification result for a deployed contract.
 ///
@@ -74,7 +74,23 @@ impl ContractVerifier {
         let deployed_code = match storage.get_state(&format!("code:{}", address)) {
             Some(hex_code) => match hex::decode(&hex_code) {
                 Ok(bytes) => bytes,
-                Err(e) => return VerificationResult {
+                Err(e) => {
+                    return VerificationResult {
+                        address: address.into(),
+                        verified: false,
+                        contract_name: Some(package.name.clone()),
+                        bytecode_match: false,
+                        vm_version_match: false,
+                        deployed_bytecode_hash: String::new(),
+                        package_bytecode_hash: Some(package.bytecode_hash.clone()),
+                        deployed_code_size: 0,
+                        vm_version: None,
+                        error: Some(format!("invalid hex in stored code: {}", e)),
+                    }
+                }
+            },
+            None => {
+                return VerificationResult {
                     address: address.into(),
                     verified: false,
                     contract_name: Some(package.name.clone()),
@@ -84,21 +100,9 @@ impl ContractVerifier {
                     package_bytecode_hash: Some(package.bytecode_hash.clone()),
                     deployed_code_size: 0,
                     vm_version: None,
-                    error: Some(format!("invalid hex in stored code: {}", e)),
-                },
-            },
-            None => return VerificationResult {
-                address: address.into(),
-                verified: false,
-                contract_name: Some(package.name.clone()),
-                bytecode_match: false,
-                vm_version_match: false,
-                deployed_bytecode_hash: String::new(),
-                package_bytecode_hash: Some(package.bytecode_hash.clone()),
-                deployed_code_size: 0,
-                vm_version: None,
-                error: Some("no code deployed at address".into()),
-            },
+                    error: Some("no code deployed at address".into()),
+                }
+            }
         };
 
         // Compute hash of deployed code
@@ -167,7 +171,9 @@ impl ContractVerifier {
         result: &VerificationResult,
         package: &ContractPackage,
     ) -> Result<(), StorageError> {
-        if !result.verified { return Ok(()); } // Only store verified contracts
+        if !result.verified {
+            return Ok(());
+        } // Only store verified contracts
 
         // Store verification metadata.
         //
@@ -240,10 +246,7 @@ impl ContractVerifier {
     /// `is_verified` is only for boolean "is there something usable
     /// here?" questions.
     pub fn is_verified(storage: &ContractStorage, address: &str) -> bool {
-        matches!(
-            Self::get_verification_strict(storage, address),
-            Ok(Some(_))
-        )
+        matches!(Self::get_verification_strict(storage, address), Ok(Some(_)))
     }
 
     /// Load verification metadata for a contract.
@@ -322,7 +325,8 @@ mod tests {
     fn tmp_path() -> String {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default().as_nanos();
+            .unwrap_or_default()
+            .as_nanos();
         format!("{}/shadowdag_verify_{}", std::env::temp_dir().display(), ts)
     }
 
@@ -333,7 +337,9 @@ mod tests {
         let bytecode = vec![0x10, 42, 0x00]; // PUSH1 42, STOP
 
         // Deploy
-        storage.set_state("code:SD1c_test", &hex::encode(&bytecode)).unwrap();
+        storage
+            .set_state("code:SD1c_test", &hex::encode(&bytecode))
+            .unwrap();
         storage.set_state("vm_version:SD1c_test", "1").unwrap();
 
         // Package
@@ -352,7 +358,9 @@ mod tests {
         let path = tmp_path();
         let storage = ContractStorage::new(&path).unwrap();
 
-        storage.set_state("code:SD1c_test", &hex::encode(&[0x10, 42, 0x00])).unwrap();
+        storage
+            .set_state("code:SD1c_test", &hex::encode([0x10, 42, 0x00]))
+            .unwrap();
 
         let abi = ContractAbi::new("Test");
         let pkg = ContractPackage::new("Test", vec![0x10, 99, 0x00], abi); // different
@@ -381,7 +389,9 @@ mod tests {
         let storage = ContractStorage::new(&path).unwrap();
         let bytecode = vec![0x10, 42, 0x00];
 
-        storage.set_state("code:SD1c_test", &hex::encode(&bytecode)).unwrap();
+        storage
+            .set_state("code:SD1c_test", &hex::encode(&bytecode))
+            .unwrap();
         storage.set_state("vm_version:SD1c_test", "1").unwrap();
 
         let abi = ContractAbi::new("MyToken");
@@ -408,17 +418,26 @@ mod tests {
         let storage = ContractStorage::new(&path).unwrap();
         let bytecode = vec![0x10, 42, 0x00];
 
-        storage.set_state("code:SD1c_no_meta", &hex::encode(&bytecode)).unwrap();
+        storage
+            .set_state("code:SD1c_no_meta", &hex::encode(&bytecode))
+            .unwrap();
         // NOTE: vm_version metadata deliberately NOT set.
 
         let abi = ContractAbi::new("Test");
         let pkg = ContractPackage::new("Test", bytecode, abi);
 
         let result = ContractVerifier::verify(&storage, "SD1c_no_meta", &pkg);
-        assert!(!result.verified, "missing vm_version metadata must not produce verified=true");
+        assert!(
+            !result.verified,
+            "missing vm_version metadata must not produce verified=true"
+        );
         assert!(!result.vm_version_match);
         assert_eq!(result.vm_version, None);
-        assert!(result.error.as_ref().map(|e| e.contains("absent")).unwrap_or(false));
+        assert!(result
+            .error
+            .as_ref()
+            .map(|e| e.contains("absent"))
+            .unwrap_or(false));
     }
 
     #[test]
@@ -428,17 +447,28 @@ mod tests {
         let storage = ContractStorage::new(&path).unwrap();
         let bytecode = vec![0x10, 42, 0x00];
 
-        storage.set_state("code:SD1c_bad_meta", &hex::encode(&bytecode)).unwrap();
-        storage.set_state("vm_version:SD1c_bad_meta", "not-a-number").unwrap();
+        storage
+            .set_state("code:SD1c_bad_meta", &hex::encode(&bytecode))
+            .unwrap();
+        storage
+            .set_state("vm_version:SD1c_bad_meta", "not-a-number")
+            .unwrap();
 
         let abi = ContractAbi::new("Test");
         let pkg = ContractPackage::new("Test", bytecode, abi);
 
         let result = ContractVerifier::verify(&storage, "SD1c_bad_meta", &pkg);
-        assert!(!result.verified, "corrupt vm_version metadata must not produce verified=true");
+        assert!(
+            !result.verified,
+            "corrupt vm_version metadata must not produce verified=true"
+        );
         assert!(!result.vm_version_match);
         assert_eq!(result.vm_version, None);
-        assert!(result.error.as_ref().map(|e| e.contains("corrupt")).unwrap_or(false));
+        assert!(result
+            .error
+            .as_ref()
+            .map(|e| e.contains("corrupt"))
+            .unwrap_or(false));
     }
 
     #[test]
@@ -453,13 +483,19 @@ mod tests {
         ));
 
         // Plant a corrupt JSON payload directly under the verified key.
-        storage.set_state("verified:SD1c_corrupt", "this-is-not-json").unwrap();
+        storage
+            .set_state("verified:SD1c_corrupt", "this-is-not-json")
+            .unwrap();
 
         // Non-strict masks corruption as None (with log)
         assert!(ContractVerifier::get_verification(&storage, "SD1c_corrupt").is_none());
         // Strict surfaces it as an explicit error
         let strict = ContractVerifier::get_verification_strict(&storage, "SD1c_corrupt");
-        assert!(strict.is_err(), "strict get_verification must expose corruption, got: {:?}", strict);
+        assert!(
+            strict.is_err(),
+            "strict get_verification must expose corruption, got: {:?}",
+            strict
+        );
     }
 
     #[test]
@@ -486,7 +522,9 @@ mod tests {
 
         // 2. Corrupt JSON payload → is_verified = false, strict = Err.
         //    The OLD behaviour here was is_verified = true.
-        storage.set_state("verified:SD1c_corrupt", "not-json-at-all").unwrap();
+        storage
+            .set_state("verified:SD1c_corrupt", "not-json-at-all")
+            .unwrap();
         assert!(
             !ContractVerifier::is_verified(&storage, "SD1c_corrupt"),
             "is_verified must refuse a corrupt payload (old behaviour returned true)"
@@ -495,7 +533,9 @@ mod tests {
 
         // 3. Valid verified record → is_verified = true, strict = Ok(Some).
         let bytecode = vec![0x10, 42, 0x00];
-        storage.set_state("code:SD1c_ok", &hex::encode(&bytecode)).unwrap();
+        storage
+            .set_state("code:SD1c_ok", &hex::encode(&bytecode))
+            .unwrap();
         storage.set_state("vm_version:SD1c_ok", "1").unwrap();
         let abi = ContractAbi::new("Ok");
         let pkg = ContractPackage::new("Ok", bytecode, abi);

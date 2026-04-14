@@ -14,7 +14,7 @@ use rocksdb::DB;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::errors::StorageError;
-use crate::{slog_info, slog_warn, slog_error};
+use crate::{slog_error, slog_info, slog_warn};
 
 /// Current database schema version
 pub const CURRENT_DB_VERSION: u32 = 6;
@@ -26,9 +26,9 @@ const MIGRATION_LOG_PREFIX: &str = "migration:";
 /// A single migration step
 #[derive(Debug, Clone)]
 pub struct Migration {
-    pub version:     u32,
+    pub version: u32,
     pub description: String,
-    pub applied_at:  Option<u64>,
+    pub applied_at: Option<u64>,
 }
 
 /// Migration result
@@ -100,9 +100,7 @@ impl MigrationManager {
                     slog_info!("storage", "migration_applied", version => version, description => Self::migration_description(version));
                 }
                 Err(e) => {
-                    return MigrationResult::Error(format!(
-                        "Migration v{} failed: {}", version, e
-                    ));
+                    return MigrationResult::Error(format!("Migration v{} failed: {}", version, e));
                 }
             }
         }
@@ -131,7 +129,10 @@ impl MigrationManager {
             4 => Ok(()), // Schema: contract state prefix — created on first contract deploy
             5 => Ok(()), // Schema: BPS configuration key — written on first config update
             6 => Ok(()), // Schema: pruning metadata + UTXO commitments — populated by pruning manager
-            _ => Err(StorageError::Migration(format!("Unknown migration version: {}", version))),
+            _ => Err(StorageError::Migration(format!(
+                "Unknown migration version: {}",
+                version
+            ))),
         }
     }
 
@@ -151,7 +152,10 @@ impl MigrationManager {
     /// Log migration application
     fn log_migration(db: &DB, version: u32) {
         let key = format!("{}{}", MIGRATION_LOG_PREFIX, version);
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         if let Err(e) = db.put(key.as_bytes(), ts.to_le_bytes()) {
             slog_error!("storage", "migration_log_write_failed", version => version, error => e);
         }
@@ -209,7 +213,9 @@ mod tests {
 
     fn make_db() -> DB {
         let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = format!("/tmp/test_migrations_{}", ts);
         let mut opts = Options::default();
         opts.create_if_missing(true);

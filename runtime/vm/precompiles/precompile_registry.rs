@@ -19,11 +19,21 @@ pub struct PrecompileResult {
 
 impl PrecompileResult {
     pub fn ok(output: Vec<u8>, gas_used: u64) -> Self {
-        Self { output, gas_used, success: true, error: None }
+        Self {
+            output,
+            gas_used,
+            success: true,
+            error: None,
+        }
     }
 
     pub fn err(msg: &str, gas_used: u64) -> Self {
-        Self { output: vec![], gas_used, success: false, error: Some(msg.to_string()) }
+        Self {
+            output: vec![],
+            gas_used,
+            success: false,
+            error: Some(msg.to_string()),
+        }
     }
 }
 
@@ -57,91 +67,118 @@ impl PrecompileRegistry {
 
         // 0x01: Ed25519 signature verification with address derivation.
         // WARNING: NOT standard secp256k1 ecrecover -- requires pubkey as input.
-        contracts.insert(0x01, PrecompileEntry {
-            name: "ed25519_verify_and_derive (not ecrecover)",
-            address: 0x01,
-            base_gas: 3000,
-            per_word_gas: 0,
-            func: super::crypto_precompiles::ecrecover,
-        });
+        contracts.insert(
+            0x01,
+            PrecompileEntry {
+                name: "ed25519_verify_and_derive (not ecrecover)",
+                address: 0x01,
+                base_gas: 3000,
+                per_word_gas: 0,
+                func: super::crypto_precompiles::ecrecover,
+            },
+        );
 
         // 0x02: SHA256 — SHA-256 hash
-        contracts.insert(0x02, PrecompileEntry {
-            name: "sha256",
-            address: 0x02,
-            base_gas: 60,
-            per_word_gas: 12,
-            func: super::hash_precompiles::sha256_precompile,
-        });
+        contracts.insert(
+            0x02,
+            PrecompileEntry {
+                name: "sha256",
+                address: 0x02,
+                base_gas: 60,
+                per_word_gas: 12,
+                func: super::hash_precompiles::sha256_precompile,
+            },
+        );
 
         // 0x03: SHA-256-truncated-to-20-bytes (NOT real RIPEMD-160).
         // WARNING: Produces different output than actual RIPEMD-160.
-        contracts.insert(0x03, PrecompileEntry {
-            name: "ripemd160 (SHA-256 truncation, not real RIPEMD-160)",
-            address: 0x03,
-            base_gas: 600,
-            per_word_gas: 120,
-            func: super::hash_precompiles::ripemd160_precompile,
-        });
+        contracts.insert(
+            0x03,
+            PrecompileEntry {
+                name: "ripemd160 (SHA-256 truncation, not real RIPEMD-160)",
+                address: 0x03,
+                base_gas: 600,
+                per_word_gas: 120,
+                func: super::hash_precompiles::ripemd160_precompile,
+            },
+        );
 
         // 0x04: IDENTITY — data copy (cheapest precompile)
-        contracts.insert(0x04, PrecompileEntry {
-            name: "identity",
-            address: 0x04,
-            base_gas: 15,
-            per_word_gas: 3,
-            func: super::hash_precompiles::identity_precompile,
-        });
+        contracts.insert(
+            0x04,
+            PrecompileEntry {
+                name: "identity",
+                address: 0x04,
+                base_gas: 15,
+                per_word_gas: 3,
+                func: super::hash_precompiles::identity_precompile,
+            },
+        );
 
         // 0x05: MODEXP -- modular exponentiation (128-bit inputs only).
         // WARNING: Limited to 16-byte (128-bit) base/exp/mod. Not suitable
         // for RSA or any big-integer operations requiring larger values.
-        contracts.insert(0x05, PrecompileEntry {
-            name: "modexp (128-bit limit)",
-            address: 0x05,
-            base_gas: 200,
-            per_word_gas: 0, // Gas is computed dynamically
-            func: super::math_precompiles::modexp_precompile,
-        });
+        contracts.insert(
+            0x05,
+            PrecompileEntry {
+                name: "modexp (128-bit limit)",
+                address: 0x05,
+                base_gas: 200,
+                per_word_gas: 0, // Gas is computed dynamically
+                func: super::math_precompiles::modexp_precompile,
+            },
+        );
 
         // 0x06: BLAKE3 hash (ShadowDAG native).
         // WARNING: Address 0x06 was historically labeled "blake2b" but the
         // implementation has always used BLAKE3. The name is now corrected.
-        contracts.insert(0x06, PrecompileEntry {
-            name: "blake3",
-            address: 0x06,
-            base_gas: 40,
-            per_word_gas: 8,
-            func: super::hash_precompiles::blake3_precompile,
-        });
+        contracts.insert(
+            0x06,
+            PrecompileEntry {
+                name: "blake3",
+                address: 0x06,
+                base_gas: 40,
+                per_word_gas: 8,
+                func: super::hash_precompiles::blake3_precompile,
+            },
+        );
 
         // 0x07: SHA3 — SHA3-256 (Keccak)
-        contracts.insert(0x07, PrecompileEntry {
-            name: "sha3",
-            address: 0x07,
-            base_gas: 50,
-            per_word_gas: 10,
-            func: super::hash_precompiles::sha3_precompile,
-        });
+        contracts.insert(
+            0x07,
+            PrecompileEntry {
+                name: "sha3",
+                address: 0x07,
+                base_gas: 50,
+                per_word_gas: 10,
+                func: super::hash_precompiles::sha3_precompile,
+            },
+        );
 
         // 0x08: ED25519_VERIFY — Ed25519 signature verification (ShadowDAG native)
-        contracts.insert(0x08, PrecompileEntry {
-            name: "ed25519_verify",
-            address: 0x08,
-            base_gas: 2000,
-            per_word_gas: 0,
-            func: super::crypto_precompiles::ed25519_verify,
-        });
+        contracts.insert(
+            0x08,
+            PrecompileEntry {
+                name: "ed25519_verify",
+                address: 0x08,
+                base_gas: 2000,
+                per_word_gas: 0,
+                func: super::crypto_precompiles::ed25519_verify,
+            },
+        );
 
         // 0x09: SHA-256 based commitment (NOT a real Pedersen commitment).
         // WARNING: No homomorphic properties. See crypto_precompiles.rs doc.
-        contracts.insert(0x09, PrecompileEntry {
-            name: "sha256_commitment (not Pedersen)",
-            address: 0x09,
-            base_gas: 5000,
-            per_word_gas: 0,
-            func: super::crypto_precompiles::pedersen_commit,
-        });
+        contracts.insert(
+            0x09,
+            PrecompileEntry {
+                name: "sha256_commitment (not Pedersen)",
+                address: 0x09,
+                base_gas: 5000,
+                per_word_gas: 0,
+                func: super::crypto_precompiles::pedersen_commit,
+            },
+        );
 
         Self { contracts }
     }
@@ -242,7 +279,10 @@ impl PrecompileRegistry {
 
     /// List all registered precompiles
     pub fn list(&self) -> Vec<(u64, &'static str)> {
-        self.contracts.iter().map(|(&addr, e)| (addr, e.name)).collect()
+        self.contracts
+            .iter()
+            .map(|(&addr, e)| (addr, e.name))
+            .collect()
     }
 }
 
@@ -400,7 +440,11 @@ mod tests {
              previous behaviour left the failure path outside the floor invariant"
         );
         assert!(
-            result.error.as_deref().unwrap_or("").contains("unknown precompile"),
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("unknown precompile"),
             "error must describe the missing address, got: {:?}",
             result.error
         );
@@ -417,7 +461,9 @@ mod tests {
         let reg = PrecompileRegistry::new();
         let result = reg.execute(0xFF, b"", 0);
         assert!(!result.success);
-        assert_eq!(result.gas_used, 0,
-            "zero-allocation unknown address charges the full (zero) limit");
+        assert_eq!(
+            result.gas_used, 0,
+            "zero-allocation unknown address charges the full (zero) limit"
+        );
     }
 }

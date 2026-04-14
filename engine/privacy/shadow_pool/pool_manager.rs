@@ -8,9 +8,9 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::domain::transaction::transaction::Transaction;
+use crate::engine::privacy::shadow_pool::mixer::ShadowMixer;
 use crate::engine::privacy::shadow_pool::shadow_pool::ShadowPool;
 use crate::engine::privacy::shadow_pool::shadow_transaction::MixDelay;
-use crate::engine::privacy::shadow_pool::mixer::ShadowMixer;
 
 /// Privacy levels for transaction routing
 #[derive(Clone, Debug)]
@@ -30,18 +30,18 @@ impl PrivacyLevel {
         use crate::engine::privacy::shadow_pool::shadow_pool::MIN_RELAY_HOPS;
         match self {
             PrivacyLevel::Standard => 3,
-            PrivacyLevel::High     => 5,
-            PrivacyLevel::Maximum  => 8,
-            PrivacyLevel::Express  => MIN_RELAY_HOPS, // Was 1, but minimum is 2
+            PrivacyLevel::High => 5,
+            PrivacyLevel::Maximum => 8,
+            PrivacyLevel::Express => MIN_RELAY_HOPS, // Was 1, but minimum is 2
         }
     }
 
     pub fn delay(&self) -> MixDelay {
         match self {
             PrivacyLevel::Standard => MixDelay::Medium,
-            PrivacyLevel::High     => MixDelay::Long,
-            PrivacyLevel::Maximum  => MixDelay::Long,
-            PrivacyLevel::Express  => MixDelay::Instant,
+            PrivacyLevel::High => MixDelay::Long,
+            PrivacyLevel::Maximum => MixDelay::Long,
+            PrivacyLevel::Express => MixDelay::Instant,
         }
     }
 }
@@ -75,12 +75,8 @@ impl ShadowPoolManager {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        self.pool.submit_with_privacy(
-            tx.clone(),
-            timestamp,
-            level.delay(),
-            level.hops(),
-        );
+        self.pool
+            .submit_with_privacy(tx.clone(), timestamp, level.delay(), level.hops());
     }
 
     /// Process the pool and return transactions ready for the DAG network
@@ -110,7 +106,7 @@ impl ShadowPoolManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::transaction::transaction::{Transaction, TxOutput, TxInput, TxType};
+    use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
 
     fn make_tx() -> Transaction {
         Transaction {
@@ -124,7 +120,13 @@ mod tests {
                 key_image: None,
                 ring_members: None,
             }],
-            outputs: vec![TxOutput { address: "bob".into(), amount: 500, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            outputs: vec![TxOutput {
+                address: "bob".into(),
+                amount: 500,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee: 1,
             timestamp: 1735689600,
             is_coinbase: false,

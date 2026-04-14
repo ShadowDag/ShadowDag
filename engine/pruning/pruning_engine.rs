@@ -20,8 +20,8 @@
 //   - Ultra:    Keep last 6 hours + compact UTXO set only
 // ═══════════════════════════════════════════════════════════════════════════
 
+use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
-use sha2::{Sha256, Digest};
 
 /// Pruning depth profiles
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,22 +42,22 @@ impl PruningLevel {
     /// Pruning depth in seconds
     pub fn depth_secs(&self) -> u64 {
         match self {
-            PruningLevel::Full     => u64::MAX,
-            PruningLevel::Standard => 3 * 86_400,    // 3 days
-            PruningLevel::Minimal  => 86_400,          // 24 hours
-            PruningLevel::Ultra    => 6 * 3_600,       // 6 hours
-            PruningLevel::Custom(s)=> *s,
+            PruningLevel::Full => u64::MAX,
+            PruningLevel::Standard => 3 * 86_400, // 3 days
+            PruningLevel::Minimal => 86_400,      // 24 hours
+            PruningLevel::Ultra => 6 * 3_600,     // 6 hours
+            PruningLevel::Custom(s) => *s,
         }
     }
 
     /// Estimated storage per day at 1 BPS (MB)
     pub fn storage_per_day_mb(&self) -> f64 {
         match self {
-            PruningLevel::Full     => f64::INFINITY,
+            PruningLevel::Full => f64::INFINITY,
             PruningLevel::Standard => 500.0 * 3.0,
-            PruningLevel::Minimal  => 500.0,
-            PruningLevel::Ultra    => 125.0,
-            PruningLevel::Custom(s)=> 500.0 * (*s as f64 / 86_400.0),
+            PruningLevel::Minimal => 500.0,
+            PruningLevel::Ultra => 125.0,
+            PruningLevel::Custom(s) => 500.0 * (*s as f64 / 86_400.0),
         }
     }
 }
@@ -65,11 +65,11 @@ impl PruningLevel {
 /// UTXO commitment (Merkle root of the UTXO set at a specific height)
 #[derive(Debug, Clone)]
 pub struct UtxoCommitment {
-    pub height:      u64,
+    pub height: u64,
     pub merkle_root: String,
-    pub utxo_count:  u64,
+    pub utxo_count: u64,
     pub total_value: u64,
-    pub timestamp:   u64,
+    pub timestamp: u64,
 }
 
 impl UtxoCommitment {
@@ -89,7 +89,8 @@ impl UtxoCommitment {
             return "0".repeat(64);
         }
 
-        let mut layer: Vec<Vec<u8>> = hashes.iter()
+        let mut layer: Vec<Vec<u8>> = hashes
+            .iter()
             .map(|h| hex::decode(h).unwrap_or_else(|_| h.as_bytes().to_vec()))
             .collect();
 
@@ -97,13 +98,16 @@ impl UtxoCommitment {
             if layer.len() % 2 == 1 {
                 layer.push(layer.last().cloned().unwrap_or_default());
             }
-            layer = layer.chunks(2).map(|pair| {
-                let mut h = Sha256::new();
-                h.update(b"ShadowDAG_UTXO_Commit_v1");
-                h.update(&pair[0]);
-                h.update(&pair[1]);
-                h.finalize().to_vec()
-            }).collect();
+            layer = layer
+                .chunks(2)
+                .map(|pair| {
+                    let mut h = Sha256::new();
+                    h.update(b"ShadowDAG_UTXO_Commit_v1");
+                    h.update(&pair[0]);
+                    h.update(&pair[1]);
+                    h.finalize().to_vec()
+                })
+                .collect();
         }
 
         hex::encode(&layer[0])
@@ -134,36 +138,46 @@ impl UtxoCommitment {
 #[derive(Debug, Clone)]
 pub struct PruningProof {
     /// Height at which pruning was performed
-    pub pruning_height:     u64,
+    pub pruning_height: u64,
     /// UTXO commitment at the pruning point
-    pub utxo_commitment:    UtxoCommitment,
+    pub utxo_commitment: UtxoCommitment,
     /// Block hashes forming the proof chain
-    pub proof_chain:        Vec<String>,
+    pub proof_chain: Vec<String>,
     /// GHOSTDAG blue scores for proof blocks
-    pub blue_scores:        Vec<u64>,
+    pub blue_scores: Vec<u64>,
     /// Selected parent chain from genesis to pruning point
-    pub selected_chain:     Vec<String>,
+    pub selected_chain: Vec<String>,
 }
 
 impl PruningProof {
     /// Verify the pruning proof is valid
     pub fn verify(&self) -> bool {
         // 1. Proof chain must not be empty
-        if self.proof_chain.is_empty() { return false; }
+        if self.proof_chain.is_empty() {
+            return false;
+        }
 
         // 2. Blue scores must match proof chain length
-        if self.blue_scores.len() != self.proof_chain.len() { return false; }
+        if self.blue_scores.len() != self.proof_chain.len() {
+            return false;
+        }
 
         // 3. Blue scores must be monotonically increasing
         for window in self.blue_scores.windows(2) {
-            if window[1] < window[0] { return false; }
+            if window[1] < window[0] {
+                return false;
+            }
         }
 
         // 4. Selected chain must not be empty
-        if self.selected_chain.is_empty() { return false; }
+        if self.selected_chain.is_empty() {
+            return false;
+        }
 
         // 5. UTXO commitment must be at pruning height
-        if self.utxo_commitment.height != self.pruning_height { return false; }
+        if self.utxo_commitment.height != self.pruning_height {
+            return false;
+        }
 
         true
     }
@@ -172,18 +186,18 @@ impl PruningProof {
 /// Pruning result statistics
 #[derive(Debug, Clone)]
 pub struct PruneResult {
-    pub blocks_pruned:    u64,
-    pub headers_kept:     u64,
-    pub utxos_compacted:  u64,
-    pub bytes_freed:      u64,
-    pub duration_ms:      u128,
+    pub blocks_pruned: u64,
+    pub headers_kept: u64,
+    pub utxos_compacted: u64,
+    pub bytes_freed: u64,
+    pub duration_ms: u128,
     pub new_lowest_block: u64,
 }
 
 /// Advanced Pruning Engine
 pub struct AdvancedPruningEngine {
-    level:        PruningLevel,
-    commitments:  Vec<UtxoCommitment>,
+    level: PruningLevel,
+    commitments: Vec<UtxoCommitment>,
     lowest_block: u64,
     total_pruned: u64,
 }
@@ -200,24 +214,26 @@ impl AdvancedPruningEngine {
 
     /// Check if a block at given height should be pruned
     pub fn should_prune(&self, block_height: u64, current_height: u64, bps: u32) -> bool {
-        if self.level == PruningLevel::Full { return false; }
+        if self.level == PruningLevel::Full {
+            return false;
+        }
 
         let depth_blocks = self.level.depth_secs() * bps as u64;
         current_height.saturating_sub(block_height) > depth_blocks
     }
 
     /// Calculate which blocks should be pruned
-    pub fn select_blocks_to_prune(
-        &self,
-        current_height: u64,
-        bps:            u32,
-    ) -> (u64, u64) {
-        if self.level == PruningLevel::Full { return (0, 0); }
+    pub fn select_blocks_to_prune(&self, current_height: u64, bps: u32) -> (u64, u64) {
+        if self.level == PruningLevel::Full {
+            return (0, 0);
+        }
 
         let keep_blocks = self.level.depth_secs() * bps as u64;
         let prune_below = current_height.saturating_sub(keep_blocks);
 
-        if prune_below <= self.lowest_block { return (0, 0); }
+        if prune_below <= self.lowest_block {
+            return (0, 0);
+        }
 
         (self.lowest_block, prune_below)
     }
@@ -225,10 +241,10 @@ impl AdvancedPruningEngine {
     /// Execute pruning and create UTXO commitment
     pub fn prune(
         &mut self,
-        from_height:   u64,
-        to_height:     u64,
-        utxo_hashes:   &[String],
-        total_value:   u64,
+        from_height: u64,
+        to_height: u64,
+        utxo_hashes: &[String],
+        total_value: u64,
     ) -> PruneResult {
         let start = std::time::Instant::now();
 
@@ -250,11 +266,11 @@ impl AdvancedPruningEngine {
         let bytes_freed = blocks_to_prune * 1024;
 
         PruneResult {
-            blocks_pruned:    blocks_to_prune,
-            headers_kept:     to_height, // We keep all headers
-            utxos_compacted:  utxo_hashes.len() as u64,
+            blocks_pruned: blocks_to_prune,
+            headers_kept: to_height, // We keep all headers
+            utxos_compacted: utxo_hashes.len() as u64,
             bytes_freed,
-            duration_ms:      start.elapsed().as_millis(),
+            duration_ms: start.elapsed().as_millis(),
             new_lowest_block: to_height,
         }
     }
@@ -267,7 +283,9 @@ impl AdvancedPruningEngine {
     /// `proof_chain.len() != blue_scores.len()`. A production implementation must
     /// supply actual block headers and their GHOSTDAG blue scores.
     pub fn generate_proof(&self, utxo_hashes: &[String], total_value: u64) -> Option<PruningProof> {
-        if self.lowest_block == 0 { return None; }
+        if self.lowest_block == 0 {
+            return None;
+        }
 
         let commitment = UtxoCommitment::compute(self.lowest_block, utxo_hashes, total_value);
 
@@ -279,19 +297,27 @@ impl AdvancedPruningEngine {
             .collect();
 
         Some(PruningProof {
-            pruning_height:  self.lowest_block,
+            pruning_height: self.lowest_block,
             utxo_commitment: commitment,
             proof_chain,
             blue_scores,
-            selected_chain:  utxo_hashes.iter().take(5).cloned().collect(),
+            selected_chain: utxo_hashes.iter().take(5).cloned().collect(),
         })
     }
 
     /// Get current pruning level
-    pub fn level(&self) -> PruningLevel { self.level }
-    pub fn lowest_block(&self) -> u64 { self.lowest_block }
-    pub fn total_pruned(&self) -> u64 { self.total_pruned }
-    pub fn commitment_count(&self) -> usize { self.commitments.len() }
+    pub fn level(&self) -> PruningLevel {
+        self.level
+    }
+    pub fn lowest_block(&self) -> u64 {
+        self.lowest_block
+    }
+    pub fn total_pruned(&self) -> u64 {
+        self.total_pruned
+    }
+    pub fn commitment_count(&self) -> usize {
+        self.commitments.len()
+    }
 
     pub fn latest_commitment(&self) -> Option<&UtxoCommitment> {
         self.commitments.last()
@@ -300,13 +326,19 @@ impl AdvancedPruningEngine {
     pub fn status(&self) -> String {
         format!(
             "Pruning: {:?} | Lowest: {} | Total pruned: {} | Commitments: {}",
-            self.level, self.lowest_block, self.total_pruned, self.commitments.len()
+            self.level,
+            self.lowest_block,
+            self.total_pruned,
+            self.commitments.len()
         )
     }
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -340,10 +372,7 @@ mod tests {
 
     #[test]
     fn utxo_commitment_verification() {
-        let hashes = vec![
-            "aabb".to_string(),
-            "ccdd".to_string(),
-        ];
+        let hashes = vec!["aabb".to_string(), "ccdd".to_string()];
         let commitment = UtxoCommitment::compute(100, &hashes, 1000);
         assert!(commitment.verify(&hashes));
         assert!(!commitment.verify(&["wrong".to_string()]));
@@ -377,7 +406,9 @@ mod tests {
 
     #[test]
     fn pruning_levels_storage_estimates() {
-        assert!(PruningLevel::Standard.storage_per_day_mb() > PruningLevel::Ultra.storage_per_day_mb());
+        assert!(
+            PruningLevel::Standard.storage_per_day_mb() > PruningLevel::Ultra.storage_per_day_mb()
+        );
         assert!(PruningLevel::Full.depth_secs() == u64::MAX);
     }
 

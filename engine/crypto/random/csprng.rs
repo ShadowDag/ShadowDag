@@ -3,15 +3,13 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{
-    DB, Options,
-    WriteOptions, ReadOptions, WriteBatch,
-    BlockBasedOptions, Cache, SliceTransform,
-    DBPinnableSlice,
-};
-use std::path::Path;
 use crate::errors::CryptoError;
 use crate::slog_error;
+use rocksdb::{
+    BlockBasedOptions, Cache, DBPinnableSlice, Options, ReadOptions, SliceTransform, WriteBatch,
+    WriteOptions, DB,
+};
+use std::path::Path;
 
 // ─────────────────────────────────────────
 // PREFIX
@@ -29,7 +27,6 @@ pub struct CSPRNG {
 }
 
 impl CSPRNG {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
@@ -41,7 +38,7 @@ impl CSPRNG {
         opts.increase_parallelism(
             std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4) as i32
+                .unwrap_or(4) as i32,
         );
 
         opts.optimize_level_style_compaction(256 * 1024 * 1024);
@@ -124,14 +121,12 @@ impl CSPRNG {
     // ─────────────────────────────────────────
     #[inline(always)]
     pub fn load_state(&self, key: &[u8]) -> Option<Vec<u8>> {
-        Self::with_key(key, |k| {
-            match self.db.get_pinned_opt(k, &self.read_opts) {
-                Ok(Some(data)) => Some(data.to_vec()),
-                Ok(None) => None,
-                Err(e) => {
-                    slog_error!("crypto", "csprng_load_state_failed", error => e);
-                    None
-                }
+        Self::with_key(key, |k| match self.db.get_pinned_opt(k, &self.read_opts) {
+            Ok(Some(data)) => Some(data.to_vec()),
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("crypto", "csprng_load_state_failed", error => e);
+                None
             }
         })
     }
@@ -141,14 +136,12 @@ impl CSPRNG {
     // ─────────────────────────────────────────
     #[inline(always)]
     pub fn load_state_pinned(&self, key: &[u8]) -> Option<DBPinnableSlice<'_>> {
-        Self::with_key(key, |k| {
-            match self.db.get_pinned_opt(k, &self.read_opts) {
-                Ok(Some(data)) => Some(data),
-                Ok(None) => None,
-                Err(e) => {
-                    slog_error!("crypto", "csprng_load_state_pinned_failed", error => e);
-                    None
-                }
+        Self::with_key(key, |k| match self.db.get_pinned_opt(k, &self.read_opts) {
+            Ok(Some(data)) => Some(data),
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("crypto", "csprng_load_state_pinned_failed", error => e);
+                None
             }
         })
     }
@@ -157,9 +150,7 @@ impl CSPRNG {
     // MULTI GET (ZERO COPY)
     // ─────────────────────────────────────────
     pub fn multi_get_pinned(&self, keys: &[&[u8]]) -> Vec<Option<DBPinnableSlice<'_>>> {
-        keys.iter()
-            .map(|k| self.load_state_pinned(k))
-            .collect()
+        keys.iter().map(|k| self.load_state_pinned(k)).collect()
     }
 
     // ─────────────────────────────────────────

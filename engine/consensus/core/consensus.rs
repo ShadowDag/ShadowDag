@@ -4,10 +4,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use rocksdb::{
-    DB, Options,
-    WriteOptions, ReadOptions,
-    WriteBatch, IteratorMode,
-    BlockBasedOptions, SliceTransform, Cache,
+    BlockBasedOptions, Cache, IteratorMode, Options, ReadOptions, SliceTransform, WriteBatch,
+    WriteOptions, DB,
 };
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -34,7 +32,6 @@ pub struct ConsensusStore {
 }
 
 impl ConsensusStore {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
@@ -54,8 +51,10 @@ impl ConsensusStore {
 
         opts.set_paranoid_checks(true);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         // Consensus state is safety-critical — always sync + WAL.
         let mut write_opts = WriteOptions::default();
@@ -109,7 +108,11 @@ impl ConsensusStore {
     // ─────────────────────────────────────────
     pub fn set_state(&self, key: &str, value: &str) -> Result<(), ConsensusError> {
         self.db
-            .put_opt(Self::build_key(PFX_STATE, key), value.as_bytes(), &self.write_opts)
+            .put_opt(
+                Self::build_key(PFX_STATE, key),
+                value.as_bytes(),
+                &self.write_opts,
+            )
             .map_err(StorageError::RocksDb)?;
         Ok(())
     }
@@ -125,9 +128,11 @@ impl ConsensusStore {
                 Err(e) => {
                     slog_error!("consensus", "state_utf8_corrupt",
                         key => key, error => &format!("{}", e));
-                    Err(StorageError::ReadFailed(
-                        format!("get_state '{}': UTF-8 corruption: {}", key, e)
-                    ).into())
+                    Err(StorageError::ReadFailed(format!(
+                        "get_state '{}': UTF-8 corruption: {}",
+                        key, e
+                    ))
+                    .into())
                 }
             },
             Ok(None) => Ok(None),
@@ -166,7 +171,9 @@ impl ConsensusStore {
                 Ok(None) => None,
                 Err(e) => {
                     slog_error!("consensus", "state_read_failed", key => *k, error => e);
-                    return Err(StorageError::ReadFailed(format!("multi_get '{}': {}", k, e)).into());
+                    return Err(
+                        StorageError::ReadFailed(format!("multi_get '{}': {}", k, e)).into(),
+                    );
                 }
             };
 
@@ -208,7 +215,9 @@ impl ConsensusStore {
         puts: &[(&str, &str)],
         deletes: &[&str],
     ) -> Result<(), ConsensusError> {
-        let _guard = self.write_lock.write()
+        let _guard = self
+            .write_lock
+            .write()
             .map_err(|_| ConsensusError::BlockValidation("write lock poisoned".into()))?;
 
         let mut batch = WriteBatch::default();
@@ -252,7 +261,9 @@ impl ConsensusStore {
                     count += 1;
 
                     if count >= DELETE_BATCH_SIZE {
-                        self.db.write_opt(batch, &self.write_opts).map_err(StorageError::RocksDb)?;
+                        self.db
+                            .write_opt(batch, &self.write_opts)
+                            .map_err(StorageError::RocksDb)?;
                         batch = WriteBatch::default();
                         count = 0;
                     }
@@ -266,11 +277,15 @@ impl ConsensusStore {
         }
 
         if count > 0 {
-            self.db.write_opt(batch, &self.write_opts).map_err(StorageError::RocksDb)?;
+            self.db
+                .write_opt(batch, &self.write_opts)
+                .map_err(StorageError::RocksDb)?;
         }
 
         if had_error {
-            return Err(StorageError::ReadFailed("iterator error during clear_prefix".into()).into());
+            return Err(
+                StorageError::ReadFailed("iterator error during clear_prefix".into()).into(),
+            );
         }
 
         Ok(())
@@ -285,7 +300,6 @@ impl ConsensusStore {
         start_key: Option<&str>,
         limit: usize,
     ) -> Result<Vec<KvPair>, ConsensusError> {
-
         let start = match start_key {
             Some(k) => Self::build_key(PFX_STATE, k),
             None => PFX_STATE.to_vec(),
@@ -304,15 +318,20 @@ impl ConsensusStore {
         let mut results = Vec::with_capacity(limit.min(1024));
 
         for (n, item) in iter.enumerate() {
-            if n >= limit { break; }
+            if n >= limit {
+                break;
+            }
             match item {
                 Ok((k, v)) => results.push((k.to_vec(), v.to_vec())),
                 Err(e) => {
                     slog_error!("consensus", "scan_from_iter_error",
                         error => e, results_so_far => results.len());
-                    return Err(StorageError::ReadFailed(
-                        format!("scan_from iterator error after {} results: {}", results.len(), e)
-                    ).into());
+                    return Err(StorageError::ReadFailed(format!(
+                        "scan_from iterator error after {} results: {}",
+                        results.len(),
+                        e
+                    ))
+                    .into());
                 }
             }
         }
@@ -340,7 +359,10 @@ impl ConsensusStore {
     // Returns None on property read failure (logged) instead of fake 0.
     // ─────────────────────────────────────────
     pub fn size_estimate(&self) -> Option<u64> {
-        match self.db.property_int_value("rocksdb.estimate-live-data-size") {
+        match self
+            .db
+            .property_int_value("rocksdb.estimate-live-data-size")
+        {
             Ok(val) => val,
             Err(e) => {
                 slog_warn!("consensus", "size_estimate_failed", error => e);
@@ -366,7 +388,10 @@ mod tests {
     fn set_and_get_state() {
         let store = ConsensusStore::new(&tmp_path()).unwrap();
         store.set_state("best_hash", "abc123").unwrap();
-        assert_eq!(store.get_state("best_hash").unwrap(), Some("abc123".to_string()));
+        assert_eq!(
+            store.get_state("best_hash").unwrap(),
+            Some("abc123".to_string())
+        );
     }
 
     #[test]
@@ -424,10 +449,9 @@ mod tests {
     fn atomic_update_puts_and_deletes() {
         let store = ConsensusStore::new(&tmp_path()).unwrap();
         store.set_state("old", "val").unwrap();
-        store.atomic_update(
-            &[("new1", "v1"), ("new2", "v2")],
-            &["old"],
-        ).unwrap();
+        store
+            .atomic_update(&[("new1", "v1"), ("new2", "v2")], &["old"])
+            .unwrap();
         assert_eq!(store.get_state("new1").unwrap(), Some("v1".to_string()));
         assert_eq!(store.get_state("new2").unwrap(), Some("v2".to_string()));
         assert!(!store.exists("old").unwrap());

@@ -12,11 +12,11 @@
 //   top0:{topic0}:{block_height}:{idx}    -> serialized IndexedLog
 // =============================================================================
 
-use std::sync::Arc;
-use rocksdb::{DB, Options, WriteBatch};
-use serde::{Serialize, Deserialize};
 use crate::domain::transaction::tx_receipt::TxReceipt;
 use crate::errors::StorageError;
+use rocksdb::{Options, WriteBatch, DB};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub struct ReceiptIndex {
     db: Arc<DB>,
@@ -56,8 +56,10 @@ impl ReceiptIndex {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(4));
-        let db = DB::open(&opts, path)
-            .map_err(|e| StorageError::OpenFailed { path: path.into(), reason: e.to_string() })?;
+        let db = DB::open(&opts, path).map_err(|e| StorageError::OpenFailed {
+            path: path.into(),
+            reason: e.to_string(),
+        })?;
         Ok(Self { db: Arc::new(db) })
     }
 
@@ -82,12 +84,7 @@ impl ReceiptIndex {
             // Index logs
             for (log_idx, log) in receipt.logs.iter().enumerate() {
                 // By address
-                let addr_key = format!(
-                    "alog:{}:{}:{}",
-                    log.contract,
-                    block_height,
-                    log_idx
-                );
+                let addr_key = format!("alog:{}:{}:{}", log.contract, block_height, log_idx);
                 let log_entry = IndexedLog {
                     tx_hash: receipt.tx_hash.clone(),
                     block_hash: block_hash.to_string(),
@@ -116,7 +113,8 @@ impl ReceiptIndex {
             batch.put(block_key.as_bytes(), &data);
         }
 
-        self.db.write(batch)
+        self.db
+            .write(batch)
             .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         Ok(())
     }
@@ -144,7 +142,8 @@ impl ReceiptIndex {
         // Note: log entries would also need cleanup, but for simplicity
         // we rely on block_height filtering to exclude rolled-back logs
 
-        self.db.write(batch)
+        self.db
+            .write(batch)
             .map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
@@ -164,13 +163,20 @@ impl ReceiptIndex {
             Ok(Some(data)) => bincode::deserialize(&data).unwrap_or_default(),
             _ => return vec![],
         };
-        tx_hashes.iter().filter_map(|h| self.get_receipt(h)).collect()
+        tx_hashes
+            .iter()
+            .filter_map(|h| self.get_receipt(h))
+            .collect()
     }
 
     /// Get logs matching a filter
     pub fn get_logs(&self, filter: &LogFilter) -> Vec<IndexedLog> {
         let mut results = Vec::new();
-        let limit = if filter.limit == 0 { 1000 } else { filter.limit };
+        let limit = if filter.limit == 0 {
+            1000
+        } else {
+            filter.limit
+        };
 
         // Choose scan prefix based on filter
         let prefix = if let Some(ref addr) = filter.address {
@@ -183,7 +189,9 @@ impl ReceiptIndex {
 
         let iter = self.db.prefix_iterator(prefix.as_bytes());
         for item in iter {
-            if results.len() >= limit { break; }
+            if results.len() >= limit {
+                break;
+            }
             let (k, v) = match item {
                 Ok(kv) => kv,
                 Err(_) => continue,
@@ -194,7 +202,9 @@ impl ReceiptIndex {
             };
 
             // Check prefix still matches
-            if !key_str.starts_with(&prefix) { break; }
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
 
             let log: IndexedLog = match bincode::deserialize(&v) {
                 Ok(l) => l,
@@ -203,23 +213,33 @@ impl ReceiptIndex {
 
             // Apply block range filter
             if let Some(from) = filter.from_block {
-                if log.block_height < from { continue; }
+                if log.block_height < from {
+                    continue;
+                }
             }
             if let Some(to) = filter.to_block {
-                if log.block_height > to { continue; }
+                if log.block_height > to {
+                    continue;
+                }
             }
 
             // Apply topic filters
             if let Some(ref t0) = filter.topic0 {
-                if log.topics.first().map(|t| t.as_str()) != Some(t0) { continue; }
+                if log.topics.first().map(|t| t.as_str()) != Some(t0) {
+                    continue;
+                }
             }
             if let Some(ref t1) = filter.topic1 {
-                if log.topics.get(1).map(|t| t.as_str()) != Some(t1) { continue; }
+                if log.topics.get(1).map(|t| t.as_str()) != Some(t1) {
+                    continue;
+                }
             }
 
             // Apply address filter (in case we scanned by topic)
             if let Some(ref addr) = filter.address {
-                if log.contract != *addr { continue; }
+                if log.contract != *addr {
+                    continue;
+                }
             }
 
             results.push(log);
@@ -325,9 +345,12 @@ mod tests {
     #[test]
     fn filter_logs_by_block_range() {
         let idx = ReceiptIndex::new(&tmp_path()).unwrap();
-        idx.index_block_receipts("b1", 100, &[make_receipt("tx1", "c", "E")]).unwrap();
-        idx.index_block_receipts("b2", 200, &[make_receipt("tx2", "c", "E")]).unwrap();
-        idx.index_block_receipts("b3", 300, &[make_receipt("tx3", "c", "E")]).unwrap();
+        idx.index_block_receipts("b1", 100, &[make_receipt("tx1", "c", "E")])
+            .unwrap();
+        idx.index_block_receipts("b2", 200, &[make_receipt("tx2", "c", "E")])
+            .unwrap();
+        idx.index_block_receipts("b3", 300, &[make_receipt("tx3", "c", "E")])
+            .unwrap();
 
         let logs = idx.get_logs(&LogFilter {
             address: Some("c".into()),
@@ -342,7 +365,8 @@ mod tests {
     #[test]
     fn rollback_removes_receipts() {
         let idx = ReceiptIndex::new(&tmp_path()).unwrap();
-        idx.index_block_receipts("b1", 100, &[make_receipt("tx1", "c", "E")]).unwrap();
+        idx.index_block_receipts("b1", 100, &[make_receipt("tx1", "c", "E")])
+            .unwrap();
 
         assert!(idx.get_receipt("tx1").is_some());
         idx.rollback_block("b1").unwrap();
@@ -353,10 +377,12 @@ mod tests {
     fn receipt_count() {
         let idx = ReceiptIndex::new(&tmp_path()).unwrap();
         assert_eq!(idx.receipt_count(), 0);
-        idx.index_block_receipts("b1", 100, &[
-            make_receipt("tx1", "c", "E"),
-            make_receipt("tx2", "c", "E"),
-        ]).unwrap();
+        idx.index_block_receipts(
+            "b1",
+            100,
+            &[make_receipt("tx1", "c", "E"), make_receipt("tx2", "c", "E")],
+        )
+        .unwrap();
         assert_eq!(idx.receipt_count(), 2);
     }
 }

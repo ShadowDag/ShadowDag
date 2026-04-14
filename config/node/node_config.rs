@@ -3,8 +3,8 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use serde::{Serialize, Deserialize};
 
 /// Get user's home directory (cross-platform)
 fn dirs_home() -> Option<PathBuf> {
@@ -21,9 +21,9 @@ fn dirs_home() -> Option<PathBuf> {
 use crate::config::genesis::genesis::create_genesis_block_for;
 use crate::config::network::bootstrap_nodes::BootstrapNodes;
 
-pub const MAINNET_MAGIC:  [u8; 4] = [0x53, 0x44, 0x41, 0x47];
-pub const TESTNET_MAGIC:  [u8; 4] = [0x53, 0x44, 0x54, 0x4e];
-pub const REGTEST_MAGIC:  [u8; 4] = [0x53, 0x44, 0x52, 0x54];
+pub const MAINNET_MAGIC: [u8; 4] = [0x53, 0x44, 0x41, 0x47];
+pub const TESTNET_MAGIC: [u8; 4] = [0x53, 0x44, 0x54, 0x4e];
+pub const REGTEST_MAGIC: [u8; 4] = [0x53, 0x44, 0x52, 0x54];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkMode {
@@ -38,7 +38,11 @@ pub struct UnknownNetwork(pub String);
 
 impl std::fmt::Display for UnknownNetwork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unknown network mode '{}' (expected mainnet/testnet/regtest)", self.0)
+        write!(
+            f,
+            "unknown network mode '{}' (expected mainnet/testnet/regtest)",
+            self.0
+        )
     }
 }
 
@@ -49,14 +53,13 @@ impl std::str::FromStr for NetworkMode {
         match s.to_lowercase().trim() {
             "mainnet" | "main" => Ok(NetworkMode::Mainnet),
             "testnet" | "test" => Ok(NetworkMode::Testnet),
-            "regtest" | "reg"  => Ok(NetworkMode::Regtest),
+            "regtest" | "reg" => Ok(NetworkMode::Regtest),
             other => Err(UnknownNetwork(other.to_string())),
         }
     }
 }
 
 impl NetworkMode {
-
     pub fn name(&self) -> &'static str {
         match self {
             NetworkMode::Mainnet => "shadowdag-mainnet",
@@ -123,16 +126,36 @@ impl NetworkMode {
         PathBuf::from(".shadowdag")
     }
 
-    pub fn blocks_path(&self)   -> PathBuf { self.data_dir().join("blocks") }
-    pub fn utxo_path(&self)     -> PathBuf { self.data_dir().join("utxo") }
-    pub fn peers_path(&self)    -> PathBuf { self.data_dir().join("peers") }
-    pub fn mempool_path(&self)  -> PathBuf { self.data_dir().join("mempool") }
-    pub fn dag_path(&self)      -> PathBuf { self.data_dir().join("dag") }
-    pub fn wallet_path(&self)   -> PathBuf { self.data_dir().join("wallet") }
-    pub fn snapshot_path(&self) -> PathBuf { self.data_dir().join("snapshots") }
-    pub fn dsp_path(&self)      -> PathBuf { self.data_dir().join("dsp") }
-    pub fn contract_path(&self) -> PathBuf { self.data_dir().join("contracts") }
-    pub fn receipt_path(&self)  -> PathBuf { self.data_dir().join("receipts") }
+    pub fn blocks_path(&self) -> PathBuf {
+        self.data_dir().join("blocks")
+    }
+    pub fn utxo_path(&self) -> PathBuf {
+        self.data_dir().join("utxo")
+    }
+    pub fn peers_path(&self) -> PathBuf {
+        self.data_dir().join("peers")
+    }
+    pub fn mempool_path(&self) -> PathBuf {
+        self.data_dir().join("mempool")
+    }
+    pub fn dag_path(&self) -> PathBuf {
+        self.data_dir().join("dag")
+    }
+    pub fn wallet_path(&self) -> PathBuf {
+        self.data_dir().join("wallet")
+    }
+    pub fn snapshot_path(&self) -> PathBuf {
+        self.data_dir().join("snapshots")
+    }
+    pub fn dsp_path(&self) -> PathBuf {
+        self.data_dir().join("dsp")
+    }
+    pub fn contract_path(&self) -> PathBuf {
+        self.data_dir().join("contracts")
+    }
+    pub fn receipt_path(&self) -> PathBuf {
+        self.data_dir().join("receipts")
+    }
 
     /// Returns the genesis block hash for this network by computing it
     /// from the actual genesis block definition.
@@ -161,9 +184,15 @@ impl NetworkMode {
         BootstrapNodes::for_network_owned(self)
     }
 
-    pub fn is_mainnet(&self) -> bool { *self == NetworkMode::Mainnet }
-    pub fn is_testnet(&self) -> bool { *self == NetworkMode::Testnet }
-    pub fn is_regtest(&self) -> bool { *self == NetworkMode::Regtest }
+    pub fn is_mainnet(&self) -> bool {
+        *self == NetworkMode::Mainnet
+    }
+    pub fn is_testnet(&self) -> bool {
+        *self == NetworkMode::Testnet
+    }
+    pub fn is_regtest(&self) -> bool {
+        *self == NetworkMode::Regtest
+    }
 
     pub fn init_dirs(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.blocks_path())?;
@@ -188,12 +217,12 @@ impl std::fmt::Display for NetworkMode {
 
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
-    pub network:    NetworkMode,
-    pub p2p_port:   u16,
-    pub rpc_port:   u16,
-    pub max_peers:  usize,
-    pub data_dir:   PathBuf,
-    pub log_level:  String,
+    pub network: NetworkMode,
+    pub p2p_port: u16,
+    pub rpc_port: u16,
+    pub max_peers: usize,
+    pub data_dir: PathBuf,
+    pub log_level: String,
     pub enable_rpc: bool,
     pub enable_mining: bool,
     pub miner_addr: String,
@@ -204,17 +233,17 @@ impl NodeConfig {
         let p2p_port = net.p2p_port();
         let rpc_port = net.rpc_port();
         let max_peers = net.max_peers();
-        let data_dir  = net.data_dir();
+        let data_dir = net.data_dir();
         Self {
-            network:        net,
+            network: net,
             p2p_port,
             rpc_port,
             max_peers,
             data_dir,
-            log_level:      "info".to_string(),
-            enable_rpc:     true,
-            enable_mining:  false,
-            miner_addr:     String::new(),
+            log_level: "info".to_string(),
+            enable_rpc: true,
+            enable_mining: false,
+            miner_addr: String::new(),
         }
     }
 
@@ -229,33 +258,45 @@ impl NodeConfig {
         let mut i = 1;
         while i < args.len() {
             match args[i].as_str() {
-                "--testnet" => { network = NetworkMode::Testnet; }
-                "--regtest" => { network = NetworkMode::Regtest; }
-                "--network" if i+1 < args.len() => {
-                    let val = &args[i+1];
+                "--testnet" => {
+                    network = NetworkMode::Testnet;
+                }
+                "--regtest" => {
+                    network = NetworkMode::Regtest;
+                }
+                "--network" if i + 1 < args.len() => {
+                    let val = &args[i + 1];
                     network = val.parse().unwrap_or_else(|_| {
-                        eprintln!("WARNING: Unknown --network '{}', falling back to mainnet", val);
+                        eprintln!(
+                            "WARNING: Unknown --network '{}', falling back to mainnet",
+                            val
+                        );
                         NetworkMode::Mainnet
                     });
                     i += 1;
                 }
-                "--port" if i+1 < args.len() => {
-                    match args[i+1].parse::<u16>() {
+                "--port" if i + 1 < args.len() => {
+                    match args[i + 1].parse::<u16>() {
                         Ok(p) if p > 0 => p2p_override = Some(p),
-                        _ => eprintln!("WARNING: Invalid --port '{}', using default", args[i+1]),
+                        _ => eprintln!("WARNING: Invalid --port '{}', using default", args[i + 1]),
                     }
                     i += 1;
                 }
-                "--rpcport" if i+1 < args.len() => {
-                    match args[i+1].parse::<u16>() {
+                "--rpcport" if i + 1 < args.len() => {
+                    match args[i + 1].parse::<u16>() {
                         Ok(p) if p > 0 => rpc_override = Some(p),
-                        _ => eprintln!("WARNING: Invalid --rpcport '{}', using default", args[i+1]),
+                        _ => eprintln!(
+                            "WARNING: Invalid --rpcport '{}', using default",
+                            args[i + 1]
+                        ),
                     }
                     i += 1;
                 }
-                "--mine" => { mining = true; }
-                "--miner-addr" if i+1 < args.len() => {
-                    miner_addr = args[i+1].clone();
+                "--mine" => {
+                    mining = true;
+                }
+                "--miner-addr" if i + 1 < args.len() => {
+                    miner_addr = args[i + 1].clone();
                     i += 1;
                 }
                 _ => {}
@@ -264,10 +305,14 @@ impl NodeConfig {
         }
 
         let mut cfg = Self::for_network(network);
-        if let Some(p) = p2p_override { cfg.p2p_port  = p; }
-        if let Some(r) = rpc_override { cfg.rpc_port  = r; }
+        if let Some(p) = p2p_override {
+            cfg.p2p_port = p;
+        }
+        if let Some(r) = rpc_override {
+            cfg.rpc_port = r;
+        }
         cfg.enable_mining = mining;
-        cfg.miner_addr    = miner_addr;
+        cfg.miner_addr = miner_addr;
         cfg
     }
 
@@ -289,23 +334,55 @@ impl NodeConfig {
         Ok(())
     }
 
-    pub fn blocks_path(&self)   -> std::path::PathBuf { self.data_dir.join("blocks") }
-    pub fn peers_path(&self)    -> std::path::PathBuf { self.data_dir.join("peers") }
-    pub fn utxo_path(&self)     -> std::path::PathBuf { self.data_dir.join("utxo") }
-    pub fn mempool_path(&self)  -> std::path::PathBuf { self.data_dir.join("mempool") }
-    pub fn dag_path(&self)      -> std::path::PathBuf { self.data_dir.join("dag") }
-    pub fn snapshot_path(&self) -> std::path::PathBuf { self.data_dir.join("snapshots") }
-    pub fn dsp_path(&self)      -> std::path::PathBuf { self.data_dir.join("dsp") }
-    pub fn runtime_path(&self)  -> std::path::PathBuf { self.data_dir.join("runtime") }
-    pub fn contract_path(&self) -> std::path::PathBuf { self.data_dir.join("contracts") }
-    pub fn receipt_path(&self)  -> std::path::PathBuf { self.data_dir.join("receipts") }
+    pub fn blocks_path(&self) -> std::path::PathBuf {
+        self.data_dir.join("blocks")
+    }
+    pub fn peers_path(&self) -> std::path::PathBuf {
+        self.data_dir.join("peers")
+    }
+    pub fn utxo_path(&self) -> std::path::PathBuf {
+        self.data_dir.join("utxo")
+    }
+    pub fn mempool_path(&self) -> std::path::PathBuf {
+        self.data_dir.join("mempool")
+    }
+    pub fn dag_path(&self) -> std::path::PathBuf {
+        self.data_dir.join("dag")
+    }
+    pub fn snapshot_path(&self) -> std::path::PathBuf {
+        self.data_dir.join("snapshots")
+    }
+    pub fn dsp_path(&self) -> std::path::PathBuf {
+        self.data_dir.join("dsp")
+    }
+    pub fn runtime_path(&self) -> std::path::PathBuf {
+        self.data_dir.join("runtime")
+    }
+    pub fn contract_path(&self) -> std::path::PathBuf {
+        self.data_dir.join("contracts")
+    }
+    pub fn receipt_path(&self) -> std::path::PathBuf {
+        self.data_dir.join("receipts")
+    }
 
-    pub fn peers_path_str(&self)    -> String { self.peers_path().to_string_lossy().into_owned() }
-    pub fn mempool_path_str(&self)  -> String { self.mempool_path().to_string_lossy().into_owned() }
-    pub fn blocks_path_str(&self)   -> String { self.blocks_path().to_string_lossy().into_owned() }
-    pub fn dag_path_str(&self)      -> String { self.dag_path().to_string_lossy().into_owned() }
-    pub fn snapshot_path_str(&self) -> String { self.snapshot_path().to_string_lossy().into_owned() }
-    pub fn dsp_path_str(&self)      -> String { self.dsp_path().to_string_lossy().into_owned() }
+    pub fn peers_path_str(&self) -> String {
+        self.peers_path().to_string_lossy().into_owned()
+    }
+    pub fn mempool_path_str(&self) -> String {
+        self.mempool_path().to_string_lossy().into_owned()
+    }
+    pub fn blocks_path_str(&self) -> String {
+        self.blocks_path().to_string_lossy().into_owned()
+    }
+    pub fn dag_path_str(&self) -> String {
+        self.dag_path().to_string_lossy().into_owned()
+    }
+    pub fn snapshot_path_str(&self) -> String {
+        self.snapshot_path().to_string_lossy().into_owned()
+    }
+    pub fn dsp_path_str(&self) -> String {
+        self.dsp_path().to_string_lossy().into_owned()
+    }
 }
 
 #[cfg(test)]
@@ -332,9 +409,18 @@ mod tests {
 
     #[test]
     fn from_str_parsing() {
-        assert_eq!(NetworkMode::from_str("testnet").unwrap(), NetworkMode::Testnet);
-        assert_eq!(NetworkMode::from_str("REGTEST").unwrap(), NetworkMode::Regtest);
-        assert_eq!(NetworkMode::from_str("mainnet").unwrap(), NetworkMode::Mainnet);
+        assert_eq!(
+            NetworkMode::from_str("testnet").unwrap(),
+            NetworkMode::Testnet
+        );
+        assert_eq!(
+            NetworkMode::from_str("REGTEST").unwrap(),
+            NetworkMode::Regtest
+        );
+        assert_eq!(
+            NetworkMode::from_str("mainnet").unwrap(),
+            NetworkMode::Mainnet
+        );
         // Short aliases work too
         assert_eq!(NetworkMode::from_str("main").unwrap(), NetworkMode::Mainnet);
         assert_eq!(NetworkMode::from_str("test").unwrap(), NetworkMode::Testnet);

@@ -3,13 +3,13 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::config::consensus::consensus_params::ConsensusParams;
 use crate::domain::block::block::Block;
 use crate::domain::block::block_body::BlockBody;
 use crate::domain::block::block_header::BlockHeader;
 use crate::domain::block::merkle_tree::MerkleTree;
-use crate::domain::transaction::transaction::Transaction;
 use crate::domain::traits::tx_pool::TxPool;
-use crate::config::consensus::consensus_params::ConsensusParams;
+use crate::domain::transaction::transaction::Transaction;
 
 pub struct BlockBuilder;
 
@@ -27,14 +27,14 @@ impl BlockBuilder {
     /// which handles coinbase creation, fee calculation, and DAG parent selection.
     #[allow(clippy::too_many_arguments)]
     pub fn build_block(
-        version:    u32,
-        height:     u64,
-        parents:    Vec<String>,
-        coinbase:   Transaction,
-        tx_pool:    &dyn TxPool,
-        max_txs:    usize,
+        version: u32,
+        height: u64,
+        parents: Vec<String>,
+        coinbase: Transaction,
+        tx_pool: &dyn TxPool,
+        max_txs: usize,
         difficulty: u64,
-        timestamp:  u64,
+        timestamp: u64,
     ) -> Result<Block, String> {
         if !coinbase.is_coinbase() {
             return Err("first transaction must be coinbase".to_string());
@@ -46,8 +46,7 @@ impl BlockBuilder {
         }
 
         // Reserve one slot for coinbase
-        let mempool_txs: Vec<Transaction> =
-            tx_pool.get_prioritized_txs(max_txs.saturating_sub(1));
+        let mempool_txs: Vec<Transaction> = tx_pool.get_prioritized_txs(max_txs.saturating_sub(1));
 
         // Coinbase first, then mempool transactions filtered by block gas budget
         let mut all_txs = vec![coinbase];
@@ -72,32 +71,30 @@ impl BlockBuilder {
             all_txs.push(tx);
         }
 
-        let merkle_root = MerkleTree::build(
-            &all_txs,
-            height,
-            &parents,
-        );
+        let merkle_root = MerkleTree::build(&all_txs, height, &parents);
 
         let selected_parent = parents.first().cloned();
 
         let header = BlockHeader {
             version,
-            hash:            String::new(),  // Template: filled by miner after PoW
+            hash: String::new(), // Template: filled by miner after PoW
             parents,
             merkle_root,
             timestamp,
-            nonce:           0,
+            nonce: 0,
             difficulty,
             height,
-            blue_score:      0,
+            blue_score: 0,
             selected_parent,
             utxo_commitment: None,
-            extra_nonce:     0,
-            receipt_root:    None,
-            state_root:      None,
+            extra_nonce: 0,
+            receipt_root: None,
+            state_root: None,
         };
 
-        let body = BlockBody { transactions: all_txs };
+        let body = BlockBody {
+            transactions: all_txs,
+        };
 
         Ok(Block { header, body })
     }
@@ -113,11 +110,21 @@ mod tests {
     struct EmptyPool;
 
     impl TxPool for EmptyPool {
-        fn get_transaction(&self, _hash: &str) -> Option<Transaction> { None }
-        fn has_transaction(&self, _hash: &str) -> bool { false }
-        fn count(&self) -> usize { 0 }
-        fn get_prioritized_txs(&self, _limit: usize) -> Vec<Transaction> { vec![] }
-        fn get_transactions_for_block(&self, _utxo: &UtxoSet, _max: usize) -> Vec<Transaction> { vec![] }
+        fn get_transaction(&self, _hash: &str) -> Option<Transaction> {
+            None
+        }
+        fn has_transaction(&self, _hash: &str) -> bool {
+            false
+        }
+        fn count(&self) -> usize {
+            0
+        }
+        fn get_prioritized_txs(&self, _limit: usize) -> Vec<Transaction> {
+            vec![]
+        }
+        fn get_transactions_for_block(&self, _utxo: &UtxoSet, _max: usize) -> Vec<Transaction> {
+            vec![]
+        }
     }
 
     fn make_coinbase(hash: &str) -> Transaction {
@@ -137,12 +144,20 @@ mod tests {
         let parents = vec!["bb".repeat(32)];
 
         let block1 = BlockBuilder::build_block(
-            1, 10, parents.clone(), coinbase_10, &pool, 100, 1, 1735689600
-        ).expect("build height=10");
+            1,
+            10,
+            parents.clone(),
+            coinbase_10,
+            &pool,
+            100,
+            1,
+            1735689600,
+        )
+        .expect("build height=10");
 
-        let block2 = BlockBuilder::build_block(
-            1, 20, parents, coinbase_20, &pool, 100, 1, 1735689600
-        ).expect("build height=20");
+        let block2 =
+            BlockBuilder::build_block(1, 20, parents, coinbase_20, &pool, 100, 1, 1735689600)
+                .expect("build height=20");
 
         assert_ne!(
             block1.header.merkle_root, block2.header.merkle_root,
@@ -157,12 +172,28 @@ mod tests {
         let coinbase_b = make_coinbase("ac".repeat(32).as_str());
 
         let block1 = BlockBuilder::build_block(
-            1, 10, vec!["parent_a".repeat(8)], coinbase_a, &pool, 100, 1, 1735689600
-        ).expect("build parent_a");
+            1,
+            10,
+            vec!["parent_a".repeat(8)],
+            coinbase_a,
+            &pool,
+            100,
+            1,
+            1735689600,
+        )
+        .expect("build parent_a");
 
         let block2 = BlockBuilder::build_block(
-            1, 10, vec!["parent_b".repeat(8)], coinbase_b, &pool, 100, 1, 1735689600
-        ).expect("build parent_b");
+            1,
+            10,
+            vec!["parent_b".repeat(8)],
+            coinbase_b,
+            &pool,
+            100,
+            1,
+            1735689600,
+        )
+        .expect("build parent_b");
 
         assert_ne!(
             block1.header.merkle_root, block2.header.merkle_root,

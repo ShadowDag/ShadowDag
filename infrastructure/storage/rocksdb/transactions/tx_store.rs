@@ -3,11 +3,11 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options, WriteBatch};
-use std::path::Path;
 use crate::domain::transaction::transaction::Transaction;
 use crate::errors::StorageError;
 use crate::slog_error;
+use rocksdb::{Options, WriteBatch, DB};
+use std::path::Path;
 
 pub struct TxStore {
     db: DB,
@@ -28,18 +28,17 @@ impl TxStore {
     }
 
     pub fn new_required(path: &str) -> Result<Self, StorageError> {
-        Self::new(path).ok_or_else(|| {
-            StorageError::OpenFailed {
-                path: path.to_string(),
-                reason: "cannot open DB — check permissions and disk space".to_string(),
-            }
+        Self::new(path).ok_or_else(|| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: "cannot open DB — check permissions and disk space".to_string(),
         })
     }
 
     pub fn save_tx(&self, tx: &Transaction) -> Result<(), StorageError> {
-        let data = bincode::serialize(tx)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        self.db.put(tx.hash.as_bytes(), &data)
+        let data =
+            bincode::serialize(tx).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        self.db
+            .put(tx.hash.as_bytes(), &data)
             .map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
@@ -58,8 +57,8 @@ impl TxStore {
     pub fn tx_exists(&self, hash: &str) -> bool {
         match self.db.get(hash.as_bytes()) {
             Ok(Some(_)) => true,
-            Ok(None)    => false,
-            Err(e)      => {
+            Ok(None) => false,
+            Err(e) => {
                 slog_error!("storage", "tx_exists_read_failed_may_be_false_negative",
                     hash => hash, error => e);
                 false // TODO: Consider Result<bool> return type
@@ -79,7 +78,7 @@ impl TxStore {
             }
         }
         match self.db.write(batch) {
-            Ok(_)  => true,
+            Ok(_) => true,
             Err(e) => {
                 slog_error!("storage", "tx_batch_write_error", error => e);
                 false
@@ -89,7 +88,7 @@ impl TxStore {
 
     pub fn delete_tx(&self, hash: &str) -> bool {
         match self.db.delete(hash.as_bytes()) {
-            Ok(_)  => true,
+            Ok(_) => true,
             Err(e) => {
                 slog_error!("storage", "tx_delete_error", hash => hash, error => e);
                 false

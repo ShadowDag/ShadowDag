@@ -17,9 +17,9 @@
 //   crate::engine::privacy::confidential::range_proof::{prove, verify}
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 
 use crate::engine::privacy::confidential::pedersen_commitment::PedersenCommitment;
 
@@ -33,23 +33,23 @@ pub const RANGE_BITS: usize = 64;
 #[derive(Debug, Clone)]
 pub struct BulletproofResult {
     /// Proof bytes (cryptographic proof data)
-    pub proof_bytes:     Vec<u8>,
+    pub proof_bytes: Vec<u8>,
     /// Pedersen commitment hex
-    pub commitment_hex:  String,
+    pub commitment_hex: String,
     /// Blinding factor hex (needed for verification by the owner)
-    pub blinding_hex:    String,
+    pub blinding_hex: String,
     /// Whether the proof is valid
-    pub is_valid:        bool,
+    pub is_valid: bool,
     /// The bit count used in the proof
-    pub bits:            usize,
+    pub bits: usize,
 }
 
 /// Aggregated proof for multiple values (batch proof)
 #[derive(Debug, Clone)]
 pub struct AggregatedProof {
-    pub proofs:          Vec<BulletproofResult>,
-    pub total_valid:     usize,
-    pub aggregate_hash:  String,
+    pub proofs: Vec<BulletproofResult>,
+    pub total_valid: usize,
+    pub aggregate_hash: String,
 }
 
 pub struct Bulletproof;
@@ -164,10 +164,10 @@ impl Bulletproof {
         proof_data.extend_from_slice(&value_binding);
 
         BulletproofResult {
-            proof_bytes:    proof_data,
+            proof_bytes: proof_data,
             commitment_hex: commitment.commitment_hex,
-            blinding_hex:   commitment.blinding_hex,
-            is_valid:       true,
+            blinding_hex: commitment.blinding_hex,
+            is_valid: true,
             bits,
         }
     }
@@ -189,15 +189,21 @@ impl Bulletproof {
     )]
     pub fn verify_range_proof(proof: &BulletproofResult) -> bool {
         // Basic structure checks
-        if proof.proof_bytes.is_empty() { return false; }
-        if proof.commitment_hex.is_empty() { return false; }
-        if !proof.is_valid { return false; }
+        if proof.proof_bytes.is_empty() {
+            return false;
+        }
+        if proof.commitment_hex.is_empty() {
+            return false;
+        }
+        if !proof.is_valid {
+            return false;
+        }
 
         let bits = proof.bits.min(64);
         let expected_size = bits * 32  // bit commitments
             + bits * 32               // responses
             + 32                      // challenge
-            + 32;                     // value binding
+            + 32; // value binding
 
         if proof.proof_bytes.len() != expected_size {
             return false; // Reject both undersized AND oversized proofs
@@ -219,7 +225,9 @@ impl Bulletproof {
 
         // Extract stored challenge
         let challenge_start = bits * 32 + bits * 32;
-        if challenge_start + 32 > proof.proof_bytes.len() { return false; }
+        if challenge_start + 32 > proof.proof_bytes.len() {
+            return false;
+        }
         let stored_challenge = &proof.proof_bytes[challenge_start..challenge_start + 32];
 
         // Verify challenge matches
@@ -242,14 +250,15 @@ impl Bulletproof {
         let response_start = bits * 32;
         let mut reconstructed_value: u64 = 0;
         for i in 0..bits {
-            let response = &proof.proof_bytes[response_start + i * 32..response_start + (i + 1) * 32];
+            let response =
+                &proof.proof_bytes[response_start + i * 32..response_start + (i + 1) * 32];
             let bit_commit = &proof.proof_bytes[i * 32..(i + 1) * 32];
 
             // Reconstruct nonce for bit=0: nonce = response
             let mut verify_h0 = Sha256::new();
             verify_h0.update(b"ShadowDAG_BitCommit_v2");
             verify_h0.update(response); // nonce = response when bit=0
-            verify_h0.update([0u8]);   // bit = 0
+            verify_h0.update([0u8]); // bit = 0
             verify_h0.update((i as u32).to_le_bytes());
             verify_h0.update(proof.commitment_hex.as_bytes());
             let commit_if_0 = verify_h0.finalize();
@@ -262,7 +271,7 @@ impl Bulletproof {
             let mut verify_h1 = Sha256::new();
             verify_h1.update(b"ShadowDAG_BitCommit_v2");
             verify_h1.update(nonce_if_1);
-            verify_h1.update([1u8]);   // bit = 1
+            verify_h1.update([1u8]); // bit = 1
             verify_h1.update((i as u32).to_le_bytes());
             verify_h1.update(proof.commitment_hex.as_bytes());
             let commit_if_1 = verify_h1.finalize();
@@ -276,10 +285,9 @@ impl Bulletproof {
             }
 
             // Reconstruct the bit value for value binding check
-            if matches_1
-                && i < 64 {
-                    reconstructed_value |= 1u64 << i;
-                }
+            if matches_1 && i < 64 {
+                reconstructed_value |= 1u64 << i;
+            }
         }
 
         // VALUE BINDING CHECK: verify the bit decomposition matches the committed value.
@@ -287,7 +295,9 @@ impl Bulletproof {
         // We recompute it using the blinding factor and reconstructed value.
         // This prevents forging a proof where bits encode value X but commitment hides Y.
         let binding_start = challenge_start + 32;
-        if binding_start + 32 > proof.proof_bytes.len() { return false; }
+        if binding_start + 32 > proof.proof_bytes.len() {
+            return false;
+        }
         let stored_binding = &proof.proof_bytes[binding_start..binding_start + 32];
 
         let mut binding_h = Sha256::new();
@@ -319,22 +329,18 @@ impl Bulletproof {
     /// Verify with a specific amount (for the commitment owner who knows the blinding factor)
     #[allow(deprecated)]
     pub fn verify_with_amount(proof: &BulletproofResult, amount: u64) -> bool {
-        if !Self::verify_range_proof(proof) { return false; }
+        if !Self::verify_range_proof(proof) {
+            return false;
+        }
 
         // Verify the Pedersen commitment opens to this amount
-        PedersenCommitment::verify(
-            &proof.commitment_hex,
-            amount,
-            &proof.blinding_hex,
-        )
+        PedersenCommitment::verify(&proof.commitment_hex, amount, &proof.blinding_hex)
     }
 
     /// Generate aggregated proofs for multiple outputs
     #[allow(deprecated)]
     pub fn prove_batch(amounts: &[u64]) -> AggregatedProof {
-        let proofs: Vec<BulletproofResult> = amounts.iter()
-            .map(|&a| Self::prove(a))
-            .collect();
+        let proofs: Vec<BulletproofResult> = amounts.iter().map(|&a| Self::prove(a)).collect();
 
         let total_valid = proofs.iter().filter(|p| p.is_valid).count();
 
@@ -346,7 +352,11 @@ impl Bulletproof {
         }
         let aggregate_hash = hex::encode(h.finalize());
 
-        AggregatedProof { proofs, total_valid, aggregate_hash }
+        AggregatedProof {
+            proofs,
+            total_valid,
+            aggregate_hash,
+        }
     }
 
     /// Verify all proofs in a batch, including the aggregate hash.
@@ -354,7 +364,9 @@ impl Bulletproof {
     /// The aggregate hash binds all individual proofs together, preventing
     /// an attacker from substituting individual proofs within a batch.
     pub fn verify_batch(batch: &AggregatedProof) -> bool {
-        if batch.proofs.is_empty() { return false; }
+        if batch.proofs.is_empty() {
+            return false;
+        }
 
         // Recompute aggregate hash and verify it matches
         let mut h = Sha256::new();
@@ -463,16 +475,21 @@ mod tests {
         let p1 = Bulletproof::prove(100);
         let p2 = Bulletproof::prove(100);
         // Same amount, different blinding → different commitment
-        assert_ne!(p1.commitment_hex, p2.commitment_hex,
-            "Same amount must produce different commitments (randomized blinding)");
+        assert_ne!(
+            p1.commitment_hex, p2.commitment_hex,
+            "Same amount must produce different commitments (randomized blinding)"
+        );
     }
 
     #[test]
     fn proof_is_deterministic_size() {
         let p1 = Bulletproof::prove(100);
         let p2 = Bulletproof::prove(999);
-        assert_eq!(p1.proof_bytes.len(), p2.proof_bytes.len(),
-            "All proofs for same bit-width should be same size");
+        assert_eq!(
+            p1.proof_bytes.len(),
+            p2.proof_bytes.len(),
+            "All proofs for same bit-width should be same size"
+        );
     }
 
     #[test]
@@ -482,8 +499,10 @@ mod tests {
         // Tamper with the value binding (last 32 bytes)
         let len = proof.proof_bytes.len();
         proof.proof_bytes[len - 1] ^= 0xFF;
-        assert!(!Bulletproof::verify_range_proof(&proof),
-            "Tampered value binding must be rejected");
+        assert!(
+            !Bulletproof::verify_range_proof(&proof),
+            "Tampered value binding must be rejected"
+        );
     }
 
     #[test]
@@ -492,8 +511,10 @@ mod tests {
         assert!(Bulletproof::verify_range_proof(&proof));
         // Tamper with the first bit commitment
         proof.proof_bytes[0] ^= 0xFF;
-        assert!(!Bulletproof::verify_range_proof(&proof),
-            "Tampered bit commitment must be rejected");
+        assert!(
+            !Bulletproof::verify_range_proof(&proof),
+            "Tampered bit commitment must be rejected"
+        );
     }
 
     #[test]
@@ -502,7 +523,9 @@ mod tests {
         assert!(Bulletproof::verify_range_proof(&proof));
         // Replace blinding with a different one
         proof.blinding_hex = hex::encode([0xABu8; 32]);
-        assert!(!Bulletproof::verify_range_proof(&proof),
-            "Wrong blinding factor must be rejected by value binding");
+        assert!(
+            !Bulletproof::verify_range_proof(&proof),
+            "Wrong blinding factor must be rejected by value binding"
+        );
     }
 }

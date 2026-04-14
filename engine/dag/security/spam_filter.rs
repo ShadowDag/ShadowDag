@@ -12,10 +12,8 @@ use crate::engine::dag::security::dos_protection::MAX_BLOCK_TX_COUNT;
 pub struct SpamFilter;
 
 impl SpamFilter {
-
     #[inline(always)]
     pub fn validate(block: &Block) -> bool {
-
         let txs = &block.body.transactions;
         let len = txs.len();
 
@@ -33,7 +31,6 @@ impl SpamFilter {
         let mut coinbase_count = 0;
 
         for (i, tx) in txs.iter().enumerate() {
-
             // ❌ must have outputs
             if tx.outputs.is_empty() {
                 return false;
@@ -54,7 +51,6 @@ impl SpamFilter {
                     return false;
                 }
             } else {
-
                 // 🔥 duplicate inputs (فقط لغير coinbase)
                 let mut seen_inputs = HashSet::with_capacity(tx.inputs.len());
                 for input in &tx.inputs {
@@ -74,7 +70,6 @@ impl SpamFilter {
             let mut total: u128 = 0;
 
             for output in &tx.outputs {
-
                 // ❌ zero output
                 if output.amount == 0 {
                     return false;

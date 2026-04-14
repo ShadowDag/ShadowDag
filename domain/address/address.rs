@@ -3,16 +3,16 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// ShadowDAG address prefixes by network
 pub const MAINNET_PREFIX: &str = "SD1";
 pub const TESTNET_PREFIX: &str = "ST1";
 pub const REGTEST_PREFIX: &str = "SR1";
 pub const STEALTH_PREFIX: &str = "SD1s";
-pub const SCHNORR_PREFIX: &str = "SD1k";   // k for key (Schnorr)
-pub const P2SH_PREFIX:    &str = "SD1h";   // h for hash (P2SH)
+pub const SCHNORR_PREFIX: &str = "SD1k"; // k for key (Schnorr)
+pub const P2SH_PREFIX: &str = "SD1h"; // h for hash (P2SH)
 
 /// Resolve a network name (`"mainnet"` / `"testnet"` / `"regtest"`) to its
 /// 3-character on-chain prefix. Returns `None` for unknown networks so the
@@ -68,14 +68,17 @@ pub enum AddressType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Address {
-    pub value:        String,
+    pub value: String,
     pub address_type: AddressType,
 }
 
 impl Address {
     pub fn new(value: String) -> Self {
         let address_type = Self::detect_type(&value);
-        Self { value, address_type }
+        Self {
+            value,
+            address_type,
+        }
     }
 
     pub fn from_public_key(public_key: &[u8], network: &str) -> Self {
@@ -87,11 +90,14 @@ impl Address {
         let prefix = match network {
             "mainnet" => MAINNET_PREFIX,
             "testnet" => TESTNET_PREFIX,
-            _         => REGTEST_PREFIX,
+            _ => REGTEST_PREFIX,
         };
 
         let value = format!("{}{}", prefix, hex::encode(&hash[..20]));
-        Self { value, address_type: AddressType::Standard }
+        Self {
+            value,
+            address_type: AddressType::Standard,
+        }
     }
 
     pub fn is_valid(&self) -> bool {
@@ -115,7 +121,7 @@ impl Address {
         let (prefix_len, expected_hex_len) = if self.value.len() > 3 {
             match self.value.as_bytes()[3] {
                 b's' | b'k' | b'h' => (4, 40), // subtype prefix + 20-byte hash
-                _ => (3, 40),                    // standard address: 20-byte hash
+                _ => (3, 40),                  // standard address: 20-byte hash
             }
         } else {
             return false;
@@ -128,8 +134,7 @@ impl Address {
         let hex_part = &self.value[prefix_len..];
 
         // STRICT: hex part must be exactly 40 chars (20 bytes) and all hex
-        hex_part.len() == expected_hex_len
-            && hex_part.bytes().all(|b: u8| b.is_ascii_hexdigit())
+        hex_part.len() == expected_hex_len && hex_part.bytes().all(|b: u8| b.is_ascii_hexdigit())
     }
 
     /// Create a Schnorr address from a 32-byte x-only public key (BIP-340 style)
@@ -142,10 +147,13 @@ impl Address {
         let prefix = match network {
             "testnet" => "ST1k",
             "regtest" => "SR1k",
-            _         => SCHNORR_PREFIX,
+            _ => SCHNORR_PREFIX,
         };
         let value = format!("{}{}", prefix, hex::encode(&hash[..20]));
-        Self { value, address_type: AddressType::Schnorr }
+        Self {
+            value,
+            address_type: AddressType::Schnorr,
+        }
     }
 
     /// Create a P2SH address from a redeem script hash
@@ -158,10 +166,13 @@ impl Address {
         let prefix = match network {
             "testnet" => "ST1h",
             "regtest" => "SR1h",
-            _         => P2SH_PREFIX,
+            _ => P2SH_PREFIX,
         };
         let value = format!("{}{}", prefix, hex::encode(&hash[..20]));
-        Self { value, address_type: AddressType::P2SH }
+        Self {
+            value,
+            address_type: AddressType::P2SH,
+        }
     }
 
     pub fn is_schnorr(&self) -> bool {
@@ -177,9 +188,13 @@ impl Address {
     }
 
     pub fn network(&self) -> &str {
-        if self.value.starts_with("SD") { "mainnet" }
-        else if self.value.starts_with("ST") { "testnet" }
-        else { "regtest" }
+        if self.value.starts_with("SD") {
+            "mainnet"
+        } else if self.value.starts_with("ST") {
+            "testnet"
+        } else {
+            "regtest"
+        }
     }
 
     fn detect_type(value: &str) -> AddressType {

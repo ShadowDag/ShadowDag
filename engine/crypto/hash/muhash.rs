@@ -30,7 +30,7 @@
 //   remove: acc = acc * H(utxo)^(-1) mod P  (modular inverse)
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 /// A large prime for the multiplicative group.
 /// We use arithmetic in Z/pZ where p is a 256-bit prime.
@@ -47,11 +47,11 @@ const UTXO_HASH_TAG: &[u8] = b"ShadowDAG_MuHash_UTXO_v1";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MuHash {
     /// Multiplicative accumulator (starts at 1)
-    numerator:   u128,
+    numerator: u128,
     /// Divisor accumulator for removed elements (starts at 1)
     denominator: u128,
     /// Number of elements added
-    count:       u64,
+    count: u64,
 }
 
 impl Default for MuHash {
@@ -64,9 +64,9 @@ impl MuHash {
     /// Create a new empty MuHash (identity element = 1)
     pub fn new() -> Self {
         Self {
-            numerator:   1,
+            numerator: 1,
             denominator: 1,
-            count:       0,
+            count: 0,
         }
     }
 
@@ -81,7 +81,9 @@ impl MuHash {
     pub fn remove_utxo(&mut self, txid: &str, index: u32, amount: u64, address: &str) {
         let h = Self::hash_utxo(txid, index, amount, address);
         self.denominator = Self::mul_mod(self.denominator, h);
-        if self.count > 0 { self.count -= 1; }
+        if self.count > 0 {
+            self.count -= 1;
+        }
     }
 
     /// Add raw bytes element
@@ -95,7 +97,9 @@ impl MuHash {
     pub fn remove_element(&mut self, data: &[u8]) {
         let h = Self::hash_element(data);
         self.denominator = Self::mul_mod(self.denominator, h);
-        if self.count > 0 { self.count -= 1; }
+        if self.count > 0 {
+            self.count -= 1;
+        }
     }
 
     /// Finalize: compute the commitment hash
@@ -120,10 +124,14 @@ impl MuHash {
     }
 
     /// Get element count
-    pub fn count(&self) -> u64 { self.count }
+    pub fn count(&self) -> u64 {
+        self.count
+    }
 
     /// Check if empty
-    pub fn is_empty(&self) -> bool { self.count == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
 
     // ── Internal math ────────────────────────────────────────────
 
@@ -168,7 +176,9 @@ impl MuHash {
 
     /// Modular inverse using Fermat's little theorem: a^(-1) = a^(p-2) mod p
     fn mod_inverse(a: u128) -> u128 {
-        if a == 0 { return 1; } // Safety: 0 has no inverse, return identity
+        if a == 0 {
+            return 1;
+        } // Safety: 0 has no inverse, return identity
         Self::pow_mod(a % PRIME, PRIME - 2)
     }
 
@@ -229,8 +239,11 @@ mod tests {
         mh2.add_utxo("tx2", 0, 200, "SD1b");
         mh2.add_utxo("tx1", 0, 100, "SD1a");
 
-        assert_eq!(mh1.finalize(), mh2.finalize(),
-            "MuHash must be order-independent");
+        assert_eq!(
+            mh1.finalize(),
+            mh2.finalize(),
+            "MuHash must be order-independent"
+        );
     }
 
     #[test]
@@ -241,8 +254,11 @@ mod tests {
         mh.add_utxo("tx1", 0, 1000, "SD1a");
         mh.remove_utxo("tx1", 0, 1000, "SD1a");
 
-        assert_eq!(mh.finalize(), empty,
-            "Adding then removing same element must return to identity");
+        assert_eq!(
+            mh.finalize(),
+            empty,
+            "Adding then removing same element must return to identity"
+        );
     }
 
     #[test]
@@ -269,8 +285,11 @@ mod tests {
         combined.add_utxo("tx2", 0, 200, "SD1b");
 
         mh1.combine(&mh2);
-        assert_eq!(mh1.finalize(), combined.finalize(),
-            "Combining two sets must equal building from scratch");
+        assert_eq!(
+            mh1.finalize(),
+            combined.finalize(),
+            "Combining two sets must equal building from scratch"
+        );
     }
 
     #[test]
@@ -286,8 +305,11 @@ mod tests {
         expected.add_utxo("tx1", 0, 100, "SD1a");
         expected.add_utxo("tx3", 0, 300, "SD1c");
 
-        assert_eq!(full.finalize(), expected.finalize(),
-            "Removing middle element must match building without it");
+        assert_eq!(
+            full.finalize(),
+            expected.finalize(),
+            "Removing middle element must match building without it"
+        );
     }
 
     #[test]
@@ -299,8 +321,11 @@ mod tests {
         }
         let _commitment = mh.finalize();
         let elapsed = start.elapsed();
-        assert!(elapsed.as_millis() < 5_000,
-            "10K UTXO MuHash should compute in <5000ms, took {}ms", elapsed.as_millis());
+        assert!(
+            elapsed.as_millis() < 5_000,
+            "10K UTXO MuHash should compute in <5000ms, took {}ms",
+            elapsed.as_millis()
+        );
     }
 
     #[test]
@@ -329,8 +354,10 @@ mod tests {
         muhash.add_utxo("genesis", 0, 1000, "SD1miner");
         let after_rollback = muhash.finalize();
 
-        assert_eq!(after_genesis, after_rollback,
-            "Rollback must restore original commitment");
+        assert_eq!(
+            after_genesis, after_rollback,
+            "Rollback must restore original commitment"
+        );
     }
 
     #[test]

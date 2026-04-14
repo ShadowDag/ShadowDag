@@ -35,12 +35,13 @@ pub enum HexParseError {
 impl fmt::Display for HexParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::BadLength { expected, got } =>
-                write!(f, "hex length {}, expected {}", got, expected),
-            Self::InvalidChar { offset, byte } =>
-                write!(f, "non-hex byte 0x{:02X} at offset {}", byte, offset),
-            Self::Empty =>
-                write!(f, "empty hex string"),
+            Self::BadLength { expected, got } => {
+                write!(f, "hex length {}, expected {}", got, expected)
+            }
+            Self::InvalidChar { offset, byte } => {
+                write!(f, "non-hex byte 0x{:02X} at offset {}", byte, offset)
+            }
+            Self::Empty => write!(f, "empty hex string"),
         }
     }
 }
@@ -55,7 +56,11 @@ impl fmt::Display for HexParseError {
 #[inline]
 pub fn normalize_hex(raw: &str) -> &str {
     let s = raw.trim();
-    if s.starts_with("0x") || s.starts_with("0X") { &s[2..] } else { s }
+    if s.starts_with("0x") || s.starts_with("0X") {
+        &s[2..]
+    } else {
+        s
+    }
 }
 
 /// Validate that `hex` (already normalized) is exactly `expected_chars` long
@@ -65,7 +70,10 @@ pub fn validate_hex_strict(hex: &str, expected_chars: usize) -> Result<(), HexPa
         return Err(HexParseError::Empty);
     }
     if hex.len() != expected_chars {
-        return Err(HexParseError::BadLength { expected: expected_chars, got: hex.len() });
+        return Err(HexParseError::BadLength {
+            expected: expected_chars,
+            got: hex.len(),
+        });
     }
     for (i, b) in hex.bytes().enumerate() {
         if !b.is_ascii_hexdigit() {
@@ -91,10 +99,7 @@ pub fn parse_hash256(raw: &str) -> Result<[u8; 32], HexParseError> {
     // Validation passed — hex::decode cannot fail on validated input.
     // Use map_err to convert any (impossible) failure into our error type
     // rather than panicking.
-    let bytes = hex::decode(hex).map_err(|_| HexParseError::InvalidChar {
-        offset: 0,
-        byte: 0,
-    })?;
+    let bytes = hex::decode(hex).map_err(|_| HexParseError::InvalidChar { offset: 0, byte: 0 })?;
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
     Ok(arr)
@@ -106,10 +111,7 @@ pub fn parse_hash256(raw: &str) -> Result<[u8; 32], HexParseError> {
 pub fn parse_hex_exact(raw: &str, expected_bytes: usize) -> Result<Vec<u8>, HexParseError> {
     let hex = normalize_hex(raw);
     validate_hex_strict(hex, expected_bytes * 2)?;
-    let bytes = hex::decode(hex).map_err(|_| HexParseError::InvalidChar {
-        offset: 0,
-        byte: 0,
-    })?;
+    let bytes = hex::decode(hex).map_err(|_| HexParseError::InvalidChar { offset: 0, byte: 0 })?;
     Ok(bytes)
 }
 
@@ -175,7 +177,10 @@ mod tests {
     fn reject_short() {
         assert_eq!(
             parse_hash256("aabb"),
-            Err(HexParseError::BadLength { expected: 64, got: 4 })
+            Err(HexParseError::BadLength {
+                expected: 64,
+                got: 4
+            })
         );
     }
 
@@ -184,7 +189,10 @@ mod tests {
         let hex = "aa".repeat(33); // 66 chars
         assert_eq!(
             parse_hash256(&hex),
-            Err(HexParseError::BadLength { expected: 64, got: 66 })
+            Err(HexParseError::BadLength {
+                expected: 64,
+                got: 66
+            })
         );
     }
 
@@ -193,7 +201,13 @@ mod tests {
         let mut bad = "aa".repeat(32);
         bad.replace_range(0..1, "g");
         let err = parse_hash256(&bad).unwrap_err();
-        assert!(matches!(err, HexParseError::InvalidChar { offset: 0, byte: b'g' }));
+        assert!(matches!(
+            err,
+            HexParseError::InvalidChar {
+                offset: 0,
+                byte: b'g'
+            }
+        ));
     }
 
     #[test]
@@ -240,4 +254,3 @@ mod tests {
         assert!(HashHelper::is_valid(&format!("0x{}", "ff".repeat(32))));
     }
 }
-
