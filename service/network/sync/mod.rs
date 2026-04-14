@@ -8,11 +8,11 @@ pub mod chain_verifier;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-pub const MAX_IN_FLIGHT:        usize    = 128;
-pub const PEER_TIMEOUT_SECS:    u64      = 15;
-pub const MAX_RETRIES:          u32      = 3;
-pub const HEADERS_BATCH_SIZE:   usize    = 2_000;
-pub const BLOCKS_BATCH_SIZE:    usize    = 128;
+pub const MAX_IN_FLIGHT: usize = 128;
+pub const PEER_TIMEOUT_SECS: u64 = 15;
+pub const MAX_RETRIES: u32 = 3;
+pub const HEADERS_BATCH_SIZE: usize = 2_000;
+pub const BLOCKS_BATCH_SIZE: usize = 128;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SyncState {
@@ -24,38 +24,38 @@ pub enum SyncState {
 
 #[derive(Debug, Clone)]
 pub struct PendingRequest {
-    pub hash:        String,
-    pub peer:        String,
-    pub sent_at:     Instant,
-    pub retries:     u32,
+    pub hash: String,
+    pub peer: String,
+    pub sent_at: Instant,
+    pub retries: u32,
 }
 
 pub struct SyncManager {
-    pub state:          SyncState,
-    pub local_height:   u64,
-    pub best_height:    u64,
-    pending_headers:    HashMap<String, PendingRequest>,
-    pending_blocks:     HashMap<String, PendingRequest>,
-    header_queue:       VecDeque<String>,
-    block_queue:        VecDeque<String>,
+    pub state: SyncState,
+    pub local_height: u64,
+    pub best_height: u64,
+    pending_headers: HashMap<String, PendingRequest>,
+    pending_blocks: HashMap<String, PendingRequest>,
+    header_queue: VecDeque<String>,
+    block_queue: VecDeque<String>,
     downloaded_headers: HashSet<String>,
-    downloaded_blocks:  HashSet<String>,
-    slow_peers:         HashSet<String>,
+    downloaded_blocks: HashSet<String>,
+    slow_peers: HashSet<String>,
 }
 
 impl SyncManager {
     pub fn new(local_height: u64) -> Self {
         Self {
-            state:              SyncState::Idle,
+            state: SyncState::Idle,
             local_height,
-            best_height:        0,
-            pending_headers:    HashMap::new(),
-            pending_blocks:     HashMap::new(),
-            header_queue:       VecDeque::new(),
-            block_queue:        VecDeque::new(),
+            best_height: 0,
+            pending_headers: HashMap::new(),
+            pending_blocks: HashMap::new(),
+            header_queue: VecDeque::new(),
+            block_queue: VecDeque::new(),
             downloaded_headers: HashSet::new(),
-            downloaded_blocks:  HashSet::new(),
-            slow_peers:         HashSet::new(),
+            downloaded_blocks: HashSet::new(),
+            slow_peers: HashSet::new(),
         }
     }
 
@@ -69,14 +69,21 @@ impl SyncManager {
     }
 
     pub fn request_headers(&mut self, from_hash: &str, peer: &str) -> bool {
-        if self.pending_headers.len() >= MAX_IN_FLIGHT { return false; }
-        if self.downloaded_headers.contains(from_hash) { return false; }
-        self.pending_headers.insert(from_hash.to_string(), PendingRequest {
-            hash:    from_hash.to_string(),
-            peer:    peer.to_string(),
-            sent_at: Instant::now(),
-            retries: 0,
-        });
+        if self.pending_headers.len() >= MAX_IN_FLIGHT {
+            return false;
+        }
+        if self.downloaded_headers.contains(from_hash) {
+            return false;
+        }
+        self.pending_headers.insert(
+            from_hash.to_string(),
+            PendingRequest {
+                hash: from_hash.to_string(),
+                peer: peer.to_string(),
+                sent_at: Instant::now(),
+                retries: 0,
+            },
+        );
         true
     }
 
@@ -99,14 +106,19 @@ impl SyncManager {
     }
 
     pub fn request_next_block(&mut self, peer: &str) -> Option<String> {
-        if self.pending_blocks.len() >= MAX_IN_FLIGHT { return None; }
+        if self.pending_blocks.len() >= MAX_IN_FLIGHT {
+            return None;
+        }
         let hash = self.block_queue.pop_front()?;
-        self.pending_blocks.insert(hash.clone(), PendingRequest {
-            hash:    hash.clone(),
-            peer:    peer.to_string(),
-            sent_at: Instant::now(),
-            retries: 0,
-        });
+        self.pending_blocks.insert(
+            hash.clone(),
+            PendingRequest {
+                hash: hash.clone(),
+                peer: peer.to_string(),
+                sent_at: Instant::now(),
+                retries: 0,
+            },
+        );
         Some(hash)
     }
 
@@ -129,7 +141,9 @@ impl SyncManager {
         let timeout = Duration::from_secs(PEER_TIMEOUT_SECS);
         let mut retry_list = Vec::new();
 
-        let stale_h: Vec<String> = self.pending_headers.iter()
+        let stale_h: Vec<String> = self
+            .pending_headers
+            .iter()
             .filter(|(_, r)| r.sent_at.elapsed() > timeout)
             .map(|(h, _)| h.clone())
             .collect();
@@ -147,7 +161,9 @@ impl SyncManager {
             }
         }
 
-        let stale_b: Vec<String> = self.pending_blocks.iter()
+        let stale_b: Vec<String> = self
+            .pending_blocks
+            .iter()
             .filter(|(_, r)| r.sent_at.elapsed() > timeout)
             .map(|(h, _)| h.clone())
             .collect();
@@ -173,11 +189,21 @@ impl SyncManager {
         self.header_queue.pop_front()
     }
 
-    pub fn is_synced(&self)               -> bool    { self.state == SyncState::Synced }
-    pub fn pending_block_count(&self)     -> usize   { self.pending_blocks.len() }
-    pub fn queued_block_count(&self)      -> usize   { self.block_queue.len() }
-    pub fn downloaded_block_count(&self)  -> usize   { self.downloaded_blocks.len() }
-    pub fn is_slow_peer(&self, p: &str)   -> bool    { self.slow_peers.contains(p) }
+    pub fn is_synced(&self) -> bool {
+        self.state == SyncState::Synced
+    }
+    pub fn pending_block_count(&self) -> usize {
+        self.pending_blocks.len()
+    }
+    pub fn queued_block_count(&self) -> usize {
+        self.block_queue.len()
+    }
+    pub fn downloaded_block_count(&self) -> usize {
+        self.downloaded_blocks.len()
+    }
+    pub fn is_slow_peer(&self, p: &str) -> bool {
+        self.slow_peers.contains(p)
+    }
 }
 
 #[cfg(test)]

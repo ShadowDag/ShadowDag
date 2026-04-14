@@ -3,12 +3,12 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options};
-use std::path::Path;
 use bincode;
+use rocksdb::{Options, DB};
+use std::path::Path;
 
-use crate::service::wallet::core::wallet::Wallet;
 use crate::errors::WalletError;
+use crate::service::wallet::core::wallet::Wallet;
 
 pub struct WalletDB {
     db: DB,
@@ -19,11 +19,12 @@ impl WalletDB {
         let mut opts = Options::default();
         opts.create_if_missing(true);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| crate::errors::StorageError::OpenFailed {
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| {
+            crate::errors::StorageError::OpenFailed {
                 path: path.to_string(),
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         Ok(Self { db })
     }
@@ -31,11 +32,14 @@ impl WalletDB {
     pub fn save_wallet(&self, wallet: &Wallet) -> Result<(), WalletError> {
         let key = wallet.address();
         if key.is_empty() || key == "__no_address__" {
-            return Err(WalletError::Other("cannot save wallet with empty address".into()));
+            return Err(WalletError::Other(
+                "cannot save wallet with empty address".into(),
+            ));
         }
         let data = bincode::serialize(wallet)
             .map_err(|e| WalletError::Other(format!("serialize failed: {}", e)))?;
-        self.db.put(&key, data)
+        self.db
+            .put(&key, data)
             .map_err(|e| WalletError::Other(format!("db put failed: {}", e)))?;
         Ok(())
     }

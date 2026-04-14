@@ -18,10 +18,10 @@
 // monopolize all connections.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::collections::HashMap;
-use sha2::{Sha256, Digest};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 /// Maximum peers from the same /16 subnet
 pub const MAX_PEERS_PER_SUBNET: usize = 2;
@@ -38,11 +38,11 @@ pub struct PeerIdentity {
     /// Ed25519 public key of the peer
     pub public_key: String,
     /// Signature over (public_key || timestamp || nonce) — proves key ownership
-    pub signature:  String,
+    pub signature: String,
     /// When the identity was created
-    pub timestamp:  u64,
+    pub timestamp: u64,
     /// Random nonce to prevent replay
-    pub nonce:      String,
+    pub nonce: String,
 }
 
 impl PeerIdentity {
@@ -54,7 +54,9 @@ impl PeerIdentity {
         let pk_hex = hex::encode(pk.to_bytes());
 
         let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
 
         let mut nonce_bytes = [0u8; 16];
         OsRng.fill_bytes(&mut nonce_bytes);
@@ -72,15 +74,15 @@ impl PeerIdentity {
 
         Self {
             public_key: pk_hex,
-            signature:  sig_hex,
-            timestamp:  ts,
-            nonce:      nonce_hex,
+            signature: sig_hex,
+            timestamp: ts,
+            nonce: nonce_hex,
         }
     }
 
     /// Verify a peer identity
     pub fn verify(&self) -> bool {
-        use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
         let pk_bytes = match hex::decode(&self.public_key) {
             Ok(b) if b.len() == 32 => b,
@@ -117,8 +119,12 @@ impl PeerIdentity {
             .as_secs();
 
         // Reject identities from the future or too old (5 minutes)
-        if self.timestamp > now + 30 { return false; } // max 30s future
-        if now.saturating_sub(self.timestamp) > 300 { return false; } // max 5 min old
+        if self.timestamp > now + 30 {
+            return false;
+        } // max 30s future
+        if now.saturating_sub(self.timestamp) > 300 {
+            return false;
+        } // max 5 min old
 
         true
     }
@@ -144,7 +150,10 @@ pub fn subnet_16(ip: &str) -> String {
 
     // Try parsing as SocketAddr first (handles "ip:port" and "[ipv6]:port"),
     // then fall back to bare IP address.
-    let addr: Option<IpAddr> = ip.parse::<SocketAddr>().ok().map(|sa| sa.ip())
+    let addr: Option<IpAddr> = ip
+        .parse::<SocketAddr>()
+        .ok()
+        .map(|sa| sa.ip())
         .or_else(|| ip.parse::<IpAddr>().ok());
 
     match addr {
@@ -167,11 +176,11 @@ pub fn subnet_16(ip: &str) -> String {
 /// Peer diversity manager
 pub struct PeerDiversity {
     /// Subnet → count of connected peers
-    subnet_counts:  HashMap<String, usize>,
+    subnet_counts: HashMap<String, usize>,
     /// Anchor peers (persist across restarts)
-    anchor_peers:   Vec<String>,
+    anchor_peers: Vec<String>,
     /// Connected peer identities
-    identities:     HashMap<String, PeerIdentity>,
+    identities: HashMap<String, PeerIdentity>,
 }
 
 impl Default for PeerDiversity {
@@ -184,8 +193,8 @@ impl PeerDiversity {
     pub fn new() -> Self {
         Self {
             subnet_counts: HashMap::new(),
-            anchor_peers:  Vec::new(),
-            identities:    HashMap::new(),
+            anchor_peers: Vec::new(),
+            identities: HashMap::new(),
         }
     }
 
@@ -220,7 +229,9 @@ impl PeerDiversity {
         let subnet = subnet_16(ip);
         if let Some(count) = self.subnet_counts.get_mut(&subnet) {
             *count = count.saturating_sub(1);
-            if *count == 0 { self.subnet_counts.remove(&subnet); }
+            if *count == 0 {
+                self.subnet_counts.remove(&subnet);
+            }
         }
         self.identities.remove(ip);
     }
@@ -281,7 +292,10 @@ mod tests {
         // Bare IPv6 address
         assert_eq!(subnet_16("2001:db8:85a3::8a2e:370:7334"), "v6:2001:0db8");
         // Different /32 subnets produce different keys
-        assert_ne!(subnet_16("[2001:db8::1]:9333"), subnet_16("[2600:1f18::1]:9333"));
+        assert_ne!(
+            subnet_16("[2001:db8::1]:9333"),
+            subnet_16("[2600:1f18::1]:9333")
+        );
         // Same /32 subnet produces same key regardless of host part
         assert_eq!(
             subnet_16("[2001:db8::1]:9333"),
@@ -292,7 +306,10 @@ mod tests {
     #[test]
     fn subnet_ipv4_vs_ipv6_distinct() {
         // Even if numeric values overlap, v4 and v6 prefixes are distinct
-        assert_ne!(subnet_16("10.0.0.1:9333"), subnet_16("[::ffff:10.0.0.1]:9333"));
+        assert_ne!(
+            subnet_16("10.0.0.1:9333"),
+            subnet_16("[::ffff:10.0.0.1]:9333")
+        );
     }
 
     #[test]

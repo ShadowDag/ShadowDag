@@ -3,7 +3,7 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options, WriteOptions, ReadOptions};
+use rocksdb::{Options, ReadOptions, WriteOptions, DB};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -20,14 +20,13 @@ pub const RETARGET_INTERVAL: u64 = 120;
 /// IMPORTANT: This is a compile-time constant derived from ConsensusParams::BLOCKS_PER_SECOND.
 /// Changing BPS requires recompilation. If a future hard fork changes BPS, this must be
 /// handled via an activation-height mechanism, not runtime BPS switching.
-pub const RETARGET_BLOCK_INTERVAL: u64 = RETARGET_INTERVAL * crate::config::consensus::consensus_params::ConsensusParams::BLOCKS_PER_SECOND;
+pub const RETARGET_BLOCK_INTERVAL: u64 = RETARGET_INTERVAL
+    * crate::config::consensus::consensus_params::ConsensusParams::BLOCKS_PER_SECOND;
 pub const ADJUSTMENT_FACTOR_MAX: u64 = 4;
 pub const TARGET_BLOCK_TIME_SECS: u64 = 1;
 
 // 🔥 EMA smoothing — must match retarget.rs (single source of truth)
-use crate::engine::consensus::difficulty::retarget::{
-    EMA_ALPHA_NUM, EMA_ALPHA_DEN,
-};
+use crate::engine::consensus::difficulty::retarget::{EMA_ALPHA_DEN, EMA_ALPHA_NUM};
 
 const KEY_DIFFICULTY: &[u8] = b"difficulty";
 
@@ -39,7 +38,6 @@ pub struct DifficultyAdjustment {
 }
 
 impl DifficultyAdjustment {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
@@ -63,8 +61,10 @@ impl DifficultyAdjustment {
         opts.set_use_fsync(true);
         opts.set_unordered_write(false);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         let mut write_opts = WriteOptions::default();
         write_opts.disable_wal(false);
@@ -93,11 +93,9 @@ impl DifficultyAdjustment {
 
     #[inline(always)]
     pub fn set_difficulty(&self, difficulty: u64) -> Result<(), ConsensusError> {
-        self.db.put_opt(
-            KEY_DIFFICULTY,
-            difficulty.to_le_bytes(),
-            &self.write_opts,
-        ).map_err(StorageError::RocksDb)?;
+        self.db
+            .put_opt(KEY_DIFFICULTY, difficulty.to_le_bytes(), &self.write_opts)
+            .map_err(StorageError::RocksDb)?;
         Ok(())
     }
 
@@ -105,11 +103,7 @@ impl DifficultyAdjustment {
     // MAIN ENTRY
     // ─────────────────────────────────────────
     #[inline(always)]
-    pub fn on_new_block(
-        &self,
-        height: u64,
-        window_timestamps: &[u64],
-    ) -> u64 {
+    pub fn on_new_block(&self, height: u64, window_timestamps: &[u64]) -> u64 {
         if height == 0 || !height.is_multiple_of(RETARGET_BLOCK_INTERVAL) {
             return self.get_difficulty();
         }
@@ -128,9 +122,10 @@ impl DifficultyAdjustment {
         // timestamps. Refuse to adjust — keep current difficulty.
         if window_timestamps.len() >= 5 {
             let first = window_timestamps[0];
-            let last  = window_timestamps[window_timestamps.len() - 1];
-            let span  = last.saturating_sub(first);
-            let expected = (window_timestamps.len() as u64 - 1).saturating_mul(self.target_block_time);
+            let last = window_timestamps[window_timestamps.len() - 1];
+            let span = last.saturating_sub(first);
+            let expected =
+                (window_timestamps.len() as u64 - 1).saturating_mul(self.target_block_time);
             // If actual span < expected / 4, timestamps are suspicious
             if expected > 0 && span < expected / ADJUSTMENT_FACTOR_MAX {
                 return self.get_difficulty();
@@ -143,11 +138,7 @@ impl DifficultyAdjustment {
     // ─────────────────────────────────────────
     // CORE LOGIC
     // ─────────────────────────────────────────
-    pub fn recalculate_difficulty(
-        &self,
-        _height: u64,
-        window_timestamps: &[u64],
-    ) -> u64 {
+    pub fn recalculate_difficulty(&self, _height: u64, window_timestamps: &[u64]) -> u64 {
         let current = self.get_difficulty();
 
         let len = window_timestamps.len();
@@ -202,14 +193,12 @@ impl DifficultyAdjustment {
 
         let clamped_timespan = actual_timespan.clamp(min_ts, max_ts);
 
-        let raw = (current as u128)
-            .saturating_mul(expected_timespan as u128)
+        let raw = (current as u128).saturating_mul(expected_timespan as u128)
             / (clamped_timespan as u128).max(1);
 
-        let smoothed = (
-            raw * EMA_ALPHA_NUM as u128 +
-            current as u128 * (EMA_ALPHA_DEN - EMA_ALPHA_NUM) as u128
-        ) / EMA_ALPHA_DEN as u128;
+        let smoothed = (raw * EMA_ALPHA_NUM as u128
+            + current as u128 * (EMA_ALPHA_DEN - EMA_ALPHA_NUM) as u128)
+            / EMA_ALPHA_DEN as u128;
 
         let new_difficulty = Difficulty::clamp(smoothed as u64);
 
@@ -224,16 +213,10 @@ impl DifficultyAdjustment {
     // LEGACY
     // ─────────────────────────────────────────
     #[inline(always)]
-    pub fn adjust_difficulty(
-        &self,
-        last_block_time: u64,
-        new_block_time: u64,
-    ) -> u64 {
+    pub fn adjust_difficulty(&self, last_block_time: u64, new_block_time: u64) -> u64 {
         let mut difficulty = self.get_difficulty();
 
-        let time_diff = new_block_time
-            .saturating_sub(last_block_time)
-            .max(1);
+        let time_diff = new_block_time.saturating_sub(last_block_time).max(1);
 
         // Legacy adjustment — use retarget engine for production.
         // Fix: time_diff == target_block_time should still increase
@@ -416,7 +399,8 @@ mod tests {
         assert!(
             d >= Difficulty::MIN_DIFFICULTY,
             "difficulty {} below MIN {}",
-            d, Difficulty::MIN_DIFFICULTY,
+            d,
+            Difficulty::MIN_DIFFICULTY,
         );
     }
 
@@ -430,7 +414,8 @@ mod tests {
         assert!(
             d <= Difficulty::MAX_DIFFICULTY,
             "difficulty {} above MAX {}",
-            d, Difficulty::MAX_DIFFICULTY,
+            d,
+            Difficulty::MAX_DIFFICULTY,
         );
     }
 

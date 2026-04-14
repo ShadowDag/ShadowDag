@@ -26,10 +26,7 @@ impl BootstrapNodes {
     }
 
     pub fn localhost() -> Vec<&'static str> {
-        vec![
-            "127.0.0.1:29333",
-            "127.0.0.1:29334",
-        ]
+        vec!["127.0.0.1:29333", "127.0.0.1:29334"]
     }
 
     /// Single source of truth: return seeds for a given network mode.
@@ -43,7 +40,10 @@ impl BootstrapNodes {
 
     /// Return seeds as owned Strings (convenience for APIs that need String).
     pub fn for_network_owned(network: &NetworkMode) -> Vec<String> {
-        Self::for_network(network).into_iter().map(|s| s.to_string()).collect()
+        Self::for_network(network)
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     /// Return full seed addresses (host:port) for bootstrap connections.
@@ -71,28 +71,42 @@ mod tests {
     #[test]
     fn mainnet_uses_port_9333() {
         for seed in BootstrapNodes::mainnet() {
-            assert!(seed.ends_with(":9333"),
-                "mainnet seed '{}' must use port 9333", seed);
+            assert!(
+                seed.ends_with(":9333"),
+                "mainnet seed '{}' must use port 9333",
+                seed
+            );
         }
     }
 
     #[test]
     fn testnet_uses_port_19333() {
         for seed in BootstrapNodes::testnet() {
-            assert!(seed.ends_with(":19333"),
-                "testnet seed '{}' must use port 19333", seed);
+            assert!(
+                seed.ends_with(":19333"),
+                "testnet seed '{}' must use port 19333",
+                seed
+            );
         }
     }
 
     #[test]
     fn localhost_uses_port_29333() {
         let seeds = BootstrapNodes::localhost();
-        assert!(seeds.iter().any(|s| s.contains(":29333")),
-            "localhost seeds must include port 29333");
-        assert!(seeds.iter().any(|s| s.contains(":29334")),
-            "localhost seeds must include port 29334");
+        assert!(
+            seeds.iter().any(|s| s.contains(":29333")),
+            "localhost seeds must include port 29333"
+        );
+        assert!(
+            seeds.iter().any(|s| s.contains(":29334")),
+            "localhost seeds must include port 29334"
+        );
         for seed in &seeds {
-            assert!(seed.starts_with("127.0.0.1:"), "seed must be localhost, got: {}", seed);
+            assert!(
+                seed.starts_with("127.0.0.1:"),
+                "seed must be localhost, got: {}",
+                seed
+            );
         }
     }
 
@@ -101,8 +115,11 @@ mod tests {
         let mn = BootstrapNodes::mainnet();
         let tn = BootstrapNodes::testnet();
         for seed in &mn {
-            assert!(!tn.contains(seed),
-                "seed '{}' appears in both mainnet and testnet", seed);
+            assert!(
+                !tn.contains(seed),
+                "seed '{}' appears in both mainnet and testnet",
+                seed
+            );
         }
     }
 }

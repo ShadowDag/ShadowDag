@@ -3,43 +3,43 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options, WriteBatch, IteratorMode};
+use crate::errors::StorageError;
+use rocksdb::{IteratorMode, Options, WriteBatch, DB};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
-use crate::errors::StorageError;
 
-pub const SNAPSHOT_INTERVAL_BLOCKS: u64   = 10_000;
-pub const MAX_SNAPSHOTS:            usize = 5;
-pub const SNAPSHOT_VERSION:         u32   = 2;
-pub const CHUNK_SIZE_BYTES:         usize = 65_536;
-pub const SNAPSHOT_MAGIC:           &[u8] = b"SDAGSNAP";
+pub const SNAPSHOT_INTERVAL_BLOCKS: u64 = 10_000;
+pub const MAX_SNAPSHOTS: usize = 5;
+pub const SNAPSHOT_VERSION: u32 = 2;
+pub const CHUNK_SIZE_BYTES: usize = 65_536;
+pub const SNAPSHOT_MAGIC: &[u8] = b"SDAGSNAP";
 /// Max allowed chunks per snapshot — prevents memory exhaustion from crafted metadata.
-pub const MAX_SNAPSHOT_CHUNKS:      u64   = 500_000;
+pub const MAX_SNAPSHOT_CHUNKS: u64 = 500_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UtxoSnapshotEntry {
-    pub txid:       String,
-    pub index:      u32,
-    pub address:    String,
-    pub amount:     u64,
-    pub height:     u64,
+    pub txid: String,
+    pub index: u32,
+    pub address: String,
+    pub amount: u64,
+    pub height: u64,
     pub is_coinbase: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotMetadata {
-    pub version:      u32,
-    pub block_hash:   String,
+    pub version: u32,
+    pub block_hash: String,
     pub block_height: u64,
-    pub utxo_count:   u64,
-    pub merkle_root:  String,
-    pub size_bytes:   u64,
-    pub chunk_count:  u64,
-    pub created_at:   u64,
-    pub network:      String,
+    pub utxo_count: u64,
+    pub merkle_root: String,
+    pub size_bytes: u64,
+    pub chunk_count: u64,
+    pub created_at: u64,
+    pub network: String,
 }
 
 impl SnapshotMetadata {
@@ -51,17 +51,17 @@ impl SnapshotMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotChunk {
-    pub chunk_index:  u64,
+    pub chunk_index: u64,
     pub total_chunks: u64,
-    pub entries:      Vec<UtxoSnapshotEntry>,
-    pub chunk_hash:   String,
+    pub entries: Vec<UtxoSnapshotEntry>,
+    pub chunk_hash: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct SnapshotProgress {
-    pub meta:         SnapshotMetadata,
-    pub received:     Vec<bool>,
-    pub from_peers:   HashMap<u64, String>,
+    pub meta: SnapshotMetadata,
+    pub received: Vec<bool>,
+    pub from_peers: HashMap<u64, String>,
 }
 
 impl SnapshotProgress {
@@ -91,7 +91,9 @@ impl SnapshotProgress {
     }
 
     pub fn missing_chunks(&self) -> Vec<u64> {
-        self.received.iter().enumerate()
+        self.received
+            .iter()
+            .enumerate()
             .filter(|(_, r)| !*r)
             .map(|(i, _)| i as u64)
             .collect()
@@ -99,9 +101,9 @@ impl SnapshotProgress {
 }
 
 pub struct SnapshotManager {
-    db:           Arc<Mutex<DB>>,
-    progress:     Arc<Mutex<Option<SnapshotProgress>>>,
-    network:      String,
+    db: Arc<Mutex<DB>>,
+    progress: Arc<Mutex<Option<SnapshotProgress>>>,
+    network: String,
 }
 
 impl SnapshotManager {
@@ -109,12 +111,14 @@ impl SnapshotManager {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_write_buffer_size(64 * 1024 * 1024);
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
         Ok(Self {
-            db:       Arc::new(Mutex::new(db)),
+            db: Arc::new(Mutex::new(db)),
             progress: Arc::new(Mutex::new(None)),
-            network:  network.to_string(),
+            network: network.to_string(),
         })
     }
 
@@ -132,37 +136,41 @@ impl SnapshotManager {
         let chunk_count = SnapshotMetadata::chunk_count_for(utxos.len() as u64);
 
         let meta = SnapshotMetadata {
-            version:      SNAPSHOT_VERSION,
-            block_hash:   block_hash.to_string(),
+            version: SNAPSHOT_VERSION,
+            block_hash: block_hash.to_string(),
             block_height,
-            utxo_count:   utxos.len() as u64,
-            merkle_root:  merkle_root.clone(),
-            size_bytes:   (utxos.len() * 128) as u64,
+            utxo_count: utxos.len() as u64,
+            merkle_root: merkle_root.clone(),
+            size_bytes: (utxos.len() * 128) as u64,
             chunk_count,
-            created_at:   unix_now(),
-            network:      self.network.clone(),
+            created_at: unix_now(),
+            network: self.network.clone(),
         };
 
         let db = self.lock_db();
         let meta_key = format!("snap:meta:{}", block_height);
-        let meta_data = bincode::serialize(&meta).map_err(|e| StorageError::Serialization(e.to_string()))?;
-        db.put(meta_key.as_bytes(), &meta_data).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        let meta_data =
+            bincode::serialize(&meta).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        db.put(meta_key.as_bytes(), &meta_data)
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
 
         let entries_per_chunk = (CHUNK_SIZE_BYTES / 128).max(1);
         let mut batch = WriteBatch::default();
 
         for (chunk_idx, chunk_entries) in utxos.chunks(entries_per_chunk).enumerate() {
             let chunk = SnapshotChunk {
-                chunk_index:  chunk_idx as u64,
+                chunk_index: chunk_idx as u64,
                 total_chunks: chunk_count,
-                entries:      chunk_entries.to_vec(),
-                chunk_hash:   self.hash_chunk(chunk_entries),
+                entries: chunk_entries.to_vec(),
+                chunk_hash: self.hash_chunk(chunk_entries),
             };
-            let chunk_key  = format!("snap:chunk:{}:{}", block_height, chunk_idx);
-            let chunk_data = bincode::serialize(&chunk).map_err(|e| StorageError::Serialization(e.to_string()))?;
+            let chunk_key = format!("snap:chunk:{}:{}", block_height, chunk_idx);
+            let chunk_data = bincode::serialize(&chunk)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
             batch.put(chunk_key.as_bytes(), &chunk_data);
         }
-        db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        db.write(batch)
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
 
         self.prune_old_snapshots(&db);
 
@@ -176,7 +184,9 @@ impl SnapshotManager {
         for item in db.iterator(IteratorMode::Start) {
             match item {
                 Ok((k, v)) => {
-                    if !k.starts_with(prefix) { continue; }
+                    if !k.starts_with(prefix) {
+                        continue;
+                    }
                     match bincode::deserialize::<SnapshotMetadata>(&v) {
                         Ok(m) => metas.push(m),
                         Err(e) => {
@@ -206,14 +216,24 @@ impl SnapshotManager {
             Ok(Some(d)) => d,
             Ok(None) => return None,
             Err(e) => {
-                log::error!("[Snapshot] DB read failed for chunk {}:{}: {}", height, chunk_index, e);
+                log::error!(
+                    "[Snapshot] DB read failed for chunk {}:{}: {}",
+                    height,
+                    chunk_index,
+                    e
+                );
                 return None;
             }
         };
         match bincode::deserialize(&data) {
             Ok(chunk) => Some(chunk),
             Err(e) => {
-                log::error!("[Snapshot] failed to deserialize chunk {}:{}: {}", height, chunk_index, e);
+                log::error!(
+                    "[Snapshot] failed to deserialize chunk {}:{}: {}",
+                    height,
+                    chunk_index,
+                    e
+                );
                 None
             }
         }
@@ -227,7 +247,10 @@ impl SnapshotManager {
     pub fn receive_chunk(&self, chunk: SnapshotChunk, peer: &str) -> Result<bool, StorageError> {
         let expected = self.hash_chunk(&chunk.entries);
         if expected != chunk.chunk_hash {
-            return Err(StorageError::Other(format!("Chunk {} hash mismatch", chunk.chunk_index)));
+            return Err(StorageError::Other(format!(
+                "Chunk {} hash mismatch",
+                chunk.chunk_index
+            )));
         }
 
         // Check active download FIRST — avoid writing to DB if no download is in progress
@@ -250,8 +273,10 @@ impl SnapshotManager {
         {
             let db = self.lock_db();
             let key = format!("snap:dl:chunk:{}", chunk.chunk_index);
-            let data = bincode::serialize(&chunk).map_err(|e| StorageError::Serialization(e.to_string()))?;
-            db.put(key.as_bytes(), &data).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+            let data = bincode::serialize(&chunk)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            db.put(key.as_bytes(), &data)
+                .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         }
 
         let mut prog = self.progress.lock().unwrap_or_else(|e| e.into_inner());
@@ -272,45 +297,57 @@ impl SnapshotManager {
             let prog = self.progress.lock().unwrap_or_else(|e| e.into_inner());
             match prog.as_ref() {
                 Some(p) if p.is_complete() => p.meta.clone(),
-                Some(_) => return Err(StorageError::Other("Snapshot download incomplete".to_string())),
-                None    => return Err(StorageError::Other("No active download".to_string())),
+                Some(_) => {
+                    return Err(StorageError::Other(
+                        "Snapshot download incomplete".to_string(),
+                    ))
+                }
+                None => return Err(StorageError::Other("No active download".to_string())),
             }
         };
 
         // Validate snapshot version
         if meta.version != SNAPSHOT_VERSION {
             return Err(StorageError::Other(format!(
-                "snapshot version {} != expected {}", meta.version, SNAPSHOT_VERSION
+                "snapshot version {} != expected {}",
+                meta.version, SNAPSHOT_VERSION
             )));
         }
 
         // Validate network matches
         if meta.network != self.network {
             return Err(StorageError::Other(format!(
-                "snapshot network '{}' != expected '{}'", meta.network, self.network
+                "snapshot network '{}' != expected '{}'",
+                meta.network, self.network
             )));
         }
 
         if meta.chunk_count > MAX_SNAPSHOT_CHUNKS {
             return Err(StorageError::Other(format!(
-                "chunk_count {} exceeds maximum {}", meta.chunk_count, MAX_SNAPSHOT_CHUNKS
+                "chunk_count {} exceeds maximum {}",
+                meta.chunk_count, MAX_SNAPSHOT_CHUNKS
             )));
         }
 
         let db = self.lock_db();
         let mut all_entries: Vec<UtxoSnapshotEntry> = Vec::new();
         for chunk_idx in 0..meta.chunk_count {
-            let key  = format!("snap:dl:chunk:{}", chunk_idx);
-            let data = db.get(key.as_bytes())
+            let key = format!("snap:dl:chunk:{}", chunk_idx);
+            let data = db
+                .get(key.as_bytes())
                 .map_err(|e| StorageError::ReadFailed(e.to_string()))?
                 .ok_or_else(|| StorageError::KeyNotFound(format!("Missing chunk {}", chunk_idx)))?;
-            let chunk: SnapshotChunk = bincode::deserialize(&data).map_err(|e| StorageError::Serialization(e.to_string()))?;
+            let chunk: SnapshotChunk = bincode::deserialize(&data)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
             all_entries.extend(chunk.entries);
         }
 
         let root = self.compute_merkle_root(&all_entries);
         if root != meta.merkle_root {
-            return Err(StorageError::Other(format!("Merkle root mismatch: got {} expected {}", root, meta.merkle_root)));
+            return Err(StorageError::Other(format!(
+                "Merkle root mismatch: got {} expected {}",
+                root, meta.merkle_root
+            )));
         }
 
         // Clear existing UTXO state before applying snapshot.
@@ -324,7 +361,8 @@ impl SnapshotManager {
                     clear_batch.delete(&k);
                 }
             }
-            db.write(clear_batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+            db.write(clear_batch)
+                .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         }
 
         let mut batch = WriteBatch::default();
@@ -333,20 +371,28 @@ impl SnapshotManager {
             // apply_block_dag_ordered and all other UTXO operations. Previously used
             // "utxo:txid:index" string which would be invisible to the UTXO layer.
             let key = crate::domain::utxo::utxo_set::utxo_key(&entry.txid, entry.index)?;
-            let data = bincode::serialize(entry).map_err(|e| StorageError::Serialization(e.to_string()))?;
+            let data = bincode::serialize(entry)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
             batch.put(key.as_ref(), &data);
         }
-        db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        db.write(batch)
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
 
         Ok(meta)
     }
 
     pub fn download_progress(&self) -> Option<u64> {
-        self.progress.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|p| p.completion_pct())
+        self.progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|p| p.completion_pct())
     }
 
     pub fn missing_chunks(&self) -> Vec<u64> {
-        self.progress.lock().unwrap_or_else(|e| e.into_inner())
+        self.progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(|p| p.missing_chunks())
             .unwrap_or_default()
@@ -361,7 +407,9 @@ impl SnapshotManager {
             .filter_map(|(_, v)| bincode::deserialize::<SnapshotMetadata>(&v).ok())
             .collect();
         metas.sort_by(|a, b| b.block_height.cmp(&a.block_height));
-        if metas.len() <= MAX_SNAPSHOTS { return; }
+        if metas.len() <= MAX_SNAPSHOTS {
+            return;
+        }
         let to_delete = &metas[MAX_SNAPSHOTS..];
         let mut batch = WriteBatch::default();
         for m in to_delete {
@@ -397,7 +445,10 @@ impl SnapshotManager {
 }
 
 fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -407,9 +458,12 @@ mod tests {
 
     fn tmp(l: &str) -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
         let pid = std::process::id();
-        format!("/tmp/snap_{}_{}_{}",  l, pid, ts)
+        format!("/tmp/snap_{}_{}_{}", l, pid, ts)
     }
     fn mgr(l: &str) -> SnapshotManager {
         let p = tmp(l);
@@ -418,9 +472,12 @@ mod tests {
     }
     fn utxo(txid: &str, idx: u32, amt: u64) -> UtxoSnapshotEntry {
         UtxoSnapshotEntry {
-            txid: txid.to_string(), index: idx,
-            address: "addr1".to_string(), amount: amt,
-            height: 100, is_coinbase: false,
+            txid: txid.to_string(),
+            index: idx,
+            address: "addr1".to_string(),
+            amount: amt,
+            height: 100,
+            is_coinbase: false,
         }
     }
 
@@ -438,7 +495,9 @@ mod tests {
     #[test]
     fn chunk_roundtrip() {
         let m = mgr("chunk");
-        let utxos: Vec<_> = (0..1000).map(|i| utxo(&format!("tx{}", i), 0, i * 100)).collect();
+        let utxos: Vec<_> = (0..1000)
+            .map(|i| utxo(&format!("tx{}", i), 0, i * 100))
+            .collect();
         let meta = m.create_snapshot("hash1", 20000, &utxos).unwrap();
         for i in 0..meta.chunk_count {
             let chunk = m.get_chunk(20000, i).expect("chunk missing");

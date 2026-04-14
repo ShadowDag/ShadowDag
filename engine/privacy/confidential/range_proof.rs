@@ -226,21 +226,30 @@ mod tests {
     fn prove_and_verify_zero() {
         let c = RealPedersenCommitment::commit_random(0);
         let proof = prove(0, &c.blinding);
-        assert!(verify(&c.commitment, &proof), "Range proof must verify for value 0");
+        assert!(
+            verify(&c.commitment, &proof),
+            "Range proof must verify for value 0"
+        );
     }
 
     #[test]
     fn prove_and_verify_one() {
         let c = RealPedersenCommitment::commit_random(1);
         let proof = prove(1, &c.blinding);
-        assert!(verify(&c.commitment, &proof), "Range proof must verify for value 1");
+        assert!(
+            verify(&c.commitment, &proof),
+            "Range proof must verify for value 1"
+        );
     }
 
     #[test]
     fn prove_and_verify_42() {
         let c = RealPedersenCommitment::commit_random(42);
         let proof = prove(42, &c.blinding);
-        assert!(verify(&c.commitment, &proof), "Range proof must verify for value 42");
+        assert!(
+            verify(&c.commitment, &proof),
+            "Range proof must verify for value 42"
+        );
     }
 
     #[test]

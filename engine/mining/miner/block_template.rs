@@ -3,30 +3,30 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use crate::domain::block::block::Block;
-use crate::domain::block::block_header::BlockHeader;
-use crate::domain::block::block_body::BlockBody;
-use crate::domain::transaction::transaction::Transaction;
-use crate::domain::transaction::tx_builder::{build_coinbase_at_height};
-use crate::domain::utxo::utxo_key::UtxoKey;
-use crate::domain::utxo::utxo_set::{UtxoSet, utxo_key};
-use crate::domain::transaction::tx_validator::TxValidator;
-use crate::domain::traits::tx_pool::TxPool;
 use crate::config::consensus::consensus_params::ConsensusParams;
 use crate::config::consensus::emission_schedule::EmissionSchedule;
-use crate::engine::dag::tips::tip_manager::TipManager;
+use crate::domain::block::block::Block;
+use crate::domain::block::block_body::BlockBody;
+use crate::domain::block::block_header::BlockHeader;
+use crate::domain::traits::tx_pool::TxPool;
+use crate::domain::transaction::transaction::Transaction;
+use crate::domain::transaction::tx_builder::build_coinbase_at_height;
+use crate::domain::transaction::tx_validator::TxValidator;
+use crate::domain::utxo::utxo_key::UtxoKey;
+use crate::domain::utxo::utxo_set::{utxo_key, UtxoSet};
 use crate::engine::dag::core::dag_manager::DagManager;
-use crate::engine::dag::security::dos_protection::{MAX_DAG_PARENTS, MAX_BLOCK_TX_COUNT};
+use crate::engine::dag::security::dos_protection::{MAX_BLOCK_TX_COUNT, MAX_DAG_PARENTS};
+use crate::engine::dag::tips::tip_manager::TipManager;
 use crate::errors::ConsensusError;
 use crate::slog_warn;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub struct BlockTemplateBuilder;
 
 pub struct BlockTemplate {
     pub transactions: Vec<Transaction>,
-    pub total_fees:   u64,
-    pub tx_count:     usize,
+    pub total_fees: u64,
+    pub tx_count: usize,
 }
 
 impl BlockTemplateBuilder {
@@ -43,7 +43,9 @@ impl BlockTemplateBuilder {
         let candidates = tip_manager.select_parents(max_parents);
 
         if candidates.is_empty() {
-            return Err(ConsensusError::Other("No DAG tips available for parent selection".to_string()));
+            return Err(ConsensusError::Other(
+                "No DAG tips available for parent selection".to_string(),
+            ));
         }
 
         // Validate all parent blocks exist in the DAG
@@ -57,7 +59,9 @@ impl BlockTemplateBuilder {
         }
 
         if validated_parents.is_empty() {
-            return Err(ConsensusError::Other("No valid parent blocks found in DAG".to_string()));
+            return Err(ConsensusError::Other(
+                "No valid parent blocks found in DAG".to_string(),
+            ));
         }
 
         // Sort parents lexicographically — consensus requires
@@ -69,13 +73,13 @@ impl BlockTemplateBuilder {
     /// Build a block template using current DAG tips as parents.
     /// This is the primary entry point that properly connects mining to the DAG.
     pub fn build_from_dag(
-        tip_manager:   &TipManager,
-        dag_manager:   &DagManager,
-        mempool:       &dyn TxPool,
-        utxo_set:      &UtxoSet,
+        tip_manager: &TipManager,
+        dag_manager: &DagManager,
+        mempool: &dyn TxPool,
+        utxo_set: &UtxoSet,
         miner_address: &str,
-        timestamp:     u64,
-        difficulty:    u64,
+        timestamp: u64,
+        difficulty: u64,
     ) -> Result<Block, ConsensusError> {
         let parents = Self::select_dag_parents(tip_manager, dag_manager)?;
 
@@ -83,10 +87,8 @@ impl BlockTemplateBuilder {
         // and blue_score computations. If tips change between reads, the
         // template could have an inconsistent combination.
         let tips = tip_manager.get_tips();
-        let tip_map_height: std::collections::HashMap<&str, u64> = tips
-            .iter()
-            .map(|t| (t.hash.as_str(), t.height))
-            .collect();
+        let tip_map_height: std::collections::HashMap<&str, u64> =
+            tips.iter().map(|t| (t.hash.as_str(), t.height)).collect();
         let tip_map_score: std::collections::HashMap<&str, u64> = tips
             .iter()
             .map(|t| (t.hash.as_str(), t.blue_score))
@@ -116,10 +118,9 @@ impl BlockTemplateBuilder {
 
         // Coinbase reward = emission + transaction fees (must match validator expectation)
         let emission = EmissionSchedule::block_reward(height);
-        let reward = emission.checked_add(template.total_fees)
-            .ok_or_else(|| ConsensusError::Other(
-                "coinbase reward overflow: emission + fees exceeds u64".into()
-            ))?;
+        let reward = emission.checked_add(template.total_fees).ok_or_else(|| {
+            ConsensusError::Other("coinbase reward overflow: emission + fees exceeds u64".into())
+        })?;
 
         let coinbase = build_coinbase_at_height(
             miner_address.to_string(),
@@ -130,7 +131,8 @@ impl BlockTemplateBuilder {
             height,
         );
 
-        let merkle_root = Self::compute_merkle_root(&coinbase, &template.transactions, height, &parents);
+        let merkle_root =
+            Self::compute_merkle_root(&coinbase, &template.transactions, height, &parents);
 
         // Selected parent = parent with highest blue score, NOT the
         // lexicographically first. The parent list is sorted lexicographically
@@ -138,7 +140,8 @@ impl BlockTemplateBuilder {
         // ordering (highest blue score wins, then lexicographic tiebreaker).
         // Uses tip_map_score from the single tips read above (no re-read).
         let selected_parent = {
-            let best = parents.iter()
+            let best = parents
+                .iter()
                 .max_by(|a, b| {
                     let sa = tip_map_score.get(a.as_str()).copied().unwrap_or(0);
                     let sb = tip_map_score.get(b.as_str()).copied().unwrap_or(0);
@@ -169,7 +172,8 @@ impl BlockTemplateBuilder {
         // GHOSTDAG directly.
         // Uses tip_map_score from the single tips read above (no re-read).
         let blue_score = {
-            parents.iter()
+            parents
+                .iter()
                 .filter_map(|p| tip_map_score.get(p.as_str()))
                 .max()
                 .copied()
@@ -178,20 +182,20 @@ impl BlockTemplateBuilder {
         };
 
         let header = BlockHeader {
-            version:         1,
-            hash:            String::new(),
+            version: 1,
+            hash: String::new(),
             parents,
             merkle_root,
             timestamp,
-            nonce:           0,
+            nonce: 0,
             difficulty,
             height,
             blue_score,
             selected_parent,
             utxo_commitment: None,
-            extra_nonce:     0,
-            receipt_root:    None,
-            state_root:      None,
+            extra_nonce: 0,
+            receipt_root: None,
+            state_root: None,
         };
 
         let mut all_txs = vec![coinbase];
@@ -199,7 +203,9 @@ impl BlockTemplateBuilder {
 
         Ok(Block {
             header,
-            body: BlockBody { transactions: all_txs },
+            body: BlockBody {
+                transactions: all_txs,
+            },
         })
     }
 
@@ -210,31 +216,32 @@ impl BlockTemplateBuilder {
     /// GHOSTDAG input, producing headers with incorrect DAG metadata.
     #[deprecated(note = "Use build_from_dag() for correct DAG-aware template building")]
     pub fn build(
-        mempool:       &dyn TxPool,
-        utxo_set:      &UtxoSet,
+        mempool: &dyn TxPool,
+        utxo_set: &UtxoSet,
         miner_address: &str,
-        height:        u64,
-        timestamp:     u64,
-        parents:       Vec<String>,
-        difficulty:    u64,
-        _prev_hash:    &str,
+        height: u64,
+        timestamp: u64,
+        parents: Vec<String>,
+        difficulty: u64,
+        _prev_hash: &str,
     ) -> Block {
         // Select transactions BEFORE building coinbase so we know total fees
-        let candidates = mempool.get_transactions_for_block(
-            utxo_set,
-            MAX_BLOCK_TX_COUNT - 1
-        );
+        let candidates = mempool.get_transactions_for_block(utxo_set, MAX_BLOCK_TX_COUNT - 1);
 
         let template = Self::select_valid_transactions(candidates, utxo_set);
 
-        // Coinbase reward = emission + transaction fees (must match validator expectation)
-        // NOTE: Legacy method returns Block (not Result), so overflow panics.
-        // Production code uses build_from_dag() which returns Result and
-        // handles overflow gracefully. This legacy path is kept for backward
-        // compatibility but callers should migrate to build_from_dag().
+        // Coinbase reward = emission + transaction fees.
+        // Legacy method returns Block (not Result), so avoid panics here.
+        // Production path is build_from_dag() which returns Result and should
+        // be preferred by callers.
         let emission = EmissionSchedule::block_reward(height);
-        let reward = emission.checked_add(template.total_fees)
-            .expect("coinbase reward overflow: emission + fees exceeds u64");
+        let reward = emission.saturating_add(template.total_fees);
+        if reward == u64::MAX && emission != u64::MAX && template.total_fees != 0 {
+            slog_warn!("mining", "legacy_coinbase_reward_saturated",
+                height => height,
+                emission => emission,
+                total_fees => template.total_fees);
+        }
 
         let coinbase = build_coinbase_at_height(
             miner_address.to_string(),
@@ -245,25 +252,26 @@ impl BlockTemplateBuilder {
             height,
         );
 
-        let merkle_root = Self::compute_merkle_root(&coinbase, &template.transactions, height, &parents);
+        let merkle_root =
+            Self::compute_merkle_root(&coinbase, &template.transactions, height, &parents);
 
         let selected_parent = parents.first().cloned();
 
         let header = BlockHeader {
-            version:         1,
-            hash:            String::new(),
+            version: 1,
+            hash: String::new(),
             parents,
             merkle_root,
             timestamp,
-            nonce:           0,
+            nonce: 0,
             difficulty,
             height,
-            blue_score:      0,
+            blue_score: 0,
             selected_parent,
             utxo_commitment: None,
-            extra_nonce:     0,
-            receipt_root:    None,
-            state_root:      None,
+            extra_nonce: 0,
+            receipt_root: None,
+            state_root: None,
         };
 
         let mut all_txs = vec![coinbase];
@@ -271,13 +279,15 @@ impl BlockTemplateBuilder {
 
         Block {
             header,
-            body: BlockBody { transactions: all_txs },
+            body: BlockBody {
+                transactions: all_txs,
+            },
         }
     }
 
     fn select_valid_transactions(
-        candidates:  Vec<Transaction>,
-        utxo_set:    &UtxoSet,
+        candidates: Vec<Transaction>,
+        utxo_set: &UtxoSet,
     ) -> BlockTemplate {
         let mut staged_utxos: HashMap<UtxoKey, (String, u64)> = HashMap::new();
 
@@ -299,10 +309,15 @@ impl BlockTemplateBuilder {
                             break;
                         }
                     }
-                    Err(_) => { bad_key = true; break; }
+                    Err(_) => {
+                        bad_key = true;
+                        break;
+                    }
                 }
             }
-            if bad_key || conflict { continue; }
+            if bad_key || conflict {
+                continue;
+            }
 
             let mut utxo_ok = true;
             for input in &tx.inputs {
@@ -315,46 +330,64 @@ impl BlockTemplateBuilder {
                             break;
                         }
                     }
-                    Err(_) => { utxo_ok = false; break; }
+                    Err(_) => {
+                        utxo_ok = false;
+                        break;
+                    }
                 }
             }
-            if !utxo_ok { continue; }
+            if !utxo_ok {
+                continue;
+            }
 
-            if !tx.is_coinbase()
-                && !TxValidator::validate_tx(&tx, utxo_set) {
-                    // TX failed full validation — reject it regardless of staged UTXO status.
-                    // Previously, TXs whose inputs were all in staged_utxos were accepted
-                    // even when signature/fee/ring checks failed. This bypassed consensus.
-                    //
-                    // KNOWN LIMITATION: validate_tx runs against the base UTXO set only,
-                    // not against (base + staged_utxos). This means a child TX whose
-                    // parent was included earlier in THIS block will fail UTXO-existence
-                    // checks even though the UTXO will exist when the block is executed.
-                    // The UTXO-existence pre-check above (in_real || in_staged) catches
-                    // the common case, but signature verification for inputs that reference
-                    // intra-block outputs may still fail if the validator's UTXO lookup
-                    // is needed for amount/script checks. A full fix requires passing a
-                    // merged UtxoSet view (base + staged) to validate_tx, which is
-                    // deferred to avoid changing the TxValidator interface mid-release.
-                    continue;
-                }
+            if !tx.is_coinbase() && !TxValidator::validate_tx(&tx, utxo_set) {
+                // TX failed full validation — reject it regardless of staged UTXO status.
+                // Previously, TXs whose inputs were all in staged_utxos were accepted
+                // even when signature/fee/ring checks failed. This bypassed consensus.
+                //
+                // KNOWN LIMITATION: validate_tx runs against the base UTXO set only,
+                // not against (base + staged_utxos). This means a child TX whose
+                // parent was included earlier in THIS block will fail UTXO-existence
+                // checks even though the UTXO will exist when the block is executed.
+                // The UTXO-existence pre-check above (in_real || in_staged) catches
+                // the common case, but signature verification for inputs that reference
+                // intra-block outputs may still fail if the validator's UTXO lookup
+                // is needed for amount/script checks. A full fix requires passing a
+                // merged UtxoSet view (base + staged) to validate_tx, which is
+                // deferred to avoid changing the TxValidator interface mid-release.
+                continue;
+            }
 
             let mut skip = false;
             for input in &tx.inputs {
                 match utxo_key(&input.txid, input.index) {
-                    Ok(key) => { spent_in_block.insert(key); }
-                    Err(_) => { skip = true; break; }
+                    Ok(key) => {
+                        spent_in_block.insert(key);
+                    }
+                    Err(_) => {
+                        skip = true;
+                        break;
+                    }
                 }
             }
-            if skip { continue; }
+            if skip {
+                continue;
+            }
 
             for (idx, output) in tx.outputs.iter().enumerate() {
                 match utxo_key(&tx.hash, idx as u32) {
-                    Ok(key) => { staged_utxos.insert(key, (output.address.clone(), output.amount)); }
-                    Err(_) => { skip = true; break; }
+                    Ok(key) => {
+                        staged_utxos.insert(key, (output.address.clone(), output.amount));
+                    }
+                    Err(_) => {
+                        skip = true;
+                        break;
+                    }
                 }
             }
-            if skip { continue; }
+            if skip {
+                continue;
+            }
 
             // BUG FIX: Use saturating_add to prevent overflow panic.
             // If a malicious mempool TX has fee near u64::MAX, a simple
@@ -366,7 +399,7 @@ impl BlockTemplateBuilder {
         }
 
         BlockTemplate {
-            tx_count:     accepted.len(),
+            tx_count: accepted.len(),
             total_fees,
             transactions: accepted,
         }
@@ -386,7 +419,10 @@ impl BlockTemplateBuilder {
             for input in &tx.inputs {
                 if tx_map.contains_key(&input.txid) {
                     *in_degree.entry(tx.hash.clone()).or_insert(0) += 1;
-                    edges.entry(input.txid.clone()).or_default().push(tx.hash.clone());
+                    edges
+                        .entry(input.txid.clone())
+                        .or_default()
+                        .push(tx.hash.clone());
                 }
             }
         }
@@ -404,7 +440,9 @@ impl BlockTemplateBuilder {
                 if let Some(dependents) = edges.get(&hash) {
                     for dep in dependents {
                         let d = in_degree.entry(dep.clone()).or_insert(0);
-                        if *d > 0 { *d -= 1; }
+                        if *d > 0 {
+                            *d -= 1;
+                        }
                         if *d == 0 {
                             queue.push_back(dep.clone());
                         }
@@ -426,7 +464,12 @@ impl BlockTemplateBuilder {
 
     /// Compute Merkle root using the SAME MerkleTree implementation
     /// as block_validator.rs. MUST match exactly or blocks will be rejected.
-    fn compute_merkle_root(coinbase: &Transaction, txs: &[Transaction], height: u64, parents: &[String]) -> String {
+    fn compute_merkle_root(
+        coinbase: &Transaction,
+        txs: &[Transaction],
+        height: u64,
+        parents: &[String],
+    ) -> String {
         use crate::domain::block::merkle_tree::MerkleTree;
 
         // Build full tx list in exact block body order: coinbase first, then txs

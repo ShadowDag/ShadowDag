@@ -14,10 +14,10 @@
 //   - Stealth address scanning with view key
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::domain::block::block_header::BlockHeader;
 use crate::domain::block::merkle_proof::MerkleProof;
 use crate::domain::block::merkle_verifier::MerkleVerifier;
+use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::slog_info;
 
 /// Maximum headers to store in memory
@@ -26,15 +26,15 @@ pub const MAX_HEADERS_CACHE: usize = 10_000;
 /// SPV light node
 pub struct LightNode {
     /// Cached block headers
-    headers:      Vec<BlockHeader>,
+    headers: Vec<BlockHeader>,
     /// Addresses we're watching for
-    watch_list:   Vec<String>,
+    watch_list: Vec<String>,
     /// Whether the node is syncing
-    syncing:      bool,
+    syncing: bool,
     /// Best known header height
-    best_height:  u64,
+    best_height: u64,
     /// Network identifier
-    network:      String,
+    network: String,
     /// Known genesis hash for this network
     genesis_hash: String,
 }
@@ -43,16 +43,17 @@ impl LightNode {
     pub fn new(network: &str) -> Self {
         // Resolve the known genesis hash for this network so we can
         // verify the first header we receive in add_header().
-        let genesis_hash = network.parse::<crate::config::node::node_config::NetworkMode>()
+        let genesis_hash = network
+            .parse::<crate::config::node::node_config::NetworkMode>()
             .ok()
             .map(|mode| crate::config::genesis::genesis::genesis_hash_for(&mode))
             .unwrap_or_default();
         Self {
-            headers:     Vec::with_capacity(MAX_HEADERS_CACHE),
-            watch_list:  Vec::new(),
-            syncing:     false,
+            headers: Vec::with_capacity(MAX_HEADERS_CACHE),
+            watch_list: Vec::new(),
+            syncing: false,
             best_height: 0,
-            network:     network.to_string(),
+            network: network.to_string(),
             genesis_hash,
         }
     }
@@ -83,8 +84,8 @@ impl LightNode {
         // 2. PoW: recompute hash from header fields, then check target.
         //    Without recomputation, an attacker can send a fake hash
         //    that meets PoW but doesn't correspond to the header content.
-        use crate::engine::mining::pow::pow_validator::PowValidator;
         use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
+        use crate::engine::mining::pow::pow_validator::PowValidator;
         let recomputed = shadow_hash_raw_full(
             header.version,
             header.height,
@@ -102,7 +103,9 @@ impl LightNode {
         if header.height > 0 && header.difficulty == 0 {
             return false;
         }
-        if header.difficulty > 0 && !PowValidator::hash_meets_target(&header.hash, header.difficulty) {
+        if header.difficulty > 0
+            && !PowValidator::hash_meets_target(&header.hash, header.difficulty)
+        {
             return false;
         }
         // 3. Timestamp sanity: reject headers too far in the future
@@ -110,7 +113,8 @@ impl LightNode {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if header.timestamp > now + 120 { // MAX_FUTURE_SECS
+        if header.timestamp > now + 120 {
+            // MAX_FUTURE_SECS
             return false;
         }
         true
@@ -170,17 +174,13 @@ impl LightNode {
     /// Finds the header by block_hash (stronger than height alone).
     pub fn verify_tx_inclusion(
         &self,
-        tx_hash:    &str,
-        proof:      &MerkleProof,
+        tx_hash: &str,
+        proof: &MerkleProof,
         block_hash: &str,
     ) -> bool {
         let header = self.headers.iter().find(|h| h.hash == block_hash);
         match header {
-            Some(h) => MerkleVerifier::verify(
-                tx_hash.to_string(),
-                proof,
-                h.merkle_root.clone(),
-            ),
+            Some(h) => MerkleVerifier::verify(tx_hash.to_string(), proof, h.merkle_root.clone()),
             None => false,
         }
     }
@@ -244,8 +244,14 @@ mod tests {
         let difficulty = if height == 0 { 0u64 } else { 1u64 };
 
         let hash = shadow_hash_raw_full(
-            version, height, timestamp, nonce, extra_nonce,
-            difficulty, &merkle_root, &parents,
+            version,
+            height,
+            timestamp,
+            nonce,
+            extra_nonce,
+            difficulty,
+            &merkle_root,
+            &parents,
         );
 
         BlockHeader {

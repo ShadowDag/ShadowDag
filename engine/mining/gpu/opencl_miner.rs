@@ -3,25 +3,25 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rayon::prelude::*;
-use std::time::Instant;
+use crate::domain::block::block::Block;
 use crate::engine::mining::algorithms::shadowhash::shadow_hash;
 use crate::engine::mining::pow::pow_validator::PowValidator;
-use crate::domain::block::block::Block;
 use crate::{slog_info, slog_warn};
+use rayon::prelude::*;
+use std::time::Instant;
 
 pub struct OpenClPlatformInfo {
-    pub platform_id:  u32,
-    pub vendor:       String,
-    pub version:      String,
+    pub platform_id: u32,
+    pub vendor: String,
+    pub version: String,
     pub device_count: u32,
 }
 
 pub struct OpenClMiner {
     pub platform_id: u32,
-    pub device_id:   u32,
-    pub work_size:   u64,
-    pub local_size:  u64,
+    pub device_id: u32,
+    pub work_size: u64,
+    pub local_size: u64,
 }
 
 impl OpenClMiner {
@@ -30,7 +30,7 @@ impl OpenClMiner {
         Self {
             platform_id,
             device_id,
-            work_size:  1_048_576,
+            work_size: 1_048_576,
             local_size: 256,
         }
     }
@@ -43,9 +43,9 @@ impl OpenClMiner {
             _ => "Generic OpenCL",
         };
         OpenClPlatformInfo {
-            platform_id:  self.platform_id,
-            vendor:       vendor.to_string(),
-            version:      "OpenCL 3.0".to_string(),
+            platform_id: self.platform_id,
+            vendor: vendor.to_string(),
+            version: "OpenCL 3.0".to_string(),
             device_count: rayon::current_num_threads() as u32,
         }
     }
@@ -61,15 +61,13 @@ impl OpenClMiner {
         slog_info!("gpu", "opencl_compute_pow", difficulty => difficulty, platform => self.platform_id, device => self.device_id, work_size => self.work_size);
 
         let _difficulty = difficulty;
-        let start   = Instant::now();
+        let start = Instant::now();
 
-        let result: Option<u64> = (0..self.work_size)
-            .into_par_iter()
-            .find_any(|&nonce| {
-                let mut b = block.clone();
-                b.header.nonce = nonce;
-                PowValidator::hash_meets_target(&shadow_hash(&b), difficulty)
-            });
+        let result: Option<u64> = (0..self.work_size).into_par_iter().find_any(|&nonce| {
+            let mut b = block.clone();
+            b.header.nonce = nonce;
+            PowValidator::hash_meets_target(&shadow_hash(&b), difficulty)
+        });
 
         let elapsed = start.elapsed().as_millis();
         slog_info!("gpu", "opencl_kernel_done", time_ms => elapsed, found => result.is_some());
@@ -94,19 +92,17 @@ impl OpenClMiner {
                 Some(n) => n,
                 None => break,
             };
-            let found: Option<u64> = (offset..end_offset)
-                .into_par_iter()
-                .find_any(|&nonce| {
-                    let mut b = block.clone();
-                    b.header.nonce = nonce;
-                    PowValidator::hash_meets_target(&shadow_hash(&b), difficulty)
-                });
+            let found: Option<u64> = (offset..end_offset).into_par_iter().find_any(|&nonce| {
+                let mut b = block.clone();
+                b.header.nonce = nonce;
+                PowValidator::hash_meets_target(&shadow_hash(&b), difficulty)
+            });
 
             if let Some(nonce) = found {
                 block.header.nonce = nonce;
                 let mut final_block = block.clone();
                 final_block.header.nonce = nonce;
-                final_block.header.hash  = shadow_hash(&final_block);
+                final_block.header.hash = shadow_hash(&final_block);
                 slog_info!("gpu", "opencl_block_found", nonce => nonce, hash_prefix => &final_block.header.hash[..16]);
                 return Some(final_block);
             }
@@ -116,9 +112,9 @@ impl OpenClMiner {
 
     pub fn benchmark(&self) -> f64 {
         use crate::config::genesis::genesis::create_genesis_block;
-        let block  = create_genesis_block();
-        let start  = Instant::now();
-        let iters  = self.work_size;
+        let block = create_genesis_block();
+        let start = Instant::now();
+        let iters = self.work_size;
 
         (0..iters).into_par_iter().for_each(|nonce| {
             let mut b = block.clone();

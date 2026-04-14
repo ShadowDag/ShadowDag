@@ -13,8 +13,8 @@
 // Gas cost: 375 base + 375 per topic + 8 per data byte
 // ═══════════════════════════════════════════════════════════════════════════
 
-use serde::{Serialize, Deserialize};
 use crate::errors::VmError;
+use serde::{Deserialize, Serialize};
 
 /// Gas costs for LOG operations
 pub const LOG_BASE_GAS: u64 = 375;
@@ -97,25 +97,50 @@ impl EventCollector {
     }
 
     /// Emit a LOG4 (4 topics)
-    pub fn log4(&mut self, t0: &str, t1: &str, t2: &str, t3: &str, data: &[u8]) -> Result<u64, VmError> {
-        self.emit(vec![t0.to_string(), t1.to_string(), t2.to_string(), t3.to_string()], data)
+    pub fn log4(
+        &mut self,
+        t0: &str,
+        t1: &str,
+        t2: &str,
+        t3: &str,
+        data: &[u8],
+    ) -> Result<u64, VmError> {
+        self.emit(
+            vec![
+                t0.to_string(),
+                t1.to_string(),
+                t2.to_string(),
+                t3.to_string(),
+            ],
+            data,
+        )
     }
 
     /// Core emit function
     fn emit(&mut self, topics: Vec<String>, data: &[u8]) -> Result<u64, VmError> {
         if topics.len() > MAX_TOPICS {
-            return Err(VmError::Other(format!("too many topics: {} (max {})", topics.len(), MAX_TOPICS)));
+            return Err(VmError::Other(format!(
+                "too many topics: {} (max {})",
+                topics.len(),
+                MAX_TOPICS
+            )));
         }
 
         if data.len() > MAX_LOG_DATA {
-            return Err(VmError::Other(format!("log data too large: {} bytes (max {})", data.len(), MAX_LOG_DATA)));
+            return Err(VmError::Other(format!(
+                "log data too large: {} bytes (max {})",
+                data.len(),
+                MAX_LOG_DATA
+            )));
         }
 
         // Validate topic format: each must be 64 hex chars (32 bytes)
         for (i, topic) in topics.iter().enumerate() {
             if topic.len() != 64 || !topic.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Err(VmError::InvalidLogTopic(format!(
-                    "topic {} must be 64 hex chars (32 bytes), got {} chars", i, topic.len()
+                    "topic {} must be 64 hex chars (32 bytes), got {} chars",
+                    i,
+                    topic.len()
                 )));
             }
         }
@@ -171,10 +196,14 @@ impl LogFilter {
     pub fn matches(&self, entry: &LogEntry) -> bool {
         // Block range check
         if let Some(from) = self.from_block {
-            if entry.block_height < from { return false; }
+            if entry.block_height < from {
+                return false;
+            }
         }
         if let Some(to) = self.to_block {
-            if entry.block_height > to { return false; }
+            if entry.block_height > to {
+                return false;
+            }
         }
 
         // Address check
@@ -235,19 +264,27 @@ mod tests {
     #[test]
     fn filter_matches_block_range() {
         let entry = LogEntry {
-            address: "0xA".into(), topics: vec![], data: String::new(),
-            block_height: 50, tx_hash: "tx".into(), log_index: 0,
+            address: "0xA".into(),
+            topics: vec![],
+            data: String::new(),
+            block_height: 50,
+            tx_hash: "tx".into(),
+            log_index: 0,
         };
 
         let filter = LogFilter {
-            from_block: Some(40), to_block: Some(60),
-            addresses: vec![], topics: vec![],
+            from_block: Some(40),
+            to_block: Some(60),
+            addresses: vec![],
+            topics: vec![],
         };
         assert!(filter.matches(&entry));
 
         let filter2 = LogFilter {
-            from_block: Some(60), to_block: Some(100),
-            addresses: vec![], topics: vec![],
+            from_block: Some(60),
+            to_block: Some(100),
+            addresses: vec![],
+            topics: vec![],
         };
         assert!(!filter2.matches(&entry));
     }

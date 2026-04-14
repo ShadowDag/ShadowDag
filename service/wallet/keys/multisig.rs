@@ -16,10 +16,10 @@
 //   - Timeout for incomplete signatures
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
-use std::collections::{HashMap, BTreeSet};
-use std::time::{SystemTime, UNIX_EPOCH};
 use crate::errors::WalletError;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Maximum signers in a multisig
 pub const MAX_SIGNERS: usize = 16;
@@ -31,28 +31,38 @@ pub const SIG_TIMEOUT_SECS: u64 = 3_600;
 #[derive(Debug, Clone)]
 pub struct MultisigConfig {
     /// Required signatures (M)
-    pub threshold:    usize,
+    pub threshold: usize,
     /// Total signers (N)
-    pub total:        usize,
+    pub total: usize,
     /// Public keys of all signers (sorted deterministically)
-    pub signers:      Vec<String>,
+    pub signers: Vec<String>,
     /// Multisig address (derived from config)
-    pub address:      String,
+    pub address: String,
 }
 
 impl MultisigConfig {
     /// Create a new M-of-N multisig configuration
-    pub fn new(threshold: usize, public_keys: Vec<String>, network: &str) -> Result<Self, WalletError> {
+    pub fn new(
+        threshold: usize,
+        public_keys: Vec<String>,
+        network: &str,
+    ) -> Result<Self, WalletError> {
         let total = public_keys.len();
 
         if threshold == 0 {
             return Err(WalletError::Other("Threshold must be >= 1".to_string()));
         }
         if threshold > total {
-            return Err(WalletError::Other(format!("Threshold {} > total signers {}", threshold, total)));
+            return Err(WalletError::Other(format!(
+                "Threshold {} > total signers {}",
+                threshold, total
+            )));
         }
         if total > MAX_SIGNERS {
-            return Err(WalletError::Other(format!("Max {} signers allowed", MAX_SIGNERS)));
+            return Err(WalletError::Other(format!(
+                "Max {} signers allowed",
+                MAX_SIGNERS
+            )));
         }
 
         // Sort public keys deterministically
@@ -61,7 +71,9 @@ impl MultisigConfig {
         sorted_keys.dedup();
 
         if sorted_keys.len() != total {
-            return Err(WalletError::Other("Duplicate public keys detected".to_string()));
+            return Err(WalletError::Other(
+                "Duplicate public keys detected".to_string(),
+            ));
         }
 
         let address = Self::compute_address(threshold, &sorted_keys, network);
@@ -113,23 +125,23 @@ impl MultisigConfig {
 #[derive(Debug, Clone)]
 pub struct PartialSignature {
     pub signer_pubkey: String,
-    pub signature:     String,
-    pub signed_at:     u64,
+    pub signature: String,
+    pub signed_at: u64,
 }
 
 /// Pending multisig transaction (collecting signatures)
 #[derive(Debug, Clone)]
 pub struct PendingMultisig {
     /// Transaction hash to sign
-    pub tx_hash:      String,
+    pub tx_hash: String,
     /// Multisig config
-    pub config:       MultisigConfig,
+    pub config: MultisigConfig,
     /// Collected partial signatures
-    pub signatures:   Vec<PartialSignature>,
+    pub signatures: Vec<PartialSignature>,
     /// When this pending tx was created
-    pub created_at:   u64,
+    pub created_at: u64,
     /// Transaction data (serialized)
-    pub tx_data:      Vec<u8>,
+    pub tx_data: Vec<u8>,
 }
 
 impl PendingMultisig {
@@ -153,7 +165,10 @@ impl PendingMultisig {
     pub fn add_signature(&mut self, pubkey: &str, signature: &str) -> Result<(), WalletError> {
         // Verify signer is authorized
         if !self.config.is_signer(pubkey) {
-            return Err(WalletError::Other(format!("Public key {} is not a signer", pubkey)));
+            return Err(WalletError::Other(format!(
+                "Public key {} is not a signer",
+                pubkey
+            )));
         }
 
         // Check for duplicate signature
@@ -163,20 +178,23 @@ impl PendingMultisig {
 
         // Check if already have enough
         if self.is_complete() {
-            return Err(WalletError::Other("Already have enough signatures".to_string()));
+            return Err(WalletError::Other(
+                "Already have enough signatures".to_string(),
+            ));
         }
 
         // Basic format validation: Ed25519 signatures are 64 bytes = 128 hex chars
         if signature.len() != 128 || !signature.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(WalletError::Other(
-                "Invalid signature format: expected 128 hex characters (64 bytes Ed25519)".to_string(),
+                "Invalid signature format: expected 128 hex characters (64 bytes Ed25519)"
+                    .to_string(),
             ));
         }
 
         self.signatures.push(PartialSignature {
             signer_pubkey: pubkey.to_string(),
-            signature:     signature.to_string(),
-            signed_at:     now_secs(),
+            signature: signature.to_string(),
+            signed_at: now_secs(),
         });
 
         Ok(())
@@ -203,9 +221,13 @@ impl PendingMultisig {
     /// Real Ed25519 multi-signature aggregation (e.g., MuSig2 or similar)
     /// must be implemented before production use. The current approach does
     /// NOT provide cryptographic security.
-    #[deprecated(note = "Placeholder: uses SHA-256 hash, not real Ed25519 signature aggregation. Needs real crypto before production.")]
+    #[deprecated(
+        note = "Placeholder: uses SHA-256 hash, not real Ed25519 signature aggregation. Needs real crypto before production."
+    )]
     pub fn aggregate_signatures(&self) -> Option<String> {
-        if !self.is_complete() { return None; }
+        if !self.is_complete() {
+            return None;
+        }
 
         // Combine all signatures deterministically
         let mut h = Sha256::new();
@@ -220,13 +242,18 @@ impl PendingMultisig {
 
     /// Who has signed so far
     pub fn signed_by(&self) -> Vec<String> {
-        self.signatures.iter().map(|s| s.signer_pubkey.clone()).collect()
+        self.signatures
+            .iter()
+            .map(|s| s.signer_pubkey.clone())
+            .collect()
     }
 
     /// Who still needs to sign
     pub fn pending_signers(&self) -> Vec<String> {
         let signed: BTreeSet<_> = self.signatures.iter().map(|s| &s.signer_pubkey).collect();
-        self.config.signers.iter()
+        self.config
+            .signers
+            .iter()
             .filter(|s| !signed.contains(s))
             .cloned()
             .collect()
@@ -235,7 +262,7 @@ impl PendingMultisig {
 
 /// Multisig manager — tracks all pending multisig transactions
 pub struct MultisigManager {
-    configs: HashMap<String, MultisigConfig>,  // address → config
+    configs: HashMap<String, MultisigConfig>, // address → config
     pending: HashMap<String, PendingMultisig>, // tx_hash → pending
 }
 
@@ -266,9 +293,18 @@ impl MultisigManager {
     }
 
     /// Start collecting signatures for a transaction
-    pub fn initiate(&mut self, tx_hash: String, address: &str, tx_data: Vec<u8>) -> Result<(), WalletError> {
-        let config = self.configs.get(address)
-            .ok_or_else(|| WalletError::AddressNotFound(format!("Multisig address {} not found", address)))?
+    pub fn initiate(
+        &mut self,
+        tx_hash: String,
+        address: &str,
+        tx_data: Vec<u8>,
+    ) -> Result<(), WalletError> {
+        let config = self
+            .configs
+            .get(address)
+            .ok_or_else(|| {
+                WalletError::AddressNotFound(format!("Multisig address {} not found", address))
+            })?
             .clone();
 
         let pending = PendingMultisig::new(tx_hash.clone(), config, tx_data);
@@ -277,12 +313,21 @@ impl MultisigManager {
     }
 
     /// Add a signature to a pending transaction
-    pub fn sign(&mut self, tx_hash: &str, pubkey: &str, signature: &str) -> Result<bool, WalletError> {
-        let pending = self.pending.get_mut(tx_hash)
+    pub fn sign(
+        &mut self,
+        tx_hash: &str,
+        pubkey: &str,
+        signature: &str,
+    ) -> Result<bool, WalletError> {
+        let pending = self
+            .pending
+            .get_mut(tx_hash)
             .ok_or_else(|| WalletError::Other(format!("No pending multisig for {}", tx_hash)))?;
 
         if pending.is_expired() {
-            return Err(WalletError::Other("Pending multisig has expired".to_string()));
+            return Err(WalletError::Other(
+                "Pending multisig has expired".to_string(),
+            ));
         }
 
         pending.add_signature(pubkey, signature)?;
@@ -297,16 +342,24 @@ impl MultisigManager {
     /// Remove completed or expired entries
     pub fn cleanup(&mut self) -> usize {
         let before = self.pending.len();
-        self.pending.retain(|_, p| !p.is_expired() && !p.is_complete());
+        self.pending
+            .retain(|_, p| !p.is_expired() && !p.is_complete());
         before - self.pending.len()
     }
 
-    pub fn pending_count(&self) -> usize { self.pending.len() }
-    pub fn config_count(&self) -> usize { self.configs.len() }
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+    pub fn config_count(&self) -> usize {
+        self.configs.len()
+    }
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -404,15 +457,23 @@ mod tests {
 
     #[test]
     fn address_is_deterministic() {
-        let a1 = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap().address;
-        let a2 = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap().address;
+        let a1 = MultisigConfig::new(2, make_keys(3), "mainnet")
+            .unwrap()
+            .address;
+        let a2 = MultisigConfig::new(2, make_keys(3), "mainnet")
+            .unwrap()
+            .address;
         assert_eq!(a1, a2);
     }
 
     #[test]
     fn different_threshold_different_address() {
-        let a2 = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap().address;
-        let a3 = MultisigConfig::new(3, make_keys(3), "mainnet").unwrap().address;
+        let a2 = MultisigConfig::new(2, make_keys(3), "mainnet")
+            .unwrap()
+            .address;
+        let a3 = MultisigConfig::new(3, make_keys(3), "mainnet")
+            .unwrap()
+            .address;
         assert_ne!(a2, a3);
     }
 }

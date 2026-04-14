@@ -5,6 +5,12 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::config::consensus::consensus_params::ConsensusParams;
+    use crate::config::consensus::emission_schedule::EmissionSchedule;
+    use crate::domain::block::block::Block;
+    use crate::domain::block::block_body::BlockBody;
+    use crate::domain::block::block_header::BlockHeader;
+    use crate::engine::mining::miner::miner::Miner;
     use crate::service::network::p2p::peer_manager::PeerManager;
 
     // ── helpers ──────────────────────────────────────────────────────────
@@ -19,7 +25,10 @@ mod tests {
     fn peer_discovery_add_and_find() {
         let pm = tmp_pm("discovery");
         pm.add_peer("192.168.1.1:8333").unwrap();
-        assert!(pm.peer_exists("192.168.1.1:8333"), "Added peer must be found");
+        assert!(
+            pm.peer_exists("192.168.1.1:8333"),
+            "Added peer must be found"
+        );
     }
 
     // ── 2. Peer count reflects insertions ────────────────────────────────
@@ -40,7 +49,10 @@ mod tests {
         pm.add_peer("10.1.0.1:8333").unwrap();
         pm.add_peer("10.1.0.2:8333").unwrap();
         pm.remove_peer("10.1.0.1:8333").ok();
-        assert!(!pm.peer_exists("10.1.0.1:8333"), "Removed peer must not exist");
+        assert!(
+            !pm.peer_exists("10.1.0.1:8333"),
+            "Removed peer must not exist"
+        );
         assert_eq!(pm.count(), 1);
     }
 
@@ -50,7 +62,7 @@ mod tests {
         let pm = tmp_pm("dup_peer");
         pm.add_peer("10.2.0.1:8333").unwrap();
         pm.add_peer("10.2.0.1:8333").ok(); // duplicate
-        // Count must remain 1 (not 2)
+                                           // Count must remain 1 (not 2)
         assert_eq!(pm.count(), 1, "Duplicate peer must not be inserted twice");
     }
 
@@ -83,7 +95,10 @@ mod tests {
         let pm = tmp_pm("ban_access");
         pm.add_peer("172.16.1.1:8333").unwrap();
         pm.ban_peer("172.16.1.1:8333", 3600, "spam");
-        assert!(pm.is_banned("172.16.1.1:8333"), "Banned peer must report as banned");
+        assert!(
+            pm.is_banned("172.16.1.1:8333"),
+            "Banned peer must report as banned"
+        );
     }
 
     // ── 8. Unban allows peer back ─────────────────────────────────────────
@@ -93,7 +108,10 @@ mod tests {
         pm.add_peer("172.16.2.1:8333").unwrap();
         pm.ban_peer("172.16.2.1:8333", 3600, "test");
         pm.unban_peer("172.16.2.1:8333");
-        assert!(!pm.is_banned("172.16.2.1:8333"), "Unbanned peer must not be banned");
+        assert!(
+            !pm.is_banned("172.16.2.1:8333"),
+            "Unbanned peer must not be banned"
+        );
     }
 
     // ── 9. Peer height tracking ───────────────────────────────────────────
@@ -133,9 +151,7 @@ mod tests {
     #[test]
     fn add_addr_batch_stores_all() {
         let pm = tmp_pm("batch_addr");
-        let batch: Vec<String> = (0..10)
-            .map(|i| format!("10.7.0.{}:8333", i))
-            .collect();
+        let batch: Vec<String> = (0..10).map(|i| format!("10.7.0.{}:8333", i)).collect();
         pm.add_addr_batch(&batch);
         let addrs = pm.get_addr_list();
         for addr in &batch {
@@ -151,7 +167,11 @@ mod tests {
         pm.add_penalty("10.8.0.1:8333", 15, "bad block");
         pm.add_penalty("10.8.0.1:8333", 10, "bad tx");
         let before = pm.get_penalty("10.8.0.1:8333");
-        assert!(before >= 25, "Penalties must accumulate to >= 25 (got {})", before);
+        assert!(
+            before >= 25,
+            "Penalties must accumulate to >= 25 (got {})",
+            before
+        );
         pm.decay_penalties();
         let after = pm.get_penalty("10.8.0.1:8333");
         // After decay, penalty should be reduced (or same if decay is time-based)
@@ -191,7 +211,8 @@ mod tests {
         for p in &peers_b {
             assert!(
                 !peers_a.contains(p),
-                "Group A must not know Group B peer {} (partition isolation)", p
+                "Group A must not know Group B peer {} (partition isolation)",
+                p
             );
         }
 
@@ -203,7 +224,8 @@ mod tests {
         for p in &peers_b {
             assert!(
                 after_reconnect.contains(p),
-                "After reconnect, Group A must know peer {}", p
+                "After reconnect, Group A must know peer {}",
+                p
             );
         }
     }
@@ -214,7 +236,11 @@ mod tests {
         let pm = tmp_pm("expiry_check");
         pm.ban_peer("172.20.0.1:8333", 1800, "eclipse_attempt");
         let expiry = pm.get_ban_expiry("172.20.0.1:8333");
-        assert!(expiry > 0, "Ban expiry must be a positive timestamp, got {}", expiry);
+        assert!(
+            expiry > 0,
+            "Ban expiry must be a positive timestamp, got {}",
+            expiry
+        );
     }
 
     // ── 17. Active peer state check ───────────────────────────────────────
@@ -238,5 +264,112 @@ mod tests {
         assert!(pm1.peer_exists("10.12.0.1:8333"));
         // Verify pm2 is a separate instance (does not share state)
         assert!(!pm2.peer_exists("10.12.0.1:8333"));
+    }
+
+    // 19. 1000-node network under 5-year simulated mining timeline.
+    #[test]
+    fn network_1000_nodes_over_ten_years_with_mining_checkpoints() {
+        let pm = tmp_pm("1000_nodes_10y");
+        let miner = Miner::new(1, "shadow1devreward".to_string());
+
+        let one_day_secs: u64 = 24 * 60 * 60;
+        let total_days: u64 = 10 * 365;
+        let mut checkpoints: Vec<u64> = (0..=total_days).step_by(30).collect();
+        if checkpoints.last().copied() != Some(total_days) {
+            checkpoints.push(total_days);
+        }
+
+        let mut peers = Vec::with_capacity(1_000);
+        for i in 0..1_000usize {
+            let octet2 = (i / 256) as u8;
+            let octet3 = (i % 256) as u8;
+            let addr = format!("10.{}.{}:8333", octet2, octet3);
+            pm.add_peer(&addr)
+                .unwrap_or_else(|e| panic!("failed adding peer {}: {}", addr, e));
+            peers.push(addr);
+        }
+        assert_eq!(pm.count(), 1_000, "network must have 1000 connected peers");
+
+        let bps = ConsensusParams::BLOCKS_PER_SECOND;
+        let mut prev_hash = String::new();
+        let mut prev_reward = u64::MAX;
+
+        for (idx, day) in checkpoints.iter().enumerate() {
+            let height = day.saturating_mul(one_day_secs).saturating_mul(bps);
+            let timestamp = 1_735_689_600u64.saturating_add(day.saturating_mul(one_day_secs));
+
+            let coinbase = miner.create_coinbase("shadow1miner".to_string(), timestamp, height);
+            let reward = EmissionSchedule::block_reward(height);
+            assert!(
+                reward <= prev_reward,
+                "reward must be non-increasing at checkpoint {}",
+                idx
+            );
+            prev_reward = reward;
+
+            let parents = if idx == 0 {
+                Vec::new()
+            } else {
+                vec![prev_hash.clone()]
+            };
+
+            let block = Block {
+                header: BlockHeader::new_with_defaults(
+                    1,
+                    String::new(),
+                    parents,
+                    coinbase.hash.clone(),
+                    timestamp,
+                    0,
+                    1,
+                    height,
+                ),
+                body: BlockBody {
+                    transactions: vec![coinbase],
+                },
+            };
+            let mined = miner.mine_block(block);
+            assert!(
+                Miner::verify_pow(&mined),
+                "invalid PoW at checkpoint {}",
+                idx
+            );
+            prev_hash = mined.header.hash;
+
+            for (peer_idx, addr) in peers.iter().enumerate() {
+                let lag = (peer_idx % 3) as u64;
+                pm.update_peer_height(addr, height.saturating_sub(lag));
+                pm.update_peer_latency(addr, 10 + (peer_idx as u64 % 120));
+            }
+
+            assert_eq!(
+                pm.best_peer_height(),
+                height,
+                "best height mismatch at checkpoint {}",
+                idx
+            );
+
+            // Exercise penalty/ban paths during long-run operation.
+            let noisy_peer = &peers[idx % peers.len()];
+            pm.add_penalty(noisy_peer, 25, "spam burst");
+            pm.decay_penalties();
+            let score = pm.get_penalty(noisy_peer);
+            assert!(
+                score <= 25,
+                "penalty decay/regression at checkpoint {}",
+                idx
+            );
+        }
+
+        let best = pm.get_best_peers(128);
+        assert!(!best.is_empty(), "best peer selection must not be empty");
+        assert!(best.len() <= 128);
+
+        let stats = pm.stats();
+        assert_eq!(stats.get("total_peers").copied().unwrap_or(0), 1_000);
+        assert_eq!(
+            stats.get("best_height").copied().unwrap_or(0),
+            pm.best_peer_height()
+        );
     }
 }

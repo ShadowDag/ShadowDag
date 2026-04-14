@@ -20,7 +20,7 @@
 //     the three states explicitly.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options};
+use rocksdb::{Options, DB};
 use std::path::Path;
 
 use crate::errors::StorageError;
@@ -35,11 +35,10 @@ impl Metrics {
         let mut opts = Options::default();
         opts.create_if_missing(true);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed {
-                path: path.to_string(),
-                reason: e.to_string(),
-            })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         Ok(Self { db })
     }
@@ -106,7 +105,8 @@ impl Metrics {
                 name => name, got => bytes.len(), expected => 8usize);
             return Err(StorageError::ReadFailed(format!(
                 "metric '{}': expected 8 bytes, got {} — data corruption",
-                name, bytes.len()
+                name,
+                bytes.len()
             )));
         }
         let mut arr = [0u8; 8];
@@ -148,7 +148,7 @@ mod tests {
     fn corrupt_length_is_err_in_strict_mode() {
         let m = Metrics::new(&tmp_path()).expect("open metrics");
         // Plant a value of the wrong length (not 8 bytes).
-        m.db.put("bad", &[0x01, 0x02, 0x03]).expect("raw put");
+        m.db.put("bad", [0x01, 0x02, 0x03]).expect("raw put");
 
         // Non-strict collapses corruption into None
         assert!(m.get_metric("bad").is_none());

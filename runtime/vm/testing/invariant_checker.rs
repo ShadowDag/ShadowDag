@@ -3,8 +3,8 @@
 //! Checks that receipt_root, state_root, storage state, and indexes
 //! are all consistent. Designed to run continuously during soak tests.
 
+use crate::domain::transaction::tx_receipt::{compute_receipt_root, TxReceipt};
 use crate::runtime::vm::core::execution_env::ExecutionEnvironment;
-use crate::domain::transaction::tx_receipt::{TxReceipt, compute_receipt_root};
 
 /// Result of an invariant check
 #[derive(Debug, Clone)]
@@ -17,7 +17,9 @@ pub struct InvariantResult {
 }
 
 impl InvariantResult {
-    pub fn is_clean(&self) -> bool { self.violations.is_empty() }
+    pub fn is_clean(&self) -> bool {
+        self.violations.is_empty()
+    }
 }
 
 /// Invariant checker that validates system state consistency.
@@ -78,18 +80,23 @@ impl InvariantChecker {
         if unique {
             result.checks_passed += 1;
         } else {
-            result.violations.push("duplicate tx_hash in block receipts".into());
+            result
+                .violations
+                .push("duplicate tx_hash in block receipts".into());
         }
 
         // 4. No destroyed contracts still have code
         result.checks_run += 1;
-        let destroyed_clean = env.destroyed_contracts.iter().all(|addr| {
-            env.state.get_code(addr).is_empty()
-        });
+        let destroyed_clean = env
+            .destroyed_contracts
+            .iter()
+            .all(|addr| env.state.get_code(addr).is_empty());
         if destroyed_clean {
             result.checks_passed += 1;
         } else {
-            result.violations.push("destroyed contract still has code".into());
+            result
+                .violations
+                .push("destroyed contract still has code".into());
         }
 
         // 5. State root is deterministic (compute twice = same result)
@@ -99,7 +106,10 @@ impl InvariantChecker {
         if root1 == root2 {
             result.checks_passed += 1;
         } else {
-            result.violations.push(format!("state_root not deterministic: {} vs {}", root1, root2));
+            result.violations.push(format!(
+                "state_root not deterministic: {} vs {}",
+                root1, root2
+            ));
         }
 
         result
@@ -113,10 +123,14 @@ impl InvariantChecker {
         env: &ExecutionEnvironment,
     ) -> bool {
         if let Some(claimed) = claimed_receipt_root {
-            if compute_receipt_root(receipts) != claimed { return false; }
+            if compute_receipt_root(receipts) != claimed {
+                return false;
+            }
         }
         if let Some(claimed) = claimed_state_root {
-            if env.state.state_root() != claimed { return false; }
+            if env.state.state_root() != claimed {
+                return false;
+            }
         }
         true
     }
@@ -124,13 +138,22 @@ impl InvariantChecker {
     /// Format invariant result for logging/display.
     pub fn format_result(result: &InvariantResult) -> String {
         if result.is_clean() {
-            format!("Block {} ({}): OK {}/{} checks passed",
-                result.block_height, &result.block_hash[..8.min(result.block_hash.len())],
-                result.checks_passed, result.checks_run)
+            format!(
+                "Block {} ({}): OK {}/{} checks passed",
+                result.block_height,
+                &result.block_hash[..8.min(result.block_hash.len())],
+                result.checks_passed,
+                result.checks_run
+            )
         } else {
-            let mut out = format!("Block {} ({}): FAIL {}/{} checks -- {} violations:\n",
-                result.block_height, &result.block_hash[..8.min(result.block_hash.len())],
-                result.checks_passed, result.checks_run, result.violations.len());
+            let mut out = format!(
+                "Block {} ({}): FAIL {}/{} checks -- {} violations:\n",
+                result.block_height,
+                &result.block_hash[..8.min(result.block_hash.len())],
+                result.checks_passed,
+                result.checks_run,
+                result.violations.len()
+            );
             for v in &result.violations {
                 out.push_str(&format!("  - {}\n", v));
             }
@@ -159,18 +182,25 @@ mod tests {
         let receipt_root = compute_receipt_root(&receipts);
 
         let result = InvariantChecker::check_block(
-            1, "block1", Some(&receipt_root), Some(&env.state.state_root()),
-            &receipts, &env,
+            1,
+            "block1",
+            Some(&receipt_root),
+            Some(&env.state.state_root()),
+            &receipts,
+            &env,
         );
-        assert!(result.is_clean(), "Empty block should pass all checks: {:?}", result.violations);
+        assert!(
+            result.is_clean(),
+            "Empty block should pass all checks: {:?}",
+            result.violations
+        );
     }
 
     #[test]
     fn mismatched_receipt_root_detected() {
         let env = make_env();
-        let result = InvariantChecker::check_block(
-            1, "block1", Some("wrong_root"), None, &[], &env,
-        );
+        let result =
+            InvariantChecker::check_block(1, "block1", Some("wrong_root"), None, &[], &env);
         assert!(!result.is_clean());
         assert!(result.violations.iter().any(|v| v.contains("receipt_root")));
     }
@@ -180,7 +210,12 @@ mod tests {
         let env = make_env();
         let receipts: Vec<TxReceipt> = vec![];
         let root = compute_receipt_root(&receipts);
-        assert!(InvariantChecker::quick_check(Some(&root), Some(&env.state.state_root()), &receipts, &env));
+        assert!(InvariantChecker::quick_check(
+            Some(&root),
+            Some(&env.state.state_root()),
+            &receipts,
+            &env
+        ));
     }
 
     #[test]

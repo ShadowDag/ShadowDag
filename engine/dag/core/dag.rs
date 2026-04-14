@@ -4,11 +4,10 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, Options,
-    WriteBatch, ReadOptions, WriteOptions, SliceTransform,
-    DBCompressionType,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, Options, ReadOptions,
+    SliceTransform, WriteBatch, WriteOptions, DB,
 };
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -49,12 +48,14 @@ impl BlockDAG {
         cf_opts.set_compression_type(DBCompressionType::Lz4);
         cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(8));
 
-        let cfs = vec![
-            ColumnFamilyDescriptor::new(CF_BLOCKS, cf_opts),
-        ];
+        let cfs = vec![ColumnFamilyDescriptor::new(CF_BLOCKS, cf_opts)];
 
-        let db = DB::open_cf_descriptors(&base_opts, Path::new(path), cfs)
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open_cf_descriptors(&base_opts, Path::new(path), cfs).map_err(|e| {
+            StorageError::OpenFailed {
+                path: path.to_string(),
+                reason: e.to_string(),
+            }
+        })?;
 
         // Write options — WAL always ON, sync always ON.
         // correctness > determinism > performance
@@ -76,7 +77,8 @@ impl BlockDAG {
 
     #[inline(always)]
     fn cf(&self) -> Result<&rocksdb::ColumnFamily, DagError> {
-        self.db.cf_handle(CF_BLOCKS)
+        self.db
+            .cf_handle(CF_BLOCKS)
             .ok_or_else(|| StorageError::ColumnFamilyNotFound(CF_BLOCKS.to_string()).into())
     }
 
@@ -101,14 +103,14 @@ impl BlockDAG {
             }
         }
 
-        let data = bincode::serialize(block)
-            .map_err(|e| DagError::Serialization(e.to_string()))?;
+        let data = bincode::serialize(block).map_err(|e| DagError::Serialization(e.to_string()))?;
 
         let cf = self.cf()?;
         let mut batch = WriteBatch::default();
         batch.put_cf(cf, &block.hash, data);
 
-        self.db.write_opt(batch, &self.write_opts)
+        self.db
+            .write_opt(batch, &self.write_opts)
             .map_err(StorageError::RocksDb)?;
 
         Ok(())
@@ -129,7 +131,8 @@ impl BlockDAG {
             Ok(cf) => cf,
             Err(_) => return false,
         };
-        self.db.get_pinned_cf(cf, hash)
+        self.db
+            .get_pinned_cf(cf, hash)
             .map(|v| v.is_some())
             .unwrap_or(false)
     }

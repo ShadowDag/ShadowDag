@@ -29,7 +29,7 @@ use crate::domain::block::block::Block;
 use crate::errors::{DagError, StorageError};
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
 use crate::slog_info;
-use rocksdb::{DB, Options, IteratorMode, WriteBatch};
+use rocksdb::{IteratorMode, Options, WriteBatch, DB};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -114,26 +114,26 @@ pub struct BlockGraph {
 
     // ── In-memory LRU cache (NOT the source of truth) ──────────────────
     /// Block data cache (LRU-bounded)
-    cache_blocks:    HashMap<String, Block>,
+    cache_blocks: HashMap<String, Block>,
     /// Parent->children cache
-    cache_children:  HashMap<String, HashSet<String>>,
+    cache_children: HashMap<String, HashSet<String>>,
     /// Child->parents cache
-    cache_parents:   HashMap<String, HashSet<String>>,
+    cache_parents: HashMap<String, HashSet<String>>,
     /// Cached tip set
-    cache_tips:      HashSet<String>,
+    cache_tips: HashSet<String>,
     /// Insertion order for LRU eviction of the cache
     insertion_order: VecDeque<String>,
 
     /// Orphan blocks (bounded, in-memory only -- orphans are transient)
-    pub orphans:      HashMap<String, Block>,
+    pub orphans: HashMap<String, Block>,
     pub orphan_index: HashMap<String, HashSet<String>>,
-    orphan_queue:     VecDeque<String>,
+    orphan_queue: VecDeque<String>,
 
-    genesis_added:    bool,
+    genesis_added: bool,
     /// Total blocks ever added (persisted in RocksDB)
-    total_added:      u64,
+    total_added: u64,
     /// Total blocks evicted from cache (runtime stat only)
-    total_evicted:    u64,
+    total_evicted: u64,
 }
 
 impl BlockGraph {
@@ -143,21 +143,24 @@ impl BlockGraph {
         opts.create_if_missing(true);
         opts.set_write_buffer_size(32 * 1024 * 1024);
 
-        let db = open_shared_db(source, &opts).map_err(|e| StorageError::OpenFailed { path: "BlockGraph".to_string(), reason: e.to_string() })?;
+        let db = open_shared_db(source, &opts).map_err(|e| StorageError::OpenFailed {
+            path: "BlockGraph".to_string(),
+            reason: e.to_string(),
+        })?;
 
         let mut graph = Self {
             db,
-            cache_blocks:    HashMap::with_capacity(MAX_CACHED_BLOCKS / 2),
-            cache_children:  HashMap::with_capacity(MAX_CACHED_BLOCKS / 2),
-            cache_parents:   HashMap::with_capacity(MAX_CACHED_BLOCKS / 2),
-            cache_tips:      HashSet::new(),
+            cache_blocks: HashMap::with_capacity(MAX_CACHED_BLOCKS / 2),
+            cache_children: HashMap::with_capacity(MAX_CACHED_BLOCKS / 2),
+            cache_parents: HashMap::with_capacity(MAX_CACHED_BLOCKS / 2),
+            cache_tips: HashSet::new(),
             insertion_order: VecDeque::with_capacity(MAX_CACHED_BLOCKS),
-            orphans:         HashMap::new(),
-            orphan_index:    HashMap::new(),
-            orphan_queue:    VecDeque::new(),
-            genesis_added:   false,
-            total_added:     0,
-            total_evicted:   0,
+            orphans: HashMap::new(),
+            orphan_index: HashMap::new(),
+            orphan_queue: VecDeque::new(),
+            genesis_added: false,
+            total_added: 0,
+            total_evicted: 0,
         };
 
         graph.recover_from_db();
@@ -170,14 +173,12 @@ impl BlockGraph {
     /// Called once at startup so the node can resume without data loss.
     pub fn recover_from_db(&mut self) {
         // Recover genesis flag
-        self.genesis_added = self.db
-            .get_pinned(META_GENESIS)
-            .ok()
-            .flatten()
-            .is_some();
+        self.genesis_added = self.db.get_pinned(META_GENESIS).ok().flatten().is_some();
 
         // Recover total_added counter
-        self.total_added = self.db.get(META_TOTAL_ADDED)
+        self.total_added = self
+            .db
+            .get(META_TOTAL_ADDED)
             .ok()
             .flatten()
             .and_then(|v| v.as_slice().try_into().ok())
@@ -187,8 +188,14 @@ impl BlockGraph {
         // Recover tips from RocksDB into cache
         self.cache_tips.clear();
         let prefix = b"bg:tip:";
-        for (k, _) in self.db.iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward)).flatten() {
-            if !k.starts_with(prefix) { break; }
+        for (k, _) in self
+            .db
+            .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward))
+            .flatten()
+        {
+            if !k.starts_with(prefix) {
+                break;
+            }
             let hash = String::from_utf8_lossy(&k[prefix.len()..]).into_owned();
             self.cache_tips.insert(hash);
         }
@@ -205,8 +212,12 @@ impl BlockGraph {
         let mut visited: HashSet<String> = HashSet::new();
 
         while let Some(hash) = queue.pop_front() {
-            if visited.contains(&hash) { continue; }
-            if visited.len() >= MAX_CACHED_BLOCKS { break; }
+            if visited.contains(&hash) {
+                continue;
+            }
+            if visited.len() >= MAX_CACHED_BLOCKS {
+                break;
+            }
             visited.insert(hash.clone());
 
             // Load block data from RocksDB
@@ -221,12 +232,16 @@ impl BlockGraph {
             let parents = self.db_get_parents(&hash);
             if !parents.is_empty() {
                 for p in &parents {
-                    self.cache_children.entry(p.clone()).or_default().insert(hash.clone());
+                    self.cache_children
+                        .entry(p.clone())
+                        .or_default()
+                        .insert(hash.clone());
                     if !visited.contains(p) {
                         queue.push_back(p.clone());
                     }
                 }
-                self.cache_parents.insert(hash.clone(), parents.into_iter().collect());
+                self.cache_parents
+                    .insert(hash.clone(), parents.into_iter().collect());
             }
 
             // Load children from RocksDB
@@ -246,17 +261,31 @@ impl BlockGraph {
 
         let orphan_prefix = b"bg:orphan:block:";
         let mut orphan_count = 0u64;
-        for (k, v) in self.db.iterator(IteratorMode::From(orphan_prefix, rocksdb::Direction::Forward)).flatten() {
-            if !k.starts_with(orphan_prefix) { break; }
+        for (k, v) in self
+            .db
+            .iterator(IteratorMode::From(
+                orphan_prefix,
+                rocksdb::Direction::Forward,
+            ))
+            .flatten()
+        {
+            if !k.starts_with(orphan_prefix) {
+                break;
+            }
             let hash = String::from_utf8_lossy(&k[orphan_prefix.len()..]).into_owned();
             if let Ok(block) = bincode::deserialize::<Block>(&v) {
                 for parent in &block.header.parents {
-                    self.orphan_index.entry(parent.clone()).or_default().insert(hash.clone());
+                    self.orphan_index
+                        .entry(parent.clone())
+                        .or_default()
+                        .insert(hash.clone());
                 }
                 self.orphan_queue.push_back(hash.clone());
                 self.orphans.insert(hash, block);
                 orphan_count += 1;
-                if orphan_count as usize >= MAX_ORPHANS { break; }
+                if orphan_count as usize >= MAX_ORPHANS {
+                    break;
+                }
             }
         }
 
@@ -276,7 +305,8 @@ impl BlockGraph {
     // ── RocksDB read helpers ─────────────────────────────────────────────
 
     fn db_block_exists(&self, hash: &str) -> bool {
-        self.db.get_pinned(key_block(hash))
+        self.db
+            .get_pinned(key_block(hash))
             .map(|v| v.is_some())
             .unwrap_or(false)
     }
@@ -293,8 +323,14 @@ impl BlockGraph {
 
     fn scan_prefix_suffix(&self, prefix: &[u8]) -> Vec<String> {
         let mut result = Vec::new();
-        for (k, _) in self.db.iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward)).flatten() {
-            if !k.starts_with(prefix) { break; }
+        for (k, _) in self
+            .db
+            .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward))
+            .flatten()
+        {
+            if !k.starts_with(prefix) {
+                break;
+            }
             result.push(String::from_utf8_lossy(&k[prefix.len()..]).into_owned());
         }
         result
@@ -334,15 +370,17 @@ impl BlockGraph {
         }
 
         // Check if all parents are known (cache OR RocksDB)
-        let all_parents_known = block_parents.iter().all(|p| {
-            self.cache_blocks.contains_key(p) || self.db_block_exists(p)
-        });
+        let all_parents_known = block_parents
+            .iter()
+            .all(|p| self.cache_blocks.contains_key(p) || self.db_block_exists(p));
 
         if all_parents_known {
             // Cycle detection: ensure none of the ancestors of this block
             // are the block itself. In a DAG, cycles are NEVER allowed.
             if self.has_cycle(&hash, &block_parents) {
-                return Err(DagError::Other("Cycle detected: block would create a cycle in the DAG".into()));
+                return Err(DagError::Other(
+                    "Cycle detected: block would create a cycle in the DAG".into(),
+                ));
             }
             self.insert_block(hash.clone(), block)?;
             self.connect_orphans(&hash);
@@ -372,8 +410,8 @@ impl BlockGraph {
         // ── Persist to RocksDB (source of truth) ────────────────────────
         let mut batch = WriteBatch::default();
 
-        let serialized = bincode::serialize(&block)
-            .map_err(|e| DagError::Serialization(e.to_string()))?;
+        let serialized =
+            bincode::serialize(&block).map_err(|e| DagError::Serialization(e.to_string()))?;
         batch.put(key_block(&hash), &serialized);
 
         for p in &block_parents {
@@ -407,7 +445,10 @@ impl BlockGraph {
         let mut parent_set = HashSet::with_capacity(block_parents.len());
         for p in &block_parents {
             parent_set.insert(p.clone());
-            self.cache_children.entry(p.clone()).or_default().insert(hash.clone());
+            self.cache_children
+                .entry(p.clone())
+                .or_default()
+                .insert(hash.clone());
             self.cache_tips.remove(p);
         }
 
@@ -434,7 +475,9 @@ impl BlockGraph {
                 self.insertion_order.push_back(hash);
                 continue;
             }
-            let is_tip_parent = self.cache_children.get(&hash)
+            let is_tip_parent = self
+                .cache_children
+                .get(&hash)
                 .map(|kids| kids.iter().any(|k| self.cache_tips.contains(k)))
                 .unwrap_or(false);
             if is_tip_parent {
@@ -448,7 +491,9 @@ impl BlockGraph {
                 for p in &parents {
                     if let Some(kids) = self.cache_children.get_mut(p) {
                         kids.remove(&hash);
-                        if kids.is_empty() { self.cache_children.remove(p); }
+                        if kids.is_empty() {
+                            self.cache_children.remove(p);
+                        }
                     }
                 }
             }
@@ -459,8 +504,12 @@ impl BlockGraph {
     }
 
     fn store_orphan(&mut self, hash: String, block: Block) {
-        if self.orphans.contains_key(&hash) { return; }
-        if self.orphans.len() >= MAX_ORPHANS { self.evict_orphan(); }
+        if self.orphans.contains_key(&hash) {
+            return;
+        }
+        if self.orphans.len() >= MAX_ORPHANS {
+            self.evict_orphan();
+        }
 
         // Persist orphan to RocksDB so it survives restarts
         if let Ok(serialized) = bincode::serialize(&block) {
@@ -473,7 +522,10 @@ impl BlockGraph {
         }
 
         for parent in &block.header.parents {
-            self.orphan_index.entry(parent.clone()).or_default().insert(hash.clone());
+            self.orphan_index
+                .entry(parent.clone())
+                .or_default()
+                .insert(hash.clone());
         }
         self.orphan_queue.push_back(hash.clone());
         self.orphans.insert(hash, block);
@@ -497,7 +549,9 @@ impl BlockGraph {
                 batch.delete(key_orphan_parent(parent, hash));
                 if let Some(set) = self.orphan_index.get_mut(parent) {
                     set.remove(hash);
-                    if set.is_empty() { self.orphan_index.remove(parent); }
+                    if set.is_empty() {
+                        self.orphan_index.remove(parent);
+                    }
                 }
             }
             let _ = self.db.write(batch);
@@ -512,16 +566,20 @@ impl BlockGraph {
         queue.push_back(root.to_string());
 
         while let Some(parent) = queue.pop_front() {
-            if !visited.insert(parent.clone()) { continue; }
+            if !visited.insert(parent.clone()) {
+                continue;
+            }
             let children = match self.orphan_index.remove(&parent) {
                 Some(c) => c,
                 None => continue,
             };
             for orphan_hash in children {
                 if let Some(block) = self.remove_orphan(&orphan_hash) {
-                    let all_known = block.header.parents.iter().all(|p| {
-                        self.cache_blocks.contains_key(p) || self.db_block_exists(p)
-                    });
+                    let all_known = block
+                        .header
+                        .parents
+                        .iter()
+                        .all(|p| self.cache_blocks.contains_key(p) || self.db_block_exists(p));
                     if all_known {
                         let h = block.header.hash.clone();
                         if self.insert_block(h.clone(), block).is_ok() {
@@ -603,9 +661,11 @@ impl BlockGraph {
             return Some(b.clone());
         }
         // Fall back to RocksDB
-        self.db.get(key_block(hash)).ok().flatten().and_then(|data| {
-            bincode::deserialize::<Block>(&data).ok()
-        })
+        self.db
+            .get(key_block(hash))
+            .ok()
+            .flatten()
+            .and_then(|data| bincode::deserialize::<Block>(&data).ok())
     }
 
     /// Get parents. Checks cache first, then RocksDB.
@@ -614,7 +674,11 @@ impl BlockGraph {
             return Some(p.clone());
         }
         let parents = self.db_get_parents(hash);
-        if parents.is_empty() { None } else { Some(parents.into_iter().collect()) }
+        if parents.is_empty() {
+            None
+        } else {
+            Some(parents.into_iter().collect())
+        }
     }
 
     /// Get children. Checks cache first, then RocksDB.
@@ -623,15 +687,31 @@ impl BlockGraph {
             return Some(c.clone());
         }
         let children = self.db_get_children(hash);
-        if children.is_empty() { None } else { Some(children.into_iter().collect()) }
+        if children.is_empty() {
+            None
+        } else {
+            Some(children.into_iter().collect())
+        }
     }
 
-    pub fn is_tip(&self, hash: &str) -> bool { self.cache_tips.contains(hash) }
-    pub fn tips_iter(&self) -> impl Iterator<Item = &String> { self.cache_tips.iter() }
-    pub fn blocks_iter(&self) -> impl Iterator<Item = (&String, &Block)> { self.cache_blocks.iter() }
-    pub fn total_blocks(&self) -> usize { self.cache_blocks.len() }
-    pub fn total_tips(&self) -> usize { self.cache_tips.len() }
-    pub fn total_orphans(&self) -> usize { self.orphans.len() }
+    pub fn is_tip(&self, hash: &str) -> bool {
+        self.cache_tips.contains(hash)
+    }
+    pub fn tips_iter(&self) -> impl Iterator<Item = &String> {
+        self.cache_tips.iter()
+    }
+    pub fn blocks_iter(&self) -> impl Iterator<Item = (&String, &Block)> {
+        self.cache_blocks.iter()
+    }
+    pub fn total_blocks(&self) -> usize {
+        self.cache_blocks.len()
+    }
+    pub fn total_tips(&self) -> usize {
+        self.cache_tips.len()
+    }
+    pub fn total_orphans(&self) -> usize {
+        self.orphans.len()
+    }
 
     /// Check if a block hash is known (cache OR RocksDB)
     pub fn is_known(&self, hash: &str) -> bool {
@@ -641,10 +721,16 @@ impl BlockGraph {
     }
 
     /// Stats
-    pub fn total_ever_added(&self) -> u64 { self.total_added }
-    pub fn total_ever_evicted(&self) -> u64 { self.total_evicted }
+    pub fn total_ever_added(&self) -> u64 {
+        self.total_added
+    }
+    pub fn total_ever_evicted(&self) -> u64 {
+        self.total_evicted
+    }
     pub fn cache_hit_rate(&self) -> f64 {
-        if self.total_added == 0 { return 100.0; }
+        if self.total_added == 0 {
+            return 100.0;
+        }
         let cached = self.cache_blocks.len() as f64;
         let total = self.total_added as f64;
         (cached / total.max(1.0)) * 100.0
@@ -673,8 +759,8 @@ impl BlockGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::block::block_header::BlockHeader;
     use crate::domain::block::block_body::BlockBody;
+    use crate::domain::block::block_header::BlockHeader;
 
     fn tmp_path() -> String {
         format!(
@@ -689,14 +775,24 @@ mod tests {
     fn make_block(hash: &str, parents: Vec<&str>) -> Block {
         Block {
             header: BlockHeader {
-                version: 1, hash: hash.to_string(),
+                version: 1,
+                hash: hash.to_string(),
                 parents: parents.into_iter().map(|s| s.to_string()).collect(),
-                merkle_root: "mr".into(), timestamp: 1000, nonce: 0,
-                difficulty: 1, height: 0, blue_score: 0, selected_parent: None,
-                utxo_commitment: None, extra_nonce: 0,
-                receipt_root: None, state_root: None,
+                merkle_root: "mr".into(),
+                timestamp: 1000,
+                nonce: 0,
+                difficulty: 1,
+                height: 0,
+                blue_score: 0,
+                selected_parent: None,
+                utxo_commitment: None,
+                extra_nonce: 0,
+                receipt_root: None,
+                state_root: None,
             },
-            body: BlockBody { transactions: vec![] },
+            body: BlockBody {
+                transactions: vec![],
+            },
         }
     }
 
@@ -785,6 +881,9 @@ mod tests {
 
         // Manually remove from cache but leave in RocksDB
         g.cache_blocks.remove("genesis");
-        assert!(g.get_block("genesis").is_some(), "Should fall back to RocksDB");
+        assert!(
+            g.get_block("genesis").is_some(),
+            "Should fall back to RocksDB"
+        );
     }
 }

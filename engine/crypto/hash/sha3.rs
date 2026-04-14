@@ -3,15 +3,13 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{
-    DB, Options, WriteOptions, ReadOptions,
-    WriteBatch, DBPinnableSlice,
-    BlockBasedOptions, Cache, SliceTransform,
-    IteratorMode, Direction,
-};
-use std::path::Path;
 use crate::errors::CryptoError;
 use crate::slog_error;
+use rocksdb::{
+    BlockBasedOptions, Cache, DBPinnableSlice, Direction, IteratorMode, Options, ReadOptions,
+    SliceTransform, WriteBatch, WriteOptions, DB,
+};
+use std::path::Path;
 
 // prefix
 const HASH_PREFIX: &[u8] = b"h:";
@@ -26,7 +24,6 @@ pub struct Sha3Store {
 }
 
 impl Sha3Store {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
@@ -38,7 +35,7 @@ impl Sha3Store {
         opts.increase_parallelism(
             std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4) as i32
+                .unwrap_or(4) as i32,
         );
 
         opts.optimize_level_style_compaction(256 * 1024 * 1024);
@@ -143,14 +140,12 @@ impl Sha3Store {
     // ─────────────────────────────────────────
     #[inline(always)]
     pub fn get_hash(&self, key: &str) -> Option<Vec<u8>> {
-        Self::with_key(key, |k| {
-            match self.db.get_opt(k, &self.read_opts) {
-                Ok(Some(v)) => Some(v.to_vec()),
-                Ok(None) => None,
-                Err(e) => {
-                    slog_error!("crypto", "sha3_store_read_failed", error => e);
-                    None
-                }
+        Self::with_key(key, |k| match self.db.get_opt(k, &self.read_opts) {
+            Ok(Some(v)) => Some(v.to_vec()),
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("crypto", "sha3_store_read_failed", error => e);
+                None
             }
         })
     }
@@ -195,14 +190,12 @@ impl Sha3Store {
     // ─────────────────────────────────────────
     #[inline(always)]
     pub fn get_hash_pinned(&self, key: &str) -> Option<DBPinnableSlice<'_>> {
-        Self::with_key(key, |k| {
-            match self.db.get_pinned_opt(k, &self.read_opts) {
-                Ok(Some(v)) => Some(v),
-                Ok(None) => None,
-                Err(e) => {
-                    slog_error!("crypto", "sha3_store_read_pinned_failed", error => e);
-                    None
-                }
+        Self::with_key(key, |k| match self.db.get_pinned_opt(k, &self.read_opts) {
+            Ok(Some(v)) => Some(v),
+            Ok(None) => None,
+            Err(e) => {
+                slog_error!("crypto", "sha3_store_read_pinned_failed", error => e);
+                None
             }
         })
     }

@@ -18,8 +18,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use std::fmt;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ── Log levels ──────────────────────────────────────────────────────────
@@ -29,8 +29,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub enum Level {
     Trace = 0,
     Debug = 1,
-    Info  = 2,
-    Warn  = 3,
+    Info = 2,
+    Warn = 3,
     Error = 4,
     Fatal = 5,
 }
@@ -40,8 +40,8 @@ impl Level {
         match self {
             Level::Trace => "TRACE",
             Level::Debug => "DEBUG",
-            Level::Info  => "INFO",
-            Level::Warn  => "WARN",
+            Level::Info => "INFO",
+            Level::Warn => "WARN",
             Level::Error => "ERROR",
             Level::Fatal => "FATAL",
         }
@@ -52,11 +52,11 @@ impl Level {
         match s.to_uppercase().as_str() {
             "TRACE" => Level::Trace,
             "DEBUG" => Level::Debug,
-            "INFO"  => Level::Info,
-            "WARN"  => Level::Warn,
+            "INFO" => Level::Info,
+            "WARN" => Level::Warn,
             "ERROR" => Level::Error,
             "FATAL" => Level::Fatal,
-            _       => Level::Info,
+            _ => Level::Info,
         }
     }
 }
@@ -82,10 +82,10 @@ pub enum LogFormat {
 impl LogFormat {
     pub fn from_env() -> Self {
         match std::env::var("SHADOWDAG_LOG_FORMAT").as_deref() {
-            Ok("json")    => LogFormat::Json,
-            Ok("pretty")  => LogFormat::Pretty,
+            Ok("json") => LogFormat::Json,
+            Ok("pretty") => LogFormat::Pretty,
             Ok("compact") => LogFormat::Compact,
-            _             => LogFormat::Pretty,
+            _ => LogFormat::Pretty,
         }
     }
 }
@@ -95,10 +95,10 @@ impl LogFormat {
 /// A structured log event with typed fields.
 pub struct LogEvent {
     pub timestamp: u64,
-    pub level:     Level,
+    pub level: Level,
     pub subsystem: &'static str,
-    pub event:     &'static str,
-    pub fields:    Vec<(&'static str, String)>,
+    pub event: &'static str,
+    pub fields: Vec<(&'static str, String)>,
 }
 
 impl LogEvent {
@@ -149,7 +149,7 @@ impl LogEvent {
     /// line-based parsers.
     pub fn to_pretty(&self) -> String {
         let secs = self.timestamp / 1000;
-        let ms   = self.timestamp % 1000;
+        let ms = self.timestamp % 1000;
 
         let mut s = String::with_capacity(256);
         s.push_str(&format!("[{}.{:03}] ", secs, ms));
@@ -242,7 +242,9 @@ fn escape_plain(s: &str) -> String {
 /// remains unambiguously parseable. Internal `"` is escaped to `\"`.
 fn format_compact_value(s: &str) -> String {
     let escaped = escape_plain(s);
-    let needs_quoting = escaped.chars().any(|c| c.is_whitespace() || c == '=' || c == '"');
+    let needs_quoting = escaped
+        .chars()
+        .any(|c| c.is_whitespace() || c == '=' || c == '"');
     if needs_quoting {
         let mut out = String::with_capacity(escaped.len() + 2);
         out.push('"');
@@ -263,7 +265,7 @@ fn format_compact_value(s: &str) -> String {
 // ── Global logger state ─────────────────────────────────────────────────
 
 static LOG_FORMAT: OnceLock<LogFormat> = OnceLock::new();
-static MIN_LEVEL:  OnceLock<Level>     = OnceLock::new();
+static MIN_LEVEL: OnceLock<Level> = OnceLock::new();
 
 /// Total log events emitted (for metrics).
 static LOG_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -314,8 +316,8 @@ pub fn emit(event: LogEvent) {
     LOG_COUNT.fetch_add(1, Ordering::Relaxed);
 
     let line = match format() {
-        LogFormat::Json    => event.to_json(),
-        LogFormat::Pretty  => event.to_pretty(),
+        LogFormat::Json => event.to_json(),
+        LogFormat::Pretty => event.to_pretty(),
         LogFormat::Compact => event.to_compact(),
     };
 
@@ -428,8 +430,7 @@ mod tests {
 
     #[test]
     fn compact_format() {
-        let ev = LogEvent::new(Level::Debug, "mempool", "tx_added")
-            .field("hash", "ff00");
+        let ev = LogEvent::new(Level::Debug, "mempool", "tx_added").field("hash", "ff00");
         let compact = ev.to_compact();
         assert!(compact.contains("level=DEBUG"));
         assert!(compact.contains("sub=mempool"));
@@ -466,11 +467,15 @@ mod tests {
         // synthetic "fake" line must not break the output onto multiple
         // lines or allow log forging.
         let malicious = "normal\nFATAL [security] fake_alert admin_bypass=1";
-        let ev = LogEvent::new(Level::Info, "p2p", "peer_msg")
-            .field("addr", malicious);
+        let ev = LogEvent::new(Level::Info, "p2p", "peer_msg").field("addr", malicious);
         let pretty = ev.to_pretty();
         // Result must still be exactly one line
-        assert_eq!(pretty.matches('\n').count(), 0, "to_pretty leaked a newline: {}", pretty);
+        assert_eq!(
+            pretty.matches('\n').count(),
+            0,
+            "to_pretty leaked a newline: {}",
+            pretty
+        );
         // And the forged content must be escaped, not inline
         assert!(pretty.contains("\\n"));
         assert!(!pretty.contains("\nFATAL"));
@@ -499,8 +504,7 @@ mod tests {
     #[test]
     fn compact_escapes_control_chars_in_values() {
         let malicious = "v1\nts=0 level=FATAL sub=sec event=forged";
-        let ev = LogEvent::new(Level::Info, "p2p", "peer_msg")
-            .field("x", malicious);
+        let ev = LogEvent::new(Level::Info, "p2p", "peer_msg").field("x", malicious);
         let compact = ev.to_compact();
         assert_eq!(compact.matches('\n').count(), 0);
         assert!(compact.contains("\\n"));

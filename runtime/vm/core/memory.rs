@@ -77,11 +77,15 @@ impl Memory {
 
         let new_cost = (new_words as u64)
             .saturating_mul(MEMORY_GAS_PER_WORD)
-            .saturating_add((new_words as u64).saturating_mul(new_words as u64) / MEMORY_QUADRATIC_DIVISOR);
+            .saturating_add(
+                (new_words as u64).saturating_mul(new_words as u64) / MEMORY_QUADRATIC_DIVISOR,
+            );
 
         let old_cost = (old_words as u64)
             .saturating_mul(MEMORY_GAS_PER_WORD)
-            .saturating_add((old_words as u64).saturating_mul(old_words as u64) / MEMORY_QUADRATIC_DIVISOR);
+            .saturating_add(
+                (old_words as u64).saturating_mul(old_words as u64) / MEMORY_QUADRATIC_DIVISOR,
+            );
 
         new_cost.saturating_sub(old_cost)
     }
@@ -106,7 +110,8 @@ impl Memory {
 
     /// Load 32 bytes from offset
     pub fn load(&mut self, offset: usize) -> Result<[u8; 32], VmError> {
-        let end = offset.checked_add(32)
+        let end = offset
+            .checked_add(32)
             .ok_or(VmError::MemoryOutOfBounds(offset))?;
         self.ensure_size(end)?;
 
@@ -117,7 +122,8 @@ impl Memory {
 
     /// Store 32 bytes at offset
     pub fn store(&mut self, offset: usize, value: &[u8; 32]) -> Result<(), VmError> {
-        let end = offset.checked_add(32)
+        let end = offset
+            .checked_add(32)
             .ok_or(VmError::MemoryOutOfBounds(offset))?;
         self.ensure_size(end)?;
 
@@ -127,7 +133,8 @@ impl Memory {
 
     /// Load a single byte
     pub fn load_byte(&mut self, offset: usize) -> Result<u8, VmError> {
-        let end = offset.checked_add(1)
+        let end = offset
+            .checked_add(1)
             .ok_or(VmError::MemoryOutOfBounds(offset))?;
         self.ensure_size(end)?;
         Ok(self.data[offset])
@@ -135,7 +142,8 @@ impl Memory {
 
     /// Store a single byte
     pub fn store_byte(&mut self, offset: usize, value: u8) -> Result<(), VmError> {
-        let end = offset.checked_add(1)
+        let end = offset
+            .checked_add(1)
             .ok_or(VmError::MemoryOutOfBounds(offset))?;
         self.ensure_size(end)?;
         self.data[offset] = value;
@@ -147,7 +155,8 @@ impl Memory {
         if size == 0 {
             return Ok(vec![]);
         }
-        let end = offset.checked_add(size)
+        let end = offset
+            .checked_add(size)
             .ok_or(VmError::MemoryOutOfBounds(offset))?;
         self.ensure_size(end)?;
         Ok(self.data[offset..end].to_vec())
@@ -158,7 +167,8 @@ impl Memory {
         if data.is_empty() {
             return Ok(());
         }
-        let end = offset.checked_add(data.len())
+        let end = offset
+            .checked_add(data.len())
             .ok_or(VmError::MemoryOutOfBounds(offset))?;
         self.ensure_size(end)?;
         self.data[offset..end].copy_from_slice(data);
@@ -185,7 +195,9 @@ impl Memory {
         if size == 0 {
             return Ok(());
         }
-        let max_end = src.max(dst).checked_add(size)
+        let max_end = src
+            .max(dst)
+            .checked_add(size)
             .ok_or(VmError::MemoryOutOfBounds(src.max(dst)))?;
         self.ensure_size(max_end)?;
         self.data.copy_within(src..src + size, dst);
@@ -236,7 +248,7 @@ mod tests {
     #[test]
     fn expansion_cost_grows() {
         let m = Memory::new();
-        let cost1 = m.expansion_cost(0, 32);  // 1 word
+        let cost1 = m.expansion_cost(0, 32); // 1 word
         let cost2 = m.expansion_cost(0, 320); // 10 words
         assert!(cost2 > cost1);
     }

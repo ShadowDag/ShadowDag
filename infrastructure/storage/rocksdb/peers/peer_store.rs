@@ -3,7 +3,7 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options, WriteBatch, IteratorMode};
+use rocksdb::{IteratorMode, Options, WriteBatch, DB};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,7 +16,7 @@ pub const MAX_STORED_PEERS: usize = 2_048;
 pub const MAX_GETPEERS_RESPONSE: usize = 200;
 
 const PFX_PEER: &str = "peer:";
-const PFX_BAN:  &str = "ban:";
+const PFX_BAN: &str = "ban:";
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -30,7 +30,9 @@ fn encode_u64(v: u64) -> [u8; 8] {
 }
 
 fn decode_u64(b: &[u8]) -> u64 {
-    if b.len() < 8 { return 0; }
+    if b.len() < 8 {
+        return 0;
+    }
     u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
 
@@ -44,9 +46,7 @@ impl PeerStore {
         opts.create_if_missing(true);
         opts.set_write_buffer_size(8 * 1024 * 1024);
         match DB::open(&opts, Path::new(path)) {
-            Ok(db) => {
-                Some(Self { db })
-            }
+            Ok(db) => Some(Self { db }),
             Err(e) => {
                 slog_error!("storage", "peer_store_open_failed", path => path, error => e);
                 None
@@ -55,8 +55,8 @@ impl PeerStore {
     }
 
     pub fn new_default() -> Result<Self, crate::errors::StorageError> {
-        let path = crate::config::node::node_config::NetworkMode::base_data_dir()
-            .join("peers_store");
+        let path =
+            crate::config::node::node_config::NetworkMode::base_data_dir().join("peers_store");
         Self::new(&path.to_string_lossy()).ok_or_else(|| {
             slog_error!("storage", "peer_store_open_failed");
             crate::errors::StorageError::OpenFailed {
@@ -81,9 +81,11 @@ impl PeerStore {
         if !self.peer_exists(&addr.address) && self.peer_count() >= MAX_STORED_PEERS {
             return Err(StorageError::WriteFailed("peer store full".into()));
         }
-        let key   = format!("{}{}", PFX_PEER, addr.address);
+        let key = format!("{}{}", PFX_PEER, addr.address);
         let value = encode_u64(addr.last_seen.max(now_secs()));
-        self.db.put(key.as_bytes(), value).map_err(|e| StorageError::WriteFailed(e.to_string()))
+        self.db
+            .put(key.as_bytes(), value)
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
     pub fn add_raw(&self, address: &str) -> Result<(), StorageError> {
@@ -93,27 +95,37 @@ impl PeerStore {
 
     pub fn remove_peer(&self, address: &str) -> Result<(), StorageError> {
         let key = format!("{}{}", PFX_PEER, address);
-        self.db.delete(key.as_bytes()).map_err(|e| StorageError::WriteFailed(e.to_string()))
+        self.db
+            .delete(key.as_bytes())
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
     pub fn get_all_peers(&self, max: usize) -> Vec<PeerAddress> {
         let prefix = PFX_PEER.as_bytes();
         let mut peers = Vec::new();
 
-        let iter = self.db.iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward));
+        let iter = self
+            .db
+            .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward));
         for item in iter {
-            if peers.len() >= max { break; }
+            if peers.len() >= max {
+                break;
+            }
             match item {
                 Ok((k, v)) => {
-                    if !k.starts_with(prefix) { break; }
+                    if !k.starts_with(prefix) {
+                        break;
+                    }
                     let addr_str = match std::str::from_utf8(&k[prefix.len()..]) {
                         Ok(s) => s.to_string(),
                         Err(_) => continue,
                     };
-                    if self.is_banned(&addr_str) { continue; }
+                    if self.is_banned(&addr_str) {
+                        continue;
+                    }
                     let last_seen = decode_u64(&v);
                     peers.push(PeerAddress {
-                        address:  addr_str,
+                        address: addr_str,
                         services: 0,
                         last_seen,
                     });
@@ -134,9 +146,11 @@ impl PeerStore {
 
     pub fn ban_peer(&self, address: &str, duration_secs: u64) -> Result<(), StorageError> {
         let expiry = now_secs() + duration_secs;
-        let key    = format!("{}{}", PFX_BAN, address);
-        let value  = encode_u64(expiry);
-        self.db.put(key.as_bytes(), value).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        let key = format!("{}{}", PFX_BAN, address);
+        let value = encode_u64(expiry);
+        self.db
+            .put(key.as_bytes(), value)
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         self.remove_peer(address)
     }
 
@@ -159,15 +173,19 @@ impl PeerStore {
 
     pub fn prune_banned(&self) -> Result<(), StorageError> {
         let prefix = PFX_BAN.as_bytes();
-        let now    = now_secs();
+        let now = now_secs();
         let mut batch = WriteBatch::default();
         let mut pruned = 0usize;
 
-        let iter = self.db.iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward));
+        let iter = self
+            .db
+            .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward));
         for item in iter {
             match item {
                 Ok((k, v)) => {
-                    if !k.starts_with(prefix) { break; }
+                    if !k.starts_with(prefix) {
+                        break;
+                    }
                     let expiry = decode_u64(&v);
                     if now >= expiry {
                         batch.delete(&k);
@@ -179,7 +197,9 @@ impl PeerStore {
         }
 
         if pruned > 0 {
-            self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+            self.db
+                .write(batch)
+                .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         }
         Ok(())
     }
@@ -198,7 +218,7 @@ impl PeerStore {
             if pa.address.is_empty() || self.is_banned(&pa.address) {
                 continue;
             }
-            let key   = format!("{}{}", PFX_PEER, pa.address);
+            let key = format!("{}{}", PFX_PEER, pa.address);
             let value = encode_u64(pa.last_seen.max(now_secs()));
             batch.put(key.as_bytes(), value);
             added += 1;
@@ -221,8 +241,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        PeerStore::new(&format!("/tmp/test_peerstore_{}", ts))
-            .expect("open test peer store")
+        PeerStore::new(&format!("/tmp/test_peerstore_{}", ts)).expect("open test peer store")
     }
 
     #[test]
@@ -231,8 +250,10 @@ mod tests {
         let pa = PeerAddress::new("10.0.0.1:9333", 1);
         store.add_peer(&pa).unwrap();
         let peers = store.get_all_peers(100);
-        assert!(peers.iter().any(|p| p.address == "10.0.0.1:9333"),
-            "Stored peer must appear in get_all_peers");
+        assert!(
+            peers.iter().any(|p| p.address == "10.0.0.1:9333"),
+            "Stored peer must appear in get_all_peers"
+        );
     }
 
     #[test]
@@ -241,8 +262,10 @@ mod tests {
         store.add_raw("10.0.0.2:9333").unwrap();
         store.remove_peer("10.0.0.2:9333").unwrap();
         let peers = store.get_all_peers(100);
-        assert!(!peers.iter().any(|p| p.address == "10.0.0.2:9333"),
-            "Removed peer must not appear");
+        assert!(
+            !peers.iter().any(|p| p.address == "10.0.0.2:9333"),
+            "Removed peer must not appear"
+        );
     }
 
     #[test]
@@ -251,8 +274,10 @@ mod tests {
         store.add_raw("10.0.0.3:9333").unwrap();
         store.ban_peer("10.0.0.3:9333", 3600).unwrap();
         let peers = store.get_all_peers(100);
-        assert!(!peers.iter().any(|p| p.address == "10.0.0.3:9333"),
-            "Banned peer must not appear in peer list");
+        assert!(
+            !peers.iter().any(|p| p.address == "10.0.0.3:9333"),
+            "Banned peer must not appear in peer list"
+        );
     }
 
     #[test]
@@ -270,8 +295,10 @@ mod tests {
         let key = "ban:10.0.0.6:9333".to_string();
         let expiry: u64 = 0;
         store.db.put(key.as_bytes(), expiry.to_le_bytes()).ok();
-        assert!(!store.is_banned("10.0.0.6:9333"),
-            "Expired ban must not count as active");
+        assert!(
+            !store.is_banned("10.0.0.6:9333"),
+            "Expired ban must not count as active"
+        );
     }
 
     #[test]
@@ -281,8 +308,10 @@ mod tests {
         let key = "ban:stale_peer:9333".to_string();
         store.db.put(key.as_bytes(), 0u64.to_le_bytes()).ok();
         store.prune_banned().unwrap();
-        assert!(!store.is_banned("stale_peer:9333"),
-            "Pruned ban must not exist");
+        assert!(
+            !store.is_banned("stale_peer:9333"),
+            "Pruned ban must not exist"
+        );
     }
 
     #[test]
@@ -293,6 +322,9 @@ mod tests {
             .collect();
         store.add_peer_batch(&peers);
         let count = store.peer_count();
-        assert!(count <= MAX_STORED_PEERS, "Peer count must not exceed MAX_STORED_PEERS");
+        assert!(
+            count <= MAX_STORED_PEERS,
+            "Peer count must not exceed MAX_STORED_PEERS"
+        );
     }
 }

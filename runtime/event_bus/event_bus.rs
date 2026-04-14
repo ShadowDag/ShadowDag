@@ -15,7 +15,7 @@
 //     audit) that MUST distinguish the three states explicitly.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options};
+use rocksdb::{Options, DB};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -27,7 +27,7 @@ use crate::slog_error;
 #[derive(Debug, Clone)]
 pub struct BusEvent {
     pub event_id: String,
-    pub payload:  String,
+    pub payload: String,
 }
 
 pub struct EventBus {
@@ -40,10 +40,9 @@ impl EventBus {
     pub fn new<S: Into<SharedDbSource>>(source: S) -> Result<Self, StorageError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
-        let db = open_shared_db(source, &opts)
-            .inspect_err(|e| {
-                slog_error!("runtime", "event_bus_db_init_failed", error => &e.to_string());
-            })?;
+        let db = open_shared_db(source, &opts).inspect_err(|e| {
+            slog_error!("runtime", "event_bus_db_init_failed", error => &e.to_string());
+        })?;
         let (broadcast_tx, _) = broadcast::channel(4096);
         Ok(Self { db, broadcast_tx })
     }
@@ -59,7 +58,7 @@ impl EventBus {
         // Broadcast to real-time subscribers (ignore send errors — no subscribers is OK)
         let _ = self.broadcast_tx.send(BusEvent {
             event_id: event_id.to_string(),
-            payload:  payload.to_string(),
+            payload: payload.to_string(),
         });
     }
 

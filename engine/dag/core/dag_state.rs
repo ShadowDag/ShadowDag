@@ -4,8 +4,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use rocksdb::{
-    DB, Options, IteratorMode, WriteBatch, ReadOptions, SliceTransform,
-    DBCompressionType, WriteOptions
+    DBCompressionType, IteratorMode, Options, ReadOptions, SliceTransform, WriteBatch,
+    WriteOptions, DB,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -14,13 +14,13 @@ use crate::errors::{DagError, StorageError};
 use crate::slog_error;
 // prefixes
 const PFX_SCORE: &[u8] = b"score:";
-const PFX_SP:    &[u8] = b"sp___:";
-const PFX_BLUE:  &[u8] = b"blue_:";
-const PFX_RED:   &[u8] = b"red__:";
-const PFX_BSET:  &[u8] = b"bset_:";
-const PFX_RSET:  &[u8] = b"rset_:";
-const PFX_DONE:  &[u8] = b"done_:";
-const KEY_TIP:   &[u8] = b"dag:tip";
+const PFX_SP: &[u8] = b"sp___:";
+const PFX_BLUE: &[u8] = b"blue_:";
+const PFX_RED: &[u8] = b"red__:";
+const PFX_BSET: &[u8] = b"bset_:";
+const PFX_RSET: &[u8] = b"rset_:";
+const PFX_DONE: &[u8] = b"done_:";
+const KEY_TIP: &[u8] = b"dag:tip";
 
 // buffer
 type KeyBuf = Vec<u8>;
@@ -47,7 +47,6 @@ pub struct DagState {
 }
 
 impl DagState {
-
     // ==============================
     // 🔥 INIT (ULTRA OPTIMIZED)
     // ==============================
@@ -90,7 +89,11 @@ impl DagState {
     pub fn new_required(path: &str) -> Result<Self, DagError> {
         Self::new(path).ok_or_else(|| {
             slog_error!("dag", "dag_state_fatal_open", path => path);
-            StorageError::OpenFailed { path: path.to_string(), reason: "cannot open DB".to_string() }.into()
+            StorageError::OpenFailed {
+                path: path.to_string(),
+                reason: "cannot open DB".to_string(),
+            }
+            .into()
         })
     }
 
@@ -132,7 +135,8 @@ impl DagState {
         let mut key = KeyBuf::new();
         key_into(&mut key, PFX_SP, hash);
 
-        self.db.get(&key)
+        self.db
+            .get(&key)
             .ok()
             .flatten()
             .and_then(|v| String::from_utf8(v.to_vec()).ok())
@@ -288,7 +292,8 @@ impl DagState {
     }
 
     pub fn get_tip(&self) -> Option<String> {
-        self.db.get(KEY_TIP)
+        self.db
+            .get(KEY_TIP)
             .ok()
             .flatten()
             .and_then(|v| String::from_utf8(v.to_vec()).ok())

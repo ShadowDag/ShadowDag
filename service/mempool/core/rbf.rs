@@ -19,12 +19,12 @@
 //   - Short block times (1s) make RBF less critical but still useful
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::domain::transaction::transaction::Transaction;
 use crate::config::consensus::mempool_config::MempoolConfig;
+use crate::domain::transaction::transaction::Transaction;
 
-pub const MIN_FEE_BUMP: u64            = MempoolConfig::MIN_FEE_BUMP;
+pub const MIN_FEE_BUMP: u64 = MempoolConfig::MIN_FEE_BUMP;
 pub const MAX_REPLACEMENT_DEPTH: usize = MempoolConfig::MAX_REPLACEMENT_DEPTH;
-pub const MAX_EVICTIONS: usize         = MempoolConfig::MAX_RBF_EVICTIONS;
+pub const MAX_EVICTIONS: usize = MempoolConfig::MAX_RBF_EVICTIONS;
 
 /// RBF evaluation result
 #[derive(Debug, Clone)]
@@ -48,12 +48,12 @@ pub enum RbfResult {
 /// Information about a mempool transaction for RBF evaluation
 #[derive(Debug, Clone)]
 pub struct MempoolTxInfo {
-    pub hash:      String,
-    pub fee:       u64,
-    pub fee_rate:  f64, // fee per byte
-    pub size:      usize,
+    pub hash: String,
+    pub fee: u64,
+    pub fee_rate: f64, // fee per byte
+    pub size: usize,
     /// Input keys this TX spends
-    pub inputs:    Vec<String>,
+    pub inputs: Vec<String>,
     /// Other TX hashes that depend on this TX's outputs
     pub dependents: Vec<String>,
     /// How many replacements have been applied to this TX chain
@@ -69,7 +69,7 @@ impl RbfEngine {
     /// `conflicting`: Existing mempool TXs that spend the same inputs
     /// `confirmed_utxo_keys`: Set of UTXO keys known to be confirmed on-chain
     pub fn evaluate(
-        new_tx:      &Transaction,
+        new_tx: &Transaction,
         conflicting: &[MempoolTxInfo],
         confirmed_utxo_keys: &std::collections::HashSet<String>,
     ) -> RbfResult {
@@ -88,24 +88,25 @@ impl RbfEngine {
         // `dependent_fees` or the engine should look up each dependent.
         // As a pragmatic fix, we sum each conflict's fee plus a per-dependent
         // estimate of MIN_FEE_BUMP (the minimum any valid TX must pay).
-        let total_evicted_fee: u64 = match conflicting.iter()
-            .try_fold(0u64, |acc, tx| {
-                // Sum the conflict's own fee
-                let with_own = acc.checked_add(tx.fee)?;
-                // Sum estimated fees for dependents that will also be evicted.
-                // Each dependent is a valid mempool TX, so it paid at least
-                // MIN_FEE_BUMP. This is a lower bound; the actual fee may be higher.
-                let dep_fees = (tx.dependents.len() as u64).checked_mul(MIN_FEE_BUMP)?;
-                with_own.checked_add(dep_fees)
-            })
-        {
+        let total_evicted_fee: u64 = match conflicting.iter().try_fold(0u64, |acc, tx| {
+            // Sum the conflict's own fee
+            let with_own = acc.checked_add(tx.fee)?;
+            // Sum estimated fees for dependents that will also be evicted.
+            // Each dependent is a valid mempool TX, so it paid at least
+            // MIN_FEE_BUMP. This is a lower bound; the actual fee may be higher.
+            let dep_fees = (tx.dependents.len() as u64).checked_mul(MIN_FEE_BUMP)?;
+            with_own.checked_add(dep_fees)
+        }) {
             Some(total) => total,
-            None => return RbfResult::Rejected {
-                reason: "evicted fee total overflows u64".to_string(),
-            },
+            None => {
+                return RbfResult::Rejected {
+                    reason: "evicted fee total overflows u64".to_string(),
+                }
+            }
         };
 
-        let total_eviction_count: usize = conflicting.iter()
+        let total_eviction_count: usize = conflicting
+            .iter()
             .map(|tx| 1 + tx.dependents.len())
             .fold(0usize, |acc, n| acc.saturating_add(n));
 
@@ -119,31 +120,42 @@ impl RbfEngine {
         }
 
         // Rule 3: Check replacement chain depth
-        let max_depth = conflicting.iter()
+        let max_depth = conflicting
+            .iter()
             .map(|tx| tx.replacement_depth)
             .max()
             .unwrap_or(0);
         if max_depth + 1 > MAX_REPLACEMENT_DEPTH {
-            return RbfResult::ChainTooDeep { depth: max_depth + 1 };
+            return RbfResult::ChainTooDeep {
+                depth: max_depth + 1,
+            };
         }
 
         // Rule 4: Check total evictions
         if total_eviction_count > MAX_EVICTIONS {
-            return RbfResult::TooManyEvictions { count: total_eviction_count };
+            return RbfResult::TooManyEvictions {
+                count: total_eviction_count,
+            };
         }
 
         // Rule 5: New TX must not introduce new unconfirmed inputs
         // (all inputs must be either confirmed UTXOs or same as original)
-        let original_inputs: std::collections::HashSet<String> = conflicting.iter()
+        let original_inputs: std::collections::HashSet<String> = conflicting
+            .iter()
             .flat_map(|tx| tx.inputs.iter().cloned())
             .collect();
 
         for input in &new_tx.inputs {
             let k = match crate::domain::utxo::utxo_set::utxo_key(&input.txid, input.index) {
                 Ok(k) => k,
-                Err(_) => return RbfResult::Rejected {
-                    reason: format!("input txid '{}' is malformed (must be 64-char hex)", input.txid),
-                },
+                Err(_) => {
+                    return RbfResult::Rejected {
+                        reason: format!(
+                            "input txid '{}' is malformed (must be 64-char hex)",
+                            input.txid
+                        ),
+                    }
+                }
             };
             let key = k.to_string();
             if !original_inputs.contains(&key) && !confirmed_utxo_keys.contains(&key) {
@@ -158,7 +170,8 @@ impl RbfEngine {
         // called twice for the same hash, wasting work and producing
         // confusing telemetry.
         let mut seen = std::collections::HashSet::new();
-        let evicted: Vec<String> = conflicting.iter()
+        let evicted: Vec<String> = conflicting
+            .iter()
             .flat_map(|tx| {
                 let mut hashes = vec![tx.hash.clone()];
                 hashes.extend(tx.dependents.clone());
@@ -173,7 +186,8 @@ impl RbfEngine {
     /// Calculate the minimum fee needed to replace a set of transactions.
     /// Includes estimated descendant fees (consistent with evaluate()).
     pub fn minimum_replacement_fee(conflicting: &[MempoolTxInfo]) -> u64 {
-        let total: u64 = conflicting.iter()
+        let total: u64 = conflicting
+            .iter()
             .try_fold(0u64, |acc, tx| {
                 let with_own = acc.checked_add(tx.fee)?;
                 let dep_fees = (tx.dependents.len() as u64).checked_mul(MIN_FEE_BUMP)?;
@@ -197,15 +211,27 @@ mod tests {
 
     /// Convert a short test name to a deterministic 64-char hex hash.
     fn th(name: &str) -> String {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(name.as_bytes()))
     }
 
     fn make_tx(hash: &str, fee: u64) -> Transaction {
         Transaction {
             hash: th(hash),
-            inputs: vec![TxInput::new(th("prev"), 0, "owner".into(), "sig".into(), "pk".into())],
-            outputs: vec![TxOutput { address: "dest".into(), amount: 1000, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            inputs: vec![TxInput::new(
+                th("prev"),
+                0,
+                "owner".into(),
+                "sig".into(),
+                "pk".into(),
+            )],
+            outputs: vec![TxOutput {
+                address: "dest".into(),
+                amount: 1000,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee,
             timestamp: 1000,
             is_coinbase: false,
@@ -304,10 +330,7 @@ mod tests {
 
     #[test]
     fn minimum_replacement_fee() {
-        let existing = vec![
-            make_mempool_tx("a", 1_000),
-            make_mempool_tx("b", 2_000),
-        ];
+        let existing = vec![make_mempool_tx("a", 1_000), make_mempool_tx("b", 2_000)];
         assert_eq!(RbfEngine::minimum_replacement_fee(&existing), 4_000); // 1000 + 2000 + 1000
     }
 
@@ -342,9 +365,21 @@ mod tests {
             hash: th("new_with_unconfirmed"),
             inputs: vec![
                 TxInput::new(th("prev"), 0, "owner".into(), "sig".into(), "pk".into()),
-                TxInput::new(unconfirmed_input_txid, 0, "owner".into(), "sig".into(), "pk".into()),
+                TxInput::new(
+                    unconfirmed_input_txid,
+                    0,
+                    "owner".into(),
+                    "sig".into(),
+                    "pk".into(),
+                ),
             ],
-            outputs: vec![TxOutput { address: "dest".into(), amount: 1000, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            outputs: vec![TxOutput {
+                address: "dest".into(),
+                amount: 1000,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee: 50_000,
             timestamp: 1000,
             is_coinbase: false,
@@ -374,7 +409,13 @@ mod tests {
                 TxInput::new(th("prev"), 0, "owner".into(), "sig".into(), "pk".into()),
                 TxInput::new(extra_txid, 0, "owner".into(), "sig".into(), "pk".into()),
             ],
-            outputs: vec![TxOutput { address: "dest".into(), amount: 1000, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            outputs: vec![TxOutput {
+                address: "dest".into(),
+                amount: 1000,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee: 50_000,
             timestamp: 1000,
             is_coinbase: false,

@@ -3,14 +3,13 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
 use crate::domain::block::block::Block;
 use crate::domain::block::block_header::BlockHeader;
+use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
 
 pub struct Serializer;
 
 impl Serializer {
-
     // ─────────────────────────────────────────
     // PRIMITIVES (Vec)
     // ─────────────────────────────────────────
@@ -28,7 +27,10 @@ impl Serializer {
     #[inline(always)]
     pub fn write_str(buf: &mut Vec<u8>, s: &str) {
         let bytes = s.as_bytes();
-        assert!(bytes.len() <= u32::MAX as usize, "string length exceeds u32::MAX");
+        assert!(
+            bytes.len() <= u32::MAX as usize,
+            "string length exceeds u32::MAX"
+        );
 
         Self::write_u32(buf, bytes.len() as u32);
         buf.extend_from_slice(bytes);
@@ -141,11 +143,7 @@ impl Serializer {
 
     #[inline(always)]
     pub fn serialize_transaction(tx: &Transaction) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(
-            64 +
-            tx.inputs.len() * 64 +
-            tx.outputs.len() * 64
-        );
+        let mut buf = Vec::with_capacity(64 + tx.inputs.len() * 64 + tx.outputs.len() * 64);
 
         Self::serialize_transaction_into(&mut buf, tx);
         buf
@@ -155,7 +153,9 @@ impl Serializer {
     fn sorted_input_indices(inputs: &[TxInput]) -> Vec<usize> {
         let mut idx: Vec<usize> = (0..inputs.len()).collect();
         idx.sort_unstable_by(|&a, &b| {
-            inputs[a].txid.cmp(&inputs[b].txid)
+            inputs[a]
+                .txid
+                .cmp(&inputs[b].txid)
                 .then(inputs[a].index.cmp(&inputs[b].index))
         });
         idx
@@ -164,15 +164,15 @@ impl Serializer {
     #[inline(always)]
     fn tx_type_byte(tx_type: &TxType) -> u8 {
         match tx_type {
-            TxType::Transfer       => 0x00,
-            TxType::Confidential   => 0x01,
+            TxType::Transfer => 0x00,
+            TxType::Confidential => 0x01,
             TxType::ContractCreate => 0x02,
-            TxType::ContractCall   => 0x03,
-            TxType::AtomicSwap     => 0x04,
-            TxType::MultiSig       => 0x05,
-            TxType::TokenTransfer  => 0x06,
-            TxType::SwapTx         => 0x07,
-            TxType::DexOrder       => 0x08,
+            TxType::ContractCall => 0x03,
+            TxType::AtomicSwap => 0x04,
+            TxType::MultiSig => 0x05,
+            TxType::TokenTransfer => 0x06,
+            TxType::SwapTx => 0x07,
+            TxType::DexOrder => 0x08,
         }
     }
 
@@ -293,7 +293,7 @@ impl Serializer {
 
     #[inline(always)]
     pub fn tx_hash(tx: &Transaction) -> String {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         let mut h = Sha256::new();
 
@@ -329,7 +329,7 @@ impl Serializer {
 
     #[inline(always)]
     pub fn block_header_hash(header: &BlockHeader) -> String {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         let mut h = Sha256::new();
 
@@ -373,29 +373,29 @@ impl Serializer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
     use crate::domain::block::block_header::BlockHeader;
+    use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
 
     fn make_tx() -> Transaction {
         Transaction {
-            hash:      String::new(),
-            inputs:    vec![TxInput {
-                txid:      "abc".to_string(),
-                index:     0,
-                owner:     "alice".to_string(),
+            hash: String::new(),
+            inputs: vec![TxInput {
+                txid: "abc".to_string(),
+                index: 0,
+                owner: "alice".to_string(),
                 signature: String::new(),
-                pub_key:   String::new(),
+                pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
             }],
-            outputs:   vec![TxOutput {
+            outputs: vec![TxOutput {
                 address: "bob".to_string(),
-                amount:  900,
+                amount: 900,
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
             }],
-            fee:       100,
+            fee: 100,
             timestamp: 1_000_000,
             is_coinbase: false,
             tx_type: TxType::Transfer,
@@ -406,15 +406,15 @@ mod tests {
 
     fn make_header() -> BlockHeader {
         BlockHeader {
-            version:         1,
-            hash:            String::new(),
-            parents:         vec!["p1".to_string(), "p2".to_string()],
-            merkle_root:     "mr".to_string(),
-            timestamp:       999,
-            nonce:           42,
-            difficulty:      1000,
-            height:          5,
-            blue_score:      3,
+            version: 1,
+            hash: String::new(),
+            parents: vec!["p1".to_string(), "p2".to_string()],
+            merkle_root: "mr".to_string(),
+            timestamp: 999,
+            nonce: 42,
+            difficulty: 1000,
+            height: 5,
+            blue_score: 3,
             selected_parent: Some("p1".to_string()),
             utxo_commitment: None,
             extra_nonce: 0,

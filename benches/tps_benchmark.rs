@@ -2,12 +2,12 @@
 //
 // Run: cargo bench --bench tps_benchmark
 
-use criterion::{criterion_group, criterion_main, Criterion, black_box, BenchmarkId};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::time::Instant;
 
+use shadowdag::domain::block::merkle_tree::MerkleTree;
 use shadowdag::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
 use shadowdag::domain::transaction::tx_validator;
-use shadowdag::domain::block::merkle_tree::MerkleTree;
 
 /// Generate a realistic-looking transaction for benchmarking.
 fn make_bench_tx(i: u64) -> Transaction {

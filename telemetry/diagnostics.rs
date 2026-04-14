@@ -31,15 +31,19 @@ fn hooks() -> &'static Mutex<BTreeMap<&'static str, DiagnosticHook>> {
 
 /// Register a diagnostic hook for a subsystem.
 ///
-/// ```ignore
+/// ```text
 /// diagnostics::register("mempool", || {
 ///     format!("{{\"size\":{},\"bytes\":{}}}", pool.count(), pool.total_bytes())
 /// });
 /// ```
 pub fn register(name: &'static str, hook: impl Fn() -> String + Send + Sync + 'static) {
     match hooks().lock() {
-        Ok(mut map) => { map.insert(name, Box::new(hook)); }
-        Err(e) => { crate::slog_error!("diagnostics", "hook_register_lock_failed", error => e.to_string()); }
+        Ok(mut map) => {
+            map.insert(name, Box::new(hook));
+        }
+        Err(e) => {
+            crate::slog_error!("diagnostics", "hook_register_lock_failed", error => e.to_string());
+        }
     }
 }
 
@@ -82,20 +86,27 @@ pub fn collect() -> String {
                         if serde_json::from_str::<serde_json::Value>(&s).is_ok() {
                             s
                         } else {
-                            format!("{{\"error\":\"invalid_json_from_hook\",\"raw\":{}}}",
-                                escape_json_string(&s))
+                            format!(
+                                "{{\"error\":\"invalid_json_from_hook\",\"raw\":{}}}",
+                                escape_json_string(&s)
+                            )
                         }
                     }
                     Err(payload) => {
                         let msg = panic_payload_to_string(&payload);
-                        format!("{{\"error\":\"hook_panicked\",\"hook\":\"{}\",\"panic\":{}}}",
-                            name, escape_json_string(&msg))
+                        format!(
+                            "{{\"error\":\"hook_panicked\",\"hook\":\"{}\",\"panic\":{}}}",
+                            name,
+                            escape_json_string(&msg)
+                        )
                     }
                 };
                 subsystems.push(format!("{}:{}", escape_json_string(name), output));
             }
         }
-        Err(e) => { crate::slog_error!("diagnostics", "collect_lock_failed", error => e.to_string()); }
+        Err(e) => {
+            crate::slog_error!("diagnostics", "collect_lock_failed", error => e.to_string());
+        }
     }
 
     // Metrics snapshot
@@ -124,7 +135,7 @@ fn escape_json_string(s: &str) -> String {
     out.push('"');
     for c in s.chars() {
         match c {
-            '"'  => out.push_str("\\\""),
+            '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
@@ -157,7 +168,10 @@ pub fn dump_pretty() -> String {
 
     let version = env!("CARGO_PKG_VERSION");
     let mut lines = Vec::new();
-    lines.push(format!("═══ ShadowDAG Diagnostics ═══  version={} timestamp={}", version, now));
+    lines.push(format!(
+        "═══ ShadowDAG Diagnostics ═══  version={} timestamp={}",
+        version, now
+    ));
     lines.push(String::new());
 
     match hooks().lock() {
@@ -175,7 +189,9 @@ pub fn dump_pretty() -> String {
                 lines.push(String::new());
             }
         }
-        Err(e) => { crate::slog_error!("diagnostics", "dump_pretty_lock_failed", error => e.to_string()); }
+        Err(e) => {
+            crate::slog_error!("diagnostics", "dump_pretty_lock_failed", error => e.to_string());
+        }
     }
 
     // Metrics
@@ -190,7 +206,10 @@ pub fn dump_pretty() -> String {
     }
     for (name, count, sum) in &snap.histograms {
         let avg = if *count > 0 { sum / *count as f64 } else { 0.0 };
-        lines.push(format!("  [hist]    {}: count={} sum={:.1}ms avg={:.2}ms", name, count, sum, avg));
+        lines.push(format!(
+            "  [hist]    {}: count={} sum={:.1}ms avg={:.2}ms",
+            name, count, sum, avg
+        ));
     }
     lines.push(String::new());
 

@@ -2,18 +2,18 @@
 //      S H A D O W D A G
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options, WriteBatch};
+use dashmap::DashMap;
+use rocksdb::{Options, WriteBatch, DB};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{
+    atomic::{AtomicU64, Ordering},
     Arc,
-    atomic::{AtomicU64, Ordering}
 };
-use std::collections::{HashMap, HashSet, VecDeque};
-use serde::{Serialize, Deserialize};
-use dashmap::DashMap;
 
-use crate::{slog_info, slog_error};
 use crate::errors::{DagError, StorageError};
+use crate::{slog_error, slog_info};
 
 /// GHOSTDAG K parameter — consensus-critical constant.
 /// This value MUST be identical on all nodes to ensure consistent
@@ -21,7 +21,8 @@ use crate::errors::{DagError, StorageError};
 /// NOTE: The canonical value lives in ConsensusParams::GHOSTDAG_K
 /// (config/consensus/consensus_params.rs). This local constant is kept
 /// for backward compatibility; prefer ConsensusParams::GHOSTDAG_K.
-pub const GHOSTDAG_K: usize = crate::config::consensus::consensus_params::ConsensusParams::GHOSTDAG_K;
+pub const GHOSTDAG_K: usize =
+    crate::config::consensus::consensus_params::ConsensusParams::GHOSTDAG_K;
 pub const MAX_ANTICONE_WALK: usize = 16_384;
 pub const MAX_MERGE_SET_SIZE: usize = 1_024;
 pub const MAX_CACHE_SIZE: usize = 100_000;
@@ -30,17 +31,17 @@ pub const MAX_CACHE_SIZE: usize = 100_000;
 // All keys use "gd:" namespace to avoid collisions with other components
 // sharing the same RocksDB instance (BlockStore uses "blk:", shadow_pool
 // uses "sp:", etc.).
-const PFX_BLOCK: &str       = "gd:blk:";
-const PFX_PARENTS: &str     = "gd:par:";
-const PFX_CHILDREN: &str    = "gd:chi:";
-const PFX_BLUE_SCORE: &str  = "gd:bs:";
-const PFX_BLUE: &str        = "gd:blue:";
-const PFX_RED: &str         = "gd:red:";
-const PFX_BLUE_SET: &str    = "gd:bset:";
+const PFX_BLOCK: &str = "gd:blk:";
+const PFX_PARENTS: &str = "gd:par:";
+const PFX_CHILDREN: &str = "gd:chi:";
+const PFX_BLUE_SCORE: &str = "gd:bs:";
+const PFX_BLUE: &str = "gd:blue:";
+const PFX_RED: &str = "gd:red:";
+const PFX_BLUE_SET: &str = "gd:bset:";
 const PFX_CHAIN_HEIGHT: &str = "gd:ch:";
-const PFX_SEL_PARENT: &str  = "gd:sp:";
-const PFX_ORDER: &str       = "gd:ord:";
-const PFX_TIPS: &str        = "gd:tips";
+const PFX_SEL_PARENT: &str = "gd:sp:";
+const PFX_ORDER: &str = "gd:ord:";
+const PFX_TIPS: &str = "gd:tips";
 const META_ORDER_COUNTER: &str = "gd:meta:order_counter";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,7 +78,6 @@ pub struct GhostDag {
 }
 
 impl GhostDag {
-
     /// Create GhostDag sharing the node's RocksDB instance (production path).
     /// All keys are prefixed with "gd:" to avoid collisions with other
     /// components (BlockStore, ShadowPool, etc.) in the same DB.
@@ -142,8 +142,7 @@ impl GhostDag {
         let selected_parent = self.select_parent(&block.parents);
         let merge_set = self.compute_merge_set(&selected_parent, &block.parents);
 
-        let (merge_blues, merge_reds) =
-            self.classify_merge_set(&selected_parent, &merge_set);
+        let (merge_blues, merge_reds) = self.classify_merge_set(&selected_parent, &merge_set);
 
         // Store only the DIFF (new blues from this block), NOT the full cumulative set.
         // Full set = walk the selected parent chain and union all diffs.
@@ -152,18 +151,18 @@ impl GhostDag {
         // For persistence, we store the diff. For computation, we use it directly.
         let blue_set = blue_set_diff.clone();
 
-        let blue_score =
-            self.get_blue_score(&selected_parent) + merge_blues.len() as u64 + 1;
+        let blue_score = self.get_blue_score(&selected_parent) + merge_blues.len() as u64 + 1;
 
-        let chain_height =
-            self.get_chain_height(&selected_parent) + 1;
+        let chain_height = self.get_chain_height(&selected_parent) + 1;
 
         let order_index = self.next_order_index();
 
         // Compute new tips before persist so they go into the same WriteBatch
         let new_tips: Vec<String> = {
             let mut tips = self.get_tips_inner();
-            for p in &block.parents { tips.remove(p); }
+            for p in &block.parents {
+                tips.remove(p);
+            }
             tips.insert(hash.clone());
             tips.into_iter().collect()
         };
@@ -195,19 +194,28 @@ impl GhostDag {
         // Pre-fetch blue scores and chain heights for consistent ordering during sort.
         // Without this, concurrent DB writes could produce inconsistent reads across
         // multiple get_blue_score/get_chain_height calls within the sort closure.
-        let scores: HashMap<&String, u64> = parents.iter()
+        let scores: HashMap<&String, u64> = parents
+            .iter()
             .map(|p| (p, self.get_blue_score(p)))
             .collect();
-        let heights: HashMap<&String, u64> = parents.iter()
+        let heights: HashMap<&String, u64> = parents
+            .iter()
             .map(|p| (p, self.get_chain_height(p)))
             .collect();
 
-        parents.iter()
+        parents
+            .iter()
             .max_by(|a, b| {
-                scores.get(a).copied().unwrap_or(0)
+                scores
+                    .get(a)
+                    .copied()
+                    .unwrap_or(0)
                     .cmp(&scores.get(b).copied().unwrap_or(0))
                     .then_with(|| {
-                        heights.get(a).copied().unwrap_or(0)
+                        heights
+                            .get(a)
+                            .copied()
+                            .unwrap_or(0)
                             .cmp(&heights.get(b).copied().unwrap_or(0))
                     })
                     .then(a.cmp(b))
@@ -223,7 +231,6 @@ impl GhostDag {
         selected_parent: &str,
         block_parents: &[String],
     ) -> Vec<String> {
-
         let sp_past = self.get_past_set(selected_parent, MAX_ANTICONE_WALK);
 
         let mut merge_set = Vec::new();
@@ -237,8 +244,12 @@ impl GhostDag {
         }
 
         while let Some(h) = queue.pop_front() {
-            if !visited.insert(h.clone()) { continue; }
-            if sp_past.contains(&h) { continue; }
+            if !visited.insert(h.clone()) {
+                continue;
+            }
+            if sp_past.contains(&h) {
+                continue;
+            }
 
             merge_set.push(h.clone());
 
@@ -261,7 +272,6 @@ impl GhostDag {
         selected_parent: &str,
         merge_set: &[String],
     ) -> (Vec<String>, Vec<String>) {
-
         let mut blues = Vec::new();
         let mut reds = Vec::new();
 
@@ -310,12 +320,7 @@ impl GhostDag {
         hash
     }
 
-    fn compute_anticone_with_blues(
-        &self,
-        block_hash: &str,
-        blue_set: &HashSet<String>,
-    ) -> usize {
-
+    fn compute_anticone_with_blues(&self, block_hash: &str, blue_set: &HashSet<String>) -> usize {
         let key = Self::fast_hash(block_hash, blue_set);
 
         // Use a secondary content hash to prevent FNV-1a collision-based cache poisoning.
@@ -342,16 +347,15 @@ impl GhostDag {
 
         let past = self.get_past_set(block_hash, MAX_ANTICONE_WALK);
 
-        let size = blue_set.iter()
-            .filter(|b| !past.contains(*b))
-            .count();
+        let size = blue_set.iter().filter(|b| !past.contains(*b)).count();
 
         // Evict lowest ~25% by key to prevent thundering herd.
         // Keys are sorted before eviction to guarantee deterministic behavior
         // across threads — DashMap iteration order is non-deterministic.
         if self.anticone_cache.len() > MAX_CACHE_SIZE {
             let evict_count = MAX_CACHE_SIZE / 4;
-            let mut keys_to_remove: Vec<u64> = self.anticone_cache
+            let mut keys_to_remove: Vec<u64> = self
+                .anticone_cache
                 .iter()
                 .map(|entry| *entry.key())
                 .collect();
@@ -376,8 +380,12 @@ impl GhostDag {
         queue.push_back(hash.to_string());
 
         while let Some(h) = queue.pop_front() {
-            if !visited.insert(h.clone()) { continue; }
-            if visited.len() >= limit { break; }
+            if !visited.insert(h.clone()) {
+                continue;
+            }
+            if visited.len() >= limit {
+                break;
+            }
 
             for p in self.get_parents(&h) {
                 queue.push_back(p);
@@ -390,15 +398,19 @@ impl GhostDag {
     // ================= STORAGE =================
 
     fn get_children_inner(&self, hash: &str) -> Vec<String> {
-        self.db.get(format!("{}{}", PFX_CHILDREN, hash))
-            .ok().flatten()
+        self.db
+            .get(format!("{}{}", PFX_CHILDREN, hash))
+            .ok()
+            .flatten()
             .and_then(|d| bincode::deserialize::<Vec<String>>(&d).ok())
             .unwrap_or_default()
     }
 
     fn get_tips_inner(&self) -> HashSet<String> {
-        self.db.get(PFX_TIPS)
-            .ok().flatten()
+        self.db
+            .get(PFX_TIPS)
+            .ok()
+            .flatten()
             .and_then(|d| bincode::deserialize::<Vec<String>>(&d).ok())
             .unwrap_or_default()
             .into_iter()
@@ -406,11 +418,11 @@ impl GhostDag {
     }
 
     pub fn get_tips(&self) -> Vec<String> {
-        let mut tips: Vec<String> =
-            self.get_tips_inner().into_iter().collect();
+        let mut tips: Vec<String> = self.get_tips_inner().into_iter().collect();
 
         tips.sort_by(|a, b| {
-            self.get_blue_score(b).cmp(&self.get_blue_score(a))
+            self.get_blue_score(b)
+                .cmp(&self.get_blue_score(a))
                 .then_with(|| a.cmp(b)) // deterministic tiebreak by hash
         });
         tips
@@ -469,8 +481,10 @@ impl GhostDag {
     }
 
     pub fn get_blue_set_diff(&self, hash: &str) -> Vec<String> {
-        self.db.get(format!("{}{}", PFX_BLUE_SET, hash))
-            .ok().flatten()
+        self.db
+            .get(format!("{}{}", PFX_BLUE_SET, hash))
+            .ok()
+            .flatten()
             .and_then(|d| bincode::deserialize::<Vec<String>>(&d).ok())
             .unwrap_or_default()
     }
@@ -486,8 +500,10 @@ impl GhostDag {
     }
 
     pub fn get_parents(&self, hash: &str) -> Vec<String> {
-        self.db.get(format!("{}{}", PFX_PARENTS, hash))
-            .ok().flatten()
+        self.db
+            .get(format!("{}{}", PFX_PARENTS, hash))
+            .ok()
+            .flatten()
             .and_then(|d| bincode::deserialize::<Vec<String>>(&d).ok())
             .unwrap_or_default()
     }
@@ -538,13 +554,19 @@ impl GhostDag {
             batch.put(format!("{}{}", PFX_CHILDREN, p), &children_data);
         }
 
-        batch.put(format!("{}{}", PFX_BLUE_SCORE, hash), blue_score.to_le_bytes());
+        batch.put(
+            format!("{}{}", PFX_BLUE_SCORE, hash),
+            blue_score.to_le_bytes(),
+        );
 
         let blue_set_data = bincode::serialize(blue_set)
             .map_err(|e| DagError::Storage(StorageError::Serialization(e.to_string())))?;
         batch.put(format!("{}{}", PFX_BLUE_SET, hash), &blue_set_data);
 
-        batch.put(format!("{}{}", PFX_CHAIN_HEIGHT, hash), chain_height.to_le_bytes());
+        batch.put(
+            format!("{}{}", PFX_CHAIN_HEIGHT, hash),
+            chain_height.to_le_bytes(),
+        );
         batch.put(format!("{}{}", PFX_SEL_PARENT, hash), sel_parent.as_bytes());
         batch.put(format!("{}{}", PFX_ORDER, hash), order_index.to_le_bytes());
 
@@ -564,12 +586,25 @@ impl GhostDag {
             batch.put(PFX_TIPS, &tips_data);
         }
 
-        self.db.write(batch).map_err(|e| DagError::Storage(StorageError::WriteFailed(e.to_string())))?;
+        self.db
+            .write(batch)
+            .map_err(|e| DagError::Storage(StorageError::WriteFailed(e.to_string())))?;
         Ok(())
     }
 
     fn store_genesis(&self, hash: &str, block: &DagBlock) -> Result<(), DagError> {
-        self.persist_block(hash, block, hash, &[hash.to_string()], &[], &[], 0, 0, 0, Some(&[hash.to_string()]))?;
+        self.persist_block(
+            hash,
+            block,
+            hash,
+            &[hash.to_string()],
+            &[],
+            &[],
+            0,
+            0,
+            0,
+            Some(&[hash.to_string()]),
+        )?;
 
         // Genesis gets order_index=0; advance counter to 1 so the next block
         // gets order_index=1 (preventing duplicate index=0).
@@ -635,10 +670,7 @@ impl GhostDag {
     /// Reconstruct the full cumulative blue set by walking the selected parent
     /// chain and unioning all stored diffs. Each block stores only its diff
     /// (new blues from that block), so we must walk back to build the full set.
-    fn reconstruct_full_blue_set(
-        &self,
-        parents: &[String],
-    ) -> std::collections::HashSet<String> {
+    fn reconstruct_full_blue_set(&self, parents: &[String]) -> std::collections::HashSet<String> {
         let mut full_set = std::collections::HashSet::new();
         let mut current = self.select_parent(parents);
         let mut depth = 0;
@@ -677,12 +709,20 @@ impl GhostDag {
     /// Used during crash recovery before rebuilding from BlockStore.
     pub fn clear_all(&self) {
         let prefixes = [
-            PFX_BLOCK, PFX_PARENTS, PFX_CHILDREN, PFX_BLUE_SCORE,
-            PFX_BLUE, PFX_RED, PFX_BLUE_SET, PFX_CHAIN_HEIGHT,
-            PFX_SEL_PARENT, PFX_ORDER,
+            PFX_BLOCK,
+            PFX_PARENTS,
+            PFX_CHILDREN,
+            PFX_BLUE_SCORE,
+            PFX_BLUE,
+            PFX_RED,
+            PFX_BLUE_SET,
+            PFX_CHAIN_HEIGHT,
+            PFX_SEL_PARENT,
+            PFX_ORDER,
         ];
         for pfx in &prefixes {
-            let keys: Vec<Vec<u8>> = self.db
+            let keys: Vec<Vec<u8>> = self
+                .db
                 .prefix_iterator(pfx.as_bytes())
                 .filter_map(|r| r.ok())
                 .map(|(k, _)| k.to_vec())
@@ -699,7 +739,8 @@ impl GhostDag {
         if let Err(e) = self.db.delete(META_ORDER_COUNTER) {
             slog_error!("ghostdag", "delete_failed", key => META_ORDER_COUNTER, error => e);
         }
-        self.order_counter.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.order_counter
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         self.anticone_cache.clear();
     }
 }
@@ -723,7 +764,12 @@ mod tests {
     }
 
     fn make_ghostdag(label: &str) -> GhostDag {
-        let path = format!("/tmp/test_ghostdag_{}_{}_{}", label, std::process::id(), ts());
+        let path = format!(
+            "/tmp/test_ghostdag_{}_{}_{}",
+            label,
+            std::process::id(),
+            ts()
+        );
         GhostDag::new(&path).expect("failed to create GhostDag")
     }
 
@@ -748,11 +794,7 @@ mod tests {
 
     #[test]
     fn test_new_with_db_creates_instance() {
-        let path = format!(
-            "/tmp/test_ghostdag_with_db_{}_{}",
-            std::process::id(),
-            ts()
-        );
+        let path = format!("/tmp/test_ghostdag_with_db_{}_{}", std::process::id(), ts());
         let mut opts = Options::default();
         opts.create_if_missing(true);
         let db = Arc::new(DB::open(&opts, &path).expect("open db"));
@@ -955,13 +997,15 @@ mod tests {
             parents: vec!["genesis".to_string()],
             height: 1,
             timestamp: 1,
-        }).unwrap();
+        })
+        .unwrap();
         dag.add_block(DagBlock {
             hash: "right".to_string(),
             parents: vec!["genesis".to_string()],
             height: 1,
             timestamp: 2,
-        }).unwrap();
+        })
+        .unwrap();
 
         // Merge both branches.
         let merge = DagBlock {
@@ -993,7 +1037,8 @@ mod tests {
             parents: vec!["genesis".to_string()],
             height: 1,
             timestamp: 1,
-        }).unwrap();
+        })
+        .unwrap();
 
         let parents = dag.get_parents("child");
         assert_eq!(parents, vec!["genesis".to_string()]);
@@ -1031,7 +1076,8 @@ mod tests {
             parents: vec!["genesis".to_string()],
             height: 1,
             timestamp: 1,
-        }).unwrap();
+        })
+        .unwrap();
 
         let stats = dag.get_stats();
         assert_eq!(stats.tip_count, 1);
@@ -1047,11 +1093,7 @@ mod tests {
         dag.store_blue_score("high", 100);
         dag.store_blue_score("mid", 50);
 
-        let parents = vec![
-            "low".to_string(),
-            "high".to_string(),
-            "mid".to_string(),
-        ];
+        let parents = vec!["low".to_string(), "high".to_string(), "mid".to_string()];
         let selected = dag.select_parent(&parents);
         assert_eq!(selected, "high");
     }

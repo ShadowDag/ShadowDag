@@ -6,11 +6,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-pub const MAX_PENDING_HEADERS:  usize = 4_096;
-pub const MAX_PENDING_BLOCKS:   usize = 512;
-pub const HEADER_BATCH_SIZE:    usize = 2_000;
-pub const BLOCK_BATCH_SIZE:     usize = 64;
-pub const SYNC_TIMEOUT_SECS:    u64   = 30;
+pub const MAX_PENDING_HEADERS: usize = 4_096;
+pub const MAX_PENDING_BLOCKS: usize = 512;
+pub const HEADER_BATCH_SIZE: usize = 2_000;
+pub const BLOCK_BATCH_SIZE: usize = 64;
+pub const SYNC_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SyncPhase {
@@ -23,24 +23,24 @@ pub enum SyncPhase {
 
 #[derive(Debug, Clone)]
 pub struct BlockRequest {
-    pub hash:    String,
-    pub peer:    String,
-    pub queued:  Instant,
+    pub hash: String,
+    pub peer: String,
+    pub queued: Instant,
     pub retries: u32,
 }
 
 pub struct DagSyncEngine {
-    pub phase:            SyncPhase,
-    pub local_dag_tips:   HashSet<String>,
-    pub remote_tips:      HashMap<String, String>,
-    pending_headers:      HashMap<String, BlockRequest>,
-    pending_blocks:       HashMap<String, BlockRequest>,
-    _header_queue:         VecDeque<String>,
-    block_queue:          VecDeque<String>,
-    verified_blocks:      HashSet<String>,
-    failed_peers:         HashSet<String>,
-    retry_counts:         HashMap<String, u32>,
-    pub synced_count:     u64,
+    pub phase: SyncPhase,
+    pub local_dag_tips: HashSet<String>,
+    pub remote_tips: HashMap<String, String>,
+    pending_headers: HashMap<String, BlockRequest>,
+    pending_blocks: HashMap<String, BlockRequest>,
+    _header_queue: VecDeque<String>,
+    block_queue: VecDeque<String>,
+    verified_blocks: HashSet<String>,
+    failed_peers: HashSet<String>,
+    retry_counts: HashMap<String, u32>,
+    pub synced_count: u64,
 }
 
 impl Default for DagSyncEngine {
@@ -52,17 +52,17 @@ impl Default for DagSyncEngine {
 impl DagSyncEngine {
     pub fn new() -> Self {
         Self {
-            phase:           SyncPhase::Idle,
-            local_dag_tips:  HashSet::new(),
-            remote_tips:     HashMap::new(),
+            phase: SyncPhase::Idle,
+            local_dag_tips: HashSet::new(),
+            remote_tips: HashMap::new(),
             pending_headers: HashMap::new(),
-            pending_blocks:  HashMap::new(),
-            _header_queue:    VecDeque::new(),
-            block_queue:     VecDeque::new(),
+            pending_blocks: HashMap::new(),
+            _header_queue: VecDeque::new(),
+            block_queue: VecDeque::new(),
             verified_blocks: HashSet::new(),
-            failed_peers:    HashSet::new(),
-            retry_counts:    HashMap::new(),
-            synced_count:    0,
+            failed_peers: HashSet::new(),
+            retry_counts: HashMap::new(),
+            synced_count: 0,
         }
     }
 
@@ -99,7 +99,9 @@ impl DagSyncEngine {
                         locator.push((*h).clone());
                     }
                 }
-                if idx < step || locator.len() >= 64 { break; }
+                if idx < step || locator.len() >= 64 {
+                    break;
+                }
                 idx -= step;
                 step *= 2;
             }
@@ -108,14 +110,21 @@ impl DagSyncEngine {
     }
 
     pub fn request_header(&mut self, hash: &str, peer: &str) -> bool {
-        if self.pending_headers.len() >= MAX_PENDING_HEADERS { return false; }
-        if self.verified_blocks.contains(hash) { return false; }
-        self.pending_headers.insert(hash.to_string(), BlockRequest {
-            hash:    hash.to_string(),
-            peer:    peer.to_string(),
-            queued:  Instant::now(),
-            retries: 0,
-        });
+        if self.pending_headers.len() >= MAX_PENDING_HEADERS {
+            return false;
+        }
+        if self.verified_blocks.contains(hash) {
+            return false;
+        }
+        self.pending_headers.insert(
+            hash.to_string(),
+            BlockRequest {
+                hash: hash.to_string(),
+                peer: peer.to_string(),
+                queued: Instant::now(),
+                retries: 0,
+            },
+        );
         true
     }
 
@@ -125,11 +134,13 @@ impl DagSyncEngine {
         // PoW or chain continuity from hashes alone — that requires the
         // full block header which arrives when the block is downloaded.
         // The block validator performs full PoW/continuity checks on download.
-        let hashes: Vec<String> = hashes.into_iter().filter(|h| {
-            h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit())
-        }).collect();
+        let hashes: Vec<String> = hashes
+            .into_iter()
+            .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
+            .collect();
 
-        let new_count = hashes.iter()
+        let new_count = hashes
+            .iter()
             .filter(|h| !self.verified_blocks.contains(*h) && !self.block_queue.contains(h))
             .count();
         // Cap block_queue to prevent unbounded memory growth from
@@ -156,21 +167,28 @@ impl DagSyncEngine {
     }
 
     pub fn next_block_request(&mut self, peer: &str) -> Option<String> {
-        if self.pending_blocks.len() >= MAX_PENDING_BLOCKS { return None; }
+        if self.pending_blocks.len() >= MAX_PENDING_BLOCKS {
+            return None;
+        }
         // If all known peers have failed, reset to avoid starvation
         if self.failed_peers.len() > 10 {
             self.failed_peers.clear();
         }
-        if self.is_failed_peer(peer) { return None; }
+        if self.is_failed_peer(peer) {
+            return None;
+        }
         let hash = self.block_queue.pop_front()?;
         // Restore retry count from previous attempts (preserved across timeouts)
         let retries = self.retry_counts.remove(&hash).unwrap_or(0);
-        self.pending_blocks.insert(hash.clone(), BlockRequest {
-            hash:    hash.clone(),
-            peer:    peer.to_string(),
-            queued:  Instant::now(),
-            retries,
-        });
+        self.pending_blocks.insert(
+            hash.clone(),
+            BlockRequest {
+                hash: hash.clone(),
+                peer: peer.to_string(),
+                queued: Instant::now(),
+                retries,
+            },
+        );
         Some(hash)
     }
 
@@ -185,8 +203,11 @@ impl DagSyncEngine {
         if self.verified_blocks.len() > 100_000 {
             // Keep only the most recent entries (clear and rebuild would be better with LRU)
             let excess = self.verified_blocks.len() - 50_000;
-            let to_remove: Vec<String> = self.verified_blocks.iter().take(excess).cloned().collect();
-            for h in to_remove { self.verified_blocks.remove(&h); }
+            let to_remove: Vec<String> =
+                self.verified_blocks.iter().take(excess).cloned().collect();
+            for h in to_remove {
+                self.verified_blocks.remove(&h);
+            }
         }
         self.local_dag_tips.insert(hash.to_string());
         // Prune old tips to prevent unbounded growth.
@@ -194,19 +215,15 @@ impl DagSyncEngine {
         if self.local_dag_tips.len() > 256 {
             // Keep only the most recently added tips
             let excess = self.local_dag_tips.len() - 128;
-            let to_remove: Vec<String> = self.local_dag_tips.iter()
-                .take(excess).cloned().collect();
-            for h in to_remove { self.local_dag_tips.remove(&h); }
+            let to_remove: Vec<String> = self.local_dag_tips.iter().take(excess).cloned().collect();
+            for h in to_remove {
+                self.local_dag_tips.remove(&h);
+            }
         }
         self.synced_count += 1;
 
-        if self.pending_blocks.is_empty() && self.block_queue.is_empty() {
-            if self.synced_count > 0 {
-                self.phase = SyncPhase::Complete;
-            }
-            // If synced_count == 0, stay in current phase — we haven't
-            // actually downloaded anything. Declaring Complete with 0
-            // blocks synced is misleading.
+        if self.pending_blocks.is_empty() && self.block_queue.is_empty() && self.synced_count > 0 {
+            self.phase = SyncPhase::Complete;
         }
     }
 
@@ -214,7 +231,9 @@ impl DagSyncEngine {
         let timeout = Duration::from_secs(SYNC_TIMEOUT_SECS);
         let mut requeue = Vec::new();
 
-        let stale: Vec<String> = self.pending_blocks.iter()
+        let stale: Vec<String> = self
+            .pending_blocks
+            .iter()
             .filter(|(_, r)| r.queued.elapsed() > timeout)
             .map(|(h, _)| h.clone())
             .collect();
@@ -237,7 +256,9 @@ impl DagSyncEngine {
         }
 
         // Also timeout stale header requests
-        let stale_headers: Vec<String> = self.pending_headers.iter()
+        let stale_headers: Vec<String> = self
+            .pending_headers
+            .iter()
             .filter(|(_, r)| r.queued.elapsed() > timeout)
             .map(|(h, _)| h.clone())
             .collect();
@@ -245,11 +266,14 @@ impl DagSyncEngine {
             if let Some(req) = self.pending_headers.remove(&hash) {
                 if req.retries < 3 {
                     // Re-request header with fresh timestamp
-                    self.pending_headers.insert(hash, BlockRequest {
-                        retries: req.retries + 1,
-                        queued: Instant::now(),
-                        ..req
-                    });
+                    self.pending_headers.insert(
+                        hash,
+                        BlockRequest {
+                            retries: req.retries + 1,
+                            queued: Instant::now(),
+                            ..req
+                        },
+                    );
                 } else {
                     self.failed_peers.insert(req.peer.clone());
                 }
@@ -259,10 +283,18 @@ impl DagSyncEngine {
         requeue
     }
 
-    pub fn is_synced(&self)         -> bool  { self.phase == SyncPhase::Complete }
-    pub fn pending_count(&self)     -> usize { self.pending_blocks.len() }
-    pub fn queue_count(&self)       -> usize { self.block_queue.len() }
-    pub fn is_failed_peer(&self, p: &str) -> bool { self.failed_peers.contains(p) }
+    pub fn is_synced(&self) -> bool {
+        self.phase == SyncPhase::Complete
+    }
+    pub fn pending_count(&self) -> usize {
+        self.pending_blocks.len()
+    }
+    pub fn queue_count(&self) -> usize {
+        self.block_queue.len()
+    }
+    pub fn is_failed_peer(&self, p: &str) -> bool {
+        self.failed_peers.contains(p)
+    }
 }
 
 #[cfg(test)]

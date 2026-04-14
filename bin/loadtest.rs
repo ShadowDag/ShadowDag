@@ -17,15 +17,15 @@
 //   shadowdag-loadtest --rpc=127.0.0.1:9332  # Connect to node
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
-use std::time::{Instant, Duration, SystemTime, UNIX_EPOCH};
-use std::sync::atomic::{AtomicU64, Ordering};
+use sha2::{Digest, Sha256};
 use shadowdag::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
 use shadowdag::domain::transaction::tx_builder::generate_keypair;
 use shadowdag::errors::NetworkError;
-use shadowdag::{slog_info, slog_warn, slog_fatal};
-use sha2::{Sha256, Digest};
+use shadowdag::{slog_fatal, slog_info, slog_warn};
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn main() {
     shadowdag::telemetry::logging::structured::init();
@@ -38,7 +38,10 @@ fn main() {
 
     let target_tps: u64 = parse_flag(&args, "--tps", "100").parse().unwrap_or(100);
     let duration_sec: u64 = parse_flag(&args, "--duration", "30").parse().unwrap_or(30);
-    let num_wallets: usize = parse_flag(&args, "--wallets", "10").parse().unwrap_or(10).max(1);
+    let num_wallets: usize = parse_flag(&args, "--wallets", "10")
+        .parse()
+        .unwrap_or(10)
+        .max(1);
     let rpc_addr = parse_flag(&args, "--rpc", "127.0.0.1:9332");
     let rpc_token = parse_flag(&args, "--rpc-token", "");
     let use_invalid = has_flag(&args, "--invalid");
@@ -150,13 +153,29 @@ fn main() {
     println!("Duration         : {:.2}s", elapsed.as_secs_f64());
     println!("Actual TPS       : {:.2}", actual_tps);
     println!("Target TPS       : {}", target_tps);
-    println!("Achievement      : {:.1}%", (actual_tps / target_tps as f64) * 100.0);
-    println!("Error Rate       : {:.1}%", if tx_count > 0 { errors as f64 / tx_count as f64 * 100.0 } else { 0.0 });
+    println!(
+        "Achievement      : {:.1}%",
+        (actual_tps / target_tps as f64) * 100.0
+    );
+    println!(
+        "Error Rate       : {:.1}%",
+        if tx_count > 0 {
+            errors as f64 / tx_count as f64 * 100.0
+        } else {
+            0.0
+        }
+    );
 }
 
 /// Submit a transaction to the node via JSON-RPC over HTTP.
-fn rpc_submit_tx(addr: &str, tx: &Transaction, id: u64, token: &str) -> Result<String, NetworkError> {
-    let tx_json = serde_json::to_string(tx).map_err(|e| NetworkError::Other(format!("serialize: {}", e)))?;
+fn rpc_submit_tx(
+    addr: &str,
+    tx: &Transaction,
+    id: u64,
+    token: &str,
+) -> Result<String, NetworkError> {
+    let tx_json =
+        serde_json::to_string(tx).map_err(|e| NetworkError::Other(format!("serialize: {}", e)))?;
 
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -165,7 +184,8 @@ fn rpc_submit_tx(addr: &str, tx: &Transaction, id: u64, token: &str) -> Result<S
         "params": [tx_json]
     });
 
-    let body_str = serde_json::to_string(&body).map_err(|e| NetworkError::Other(format!("serialize: {}", e)))?;
+    let body_str = serde_json::to_string(&body)
+        .map_err(|e| NetworkError::Other(format!("serialize: {}", e)))?;
 
     let mut request = format!(
         "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -176,12 +196,17 @@ fn rpc_submit_tx(addr: &str, tx: &Transaction, id: u64, token: &str) -> Result<S
     }
     request.push_str(&format!("\r\n{}", body_str));
 
-    let mut stream = TcpStream::connect(addr).map_err(|e| NetworkError::Other(format!("connect: {}", e)))?;
+    let mut stream =
+        TcpStream::connect(addr).map_err(|e| NetworkError::Other(format!("connect: {}", e)))?;
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
 
-    stream.write_all(request.as_bytes()).map_err(|e| NetworkError::Other(format!("write: {}", e)))?;
-    stream.flush().map_err(|e| NetworkError::Other(format!("flush: {}", e)))?;
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| NetworkError::Other(format!("write: {}", e)))?;
+    stream
+        .flush()
+        .map_err(|e| NetworkError::Other(format!("flush: {}", e)))?;
 
     // Read HTTP response: skip headers until empty line, then read body by Content-Length
     let mut reader = BufReader::new(&stream);
@@ -193,7 +218,9 @@ fn rpc_submit_tx(addr: &str, tx: &Transaction, id: u64, token: &str) -> Result<S
             Ok(0) => break,
             Ok(_) => {
                 let trimmed = line.trim();
-                if trimmed.is_empty() { break; }
+                if trimmed.is_empty() {
+                    break;
+                }
                 if trimmed.len() > 15 && trimmed[..15].eq_ignore_ascii_case("content-length:") {
                     let cl_str = trimmed[15..].trim();
                     content_length = match cl_str.parse() {
@@ -223,11 +250,15 @@ fn rpc_submit_tx(addr: &str, tx: &Transaction, id: u64, token: &str) -> Result<S
                 return Err(NetworkError::Other(format!("read failed: {}", e)));
             }
         };
-        String::from_utf8(buf[..n].to_vec()).map_err(|e| NetworkError::Other(format!("utf8: {}", e)))?
+        String::from_utf8(buf[..n].to_vec())
+            .map_err(|e| NetworkError::Other(format!("utf8: {}", e)))?
     };
 
     if response.contains("\"error\"") && !response.contains("\"error\":null") {
-        return Err(NetworkError::Other(format!("rpc error: {}", response.trim())));
+        return Err(NetworkError::Other(format!(
+            "rpc error: {}",
+            response.trim()
+        )));
     }
 
     Ok(response)
@@ -256,17 +287,17 @@ fn generate_test_tx_invalid(from: &str, to: &str, seq: u64) -> Transaction {
     Transaction {
         hash,
         inputs: vec![TxInput {
-            txid:      format!("prev_tx_{}", seq),
-            index:     0,
-            owner:     from.to_string(),
+            txid: format!("prev_tx_{}", seq),
+            index: 0,
+            owner: from.to_string(),
             signature: "loadtest_sig".to_string(),
-            pub_key:   "loadtest_pk".to_string(),
+            pub_key: "loadtest_pk".to_string(),
             key_image: None,
             ring_members: None,
         }],
         outputs: vec![TxOutput {
             address: to.to_string(),
-            amount:  1_000, // 0.00001 SDAG,
+            amount: 1_000, // 0.00001 SDAG,
             commitment: None,
             range_proof: None,
             ephemeral_pubkey: None,
@@ -339,7 +370,10 @@ fn parse_flag_opt(args: &[String], name: &str) -> Option<String> {
             return match args.get(i + 1) {
                 Some(val) if !val.starts_with("--") => Some(val.clone()),
                 _ => {
-                    eprintln!("[loadtest] Error: {} requires a value (e.g. {}=VALUE)", name, name);
+                    eprintln!(
+                        "[loadtest] Error: {} requires a value (e.g. {}=VALUE)",
+                        name, name
+                    );
                     std::process::exit(1);
                 }
             };
@@ -379,6 +413,8 @@ fn print_help() {
     println!("  --help, -h         Show this help");
     println!();
     println!("MODES:");
-    println!("  Default            Valid transfer TXs with proper structure (acceptance throughput)");
+    println!(
+        "  Default            Valid transfer TXs with proper structure (acceptance throughput)"
+    );
     println!("  --invalid          Invalid TXs with fake sig/pubkey (rejection throughput)");
 }

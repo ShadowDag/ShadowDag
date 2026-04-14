@@ -3,9 +3,9 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
-use crate::domain::utxo::utxo_set::{UtxoSet, utxo_key};
+use crate::domain::utxo::utxo_set::{utxo_key, UtxoSet};
 use crate::errors::StorageError;
 use crate::slog_warn;
 
@@ -13,15 +13,15 @@ pub const SNAPSHOT_INTERVAL: u64 = 1_000;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UtxoEntry {
-    pub key:     String,
-    pub owner:   String,
-    pub amount:  u64,
+    pub key: String,
+    pub owner: String,
+    pub amount: u64,
     pub address: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SnapshotMeta {
-    pub height:  u64,
+    pub height: u64,
     pub entries: Vec<UtxoEntry>,
 }
 
@@ -42,12 +42,13 @@ impl UtxoSnapshot {
     }
 
     pub fn export(utxo_set: &UtxoSet) -> Vec<UtxoEntry> {
-        utxo_set.export_all()
+        utxo_set
+            .export_all()
             .into_iter()
             .map(|(key, utxo)| UtxoEntry {
                 key: key.to_string(),
-                owner:   utxo.owner,
-                amount:  utxo.amount,
+                owner: utxo.owner,
+                amount: utxo.amount,
                 address: utxo.address,
             })
             .collect()
@@ -55,11 +56,11 @@ impl UtxoSnapshot {
 
     pub fn save(
         utxo_set: &UtxoSet,
-        store:    &dyn SnapshotStore,
-        height:   u64,
+        store: &dyn SnapshotStore,
+        height: u64,
     ) -> Result<(), StorageError> {
         let entries = Self::export(utxo_set);
-        let meta    = SnapshotMeta { height, entries };
+        let meta = SnapshotMeta { height, entries };
         store.save_snapshot(&meta)
     }
 
@@ -83,14 +84,23 @@ impl UtxoSnapshot {
         for (i, entry) in entries.iter().enumerate() {
             let result = (|| -> Result<_, StorageError> {
                 if entry.amount == 0 {
-                    return Err(StorageError::Other(format!("zero amount for key '{}'", entry.key)));
+                    return Err(StorageError::Other(format!(
+                        "zero amount for key '{}'",
+                        entry.key
+                    )));
                 }
-                let (hash, idx_s) = entry.key.rsplit_once(':')
-                    .ok_or_else(|| StorageError::Other(format!("missing ':' separator in key '{}'", entry.key)))?;
-                let idx: u32 = idx_s.parse()
-                    .map_err(|e| StorageError::Other(format!("invalid index '{}' in key '{}': {}", idx_s, entry.key, e)))?;
-                let k = utxo_key(hash, idx)
-                    .map_err(|e| StorageError::Other(format!("utxo_key failed for '{}': {}", entry.key, e)))?;
+                let (hash, idx_s) = entry.key.rsplit_once(':').ok_or_else(|| {
+                    StorageError::Other(format!("missing ':' separator in key '{}'", entry.key))
+                })?;
+                let idx: u32 = idx_s.parse().map_err(|e| {
+                    StorageError::Other(format!(
+                        "invalid index '{}' in key '{}': {}",
+                        idx_s, entry.key, e
+                    ))
+                })?;
+                let k = utxo_key(hash, idx).map_err(|e| {
+                    StorageError::Other(format!("utxo_key failed for '{}': {}", entry.key, e))
+                })?;
                 Ok((k, entry))
             })();
 
@@ -106,7 +116,8 @@ impl UtxoSnapshot {
         if !validation_errors.is_empty() {
             return Err(StorageError::Other(format!(
                 "snapshot apply aborted: {}/{} entries failed validation — no state modified",
-                validation_errors.len(), entries.len()
+                validation_errors.len(),
+                entries.len()
             )));
         }
 
@@ -134,8 +145,7 @@ impl UtxoSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rocksdb::{DB, Options};
-
+    use rocksdb::{Options, DB};
 
     const PFX_SNAPSHOT: &str = "snapshot:";
 
@@ -151,12 +161,14 @@ mod tests {
     }
 
     fn make_entries(n: usize) -> Vec<UtxoEntry> {
-        (0..n).map(|i| UtxoEntry {
-            key:     format!("key:{}", i),
-            owner:   format!("owner{}", i),
-            amount:  (i as u64 + 1) * 100,
-            address: format!("addr{}", i),
-        }).collect()
+        (0..n)
+            .map(|i| UtxoEntry {
+                key: format!("key:{}", i),
+                owner: format!("owner{}", i),
+                amount: (i as u64 + 1) * 100,
+                address: format!("addr{}", i),
+            })
+            .collect()
     }
 
     /// Test-only SnapshotStore backed by rocksdb for round-trip tests
@@ -165,7 +177,9 @@ mod tests {
     }
 
     impl TestSnapshotStore {
-        fn new(db: DB) -> Self { Self { db } }
+        fn new(db: DB) -> Self {
+            Self { db }
+        }
 
         fn snapshot_key(height: u64) -> String {
             format!("{}{}", PFX_SNAPSHOT, hex::encode(height.to_be_bytes()))
@@ -191,17 +205,21 @@ mod tests {
 
         fn load_latest_snapshot(&self) -> Option<SnapshotMeta> {
             let prefix = PFX_SNAPSHOT.as_bytes();
-            let iter   = self.db.prefix_iterator(prefix);
+            let iter = self.db.prefix_iterator(prefix);
             let mut best: Option<SnapshotMeta> = None;
 
             for item in iter {
                 match item {
                     Ok((k, v)) => {
                         let k_str = String::from_utf8(k.to_vec()).unwrap_or_default();
-                        if !k_str.starts_with(PFX_SNAPSHOT) { break; }
+                        if !k_str.starts_with(PFX_SNAPSHOT) {
+                            break;
+                        }
                         if let Ok(meta) = bincode::deserialize::<SnapshotMeta>(&v) {
                             let is_better = best.as_ref().is_none_or(|b| meta.height > b.height);
-                            if is_better { best = Some(meta); }
+                            if is_better {
+                                best = Some(meta);
+                            }
                         }
                     }
                     Err(_) => break,
@@ -222,7 +240,7 @@ mod tests {
 
     #[test]
     fn snapshot_key_sortable() {
-        let k999  = format!("snapshot:{}", hex::encode(999u64.to_be_bytes()));
+        let k999 = format!("snapshot:{}", hex::encode(999u64.to_be_bytes()));
         let k1000 = format!("snapshot:{}", hex::encode(1000u64.to_be_bytes()));
         assert!(k999 < k1000);
     }
@@ -230,9 +248,9 @@ mod tests {
     #[test]
     fn validate_rejects_zero_amount() {
         let entries = vec![UtxoEntry {
-            key:     "k".to_string(),
-            owner:   "o".to_string(),
-            amount:  0,
+            key: "k".to_string(),
+            owner: "o".to_string(),
+            amount: 0,
             address: "a".to_string(),
         }];
         assert!(!UtxoSnapshot::validate(&entries));
@@ -241,9 +259,9 @@ mod tests {
     #[test]
     fn validate_rejects_empty_key() {
         let entries = vec![UtxoEntry {
-            key:     String::new(),
-            owner:   "o".to_string(),
-            amount:  100,
+            key: String::new(),
+            owner: "o".to_string(),
+            amount: 100,
             address: "a".to_string(),
         }];
         assert!(!UtxoSnapshot::validate(&entries));
@@ -258,7 +276,7 @@ mod tests {
     #[test]
     fn round_trip_serialisation() {
         let meta = SnapshotMeta {
-            height:  1_000,
+            height: 1_000,
             entries: make_entries(5),
         };
         let bytes = bincode::serialize(&meta).unwrap();
@@ -272,24 +290,55 @@ mod tests {
         // Valid key needs 64-char hex hash : u32 index
         let valid_hash = "a".repeat(64);
         let entries = vec![
-            UtxoEntry { key: format!("{}:0", valid_hash), owner: "o".into(), amount: 100, address: "a".into() },
-            UtxoEntry { key: "no_separator".into(), owner: "o".into(), amount: 100, address: "a".into() },
-            UtxoEntry { key: "abc:notanumber".into(), owner: "o".into(), amount: 100, address: "a".into() },
+            UtxoEntry {
+                key: format!("{}:0", valid_hash),
+                owner: "o".into(),
+                amount: 100,
+                address: "a".into(),
+            },
+            UtxoEntry {
+                key: "no_separator".into(),
+                owner: "o".into(),
+                amount: 100,
+                address: "a".into(),
+            },
+            UtxoEntry {
+                key: "abc:notanumber".into(),
+                owner: "o".into(),
+                amount: 100,
+                address: "a".into(),
+            },
         ];
         let utxo_set = UtxoSet::new_empty();
         let result = UtxoSnapshot::apply(&entries, &utxo_set);
-        assert!(result.is_err(), "apply must return Err when entries have malformed keys");
+        assert!(
+            result.is_err(),
+            "apply must return Err when entries have malformed keys"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("2/3 entries failed validation"),
-            "should report 2 out of 3 failed validation, got: {}", err_msg);
+        assert!(
+            err_msg.contains("2/3 entries failed validation"),
+            "should report 2 out of 3 failed validation, got: {}",
+            err_msg
+        );
     }
 
     #[test]
     fn apply_succeeds_with_all_valid_keys() {
         let valid_hash = "b".repeat(64);
         let entries = vec![
-            UtxoEntry { key: format!("{}:0", valid_hash), owner: "o1".into(), amount: 100, address: "a1".into() },
-            UtxoEntry { key: format!("{}:1", valid_hash), owner: "o2".into(), amount: 200, address: "a2".into() },
+            UtxoEntry {
+                key: format!("{}:0", valid_hash),
+                owner: "o1".into(),
+                amount: 100,
+                address: "a1".into(),
+            },
+            UtxoEntry {
+                key: format!("{}:1", valid_hash),
+                owner: "o2".into(),
+                amount: 200,
+                address: "a2".into(),
+            },
         ];
         let utxo_set = UtxoSet::new_empty();
         let result = UtxoSnapshot::apply(&entries, &utxo_set);

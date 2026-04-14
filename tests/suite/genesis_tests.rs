@@ -5,7 +5,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::config::genesis::genesis::{create_genesis_block, verify_genesis, GENESIS_HEIGHT, GENESIS_TIMESTAMP};
+    use crate::config::genesis::genesis::{
+        create_genesis_block, verify_genesis, GENESIS_HEIGHT, GENESIS_TIMESTAMP,
+    };
 
     #[test]
     fn genesis_is_deterministic() {
@@ -59,7 +61,8 @@ mod tests {
     #[test]
     fn genesis_verify_fails_wrong_hash() {
         let mut g = create_genesis_block();
-        g.header.hash = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        g.header.hash =
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string();
         assert!(!verify_genesis(&g));
     }
 

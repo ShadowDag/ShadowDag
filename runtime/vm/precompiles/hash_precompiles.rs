@@ -6,7 +6,7 @@
 // Hash precompiled contracts — native hash function implementations.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest as Sha2Digest};
+use sha2::{Digest as Sha2Digest, Sha256};
 use sha3::Sha3_256;
 
 use super::precompile_registry::PrecompileResult;

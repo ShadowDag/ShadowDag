@@ -18,15 +18,14 @@ use crate::domain::block::block::Block;
 /// For testnets with a single miner, set the minimum to 1 via the validation
 /// function which uses `min(MIN_DAG_PARENTS, available_tips)`.
 pub const MIN_DAG_PARENTS: usize = 2;
-pub const MAX_DAG_PARENTS: usize = crate::config::consensus::consensus_params::ConsensusParams::MAX_PARENTS;
+pub const MAX_DAG_PARENTS: usize =
+    crate::config::consensus::consensus_params::ConsensusParams::MAX_PARENTS;
 
 pub struct SelfishMiningGuard;
 
 impl SelfishMiningGuard {
-
     #[inline(always)]
     pub fn validate(block: &Block) -> bool {
-
         let parents = &block.header.parents;
         let len = parents.len();
 
@@ -49,7 +48,6 @@ impl SelfishMiningGuard {
         let mut seen = HashSet::with_capacity(len);
 
         for parent in parents {
-
             // ❌ empty
             if parent.is_empty() {
                 return false;
@@ -86,8 +84,8 @@ impl SelfishMiningGuard {
 mod tests {
     use super::*;
     use crate::domain::block::block::Block;
-    use crate::domain::block::block_header::BlockHeader;
     use crate::domain::block::block_body::BlockBody;
+    use crate::domain::block::block_header::BlockHeader;
 
     fn make_block(hash: &str, parents: Vec<&str>, height: u64) -> Block {
         Block {
@@ -107,7 +105,9 @@ mod tests {
                 receipt_root: None,
                 state_root: None,
             },
-            body: BlockBody { transactions: vec![] },
+            body: BlockBody {
+                transactions: vec![],
+            },
         }
     }
 

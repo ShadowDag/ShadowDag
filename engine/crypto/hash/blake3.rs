@@ -3,13 +3,10 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{
-    DB, Options, WriteOptions, ReadOptions,
-    WriteBatch, DBPinnableSlice, IteratorMode,
-};
-use std::path::Path;
 use crate::errors::CryptoError;
 use crate::slog_error;
+use rocksdb::{DBPinnableSlice, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions, DB};
+use std::path::Path;
 
 const CLEAR_BATCH_SIZE: usize = 1000;
 
@@ -20,7 +17,6 @@ pub struct Blake3Store {
 }
 
 impl Blake3Store {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
@@ -86,10 +82,7 @@ impl Blake3Store {
 
     // 🔥 أقل syscalls
     pub fn store_if_absent(&self, key: &[u8], value: &[u8]) -> bool {
-        let exists = matches!(
-            self.db.get_pinned_opt(key, &self.read_opts),
-            Ok(Some(_))
-        );
+        let exists = matches!(self.db.get_pinned_opt(key, &self.read_opts), Ok(Some(_)));
 
         if exists {
             return false;
@@ -100,10 +93,7 @@ impl Blake3Store {
         }
 
         // fallback (race)
-        !matches!(
-            self.db.get_pinned_opt(key, &self.read_opts),
-            Ok(Some(_))
-        )
+        !matches!(self.db.get_pinned_opt(key, &self.read_opts), Ok(Some(_)))
     }
 
     // ─────────────────────────────────────────
@@ -124,7 +114,9 @@ impl Blake3Store {
 
     #[inline(always)]
     pub fn get_pinned(&self, key: &[u8]) -> Option<DBPinnableSlice<'_>> {
-        self.db.get_pinned_opt(key, &self.read_opts).unwrap_or_default()
+        self.db
+            .get_pinned_opt(key, &self.read_opts)
+            .unwrap_or_default()
     }
 
     // ─────────────────────────────────────────
@@ -251,7 +243,8 @@ impl Blake3Store {
 
     #[must_use]
     pub fn len_estimate(&self) -> u64 {
-        self.db.property_int_value("rocksdb.estimate-num-keys")
+        self.db
+            .property_int_value("rocksdb.estimate-num-keys")
             .unwrap_or(None)
             .unwrap_or(0)
     }
@@ -262,7 +255,10 @@ impl Blake3Store {
             return true;
         }
 
-        matches!(self.db.iterator(IteratorMode::Start).next(), None | Some(Err(_)))
+        matches!(
+            self.db.iterator(IteratorMode::Start).next(),
+            None | Some(Err(_))
+        )
     }
 
     pub fn set_sync(&mut self, enabled: bool) {

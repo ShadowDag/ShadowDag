@@ -3,16 +3,16 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options};
-use std::path::Path;
+use crate::errors::WalletError;
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
 use pbkdf2::pbkdf2_hmac;
+use rocksdb::{Options, DB};
 use sha2::Sha256;
+use std::path::Path;
 use zeroize::Zeroize;
-use crate::errors::WalletError;
 
 const PBKDF2_ITER: u32 = 600_000;
 const SALT_LEN: usize = 16;
@@ -66,12 +66,9 @@ impl KeyManager {
         Ok(())
     }
 
-    pub fn get_key_decrypted(
-        &self,
-        key_id: &str,
-        password: &str,
-    ) -> Result<String, WalletError> {
-        let stored = self.db
+    pub fn get_key_decrypted(&self, key_id: &str, password: &str) -> Result<String, WalletError> {
+        let stored = self
+            .db
             .get(key_id.as_bytes())
             .map_err(|e| WalletError::Other(format!("DB get error: {}", e)))?
             .ok_or_else(|| WalletError::Other(format!("Key '{}' not found", key_id)))?;
@@ -113,9 +110,10 @@ impl KeyManager {
             Ok(None) => Ok(false),
             Err(e) => {
                 crate::slog_error!("wallet", "key_exists_read_failed", error => &e.to_string());
-                Err(crate::errors::StorageError::ReadFailed(
-                    format!("key_exists '{}': {}", key_id, e),
-                ))
+                Err(crate::errors::StorageError::ReadFailed(format!(
+                    "key_exists '{}': {}",
+                    key_id, e
+                )))
             }
         }
     }

@@ -1,6 +1,6 @@
 //! Execution Trace -- records VM execution for debugging.
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// A single step in execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,28 +109,45 @@ impl ExecutionTrace {
         out.push_str(&format!("  Contract:  {}\n", self.contract));
         out.push_str(&format!("  Caller:    {}\n", self.caller));
         out.push_str(&format!("  Value:     {}\n", self.value));
-        out.push_str(&format!("  Gas:       {} / {} ({}%)\n",
-            self.gas_used, self.gas_limit,
-            if self.gas_limit > 0 { self.gas_used * 100 / self.gas_limit } else { 0 }));
-        out.push_str(&format!("  Status:    {}\n", if self.success { "SUCCESS" } else { "FAILED" }));
+        out.push_str(&format!(
+            "  Gas:       {} / {} ({}%)\n",
+            self.gas_used,
+            self.gas_limit,
+            if self.gas_limit > 0 {
+                self.gas_used * 100 / self.gas_limit
+            } else {
+                0
+            }
+        ));
+        out.push_str(&format!(
+            "  Status:    {}\n",
+            if self.success { "SUCCESS" } else { "FAILED" }
+        ));
         out.push_str(&format!("  Steps:     {}\n", self.steps.len()));
 
         if !self.storage_changes.is_empty() {
             out.push_str("\n  Storage Changes:\n");
             for c in &self.storage_changes {
-                out.push_str(&format!("    {} {} -> {}\n",
+                out.push_str(&format!(
+                    "    {} {} -> {}\n",
                     c.key,
                     c.old_value.as_deref().unwrap_or("(empty)"),
-                    c.new_value.as_deref().unwrap_or("(empty)")));
+                    c.new_value.as_deref().unwrap_or("(empty)")
+                ));
             }
         }
 
         if !self.calls.is_empty() {
             out.push_str("\n  Calls:\n");
             for c in &self.calls {
-                out.push_str(&format!("    {} {} -> {} (gas: {}, {})\n",
-                    c.call_type, c.from, c.to, c.gas_used,
-                    if c.success { "OK" } else { "FAIL" }));
+                out.push_str(&format!(
+                    "    {} {} -> {} (gas: {}, {})\n",
+                    c.call_type,
+                    c.from,
+                    c.to,
+                    c.gas_used,
+                    if c.success { "OK" } else { "FAIL" }
+                ));
             }
         }
 
@@ -156,9 +173,15 @@ mod tests {
         trace.gas_used = 5000;
         trace.success = true;
         trace.add_step(TraceStep {
-            pc: 0, opcode: 0x10, opcode_name: "PUSH1".into(),
-            gas_before: 100_000, gas_after: 99_997, gas_cost: 3,
-            stack_depth: 0, memory_size: 256, depth: 0,
+            pc: 0,
+            opcode: 0x10,
+            opcode_name: "PUSH1".into(),
+            gas_before: 100_000,
+            gas_after: 99_997,
+            gas_cost: 3,
+            stack_depth: 0,
+            memory_size: 256,
+            depth: 0,
         });
         trace.add_storage_change(StorageChange {
             contract: "SD1c_abc".into(),
@@ -177,7 +200,13 @@ mod tests {
     fn trace_json_roundtrip() {
         let trace = ExecutionTrace::new("c", "u", 100, 50_000);
         let json = trace.to_json().unwrap();
-        assert!(json.contains("\"contract\""), "JSON should contain contract field");
-        assert!(json.contains("\"c\""), "JSON should contain contract value 'c'");
+        assert!(
+            json.contains("\"contract\""),
+            "JSON should contain contract field"
+        );
+        assert!(
+            json.contains("\"c\""),
+            "JSON should contain contract value 'c'"
+        );
     }
 }

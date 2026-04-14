@@ -67,11 +67,7 @@ impl RealPedersenCommitment {
     /// Verify that a commitment opens to the given value and blinding factor.
     ///
     /// Anyone who knows (value, blinding) can verify the opening.
-    pub fn verify_opening(
-        commitment: &RistrettoPoint,
-        value: u64,
-        blinding: &Scalar,
-    ) -> bool {
+    pub fn verify_opening(commitment: &RistrettoPoint, value: u64, blinding: &Scalar) -> bool {
         let g = RISTRETTO_BASEPOINT_POINT;
         let h = generator_h();
         let v = Scalar::from(value);
@@ -186,11 +182,7 @@ mod tests {
         let c_out = RealPedersenCommitment::commit(200, r_out);
 
         assert!(
-            !RealPedersenCommitment::verify_balance(
-                &[c_in.commitment],
-                &[c_out.commitment],
-                0,
-            ),
+            !RealPedersenCommitment::verify_balance(&[c_in.commitment], &[c_out.commitment], 0,),
             "Balance must fail when outputs exceed inputs (inflation attempt)"
         );
     }

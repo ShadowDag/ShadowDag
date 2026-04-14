@@ -20,9 +20,9 @@
 //   - Fee distribution to miners
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::collections::BTreeMap;
-use serde::{Serialize, Deserialize};
 use crate::errors::DexError;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Order side
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,13 +50,16 @@ pub enum OrderStatus {
 /// A trading pair (e.g., SDAG/USDT, TOKEN_A/SDAG)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TradingPair {
-    pub base:  String,  // e.g., "SDAG"
-    pub quote: String,  // e.g., "USDT"
+    pub base: String,  // e.g., "SDAG"
+    pub quote: String, // e.g., "USDT"
 }
 
 impl TradingPair {
     pub fn new(base: &str, quote: &str) -> Self {
-        Self { base: base.to_string(), quote: quote.to_string() }
+        Self {
+            base: base.to_string(),
+            quote: quote.to_string(),
+        }
     }
 
     pub fn symbol(&self) -> String {
@@ -67,16 +70,16 @@ impl TradingPair {
 /// An order in the order book
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Order {
-    pub id:          String,
-    pub owner:       String,
-    pub pair:        TradingPair,
-    pub side:        OrderSide,
-    pub order_type:  OrderType,
-    pub price:       u64,     // Price in quote currency satoshis
-    pub amount:      u64,     // Amount in base currency satoshis
-    pub filled:      u64,     // Amount already filled
-    pub status:      OrderStatus,
-    pub timestamp:   u64,
+    pub id: String,
+    pub owner: String,
+    pub pair: TradingPair,
+    pub side: OrderSide,
+    pub order_type: OrderType,
+    pub price: u64,  // Price in quote currency satoshis
+    pub amount: u64, // Amount in base currency satoshis
+    pub filled: u64, // Amount already filled
+    pub status: OrderStatus,
+    pub timestamp: u64,
     pub block_height: u64,
 }
 
@@ -93,20 +96,20 @@ impl Order {
 /// Trade execution result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trade {
-    pub buy_order_id:  String,
+    pub buy_order_id: String,
     pub sell_order_id: String,
-    pub price:         u64,
-    pub amount:        u64,
-    pub timestamp:     u64,
+    pub price: u64,
+    pub amount: u64,
+    pub timestamp: u64,
 }
 
 /// Order book for a single trading pair
 pub struct OrderBook {
-    pub pair:    TradingPair,
+    pub pair: TradingPair,
     /// Buy orders sorted by price descending (highest first)
-    bids:        BTreeMap<u64, Vec<Order>>,
+    bids: BTreeMap<u64, Vec<Order>>,
     /// Sell orders sorted by price ascending (lowest first)
-    asks:        BTreeMap<u64, Vec<Order>>,
+    asks: BTreeMap<u64, Vec<Order>>,
     /// Total trades executed
     trade_count: u64,
 }
@@ -146,12 +149,17 @@ impl OrderBook {
                         break; // Limit orders respect price ceiling
                     }
                     for ask in ask_orders.iter_mut() {
-                        if remaining.remaining() == 0 { break; }
+                        if remaining.remaining() == 0 {
+                            break;
+                        }
                         let fill = remaining.remaining().min(ask.remaining());
                         remaining.filled += fill;
                         ask.filled += fill;
-                        if ask.is_fully_filled() { ask.status = OrderStatus::Filled; }
-                        else { ask.status = OrderStatus::PartiallyFilled; }
+                        if ask.is_fully_filled() {
+                            ask.status = OrderStatus::Filled;
+                        } else {
+                            ask.status = OrderStatus::PartiallyFilled;
+                        }
 
                         self.trade_count += 1;
                         trades.push(Trade {
@@ -163,9 +171,13 @@ impl OrderBook {
                         });
                     }
                     ask_orders.retain(|o| !o.is_fully_filled());
-                    if ask_orders.is_empty() { matched_prices.push(ask_price); }
+                    if ask_orders.is_empty() {
+                        matched_prices.push(ask_price);
+                    }
                 }
-                for p in matched_prices { self.asks.remove(&p); }
+                for p in matched_prices {
+                    self.asks.remove(&p);
+                }
 
                 // Market orders: remaining unfilled quantity is cancelled, not posted
                 if remaining.order_type == OrderType::Market {
@@ -177,7 +189,11 @@ impl OrderBook {
 
                 // Place remaining as limit order
                 if remaining.remaining() > 0 {
-                    remaining.status = if remaining.filled > 0 { OrderStatus::PartiallyFilled } else { OrderStatus::Open };
+                    remaining.status = if remaining.filled > 0 {
+                        OrderStatus::PartiallyFilled
+                    } else {
+                        OrderStatus::Open
+                    };
                     self.bids.entry(order.price).or_default().push(remaining);
                 }
             }
@@ -189,12 +205,17 @@ impl OrderBook {
                         break; // Limit orders respect price floor
                     }
                     for bid in bid_orders.iter_mut() {
-                        if remaining.remaining() == 0 { break; }
+                        if remaining.remaining() == 0 {
+                            break;
+                        }
                         let fill = remaining.remaining().min(bid.remaining());
                         remaining.filled += fill;
                         bid.filled += fill;
-                        if bid.is_fully_filled() { bid.status = OrderStatus::Filled; }
-                        else { bid.status = OrderStatus::PartiallyFilled; }
+                        if bid.is_fully_filled() {
+                            bid.status = OrderStatus::Filled;
+                        } else {
+                            bid.status = OrderStatus::PartiallyFilled;
+                        }
 
                         self.trade_count += 1;
                         trades.push(Trade {
@@ -206,9 +227,13 @@ impl OrderBook {
                         });
                     }
                     bid_orders.retain(|o| !o.is_fully_filled());
-                    if bid_orders.is_empty() { matched_prices.push(bid_price); }
+                    if bid_orders.is_empty() {
+                        matched_prices.push(bid_price);
+                    }
                 }
-                for p in matched_prices { self.bids.remove(&p); }
+                for p in matched_prices {
+                    self.bids.remove(&p);
+                }
 
                 // Market orders: remaining unfilled quantity is cancelled, not posted
                 if remaining.order_type == OrderType::Market {
@@ -219,7 +244,11 @@ impl OrderBook {
                 }
 
                 if remaining.remaining() > 0 {
-                    remaining.status = if remaining.filled > 0 { OrderStatus::PartiallyFilled } else { OrderStatus::Open };
+                    remaining.status = if remaining.filled > 0 {
+                        OrderStatus::PartiallyFilled
+                    } else {
+                        OrderStatus::Open
+                    };
                     self.asks.entry(order.price).or_default().push(remaining);
                 }
             }
@@ -237,7 +266,9 @@ impl OrderBook {
             }
             !orders.is_empty()
         });
-        if found { return true; }
+        if found {
+            return true;
+        }
         self.asks.retain(|_, orders| {
             if let Some(pos) = orders.iter().position(|o| o.id == order_id) {
                 orders.remove(pos);
@@ -273,7 +304,9 @@ impl OrderBook {
         (bid_depth, ask_depth)
     }
 
-    pub fn trade_count(&self) -> u64 { self.trade_count }
+    pub fn trade_count(&self) -> u64 {
+        self.trade_count
+    }
 }
 
 #[cfg(test)]
@@ -282,11 +315,17 @@ mod tests {
 
     fn make_order(id: &str, side: OrderSide, price: u64, amount: u64) -> Order {
         Order {
-            id: id.to_string(), owner: "SD1test".to_string(),
+            id: id.to_string(),
+            owner: "SD1test".to_string(),
             pair: TradingPair::new("SDAG", "USDT"),
-            side, order_type: OrderType::Limit,
-            price, amount, filled: 0,
-            status: OrderStatus::Open, timestamp: 0, block_height: 0,
+            side,
+            order_type: OrderType::Limit,
+            price,
+            amount,
+            filled: 0,
+            status: OrderStatus::Open,
+            timestamp: 0,
+            block_height: 0,
         }
     }
 
@@ -295,11 +334,14 @@ mod tests {
         let mut book = OrderBook::new(TradingPair::new("SDAG", "USDT"));
 
         // Place sell at 100
-        book.place_order(make_order("s1", OrderSide::Sell, 100, 500)).unwrap();
+        book.place_order(make_order("s1", OrderSide::Sell, 100, 500))
+            .unwrap();
         assert_eq!(book.best_ask(), Some(100));
 
         // Place buy at 100 → should match
-        let trades = book.place_order(make_order("b1", OrderSide::Buy, 100, 300)).unwrap();
+        let trades = book
+            .place_order(make_order("b1", OrderSide::Buy, 100, 300))
+            .unwrap();
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].amount, 300);
         assert_eq!(trades[0].price, 100);
@@ -308,8 +350,11 @@ mod tests {
     #[test]
     fn partial_fill() {
         let mut book = OrderBook::new(TradingPair::new("SDAG", "USDT"));
-        book.place_order(make_order("s1", OrderSide::Sell, 50, 1000)).unwrap();
-        let trades = book.place_order(make_order("b1", OrderSide::Buy, 50, 400)).unwrap();
+        book.place_order(make_order("s1", OrderSide::Sell, 50, 1000))
+            .unwrap();
+        let trades = book
+            .place_order(make_order("b1", OrderSide::Buy, 50, 400))
+            .unwrap();
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].amount, 400);
         // 600 remaining on sell side
@@ -320,7 +365,8 @@ mod tests {
     #[test]
     fn cancel_order() {
         let mut book = OrderBook::new(TradingPair::new("SDAG", "USDT"));
-        book.place_order(make_order("s1", OrderSide::Sell, 100, 500)).unwrap();
+        book.place_order(make_order("s1", OrderSide::Sell, 100, 500))
+            .unwrap();
         assert!(book.cancel_order("s1"));
         assert_eq!(book.best_ask(), None);
     }
@@ -328,16 +374,21 @@ mod tests {
     #[test]
     fn spread_calculation() {
         let mut book = OrderBook::new(TradingPair::new("SDAG", "USDT"));
-        book.place_order(make_order("b1", OrderSide::Buy, 95, 100)).unwrap();
-        book.place_order(make_order("s1", OrderSide::Sell, 105, 100)).unwrap();
+        book.place_order(make_order("b1", OrderSide::Buy, 95, 100))
+            .unwrap();
+        book.place_order(make_order("s1", OrderSide::Sell, 105, 100))
+            .unwrap();
         assert_eq!(book.spread(), Some(10));
     }
 
     #[test]
     fn no_match_when_prices_dont_cross() {
         let mut book = OrderBook::new(TradingPair::new("SDAG", "USDT"));
-        book.place_order(make_order("s1", OrderSide::Sell, 100, 500)).unwrap();
-        let trades = book.place_order(make_order("b1", OrderSide::Buy, 90, 300)).unwrap();
+        book.place_order(make_order("s1", OrderSide::Sell, 100, 500))
+            .unwrap();
+        let trades = book
+            .place_order(make_order("b1", OrderSide::Buy, 90, 300))
+            .unwrap();
         assert!(trades.is_empty()); // buy at 90, sell at 100 → no match
     }
 }

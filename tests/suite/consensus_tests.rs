@@ -5,14 +5,14 @@
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use crate::domain::block::block::Block;
-    use crate::domain::block::block_header::BlockHeader;
-    use crate::domain::block::block_body::BlockBody;
-    use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
-    use crate::engine::dag::core::dag_manager::DagManager;
-    use crate::engine::consensus::validation::block_validator::BlockValidator;
     use crate::config::consensus::consensus_params::ConsensusParams;
+    use crate::domain::block::block::Block;
+    use crate::domain::block::block_body::BlockBody;
+    use crate::domain::block::block_header::BlockHeader;
+    use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
+    use crate::engine::consensus::validation::block_validator::BlockValidator;
+    use crate::engine::dag::core::dag_manager::DagManager;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     // ── helpers ──────────────────────────────────────────────────────────
     fn now_ts() -> u64 {
@@ -24,10 +24,16 @@ mod tests {
 
     fn coinbase_tx(hash: &str) -> Transaction {
         Transaction {
-            hash:      hash.to_string(),
-            inputs:    vec![],
-            outputs:   vec![TxOutput { address: "shadow1miner".into(), amount: 10_000, commitment: None, range_proof: None, ephemeral_pubkey: None }],
-            fee:       0,
+            hash: hash.to_string(),
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                address: "shadow1miner".into(),
+                amount: 10_000,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
+            fee: 0,
             timestamp: now_ts(),
             is_coinbase: true,
             tx_type: TxType::Transfer,
@@ -48,7 +54,9 @@ mod tests {
                 ConsensusParams::GENESIS_DIFFICULTY,
                 height,
             ),
-            body: BlockBody { transactions: vec![coinbase_tx(&format!("cb_{}", hash))] },
+            body: BlockBody {
+                transactions: vec![coinbase_tx(&format!("cb_{}", hash))],
+            },
         }
     }
 
@@ -68,7 +76,11 @@ mod tests {
         let dag = tmp_dag("accept_genesis");
         let genesis = genesis_block();
         let result = dag.add_block_validated(&genesis, true);
-        assert!(result.is_ok(), "Valid genesis block must be accepted: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Valid genesis block must be accepted: {:?}",
+            result
+        );
         assert!(dag.block_exists(&genesis.header.hash));
     }
 
@@ -78,9 +90,17 @@ mod tests {
         let genesis = genesis_block();
         dag.add_block_validated(&genesis, true).unwrap();
 
-        let child = make_block("child_aaaaaaaaaaaaaaa", vec![genesis.header.hash.clone()], 1);
+        let child = make_block(
+            "child_aaaaaaaaaaaaaaa",
+            vec![genesis.header.hash.clone()],
+            1,
+        );
         let result = dag.add_block_validated(&child, true);
-        assert!(result.is_ok(), "Valid child block must be accepted: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Valid child block must be accepted: {:?}",
+            result
+        );
     }
 
     // ── 2. Reject invalid block ───────────────────────────────────────────
@@ -103,11 +123,17 @@ mod tests {
         let _dag = tmp_dag("empty_hash");
         let mut block = genesis_block();
         block.header.hash = String::new();
-        assert!(block.header.hash.is_empty(), "Hash should be empty for this test");
+        assert!(
+            block.header.hash.is_empty(),
+            "Hash should be empty for this test"
+        );
 
         // Actually run the block through the validator
         let result = BlockValidator::validate_network_layer(&block);
-        assert!(result.is_err(), "empty hash should be rejected by the validator");
+        assert!(
+            result.is_err(),
+            "empty hash should be rejected by the validator"
+        );
     }
 
     // ── 3. Reject duplicate block ─────────────────────────────────────────
@@ -178,7 +204,9 @@ mod tests {
                 ConsensusParams::GENESIS_DIFFICULTY,
                 1,
             ),
-            body: BlockBody { transactions: vec![coinbase_tx("cb_self")] },
+            body: BlockBody {
+                transactions: vec![coinbase_tx("cb_self")],
+            },
         };
         let result = dag.add_block_validated(&block, true);
         assert!(result.is_err(), "Self-parent block must be rejected");
@@ -192,13 +220,14 @@ mod tests {
         dag.add_block_validated(&genesis, true).unwrap();
 
         // MAX_PARENTS = 8, so 9 parents is invalid
-        let many_parents: Vec<String> = (0..9)
-            .map(|i| format!("parent_{:020}", i))
-            .collect();
+        let many_parents: Vec<String> = (0..9).map(|i| format!("parent_{:020}", i)).collect();
 
         let block = make_block("block_many_parents_ee", many_parents, 1);
         let result = dag.add_block_validated(&block, true);
-        assert!(result.is_err(), "Block with too many parents must be rejected");
+        assert!(
+            result.is_err(),
+            "Block with too many parents must be rejected"
+        );
     }
 
     // ── 8. Duplicate parents in a single block ────────────────────────────
@@ -222,10 +251,15 @@ mod tests {
                 ConsensusParams::GENESIS_DIFFICULTY,
                 1,
             ),
-            body: BlockBody { transactions: vec![coinbase_tx("cb_dup")] },
+            body: BlockBody {
+                transactions: vec![coinbase_tx("cb_dup")],
+            },
         };
         let result = dag.add_block_validated(&block, true);
-        assert!(result.is_err(), "Block with duplicate parents must be rejected");
+        assert!(
+            result.is_err(),
+            "Block with duplicate parents must be rejected"
+        );
     }
 
     // ── 9. Timestamp sanity ───────────────────────────────────────────────
@@ -233,7 +267,10 @@ mod tests {
     fn genesis_timestamp_is_plausible() {
         let genesis = genesis_block();
         // timestamp must be > 0
-        assert!(genesis.header.timestamp > 0, "Genesis timestamp must be > 0");
+        assert!(
+            genesis.header.timestamp > 0,
+            "Genesis timestamp must be > 0"
+        );
         // not in the future by more than 2 hours
         let two_hours_from_now = now_ts() + 7200;
         assert!(
@@ -248,7 +285,10 @@ mod tests {
         let dag = tmp_dag("difficulty_store");
         let genesis = genesis_block();
         dag.add_block_validated(&genesis, true).unwrap();
-        assert_eq!(genesis.header.difficulty, ConsensusParams::GENESIS_DIFFICULTY);
+        assert_eq!(
+            genesis.header.difficulty,
+            ConsensusParams::GENESIS_DIFFICULTY
+        );
     }
 
     // ── 11. Node A & Node B simultaneous blocks — fork detection ─────────
@@ -262,21 +302,33 @@ mod tests {
 
         let block_a = Block {
             header: BlockHeader::new_with_defaults(
-                1, "node_a_block_111111".to_string(),
+                1,
+                "node_a_block_111111".to_string(),
                 vec![genesis.header.hash.clone()],
-                "merkle_a".to_string(), ts, 1,
-                ConsensusParams::GENESIS_DIFFICULTY, 1,
+                "merkle_a".to_string(),
+                ts,
+                1,
+                ConsensusParams::GENESIS_DIFFICULTY,
+                1,
             ),
-            body: BlockBody { transactions: vec![coinbase_tx("cb_a")] },
+            body: BlockBody {
+                transactions: vec![coinbase_tx("cb_a")],
+            },
         };
         let block_b = Block {
             header: BlockHeader::new_with_defaults(
-                1, "node_b_block_222222".to_string(),
+                1,
+                "node_b_block_222222".to_string(),
                 vec![genesis.header.hash.clone()],
-                "merkle_b".to_string(), ts, 2,
-                ConsensusParams::GENESIS_DIFFICULTY, 1,
+                "merkle_b".to_string(),
+                ts,
+                2,
+                ConsensusParams::GENESIS_DIFFICULTY,
+                1,
             ),
-            body: BlockBody { transactions: vec![coinbase_tx("cb_b")] },
+            body: BlockBody {
+                transactions: vec![coinbase_tx("cb_b")],
+            },
         };
 
         dag.add_block_validated(&block_a, true).unwrap();
@@ -289,15 +341,21 @@ mod tests {
         // A merge block references both, resolving the fork
         let merge = Block {
             header: BlockHeader::new_with_defaults(
-                1, "merge_block_333333".to_string(),
+                1,
+                "merge_block_333333".to_string(),
                 vec![
                     "node_a_block_111111".to_string(),
                     "node_b_block_222222".to_string(),
                 ],
-                "merkle_merge".to_string(), ts + 1, 0,
-                ConsensusParams::GENESIS_DIFFICULTY, 2,
+                "merkle_merge".to_string(),
+                ts + 1,
+                0,
+                ConsensusParams::GENESIS_DIFFICULTY,
+                2,
             ),
-            body: BlockBody { transactions: vec![coinbase_tx("cb_merge")] },
+            body: BlockBody {
+                transactions: vec![coinbase_tx("cb_merge")],
+            },
         };
         let result = dag.add_block_validated(&merge, true);
         assert!(result.is_ok(), "Merge block must be accepted: {:?}", result);

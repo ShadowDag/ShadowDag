@@ -3,7 +3,7 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options};
+use rocksdb::{Options, DB};
 use std::path::Path;
 
 use crate::errors::StorageError;
@@ -11,7 +11,6 @@ use crate::slog_error;
 
 pub struct UtxoIndex {
     db: DB,
-
 }
 
 impl UtxoIndex {
@@ -33,15 +32,13 @@ impl UtxoIndex {
 
     pub fn get_owner(&self, key: &str) -> Option<String> {
         match self.db.get(key) {
-            Ok(Some(data)) => {
-                match String::from_utf8(data.to_vec()) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        slog_error!("index", "utxo_owner_corrupt_utf8", key => key, error => e);
-                        None
-                    }
+            Ok(Some(data)) => match String::from_utf8(data.to_vec()) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    slog_error!("index", "utxo_owner_corrupt_utf8", key => key, error => e);
+                    None
                 }
-            }
+            },
             Ok(None) => None,
             Err(e) => {
                 slog_error!("storage", "utxo_owner_read_error_returns_none",
@@ -51,5 +48,4 @@ impl UtxoIndex {
             }
         }
     }
-
 }

@@ -11,41 +11,52 @@ use std::fs;
 use std::process;
 
 // Access the library crate
-use shadowdag::runtime::vm::core::assembler::Assembler;
-use shadowdag::runtime::vm::contracts::contract_abi::{ContractAbi, AbiParam, AbiType, Mutability};
-use shadowdag::runtime::vm::contracts::contract_package::ContractPackage;
 use shadowdag::runtime::vm::contracts::build_manifest::BuildManifest;
-use shadowdag::runtime::vm::core::v1_spec;
-use shadowdag::runtime::vm::testing::test_runner::{TestRunner, TestCase};
+use shadowdag::runtime::vm::contracts::contract_abi::{AbiParam, AbiType, ContractAbi, Mutability};
+use shadowdag::runtime::vm::contracts::contract_package::ContractPackage;
+use shadowdag::runtime::vm::core::assembler::Assembler;
 use shadowdag::runtime::vm::core::execution_trace::ExecutionTrace;
+use shadowdag::runtime::vm::core::v1_spec;
+use shadowdag::runtime::vm::testing::test_runner::{TestCase, TestRunner};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
     match command {
-        "build"       => cmd_build(&args),
+        "build" => cmd_build(&args),
         "disassemble" | "dis" => cmd_disassemble(&args),
-        "verify"      => cmd_verify(&args),
-        "info"        => cmd_info(&args),
-        "test"        => cmd_test(&args),
-        "trace"       => cmd_trace(&args),
-        "script"      => cmd_script(&args),
+        "verify" => cmd_verify(&args),
+        "info" => cmd_info(&args),
+        "test" => cmd_test(&args),
+        "trace" => cmd_trace(&args),
+        "script" => cmd_script(&args),
         "help" | "--help" | "-h" => print_help(),
-        _ => { eprintln!("Unknown command: {}", command); print_help(); process::exit(1); }
+        _ => {
+            eprintln!("Unknown command: {}", command);
+            print_help();
+            process::exit(1);
+        }
     }
 }
 
 fn cmd_build(args: &[String]) {
     let source_path = match args.get(2) {
         Some(p) => p,
-        None => { eprintln!("Usage: shadowasm build <source.sasm> [-o output.json] [--name <name>]"); process::exit(1); }
+        None => {
+            eprintln!("Usage: shadowasm build <source.sasm> [-o output.json] [--name <name>]");
+            process::exit(1);
+        }
     };
 
     // Parse flags
     let mut output_path = source_path.replace(".sasm", ".pkg.json");
-    let mut contract_name = source_path.replace(".sasm", "")
-        .rsplit('/').next().unwrap_or("contract").to_string();
+    let mut contract_name = source_path
+        .replace(".sasm", "")
+        .rsplit('/')
+        .next()
+        .unwrap_or("contract")
+        .to_string();
     let mut check_only = false;
 
     let mut i = 3;
@@ -59,7 +70,10 @@ fn cmd_build(args: &[String]) {
                 contract_name = args.get(i + 1).cloned().unwrap_or(contract_name);
                 i += 2;
             }
-            "--check" => { check_only = true; i += 1; }
+            "--check" => {
+                check_only = true;
+                i += 1;
+            }
             _ => i += 1,
         }
     }
@@ -67,14 +81,20 @@ fn cmd_build(args: &[String]) {
     // Read source
     let source = match fs::read_to_string(source_path) {
         Ok(s) => s,
-        Err(e) => { eprintln!("Failed to read {}: {}", source_path, e); process::exit(1); }
+        Err(e) => {
+            eprintln!("Failed to read {}: {}", source_path, e);
+            process::exit(1);
+        }
     };
 
     // Assemble
     println!("Assembling {}...", source_path);
     let bytecode = match Assembler::assemble(&source) {
         Ok(b) => b,
-        Err(e) => { eprintln!("Assembly error: {}", e); process::exit(1); }
+        Err(e) => {
+            eprintln!("Assembly error: {}", e);
+            process::exit(1);
+        }
     };
 
     // V1 validation
@@ -85,7 +105,11 @@ fn cmd_build(args: &[String]) {
 
     // --check: validate only, don't write output files
     if check_only {
-        println!("  \u{2713} Build check passed ({} bytes, {} gas est.)", bytecode.len(), 32_000 + bytecode.len() as u64 * 200);
+        println!(
+            "  \u{2713} Build check passed ({} bytes, {} gas est.)",
+            bytecode.len(),
+            32_000 + bytecode.len() as u64 * 200
+        );
         return;
     }
 
@@ -103,7 +127,10 @@ fn cmd_build(args: &[String]) {
     // Write package
     let json = match package.to_json() {
         Ok(j) => j,
-        Err(e) => { eprintln!("Serialization error: {}", e); process::exit(1); }
+        Err(e) => {
+            eprintln!("Serialization error: {}", e);
+            process::exit(1);
+        }
     };
     if let Err(e) = fs::write(&output_path, &json) {
         eprintln!("Failed to write {}: {}", output_path, e);
@@ -129,7 +156,10 @@ fn cmd_build(args: &[String]) {
 fn cmd_disassemble(args: &[String]) {
     let hex_or_path = match args.get(2) {
         Some(h) => h,
-        None => { eprintln!("Usage: shadowasm disassemble <hex_or_file>"); process::exit(1); }
+        None => {
+            eprintln!("Usage: shadowasm disassemble <hex_or_file>");
+            process::exit(1);
+        }
     };
 
     // Try as file first, then as hex string
@@ -157,15 +187,20 @@ fn cmd_disassemble(args: &[String]) {
 fn cmd_verify(args: &[String]) {
     let path = match args.get(2) {
         Some(p) => p,
-        None => { eprintln!("Usage: shadowasm verify <package.json>"); process::exit(1); }
+        None => {
+            eprintln!("Usage: shadowasm verify <package.json>");
+            process::exit(1);
+        }
     };
 
     let json = fs::read_to_string(path).unwrap_or_else(|e| {
-        eprintln!("Failed to read {}: {}", path, e); process::exit(1);
+        eprintln!("Failed to read {}: {}", path, e);
+        process::exit(1);
     });
 
     let package = ContractPackage::from_json(&json).unwrap_or_else(|e| {
-        eprintln!("Invalid package: {}", e); process::exit(1);
+        eprintln!("Invalid package: {}", e);
+        process::exit(1);
     });
 
     if package.verify() {
@@ -183,7 +218,10 @@ fn cmd_verify(args: &[String]) {
     match v1_spec::validate_v1_bytecode(&package.bytecode) {
         Ok(()) => println!("  V1 spec:  all opcodes valid"),
         Err((pos, byte)) => {
-            eprintln!("  V1 spec:  invalid opcode 0x{:02X} at position {}", byte, pos);
+            eprintln!(
+                "  V1 spec:  invalid opcode 0x{:02X} at position {}",
+                byte, pos
+            );
             process::exit(1);
         }
     }
@@ -192,14 +230,19 @@ fn cmd_verify(args: &[String]) {
 fn cmd_info(args: &[String]) {
     let path = match args.get(2) {
         Some(p) => p,
-        None => { eprintln!("Usage: shadowasm info <package.json>"); process::exit(1); }
+        None => {
+            eprintln!("Usage: shadowasm info <package.json>");
+            process::exit(1);
+        }
     };
 
     let json = fs::read_to_string(path).unwrap_or_else(|e| {
-        eprintln!("Failed to read {}: {}", path, e); process::exit(1);
+        eprintln!("Failed to read {}: {}", path, e);
+        process::exit(1);
     });
     let package = ContractPackage::from_json(&json).unwrap_or_else(|e| {
-        eprintln!("Invalid package: {}", e); process::exit(1);
+        eprintln!("Invalid package: {}", e);
+        process::exit(1);
     });
 
     println!("Contract Package: {}", package.name);
@@ -213,7 +256,12 @@ fn cmd_info(args: &[String]) {
     }
 
     // ABI summary
-    let funcs: Vec<&str> = package.abi.functions.iter().map(|f| f.name.as_str()).collect();
+    let funcs: Vec<&str> = package
+        .abi
+        .functions
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
     let events: Vec<&str> = package.abi.events.iter().map(|e| e.name.as_str()).collect();
     if !funcs.is_empty() {
         println!("  Functions:        {}", funcs.join(", "));
@@ -226,18 +274,27 @@ fn cmd_info(args: &[String]) {
 fn cmd_test(args: &[String]) {
     let source_path = match args.get(2) {
         Some(p) => p.clone(),
-        None => { eprintln!("Usage: shadowasm test <source.sasm>"); process::exit(1); }
+        None => {
+            eprintln!("Usage: shadowasm test <source.sasm>");
+            process::exit(1);
+        }
     };
 
     // Read and assemble the contract
     let source = match fs::read_to_string(&source_path) {
         Ok(s) => s,
-        Err(e) => { eprintln!("Failed to read {}: {}", source_path, e); process::exit(1); }
+        Err(e) => {
+            eprintln!("Failed to read {}: {}", source_path, e);
+            process::exit(1);
+        }
     };
 
     let bytecode = match Assembler::assemble(&source) {
         Ok(b) => b,
-        Err(e) => { eprintln!("Assembly error: {}", e); process::exit(1); }
+        Err(e) => {
+            eprintln!("Assembly error: {}", e);
+            process::exit(1);
+        }
     };
 
     // Parse test cases from source comments
@@ -245,7 +302,10 @@ fn cmd_test(args: &[String]) {
     let tests = parse_tests_from_source(&source);
 
     if tests.is_empty() {
-        println!("No tests found in {}. Add ;; @test annotations.", source_path);
+        println!(
+            "No tests found in {}. Add ;; @test annotations.",
+            source_path
+        );
         println!("Example: ;; @test store_value 00000000000000000000000000000000000000000000000000000000000000ff");
         return;
     }
@@ -284,10 +344,13 @@ fn parse_tests_from_source(source: &str) -> Vec<TestCase> {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix(";; @test ") {
             let parts: Vec<&str> = rest.split_whitespace().collect();
-            if parts.is_empty() { continue; }
+            if parts.is_empty() {
+                continue;
+            }
 
             let name = parts[0].to_string();
-            let calldata = parts.get(1)
+            let calldata = parts
+                .get(1)
                 .and_then(|h| hex::decode(h).ok())
                 .unwrap_or_default();
 
@@ -295,7 +358,9 @@ fn parse_tests_from_source(source: &str) -> Vec<TestCase> {
             let mut max_gas = None;
 
             for p in &parts[2..] {
-                if *p == "expect:revert" { expect_revert = true; }
+                if *p == "expect:revert" {
+                    expect_revert = true;
+                }
                 if let Some(g) = p.strip_prefix("gas:") {
                     max_gas = g.parse().ok();
                 }
@@ -317,28 +382,38 @@ fn parse_tests_from_source(source: &str) -> Vec<TestCase> {
 fn cmd_trace(args: &[String]) {
     let source_or_hex = match args.get(2) {
         Some(p) => p,
-        None => { eprintln!("Usage: shadowasm trace <source.sasm|bytecode_hex> [calldata_hex]"); process::exit(1); }
+        None => {
+            eprintln!("Usage: shadowasm trace <source.sasm|bytecode_hex> [calldata_hex]");
+            process::exit(1);
+        }
     };
-    let calldata = args.get(3)
+    let calldata = args
+        .get(3)
         .and_then(|h| hex::decode(h).ok())
         .unwrap_or_default();
 
     // Get bytecode
     let bytecode = if source_or_hex.ends_with(".sasm") {
         let source = fs::read_to_string(source_or_hex).unwrap_or_else(|e| {
-            eprintln!("Failed to read: {}", e); process::exit(1);
+            eprintln!("Failed to read: {}", e);
+            process::exit(1);
         });
         Assembler::assemble(&source).unwrap_or_else(|e| {
-            eprintln!("Assembly error: {}", e); process::exit(1);
+            eprintln!("Assembly error: {}", e);
+            process::exit(1);
         })
     } else if source_or_hex.ends_with(".json") {
         let json = fs::read_to_string(source_or_hex).unwrap_or_default();
-        ContractPackage::from_json(&json).map(|p| p.bytecode).unwrap_or_else(|e| {
-            eprintln!("Invalid package: {}", e); process::exit(1);
-        })
+        ContractPackage::from_json(&json)
+            .map(|p| p.bytecode)
+            .unwrap_or_else(|e| {
+                eprintln!("Invalid package: {}", e);
+                process::exit(1);
+            })
     } else {
         hex::decode(source_or_hex).unwrap_or_else(|e| {
-            eprintln!("Invalid hex: {}", e); process::exit(1);
+            eprintln!("Invalid hex: {}", e);
+            process::exit(1);
         })
     };
 
@@ -369,7 +444,10 @@ fn cmd_trace(args: &[String]) {
 
     println!("{}", trace.format_pretty());
     println!("Gas used: {}", result.gas_used);
-    println!("Status:   {}", if result.passed { "SUCCESS" } else { "FAILED" });
+    println!(
+        "Status:   {}",
+        if result.passed { "SUCCESS" } else { "FAILED" }
+    );
     if let Some(ref msg) = result.message {
         println!("Message:  {}", msg);
     }
@@ -402,7 +480,10 @@ fn parse_abi_from_source(source: &str, name: &str) -> ContractAbi {
                                 Err(e) => {
                                     eprintln!(
                                         "warning: line {} fn {}: skipping parameter {}: {}",
-                                        line_num + 1, fname.trim(), i, e
+                                        line_num + 1,
+                                        fname.trim(),
+                                        i,
+                                        e
                                     );
                                     continue;
                                 }
@@ -424,7 +505,9 @@ fn parse_abi_from_source(source: &str, name: &str) -> ContractAbi {
                         Err(e) => {
                             eprintln!(
                                 "warning: line {} fn {}: skipping return type: {}",
-                                line_num + 1, fname.trim(), e
+                                line_num + 1,
+                                fname.trim(),
+                                e
                             );
                             vec![]
                         }
@@ -445,7 +528,10 @@ fn parse_abi_from_source(source: &str, name: &str) -> ContractAbi {
                             Err(e) => {
                                 eprintln!(
                                     "warning: line {} event {}: skipping parameter {}: {}",
-                                    line_num + 1, ename.trim(), i, e
+                                    line_num + 1,
+                                    ename.trim(),
+                                    i,
+                                    e
                                 );
                                 continue;
                             }
@@ -469,7 +555,10 @@ fn parse_abi_from_source(source: &str, name: &str) -> ContractAbi {
 fn cmd_script(args: &[String]) {
     let source_path = match args.get(2) {
         Some(p) => p,
-        None => { eprintln!("Usage: shadowasm script <source.sasm> [--network <name>] [--broadcast]"); process::exit(1); }
+        None => {
+            eprintln!("Usage: shadowasm script <source.sasm> [--network <name>] [--broadcast]");
+            process::exit(1);
+        }
     };
 
     let mut network = "local".to_string();
@@ -477,16 +566,28 @@ fn cmd_script(args: &[String]) {
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
-            "--network" => { network = args.get(i+1).cloned().unwrap_or(network); i += 2; }
-            "--broadcast" => { broadcast = true; i += 1; }
-            "--dry-run" => { broadcast = false; i += 1; } // Explicit dry-run (default behavior)
+            "--network" => {
+                network = args.get(i + 1).cloned().unwrap_or(network);
+                i += 2;
+            }
+            "--broadcast" => {
+                broadcast = true;
+                i += 1;
+            }
+            "--dry-run" => {
+                broadcast = false;
+                i += 1;
+            } // Explicit dry-run (default behavior)
             _ => i += 1,
         }
     }
 
     let source = match fs::read_to_string(source_path) {
         Ok(s) => s,
-        Err(e) => { eprintln!("Failed to read {}: {}", source_path, e); process::exit(1); }
+        Err(e) => {
+            eprintln!("Failed to read {}: {}", source_path, e);
+            process::exit(1);
+        }
     };
 
     // Parse script actions from source
@@ -504,7 +605,6 @@ fn cmd_script(args: &[String]) {
     }
 
     use shadowdag::runtime::vm::testing::script_runner::*;
-
 
     let mut runner = match ScriptRunner::new(&network, "script_deployer") {
         Ok(r) => r,
@@ -532,13 +632,17 @@ fn cmd_script(args: &[String]) {
     }
 
     let failed = results.iter().any(|r| !r.success);
-    if failed { process::exit(1); }
+    if failed {
+        process::exit(1);
+    }
 }
 
-fn parse_script_actions(source: &str) -> Vec<shadowdag::runtime::vm::testing::script_runner::ScriptAction> {
-    use shadowdag::runtime::vm::testing::script_runner::ScriptAction;
+fn parse_script_actions(
+    source: &str,
+) -> Vec<shadowdag::runtime::vm::testing::script_runner::ScriptAction> {
     use shadowdag::runtime::vm::contracts::contract_abi::ContractAbi;
     use shadowdag::runtime::vm::core::assembler::Assembler;
+    use shadowdag::runtime::vm::testing::script_runner::ScriptAction;
 
     let mut actions = Vec::new();
     let mut current_deploy_name: Option<String> = None;
@@ -565,7 +669,8 @@ fn parse_script_actions(source: &str) -> Vec<shadowdag::runtime::vm::testing::sc
         } else if let Some(rest) = trimmed.strip_prefix(";; @call ") {
             let parts: Vec<&str> = rest.split_whitespace().collect();
             if let Some(contract_name) = parts.first() {
-                let calldata = parts.get(1)
+                let calldata = parts
+                    .get(1)
                     .and_then(|h| hex::decode(h).ok())
                     .unwrap_or_default();
                 actions.push(ScriptAction::Call {
@@ -586,7 +691,9 @@ fn parse_script_actions(source: &str) -> Vec<shadowdag::runtime::vm::testing::sc
                 }
             }
         } else if let Some(rest) = trimmed.strip_prefix(";; @log ") {
-            actions.push(ScriptAction::Log { message: rest.to_string() });
+            actions.push(ScriptAction::Log {
+                message: rest.to_string(),
+            });
         } else if current_deploy_name.is_some() && !trimmed.starts_with(";;") {
             current_source.push_str(line);
             current_source.push('\n');
@@ -623,8 +730,12 @@ fn print_help() {
     println!("  shadowasm help");
     println!();
     println!("Build Flags:");
-    println!("  --check              Validate only — assemble + V1 check, no output files (CI mode)");
-    println!("  --dry-run            Script dry-run — local execution only, no broadcast (default)");
+    println!(
+        "  --check              Validate only — assemble + V1 check, no output files (CI mode)"
+    );
+    println!(
+        "  --dry-run            Script dry-run — local execution only, no broadcast (default)"
+    );
     println!();
     println!("ABI Annotations (in .sasm source comments):");
     println!("  ;; @fn transfer(uint64,address):bool");

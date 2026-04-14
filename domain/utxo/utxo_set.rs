@@ -3,25 +3,26 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::sync::Arc;
+use parking_lot::RwLock;
 use std::collections::HashMap; // 🔥 ADD
-use parking_lot::RwLock;       // 🔥 ADD
+use std::sync::Arc; // 🔥 ADD
 
 use crate::domain::block::block::Block;
+use crate::domain::traits::utxo_backend::{BatchWrite, UtxoBackend};
 use crate::domain::transaction::transaction::Transaction;
-use crate::domain::transaction::tx_validator::TxValidator;
 use crate::domain::transaction::tx_hash::TxHash;
+use crate::domain::transaction::tx_validator::TxValidator;
 use crate::domain::utxo::utxo::Utxo;
 use crate::domain::utxo::utxo_key::UtxoKey;
 use crate::domain::utxo::utxo_validator::UtxoValidator;
-use crate::domain::traits::utxo_backend::{UtxoBackend, BatchWrite};
 use crate::errors::StorageError;
-use crate::slog_warn;
 use crate::slog_error;
+use crate::slog_warn;
 
 /// Coinbase maturity — MUST match ConsensusParams::COINBASE_MATURITY.
 /// At 10 BPS, 1000 blocks = 100 seconds = safe against DAG reorgs.
-pub const COINBASE_MATURITY: u64 = crate::config::consensus::consensus_params::ConsensusParams::COINBASE_MATURITY;
+pub const COINBASE_MATURITY: u64 =
+    crate::config::consensus::consensus_params::ConsensusParams::COINBASE_MATURITY;
 
 /// Single source of truth for UTXO key construction.
 ///
@@ -51,7 +52,7 @@ pub fn utxo_key(tx_hash: &str, index: u32) -> Result<UtxoKey, StorageError> {
 /// NOT consensus code — never call in production paths.
 #[cfg(test)]
 pub fn test_hash(name: &str) -> String {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(name.as_bytes()))
 }
 
@@ -211,7 +212,11 @@ impl UtxoSet {
         Ok(())
     }
 
-    pub fn spend_utxo_checked(&self, key: &UtxoKey, current_height: u64) -> Result<(), StorageError> {
+    pub fn spend_utxo_checked(
+        &self,
+        key: &UtxoKey,
+        current_height: u64,
+    ) -> Result<(), StorageError> {
         let utxo = self
             .get_utxo(key) // 🔥 use cache-aware
             .ok_or_else(|| StorageError::KeyNotFound(format!("utxo {} not found", key)))?;
@@ -306,7 +311,12 @@ impl UtxoSet {
         self.apply_block_write(&block.body.transactions, block_height, &block.header.hash)
     }
 
-    pub fn apply_block(&self, transactions: &[Transaction], block_height: u64, block_hash: &str) -> Result<(), StorageError> {
+    pub fn apply_block(
+        &self,
+        transactions: &[Transaction],
+        block_height: u64,
+        block_hash: &str,
+    ) -> Result<(), StorageError> {
         // Build a temporary Block for the unified validator
         let block = Block {
             header: crate::domain::block::block_header::BlockHeader {
@@ -350,7 +360,7 @@ impl UtxoSet {
         block_height: u64,
         block_hash: &str,
     ) -> Result<String, StorageError> {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         let mut ops: Vec<BatchWrite> = Vec::new();
 
@@ -382,20 +392,29 @@ impl UtxoSet {
                     let key = utxo_key(&tx.hash, idx as u32)?;
 
                     let addr = output.address.clone();
-                    let utxo = crate::domain::utxo::utxo::Utxo::new(
-                        addr.clone(), addr, output.amount,
-                    );
-                    let data = bincode::serialize(&utxo)
-                        .map_err(|e| StorageError::Serialization(format!("coinbase UTXO {}: {}", key, e)))?;
-                    ops.push(BatchWrite::Put { key: key.as_ref().to_vec(), value: data });
+                    let utxo =
+                        crate::domain::utxo::utxo::Utxo::new(addr.clone(), addr, output.amount);
+                    let data = bincode::serialize(&utxo).map_err(|e| {
+                        StorageError::Serialization(format!("coinbase UTXO {}: {}", key, e))
+                    })?;
+                    ops.push(BatchWrite::Put {
+                        key: key.as_ref().to_vec(),
+                        value: data,
+                    });
 
                     let key_str = key.to_string();
                     let addr_key = format!("addr:{}:{}", output.address, key_str);
-                    ops.push(BatchWrite::Put { key: addr_key.as_bytes().to_vec(), value: key.as_ref().to_vec() });
+                    ops.push(BatchWrite::Put {
+                        key: addr_key.as_bytes().to_vec(),
+                        value: key.as_ref().to_vec(),
+                    });
 
                     let mut meta_key_bytes = b"cb_height:".to_vec();
                     meta_key_bytes.extend_from_slice(key.as_ref());
-                    ops.push(BatchWrite::Put { key: meta_key_bytes.clone(), value: block_height.to_le_bytes().to_vec() });
+                    ops.push(BatchWrite::Put {
+                        key: meta_key_bytes.clone(),
+                        value: block_height.to_le_bytes().to_vec(),
+                    });
 
                     // Track for undo
                     undo.created_keys.push(key_str.clone());
@@ -412,14 +431,24 @@ impl UtxoSet {
                     let key = utxo_key(&input.txid, input.index)?;
 
                     // CONFLICT DETECTION: read from DB (not cache) for latest state
-                    let raw = self.store.get_raw(key.as_ref())
-                        .ok_or_else(|| StorageError::KeyNotFound(format!("UTXO_CONFLICT: {} not found at write time", key)))?;
+                    let raw = self.store.get_raw(key.as_ref()).ok_or_else(|| {
+                        StorageError::KeyNotFound(format!(
+                            "UTXO_CONFLICT: {} not found at write time",
+                            key
+                        ))
+                    })?;
                     let mut utxo: crate::domain::utxo::utxo::Utxo = bincode::deserialize(&raw)
-                        .map_err(|e| StorageError::Serialization(format!("conflict check deserialize {}: {}", key, e)))?;
+                        .map_err(|e| {
+                            StorageError::Serialization(format!(
+                                "conflict check deserialize {}: {}",
+                                key, e
+                            ))
+                        })?;
 
                     if utxo.spent {
                         return Err(StorageError::Other(format!(
-                            "UTXO_CONFLICT: {} already spent (concurrent block won)", key
+                            "UTXO_CONFLICT: {} already spent (concurrent block won)",
+                            key
                         )));
                     }
 
@@ -428,7 +457,9 @@ impl UtxoSet {
                     undo.spent_utxos.push((key_str.clone(), utxo.clone()));
 
                     let addr_key = format!("addr:{}:{}", utxo.address, key);
-                    ops.push(BatchWrite::Delete { key: addr_key.as_bytes().to_vec() });
+                    ops.push(BatchWrite::Delete {
+                        key: addr_key.as_bytes().to_vec(),
+                    });
                     undo.deleted_addr_indexes.push((addr_key, key_str));
 
                     commitment_hasher.update(b"S");
@@ -436,9 +467,13 @@ impl UtxoSet {
                     commitment_hasher.update(utxo.amount.to_le_bytes());
 
                     utxo.spent = true;
-                    let data = bincode::serialize(&utxo)
-                        .map_err(|e| StorageError::Serialization(format!("spent UTXO {}: {}", key, e)))?;
-                    ops.push(BatchWrite::Put { key: key.as_ref().to_vec(), value: data });
+                    let data = bincode::serialize(&utxo).map_err(|e| {
+                        StorageError::Serialization(format!("spent UTXO {}: {}", key, e))
+                    })?;
+                    ops.push(BatchWrite::Put {
+                        key: key.as_ref().to_vec(),
+                        value: data,
+                    });
                 }
 
                 for (idx, output) in tx.outputs.iter().enumerate() {
@@ -446,16 +481,22 @@ impl UtxoSet {
                     let key = utxo_key(&tx.hash, idx as u32)?;
 
                     let addr = output.address.clone();
-                    let utxo = crate::domain::utxo::utxo::Utxo::new(
-                        addr.clone(), addr, output.amount,
-                    );
-                    let data = bincode::serialize(&utxo)
-                        .map_err(|e| StorageError::Serialization(format!("output UTXO {}: {}", key, e)))?;
-                    ops.push(BatchWrite::Put { key: key.as_ref().to_vec(), value: data });
+                    let utxo =
+                        crate::domain::utxo::utxo::Utxo::new(addr.clone(), addr, output.amount);
+                    let data = bincode::serialize(&utxo).map_err(|e| {
+                        StorageError::Serialization(format!("output UTXO {}: {}", key, e))
+                    })?;
+                    ops.push(BatchWrite::Put {
+                        key: key.as_ref().to_vec(),
+                        value: data,
+                    });
 
                     let key_str = key.to_string();
                     let addr_key = format!("addr:{}:{}", output.address, key_str);
-                    ops.push(BatchWrite::Put { key: addr_key.as_bytes().to_vec(), value: key.as_ref().to_vec() });
+                    ops.push(BatchWrite::Put {
+                        key: addr_key.as_bytes().to_vec(),
+                        value: key.as_ref().to_vec(),
+                    });
 
                     // Track for undo
                     undo.created_keys.push(key_str.clone());
@@ -472,17 +513,28 @@ impl UtxoSet {
         // Commitment
         let commitment = format!("{:x}", commitment_hasher.finalize());
         let commit_key = format!("utxo:commitment:{}", block_hash);
-        ops.push(BatchWrite::Put { key: commit_key.as_bytes().to_vec(), value: commitment.as_bytes().to_vec() });
-        ops.push(BatchWrite::Put { key: prev_commitment_key.as_bytes().to_vec(), value: commitment.as_bytes().to_vec() });
+        ops.push(BatchWrite::Put {
+            key: commit_key.as_bytes().to_vec(),
+            value: commitment.as_bytes().to_vec(),
+        });
+        ops.push(BatchWrite::Put {
+            key: prev_commitment_key.as_bytes().to_vec(),
+            value: commitment.as_bytes().to_vec(),
+        });
 
         // Store undo data in SAME batch — atomic with UTXO changes
         let undo_key = format!("utxo:undo:{}", block_hash);
         let undo_data = bincode::serialize(&undo)
             .map_err(|e| StorageError::Serialization(format!("undo data: {}", e)))?;
-        ops.push(BatchWrite::Put { key: undo_key.as_bytes().to_vec(), value: undo_data });
+        ops.push(BatchWrite::Put {
+            key: undo_key.as_bytes().to_vec(),
+            value: undo_data,
+        });
 
         // ATOMIC COMMIT — UTXO + commitment + undo = all or nothing
-        self.store.write_batch(ops).map_err(|e| StorageError::WriteFailed(format!("apply_block atomic write: {}", e)))?;
+        self.store
+            .write_batch(ops)
+            .map_err(|e| StorageError::WriteFailed(format!("apply_block atomic write: {}", e)))?;
 
         // Update cache after successful DB write
         for tx in transactions {
@@ -531,7 +583,7 @@ impl UtxoSet {
         block_height: u64,
         block_hash: &str,
     ) -> Result<(usize, usize, u64), StorageError> {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         let mut ops: Vec<BatchWrite> = Vec::new();
         let mut undo = BlockUndoData {
@@ -562,10 +614,8 @@ impl UtxoSet {
         //
         // Input lookup order: staged_spent → DB → staged_outputs
         // This ensures tx3 can see tx1's output even though it's only in the batch.
-        let mut staged_outputs: HashMap<UtxoKey, crate::domain::utxo::utxo::Utxo> =
-            HashMap::new();
-        let mut staged_spent: std::collections::HashSet<UtxoKey> =
-            std::collections::HashSet::new();
+        let mut staged_outputs: HashMap<UtxoKey, crate::domain::utxo::utxo::Utxo> = HashMap::new();
+        let mut staged_spent: std::collections::HashSet<UtxoKey> = std::collections::HashSet::new();
 
         for tx in transactions {
             // ───────────────────────────────────────────────────────────
@@ -594,19 +644,28 @@ impl UtxoSet {
                 for (idx, output) in tx.outputs.iter().enumerate() {
                     let key = utxo_key(&tx.hash, idx as u32)?;
                     let addr = output.address.clone();
-                    let utxo = crate::domain::utxo::utxo::Utxo::new(
-                        addr.clone(), addr, output.amount,
-                    );
-                    let data = bincode::serialize(&utxo)
-                        .map_err(|e| StorageError::Serialization(format!("coinbase UTXO {}: {}", key, e)))?;
-                    ops.push(BatchWrite::Put { key: key.as_ref().to_vec(), value: data });
+                    let utxo =
+                        crate::domain::utxo::utxo::Utxo::new(addr.clone(), addr, output.amount);
+                    let data = bincode::serialize(&utxo).map_err(|e| {
+                        StorageError::Serialization(format!("coinbase UTXO {}: {}", key, e))
+                    })?;
+                    ops.push(BatchWrite::Put {
+                        key: key.as_ref().to_vec(),
+                        value: data,
+                    });
                     let key_str = key.to_string();
                     let addr_key = format!("addr:{}:{}", output.address, key_str);
-                    ops.push(BatchWrite::Put { key: addr_key.as_bytes().to_vec(), value: key.as_ref().to_vec() });
+                    ops.push(BatchWrite::Put {
+                        key: addr_key.as_bytes().to_vec(),
+                        value: key.as_ref().to_vec(),
+                    });
                     let meta_key = "cb_height:".to_string();
                     let mut meta_key_bytes = meta_key.into_bytes();
                     meta_key_bytes.extend_from_slice(key.as_ref());
-                    ops.push(BatchWrite::Put { key: meta_key_bytes.clone(), value: block_height.to_le_bytes().to_vec() });
+                    ops.push(BatchWrite::Put {
+                        key: meta_key_bytes.clone(),
+                        value: block_height.to_le_bytes().to_vec(),
+                    });
 
                     undo.created_keys.push(key_str.clone());
                     undo.created_addr_indexes.push((addr_key, key_str));
@@ -660,7 +719,8 @@ impl UtxoSet {
 
                 // 3. Exists in DB (committed state from previous blocks)?
                 if let Some(raw) = self.store.get_raw(key.as_ref()) {
-                    if let Ok(utxo) = bincode::deserialize::<crate::domain::utxo::utxo::Utxo>(&raw) {
+                    if let Ok(utxo) = bincode::deserialize::<crate::domain::utxo::utxo::Utxo>(&raw)
+                    {
                         if !utxo.spent {
                             tx_inputs.push((key, utxo));
                             continue;
@@ -707,7 +767,9 @@ impl UtxoSet {
                 for (i, input) in tx.inputs.iter().enumerate() {
                     let (ref _key, ref utxo) = tx_inputs[i];
                     if !TxValidator::verify_input_ownership_by_address(
-                        input, &utxo.address, &signing_msg
+                        input,
+                        &utxo.address,
+                        &signing_msg,
                     ) {
                         ownership_ok = false;
                         break;
@@ -723,7 +785,8 @@ impl UtxoSet {
 
             // C) Balance check — total inputs >= total outputs + fee
             {
-                let input_sum: u64 = match tx_inputs.iter()
+                let input_sum: u64 = match tx_inputs
+                    .iter()
                     .map(|(_, u)| u.amount)
                     .try_fold(0u64, |a, b| a.checked_add(b))
                 {
@@ -735,7 +798,9 @@ impl UtxoSet {
                         continue;
                     }
                 };
-                let output_sum: u64 = match tx.outputs.iter()
+                let output_sum: u64 = match tx
+                    .outputs
+                    .iter()
                     .map(|o| o.amount)
                     .try_fold(0u64, |a, b| a.checked_add(b))
                 {
@@ -774,8 +839,9 @@ impl UtxoSet {
                     meta_key.extend_from_slice(key.as_ref());
                     if let Some(raw) = self.store.get_raw(&meta_key) {
                         if raw.len() >= 8 {
-                            let cb_h = u64::from_le_bytes(raw[..8].try_into().unwrap_or([0;8]));
-                            if block_height < cb_h + COINBASE_MATURITY { // consensus maturity check
+                            let cb_h = u64::from_le_bytes(raw[..8].try_into().unwrap_or([0; 8]));
+                            if block_height < cb_h + COINBASE_MATURITY {
+                                // consensus maturity check
                                 maturity_ok = false;
                                 break;
                             }
@@ -795,14 +861,20 @@ impl UtxoSet {
                 let key_str = key.to_string();
                 undo.spent_utxos.push((key_str.clone(), utxo.clone()));
                 let addr_key = format!("addr:{}:{}", utxo.address, key_str);
-                ops.push(BatchWrite::Delete { key: addr_key.as_bytes().to_vec() });
+                ops.push(BatchWrite::Delete {
+                    key: addr_key.as_bytes().to_vec(),
+                });
                 undo.deleted_addr_indexes.push((addr_key, key_str));
 
                 let mut spent_utxo = utxo.clone();
                 spent_utxo.spent = true;
-                let data = bincode::serialize(&spent_utxo)
-                    .map_err(|e| StorageError::Serialization(format!("spent UTXO {}: {}", key, e)))?;
-                ops.push(BatchWrite::Put { key: key.as_ref().to_vec(), value: data });
+                let data = bincode::serialize(&spent_utxo).map_err(|e| {
+                    StorageError::Serialization(format!("spent UTXO {}: {}", key, e))
+                })?;
+                ops.push(BatchWrite::Put {
+                    key: key.as_ref().to_vec(),
+                    value: data,
+                });
 
                 // Mark as spent in staged state
                 staged_spent.insert(*key);
@@ -816,15 +888,20 @@ impl UtxoSet {
             for (idx, output) in tx.outputs.iter().enumerate() {
                 let key = utxo_key(&tx.hash, idx as u32)?;
                 let addr = output.address.clone();
-                let utxo = crate::domain::utxo::utxo::Utxo::new(
-                    addr.clone(), addr, output.amount,
-                );
-                let data = bincode::serialize(&utxo)
-                    .map_err(|e| StorageError::Serialization(format!("output UTXO {}: {}", key, e)))?;
-                ops.push(BatchWrite::Put { key: key.as_ref().to_vec(), value: data });
+                let utxo = crate::domain::utxo::utxo::Utxo::new(addr.clone(), addr, output.amount);
+                let data = bincode::serialize(&utxo).map_err(|e| {
+                    StorageError::Serialization(format!("output UTXO {}: {}", key, e))
+                })?;
+                ops.push(BatchWrite::Put {
+                    key: key.as_ref().to_vec(),
+                    value: data,
+                });
                 let key_str = key.to_string();
                 let addr_key = format!("addr:{}:{}", output.address, key_str);
-                ops.push(BatchWrite::Put { key: addr_key.as_bytes().to_vec(), value: key.as_ref().to_vec() });
+                ops.push(BatchWrite::Put {
+                    key: addr_key.as_bytes().to_vec(),
+                    value: key.as_ref().to_vec(),
+                });
 
                 undo.created_keys.push(key_str.clone());
                 undo.created_addr_indexes.push((addr_key, key_str));
@@ -840,7 +917,10 @@ impl UtxoSet {
 
             // Mark tx as seen (uniqueness) + record for undo
             let seen_key = format!("tx_seen:{}", tx.hash);
-            ops.push(BatchWrite::Put { key: seen_key.as_bytes().to_vec(), value: block_hash.as_bytes().to_vec() });
+            ops.push(BatchWrite::Put {
+                key: seen_key.as_bytes().to_vec(),
+                value: block_hash.as_bytes().to_vec(),
+            });
             undo.applied_tx_ids.push(tx.hash.clone());
 
             applied += 1;
@@ -852,16 +932,27 @@ impl UtxoSet {
         // Commitment + undo in same batch
         let commitment = format!("{:x}", commitment_hasher.finalize());
         let commit_key = format!("utxo:commitment:{}", block_hash);
-        ops.push(BatchWrite::Put { key: commit_key.as_bytes().to_vec(), value: commitment.as_bytes().to_vec() });
-        ops.push(BatchWrite::Put { key: prev_commitment_key.as_bytes().to_vec(), value: commitment.as_bytes().to_vec() });
+        ops.push(BatchWrite::Put {
+            key: commit_key.as_bytes().to_vec(),
+            value: commitment.as_bytes().to_vec(),
+        });
+        ops.push(BatchWrite::Put {
+            key: prev_commitment_key.as_bytes().to_vec(),
+            value: commitment.as_bytes().to_vec(),
+        });
 
         let undo_key = format!("utxo:undo:{}", block_hash);
         let undo_data = bincode::serialize(&undo)
             .map_err(|e| StorageError::Serialization(format!("undo data: {}", e)))?;
-        ops.push(BatchWrite::Put { key: undo_key.as_bytes().to_vec(), value: undo_data });
+        ops.push(BatchWrite::Put {
+            key: undo_key.as_bytes().to_vec(),
+            value: undo_data,
+        });
 
         // ATOMIC COMMIT
-        self.store.write_batch(ops).map_err(|e| StorageError::WriteFailed(format!("apply_block_dag atomic write: {}", e)))?;
+        self.store.write_batch(ops).map_err(|e| {
+            StorageError::WriteFailed(format!("apply_block_dag atomic write: {}", e))
+        })?;
 
         // Update cache
         for (key_str, _) in &undo.spent_utxos {
@@ -892,10 +983,12 @@ impl UtxoSet {
     pub fn rollback_block_undo(&self, block_hash: &str) -> Result<(), StorageError> {
         // Load undo data
         let undo_key = format!("utxo:undo:{}", block_hash);
-        let raw = self.store.get_raw(undo_key.as_bytes())
-            .ok_or_else(|| StorageError::KeyNotFound(format!("rollback: no undo data for block {}", block_hash)))?;
-        let undo: BlockUndoData = bincode::deserialize(&raw)
-            .map_err(|e| StorageError::Serialization(format!("rollback: deserialize undo: {}", e)))?;
+        let raw = self.store.get_raw(undo_key.as_bytes()).ok_or_else(|| {
+            StorageError::KeyNotFound(format!("rollback: no undo data for block {}", block_hash))
+        })?;
+        let undo: BlockUndoData = bincode::deserialize(&raw).map_err(|e| {
+            StorageError::Serialization(format!("rollback: deserialize undo: {}", e))
+        })?;
 
         let mut ops: Vec<BatchWrite> = Vec::new();
 
@@ -912,12 +1005,16 @@ impl UtxoSet {
                     key_str, original_utxo.amount, original_utxo.address
                 )));
             }
-            let data = bincode::serialize(original_utxo)
-                .map_err(|e| StorageError::Serialization(format!("rollback: restored UTXO {}: {}", key_str, e)))?;
+            let data = bincode::serialize(original_utxo).map_err(|e| {
+                StorageError::Serialization(format!("rollback: restored UTXO {}: {}", key_str, e))
+            })?;
             if let Some((hash, idx_s)) = key_str.rsplit_once(':') {
                 if let Ok(idx) = idx_s.parse::<u32>() {
                     let key = utxo_key(hash, idx)?;
-                    ops.push(BatchWrite::Put { key: key.as_ref().to_vec(), value: data });
+                    ops.push(BatchWrite::Put {
+                        key: key.as_ref().to_vec(),
+                        value: data,
+                    });
                 }
             }
         }
@@ -928,39 +1025,56 @@ impl UtxoSet {
             if let Some((hash, idx_s)) = key_str.rsplit_once(':') {
                 if let Ok(idx) = idx_s.parse::<u32>() {
                     let key = utxo_key(hash, idx)?;
-                    ops.push(BatchWrite::Delete { key: key.as_ref().to_vec() });
+                    ops.push(BatchWrite::Delete {
+                        key: key.as_ref().to_vec(),
+                    });
                 }
             }
         }
 
         // 3. Restore address indexes that were deleted
         for (addr_key, utxo_key) in &undo.deleted_addr_indexes {
-            ops.push(BatchWrite::Put { key: addr_key.as_bytes().to_vec(), value: utxo_key.as_bytes().to_vec() });
+            ops.push(BatchWrite::Put {
+                key: addr_key.as_bytes().to_vec(),
+                value: utxo_key.as_bytes().to_vec(),
+            });
         }
 
         // 4. Delete address indexes that were created
         for (addr_key, _) in &undo.created_addr_indexes {
-            ops.push(BatchWrite::Delete { key: addr_key.as_bytes().to_vec() });
+            ops.push(BatchWrite::Delete {
+                key: addr_key.as_bytes().to_vec(),
+            });
         }
 
         // 5. Delete coinbase height metadata
         for meta_key in &undo.created_cb_heights {
-            ops.push(BatchWrite::Delete { key: meta_key.as_bytes().to_vec() });
+            ops.push(BatchWrite::Delete {
+                key: meta_key.as_bytes().to_vec(),
+            });
         }
 
         // 6. Remove tx_seen entries (allow re-application on new chain)
         for tx_id in &undo.applied_tx_ids {
             let seen_key = format!("tx_seen:{}", tx_id);
-            ops.push(BatchWrite::Delete { key: seen_key.as_bytes().to_vec() });
+            ops.push(BatchWrite::Delete {
+                key: seen_key.as_bytes().to_vec(),
+            });
         }
 
         // 7. Clean up undo data and commitment
-        ops.push(BatchWrite::Delete { key: undo_key.as_bytes().to_vec() });
+        ops.push(BatchWrite::Delete {
+            key: undo_key.as_bytes().to_vec(),
+        });
         let commit_key = format!("utxo:commitment:{}", block_hash);
-        ops.push(BatchWrite::Delete { key: commit_key.as_bytes().to_vec() });
+        ops.push(BatchWrite::Delete {
+            key: commit_key.as_bytes().to_vec(),
+        });
 
         // ATOMIC ROLLBACK — all or nothing
-        self.store.write_batch(ops).map_err(|e| StorageError::WriteFailed(format!("rollback atomic write: {}", e)))?;
+        self.store
+            .write_batch(ops)
+            .map_err(|e| StorageError::WriteFailed(format!("rollback atomic write: {}", e)))?;
 
         // Invalidate cache entries
         let mut cache = self.cache.write();
@@ -998,7 +1112,9 @@ impl UtxoSet {
         for block_hash in finalized_block_hashes {
             let undo_key = format!("utxo:undo:{}", block_hash);
             if self.store.get_raw(undo_key.as_bytes()).is_some() {
-                ops.push(BatchWrite::Delete { key: undo_key.as_bytes().to_vec() });
+                ops.push(BatchWrite::Delete {
+                    key: undo_key.as_bytes().to_vec(),
+                });
                 count += 1;
             }
         }
@@ -1022,16 +1138,25 @@ impl UtxoSet {
     /// Get stored UTXO commitment for a specific block.
     pub fn get_commitment(&self, block_hash: &str) -> Option<String> {
         let key = format!("utxo:commitment:{}", block_hash);
-        self.store.get_raw(key.as_bytes())
+        self.store
+            .get_raw(key.as_bytes())
             .and_then(|data| String::from_utf8(data).ok())
     }
 
     /// Apply a block's UTXO changes with the actual block hash for undo/commitment keys.
-    pub fn apply_block_write(&self, transactions: &[Transaction], block_height: u64, block_hash: &str) -> Result<(), StorageError> {
+    pub fn apply_block_write(
+        &self,
+        transactions: &[Transaction],
+        block_height: u64,
+        block_hash: &str,
+    ) -> Result<(), StorageError> {
         if transactions.is_empty() {
-            return Err(StorageError::Other("cannot apply empty transaction list".into()));
+            return Err(StorageError::Other(
+                "cannot apply empty transaction list".into(),
+            ));
         }
-        self.apply_block_write_with_commitment(transactions, block_height, block_hash).map(|_| ())
+        self.apply_block_write_with_commitment(transactions, block_height, block_hash)
+            .map(|_| ())
     }
 
     /// DEPRECATED: Use rollback_block_undo(block_hash) instead.
@@ -1042,7 +1167,9 @@ impl UtxoSet {
     ///
     /// WARNING: This method is NOT consensus-safe and WILL be removed in a
     /// future release. All callers must migrate to rollback_block_undo().
-    #[deprecated(note = "UNSAFE: Use rollback_block_undo(block_hash) — this method is NOT consensus-safe and will be removed")]
+    #[deprecated(
+        note = "UNSAFE: Use rollback_block_undo(block_hash) — this method is NOT consensus-safe and will be removed"
+    )]
     pub fn rollback_block(&self, transactions: &[Transaction]) -> Result<(), StorageError> {
         slog_warn!("utxo", "deprecated_rollback_block_called", note => "migrate to rollback_block_undo()");
         let mut ops: Vec<BatchWrite> = Vec::new();
@@ -1058,11 +1185,15 @@ impl UtxoSet {
             for (idx, _output) in tx.outputs.iter().enumerate() {
                 let key = utxo_key(&tx.hash, idx as u32)?;
 
-                ops.push(BatchWrite::Delete { key: key.as_ref().to_vec() });
+                ops.push(BatchWrite::Delete {
+                    key: key.as_ref().to_vec(),
+                });
 
                 if let Some(utxo) = self.get_utxo(&key) {
                     let addr_key = format!("addr:{}:{}", utxo.address, key);
-                    ops.push(BatchWrite::Delete { key: addr_key.as_bytes().to_vec() });
+                    ops.push(BatchWrite::Delete {
+                        key: addr_key.as_bytes().to_vec(),
+                    });
                 }
 
                 let mut meta = Vec::with_capacity(10 + 36);
@@ -1092,10 +1223,16 @@ impl UtxoSet {
                         }
                         utxo.spent = false;
                         if let Ok(data) = bincode::serialize(&utxo) {
-                            ops.push(BatchWrite::Put { key: key.as_ref().to_vec(), value: data });
+                            ops.push(BatchWrite::Put {
+                                key: key.as_ref().to_vec(),
+                                value: data,
+                            });
                         }
                         let addr_key = format!("addr:{}:{}", utxo.address, key);
-                        ops.push(BatchWrite::Put { key: addr_key.as_bytes().to_vec(), value: key.as_ref().to_vec() });
+                        ops.push(BatchWrite::Put {
+                            key: addr_key.as_bytes().to_vec(),
+                            value: key.as_ref().to_vec(),
+                        });
 
                         // Stage for cache (not applied yet)
                         cache_unspends.push(key);
@@ -1105,7 +1242,9 @@ impl UtxoSet {
         }
 
         // 3) DB commit FIRST — atomic, all or nothing
-        self.store.write_batch(ops).map_err(|e| StorageError::WriteFailed(format!("rollback_block atomic write: {}", e)))?;
+        self.store.write_batch(ops).map_err(|e| {
+            StorageError::WriteFailed(format!("rollback_block atomic write: {}", e))
+        })?;
 
         // 4) ONLY after DB success: apply staged cache mutations.
         // If crash happens here, crash recovery will rebuild cache from DB.
@@ -1131,7 +1270,7 @@ impl UtxoSet {
     /// Algorithm: sort all UTXOs by key, hash each (key|owner|amount|address|spent),
     /// then hash all individual hashes together → single 64-char hex string.
     pub fn compute_commitment_hash(&self) -> String {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         let mut all_utxos = self.export_all();
         all_utxos.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1164,8 +1303,8 @@ impl UtxoSet {
     /// Create an empty UtxoSet backed by a temporary DB.
     #[cfg(test)]
     pub fn try_new_empty() -> Result<Self, StorageError> {
-        use std::collections::HashMap as HM;
         use crate::infrastructure::storage::rocksdb::utxo::utxo_store::UtxoStore;
+        use std::collections::HashMap as HM;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1188,7 +1327,9 @@ impl UtxoSet {
     #[cfg(test)]
     pub fn add_test_utxo(&mut self, key: &str, amount: u64, owner: &str) {
         // Parse "txhash:index" format for backward compatibility with tests
-        let (hash, idx) = key.rsplit_once(':').expect("add_test_utxo key must be 'hash:index'");
+        let (hash, idx) = key
+            .rsplit_once(':')
+            .expect("add_test_utxo key must be 'hash:index'");
         let index: u32 = idx.parse().expect("add_test_utxo index must be u32");
         let normalized = Self::normalize_test_hash(hash);
         let k = utxo_key(&normalized, index).expect("test hash should be valid");
@@ -1203,8 +1344,21 @@ impl UtxoSet {
 
     /// add_utxo_coinbase by string key — convenience for tests.
     #[cfg(test)]
-    pub fn add_utxo_coinbase_str(&self, key: &str, owner: String, amount: u64, address: String, created_height: u64) {
-        self.add_utxo_coinbase(&Self::parse_utxo_key(key), owner, amount, address, created_height);
+    pub fn add_utxo_coinbase_str(
+        &self,
+        key: &str,
+        owner: String,
+        amount: u64,
+        address: String,
+        created_height: u64,
+    ) {
+        self.add_utxo_coinbase(
+            &Self::parse_utxo_key(key),
+            owner,
+            amount,
+            address,
+            created_height,
+        );
     }
 
     /// Parse a "hash:index" string into a UtxoKey.
@@ -1215,7 +1369,9 @@ impl UtxoSet {
     /// like "tx1:0" still works deterministically.
     #[cfg(test)]
     pub fn parse_utxo_key(key_str: &str) -> UtxoKey {
-        let (hash, idx) = key_str.rsplit_once(':').expect("utxo key must be 'hash:index'");
+        let (hash, idx) = key_str
+            .rsplit_once(':')
+            .expect("utxo key must be 'hash:index'");
         let index: u32 = idx.parse().expect("utxo key index must be u32");
         let normalized = Self::normalize_test_hash(hash);
         utxo_key(&normalized, index).expect("test hash should be valid")
@@ -1229,13 +1385,17 @@ impl UtxoSet {
     #[cfg(test)]
     fn normalize_test_hash(hash: &str) -> String {
         let h = hash.trim();
-        let h = if h.starts_with("0x") || h.starts_with("0X") { &h[2..] } else { h };
+        let h = if h.starts_with("0x") || h.starts_with("0X") {
+            &h[2..]
+        } else {
+            h
+        };
         // If already valid 64-char hex, pass through unchanged
-        if h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F')) {
+        if h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()) {
             return h.to_string();
         }
         // Otherwise, SHA-256 the raw name to get a deterministic 64-char hex hash
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(hash.as_bytes()))
     }
 
@@ -1253,7 +1413,11 @@ impl UtxoSet {
 
     /// spend_utxo_checked by string key — convenience for tests.
     #[cfg(test)]
-    pub fn spend_utxo_checked_str(&self, key: &str, current_height: u64) -> Result<(), StorageError> {
+    pub fn spend_utxo_checked_str(
+        &self,
+        key: &str,
+        current_height: u64,
+    ) -> Result<(), StorageError> {
         self.spend_utxo_checked(&Self::parse_utxo_key(key), current_height)
     }
 

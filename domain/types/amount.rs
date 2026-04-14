@@ -15,9 +15,9 @@ pub type Amount = u64;
 pub struct AmountHelper;
 
 impl AmountHelper {
-    pub const COIN:       u64 = 100_000_000;  // 1 SDAG
-    pub const HALF_COIN:  u64 = 50_000_000;   // 0.5 SDAG
-    pub const MIN_AMOUNT: u64 = 1;            // 1 satoshi
+    pub const COIN: u64 = 100_000_000; // 1 SDAG
+    pub const HALF_COIN: u64 = 50_000_000; // 0.5 SDAG
+    pub const MIN_AMOUNT: u64 = 1; // 1 satoshi
     pub const MAX_AMOUNT: u64 = 21_000_000_000 * 100_000_000; // 21 billion SDAG
 
     /// Convert SDAG string to satoshis (integer-only, no floating point)
@@ -26,13 +26,16 @@ impl AmountHelper {
         let parts: Vec<&str> = s.split('.').collect();
         match parts.len() {
             1 => {
-                let whole: u64 = parts[0].parse()
+                let whole: u64 = parts[0]
+                    .parse()
                     .map_err(|e| CryptoError::Other(format!("Invalid amount: {}", e)))?;
-                whole.checked_mul(Self::COIN)
+                whole
+                    .checked_mul(Self::COIN)
                     .ok_or_else(|| CryptoError::Other("Amount overflow".to_string()))
             }
             2 => {
-                let whole: u64 = parts[0].parse()
+                let whole: u64 = parts[0]
+                    .parse()
                     .map_err(|e| CryptoError::Other(format!("Invalid whole part: {}", e)))?;
                 let frac_str = parts[1];
                 if frac_str.len() > 8 {
@@ -40,15 +43,20 @@ impl AmountHelper {
                 }
                 // Pad to 8 digits
                 let padded = format!("{:0<8}", frac_str);
-                let frac: u64 = padded.parse()
+                let frac: u64 = padded
+                    .parse()
                     .map_err(|e| CryptoError::Other(format!("Invalid fraction: {}", e)))?;
 
-                let whole_sats = whole.checked_mul(Self::COIN)
+                let whole_sats = whole
+                    .checked_mul(Self::COIN)
                     .ok_or_else(|| CryptoError::Other("Amount overflow".to_string()))?;
-                whole_sats.checked_add(frac)
+                whole_sats
+                    .checked_add(frac)
                     .ok_or_else(|| CryptoError::Other("Amount overflow".to_string()))
             }
-            _ => Err(CryptoError::Other("Invalid format: too many decimal points".to_string())),
+            _ => Err(CryptoError::Other(
+                "Invalid format: too many decimal points".to_string(),
+            )),
         }
     }
 
@@ -61,17 +69,20 @@ impl AmountHelper {
 
     /// Safe addition with overflow check
     pub fn checked_add(a: u64, b: u64) -> Result<u64, CryptoError> {
-        a.checked_add(b).ok_or_else(|| CryptoError::Other("Amount addition overflow".to_string()))
+        a.checked_add(b)
+            .ok_or_else(|| CryptoError::Other("Amount addition overflow".to_string()))
     }
 
     /// Safe subtraction with underflow check
     pub fn checked_sub(a: u64, b: u64) -> Result<u64, CryptoError> {
-        a.checked_sub(b).ok_or_else(|| CryptoError::Other("Amount subtraction underflow".to_string()))
+        a.checked_sub(b)
+            .ok_or_else(|| CryptoError::Other("Amount subtraction underflow".to_string()))
     }
 
     /// Safe multiplication with overflow check
     pub fn checked_mul(a: u64, b: u64) -> Result<u64, CryptoError> {
-        a.checked_mul(b).ok_or_else(|| CryptoError::Other("Amount multiplication overflow".to_string()))
+        a.checked_mul(b)
+            .ok_or_else(|| CryptoError::Other("Amount multiplication overflow".to_string()))
     }
 }
 
@@ -81,7 +92,10 @@ mod tests {
 
     #[test]
     fn parse_whole_number() {
-        assert_eq!(AmountHelper::parse_sdag("10").unwrap(), 10 * AmountHelper::COIN);
+        assert_eq!(
+            AmountHelper::parse_sdag("10").unwrap(),
+            10 * AmountHelper::COIN
+        );
     }
 
     #[test]

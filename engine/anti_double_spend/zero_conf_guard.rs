@@ -15,12 +15,12 @@ pub const SAFE_CONFIRMATIONS: u64 = 6;
 /// A potential double-spend conflict
 #[derive(Debug, Clone)]
 pub struct ConflictAlert {
-    pub tx_hash_1:   String,
-    pub tx_hash_2:   String,
+    pub tx_hash_1: String,
+    pub tx_hash_2: String,
     pub shared_input: String,
     pub confirmations_1: u64,
     pub confirmations_2: u64,
-    pub alert_type:  ConflictType,
+    pub alert_type: ConflictType,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,9 +42,9 @@ pub struct ZeroConfGuard {
     /// Input → TX hash mapping for mempool TXs
     mempool_inputs: HashMap<String, String>,
     /// Input → TX hash mapping for recent blocks (last N blocks)
-    block_inputs:   HashMap<String, (String, u64)>, // (tx_hash, block_height)
+    block_inputs: HashMap<String, (String, u64)>, // (tx_hash, block_height)
     /// Detected conflicts
-    alerts:         Vec<ConflictAlert>,
+    alerts: Vec<ConflictAlert>,
     /// Current chain height
     current_height: u64,
 }
@@ -59,8 +59,8 @@ impl ZeroConfGuard {
     pub fn new() -> Self {
         Self {
             mempool_inputs: HashMap::new(),
-            block_inputs:   HashMap::new(),
-            alerts:         Vec::new(),
+            block_inputs: HashMap::new(),
+            alerts: Vec::new(),
             current_height: 0,
         }
     }
@@ -69,8 +69,15 @@ impl ZeroConfGuard {
     pub fn on_mempool_tx(&mut self, tx_hash: &str, input_keys: &[String]) -> Option<ConflictAlert> {
         // Prevent unbounded growth — evict oldest entries if at capacity
         if self.mempool_inputs.len() >= MAX_MEMPOOL_INPUTS {
-            let keys: Vec<String> = self.mempool_inputs.keys().take(MAX_MEMPOOL_INPUTS / 10).cloned().collect();
-            for k in keys { self.mempool_inputs.remove(&k); }
+            let keys: Vec<String> = self
+                .mempool_inputs
+                .keys()
+                .take(MAX_MEMPOOL_INPUTS / 10)
+                .cloned()
+                .collect();
+            for k in keys {
+                self.mempool_inputs.remove(&k);
+            }
         }
         if self.alerts.len() >= MAX_ALERTS {
             self.alerts.drain(..MAX_ALERTS / 2);
@@ -127,20 +134,25 @@ impl ZeroConfGuard {
         self.current_height = self.current_height.max(block_height);
         for key in input_keys {
             self.mempool_inputs.remove(key);
-            self.block_inputs.insert(key.clone(), (tx_hash.to_string(), block_height));
+            self.block_inputs
+                .insert(key.clone(), (tx_hash.to_string(), block_height));
         }
     }
 
     /// Prune old block inputs (only keep last SAFE_CONFIRMATIONS blocks)
     pub fn prune(&mut self) {
-        if self.current_height <= SAFE_CONFIRMATIONS { return; }
+        if self.current_height <= SAFE_CONFIRMATIONS {
+            return;
+        }
         let cutoff = self.current_height - SAFE_CONFIRMATIONS;
         self.block_inputs.retain(|_, (_, h)| *h > cutoff);
     }
 
     /// Check if a TX has any active double-spend alerts.
     pub fn has_alert(&self, tx_hash: &str) -> bool {
-        self.alerts.iter().any(|a| a.tx_hash_1 == tx_hash || a.tx_hash_2 == tx_hash)
+        self.alerts
+            .iter()
+            .any(|a| a.tx_hash_1 == tx_hash || a.tx_hash_2 == tx_hash)
     }
 
     /// Is a TX safe (enough confirmations and no active alerts)?
@@ -153,9 +165,15 @@ impl ZeroConfGuard {
     }
 
     /// Get recent alerts
-    pub fn recent_alerts(&self) -> &[ConflictAlert] { &self.alerts }
-    pub fn alert_count(&self) -> usize { self.alerts.len() }
-    pub fn clear_alerts(&mut self) { self.alerts.clear(); }
+    pub fn recent_alerts(&self) -> &[ConflictAlert] {
+        &self.alerts
+    }
+    pub fn alert_count(&self) -> usize {
+        self.alerts.len()
+    }
+    pub fn clear_alerts(&mut self) {
+        self.alerts.clear();
+    }
 }
 
 #[cfg(test)]

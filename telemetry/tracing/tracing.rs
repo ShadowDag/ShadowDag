@@ -17,7 +17,7 @@
 //     these three states explicitly (`Ok(None)` vs `Err(_)`).
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options};
+use rocksdb::{Options, DB};
 use std::path::Path;
 
 use crate::errors::StorageError;
@@ -32,11 +32,10 @@ impl Tracing {
         let mut opts = Options::default();
         opts.create_if_missing(true);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed {
-                path: path.to_string(),
-                reason: e.to_string(),
-            })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         Ok(Self { db })
     }
@@ -149,7 +148,7 @@ mod tests {
     fn corrupt_utf8_is_err_in_strict_mode() {
         let t = Tracing::new(&tmp_path()).expect("open tracing");
         // Bypass the typed API to plant invalid UTF-8 bytes.
-        t.db.put("evt:bad", &[0xff, 0xfe, 0xfd]).expect("raw put");
+        t.db.put("evt:bad", [0xff, 0xfe, 0xfd]).expect("raw put");
 
         // Non-strict returns None (but logs the corruption)
         assert!(t.get_trace("evt:bad").is_none());

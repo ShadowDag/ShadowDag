@@ -21,13 +21,18 @@
 //! use shadowdag::sdk::shadowdag_sdk::ShadowDagSdk;
 //!
 //! let sdk = ShadowDagSdk::new("http://localhost:9332");
-//! let addr = sdk.deploy_contract(&bytecode, "deployer", 0, 10_000_000)?;
-//! let result = sdk.call_contract(&addr, &calldata, "caller", 0, 1_000_000)?;
-//! let receipt = sdk.wait_for_receipt(&result.tx_hash, 30)?;
+//! let bytecode = vec![0x60, 0x00];
+//! let calldata = vec![];
+//!
+//! let deploy = sdk.deploy_contract(&bytecode, "deployer", 0, 10_000_000)?;
+//! let call = sdk.call_contract(&deploy.address, &calldata, "caller", 0, 1_000_000)?;
+//! if let Some(tx_hash) = call.tx_hash.as_deref() {
+//!     let _receipt = sdk.wait_for_receipt(tx_hash, 30)?;
+//! }
 //! # Ok::<_, shadowdag::sdk::shadowdag_sdk::SdkError>(())
 //! ```
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use std::io::{Read, Write};
@@ -136,12 +141,7 @@ impl ShadowDagSdk {
         value: u64,
         gas_limit: u64,
     ) -> Result<DeployResult, SdkError> {
-        let params = json!([
-            hex::encode(bytecode),
-            deployer,
-            value,
-            gas_limit
-        ]);
+        let params = json!([hex::encode(bytecode), deployer, value, gas_limit]);
         let resp = self.rpc_call("deploy_contract", params)?;
         serde_json::from_value(resp).map_err(|e| SdkError::Other(e.to_string()))
     }
@@ -174,12 +174,7 @@ impl ShadowDagSdk {
         caller: &str,
         value: u64,
     ) -> Result<u64, SdkError> {
-        let params = json!([
-            contract_addr,
-            hex::encode(calldata),
-            caller,
-            value
-        ]);
+        let params = json!([contract_addr, hex::encode(calldata), caller, value]);
         let resp = self.rpc_call("estimate_gas", params)?;
         resp.get("gas_used")
             .and_then(|v| v.as_u64())
@@ -214,9 +209,7 @@ impl ShadowDagSdk {
     pub fn get_code(&self, address: &str) -> Result<Vec<u8>, SdkError> {
         let params = json!([address]);
         let resp = self.rpc_call("get_contract_code", params)?;
-        let hex_code = resp.get("code")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let hex_code = resp.get("code").and_then(|v| v.as_str()).unwrap_or("");
         hex::decode(hex_code).map_err(|e| SdkError::Other(e.to_string()))
     }
 
@@ -224,7 +217,8 @@ impl ShadowDagSdk {
     pub fn get_storage_at(&self, address: &str, slot: &str) -> Result<String, SdkError> {
         let params = json!([address, slot]);
         let resp = self.rpc_call("get_storage_at", params)?;
-        Ok(resp.get("value")
+        Ok(resp
+            .get("value")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string())
@@ -239,10 +233,18 @@ impl ShadowDagSdk {
         to_block: Option<u64>,
     ) -> Result<Vec<LogEntry>, SdkError> {
         let mut filter = json!({});
-        if let Some(a) = address { filter["address"] = json!(a); }
-        if let Some(t) = topic0 { filter["topic0"] = json!(t); }
-        if let Some(f) = from_block { filter["from_block"] = json!(f); }
-        if let Some(t) = to_block { filter["to_block"] = json!(t); }
+        if let Some(a) = address {
+            filter["address"] = json!(a);
+        }
+        if let Some(t) = topic0 {
+            filter["topic0"] = json!(t);
+        }
+        if let Some(f) = from_block {
+            filter["from_block"] = json!(f);
+        }
+        if let Some(t) = to_block {
+            filter["to_block"] = json!(t);
+        }
         let params = json!([filter]);
         let resp = self.rpc_call("get_logs", params)?;
         serde_json::from_value(resp).map_err(|e| SdkError::Other(e.to_string()))
@@ -252,7 +254,10 @@ impl ShadowDagSdk {
     pub fn verify_contract(&self, address: &str, package_json: &str) -> Result<bool, SdkError> {
         let params = json!([address, package_json]);
         let resp = self.rpc_call("verify_contract", params)?;
-        Ok(resp.get("verified").and_then(|v| v.as_bool()).unwrap_or(false))
+        Ok(resp
+            .get("verified")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
     }
 
     /// Get contract info.
@@ -296,12 +301,11 @@ impl ShadowDagSdk {
             .ok_or_else(|| SdkError::Other(format!("no address for {}", addr_str)))?;
 
         let timeout = Duration::from_secs(self.timeout_secs);
-        let mut stream = TcpStream::connect_timeout(&socket_addr, timeout).map_err(|e| {
-            match e.kind() {
+        let mut stream =
+            TcpStream::connect_timeout(&socket_addr, timeout).map_err(|e| match e.kind() {
                 std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => SdkError::Timeout,
                 _ => SdkError::Other(format!("connect {} failed: {}", addr_str, e)),
-            }
-        })?;
+            })?;
         stream
             .set_read_timeout(Some(timeout))
             .map_err(|e| SdkError::Other(format!("set_read_timeout: {}", e)))?;
@@ -353,7 +357,9 @@ impl ShadowDagSdk {
         let header_end = raw_response
             .windows(4)
             .position(|w| w == b"\r\n\r\n")
-            .ok_or_else(|| SdkError::Other("malformed HTTP response: no header terminator".into()))?;
+            .ok_or_else(|| {
+                SdkError::Other("malformed HTTP response: no header terminator".into())
+            })?;
         let headers_bytes = &raw_response[..header_end];
         let body_bytes = &raw_response[header_end + 4..];
 

@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use rand::RngCore;
 
 use crate::domain::transaction::transaction::Transaction;
-use crate::engine::privacy::shadow_pool::shadow_transaction::{ShadowTransaction, MixDelay};
+use crate::engine::privacy::shadow_pool::shadow_transaction::{MixDelay, ShadowTransaction};
 use crate::slog_info;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -68,7 +68,7 @@ fn normalize_timestamp(ts: u64) -> u64 {
 /// Each layer's entropy depends only on the master secret and layer index,
 /// not on any other layer's output — preventing chained entropy correlation.
 fn generate_layer_entropy(master_secret: &[u8], layer_index: usize) -> [u8; 32] {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(b"ShadowDAG_OnionLayer_v1");
     h.update(master_secret);
@@ -174,7 +174,9 @@ impl OnionWrappedTx {
 
     /// Check if enough time has passed since last hop (timing obfuscation)
     pub fn timing_ready(&self, current_time: u64) -> bool {
-        if self.last_hop_time == 0 { return true; } // First hop
+        if self.last_hop_time == 0 {
+            return true;
+        } // First hop
         let elapsed = current_time.saturating_sub(self.last_hop_time);
         elapsed >= self.jitter_ms
     }
@@ -403,7 +405,8 @@ impl ShadowPool {
     /// Drain all ready transactions for emission to the network.
     /// Decoys are filtered out — only real transactions are returned.
     pub fn drain_ready(&mut self) -> Vec<Transaction> {
-        self.ready.drain(..)
+        self.ready
+            .drain(..)
             .filter(|stx| !stx.is_decoy)
             .map(|stx| stx.tx)
             .collect()
@@ -423,7 +426,12 @@ impl ShadowPool {
     // ── Stats ────────────────────────────────────────────────────
 
     pub fn size(&self) -> usize {
-        self.pending.len() + self.relaying.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.pending.len()
+            + self
+                .relaying
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
     }
 
     pub fn ready_count(&self) -> usize {
@@ -443,7 +451,10 @@ impl ShadowPool {
     }
 
     pub fn relay_count(&self) -> usize {
-        self.relaying.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.relaying
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     // ── Persistence ──────────────────────────────────────────────
@@ -493,7 +504,9 @@ impl ShadowPool {
 
 /// Cryptographically random shuffle using Fisher-Yates with OS entropy
 fn shuffle_with_entropy<T>(items: &mut [T]) {
-    if items.len() <= 1 { return; }
+    if items.len() <= 1 {
+        return;
+    }
 
     for i in (1..items.len()).rev() {
         let bound = (i + 1) as u64;
@@ -519,7 +532,13 @@ mod tests {
         Transaction {
             hash: hash.to_string(),
             inputs: vec![],
-            outputs: vec![TxOutput { address: "addr".into(), amount: 100, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            outputs: vec![TxOutput {
+                address: "addr".into(),
+                amount: 100,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee: 1,
             timestamp: 1735689600,
             is_coinbase: false,
@@ -648,17 +667,20 @@ mod tests {
             pool.process(t);
         }
         // Decoys should have been injected
-        assert!(pool.total_decoys() > 0,
-            "Expected decoys to be injected for partial batch");
+        assert!(
+            pool.total_decoys() > 0,
+            "Expected decoys to be injected for partial batch"
+        );
 
         // drain_ready_shadow includes decoys
         let all = pool.drain_ready_shadow();
         let decoy_count = all.iter().filter(|stx| stx.is_decoy).count();
-        let real_count  = all.iter().filter(|stx| !stx.is_decoy).count();
+        let real_count = all.iter().filter(|stx| !stx.is_decoy).count();
         assert!(decoy_count > 0, "Decoys should exist in shadow drain");
         assert!(real_count > 0, "Real TXs should exist in shadow drain");
         assert_eq!(
-            (real_count + decoy_count) % FIXED_BATCH_SIZE, 0,
+            (real_count + decoy_count) % FIXED_BATCH_SIZE,
+            0,
             "Total batch size should be a multiple of FIXED_BATCH_SIZE"
         );
     }
@@ -678,8 +700,10 @@ mod tests {
         let txs = pool.drain_ready();
         // drain_ready filters decoys — all returned TXs should be real
         for tx in &txs {
-            assert!(!tx.hash.starts_with("DECOY"),
-                "drain_ready should not return decoy transactions");
+            assert!(
+                !tx.hash.starts_with("DECOY"),
+                "drain_ready should not return decoy transactions"
+            );
         }
     }
 

@@ -4,9 +4,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, Options,
-    WriteBatch, WriteOptions, ReadOptions,
-    DBCompressionType, IteratorMode, Direction,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, Direction, IteratorMode,
+    Options, ReadOptions, WriteBatch, WriteOptions, DB,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -34,9 +33,7 @@ pub struct StorageEngine {
 }
 
 impl StorageEngine {
-
     pub fn open(path: &str) -> Result<Self, DagError> {
-
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
@@ -55,8 +52,12 @@ impl StorageEngine {
         ];
 
         let db = Arc::new(
-            DB::open_cf_descriptors(&opts, Path::new(path), cfs)
-                .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?
+            DB::open_cf_descriptors(&opts, Path::new(path), cfs).map_err(|e| {
+                StorageError::OpenFailed {
+                    path: path.to_string(),
+                    reason: e.to_string(),
+                }
+            })?,
         );
 
         let mut write_opts = WriteOptions::default();
@@ -90,55 +91,55 @@ pub struct BlockLocator<'a> {
 }
 
 impl<'a> BlockLocator<'a> {
-
     pub fn new(engine: &'a StorageEngine) -> Self {
         Self { engine }
     }
 
     #[inline(always)]
     pub fn add(&self, hash: &str) {
-
         let key = StorageEngine::make_key(hash);
         let cf = match self.engine.db.cf_handle(CF_LOCATORS) {
             Some(cf) => cf,
-            None => { slog_error!("dag", "locator_cf_missing"); return; }
+            None => {
+                slog_error!("dag", "locator_cf_missing");
+                return;
+            }
         };
 
-        if let Err(e) = self.engine.db.put_cf_opt(
-            cf,
-            &key,
-            b"1",
-            &self.engine.write_opts,
-        ) {
+        if let Err(e) = self
+            .engine
+            .db
+            .put_cf_opt(cf, &key, b"1", &self.engine.write_opts)
+        {
             slog_error!("dag", "locator_put_failed", error => e);
         }
     }
 
     #[inline(always)]
     pub fn exists(&self, hash: &str) -> bool {
-
         let key = StorageEngine::make_key(hash);
         let cf = match self.engine.db.cf_handle(CF_LOCATORS) {
             Some(cf) => cf,
-            None => { slog_error!("dag", "locator_cf_missing_exists"); return false; }
+            None => {
+                slog_error!("dag", "locator_cf_missing_exists");
+                return false;
+            }
         };
 
         matches!(
-            self.engine.db.get_cf_opt(
-                cf,
-                &key,
-                &self.engine.read_opts
-            ),
+            self.engine.db.get_cf_opt(cf, &key, &self.engine.read_opts),
             Ok(Some(_))
         )
     }
 
     pub fn list(&self, limit: usize) -> Vec<String> {
-
         let mut result = Vec::with_capacity(limit.min(1024));
         let cf = match self.engine.db.cf_handle(CF_LOCATORS) {
             Some(cf) => cf,
-            None => { slog_error!("dag", "locator_cf_missing_list"); return result; }
+            None => {
+                slog_error!("dag", "locator_cf_missing_list");
+                return result;
+            }
         };
 
         let mut iter_opts = ReadOptions::default();
@@ -151,7 +152,6 @@ impl<'a> BlockLocator<'a> {
         );
 
         for item in iter {
-
             let (key, _) = match item {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -181,16 +181,20 @@ impl<'a> BlockLocator<'a> {
 //////////////////////////////////////////////////////////////
 
 impl StorageEngine {
-
     pub fn batch_write_example(&self) {
-
         let cf_locators = match self.db.cf_handle(CF_LOCATORS) {
             Some(cf) => cf,
-            None => { slog_error!("dag", "storage_engine_cf_locators_missing"); return; }
+            None => {
+                slog_error!("dag", "storage_engine_cf_locators_missing");
+                return;
+            }
         };
         let cf_blocks = match self.db.cf_handle(CF_BLOCKS) {
             Some(cf) => cf,
-            None => { slog_error!("dag", "storage_engine_cf_blocks_missing"); return; }
+            None => {
+                slog_error!("dag", "storage_engine_cf_blocks_missing");
+                return;
+            }
         };
 
         let mut batch = WriteBatch::default();

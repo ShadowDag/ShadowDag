@@ -10,9 +10,9 @@
 // Flow: User -> Shadow Pool -> Mix -> DAG Network
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 
 use crate::domain::transaction::transaction::Transaction;
 
@@ -33,9 +33,9 @@ impl MixDelay {
     pub fn max_delay_ms(&self) -> u64 {
         match self {
             MixDelay::Instant => 0,
-            MixDelay::Short   => 5_000,
-            MixDelay::Medium  => 30_000,
-            MixDelay::Long    => 120_000,
+            MixDelay::Short => 5_000,
+            MixDelay::Medium => 30_000,
+            MixDelay::Long => 120_000,
         }
     }
 }
@@ -44,24 +44,24 @@ impl MixDelay {
 #[derive(Debug, Clone)]
 pub struct ShadowTransaction {
     /// The original transaction
-    pub tx:             Transaction,
+    pub tx: Transaction,
     /// When the transaction entered the shadow pool
-    pub timestamp:      u64,
+    pub timestamp: u64,
     /// Whether the transaction has been mixed
-    pub mixed:          bool,
+    pub mixed: bool,
     /// Unique shadow ID (prevents correlation)
-    pub shadow_id:      String,
+    pub shadow_id: String,
     /// Delay tier for this transaction
-    pub delay:          MixDelay,
+    pub delay: MixDelay,
     /// Number of hops through relay nodes
-    pub hop_count:      u8,
+    pub hop_count: u8,
     /// Maximum hops before exiting shadow pool
-    pub max_hops:       u8,
+    pub max_hops: u8,
     /// Whether this transaction is ready to exit the shadow pool
-    pub ready_to_emit:  bool,
+    pub ready_to_emit: bool,
     /// True if this is a decoy (dummy TX for batch padding).
     /// Decoys are filtered out at the network emission layer.
-    pub is_decoy:       bool,
+    pub is_decoy: bool,
 }
 
 impl ShadowTransaction {
@@ -143,7 +143,8 @@ impl ShadowTransaction {
         self.mixed = true;
         self.hop_count += 1;
         // Regenerate shadow ID after each mix to break correlation
-        self.shadow_id = Self::generate_shadow_id(&self.shadow_id, self.timestamp + self.hop_count as u64);
+        self.shadow_id =
+            Self::generate_shadow_id(&self.shadow_id, self.timestamp + self.hop_count as u64);
 
         if self.hop_count >= self.max_hops {
             self.ready_to_emit = true;
@@ -183,7 +184,13 @@ mod tests {
         Transaction {
             hash: "abc123".to_string(),
             inputs: vec![],
-            outputs: vec![TxOutput { address: "addr".into(), amount: 100, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            outputs: vec![TxOutput {
+                address: "addr".into(),
+                amount: 100,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee: 1,
             timestamp: 1735689600,
             is_coinbase: false,
@@ -211,8 +218,7 @@ mod tests {
 
     #[test]
     fn ready_after_max_hops() {
-        let mut stx = ShadowTransaction::new(make_tx(), 1000)
-            .with_max_hops(2);
+        let mut stx = ShadowTransaction::new(make_tx(), 1000).with_max_hops(2);
         stx.mark_mixed();
         assert!(!stx.ready_to_emit);
         stx.mark_mixed();
@@ -229,9 +235,8 @@ mod tests {
 
     #[test]
     fn should_emit_after_delay() {
-        let stx = ShadowTransaction::new(make_tx(), 1000)
-            .with_delay(MixDelay::Short);
+        let stx = ShadowTransaction::new(make_tx(), 1000).with_delay(MixDelay::Short);
         assert!(!stx.should_emit(2000)); // only 1s passed
-        assert!(stx.should_emit(7000));  // 6s passed > 5s max
+        assert!(stx.should_emit(7000)); // 6s passed > 5s max
     }
 }

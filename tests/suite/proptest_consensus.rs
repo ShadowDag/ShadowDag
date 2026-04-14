@@ -9,9 +9,9 @@
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
-    use crate::engine::dag::core::bps_engine::BpsParams;
     use crate::config::consensus::emission_schedule::EmissionSchedule;
+    use crate::engine::dag::core::bps_engine::BpsParams;
+    use proptest::prelude::*;
 
     proptest! {
         #[test]
@@ -89,9 +89,9 @@ mod tests {
             nonce in 0u64..1000,
             difficulty in 1u64..100,
         ) {
-            use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw;
-            let h1 = shadow_hash_raw(version, height, timestamp, nonce, difficulty, "merkle", &[]);
-            let h2 = shadow_hash_raw(version, height, timestamp, nonce, difficulty, "merkle", &[]);
+            use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
+            let h1 = shadow_hash_raw_full(version, height, timestamp, nonce, 0, difficulty, "merkle", &[]);
+            let h2 = shadow_hash_raw_full(version, height, timestamp, nonce, 0, difficulty, "merkle", &[]);
             prop_assert_eq!(h1.len(), 64);
             prop_assert_eq!(h1, h2);
         }

@@ -3,19 +3,19 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
 use crate::domain::block::block::Block;
 use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
-use crate::engine::mining::algorithms::shadowhash::shadow_hash;
-use crate::engine::mining::pow::pow_validator::PowValidator;
 use crate::engine::dag::core::dag_manager::DagManager;
 use crate::engine::dag::security::dos_protection::MAX_DAG_PARENTS;
+use crate::engine::mining::algorithms::shadowhash::shadow_hash;
+use crate::engine::mining::pow::pow_validator::PowValidator;
 use crate::errors::ConsensusError;
-use crate::{slog_info, slog_debug, slog_warn, slog_error};
+use crate::{slog_debug, slog_error, slog_info, slog_warn};
+use sha2::{Digest, Sha256};
 
 pub struct Miner {
-    pub difficulty:           u64,
-    pub block_reward:         u64,
+    pub difficulty: u64,
+    pub block_reward: u64,
     pub owner_reward_address: String,
 }
 
@@ -46,7 +46,8 @@ impl Miner {
         height: u64,
         total_fees: u64,
     ) -> Transaction {
-        let emission = crate::config::consensus::emission_schedule::EmissionSchedule::block_reward(height);
+        let emission =
+            crate::config::consensus::emission_schedule::EmissionSchedule::block_reward(height);
         let reward = match emission.checked_add(total_fees) {
             Some(r) => r,
             None => {
@@ -57,19 +58,40 @@ impl Miner {
                 u64::MAX
             }
         };
-        let miner_reward = (reward * crate::config::consensus::consensus_params::ConsensusParams::MINER_PERCENT) / 100;
+        let miner_reward = (reward
+            * crate::config::consensus::consensus_params::ConsensusParams::MINER_PERCENT)
+            / 100;
         let owner_reward = reward - miner_reward;
 
-        let hash = Self::coinbase_hash(&miner_address, timestamp, height, miner_reward, owner_reward, total_fees);
+        let hash = Self::coinbase_hash(
+            &miner_address,
+            timestamp,
+            height,
+            miner_reward,
+            owner_reward,
+            total_fees,
+        );
 
         Transaction {
             hash,
             inputs: vec![],
             outputs: vec![
-                TxOutput { address: miner_address,                    amount: miner_reward, commitment: None, range_proof: None, ephemeral_pubkey: None },
-                TxOutput { address: self.owner_reward_address.clone(), amount: owner_reward, commitment: None, range_proof: None, ephemeral_pubkey: None },
+                TxOutput {
+                    address: miner_address,
+                    amount: miner_reward,
+                    commitment: None,
+                    range_proof: None,
+                    ephemeral_pubkey: None,
+                },
+                TxOutput {
+                    address: self.owner_reward_address.clone(),
+                    amount: owner_reward,
+                    commitment: None,
+                    range_proof: None,
+                    ephemeral_pubkey: None,
+                },
             ],
-            fee:         0,
+            fee: 0,
             timestamp,
             is_coinbase: true,
             tx_type: TxType::Transfer,
@@ -99,22 +121,22 @@ impl Miner {
 
     /// Validate that all parent blocks exist in the DAG and enforce max parents limit.
     /// Returns Ok(()) if all parents are valid, Err with description otherwise.
-    pub fn validate_parents(
-        block: &Block,
-        dag_manager: &DagManager,
-    ) -> Result<(), ConsensusError> {
+    pub fn validate_parents(block: &Block, dag_manager: &DagManager) -> Result<(), ConsensusError> {
         let parents = &block.header.parents;
 
         // Non-genesis blocks must have parents
         if block.header.height > 0 && parents.is_empty() {
-            return Err(ConsensusError::Other("Block has no parents (non-genesis blocks require at least one parent)".to_string()));
+            return Err(ConsensusError::Other(
+                "Block has no parents (non-genesis blocks require at least one parent)".to_string(),
+            ));
         }
 
         // Enforce max parents limit
         if parents.len() > MAX_DAG_PARENTS {
             return Err(ConsensusError::Other(format!(
                 "Block has {} parents, exceeding max of {}",
-                parents.len(), MAX_DAG_PARENTS
+                parents.len(),
+                MAX_DAG_PARENTS
             )));
         }
 
@@ -122,7 +144,10 @@ impl Miner {
         let mut seen = std::collections::HashSet::with_capacity(parents.len());
         for parent in parents {
             if !seen.insert(parent.as_str()) {
-                return Err(ConsensusError::Other(format!("Duplicate parent: {}", parent)));
+                return Err(ConsensusError::Other(format!(
+                    "Duplicate parent: {}",
+                    parent
+                )));
             }
         }
 
@@ -139,7 +164,9 @@ impl Miner {
         // Self-referential check
         for parent in parents {
             if parent == &block.header.hash && !block.header.hash.is_empty() {
-                return Err(ConsensusError::Other("Block cannot be its own parent".to_string()));
+                return Err(ConsensusError::Other(
+                    "Block cannot be its own parent".to_string(),
+                ));
             }
         }
 

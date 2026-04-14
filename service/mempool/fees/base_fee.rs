@@ -30,14 +30,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// EIP-1559 style base fee calculator
 pub struct BaseFeeCalculator {
     pub current_base_fee: u64,
-    pub total_burned:     AtomicU64,
+    pub total_burned: AtomicU64,
 }
 
 impl BaseFeeCalculator {
     pub fn new(initial_base_fee: u64) -> Self {
         Self {
             current_base_fee: initial_base_fee.max(MIN_BASE_FEE),
-            total_burned:     AtomicU64::new(0),
+            total_burned: AtomicU64::new(0),
         }
     }
 
@@ -45,10 +45,14 @@ impl BaseFeeCalculator {
     /// gas_used: actual gas consumed in the block
     /// gas_limit: maximum gas allowed in the block
     pub fn next_base_fee(&mut self, gas_used: u64, gas_limit: u64) -> u64 {
-        if gas_limit == 0 { return self.current_base_fee; }
+        if gas_limit == 0 {
+            return self.current_base_fee;
+        }
 
         let target_gas = gas_limit * TARGET_UTILIZATION_PCT / 100;
-        if target_gas == 0 { return self.current_base_fee; }
+        if target_gas == 0 {
+            return self.current_base_fee;
+        }
 
         let new_fee = if gas_used > target_gas {
             // Block was MORE than 50% full → increase base fee
@@ -80,8 +84,12 @@ impl BaseFeeCalculator {
         self.total_burned.fetch_add(amount, Ordering::Relaxed);
     }
 
-    pub fn base_fee(&self) -> u64 { self.current_base_fee }
-    pub fn total_burned(&self) -> u64 { self.total_burned.load(Ordering::Relaxed) }
+    pub fn base_fee(&self) -> u64 {
+        self.current_base_fee
+    }
+    pub fn total_burned(&self) -> u64 {
+        self.total_burned.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -92,14 +100,20 @@ mod tests {
     fn base_fee_increases_when_busy() {
         let mut calc = BaseFeeCalculator::new(100);
         let new = calc.next_base_fee(8000, 10000); // 80% utilization > 50% target
-        assert!(new > 100, "Base fee should increase when block is >50% full");
+        assert!(
+            new > 100,
+            "Base fee should increase when block is >50% full"
+        );
     }
 
     #[test]
     fn base_fee_decreases_when_empty() {
         let mut calc = BaseFeeCalculator::new(100);
         let new = calc.next_base_fee(1000, 10000); // 10% utilization < 50% target
-        assert!(new < 100, "Base fee should decrease when block is <50% full");
+        assert!(
+            new < 100,
+            "Base fee should decrease when block is <50% full"
+        );
     }
 
     #[test]

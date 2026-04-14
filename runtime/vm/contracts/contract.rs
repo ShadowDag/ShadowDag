@@ -41,10 +41,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::errors::VmError;
+use crate::runtime::vm::contracts::contract_storage::ContractStorage;
 use crate::runtime::vm::core::executor::{Executor, DEFAULT_GAS_LIMIT};
 use crate::runtime::vm::core::vm::ExecutionResult;
 use crate::runtime::vm::core::vm_context::VMContext;
-use crate::runtime::vm::contracts::contract_storage::ContractStorage;
 
 pub struct Contract;
 
@@ -65,8 +65,8 @@ pub struct Contract;
 /// tests, explorer tools, fuzzer harnesses), whereas this helper
 /// pins the caller to a single global default.
 fn open_default_contract_storage() -> Result<ContractStorage, VmError> {
-    let contracts_path = crate::config::node::node_config::NetworkMode::base_data_dir()
-        .join("contracts");
+    let contracts_path =
+        crate::config::node::node_config::NetworkMode::base_data_dir().join("contracts");
     let path_str = contracts_path.to_string_lossy().to_string();
     ContractStorage::new(&path_str)
 }
@@ -114,7 +114,7 @@ impl Contract {
         timestamp: u64,
         block_hash: &str,
     ) -> Result<ExecutionResult, VmError> {
-        let ctx      = VMContext::new(storage);
+        let ctx = VMContext::new(storage);
         let executor = Executor::new(ctx);
         let result = executor.call(
             contract_addr,
@@ -175,7 +175,7 @@ impl Contract {
         key: &str,
         value: &str,
     ) -> Result<(), VmError> {
-        let ctx      = VMContext::new(storage);
+        let ctx = VMContext::new(storage);
         let executor = Executor::new(ctx);
         executor.execute(key, value)?;
         Ok(())
@@ -322,9 +322,11 @@ mod tests {
         // call succeeds against the INJECTED storage (no NetworkMode
         // lookup) without panicking.
         let result = Contract::store_value_with_storage(storage, "test_key", "test_value");
-        assert!(result.is_ok(),
+        assert!(
+            result.is_ok(),
             "store_value_with_storage must succeed on an injected tmp storage, got: {:?}",
-            result);
+            result
+        );
     }
 
     #[test]
@@ -351,22 +353,23 @@ mod tests {
             1_000_000,
             "00".repeat(32).as_str(),
         );
-        assert!(result.is_ok(),
+        assert!(
+            result.is_ok(),
             "call_with_storage must return an ExecutionResult rather than propagate \
-             a storage-init error, got: {:?}", result);
+             a storage-init error, got: {:?}",
+            result
+        );
     }
 
     #[test]
     fn call_at_now_with_storage_accepts_injected_handle() {
         let storage = tmp_storage("call_at_now");
-        let result = Contract::call_at_now_with_storage(
-            storage,
-            "SR1c_nonexistent",
-            b"",
-            "SR1caller",
-        );
-        assert!(result.is_ok(),
+        let result =
+            Contract::call_at_now_with_storage(storage, "SR1c_nonexistent", b"", "SR1caller");
+        assert!(
+            result.is_ok(),
             "call_at_now_with_storage must accept the injected handle, got: {:?}",
-            result);
+            result
+        );
     }
 }

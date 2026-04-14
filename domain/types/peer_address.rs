@@ -3,11 +3,11 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct PeerAddress {
-    pub address:  String,
+    pub address: String,
 
     pub services: u64,
 
@@ -17,7 +17,7 @@ pub struct PeerAddress {
 impl PeerAddress {
     pub fn new(address: impl Into<String>, services: u64) -> Self {
         Self {
-            address:  address.into(),
+            address: address.into(),
             services,
             last_seen: 0,
         }

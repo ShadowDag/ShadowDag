@@ -3,27 +3,27 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub mod zero_conf_guard;
 pub mod confirmed_tx_store;
+pub mod zero_conf_guard;
 
-use rocksdb::{DB, Options, WriteBatch, ReadOptions};
+use crate::errors::StorageError;
+use crate::slog_error;
+use rocksdb::{Options, ReadOptions, WriteBatch, DB};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use serde::{Serialize, Deserialize};
-use crate::errors::StorageError;
-use crate::slog_error;
 
-pub const LOCK_TTL_SECS:    u64 = 10_800;
+pub const LOCK_TTL_SECS: u64 = 10_800;
 pub const MAX_LOCKS_PER_TX: usize = 50;
 pub const EVICT_BATCH_SIZE: usize = 1_000;
 
-const PFX_LOCK:  &[u8] = b"l:";
+const PFX_LOCK: &[u8] = b"l:";
 const PFX_SPENT: &[u8] = b"s:";
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UtxoRef {
-    pub txid:  [u8; 32],
+    pub txid: [u8; 32],
     pub index: u32,
 }
 
@@ -46,7 +46,10 @@ impl UtxoRef {
     #[cfg(test)]
     pub fn new(txid: &str, index: u32) -> Self {
         Self::try_new(txid, index).unwrap_or_else(|| {
-            panic!("UtxoRef::new: invalid txid '{}' (must be 64 hex chars)", txid)
+            panic!(
+                "UtxoRef::new: invalid txid '{}' (must be 64 hex chars)",
+                txid
+            )
         })
     }
 
@@ -61,9 +64,9 @@ impl UtxoRef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockRecord {
-    pub locked_by:  Vec<u8>,
-    pub locked_at:  u64,
-    pub fee:        u64,
+    pub locked_by: Vec<u8>,
+    pub locked_at: u64,
+    pub fee: u64,
 }
 
 impl LockRecord {
@@ -79,14 +82,15 @@ pub struct DoubleSpendProtector {
 }
 
 impl DoubleSpendProtector {
-
     pub fn new(path: &str) -> Result<Self, StorageError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.increase_parallelism(4);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         let mut read_opts = ReadOptions::default();
         read_opts.fill_cache(false);
@@ -111,7 +115,8 @@ impl DoubleSpendProtector {
                 // In tests, fall back to temp dir so unit tests don't need real data dirs
                 #[cfg(test)]
                 {
-                    let fallback = std::env::temp_dir().join(format!("shadowdag_dsp_{}", std::process::id()));
+                    let fallback =
+                        std::env::temp_dir().join(format!("shadowdag_dsp_{}", std::process::id()));
                     Self::new(&fallback.to_string_lossy()).inspect_err(|e2| {
                         slog_error!("consensus", "dsp_fallback_failed", error => &e2.to_string());
                     })
@@ -134,7 +139,6 @@ impl DoubleSpendProtector {
         inputs: &[UtxoRef],
         fee: u64,
     ) -> Result<(), StorageError> {
-
         if inputs.len() > MAX_LOCKS_PER_TX {
             return Err(StorageError::Other("too many inputs".to_string()));
         }
@@ -146,7 +150,6 @@ impl DoubleSpendProtector {
 
         // 🔴 VALIDATION
         for utxo in inputs {
-
             let suffix = utxo.key();
 
             // LOCK CHECK
@@ -154,7 +157,6 @@ impl DoubleSpendProtector {
 
             if let Ok(Some(data)) = self.db.get_opt(&key, &self.read_opts) {
                 if let Ok(rec) = bincode::deserialize::<LockRecord>(&data) {
-
                     if rec.locked_by == txid_bytes {
                         continue;
                     }
@@ -181,7 +183,6 @@ impl DoubleSpendProtector {
         let mut val_buf = Vec::with_capacity(64);
 
         for utxo in inputs {
-
             let suffix = utxo.key();
 
             // 🔁 RE-CHECK LOCK (race protection)
@@ -203,13 +204,17 @@ impl DoubleSpendProtector {
 
             val_buf.clear();
             if bincode::serialize_into(&mut val_buf, &rec).is_err() {
-                return Err(StorageError::Serialization("serialization failed".to_string()));
+                return Err(StorageError::Serialization(
+                    "serialization failed".to_string(),
+                ));
             }
 
             batch.put(&key, &val_buf);
         }
 
-        self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))
+        self.db
+            .write(batch)
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
     // ─────────────────────────────────────────
@@ -222,21 +227,17 @@ impl DoubleSpendProtector {
             batch.delete(&key);
         }
 
-        self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))
+        self.db
+            .write(batch)
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
     // ─────────────────────────────────────────
-    pub fn confirm_spent(
-        &self,
-        inputs: &[UtxoRef],
-        block_hash: &str,
-    ) -> Result<(), StorageError> {
-
+    pub fn confirm_spent(&self, inputs: &[UtxoRef], block_hash: &str) -> Result<(), StorageError> {
         let mut batch = WriteBatch::default();
         let mut key = Vec::with_capacity(38);
 
         for utxo in inputs {
-
             let suffix = utxo.key();
 
             Self::build_key(&mut key, PFX_SPENT, &suffix);
@@ -246,7 +247,9 @@ impl DoubleSpendProtector {
             batch.delete(&key);
         }
 
-        self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))
+        self.db
+            .write(batch)
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
     // ─────────────────────────────────────────
@@ -259,12 +262,13 @@ impl DoubleSpendProtector {
             batch.delete(&key);
         }
 
-        self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))
+        self.db
+            .write(batch)
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
     // ─────────────────────────────────────────
     pub fn can_spend(&self, utxo: &UtxoRef) -> SpendStatus {
-
         let now = unix_now();
         let mut key = Vec::with_capacity(38);
 
@@ -289,7 +293,7 @@ impl DoubleSpendProtector {
                 if let Ok(rec) = bincode::deserialize::<LockRecord>(&data) {
                     if !rec.is_expired(now) {
                         return SpendStatus::LockedInMempool(
-                            String::from_utf8_lossy(&rec.locked_by).to_string()
+                            String::from_utf8_lossy(&rec.locked_by).to_string(),
                         );
                     }
                 }
@@ -311,8 +315,7 @@ impl DoubleSpendProtector {
         &self,
         txs: &[(String, Vec<UtxoRef>)],
     ) -> Option<(String, String)> {
-        let mut seen: std::collections::HashMap<[u8; 36], &str> =
-            std::collections::HashMap::new();
+        let mut seen: std::collections::HashMap<[u8; 36], &str> = std::collections::HashMap::new();
         for (tx_id, inputs) in txs {
             for inp in inputs {
                 let k = inp.key();
@@ -379,7 +382,9 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn tmp(l: &str) -> String { format!("/tmp/dsp_{}", l) }
+    fn tmp(l: &str) -> String {
+        format!("/tmp/dsp_{}", l)
+    }
     fn dsp(l: &str) -> DoubleSpendProtector {
         let p = tmp(l);
         let _ = fs::remove_dir_all(&p);
@@ -387,7 +392,7 @@ mod tests {
     }
     /// Generate a deterministic 64-char hex hash from a short label.
     fn test_hash(label: &str) -> String {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(label.as_bytes()))
     }
     fn utxo(label: &str, idx: u32) -> UtxoRef {
@@ -399,7 +404,10 @@ mod tests {
         let d = dsp("lock");
         let inputs = vec![utxo("tx1", 0), utxo("tx1", 1)];
         assert!(d.lock_inputs("spender1", &inputs, 100).is_ok());
-        assert!(matches!(d.can_spend(&utxo("tx1", 0)), SpendStatus::LockedInMempool(_)));
+        assert!(matches!(
+            d.can_spend(&utxo("tx1", 0)),
+            SpendStatus::LockedInMempool(_)
+        ));
         assert!(d.release_locks(&inputs).is_ok());
         assert_eq!(d.can_spend(&utxo("tx1", 0)), SpendStatus::Free);
     }
@@ -422,7 +430,9 @@ mod tests {
 
         assert!(d.lock_inputs("txB", &inputs, 500).is_ok());
 
-        assert!(matches!(d.can_spend(&utxo("tx3", 0)), SpendStatus::LockedInMempool(ref t) if t == "txB"));
+        assert!(
+            matches!(d.can_spend(&utxo("tx3", 0)), SpendStatus::LockedInMempool(ref t) if t == "txB")
+        );
     }
 
     #[test]

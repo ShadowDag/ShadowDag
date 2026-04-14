@@ -6,32 +6,32 @@
 
 #[cfg(test)]
 mod contract_e2e {
-    use crate::runtime::vm::core::execution_env::*;
-    use crate::runtime::vm::core::vm::ExecutionResult;
-    use crate::runtime::vm::core::executor::Executor;
-    use crate::runtime::vm::core::vm_context::VMContext;
-    use crate::runtime::vm::contracts::contract_storage::{ContractStorage, ContractUndoData};
     use crate::domain::transaction::tx_receipt::{
-        TxReceipt, compute_receipt_root, persist_receipt, load_receipt, persist_receipts_batch,
+        compute_receipt_root, load_receipt, persist_receipt, persist_receipts_batch, TxReceipt,
     };
+    use crate::runtime::vm::contracts::contract_storage::{ContractStorage, ContractUndoData};
+    use crate::runtime::vm::core::execution_env::*;
+    use crate::runtime::vm::core::executor::Executor;
+    use crate::runtime::vm::core::vm::ExecutionResult;
+    use crate::runtime::vm::core::vm_context::VMContext;
 
     // ── Opcode byte constants (from v1_spec.rs) ─────────────────────────
-    const STOP: u8          = 0x00;
-    const PUSH1: u8         = 0x10;
-    const PUSH2: u8         = 0x11;
-    const PUSH4: u8         = 0x12;
-    const ADD: u8           = 0x20;
-    const SLOAD: u8         = 0x50;
-    const SSTORE: u8        = 0x51;
-    const CALLVALUE: u8     = 0x71;
-    const JUMP: u8          = 0x80;
-    const JUMPDEST: u8      = 0x82;
-    const MSTORE: u8        = 0x91;
-    const LOG: u8           = 0xA0;
-    const CALL: u8          = 0xB0;
-    const RETURN: u8        = 0xB6;
-    const REVERT: u8        = 0xB7;
-    const CALLDATALOAD: u8  = 0xC0;
+    const STOP: u8 = 0x00;
+    const PUSH1: u8 = 0x10;
+    const PUSH2: u8 = 0x11;
+    const PUSH4: u8 = 0x12;
+    const ADD: u8 = 0x20;
+    const SLOAD: u8 = 0x50;
+    const SSTORE: u8 = 0x51;
+    const CALLVALUE: u8 = 0x71;
+    const JUMP: u8 = 0x80;
+    const JUMPDEST: u8 = 0x82;
+    const MSTORE: u8 = 0x91;
+    const LOG: u8 = 0xA0;
+    const CALL: u8 = 0xB0;
+    const RETURN: u8 = 0xB6;
+    const REVERT: u8 = 0xB7;
+    const CALLDATALOAD: u8 = 0xC0;
 
     // ── Helper: unique temp path for DB isolation between tests ──────────
     fn tmp_path(suffix: &str) -> String {
@@ -72,8 +72,7 @@ mod contract_e2e {
     // ── Helper: build a fresh Executor backed by a temp DB ──────────────
     fn make_executor() -> Executor {
         let path = tmp_path("executor");
-        let storage = ContractStorage::new(&path)
-            .expect("ContractStorage::new should succeed");
+        let storage = ContractStorage::new(&path).expect("ContractStorage::new should succeed");
         let ctx = VMContext::new(storage);
         Executor::new(ctx)
     }
@@ -160,10 +159,10 @@ mod contract_e2e {
         //   JUMPDEST                     (position 5)
         //   PUSH1 5, JUMP               (jump back to pos 5)
         let code = vec![
-            PUSH1, 77, PUSH1, 0, SSTORE, // store 77 at slot 0
-            JUMPDEST,                     // pos 5
-            PUSH1, 5,                     // push target
-            JUMP,                         // jump back to 5
+            PUSH1, 77, PUSH1, 0, SSTORE,   // store 77 at slot 0
+            JUMPDEST, // pos 5
+            PUSH1, 5,    // push target
+            JUMP, // jump back to 5
         ];
         env.state.set_code("contract", code).unwrap();
 
@@ -231,15 +230,14 @@ mod contract_e2e {
         //   CALL
         //   STOP
         let code_a = vec![
-            PUSH1, 0,     // retLen
-            PUSH1, 0,     // retOff
-            PUSH1, 0,     // argsLen
-            PUSH1, 0,     // argsOff
-            PUSH1, 100,   // value = 100
-            PUSH1, 0x0b,  // target addr = 11
+            PUSH1, 0, // retLen
+            PUSH1, 0, // retOff
+            PUSH1, 0, // argsLen
+            PUSH1, 0, // argsOff
+            PUSH1, 100, // value = 100
+            PUSH1, 0x0b, // target addr = 11
             PUSH4, 0x00, 0x00, 0xC3, 0x50, // gas = 50000
-            CALL,
-            STOP,
+            CALL, STOP,
         ];
         env.state.set_code("contract_a", code_a).unwrap();
 
@@ -344,10 +342,22 @@ mod contract_e2e {
 
         persist_receipts_batch(&db, &[r1, r2, r3]);
 
-        assert!(load_receipt(&db, "tx_1").is_some(), "Batch-persisted receipt 1 should load");
-        assert!(load_receipt(&db, "tx_2").is_some(), "Batch-persisted receipt 2 should load");
-        assert!(load_receipt(&db, "tx_3").is_some(), "Batch-persisted receipt 3 should load");
-        assert!(load_receipt(&db, "tx_4").is_none(), "Non-persisted receipt should be absent");
+        assert!(
+            load_receipt(&db, "tx_1").is_some(),
+            "Batch-persisted receipt 1 should load"
+        );
+        assert!(
+            load_receipt(&db, "tx_2").is_some(),
+            "Batch-persisted receipt 2 should load"
+        );
+        assert!(
+            load_receipt(&db, "tx_3").is_some(),
+            "Batch-persisted receipt 3 should load"
+        );
+        assert!(
+            load_receipt(&db, "tx_4").is_none(),
+            "Non-persisted receipt should be absent"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -394,13 +404,17 @@ mod contract_e2e {
 
         // Execute and persist with undo
         let mut env = make_env();
-        env.state.set_code("contract1", vec![PUSH1, 55, PUSH1, 0, SSTORE, STOP]).unwrap();
+        env.state
+            .set_code("contract1", vec![PUSH1, 55, PUSH1, 0, SSTORE, STOP])
+            .unwrap();
 
         let ctx = make_call("contract1", "user", vec![]);
         env.execute_frame(&ctx);
 
         // Persist with undo data for block_123
-        let undo = env.persist_with_undo(&storage, "block_123", None, None).unwrap();
+        let undo = env
+            .persist_with_undo(&storage, "block_123", None, None)
+            .unwrap();
         assert!(
             !undo.modified_keys.is_empty(),
             "Undo should capture modified keys",
@@ -547,10 +561,10 @@ mod contract_e2e {
         // PUSH2 0xBEEF -> memory[0..32] via MSTORE -> RETURN 2 bytes from offset 30
         let code = vec![
             PUSH2, 0xBE, 0xEF, // push 0xBEEF
-            PUSH1, 0,           // offset 0
-            MSTORE,             // memory[0..32] = U256(0xBEEF) big-endian
-            PUSH1, 2,           // size = 2
-            PUSH1, 30,          // offset = 30  (last 2 bytes of the 32-byte word)
+            PUSH1, 0,      // offset 0
+            MSTORE, // memory[0..32] = U256(0xBEEF) big-endian
+            PUSH1, 2, // size = 2
+            PUSH1, 30, // offset = 30  (last 2 bytes of the 32-byte word)
             RETURN,
         ];
         env.state.set_code("c", code).unwrap();
@@ -629,19 +643,29 @@ mod contract_e2e {
 
         // Deploy a contract: PUSH1 42, STOP
         let bytecode = vec![PUSH1, 42, STOP];
-        let (addr, result) = exec.deploy(
-            &bytecode, "SD1deployer", 0, 100_000, 1000, "blockhash", 0,
-        ).unwrap();
+        let (addr, result) = exec
+            .deploy(&bytecode, "SD1deployer", 0, 100_000, 1000, "blockhash", 0)
+            .unwrap();
 
-        assert!(addr.starts_with("SD1c"), "Contract address should start with SD1c");
+        assert!(
+            addr.starts_with("SD1c"),
+            "Contract address should start with SD1c"
+        );
         match result {
             ExecutionResult::Success { .. } => {}
             other => panic!("Deploy should succeed, got: {:?}", other),
         }
 
-        assert!(exec.contract_exists(&addr), "Contract should exist after deploy");
+        assert!(
+            exec.contract_exists(&addr),
+            "Contract should exist after deploy"
+        );
         let code = exec.get_code(&addr);
-        assert_eq!(code, Some(bytecode), "Stored code should match deployed bytecode");
+        assert_eq!(
+            code,
+            Some(bytecode),
+            "Stored code should match deployed bytecode"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -690,14 +714,14 @@ mod contract_e2e {
         let root_21 = compute_receipt_root(&[r2, r1]);
 
         // Different ordering must produce a different root
-        assert_ne!(
-            root_12, root_21,
-            "Receipt root must be order-dependent",
-        );
+        assert_ne!(root_12, root_21, "Receipt root must be order-dependent",);
 
         // Empty receipt list
         let root_empty = compute_receipt_root(&[]);
-        assert_ne!(root_empty, root_12, "Empty receipt root should differ from non-empty");
+        assert_ne!(
+            root_empty, root_12,
+            "Empty receipt root should differ from non-empty"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -725,7 +749,13 @@ mod contract_e2e {
         // Prune finalized blocks
         let pruned = storage.prune_finalized_undo_data(&["block_a".into()]);
         assert_eq!(pruned, 1, "Should prune exactly 1 entry");
-        assert!(!storage.has_undo_data("block_a"), "block_a undo should be gone");
-        assert!(storage.has_undo_data("block_b"), "block_b undo should remain");
+        assert!(
+            !storage.has_undo_data("block_a"),
+            "block_a undo should be gone"
+        );
+        assert!(
+            storage.has_undo_data("block_b"),
+            "block_b undo should remain"
+        );
     }
 }

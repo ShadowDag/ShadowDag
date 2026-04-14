@@ -3,25 +3,28 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, RwLock, atomic::{AtomicU64, AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex, RwLock,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
-use serde::{Serialize, Deserialize};
 
-use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::config::genesis::genesis::genesis_hash;
+use crate::service::network::p2p::peer_manager::PeerManager;
 
-pub const MAX_CONCURRENT_DOWNLOADS:  usize = 32;
-pub const MAX_HEADER_BATCH:          usize = 2_000;
-pub const MAX_BLOCK_BATCH:           usize = 64;
-pub const SYNC_STALL_TIMEOUT_SECS:   u64   = 60;
-pub const DOWNLOAD_TIMEOUT_SECS:     u64   = 30;
-pub const MAX_RETRIES:               u32   = 5;
-pub const BACKOFF_BASE_MS:           u64   = 200;
-pub const SNAPSHOT_CHUNK_SIZE:       usize = 65_536;
-pub const IBD_BATCH_VERIFY_WORKERS:  usize = 4;
-pub const PEER_SCORE_BONUS:          i64   = 10;
-pub const PEER_SCORE_PENALTY:        i64   = 50;
+pub const MAX_CONCURRENT_DOWNLOADS: usize = 32;
+pub const MAX_HEADER_BATCH: usize = 2_000;
+pub const MAX_BLOCK_BATCH: usize = 64;
+pub const SYNC_STALL_TIMEOUT_SECS: u64 = 60;
+pub const DOWNLOAD_TIMEOUT_SECS: u64 = 30;
+pub const MAX_RETRIES: u32 = 5;
+pub const BACKOFF_BASE_MS: u64 = 200;
+pub const SNAPSHOT_CHUNK_SIZE: usize = 65_536;
+pub const IBD_BATCH_VERIFY_WORKERS: usize = 4;
+pub const PEER_SCORE_BONUS: i64 = 10;
+pub const PEER_SCORE_PENALTY: i64 = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncPhase {
@@ -42,22 +45,22 @@ impl SyncPhase {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncHeader {
-    pub hash:       String,
-    pub prev_hash:  String,
-    pub height:     u64,
-    pub timestamp:  u64,
+    pub hash: String,
+    pub prev_hash: String,
+    pub height: u64,
+    pub timestamp: u64,
     pub difficulty: u64,
-    pub parents:    Vec<String>,
+    pub parents: Vec<String>,
     pub blue_score: u64,
 }
 
 #[derive(Debug, Clone)]
 struct DownloadJob {
-    hash:        String,
-    _height:     u64,
+    hash: String,
+    _height: u64,
     assigned_to: String,
-    started_at:  u64,
-    retries:     u32,
+    started_at: u64,
+    retries: u32,
     _is_snapshot: bool,
 }
 
@@ -69,12 +72,12 @@ impl DownloadJob {
 
 #[derive(Debug, Clone)]
 struct PeerSyncState {
-    _addr:          String,
-    _best_height:   u64,
-    score:         i64,
-    in_flight:     usize,
+    _addr: String,
+    _best_height: u64,
+    score: i64,
+    in_flight: usize,
     last_response: u64,
-    failed:        u32,
+    failed: u32,
 }
 
 impl PeerSyncState {
@@ -88,17 +91,16 @@ impl PeerSyncState {
             failed: 0,
         }
     }
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UtxoSnapshot {
-    pub block_hash:  String,
-    pub height:      u64,
-    pub utxo_count:  u64,
-    pub root_hash:   String,
-    pub size_bytes:  u64,
-    pub created_at:  u64,
+    pub block_hash: String,
+    pub height: u64,
+    pub utxo_count: u64,
+    pub root_hash: String,
+    pub size_bytes: u64,
+    pub created_at: u64,
 }
 
 /// LOCK ORDERING: To prevent deadlocks, always acquire locks in this order:
@@ -112,43 +114,43 @@ pub struct UtxoSnapshot {
 ///
 /// Never acquire a lower-numbered lock while holding a higher-numbered one.
 pub struct BlockSyncManager {
-    _peers:          Arc<PeerManager>,
-    phase:          Arc<RwLock<SyncPhase>>,           // Lock order: 1
-    local_height:   Arc<AtomicU64>,
-    best_height:    Arc<AtomicU64>,
-    is_running:     Arc<AtomicBool>,
+    _peers: Arc<PeerManager>,
+    phase: Arc<RwLock<SyncPhase>>, // Lock order: 1
+    local_height: Arc<AtomicU64>,
+    best_height: Arc<AtomicU64>,
+    is_running: Arc<AtomicBool>,
 
-    headers:            Arc<RwLock<HashMap<String, SyncHeader>>>,       // Lock order: 2 — hash -> header
-    headers_by_height:  Arc<RwLock<HashMap<u64, Vec<String>>>>,         // Lock order: 2b — height -> [hashes]
+    headers: Arc<RwLock<HashMap<String, SyncHeader>>>, // Lock order: 2 — hash -> header
+    headers_by_height: Arc<RwLock<HashMap<u64, Vec<String>>>>, // Lock order: 2b — height -> [hashes]
 
-    pending:        Arc<Mutex<VecDeque<DownloadJob>>>,         // Lock order: 5
-    pending_set:    Arc<Mutex<HashSet<String>>>,               // Lock order: 5b — dedup
+    pending: Arc<Mutex<VecDeque<DownloadJob>>>, // Lock order: 5
+    pending_set: Arc<Mutex<HashSet<String>>>,   // Lock order: 5b — dedup
 
-    in_flight:      Arc<Mutex<HashMap<String, DownloadJob>>>,  // Lock order: 6
+    in_flight: Arc<Mutex<HashMap<String, DownloadJob>>>, // Lock order: 6
 
-    completed:      Arc<Mutex<HashSet<String>>>,               // Lock order: 7
+    completed: Arc<Mutex<HashSet<String>>>, // Lock order: 7
 
-    peer_states:    Arc<RwLock<HashMap<String, PeerSyncState>>>,  // Lock order: 3
+    peer_states: Arc<RwLock<HashMap<String, PeerSyncState>>>, // Lock order: 3
 
-    best_snapshot:  Arc<RwLock<Option<UtxoSnapshot>>>,            // Lock order: 4
+    best_snapshot: Arc<RwLock<Option<UtxoSnapshot>>>, // Lock order: 4
 }
 
 impl BlockSyncManager {
     pub fn new(peers: Arc<PeerManager>) -> Self {
         Self {
             _peers: peers,
-            phase:             Arc::new(RwLock::new(SyncPhase::Idle)),
-            local_height:      Arc::new(AtomicU64::new(0)),
-            best_height:       Arc::new(AtomicU64::new(0)),
-            is_running:        Arc::new(AtomicBool::new(false)),
-            headers:           Arc::new(RwLock::new(HashMap::new())),
+            phase: Arc::new(RwLock::new(SyncPhase::Idle)),
+            local_height: Arc::new(AtomicU64::new(0)),
+            best_height: Arc::new(AtomicU64::new(0)),
+            is_running: Arc::new(AtomicBool::new(false)),
+            headers: Arc::new(RwLock::new(HashMap::new())),
             headers_by_height: Arc::new(RwLock::new(HashMap::new())),
-            pending:           Arc::new(Mutex::new(VecDeque::new())),
-            pending_set:       Arc::new(Mutex::new(HashSet::new())),
-            in_flight:         Arc::new(Mutex::new(HashMap::new())),
-            completed:         Arc::new(Mutex::new(HashSet::new())),
-            peer_states:       Arc::new(RwLock::new(HashMap::new())),
-            best_snapshot:     Arc::new(RwLock::new(None)),
+            pending: Arc::new(Mutex::new(VecDeque::new())),
+            pending_set: Arc::new(Mutex::new(HashSet::new())),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            completed: Arc::new(Mutex::new(HashSet::new())),
+            peer_states: Arc::new(RwLock::new(HashMap::new())),
+            best_snapshot: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -186,8 +188,8 @@ impl BlockSyncManager {
             ps.score -= PEER_SCORE_PENALTY;
         }
 
-        let mut inflight    = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-        let mut pending     = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inflight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         let mut pending_set = self.pending_set.lock().unwrap_or_else(|e| e.into_inner());
         let re_queue: Vec<DownloadJob> = inflight
             .values()
@@ -216,12 +218,18 @@ impl BlockSyncManager {
             return;
         }
         if snap.height == 0 || snap.utxo_count == 0 {
-            log::warn!("snapshot_discovery_untrusted: rejecting snapshot with zero height or utxo_count");
+            log::warn!(
+                "snapshot_discovery_untrusted: rejecting snapshot with zero height or utxo_count"
+            );
             return;
         }
 
-        let mut best = self.best_snapshot.write().unwrap_or_else(|e| e.into_inner());
-        let should_replace = best.as_ref()
+        let mut best = self
+            .best_snapshot
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let should_replace = best
+            .as_ref()
             .map(|b| snap.height > b.height)
             .unwrap_or(true);
         if should_replace {
@@ -236,7 +244,11 @@ impl BlockSyncManager {
 
     pub fn select_snapshot(&self) -> Option<UtxoSnapshot> {
         let local = self.local_height.load(Ordering::SeqCst);
-        let snap = self.best_snapshot.read().unwrap_or_else(|e| e.into_inner()).clone()?;
+        let snap = self
+            .best_snapshot
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?;
 
         if snap.height > local + 10_000 {
             log::warn!(
@@ -256,7 +268,12 @@ impl BlockSyncManager {
     pub fn on_snapshot_chunk_received(&self, chunk_index: u64, total_chunks: u64, _data: &[u8]) {
         let pct = (chunk_index * 100) / total_chunks.max(1);
         if chunk_index.is_multiple_of(100) {
-            log::info!("Snapshot chunk received: chunk_index={}, total_chunks={}, pct={}%", chunk_index, total_chunks, pct);
+            log::info!(
+                "Snapshot chunk received: chunk_index={}, total_chunks={}, pct={}%",
+                chunk_index,
+                total_chunks,
+                pct
+            );
         }
         if chunk_index + 1 >= total_chunks {
             // NOTE: Snapshot content integrity is NOT verified here.
@@ -278,7 +295,8 @@ impl BlockSyncManager {
         let headers: Vec<SyncHeader> = if headers.len() > MAX_HEADER_BATCH {
             log::warn!(
                 "header_batch_truncated: received={}, max={}",
-                headers.len(), MAX_HEADER_BATCH
+                headers.len(),
+                MAX_HEADER_BATCH
             );
             headers.into_iter().take(MAX_HEADER_BATCH).collect()
         } else {
@@ -288,12 +306,18 @@ impl BlockSyncManager {
         if headers.is_empty() {
             // Peer has no more headers. Only transition to BlockSync
             // if we actually have headers to download blocks for.
-            let has_pending = !self.headers.read().unwrap_or_else(|e| e.into_inner()).is_empty();
+            let has_pending = !self
+                .headers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
             if has_pending {
                 self.set_phase(SyncPhase::BlockSync);
                 self.enqueue_block_downloads();
             } else {
-                log::warn!("on_headers_received: peer sent empty headers but we have nothing to download");
+                log::warn!(
+                    "on_headers_received: peer sent empty headers but we have nothing to download"
+                );
             }
             return;
         }
@@ -301,24 +325,30 @@ impl BlockSyncManager {
         // Validate headers before accepting them into the sync pipeline.
         // Without this, a malicious peer can inject fake headers that
         // cause invalid block downloads.
-        let headers: Vec<SyncHeader> = headers.into_iter().filter(|h| {
-            // Basic sanity: hash must be 64 hex chars
-            if h.hash.len() != 64 || !h.hash.chars().all(|c| c.is_ascii_hexdigit()) {
-                log::warn!("header_invalid_hash: rejecting header with bad hash '{}'", h.hash);
-                return false;
-            }
-            // Height must be positive (genesis is not synced via headers)
-            if h.height == 0 {
-                log::warn!("header_zero_height: rejecting header hash={}", h.hash);
-                return false;
-            }
-            // Difficulty must be non-zero
-            if h.difficulty == 0 {
-                log::warn!("header_zero_difficulty: rejecting header hash={}", h.hash);
-                return false;
-            }
-            true
-        }).collect();
+        let headers: Vec<SyncHeader> = headers
+            .into_iter()
+            .filter(|h| {
+                // Basic sanity: hash must be 64 hex chars
+                if h.hash.len() != 64 || !h.hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                    log::warn!(
+                        "header_invalid_hash: rejecting header with bad hash '{}'",
+                        h.hash
+                    );
+                    return false;
+                }
+                // Height must be positive (genesis is not synced via headers)
+                if h.height == 0 {
+                    log::warn!("header_zero_height: rejecting header hash={}", h.hash);
+                    return false;
+                }
+                // Difficulty must be non-zero
+                if h.difficulty == 0 {
+                    log::warn!("header_zero_difficulty: rejecting header hash={}", h.hash);
+                    return false;
+                }
+                true
+            })
+            .collect();
 
         if headers.is_empty() {
             log::warn!("on_headers_received: all headers rejected by validation");
@@ -331,7 +361,8 @@ impl BlockSyncManager {
             if h.height > 0 && h.height <= prev_h {
                 log::warn!(
                     "on_headers_received: header height not ascending (height={}, prev={})",
-                    h.height, prev_h
+                    h.height,
+                    prev_h
                 );
                 return; // Reject entire batch
             }
@@ -340,8 +371,7 @@ impl BlockSyncManager {
 
         // Verify prev_hash continuity between consecutive headers
         for window in headers.windows(2) {
-            if !window[1].parents.contains(&window[0].hash)
-                && window[1].prev_hash != window[0].hash
+            if !window[1].parents.contains(&window[0].hash) && window[1].prev_hash != window[0].hash
             {
                 log::warn!(
                     "header_chain_break: height={}, expected_parent={}",
@@ -353,7 +383,10 @@ impl BlockSyncManager {
         }
 
         let mut map = self.headers.write().unwrap_or_else(|e| e.into_inner());
-        let mut by_height = self.headers_by_height.write().unwrap_or_else(|e| e.into_inner());
+        let mut by_height = self
+            .headers_by_height
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         for h in &headers {
             map.insert(h.hash.clone(), h.clone());
             let entry = by_height.entry(h.height).or_default();
@@ -365,7 +398,10 @@ impl BlockSyncManager {
     }
 
     pub fn build_header_locator(&self) -> Vec<String> {
-        let by_height = self.headers_by_height.read().unwrap_or_else(|e| e.into_inner());
+        let by_height = self
+            .headers_by_height
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let local_h = self.local_height.load(Ordering::SeqCst);
         let mut locator = Vec::new();
         let mut step = 1u64;
@@ -376,7 +412,9 @@ impl BlockSyncManager {
                     locator.push(first.clone());
                 }
             }
-            if h < step { break; }
+            if h < step {
+                break;
+            }
             h -= step;
             step *= 2;
         }
@@ -393,34 +431,44 @@ impl BlockSyncManager {
         let completed = self.completed.lock().unwrap_or_else(|e| e.into_inner());
 
         for (hash, hdr) in headers.iter() {
-            if hdr.height <= local_h { continue; }
-            if inflight.contains_key(hash) { continue; }
-            if completed.contains(hash) { continue; }
-            if pending_set.contains(hash) { continue; }
+            if hdr.height <= local_h {
+                continue;
+            }
+            if inflight.contains_key(hash) {
+                continue;
+            }
+            if completed.contains(hash) {
+                continue;
+            }
+            if pending_set.contains(hash) {
+                continue;
+            }
             pending_set.insert(hash.clone());
             pending.push_back(DownloadJob {
-                hash:        hash.clone(),
-                _height:     hdr.height,
+                hash: hash.clone(),
+                _height: hdr.height,
                 assigned_to: String::new(),
-                started_at:  0,
-                retries:     0,
+                started_at: 0,
+                retries: 0,
                 _is_snapshot: false,
             });
         }
     }
 
     pub fn next_download_batch(&self, peer: &str) -> Vec<String> {
-        let mut pending     = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         let mut pending_set = self.pending_set.lock().unwrap_or_else(|e| e.into_inner());
-        let mut inflight    = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-        let mut batch       = Vec::new();
+        let mut inflight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        let mut batch = Vec::new();
 
         let inflight_count = inflight.len();
-        while batch.len() < MAX_BLOCK_BATCH && (inflight_count + batch.len()) < MAX_CONCURRENT_DOWNLOADS {
+        while batch.len() < MAX_BLOCK_BATCH
+            && (inflight_count + batch.len()) < MAX_CONCURRENT_DOWNLOADS
+        {
             match pending.pop_front() {
                 Some(mut job) => {
                     job.assigned_to = peer.to_string();
-                    job.started_at  = unix_now();
+                    job.started_at = unix_now();
                     let hash = job.hash.clone();
                     pending_set.remove(&hash);
                     inflight.insert(hash.clone(), job);
@@ -442,14 +490,18 @@ impl BlockSyncManager {
     }
 
     pub fn on_block_received(&self, hash: &str, peer: &str) {
-        let mut inflight  = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inflight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
         let mut completed = self.completed.lock().unwrap_or_else(|e| e.into_inner());
 
         if inflight.remove(hash).is_some() {
             completed.insert(hash.to_string());
 
-            if let Some(hdr) = self.headers.read().unwrap_or_else(|e| e.into_inner())
-                .get(hash).cloned()
+            if let Some(hdr) = self
+                .headers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(hash)
+                .cloned()
             {
                 let cur = self.local_height.load(Ordering::SeqCst);
                 // NOTE: In a DAG, height gaps are expected. This update
@@ -468,7 +520,13 @@ impl BlockSyncManager {
             }
         }
 
-        if inflight.is_empty() && self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        if inflight.is_empty()
+            && self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        {
             let best = self.best_height.load(Ordering::SeqCst);
             let local = self.local_height.load(Ordering::SeqCst);
             if local >= best.saturating_sub(5) {
@@ -483,7 +541,9 @@ impl BlockSyncManager {
         if completed.len() > 50_000 {
             let excess = completed.len() - 25_000;
             let to_remove: Vec<String> = completed.iter().take(excess).cloned().collect();
-            for h in &to_remove { completed.remove(h); }
+            for h in &to_remove {
+                completed.remove(h);
+            }
         }
 
         // Prune headers map to prevent unbounded memory growth.
@@ -492,14 +552,16 @@ impl BlockSyncManager {
             if map.len() > 50_000 {
                 let excess = map.len() - 25_000;
                 let to_remove: Vec<String> = map.keys().take(excess).cloned().collect();
-                for h in &to_remove { map.remove(h); }
+                for h in &to_remove {
+                    map.remove(h);
+                }
             }
         }
     }
 
     pub fn on_block_failed(&self, hash: &str, peer: &str) {
-        let mut inflight    = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-        let mut pending     = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inflight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         let mut pending_set = self.pending_set.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(mut job) = inflight.remove(hash) {
@@ -515,16 +577,17 @@ impl BlockSyncManager {
 
         let mut states = self.peer_states.write().unwrap_or_else(|e| e.into_inner());
         if let Some(ps) = states.get_mut(peer) {
-            ps.score     -= PEER_SCORE_PENALTY;
-            ps.failed    += 1;
-            ps.in_flight  = ps.in_flight.saturating_sub(1);
+            ps.score -= PEER_SCORE_PENALTY;
+            ps.failed += 1;
+            ps.in_flight = ps.in_flight.saturating_sub(1);
         }
     }
 
     pub fn check_stalled_downloads(&self) {
         let stalled: Vec<(String, String)> = {
             let inflight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-            inflight.values()
+            inflight
+                .values()
                 .filter(|j| j.is_stalled())
                 .map(|j| (j.hash.clone(), j.assigned_to.clone()))
                 .collect()
@@ -536,12 +599,20 @@ impl BlockSyncManager {
 
     pub fn stats(&self) -> SyncStats {
         SyncStats {
-            phase:           format!("{:?}", self.phase()),
-            local_height:    self.local_height.load(Ordering::SeqCst),
-            best_height:     self.best_height.load(Ordering::SeqCst),
-            pending_blocks:  self.pending.lock().unwrap_or_else(|e| e.into_inner()).len(),
-            in_flight:       self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).len(),
-            completed:       self.completed.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            phase: format!("{:?}", self.phase()),
+            local_height: self.local_height.load(Ordering::SeqCst),
+            best_height: self.best_height.load(Ordering::SeqCst),
+            pending_blocks: self.pending.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            in_flight: self
+                .in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            completed: self
+                .completed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
         }
     }
 
@@ -560,16 +631,19 @@ impl BlockSyncManager {
 
 #[derive(Debug)]
 pub struct SyncStats {
-    pub phase:          String,
-    pub local_height:   u64,
-    pub best_height:    u64,
+    pub phase: String,
+    pub local_height: u64,
+    pub best_height: u64,
     pub pending_blocks: usize,
-    pub in_flight:      usize,
-    pub completed:      usize,
+    pub in_flight: usize,
+    pub completed: usize,
 }
 
 fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -580,7 +654,8 @@ mod tests {
     fn make_sync(label: &str) -> BlockSyncManager {
         let path = format!("/tmp/sync_{}", label);
         let _ = fs::remove_dir_all(&path);
-        let pm = Arc::new(crate::service::network::p2p::peer_manager::PeerManager::open(&path).unwrap());
+        let pm =
+            Arc::new(crate::service::network::p2p::peer_manager::PeerManager::open(&path).unwrap());
         BlockSyncManager::new(pm)
     }
 

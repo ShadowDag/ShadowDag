@@ -3,10 +3,10 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
-use crate::domain::transaction::transaction::Transaction;
 use crate::config::consensus::consensus_params::ConsensusParams;
 use crate::config::node::node_config::NetworkMode;
+use crate::domain::transaction::transaction::Transaction;
+use sha2::{Digest, Sha256};
 
 pub const TX_HASH_VERSION: u32 = 2;
 
@@ -74,7 +74,9 @@ impl TxHash {
         // inputs sorted by (txid, index) for determinism
         let mut sorted_indices: Vec<usize> = (0..tx.inputs.len()).collect();
         sorted_indices.sort_unstable_by(|&a, &b| {
-            tx.inputs[a].txid.cmp(&tx.inputs[b].txid)
+            tx.inputs[a]
+                .txid
+                .cmp(&tx.inputs[b].txid)
                 .then(tx.inputs[a].index.cmp(&tx.inputs[b].index))
         });
         h.update((tx.inputs.len() as u32).to_le_bytes());
@@ -133,21 +135,27 @@ mod tests {
 
     fn make_tx() -> Transaction {
         let mut tx = Transaction {
-            hash:      "placeholder".to_string(),
-            inputs:    vec![TxInput {
-                txid:      "prev_tx_001".to_string(),
-                index:     0,
-                owner:     "alice".to_string(),
+            hash: "placeholder".to_string(),
+            inputs: vec![TxInput {
+                txid: "prev_tx_001".to_string(),
+                index: 0,
+                owner: "alice".to_string(),
                 signature: String::new(),
-                pub_key:   String::new(),
+                pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
             }],
-            outputs:   vec![TxOutput { address: "bob".to_string(), amount: 546, commitment: None, range_proof: None, ephemeral_pubkey: None }],
-            fee:       1,
+            outputs: vec![TxOutput {
+                address: "bob".to_string(),
+                amount: 546,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
+            fee: 1,
             timestamp: 1_735_689_600,
             is_coinbase: false,
-            tx_type:   TxType::Transfer,
+            tx_type: TxType::Transfer,
             payload_hash: None,
             ..Default::default()
         };
@@ -173,13 +181,19 @@ mod tests {
     fn different_outputs_different_hash() {
         let tx1 = make_tx();
         let mut tx2_inner = Transaction {
-            hash:      "placeholder".to_string(),
-            inputs:    tx1.inputs.clone(),
-            outputs:   vec![TxOutput { address: "bob".to_string(), amount: 999, commitment: None, range_proof: None, ephemeral_pubkey: None }],
-            fee:       1,
+            hash: "placeholder".to_string(),
+            inputs: tx1.inputs.clone(),
+            outputs: vec![TxOutput {
+                address: "bob".to_string(),
+                amount: 999,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
+            fee: 1,
             timestamp: tx1.timestamp,
             is_coinbase: false,
-            tx_type:   TxType::Transfer,
+            tx_type: TxType::Transfer,
             payload_hash: None,
             ..Default::default()
         };
@@ -196,7 +210,10 @@ mod tests {
     #[test]
     fn verify_matches_content() {
         let tx = make_tx();
-        assert!(TxHash::verify(&tx), "verify must return true for correctly hashed tx");
+        assert!(
+            TxHash::verify(&tx),
+            "verify must return true for correctly hashed tx"
+        );
     }
 
     #[test]
@@ -211,7 +228,8 @@ mod tests {
         let testnet_hash = hex::encode(h.finalize());
 
         assert_ne!(
-            TxHash::hash(&tx), testnet_hash,
+            TxHash::hash(&tx),
+            testnet_hash,
             "Mainnet and testnet hashes must differ (replay protection)"
         );
     }
@@ -254,16 +272,78 @@ mod tests {
     #[test]
     fn input_order_does_not_affect_hash() {
         let inputs_a = vec![
-            TxInput { txid: "tx_aaa".into(), index: 0, owner: "alice".into(), signature: String::new(), pub_key: String::new(), key_image: None, ring_members: None },
-            TxInput { txid: "tx_bbb".into(), index: 1, owner: "bob".into(), signature: String::new(), pub_key: String::new(), key_image: None, ring_members: None },
+            TxInput {
+                txid: "tx_aaa".into(),
+                index: 0,
+                owner: "alice".into(),
+                signature: String::new(),
+                pub_key: String::new(),
+                key_image: None,
+                ring_members: None,
+            },
+            TxInput {
+                txid: "tx_bbb".into(),
+                index: 1,
+                owner: "bob".into(),
+                signature: String::new(),
+                pub_key: String::new(),
+                key_image: None,
+                ring_members: None,
+            },
         ];
         let inputs_b = vec![
-            TxInput { txid: "tx_bbb".into(), index: 1, owner: "bob".into(), signature: String::new(), pub_key: String::new(), key_image: None, ring_members: None },
-            TxInput { txid: "tx_aaa".into(), index: 0, owner: "alice".into(), signature: String::new(), pub_key: String::new(), key_image: None, ring_members: None },
+            TxInput {
+                txid: "tx_bbb".into(),
+                index: 1,
+                owner: "bob".into(),
+                signature: String::new(),
+                pub_key: String::new(),
+                key_image: None,
+                ring_members: None,
+            },
+            TxInput {
+                txid: "tx_aaa".into(),
+                index: 0,
+                owner: "alice".into(),
+                signature: String::new(),
+                pub_key: String::new(),
+                key_image: None,
+                ring_members: None,
+            },
         ];
-        let outputs = vec![TxOutput { address: "bob".into(), amount: 100, commitment: None, range_proof: None, ephemeral_pubkey: None }];
-        let tx_a = Transaction { hash: String::new(), inputs: inputs_a, outputs: outputs.clone(), fee: 1, timestamp: 1_000, is_coinbase: false, tx_type: TxType::Transfer, payload_hash: None, ..Default::default() };
-        let tx_b = Transaction { hash: String::new(), inputs: inputs_b, outputs, fee: 1, timestamp: 1_000, is_coinbase: false, tx_type: TxType::Transfer, payload_hash: None, ..Default::default() };
-        assert_eq!(TxHash::hash(&tx_a), TxHash::hash(&tx_b), "Input order must not affect transaction hash");
+        let outputs = vec![TxOutput {
+            address: "bob".into(),
+            amount: 100,
+            commitment: None,
+            range_proof: None,
+            ephemeral_pubkey: None,
+        }];
+        let tx_a = Transaction {
+            hash: String::new(),
+            inputs: inputs_a,
+            outputs: outputs.clone(),
+            fee: 1,
+            timestamp: 1_000,
+            is_coinbase: false,
+            tx_type: TxType::Transfer,
+            payload_hash: None,
+            ..Default::default()
+        };
+        let tx_b = Transaction {
+            hash: String::new(),
+            inputs: inputs_b,
+            outputs,
+            fee: 1,
+            timestamp: 1_000,
+            is_coinbase: false,
+            tx_type: TxType::Transfer,
+            payload_hash: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            TxHash::hash(&tx_a),
+            TxHash::hash(&tx_b),
+            "Input order must not affect transaction hash"
+        );
     }
 }

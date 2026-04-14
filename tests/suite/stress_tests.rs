@@ -5,34 +5,34 @@
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-    use std::sync::Arc;
+    use crate::config::consensus::consensus_params::ConsensusParams;
+    use crate::config::genesis::genesis::GENESIS_TIMESTAMP;
+    use crate::domain::block::block::Block;
+    use crate::domain::block::block_body::BlockBody;
+    use crate::domain::block::block_header::BlockHeader;
     use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
     use crate::domain::transaction::tx_hash::TxHash;
     use crate::domain::transaction::tx_validator::{validate_tx, DUST_LIMIT, MIN_TX_FEE};
-    use crate::domain::block::block::Block;
-    use crate::domain::block::block_header::BlockHeader;
-    use crate::domain::block::block_body::BlockBody;
+    use crate::domain::utxo::utxo_set::UtxoSet;
     use crate::engine::dag::core::dag_manager::DagManager;
     use crate::infrastructure::storage::rocksdb::utxo::utxo_store::UtxoStore;
-    use crate::domain::utxo::utxo_set::UtxoSet;
     use crate::service::mempool::core::mempool::Mempool;
-    use crate::config::consensus::consensus_params::ConsensusParams;
-    use crate::config::genesis::genesis::GENESIS_TIMESTAMP;
+    use std::sync::Arc;
+    use std::time::Instant;
 
     // ── helpers ──────────────────────────────────────────────────────────
     fn make_tx(i: usize) -> Transaction {
         let mut tx = Transaction {
-            hash:      String::new(),
-            inputs:    vec![],
-            outputs:   vec![TxOutput {
+            hash: String::new(),
+            inputs: vec![],
+            outputs: vec![TxOutput {
                 address: format!("shadow1stress_{:020}", i % 10_000),
-                amount:  DUST_LIMIT,
+                amount: DUST_LIMIT,
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
             }],
-            fee:       0,
+            fee: 0,
             timestamp: GENESIS_TIMESTAMP + i as u64,
             is_coinbase: true,
             tx_type: TxType::Transfer,
@@ -58,24 +58,42 @@ mod tests {
     fn tmp_utxo(suffix: &str) -> UtxoSet {
         let path = format!("/tmp/stress_utxo_{}", suffix);
         let _ = std::fs::remove_dir_all(&path);
-        UtxoSet::new(Arc::new(UtxoStore::new(path.as_str()).expect("UtxoStore::new failed")))
+        UtxoSet::new(Arc::new(
+            UtxoStore::new(path.as_str()).expect("UtxoStore::new failed"),
+        ))
     }
 
     fn genesis_block() -> Block {
         Block {
             header: BlockHeader::new_with_defaults(
-                1, "stress_genesis_00000000000".to_string(), vec![],
+                1,
+                "stress_genesis_00000000000".to_string(),
+                vec![],
                 "m_stress_genesis".to_string(),
-                GENESIS_TIMESTAMP, 0, ConsensusParams::GENESIS_DIFFICULTY, 0,
+                GENESIS_TIMESTAMP,
+                0,
+                ConsensusParams::GENESIS_DIFFICULTY,
+                0,
             ),
-            body: BlockBody { transactions: vec![Transaction {
-                hash: "cb_stress_genesis".to_string(), inputs: vec![],
-                outputs: vec![TxOutput { address: "shadow1stress".into(), amount: 10_000, commitment: None, range_proof: None, ephemeral_pubkey: None }],
-                fee: 0, timestamp: GENESIS_TIMESTAMP, is_coinbase: true,
-                tx_type: TxType::Transfer,
-            payload_hash: None,
-            ..Default::default()
-            }]},
+            body: BlockBody {
+                transactions: vec![Transaction {
+                    hash: "cb_stress_genesis".to_string(),
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        address: "shadow1stress".into(),
+                        amount: 10_000,
+                        commitment: None,
+                        range_proof: None,
+                        ephemeral_pubkey: None,
+                    }],
+                    fee: 0,
+                    timestamp: GENESIS_TIMESTAMP,
+                    is_coinbase: true,
+                    tx_type: TxType::Transfer,
+                    payload_hash: None,
+                    ..Default::default()
+                }],
+            },
         }
     }
 
@@ -86,21 +104,21 @@ mod tests {
         let hashes: Vec<String> = (0..100_000usize)
             .map(|i| {
                 let tx = Transaction {
-                    hash:      String::new(),
-                    inputs:    vec![],
-                    outputs:   vec![TxOutput {
+                    hash: String::new(),
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
                         address: format!("shadow1_{}", i),
-                        amount:  DUST_LIMIT,
+                        amount: DUST_LIMIT,
                         commitment: None,
                         range_proof: None,
                         ephemeral_pubkey: None,
                     }],
-                    fee:       MIN_TX_FEE,
+                    fee: MIN_TX_FEE,
                     timestamp: GENESIS_TIMESTAMP + i as u64,
                     is_coinbase: false,
                     tx_type: TxType::Transfer,
-            payload_hash: None,
-            ..Default::default()
+                    payload_hash: None,
+                    ..Default::default()
                 };
                 TxHash::hash(&tx)
             })
@@ -132,10 +150,18 @@ mod tests {
         let accepted = valid.iter().filter(|&&v| v).count();
         println!(
             "[STRESS] 10k TX validate: {} accepted in {:.2}ms",
-            accepted, elapsed.as_millis()
+            accepted,
+            elapsed.as_millis()
         );
-        assert!(accepted > 9_000, "At least 90% of TXs must be valid (got {})", accepted);
-        assert!(elapsed.as_secs() < 10, "10k validation must finish within 10s");
+        assert!(
+            accepted > 9_000,
+            "At least 90% of TXs must be valid (got {})",
+            accepted
+        );
+        assert!(
+            elapsed.as_secs() < 10,
+            "10k validation must finish within 10s"
+        );
     }
 
     // ── 3. 5k utxo writes ────────────────────────────────────────────────
@@ -158,7 +184,10 @@ mod tests {
         let start = Instant::now();
         let mut found = 0usize;
         for i in 0..n {
-            if store.get_utxo_str(&format!("stress_utxo_{:020}:0", i)).is_some() {
+            if store
+                .get_utxo_str(&format!("stress_utxo_{:020}:0", i))
+                .is_some()
+            {
                 found += 1;
             }
         }
@@ -166,7 +195,9 @@ mod tests {
 
         println!(
             "[STRESS] 5k utxo writes: {:.2}ms, reads: {:.2}ms, found: {}",
-            write_t.as_millis(), read_t.as_millis(), found
+            write_t.as_millis(),
+            read_t.as_millis(),
+            found
         );
         assert_eq!(found, n);
         assert!(write_t.as_secs() < 60 && read_t.as_secs() < 60);
@@ -185,18 +216,34 @@ mod tests {
             let hash = format!("stress_blk_{:020}", i);
             let block = Block {
                 header: BlockHeader::new_with_defaults(
-                    1, hash.clone(), vec![prev.clone()],
-                    format!("ms_{}", i), GENESIS_TIMESTAMP + i as u64,
-                    0, ConsensusParams::GENESIS_DIFFICULTY, (i + 1) as u64,
+                    1,
+                    hash.clone(),
+                    vec![prev.clone()],
+                    format!("ms_{}", i),
+                    GENESIS_TIMESTAMP + i as u64,
+                    0,
+                    ConsensusParams::GENESIS_DIFFICULTY,
+                    (i + 1) as u64,
                 ),
-                body: BlockBody { transactions: vec![Transaction {
-                    hash: format!("cb_s_{}", i), inputs: vec![],
-                    outputs: vec![TxOutput { address: "shadow1".into(), amount: 1_000, commitment: None, range_proof: None, ephemeral_pubkey: None }],
-                    fee: 0, timestamp: GENESIS_TIMESTAMP + i as u64, is_coinbase: true,
-                    tx_type: TxType::Transfer,
-            payload_hash: None,
-            ..Default::default()
-                }]},
+                body: BlockBody {
+                    transactions: vec![Transaction {
+                        hash: format!("cb_s_{}", i),
+                        inputs: vec![],
+                        outputs: vec![TxOutput {
+                            address: "shadow1".into(),
+                            amount: 1_000,
+                            commitment: None,
+                            range_proof: None,
+                            ephemeral_pubkey: None,
+                        }],
+                        fee: 0,
+                        timestamp: GENESIS_TIMESTAMP + i as u64,
+                        is_coinbase: true,
+                        tx_type: TxType::Transfer,
+                        payload_hash: None,
+                        ..Default::default()
+                    }],
+                },
             };
             dag.add_block_validated(&block, true).unwrap();
             prev = hash;
@@ -209,7 +256,10 @@ mod tests {
             2_000.0 / elapsed.as_secs_f64()
         );
         assert_eq!(dag.dag_size(), 2_001);
-        assert!(elapsed.as_secs() < 600, "2k blocks must insert within 10 minutes (debug mode with 256KB scratchpad)");
+        assert!(
+            elapsed.as_secs() < 600,
+            "2k blocks must insert within 10 minutes (debug mode with 256KB scratchpad)"
+        );
     }
 
     // ── 5. DAG fan-out (wide DAG — many parallel blocks) ─────────────────
@@ -225,18 +275,34 @@ mod tests {
             let hash = format!("fanout_blk_{:020}", i);
             let block = Block {
                 header: BlockHeader::new_with_defaults(
-                    1, hash.clone(), vec![g.header.hash.clone()],
-                    format!("mf_{}", i), GENESIS_TIMESTAMP + i as u64,
-                    0, ConsensusParams::GENESIS_DIFFICULTY, 1,
+                    1,
+                    hash.clone(),
+                    vec![g.header.hash.clone()],
+                    format!("mf_{}", i),
+                    GENESIS_TIMESTAMP + i as u64,
+                    0,
+                    ConsensusParams::GENESIS_DIFFICULTY,
+                    1,
                 ),
-                body: BlockBody { transactions: vec![Transaction {
-                    hash: format!("cb_f_{}", i), inputs: vec![],
-                    outputs: vec![TxOutput { address: "shadow1".into(), amount: 1_000, commitment: None, range_proof: None, ephemeral_pubkey: None }],
-                    fee: 0, timestamp: GENESIS_TIMESTAMP + i as u64, is_coinbase: true,
-                    tx_type: TxType::Transfer,
-            payload_hash: None,
-            ..Default::default()
-                }]},
+                body: BlockBody {
+                    transactions: vec![Transaction {
+                        hash: format!("cb_f_{}", i),
+                        inputs: vec![],
+                        outputs: vec![TxOutput {
+                            address: "shadow1".into(),
+                            amount: 1_000,
+                            commitment: None,
+                            range_proof: None,
+                            ephemeral_pubkey: None,
+                        }],
+                        fee: 0,
+                        timestamp: GENESIS_TIMESTAMP + i as u64,
+                        is_coinbase: true,
+                        tx_type: TxType::Transfer,
+                        payload_hash: None,
+                        ..Default::default()
+                    }],
+                },
             };
             dag.add_block_validated(&block, true).unwrap();
         }
@@ -262,7 +328,9 @@ mod tests {
         let start = Instant::now();
         let mut accepted = 0usize;
         for tx in &txs {
-            if pool.add_transaction_test(tx) { accepted += 1; }
+            if pool.add_transaction_test(tx) {
+                accepted += 1;
+            }
         }
         let elapsed = start.elapsed();
 
@@ -273,8 +341,15 @@ mod tests {
             accepted as f64 / elapsed.as_secs_f64()
         );
         // At least 50% accepted (mempool may enforce limits/evictions)
-        assert!(accepted >= 1_000, "At least 1000 TXs must be accepted (got {})", accepted);
-        assert!(elapsed.as_secs() < 120, "10k mempool stress must finish within 2 minutes");
+        assert!(
+            accepted >= 1_000,
+            "At least 1000 TXs must be accepted (got {})",
+            accepted
+        );
+        assert!(
+            elapsed.as_secs() < 120,
+            "10k mempool stress must finish within 2 minutes"
+        );
     }
 
     // ── 7. utxo balance under 300ms simulated network latency ────────────
@@ -300,9 +375,18 @@ mod tests {
         let balance = store.get_balance(&addr);
         let query_t = start.elapsed();
 
-        assert_eq!(balance, 100_000, "Balance must be correct after latency simulation");
-        println!("[STRESS] Balance query after 300ms sleep: {:.2}ms", query_t.as_millis());
-        assert!(query_t.as_millis() < 1_000, "Balance query must be fast after latency");
+        assert_eq!(
+            balance, 100_000,
+            "Balance must be correct after latency simulation"
+        );
+        println!(
+            "[STRESS] Balance query after 300ms sleep: {:.2}ms",
+            query_t.as_millis()
+        );
+        assert!(
+            query_t.as_millis() < 1_000,
+            "Balance query must be fast after latency"
+        );
     }
 
     // ── 8. No duplicate hashes in 50k generated TXs ──────────────────────
@@ -311,21 +395,21 @@ mod tests {
         let hashes: Vec<String> = (0..50_000usize)
             .map(|i| {
                 let tx = Transaction {
-                    hash:      String::new(),
-                    inputs:    vec![],
-                    outputs:   vec![TxOutput {
+                    hash: String::new(),
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
                         address: format!("shadow1unique_{}", i),
-                        amount:  DUST_LIMIT,
+                        amount: DUST_LIMIT,
                         commitment: None,
                         range_proof: None,
                         ephemeral_pubkey: None,
                     }],
-                    fee:       MIN_TX_FEE,
+                    fee: MIN_TX_FEE,
                     timestamp: GENESIS_TIMESTAMP + i as u64,
                     is_coinbase: false,
                     tx_type: TxType::Transfer,
-            payload_hash: None,
-            ..Default::default()
+                    payload_hash: None,
+                    ..Default::default()
                 };
                 TxHash::hash(&tx)
             })

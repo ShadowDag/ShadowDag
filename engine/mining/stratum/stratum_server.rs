@@ -20,14 +20,14 @@
 //   mining.subscribe → mining.authorize → mining.notify → mining.submit
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::errors::NetworkError;
+use crate::{slog_error, slog_info, slog_warn};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read as _, Write};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
-use crate::{slog_info, slog_error, slog_warn};
-use crate::errors::NetworkError;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default Stratum port
 pub const DEFAULT_STRATUM_PORT: u16 = 7779;
@@ -70,11 +70,11 @@ impl StratumMethod {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
-            "mining.subscribe"  => StratumMethod::Subscribe,
-            "mining.authorize"  => StratumMethod::Authorize,
-            "mining.submit"     => StratumMethod::Submit,
-            "mining.get_work"   => StratumMethod::GetWork,
-            _                   => StratumMethod::Unknown(s.to_string()),
+            "mining.subscribe" => StratumMethod::Subscribe,
+            "mining.authorize" => StratumMethod::Authorize,
+            "mining.submit" => StratumMethod::Submit,
+            "mining.get_work" => StratumMethod::GetWork,
+            _ => StratumMethod::Unknown(s.to_string()),
         }
     }
 }
@@ -82,7 +82,7 @@ impl StratumMethod {
 /// Stratum JSON-RPC request
 #[derive(Debug, Clone)]
 pub struct StratumRequest {
-    pub id:     u64,
+    pub id: u64,
     pub method: StratumMethod,
     pub params: Vec<String>,
 }
@@ -90,9 +90,9 @@ pub struct StratumRequest {
 /// Stratum JSON-RPC response
 #[derive(Debug, Clone)]
 pub struct StratumResponse {
-    pub id:     u64,
+    pub id: u64,
     pub result: Option<String>,
-    pub error:  Option<String>,
+    pub error: Option<String>,
 }
 
 /// Escape a string for safe inclusion in a JSON string value.
@@ -106,7 +106,7 @@ fn escape_json_str(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => {},
+            c if c.is_control() => {}
             c => out.push(c),
         }
     }
@@ -115,17 +115,32 @@ fn escape_json_str(s: &str) -> String {
 
 impl StratumResponse {
     pub fn ok(id: u64, result: &str) -> Self {
-        Self { id, result: Some(result.to_string()), error: None }
+        Self {
+            id,
+            result: Some(result.to_string()),
+            error: None,
+        }
     }
     pub fn err(id: u64, error: &str) -> Self {
-        Self { id, result: None, error: Some(error.to_string()) }
+        Self {
+            id,
+            result: None,
+            error: Some(error.to_string()),
+        }
     }
     pub fn to_json(&self) -> String {
         if let Some(ref e) = self.error {
-            format!("{{\"id\":{},\"result\":null,\"error\":\"{}\"}}\n", self.id, escape_json_str(e))
+            format!(
+                "{{\"id\":{},\"result\":null,\"error\":\"{}\"}}\n",
+                self.id,
+                escape_json_str(e)
+            )
         } else {
-            format!("{{\"id\":{},\"result\":{},\"error\":null}}\n", self.id,
-                self.result.as_deref().unwrap_or("true"))
+            format!(
+                "{{\"id\":{},\"result\":{},\"error\":null}}\n",
+                self.id,
+                self.result.as_deref().unwrap_or("true")
+            )
         }
     }
 }
@@ -133,34 +148,40 @@ impl StratumResponse {
 /// Worker (connected miner) state
 #[derive(Debug, Clone)]
 pub struct Worker {
-    pub id:              u64,
-    pub name:            String,
-    pub address:         String,
-    pub peer_addr:       SocketAddr, // Bound to the originating connection
-    pub difficulty:      u64,
+    pub id: u64,
+    pub name: String,
+    pub address: String,
+    pub peer_addr: SocketAddr, // Bound to the originating connection
+    pub difficulty: u64,
     pub shares_accepted: u64,
     pub shares_rejected: u64,
-    pub hashrate:        f64,
-    pub connected_at:    u64,
-    pub last_share_at:   u64,
-    pub shares_in_window: u32, // Shares in current vardiff window
-    pub extra_nonce:     u64,  // Unique per-worker nonce prefix (assigned on subscribe)
+    pub hashrate: f64,
+    pub connected_at: u64,
+    pub last_share_at: u64,
+    pub shares_in_window: u32,           // Shares in current vardiff window
+    pub extra_nonce: u64,                // Unique per-worker nonce prefix (assigned on subscribe)
     pub pending_difficulty_update: bool, // True when vardiff changed and client needs notification
 }
 
 impl Worker {
-    pub fn new(id: u64, name: String, address: String, extra_nonce: u64, peer_addr: SocketAddr) -> Self {
+    pub fn new(
+        id: u64,
+        name: String,
+        address: String,
+        extra_nonce: u64,
+        peer_addr: SocketAddr,
+    ) -> Self {
         Self {
             id,
             name,
             address,
             peer_addr,
-            difficulty:       MIN_SHARE_DIFF,
-            shares_accepted:  0,
-            shares_rejected:  0,
-            hashrate:         0.0,
-            connected_at:     now_secs(),
-            last_share_at:    0,
+            difficulty: MIN_SHARE_DIFF,
+            shares_accepted: 0,
+            shares_rejected: 0,
+            hashrate: 0.0,
+            connected_at: now_secs(),
+            last_share_at: 0,
             shares_in_window: 0,
             extra_nonce,
             pending_difficulty_update: false,
@@ -179,7 +200,9 @@ impl Worker {
 
     /// Adjust difficulty based on share submission rate
     pub fn vardiff_adjust(&mut self) -> bool {
-        if self.shares_in_window == 0 { return false; }
+        if self.shares_in_window == 0 {
+            return false;
+        }
 
         let ratio = self.shares_in_window as f64 / TARGET_SHARES_PER_MIN as f64;
 
@@ -198,11 +221,17 @@ impl Worker {
         changed
     }
 
-    pub fn uptime_secs(&self) -> u64 { now_secs().saturating_sub(self.connected_at) }
-    pub fn total_shares(&self) -> u64 { self.shares_accepted + self.shares_rejected }
+    pub fn uptime_secs(&self) -> u64 {
+        now_secs().saturating_sub(self.connected_at)
+    }
+    pub fn total_shares(&self) -> u64 {
+        self.shares_accepted + self.shares_rejected
+    }
     pub fn acceptance_rate(&self) -> f64 {
         let total = self.total_shares();
-        if total == 0 { return 0.0; }
+        if total == 0 {
+            return 0.0;
+        }
         self.shares_accepted as f64 / total as f64
     }
 }
@@ -210,33 +239,41 @@ impl Worker {
 /// Block template sent to miners
 #[derive(Debug, Clone)]
 pub struct BlockTemplate {
-    pub job_id:       String,
-    pub version:      u32,
-    pub prev_hash:    String,
-    pub parents:      Vec<String>,
-    pub merkle_root:  String,
-    pub timestamp:    u64,
-    pub difficulty:   u64,
-    pub height:       u64,
-    pub extra_nonce:  u64,
-    pub clean_jobs:   bool, // True = discard previous work
+    pub job_id: String,
+    pub version: u32,
+    pub prev_hash: String,
+    pub parents: Vec<String>,
+    pub merkle_root: String,
+    pub timestamp: u64,
+    pub difficulty: u64,
+    pub height: u64,
+    pub extra_nonce: u64,
+    pub clean_jobs: bool, // True = discard previous work
 }
 
 impl BlockTemplate {
     pub fn to_notify_json(&self) -> String {
-        let parents_json: String = self.parents.iter()
+        let parents_json: String = self
+            .parents
+            .iter()
             .map(|p| format!("\"{}\"", p))
             .collect::<Vec<_>>()
             .join(",");
-        let ts_hex  = encode_hex_u64(self.timestamp);
+        let ts_hex = encode_hex_u64(self.timestamp);
         let diff_hex = encode_hex_u64(self.difficulty);
-        let en_hex  = encode_hex_u64(self.extra_nonce);
+        let en_hex = encode_hex_u64(self.extra_nonce);
         format!(
             "{{\"id\":null,\"method\":\"mining.notify\",\
              \"params\":[\"{}\",{},\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",[{}],{}]}}\n",
-            self.job_id, self.version, self.prev_hash, self.merkle_root,
-            ts_hex, diff_hex, en_hex,
-            parents_json, self.clean_jobs,
+            self.job_id,
+            self.version,
+            self.prev_hash,
+            self.merkle_root,
+            ts_hex,
+            diff_hex,
+            en_hex,
+            parents_json,
+            self.clean_jobs,
         )
     }
 
@@ -244,20 +281,29 @@ impl BlockTemplate {
     /// Unlike to_notify_json(), this is not wrapped in a mining.notify envelope
     /// and is suitable for embedding in a StratumResponse result field.
     pub fn to_getwork_json(&self) -> String {
-        let parents_json: String = self.parents.iter()
+        let parents_json: String = self
+            .parents
+            .iter()
             .map(|p| format!("\"{}\"", p))
             .collect::<Vec<_>>()
             .join(",");
-        let ts_hex  = encode_hex_u64(self.timestamp);
+        let ts_hex = encode_hex_u64(self.timestamp);
         let diff_hex = encode_hex_u64(self.difficulty);
-        let en_hex  = encode_hex_u64(self.extra_nonce);
+        let en_hex = encode_hex_u64(self.extra_nonce);
         format!(
             "{{\"job_id\":\"{}\",\"version\":{},\"prev_hash\":\"{}\",\"merkle_root\":\"{}\",\
              \"timestamp\":\"{}\",\"difficulty\":\"{}\",\
              \"extra_nonce\":\"{}\",\"height\":{},\"parents\":[{}],\"clean_jobs\":{}}}",
-            self.job_id, self.version, self.prev_hash, self.merkle_root,
-            ts_hex, diff_hex,
-            en_hex, self.height, parents_json, self.clean_jobs,
+            self.job_id,
+            self.version,
+            self.prev_hash,
+            self.merkle_root,
+            ts_hex,
+            diff_hex,
+            en_hex,
+            self.height,
+            parents_json,
+            self.clean_jobs,
         )
     }
 }
@@ -281,7 +327,8 @@ fn encode_hex_u64(value: u64) -> String {
     let hex = format!("{:016x}", value);
     debug_assert!(
         hex.len() == 16 && hex.chars().all(|c| c.is_ascii_hexdigit()),
-        "encode_hex_u64 produced invalid hex: {}", hex
+        "encode_hex_u64 produced invalid hex: {}",
+        hex
     );
     hex
 }
@@ -289,25 +336,25 @@ fn encode_hex_u64(value: u64) -> String {
 /// Stratum Server
 pub struct StratumServer {
     /// Connected workers
-    workers:         RwLock<HashMap<u64, Worker>>,
+    workers: RwLock<HashMap<u64, Worker>>,
     /// Current block template
     current_template: RwLock<Option<BlockTemplate>>,
     /// Next worker ID
-    next_worker_id:  AtomicU64,
+    next_worker_id: AtomicU64,
     /// Server port
-    port:            u16,
+    port: u16,
     /// Running flag
-    running:         AtomicBool,
+    running: AtomicBool,
     /// Total blocks found by pool
-    blocks_found:    AtomicU64,
+    blocks_found: AtomicU64,
     /// Pool hashrate (estimated)
-    _pool_hashrate:   AtomicU64,
+    _pool_hashrate: AtomicU64,
     /// Pending subscribe→authorize mapping: stores the worker_id assigned
     /// during Subscribe so the subsequent Authorize for the same connection
     /// retrieves the correct ID (fixes race condition with concurrent miners).
-    pending_subs:    RwLock<HashMap<SocketAddr, (u64, std::time::Instant)>>,
-    /// Share replay prevention: set of (job_id, nonce_hex, worker_name) tuples already seen.
-    seen_shares:     RwLock<HashSet<(String, String, String)>>,
+    pending_subs: RwLock<HashMap<SocketAddr, (u64, std::time::Instant)>>,
+    /// Share replay prevention: set of valid (job_id, nonce_hex, worker_id) tuples already accepted.
+    seen_shares: RwLock<HashSet<(String, String, u64)>>,
     /// Active TCP connection count (DoS protection).
     active_connections: AtomicU64,
 }
@@ -315,15 +362,15 @@ pub struct StratumServer {
 impl StratumServer {
     pub fn new(port: u16) -> Self {
         Self {
-            workers:          RwLock::new(HashMap::new()),
+            workers: RwLock::new(HashMap::new()),
             current_template: RwLock::new(None),
-            next_worker_id:   AtomicU64::new(1),
+            next_worker_id: AtomicU64::new(1),
             port,
-            running:          AtomicBool::new(false),
-            blocks_found:     AtomicU64::new(0),
-            _pool_hashrate:    AtomicU64::new(0),
-            pending_subs:     RwLock::new(HashMap::new()),
-            seen_shares:      RwLock::new(HashSet::new()),
+            running: AtomicBool::new(false),
+            blocks_found: AtomicU64::new(0),
+            _pool_hashrate: AtomicU64::new(0),
+            pending_subs: RwLock::new(HashMap::new()),
+            seen_shares: RwLock::new(HashSet::new()),
             active_connections: AtomicU64::new(0),
         }
     }
@@ -340,7 +387,9 @@ impl StratumServer {
 
                 // Evict entries older than TTL
                 let now = std::time::Instant::now();
-                subs.retain(|_, (_, created)| now.duration_since(*created).as_secs() < PENDING_SUB_TTL_SECS);
+                subs.retain(|_, (_, created)| {
+                    now.duration_since(*created).as_secs() < PENDING_SUB_TTL_SECS
+                });
 
                 // Reject if at capacity after eviction
                 if subs.len() >= MAX_PENDING_SUBS {
@@ -348,10 +397,13 @@ impl StratumServer {
                 }
 
                 subs.insert(peer_addr, (worker_id, now));
-                StratumResponse::ok(req.id, &format!(
-                    "{{\"subscription_id\":\"{:x}\",\"nonce1\":\"{:016x}\"}}",
-                    worker_id, worker_id
-                ))
+                StratumResponse::ok(
+                    req.id,
+                    &format!(
+                        "{{\"subscription_id\":\"{:x}\",\"nonce1\":\"{:016x}\"}}",
+                        worker_id, worker_id
+                    ),
+                )
             }
 
             StratumMethod::Authorize => {
@@ -359,7 +411,11 @@ impl StratumServer {
                 if worker_name.is_empty() {
                     return StratumResponse::err(req.id, "worker name required");
                 }
-                let address = worker_name.split('.').next().unwrap_or_default().to_string();
+                let address = worker_name
+                    .split('.')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
                 if address.is_empty() || address.len() < 10 {
                     return StratumResponse::err(req.id, "invalid mining address");
                 }
@@ -383,12 +439,19 @@ impl StratumServer {
                 // Retrieve the worker_id that was assigned during Subscribe for
                 // this connection. This eliminates the race where concurrent
                 // subscribe/authorize pairs could read the wrong ID.
-                let worker_id = match self.pending_subs.write()
+                let worker_id = match self
+                    .pending_subs
+                    .write()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&peer_addr)
                 {
                     Some((id, _created)) => id,
-                    None => return StratumResponse::err(req.id, "No pending subscription for this connection"),
+                    None => {
+                        return StratumResponse::err(
+                            req.id,
+                            "No pending subscription for this connection",
+                        )
+                    }
                 };
 
                 // Check for duplicate worker name
@@ -399,17 +462,23 @@ impl StratumServer {
                 drop(workers);
 
                 let worker = Worker::new(worker_id, worker_name, address, worker_id, peer_addr);
-                self.workers.write().unwrap_or_else(|e| e.into_inner()).insert(worker_id, worker);
+                self.workers
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(worker_id, worker);
 
                 StratumResponse::ok(req.id, "true")
             }
 
-            StratumMethod::Submit => {
-                self.handle_submit(req, peer_addr)
-            }
+            StratumMethod::Submit => self.handle_submit(req, peer_addr),
 
             StratumMethod::GetWork => {
-                match self.current_template.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                match self
+                    .current_template
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                {
                     Some(template) => StratumResponse::ok(req.id, &template.to_getwork_json()),
                     None => StratumResponse::err(req.id, "No work available"),
                 }
@@ -435,7 +504,10 @@ impl StratumServer {
         // share validation below, eliminating a TOCTOU race where the template
         // could change between the two reads.
         let template_snapshot = {
-            let template = self.current_template.read().unwrap_or_else(|e| e.into_inner());
+            let template = self
+                .current_template
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             match template.as_ref() {
                 Some(t) if t.job_id != *job_id => {
                     return StratumResponse::err(req.id, "Stale job_id");
@@ -446,28 +518,6 @@ impl StratumServer {
                 Some(t) => t.clone(),
             }
         };
-
-        // Share replay prevention: reject duplicate (job_id, nonce, worker) tuples.
-        // Include worker_name so two different workers submitting the same nonce
-        // for the same job are not falsely flagged as replays.
-        // Normalize nonce to lowercase to prevent case-bypass.
-        {
-            let share_key = (job_id.clone(), nonce_hex.to_lowercase(), worker_name.clone());
-            let mut seen = self.seen_shares.write().unwrap_or_else(|e| e.into_inner());
-            if !seen.insert(share_key.clone()) {
-                return StratumResponse::err(req.id, "Duplicate share");
-            }
-            // Prevent unbounded memory growth. Since HashSet has no
-            // ordering (can't distinguish "newest" from "oldest"),
-            // we clear and re-seed with the current share. This is safe
-            // because templates rotate frequently (clearing seen_shares
-            // on each template update), and the 100K threshold means
-            // this path fires rarely between rotations.
-            if seen.len() > 100_000 {
-                seen.clear();
-                seen.insert(share_key);
-            }
-        }
 
         // Find the submitting worker by name AND validate peer_addr matches
         let mut workers = self.workers.write().unwrap_or_else(|e| e.into_inner());
@@ -482,28 +532,67 @@ impl StratumServer {
             None => return StratumResponse::err(req.id, "Worker not authorized"),
         };
 
+        // Share replay prevention key for this worker/job/nonce.
+        let share_key = (job_id.clone(), nonce_hex.to_lowercase(), worker.id);
+        // Fast duplicate check before expensive hashing.
+        if self
+            .seen_shares
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&share_key)
+        {
+            return StratumResponse::err(req.id, "Duplicate share");
+        }
+
         let worker_difficulty = worker.difficulty;
         let worker_extra_nonce = worker.extra_nonce;
 
         // Validate share against the worker's current vardiff difficulty,
         // using the template snapshot captured above (avoids TOCTOU).
-        let share_valid = self.validate_share(nonce_hex, worker_difficulty, worker_extra_nonce, &template_snapshot);
+        let share_valid = self.validate_share(
+            nonce_hex,
+            worker_difficulty,
+            worker_extra_nonce,
+            &template_snapshot,
+        );
 
         if share_valid {
+            // Only accepted shares are inserted into replay cache. This prevents
+            // invalid-share floods from exhausting the replay set.
+            {
+                let mut seen = self.seen_shares.write().unwrap_or_else(|e| e.into_inner());
+
+                // Re-check under write lock to close races between parallel submits.
+                if seen.contains(&share_key) {
+                    return StratumResponse::err(req.id, "Duplicate share");
+                }
+
+                // If replay cache is full, prune stale job entries first.
+                if seen.len() >= 100_000 {
+                    seen.retain(|(jid, _, _)| jid == job_id);
+                    if seen.len() >= 100_000 {
+                        return StratumResponse::err(
+                            req.id,
+                            "Share replay cache saturated; wait for next job",
+                        );
+                    }
+                }
+
+                seen.insert(share_key);
+            }
+
             worker.accept_share();
 
             // Adjust difficulty when enough shares have accumulated in
             // the current window. The old approach (elapsed % 60 == 0)
             // was fragile — it could miss the exact second or fire
             // multiple times. Checking shares_in_window is deterministic.
-            if worker.shares_in_window >= TARGET_SHARES_PER_MIN {
-                if worker.vardiff_adjust() {
-                    // Flag the worker so the connection handler sends
-                    // mining.set_difficulty after writing the submit response.
-                    // We cannot write to the TCP stream here because
-                    // handle_submit has no access to the writer.
-                    worker.pending_difficulty_update = true;
-                }
+            if worker.shares_in_window >= TARGET_SHARES_PER_MIN && worker.vardiff_adjust() {
+                // Flag the worker so the connection handler sends
+                // mining.set_difficulty after writing the submit response.
+                // We cannot write to the TCP stream here because
+                // handle_submit has no access to the writer.
+                worker.pending_difficulty_update = true;
             }
 
             // Check if share also meets network difficulty (block found!)
@@ -520,10 +609,16 @@ impl StratumServer {
 
     /// Update the block template (called when new block arrives)
     pub fn update_template(&self, template: BlockTemplate) {
-        *self.current_template.write().unwrap_or_else(|e| e.into_inner()) = Some(template);
+        *self
+            .current_template
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(template);
         // New template means old job_id shares are stale — clear the replay
         // prevention set so it doesn't grow unbounded.
-        self.seen_shares.write().unwrap_or_else(|e| e.into_inner()).clear();
+        self.seen_shares
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Start the Stratum TCP server.
@@ -547,7 +642,9 @@ impl StratumServer {
         listener.set_nonblocking(true).ok();
 
         loop {
-            if !self.running.load(Ordering::Relaxed) { break; }
+            if !self.running.load(Ordering::Relaxed) {
+                break;
+            }
 
             match listener.accept() {
                 Ok((tcp_stream, _addr)) => {
@@ -584,13 +681,20 @@ impl StratumServer {
     /// Handle a single miner TCP connection.
     /// Reads newline-delimited JSON-RPC messages and responds to each.
     fn handle_connection(&self, stream: std::net::TcpStream) -> Result<(), NetworkError> {
-        stream.set_read_timeout(Some(Duration::from_secs(300)))
+        stream
+            .set_read_timeout(Some(Duration::from_secs(300)))
             .map_err(|e| NetworkError::ConnectionFailed(format!("set_read_timeout: {}", e)))?;
 
-        let peer_addr = stream.peer_addr().map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+        let peer_addr = stream
+            .peer_addr()
+            .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
         slog_info!("stratum", "miner_connected", peer => peer_addr);
 
-        let reader = BufReader::new(stream.try_clone().map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?);
+        let reader = BufReader::new(
+            stream
+                .try_clone()
+                .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?,
+        );
         let mut writer = stream;
 
         // Use a size-limited line reader instead of unbounded reader.lines()
@@ -601,7 +705,9 @@ impl StratumServer {
         const MAX_PARSE_ERRORS: u32 = 50;
         loop {
             line_buf.clear();
-            if !self.running.load(Ordering::Relaxed) { break; }
+            if !self.running.load(Ordering::Relaxed) {
+                break;
+            }
 
             // Read up to MAX_LINE_LENGTH bytes for a single line
             let bytes_read = {
@@ -614,20 +720,28 @@ impl StratumServer {
                     }
                 }
             };
-            if bytes_read == 0 { break; } // EOF — connection closed
+            if bytes_read == 0 {
+                break;
+            } // EOF — connection closed
 
             // If the line buffer is at limit but has no newline, the line is
             // too long. Discard and notify the client.
             if line_buf.len() >= MAX_LINE_LENGTH && !line_buf.ends_with('\n') {
                 slog_warn!("stratum", "line_too_long", peer => peer_addr, len => line_buf.len());
                 let err_resp = "{\"id\":null,\"result\":null,\"error\":\"Line too long\"}\n";
-                if writer.write_all(err_resp.as_bytes()).is_err() { break; }
+                if writer.write_all(err_resp.as_bytes()).is_err() {
+                    break;
+                }
                 // Drain the rest of the oversized line
                 let mut drain = [0u8; 1024];
                 loop {
                     match limited_reader.get_mut().read(&mut drain) {
                         Ok(0) => break,
-                        Ok(n) => { if drain[..n].contains(&b'\n') { break; } }
+                        Ok(n) => {
+                            if drain[..n].contains(&b'\n') {
+                                break;
+                            }
+                        }
                         Err(_) => break,
                     }
                 }
@@ -635,7 +749,9 @@ impl StratumServer {
             }
 
             let line = line_buf.trim().to_string();
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
 
             // Parse the JSON-RPC request
             let request = match Self::parse_json_rpc(&line) {
@@ -648,7 +764,8 @@ impl StratumServer {
                         break; // Disconnect — likely a misbehaving or malicious client
                     }
                     let err_resp = format!(
-                        "{{\"id\":null,\"result\":null,\"error\":\"Parse error: {}\"}}\n", e
+                        "{{\"id\":null,\"result\":null,\"error\":\"Parse error: {}\"}}\n",
+                        e
                     );
                     if let Err(e) = writer.write_all(err_resp.as_bytes()) {
                         slog_error!("stratum", "worker_write_failed", error => e);
@@ -689,8 +806,11 @@ impl StratumServer {
 
             // After subscribe, send the current block template if available
             if request.method == StratumMethod::Subscribe {
-                if let Some(template) = self.current_template.read()
-                    .unwrap_or_else(|e| e.into_inner()).as_ref()
+                if let Some(template) = self
+                    .current_template
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
                 {
                     let notify = template.to_notify_json();
                     if let Err(e) = writer.write_all(notify.as_bytes()) {
@@ -704,7 +824,9 @@ impl StratumServer {
         // Clean up any pending subscribe entry for this peer so that workers
         // who subscribed but disconnected before authorizing don't leak entries
         // in the pending_subs map.
-        self.pending_subs.write().unwrap_or_else(|e| e.into_inner())
+        self.pending_subs
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&peer_addr);
 
         // Remove all workers bound to this peer address on disconnect
@@ -724,20 +846,25 @@ impl StratumServer {
         let val: serde_json::Value = serde_json::from_str(line)
             .map_err(|e| NetworkError::Serialization(format!("invalid JSON: {}", e)))?;
 
-        let id = val.get("id")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let id = val.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
 
-        let method_str = val.get("method")
+        let method_str = val
+            .get("method")
             .and_then(|v| v.as_str())
             .ok_or_else(|| NetworkError::Serialization("missing 'method' field".to_string()))?;
 
-        let params: Vec<String> = val.get("params")
+        let params: Vec<String> = val
+            .get("params")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().map(|v| {
-                v.as_str().map(|s| s.to_string())
-                    .unwrap_or_else(|| v.to_string())
-            }).collect())
+            .map(|arr| {
+                arr.iter()
+                    .map(|v| {
+                        v.as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| v.to_string())
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
 
         Ok(StratumRequest {
@@ -753,18 +880,28 @@ impl StratumServer {
 
     // ── Stats ────────────────────────────────────────────────────────────
 
-    pub fn worker_count(&self) -> usize { self.workers.read().unwrap_or_else(|e| e.into_inner()).len() }
-    pub fn blocks_found(&self) -> u64 { self.blocks_found.load(Ordering::Relaxed) }
-    pub fn is_running(&self) -> bool { self.running.load(Ordering::Relaxed) }
+    pub fn worker_count(&self) -> usize {
+        self.workers.read().unwrap_or_else(|e| e.into_inner()).len()
+    }
+    pub fn blocks_found(&self) -> u64 {
+        self.blocks_found.load(Ordering::Relaxed)
+    }
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
 
     pub fn pool_stats(&self) -> String {
         let workers = self.workers.read().unwrap_or_else(|e| e.into_inner());
-        let total_shares: u64 = workers.values()
+        let total_shares: u64 = workers
+            .values()
             .try_fold(0u64, |acc, w| acc.checked_add(w.shares_accepted))
             .unwrap_or(u64::MAX);
         format!(
             "Workers: {} | Shares: {} | Blocks: {} | Port: {}",
-            workers.len(), total_shares, self.blocks_found(), self.port
+            workers.len(),
+            total_shares,
+            self.blocks_found(),
+            self.port
         )
     }
 
@@ -773,7 +910,13 @@ impl StratumServer {
     /// the worker's share difficulty target.
     /// The template is passed in directly (captured once in handle_submit)
     /// to eliminate the TOCTOU race of re-reading current_template.
-    fn validate_share(&self, nonce_hex: &str, share_difficulty: u64, worker_extra_nonce: u64, template: &BlockTemplate) -> bool {
+    fn validate_share(
+        &self,
+        nonce_hex: &str,
+        share_difficulty: u64,
+        worker_extra_nonce: u64,
+        template: &BlockTemplate,
+    ) -> bool {
         // A valid share must be a proper hex-encoded nonce
         if nonce_hex.is_empty() || nonce_hex.len() > 16 {
             return false;
@@ -806,7 +949,8 @@ impl StratumServer {
 
         // Check against the worker's current share difficulty target
         crate::engine::mining::pow::pow_validator::PowValidator::hash_meets_target(
-            &hash, share_difficulty,
+            &hash,
+            share_difficulty,
         )
     }
 
@@ -814,7 +958,12 @@ impl StratumServer {
     /// Recomputes the hash with ShadowHash and compares against network target.
     /// The template is passed in directly (captured once in handle_submit)
     /// to eliminate the TOCTOU race of re-reading current_template.
-    fn meets_network_difficulty(&self, nonce_hex: &str, worker_extra_nonce: u64, template: &BlockTemplate) -> bool {
+    fn meets_network_difficulty(
+        &self,
+        nonce_hex: &str,
+        worker_extra_nonce: u64,
+        template: &BlockTemplate,
+    ) -> bool {
         if nonce_hex.is_empty() || nonce_hex.len() > 16 {
             return false;
         }
@@ -841,7 +990,8 @@ impl StratumServer {
 
         // Check against the full network difficulty from the template
         crate::engine::mining::pow::pow_validator::PowValidator::hash_meets_target(
-            &hash, template.difficulty,
+            &hash,
+            template.difficulty,
         )
     }
 }
@@ -860,8 +1010,8 @@ pub enum PayoutScheme {
 impl PayoutScheme {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::PPS          => "PPS",
-            Self::PPLNS        => "PPLNS",
+            Self::PPS => "PPS",
+            Self::PPLNS => "PPLNS",
             Self::Proportional => "PROP",
         }
     }
@@ -872,10 +1022,15 @@ pub struct PayoutCalculator;
 
 impl PayoutCalculator {
     /// Calculate payouts for a found block using PPS scheme
-    pub fn calculate_pps(workers: &HashMap<u64, Worker>, block_reward: u64, pool_fee_pct: u64) -> HashMap<String, u64> {
+    pub fn calculate_pps(
+        workers: &HashMap<u64, Worker>,
+        block_reward: u64,
+        pool_fee_pct: u64,
+    ) -> HashMap<String, u64> {
         let pool_fee = block_reward * pool_fee_pct / 100;
         let distributable = block_reward - pool_fee;
-        let total_shares: u64 = match workers.values()
+        let total_shares: u64 = match workers
+            .values()
             .try_fold(0u64, |acc, w| acc.checked_add(w.shares_accepted))
         {
             Some(s) => s,
@@ -890,7 +1045,8 @@ impl PayoutCalculator {
 
         let mut payouts: HashMap<String, u64> = HashMap::new();
         for w in workers.values() {
-            let payout = (distributable as u128 * w.shares_accepted as u128 / total_shares as u128) as u64;
+            let payout =
+                (distributable as u128 * w.shares_accepted as u128 / total_shares as u128) as u64;
             *payouts.entry(w.address.clone()).or_insert(0) += payout;
         }
         payouts
@@ -902,11 +1058,17 @@ impl PayoutCalculator {
     /// distributing the block reward proportionally among those shares.
     /// Workers whose `shares_accepted` exceeds their share of the window are
     /// capped so the total does not exceed `window_size`.
-    pub fn calculate_pplns(workers: &HashMap<u64, Worker>, block_reward: u64, pool_fee_pct: u64, window_size: u64) -> HashMap<String, u64> {
+    pub fn calculate_pplns(
+        workers: &HashMap<u64, Worker>,
+        block_reward: u64,
+        pool_fee_pct: u64,
+        window_size: u64,
+    ) -> HashMap<String, u64> {
         let pool_fee = block_reward * pool_fee_pct / 100;
         let distributable = block_reward - pool_fee;
 
-        let total_shares: u64 = match workers.values()
+        let total_shares: u64 = match workers
+            .values()
             .try_fold(0u64, |acc, w| acc.checked_add(w.shares_accepted))
         {
             Some(s) => s,
@@ -927,8 +1089,8 @@ impl PayoutCalculator {
             // Scale each worker's shares into the window
             let windowed_shares = (w.shares_accepted as u128 * effective_window as u128
                 / total_shares as u128) as u64;
-            let payout = (distributable as u128 * windowed_shares as u128
-                / effective_window as u128) as u64;
+            let payout =
+                (distributable as u128 * windowed_shares as u128 / effective_window as u128) as u64;
             *payouts.entry(w.address.clone()).or_insert(0) += payout;
         }
         payouts
@@ -936,7 +1098,10 @@ impl PayoutCalculator {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -946,6 +1111,38 @@ mod tests {
     /// Helper: create a dummy peer address for tests.
     fn test_addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    fn authorize_worker(server: &StratumServer, addr: SocketAddr, worker_login: &str) {
+        let sub_req = StratumRequest {
+            id: 1,
+            method: StratumMethod::Subscribe,
+            params: vec![],
+        };
+        let _ = server.handle_request(&sub_req, addr);
+
+        let auth_req = StratumRequest {
+            id: 2,
+            method: StratumMethod::Authorize,
+            params: vec![worker_login.to_string()],
+        };
+        let resp = server.handle_request(&auth_req, addr);
+        assert!(resp.error.is_none(), "authorize failed: {:?}", resp.error);
+    }
+
+    fn install_template(server: &StratumServer, job_id: &str, difficulty: u64) {
+        server.update_template(BlockTemplate {
+            job_id: job_id.to_string(),
+            version: 1,
+            prev_hash: "0000abc".into(),
+            parents: vec!["0000abc".into()],
+            merkle_root: "merkle1".into(),
+            timestamp: 1735689600,
+            difficulty,
+            height: 1,
+            extra_nonce: 0,
+            clean_jobs: true,
+        });
     }
 
     #[test]
@@ -998,8 +1195,11 @@ mod tests {
         // 60 shares when target is 20 => ratio = 3.0
         worker.shares_in_window = 60;
         worker.vardiff_adjust();
-        assert!(worker.difficulty > 100,
-            "Difficulty should increase when shares exceed 2x target, got {}", worker.difficulty);
+        assert!(
+            worker.difficulty > 100,
+            "Difficulty should increase when shares exceed 2x target, got {}",
+            worker.difficulty
+        );
     }
 
     #[test]
@@ -1010,8 +1210,11 @@ mod tests {
         // 5 shares when target is 20 => ratio = 0.25
         worker.shares_in_window = 5;
         worker.vardiff_adjust();
-        assert!(worker.difficulty < 100,
-            "Difficulty should decrease when shares below 0.5x target, got {}", worker.difficulty);
+        assert!(
+            worker.difficulty < 100,
+            "Difficulty should decrease when shares below 0.5x target, got {}",
+            worker.difficulty
+        );
     }
 
     #[test]
@@ -1022,7 +1225,10 @@ mod tests {
         // 20 shares when target is 20 => ratio = 1.0
         worker.shares_in_window = 20;
         let changed = worker.vardiff_adjust();
-        assert!(!changed, "Difficulty should not change when ratio is in stable range");
+        assert!(
+            !changed,
+            "Difficulty should not change when ratio is in stable range"
+        );
         assert_eq!(worker.difficulty, 100);
     }
 
@@ -1033,7 +1239,10 @@ mod tests {
         worker.difficulty = MIN_SHARE_DIFF;
         worker.shares_in_window = 1; // ratio = 0.05 => wants to decrease below minimum
         worker.vardiff_adjust();
-        assert_eq!(worker.difficulty, MIN_SHARE_DIFF, "Difficulty should not go below MIN_SHARE_DIFF");
+        assert_eq!(
+            worker.difficulty, MIN_SHARE_DIFF,
+            "Difficulty should not go below MIN_SHARE_DIFF"
+        );
     }
 
     #[test]
@@ -1069,22 +1278,35 @@ mod tests {
         let server = StratumServer::new(7779);
         let addr1 = test_addr(9010);
         let addr2 = test_addr(9011);
-        let req1 = StratumRequest { id: 1, method: StratumMethod::Subscribe, params: vec![] };
-        let req2 = StratumRequest { id: 2, method: StratumMethod::Subscribe, params: vec![] };
+        let req1 = StratumRequest {
+            id: 1,
+            method: StratumMethod::Subscribe,
+            params: vec![],
+        };
+        let req2 = StratumRequest {
+            id: 2,
+            method: StratumMethod::Subscribe,
+            params: vec![],
+        };
         let resp1 = server.handle_request(&req1, addr1);
         let resp2 = server.handle_request(&req2, addr2);
         let r1 = resp1.result.unwrap();
         let r2 = resp2.result.unwrap();
         // Each subscription should return a different nonce1
-        assert_ne!(r1, r2, "Each worker must receive a unique nonce1 (extra_nonce)");
+        assert_ne!(
+            r1, r2,
+            "Each worker must receive a unique nonce1 (extra_nonce)"
+        );
     }
 
     #[test]
     fn workers_get_distinct_extra_nonce() {
         let w1 = Worker::new(1, "w1".into(), "a".into(), 1, test_addr(0));
         let w2 = Worker::new(2, "w2".into(), "a".into(), 2, test_addr(1));
-        assert_ne!(w1.extra_nonce, w2.extra_nonce,
-            "Workers must have distinct extra_nonce values");
+        assert_ne!(
+            w1.extra_nonce, w2.extra_nonce,
+            "Workers must have distinct extra_nonce values"
+        );
     }
 
     #[test]
@@ -1093,5 +1315,52 @@ mod tests {
         let stats = server.pool_stats();
         assert!(stats.contains("Workers: 0"));
         assert!(stats.contains("Port: 7779"));
+    }
+
+    #[test]
+    fn invalid_submit_does_not_pollute_replay_cache() {
+        let server = StratumServer::new(7779);
+        let addr = test_addr(9020);
+        authorize_worker(&server, addr, "SD1abc12345.worker1");
+        install_template(&server, "job1", 1);
+
+        let submit = StratumRequest {
+            id: 3,
+            method: StratumMethod::Submit,
+            params: vec!["SD1abc12345.worker1".into(), "job1".into(), "zzzz".into()],
+        };
+        let resp = server.handle_request(&submit, addr);
+        assert!(resp.error.is_some());
+
+        let seen = server.seen_shares.read().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            seen.len(),
+            0,
+            "invalid shares must not consume replay-cache slots"
+        );
+    }
+
+    #[test]
+    fn duplicate_valid_share_is_rejected() {
+        let server = StratumServer::new(7779);
+        let addr = test_addr(9021);
+        authorize_worker(&server, addr, "SD1abc12345.worker1");
+        install_template(&server, "job1", 1);
+
+        let submit = StratumRequest {
+            id: 4,
+            method: StratumMethod::Submit,
+            params: vec!["SD1abc12345.worker1".into(), "job1".into(), "1".into()],
+        };
+        let first = server.handle_request(&submit, addr);
+        assert!(
+            first.error.is_none(),
+            "first valid share should be accepted: {:?}",
+            first.error
+        );
+
+        let second = server.handle_request(&submit, addr);
+        assert!(second.error.is_some(), "duplicate share should be rejected");
+        assert!(second.error.unwrap_or_default().contains("Duplicate share"));
     }
 }

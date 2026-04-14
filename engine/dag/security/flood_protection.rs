@@ -20,7 +20,6 @@ pub const MAX_PAST_SECS: u64 = 600;
 pub struct FloodProtection;
 
 impl FloodProtection {
-
     pub fn validate(block: &Block) -> bool {
         // 1️⃣ Timestamp — wall-clock sanity only.
         //    Full timestamp validation (MTP, causality, jump limits) is in
@@ -50,7 +49,9 @@ impl FloodProtection {
 
 #[cfg(test)]
 fn fast_hex_to_u64(hex: &str) -> Option<u64> {
-    if hex.is_empty() { return None; }
+    if hex.is_empty() {
+        return None;
+    }
     let mut result: u64 = 0;
     for byte in hex.bytes() {
         let digit = match byte {
@@ -78,11 +79,14 @@ fn fallback_mix(data: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use crate::domain::block::block::Block;
-    use crate::domain::block::block_header::BlockHeader;
     use crate::domain::block::block_body::BlockBody;
+    use crate::domain::block::block_header::BlockHeader;
 
     fn now_secs() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 
     fn make_block_ts(nonce: u64, timestamp: u64, parents: Vec<&str>) -> Block {
@@ -103,7 +107,9 @@ mod tests {
                 receipt_root: None,
                 state_root: None,
             },
-            body: BlockBody { transactions: vec![] },
+            body: BlockBody {
+                transactions: vec![],
+            },
         }
     }
 

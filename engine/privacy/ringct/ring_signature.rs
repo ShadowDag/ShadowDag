@@ -21,11 +21,11 @@
 //   - Different key → different image → no linkability
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
+use curve25519_dalek::scalar::Scalar;
+use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use ed25519_dalek::SigningKey;
-use curve25519_dalek::scalar::Scalar;
+use sha2::{Digest, Sha256};
 
 use crate::domain::transaction::transaction::Transaction;
 use crate::errors::CryptoError;
@@ -42,7 +42,7 @@ pub const MAX_RING_SIZE: usize = 64;
 #[derive(Clone, Debug)]
 pub struct KeyImage {
     pub image: [u8; 32],
-    pub hex:   String,
+    pub hex: String,
 }
 
 impl KeyImage {
@@ -56,7 +56,10 @@ impl KeyImage {
         // DO NOT include tx_hash — key image must be per-key, not per-tx
         let mut image = [0u8; 32];
         image.copy_from_slice(&h.finalize());
-        Self { image, hex: hex::encode(image) }
+        Self {
+            image,
+            hex: hex::encode(image),
+        }
     }
 
     pub fn is_duplicate(&self, seen: &[String]) -> bool {
@@ -74,7 +77,9 @@ pub struct RingMember {
 }
 
 impl RingMember {
-    pub fn new(public_key: [u8; 32]) -> Self { Self { public_key } }
+    pub fn new(public_key: [u8; 32]) -> Self {
+        Self { public_key }
+    }
 
     pub fn random_decoy() -> Self {
         let sk = SigningKey::generate(&mut OsRng);
@@ -100,12 +105,12 @@ impl RingMember {
 
 #[derive(Clone, Debug)]
 pub struct RingSignatureData {
-    pub key_image:  KeyImage,
-    pub ring:       Vec<RingMember>,
-    pub c_values:   Vec<[u8; 32]>,
-    pub r_values:   Vec<[u8; 32]>,
-    pub message:    [u8; 32],
-    pub ring_size:  usize,
+    pub key_image: KeyImage,
+    pub ring: Vec<RingMember>,
+    pub c_values: Vec<[u8; 32]>,
+    pub r_values: Vec<[u8; 32]>,
+    pub message: [u8; 32],
+    pub ring_size: usize,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -119,8 +124,8 @@ impl RingSignature {
     /// Returns the full ring signature data.
     pub fn sign_with_key(
         private_key: &[u8; 32],
-        tx:          &Transaction,
-        decoy_pubs:  &[[u8; 32]],
+        tx: &Transaction,
+        decoy_pubs: &[[u8; 32]],
     ) -> Result<RingSignatureData, CryptoError> {
         let ring_size = (decoy_pubs.len() + 1).clamp(MIN_RING_SIZE, MAX_RING_SIZE);
 
@@ -200,9 +205,8 @@ impl RingSignature {
         // compute_link with the same code path.
 
         // Seed the challenge chain from the signer position using alpha
-        c_values[(signer_pos + 1) % ring_size] = Self::compute_link_core(
-            &message, &alpha, &key_image.image, signer_pos,
-        );
+        c_values[(signer_pos + 1) % ring_size] =
+            Self::compute_link_core(&message, &alpha, &key_image.image, signer_pos);
 
         // Fill all non-signer positions uniformly via compute_link.
         // Every iteration does identical work (hash_pubkey + scalar_mul + XOR + hash).
@@ -210,8 +214,12 @@ impl RingSignature {
             let i = (signer_pos + 1 + step) % ring_size;
             let next = (i + 1) % ring_size;
             c_values[next] = Self::compute_link(
-                &message, &ring[i].public_key, &r_values[i],
-                &c_values[i], &key_image.image, i,
+                &message,
+                &ring[i].public_key,
+                &r_values[i],
+                &c_values[i],
+                &key_image.image,
+                i,
             )?;
         }
 
@@ -227,7 +235,9 @@ impl RingSignature {
 
         // Verify ring closes before returning
         if !Self::verify_ring(&ring, &c_values, &r_values, &message, &key_image.image) {
-            return Err(CryptoError::Other("Ring signature failed to close".to_string()));
+            return Err(CryptoError::Other(
+                "Ring signature failed to close".to_string(),
+            ));
         }
 
         Ok(RingSignatureData {
@@ -242,11 +252,23 @@ impl RingSignature {
 
     /// Verify a ring signature (anyone can verify, only signer can create)
     pub fn verify_signature(sig: &RingSignatureData) -> bool {
-        if sig.ring.is_empty() || sig.ring.len() != sig.ring_size { return false; }
-        if sig.c_values.len() != sig.ring_size { return false; }
-        if sig.r_values.len() != sig.ring_size { return false; }
+        if sig.ring.is_empty() || sig.ring.len() != sig.ring_size {
+            return false;
+        }
+        if sig.c_values.len() != sig.ring_size {
+            return false;
+        }
+        if sig.r_values.len() != sig.ring_size {
+            return false;
+        }
 
-        Self::verify_ring(&sig.ring, &sig.c_values, &sig.r_values, &sig.message, &sig.key_image.image)
+        Self::verify_ring(
+            &sig.ring,
+            &sig.c_values,
+            &sig.r_values,
+            &sig.message,
+            &sig.key_image.image,
+        )
     }
 
     /// Verify the ring closes: recompute the ENTIRE chain from c[0] using
@@ -261,14 +283,16 @@ impl RingSignature {
     /// - We do NOT trust stored intermediate c_values — we recompute everything
     ///   from c[0] and the r_values, which makes forgery infeasible.
     fn verify_ring(
-        ring:      &[RingMember],
-        c_values:  &[[u8; 32]],
-        r_values:  &[[u8; 32]],
-        message:   &[u8; 32],
+        ring: &[RingMember],
+        c_values: &[[u8; 32]],
+        r_values: &[[u8; 32]],
+        message: &[u8; 32],
         key_image: &[u8; 32],
     ) -> bool {
         let n = ring.len();
-        if n == 0 || c_values.len() != n || r_values.len() != n { return false; }
+        if n == 0 || c_values.len() != n || r_values.len() != n {
+            return false;
+        }
 
         // Start from stored c[0] and recompute the FULL chain.
         // We only trust c[0] as the "anchor" — all other c_values are recomputed.
@@ -276,8 +300,12 @@ impl RingSignature {
 
         for i in 0..n {
             let c_next = match Self::compute_link(
-                message, &ring[i].public_key, &r_values[i],
-                &c_current, key_image, i,
+                message,
+                &ring[i].public_key,
+                &r_values[i],
+                &c_current,
+                key_image,
+                i,
             ) {
                 Ok(c) => c,
                 Err(_) => return false,
@@ -325,7 +353,9 @@ impl RingSignature {
         for input in &tx.inputs {
             // Only enforce ring data on inputs that claim to be confidential
             // (i.e., they have a key_image set, indicating privacy TX usage).
-            if input.key_image.is_some() || tx.tx_type == crate::domain::transaction::transaction::TxType::Confidential {
+            if input.key_image.is_some()
+                || tx.tx_type == crate::domain::transaction::transaction::TxType::Confidential
+            {
                 // Check key_image is present, non-empty, and valid 64 hex chars
                 match &input.key_image {
                     Some(ki) if ki.len() == 64 && ki.chars().all(|c| c.is_ascii_hexdigit()) => {}
@@ -333,7 +363,10 @@ impl RingSignature {
                 }
                 // Check ring_members is present and non-empty
                 match &input.ring_members {
-                    Some(members) if !members.is_empty() && members.len() >= MIN_RING_SIZE && members.len() <= MAX_RING_SIZE => {}
+                    Some(members)
+                        if !members.is_empty()
+                            && members.len() >= MIN_RING_SIZE
+                            && members.len() <= MAX_RING_SIZE => {}
                     _ => return false,
                 }
             }
@@ -345,13 +378,13 @@ impl RingSignature {
     /// Extract the key image from a transaction's first input.
     /// Returns None if the transaction has no inputs or no key image.
     pub fn key_image(tx: &Transaction) -> Option<String> {
-        tx.inputs.first()
-            .and_then(|input| input.key_image.clone())
+        tx.inputs.first().and_then(|input| input.key_image.clone())
     }
 
     /// Extract all key images from a transaction's inputs.
     pub fn key_images(tx: &Transaction) -> Vec<String> {
-        tx.inputs.iter()
+        tx.inputs
+            .iter()
             .filter_map(|input| input.key_image.clone())
             .collect()
     }
@@ -373,8 +406,13 @@ impl RingSignature {
         h.update(tx.hash.as_bytes());
         h.update(tx.timestamp.to_le_bytes());
         h.update(tx.fee.to_le_bytes());
-        for inp in &tx.inputs  { h.update(inp.txid.as_bytes()); }
-        for out in &tx.outputs { h.update(out.address.as_bytes()); h.update(out.amount.to_le_bytes()); }
+        for inp in &tx.inputs {
+            h.update(inp.txid.as_bytes());
+        }
+        for out in &tx.outputs {
+            h.update(out.address.as_bytes());
+            h.update(out.amount.to_le_bytes());
+        }
         let mut out = [0u8; 32];
         out.copy_from_slice(&h.finalize());
         out
@@ -390,8 +428,12 @@ impl RingSignature {
     /// the effective_r at the signer position equals alpha, producing
     /// the same challenge as compute_link_from_alpha.
     fn compute_link(
-        message: &[u8; 32], pub_key: &[u8; 32], r_val: &[u8; 32],
-        c_val: &[u8; 32], key_image: &[u8; 32], index: usize,
+        message: &[u8; 32],
+        pub_key: &[u8; 32],
+        r_val: &[u8; 32],
+        c_val: &[u8; 32],
+        key_image: &[u8; 32],
+        index: usize,
     ) -> Result<[u8; 32], CryptoError> {
         // Simulate: effective_r = r XOR (c * H(pk))
         let pk_hash = Self::hash_pubkey(pub_key);
@@ -400,13 +442,20 @@ impl RingSignature {
         for j in 0..32 {
             effective_r[j] = r_val[j] ^ c_times_pk[j];
         }
-        Ok(Self::compute_link_core(message, &effective_r, key_image, index))
+        Ok(Self::compute_link_core(
+            message,
+            &effective_r,
+            key_image,
+            index,
+        ))
     }
 
     /// Core challenge computation — same hash for both signing and verification.
     fn compute_link_core(
-        message: &[u8; 32], effective_r: &[u8; 32],
-        key_image: &[u8; 32], index: usize,
+        message: &[u8; 32],
+        effective_r: &[u8; 32],
+        key_image: &[u8; 32],
+        index: usize,
     ) -> [u8; 32] {
         let mut h = Sha256::new();
         h.update(b"ShadowDAG_Link_v4");
@@ -442,19 +491,30 @@ impl RingSignature {
         let product = sa * sb;
         Ok(product.to_bytes())
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::transaction::transaction::{Transaction, TxOutput, TxInput, TxType};
+    use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
 
     fn make_tx(hash: &str) -> Transaction {
         Transaction {
             hash: hash.to_string(),
-            inputs: vec![TxInput::new("prev".into(), 0, "alice".into(), "sig".into(), "pk".into())],
-            outputs: vec![TxOutput { address: "bob".into(), amount: 1000, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            inputs: vec![TxInput::new(
+                "prev".into(),
+                0,
+                "alice".into(),
+                "sig".into(),
+                "pk".into(),
+            )],
+            outputs: vec![TxOutput {
+                address: "bob".into(),
+                amount: 1000,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee: 10,
             timestamp: 1735689600,
             is_coinbase: false,
@@ -471,7 +531,10 @@ mod tests {
         let tx = make_tx("test_tx_001");
 
         let sig = RingSignature::sign_with_key(&private_key, &tx, &[]).unwrap();
-        assert!(RingSignature::verify_signature(&sig), "Valid signature must verify");
+        assert!(
+            RingSignature::verify_signature(&sig),
+            "Valid signature must verify"
+        );
     }
 
     #[test]
@@ -495,7 +558,10 @@ mod tests {
     fn different_keys_different_images() {
         let ki1 = KeyImage::from_private_key(&[1u8; 32]);
         let ki2 = KeyImage::from_private_key(&[2u8; 32]);
-        assert_ne!(ki1.hex, ki2.hex, "Different keys must have different images");
+        assert_ne!(
+            ki1.hex, ki2.hex,
+            "Different keys must have different images"
+        );
     }
 
     #[test]
@@ -517,10 +583,16 @@ mod tests {
 
             if let Ok(mut sig) = RingSignature::sign_with_key(&pk, &tx, &[]) {
                 // Verify it works first
-                assert!(RingSignature::verify_signature(&sig), "Fresh sig must verify");
+                assert!(
+                    RingSignature::verify_signature(&sig),
+                    "Fresh sig must verify"
+                );
                 // Now tamper
                 sig.c_values[0][0] ^= 0xFF;
-                assert!(!RingSignature::verify_signature(&sig), "Tampered sig must fail");
+                assert!(
+                    !RingSignature::verify_signature(&sig),
+                    "Tampered sig must fail"
+                );
                 return;
             }
         }
@@ -565,10 +637,18 @@ mod tests {
             if let Ok(sig) = RingSignature::sign_with_key(&pk, &tx, &[]) {
                 let pk_hex = hex::encode(pk);
                 for c in &sig.c_values {
-                    assert_ne!(hex::encode(c), pk_hex, "Private key must not leak in c_values");
+                    assert_ne!(
+                        hex::encode(c),
+                        pk_hex,
+                        "Private key must not leak in c_values"
+                    );
                 }
                 for r in &sig.r_values {
-                    assert_ne!(hex::encode(r), pk_hex, "Private key must not leak in r_values");
+                    assert_ne!(
+                        hex::encode(r),
+                        pk_hex,
+                        "Private key must not leak in r_values"
+                    );
                 }
                 return;
             }
@@ -580,10 +660,16 @@ mod tests {
         let seed = b"block_context_seed_12345678901234567890";
         let d1 = RingMember::deterministic_decoy(seed, 0);
         let d2 = RingMember::deterministic_decoy(seed, 0);
-        assert_eq!(d1.public_key, d2.public_key, "Same seed+index must produce same decoy");
+        assert_eq!(
+            d1.public_key, d2.public_key,
+            "Same seed+index must produce same decoy"
+        );
 
         let d3 = RingMember::deterministic_decoy(seed, 1);
-        assert_ne!(d1.public_key, d3.public_key, "Different index must produce different decoy");
+        assert_ne!(
+            d1.public_key, d3.public_key,
+            "Different index must produce different decoy"
+        );
     }
 
     #[test]
@@ -593,7 +679,11 @@ mod tests {
         tx.inputs[0].key_image = Some(ki_hex.clone());
 
         let extracted = RingSignature::key_image(&tx);
-        assert_eq!(extracted, Some(ki_hex), "key_image must read from tx input, not generate random");
+        assert_eq!(
+            extracted,
+            Some(ki_hex),
+            "key_image must read from tx input, not generate random"
+        );
     }
 
     #[test]
@@ -610,8 +700,13 @@ mod tests {
         let mut tx = make_tx("multi_ki_test");
         tx.inputs[0].key_image = Some(ki1.clone());
         tx.inputs.push(TxInput::new_confidential(
-            "prev2".into(), 1, "alice".into(), "sig2".into(), "pk2".into(),
-            ki2.clone(), vec!["decoy".into()],
+            "prev2".into(),
+            1,
+            "alice".into(),
+            "sig2".into(),
+            "pk2".into(),
+            ki2.clone(),
+            vec!["decoy".into()],
         ));
 
         let kis = RingSignature::key_images(&tx);

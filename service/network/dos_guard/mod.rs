@@ -3,39 +3,39 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::errors::NetworkError;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH, Instant};
-use crate::errors::NetworkError;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // ── Token bucket tuning ────────────────────────────────────────────────
 // At 32 BPS: legitimate traffic ≈ 32 blocks/sec × 8 tok + TX relay + INV
 // ≈ 400–600 tok/sec.  Refill must exceed this with headroom for bursts.
 // At 10 BPS: ~120 tok/sec steady → plenty of room.
 // Capacity = 5 sec burst buffer at max refill rate.
-pub const BUCKET_REFILL_RATE:     f64 = 800.0;
-pub const BUCKET_CAPACITY:        f64 = 4_000.0;
+pub const BUCKET_REFILL_RATE: f64 = 800.0;
+pub const BUCKET_CAPACITY: f64 = 4_000.0;
 
 // ── Per-message token costs ────────────────────────────────────────────
 // Tuned so at 32 BPS, block relay alone = 32 × 8 = 256 tok/sec
 // (well within 800/sec refill).  Previous COST_BLOCK=20 caused
 // false-positive rate-limiting at high BPS.
-pub const COST_MSG_DEFAULT:       f64 = 1.0;
-pub const COST_TX:                f64 = 3.0;
-pub const COST_BLOCK:             f64 = 8.0;
-pub const COST_GETDATA:           f64 = 2.0;
-pub const COST_INV:               f64 = 1.0;
-pub const COST_ADDR:              f64 = 1.0;
-pub const COST_HEADERS:           f64 = 3.0;
-pub const COST_GETBLOCKS:         f64 = 5.0;
-pub const COST_MEMPOOL:           f64 = 10.0;
+pub const COST_MSG_DEFAULT: f64 = 1.0;
+pub const COST_TX: f64 = 3.0;
+pub const COST_BLOCK: f64 = 8.0;
+pub const COST_GETDATA: f64 = 2.0;
+pub const COST_INV: f64 = 1.0;
+pub const COST_ADDR: f64 = 1.0;
+pub const COST_HEADERS: f64 = 3.0;
+pub const COST_GETBLOCKS: f64 = 5.0;
+pub const COST_MEMPOOL: f64 = 10.0;
 
-pub const BAN_SCORE_AUTOBAN:      u64 = 100;
-pub const BAN_SCORE_SEVERE:       u64 = 50;
-pub const BAN_SCORE_MINOR:        u64 = 10;
-pub const BAN_DURATION_SECS:      u64 = 86_400;
-pub const BAN_DURATION_SEVERE:    u64 = 604_800;
-pub const BAN_DECAY_PER_MINUTE:   u64 = 1;
+pub const BAN_SCORE_AUTOBAN: u64 = 100;
+pub const BAN_SCORE_SEVERE: u64 = 50;
+pub const BAN_SCORE_MINOR: u64 = 10;
+pub const BAN_DURATION_SECS: u64 = 86_400;
+pub const BAN_DURATION_SEVERE: u64 = 604_800;
+pub const BAN_DECAY_PER_MINUTE: u64 = 1;
 
 // ── Offense categories ─────────────────────────────────────────────────
 /// Categorise offenses so decay, ban duration, and repeat-offender
@@ -46,7 +46,7 @@ pub enum BanCategory {
     /// Resource / rate abuse: token bucket exhaustion, bandwidth flooding,
     /// queue quota exceeded, slow responses. Often transient.
     /// Fastest decay, shortest bans.
-    Resource  = 0,
+    Resource = 0,
     /// Structural / parsing errors: bad deserialization, oversized payload,
     /// invalid checksums, malformed fields. Could be buggy client or attack.
     /// Moderate decay and ban duration.
@@ -66,7 +66,7 @@ impl BanCategory {
         match self {
             BanCategory::Malicious => 1,
             BanCategory::Malformed => 2,
-            BanCategory::Resource  => 5,
+            BanCategory::Resource => 5,
         }
     }
 
@@ -78,14 +78,14 @@ impl BanCategory {
         match self {
             BanCategory::Malicious => 86_400,
             BanCategory::Malformed => 21_600,
-            BanCategory::Resource  => 3_600,
+            BanCategory::Resource => 3_600,
         }
     }
 
     /// Severity rank for ordering (higher = worse).
     const fn severity(&self) -> u8 {
         match self {
-            BanCategory::Resource  => 0,
+            BanCategory::Resource => 0,
             BanCategory::Malformed => 1,
             BanCategory::Malicious => 2,
         }
@@ -93,16 +93,20 @@ impl BanCategory {
 
     /// Return the more severe of two categories.
     pub fn escalate(self, other: BanCategory) -> BanCategory {
-        if other.severity() > self.severity() { other } else { self }
+        if other.severity() > self.severity() {
+            other
+        } else {
+            self
+        }
     }
 }
 
-pub const MAX_MSG_BYTES:          usize = 4 * 1024 * 1024;
-pub const MAX_BLOCK_BYTES:        usize = 2 * 1024 * 1024;
-pub const MAX_TX_BYTES:           usize = 100_000;
-pub const MAX_HEADERS_PER_MSG:    usize = 2_000;
-pub const MAX_INV_PER_MSG:        usize = 5_000;
-pub const MAX_ADDR_PER_MSG:       usize = 1_000;
+pub const MAX_MSG_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_BLOCK_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_TX_BYTES: usize = 100_000;
+pub const MAX_HEADERS_PER_MSG: usize = 2_000;
+pub const MAX_INV_PER_MSG: usize = 5_000;
+pub const MAX_ADDR_PER_MSG: usize = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MsgType {
@@ -127,35 +131,38 @@ pub enum MsgType {
 impl MsgType {
     pub fn token_cost(&self) -> f64 {
         match self {
-            MsgType::Tx         => COST_TX,
-            MsgType::Block      => COST_BLOCK,
-            MsgType::GetData    => COST_GETDATA,
-            MsgType::Inv        => COST_INV,
-            MsgType::Addr       => COST_ADDR,
-            MsgType::Headers    => COST_HEADERS,
-            MsgType::GetBlocks  => COST_GETBLOCKS,
-            MsgType::Mempool    => COST_MEMPOOL,
-            _                   => COST_MSG_DEFAULT,
+            MsgType::Tx => COST_TX,
+            MsgType::Block => COST_BLOCK,
+            MsgType::GetData => COST_GETDATA,
+            MsgType::Inv => COST_INV,
+            MsgType::Addr => COST_ADDR,
+            MsgType::Headers => COST_HEADERS,
+            MsgType::GetBlocks => COST_GETBLOCKS,
+            MsgType::Mempool => COST_MEMPOOL,
+            _ => COST_MSG_DEFAULT,
         }
     }
 
     pub fn max_size(&self) -> Option<usize> {
         match self {
-            MsgType::Block   => Some(MAX_BLOCK_BYTES),
-            MsgType::Tx      => Some(MAX_TX_BYTES),
-            _                => Some(MAX_MSG_BYTES),
+            MsgType::Block => Some(MAX_BLOCK_BYTES),
+            MsgType::Tx => Some(MAX_TX_BYTES),
+            _ => Some(MAX_MSG_BYTES),
         }
     }
 }
 
 struct TokenBucket {
-    tokens:      f64,
+    tokens: f64,
     last_refill: Instant,
 }
 
 impl TokenBucket {
     fn new() -> Self {
-        Self { tokens: BUCKET_CAPACITY, last_refill: Instant::now() }
+        Self {
+            tokens: BUCKET_CAPACITY,
+            last_refill: Instant::now(),
+        }
     }
 
     fn refill(&mut self) {
@@ -173,30 +180,33 @@ impl TokenBucket {
             false
         }
     }
-
 }
 
 #[derive(Debug, Clone)]
 struct BanRecord {
-    score:           u64,
-    banned:          bool,
-    ban_until:       u64,
-    last_decay:      u64,
-    reason:          String,
+    score: u64,
+    banned: bool,
+    ban_until: u64,
+    last_decay: u64,
+    reason: String,
     /// How many times this peer has been auto-banned. Persists across ban
     /// expirations so repeat offenders get escalating penalties.
-    ban_count:       u32,
+    ban_count: u32,
     /// Highest-severity category seen during the current scoring cycle.
     /// Drives decay rate and ban duration selection.
-    worst_category:  BanCategory,
+    worst_category: BanCategory,
 }
 
 impl BanRecord {
     fn new() -> Self {
         Self {
-            score: 0, banned: false, ban_until: 0,
-            last_decay: unix_now(), reason: String::new(),
-            ban_count: 0, worst_category: BanCategory::Resource,
+            score: 0,
+            banned: false,
+            ban_until: 0,
+            last_decay: unix_now(),
+            reason: String::new(),
+            ban_count: 0,
+            worst_category: BanCategory::Resource,
         }
     }
 
@@ -214,14 +224,16 @@ impl BanRecord {
 
         // Repeat-offender multiplier: 1× first time, 2× after 1 ban, 4× after 2, cap 8×
         let multiplier = 1u64 << self.ban_count.min(3); // 1, 2, 4, 8
-        let effective  = points.saturating_mul(multiplier);
+        let effective = points.saturating_mul(multiplier);
 
         self.score = self.score.saturating_add(effective);
-        if !self.reason.is_empty() { self.reason.push_str("; "); }
+        if !self.reason.is_empty() {
+            self.reason.push_str("; ");
+        }
         self.reason.push_str(reason);
 
         if self.score >= BAN_SCORE_AUTOBAN && !self.banned {
-            self.banned    = true;
+            self.banned = true;
             self.ban_count = self.ban_count.saturating_add(1);
             self.ban_until = unix_now() + self.compute_ban_duration();
             return true;
@@ -265,7 +277,7 @@ impl BanRecord {
         // but keep ban_count for repeat-offender escalation.
         if self.banned && now >= self.ban_until {
             self.banned = false;
-            self.score  = 0;
+            self.score = 0;
             self.worst_category = BanCategory::Resource;
             self.reason.clear();
         }
@@ -284,14 +296,20 @@ struct GlobalLimits {
 }
 
 impl GlobalLimits {
-    fn new() -> Self { Self { tx_count_per_sec: 0, block_count_per_sec: 0, last_reset: unix_now() } }
+    fn new() -> Self {
+        Self {
+            tx_count_per_sec: 0,
+            block_count_per_sec: 0,
+            last_reset: unix_now(),
+        }
+    }
 
     fn tick(&mut self) {
         let now = unix_now();
         if now > self.last_reset {
-            self.tx_count_per_sec    = 0;
+            self.tx_count_per_sec = 0;
             self.block_count_per_sec = 0;
-            self.last_reset          = now;
+            self.last_reset = now;
         }
     }
 
@@ -317,10 +335,10 @@ impl GlobalLimits {
 }
 
 pub struct DosGuard {
-    buckets:       Arc<Mutex<HashMap<String, TokenBucket>>>,
-    bans:          Arc<RwLock<HashMap<String, BanRecord>>>,
-    global:        Arc<Mutex<GlobalLimits>>,
-    max_tx_per_s:  u64,
+    buckets: Arc<Mutex<HashMap<String, TokenBucket>>>,
+    bans: Arc<RwLock<HashMap<String, BanRecord>>>,
+    global: Arc<Mutex<GlobalLimits>>,
+    max_tx_per_s: u64,
     max_blk_per_s: u64,
 }
 
@@ -331,17 +349,17 @@ impl DosGuard {
         //     gives ~6× headroom over single-node relay duty
         //   - 32 BPS × 4 (DAG width) = 128 blocks/sec max → 200 limit
         Self {
-            buckets:       Arc::new(Mutex::new(HashMap::new())),
-            bans:          Arc::new(RwLock::new(HashMap::new())),
-            global:        Arc::new(Mutex::new(GlobalLimits::new())),
-            max_tx_per_s:  50_000,
+            buckets: Arc::new(Mutex::new(HashMap::new())),
+            bans: Arc::new(RwLock::new(HashMap::new())),
+            global: Arc::new(Mutex::new(GlobalLimits::new())),
+            max_tx_per_s: 50_000,
             max_blk_per_s: 200,
         }
     }
 
     pub fn with_limits(max_tx_per_s: u64, max_blk_per_s: u64) -> Self {
         let mut g = Self::new();
-        g.max_tx_per_s  = max_tx_per_s;
+        g.max_tx_per_s = max_tx_per_s;
         g.max_blk_per_s = max_blk_per_s;
         g
     }
@@ -353,19 +371,37 @@ impl DosGuard {
 
         if let Some(max) = msg_type.max_size() {
             if msg_size > max {
-                self.add_ban_score_cat(peer, BAN_SCORE_SEVERE, "oversized message", BanCategory::Malformed);
-                return DosVerdict::OversizedMessage { allowed: max, got: msg_size };
+                self.add_ban_score_cat(
+                    peer,
+                    BAN_SCORE_SEVERE,
+                    "oversized message",
+                    BanCategory::Malformed,
+                );
+                return DosVerdict::OversizedMessage {
+                    allowed: max,
+                    got: msg_size,
+                };
             }
         }
 
         match msg_type {
             MsgType::Tx => {
-                if !self.global.lock().unwrap_or_else(|e| e.into_inner()).check_tx(self.max_tx_per_s) {
+                if !self
+                    .global
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .check_tx(self.max_tx_per_s)
+                {
                     return DosVerdict::GlobalRateLimited;
                 }
             }
             MsgType::Block => {
-                if !self.global.lock().unwrap_or_else(|e| e.into_inner()).check_block(self.max_blk_per_s) {
+                if !self
+                    .global
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .check_block(self.max_blk_per_s)
+                {
                     return DosVerdict::GlobalRateLimited;
                 }
             }
@@ -375,12 +411,21 @@ impl DosGuard {
         let cost = msg_type.token_cost();
         let allowed = {
             let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-            let bucket = buckets.entry(peer.to_string()).or_insert_with(TokenBucket::new);
+            let bucket = buckets
+                .entry(peer.to_string())
+                .or_insert_with(TokenBucket::new);
             bucket.consume(cost)
         };
         if !allowed {
-            self.add_ban_score_cat(peer, BAN_SCORE_MINOR, "rate exceeded", BanCategory::Resource);
-            return DosVerdict::RateLimited { peer: peer.to_string() };
+            self.add_ban_score_cat(
+                peer,
+                BAN_SCORE_MINOR,
+                "rate exceeded",
+                BanCategory::Resource,
+            );
+            return DosVerdict::RateLimited {
+                peer: peer.to_string(),
+            };
         }
 
         DosVerdict::Allow
@@ -392,7 +437,13 @@ impl DosGuard {
     ///   - **Decay rate**: Malicious decays slowly, Resource decays fast
     ///   - **Ban duration**: Malicious → 24h base, Resource → 1h base
     ///   - **Repeat multiplier**: Score × 2^ban_count (cap 8×)
-    pub fn add_ban_score_cat(&self, peer: &str, points: u64, reason: &str, category: BanCategory) -> bool {
+    pub fn add_ban_score_cat(
+        &self,
+        peer: &str,
+        points: u64,
+        reason: &str,
+        category: BanCategory,
+    ) -> bool {
         let mut bans = self.bans.write().unwrap_or_else(|e| e.into_inner());
         let rec = bans.entry(peer.to_string()).or_insert_with(BanRecord::new);
         let banned = rec.add_score(points, reason, category);
@@ -416,17 +467,17 @@ impl DosGuard {
     pub fn ban_peer(&self, peer: &str, duration_secs: u64, reason: &str) {
         let mut bans = self.bans.write().unwrap_or_else(|e| e.into_inner());
         let rec = bans.entry(peer.to_string()).or_insert_with(BanRecord::new);
-        rec.banned    = true;
+        rec.banned = true;
         rec.ban_until = unix_now() + duration_secs;
-        rec.reason    = reason.to_string();
+        rec.reason = reason.to_string();
     }
 
     pub fn unban_peer(&self, peer: &str) {
         let mut bans = self.bans.write().unwrap_or_else(|e| e.into_inner());
         if let Some(rec) = bans.get_mut(peer) {
-            rec.banned         = false;
-            rec.score          = 0;
-            rec.ban_until      = 0;
+            rec.banned = false;
+            rec.score = 0;
+            rec.ban_until = 0;
             rec.worst_category = BanCategory::Resource;
             rec.reason.clear();
         }
@@ -448,12 +499,12 @@ impl DosGuard {
     pub fn get_ban_info(&self, peer: &str) -> Option<BanInfo> {
         let bans = self.bans.read().unwrap_or_else(|e| e.into_inner());
         bans.get(peer).map(|r| BanInfo {
-            score:          r.score,
-            banned:         r.banned,
-            ban_until:      r.ban_until,
-            ban_count:      r.ban_count,
+            score: r.score,
+            banned: r.banned,
+            ban_until: r.ban_until,
+            ban_count: r.ban_count,
             worst_category: r.worst_category,
-            reason:         r.reason.clone(),
+            reason: r.reason.clone(),
         })
     }
 
@@ -465,7 +516,7 @@ impl DosGuard {
     }
 
     pub fn evict_inactive(&self) {
-        let mut bans    = self.bans.write().unwrap_or_else(|e| e.into_inner());
+        let mut bans = self.bans.write().unwrap_or_else(|e| e.into_inner());
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
         bans.retain(|_, r| r.banned || r.score > 0);
 
@@ -483,7 +534,10 @@ impl DosGuard {
 
     pub fn check_block_size(&self, size: usize) -> Result<(), NetworkError> {
         if size > MAX_BLOCK_BYTES {
-            Err(NetworkError::DosGuard(format!("Block too large: {} > {}", size, MAX_BLOCK_BYTES)))
+            Err(NetworkError::DosGuard(format!(
+                "Block too large: {} > {}",
+                size, MAX_BLOCK_BYTES
+            )))
         } else {
             Ok(())
         }
@@ -491,7 +545,10 @@ impl DosGuard {
 
     pub fn check_tx_size(&self, size: usize) -> Result<(), NetworkError> {
         if size > MAX_TX_BYTES {
-            Err(NetworkError::DosGuard(format!("Tx too large: {} > {}", size, MAX_TX_BYTES)))
+            Err(NetworkError::DosGuard(format!(
+                "Tx too large: {} > {}",
+                size, MAX_TX_BYTES
+            )))
         } else {
             Ok(())
         }
@@ -499,41 +556,48 @@ impl DosGuard {
 }
 
 impl Default for DosGuard {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum DosVerdict {
     Allow,
     BanActive,
-    RateLimited  { peer: String },
+    RateLimited { peer: String },
     GlobalRateLimited,
     OversizedMessage { allowed: usize, got: usize },
 }
 
 impl DosVerdict {
-    pub fn is_allowed(&self) -> bool { matches!(self, DosVerdict::Allow) }
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, DosVerdict::Allow)
+    }
 }
 
 #[derive(Debug)]
 pub struct DosStats {
-    pub tracked_peers:    usize,
+    pub tracked_peers: usize,
     pub currently_banned: usize,
 }
 
 /// Public snapshot of a peer's ban state (for RPC / diagnostics).
 #[derive(Debug, Clone)]
 pub struct BanInfo {
-    pub score:          u64,
-    pub banned:         bool,
-    pub ban_until:      u64,
-    pub ban_count:      u32,
+    pub score: u64,
+    pub banned: bool,
+    pub ban_until: u64,
+    pub ban_count: u32,
     pub worst_category: BanCategory,
-    pub reason:         String,
+    pub reason: String,
 }
 
 fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -654,7 +718,12 @@ mod tests {
         let g = DosGuard::new();
         // Resource offenses accumulate
         for i in 0..10 {
-            g.add_ban_score_cat("ratelimited", 10, &format!("rate #{}", i), BanCategory::Resource);
+            g.add_ban_score_cat(
+                "ratelimited",
+                10,
+                &format!("rate #{}", i),
+                BanCategory::Resource,
+            );
         }
         assert!(g.is_banned("ratelimited"));
         let info = g.get_ban_info("ratelimited").unwrap();
@@ -698,7 +767,10 @@ mod tests {
 
         // Second cycle: multiplier = 2×, so 50 pts becomes 100 → instant ban
         let banned = g.add_ban_score_cat("repeat", 50, "second", BanCategory::Malformed);
-        assert!(banned, "repeat offender should ban faster with 2× multiplier");
+        assert!(
+            banned,
+            "repeat offender should ban faster with 2× multiplier"
+        );
         let info = g.get_ban_info("repeat").unwrap();
         assert_eq!(info.ban_count, 2);
     }
@@ -712,7 +784,11 @@ mod tests {
         let info1 = g.get_ban_info("esc").unwrap();
         let dur1 = info1.ban_until - unix_now();
         // 6h = 21600 ± tolerance
-        assert!(dur1 <= 21_602 && dur1 >= 21_598, "1st ban should be ~6h, got {}s", dur1);
+        assert!(
+            (21_598..=21_602).contains(&dur1),
+            "1st ban should be ~6h, got {}s",
+            dur1
+        );
 
         // Simulate expiry, keep ban_count=1
         {
@@ -731,7 +807,11 @@ mod tests {
         assert_eq!(info2.ban_count, 2);
         let dur2 = info2.ban_until - unix_now();
         // 12h = 43200
-        assert!(dur2 <= 43_202 && dur2 >= 43_198, "2nd ban should be ~12h, got {}s", dur2);
+        assert!(
+            (43_198..=43_202).contains(&dur2),
+            "2nd ban should be ~12h, got {}s",
+            dur2
+        );
     }
 
     #[test]

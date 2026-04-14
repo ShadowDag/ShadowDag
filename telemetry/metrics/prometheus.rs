@@ -3,9 +3,9 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::sync::{Arc, Mutex};
+use crate::{slog_error, slog_info, slog_warn};
 use std::io::Write;
-use crate::{slog_info, slog_error, slog_warn};
+use std::sync::{Arc, Mutex};
 
 pub struct PrometheusExporter {
     metrics: Arc<Mutex<Vec<(String, u64)>>>,
@@ -174,10 +174,13 @@ impl PrometheusExporter {
                 let (content_type, body) = if request.contains("GET /debug") {
                     ("application/json", crate::telemetry::diagnostics::collect())
                 } else if request.contains("GET /health") {
-                    ("application/json", format!(
-                        "{{\"status\":\"up\",\"uptime_secs\":{}}}",
-                        crate::telemetry::metrics::registry::global().uptime_secs()
-                    ))
+                    (
+                        "application/json",
+                        format!(
+                            "{{\"status\":\"up\",\"uptime_secs\":{}}}",
+                            crate::telemetry::metrics::registry::global().uptime_secs()
+                        ),
+                    )
                 } else {
                     // Default: /metrics → Prometheus text
                     let registry = crate::telemetry::metrics::registry::global();
@@ -185,7 +188,8 @@ impl PrometheusExporter {
 
                     // Also include any manually-recorded metrics from this exporter
                     if let Ok(m) = self_metrics_guard() {
-                        let refs: Vec<(&str, u64)> = m.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+                        let refs: Vec<(&str, u64)> =
+                            m.iter().map(|(n, v)| (n.as_str(), *v)).collect();
                         body.push_str(&Self::export(&refs));
                     }
 
@@ -197,7 +201,9 @@ impl PrometheusExporter {
                      Content-Type: {}\r\n\
                      Content-Length: {}\r\n\
                      Connection: close\r\n\r\n{}",
-                    content_type, body.len(), body
+                    content_type,
+                    body.len(),
+                    body
                 );
 
                 let mut writer = std::io::BufWriter::new(&stream);
@@ -217,8 +223,10 @@ impl PrometheusExporter {
 fn self_metrics_guard() -> Result<std::sync::MutexGuard<'static, Vec<(String, u64)>>, ()> {
     // This is a convenience for metrics recorded via PrometheusExporter::record()
     // rather than the global registry. New code should use the registry directly.
-    static SELF_METRICS: std::sync::OnceLock<std::sync::Mutex<Vec<(String, u64)>>> = std::sync::OnceLock::new();
-    SELF_METRICS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    static SELF_METRICS: std::sync::OnceLock<std::sync::Mutex<Vec<(String, u64)>>> =
+        std::sync::OnceLock::new();
+    SELF_METRICS
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
         .lock()
         .map_err(|_| ())
 }
@@ -254,15 +262,15 @@ mod tests {
     #[test]
     fn sanitize_replaces_forbidden_chars() {
         assert_eq!(sanitize_metric_name("blocks total"), "blocks_total");
-        assert_eq!(sanitize_metric_name("has-dash"),      "has_dash");
-        assert_eq!(sanitize_metric_name("has.dot"),       "has_dot");
-        assert_eq!(sanitize_metric_name("has#hash"),      "has_hash");
-        assert_eq!(sanitize_metric_name("has\nnewline"),  "has_newline");
-        assert_eq!(sanitize_metric_name(""),              "_invalid");
+        assert_eq!(sanitize_metric_name("has-dash"), "has_dash");
+        assert_eq!(sanitize_metric_name("has.dot"), "has_dot");
+        assert_eq!(sanitize_metric_name("has#hash"), "has_hash");
+        assert_eq!(sanitize_metric_name("has\nnewline"), "has_newline");
+        assert_eq!(sanitize_metric_name(""), "_invalid");
         // Digit first → prepend underscore
-        assert_eq!(sanitize_metric_name("1start"),        "_1start");
+        assert_eq!(sanitize_metric_name("1start"), "_1start");
         // Multiple bad chars in a row
-        assert_eq!(sanitize_metric_name("a b-c.d"),       "a_b_c_d");
+        assert_eq!(sanitize_metric_name("a b-c.d"), "a_b_c_d");
     }
 
     #[test]
@@ -276,7 +284,12 @@ mod tests {
         // The sanitized name should have underscores where the newlines
         // and spaces were, so there is exactly ONE HELP + ONE TYPE + ONE
         // sample line (three '\n' characters) in the output.
-        assert_eq!(out.matches('\n').count(), 3, "sanitized export must be 3 lines, got:\n{}", out);
+        assert_eq!(
+            out.matches('\n').count(),
+            3,
+            "sanitized export must be 3 lines, got:\n{}",
+            out
+        );
         assert!(!out.contains("fake_metric 1337"));
         assert!(!out.contains("# HELP shadowdag_fake_metric injected"));
     }
@@ -285,7 +298,7 @@ mod tests {
     fn record_rejects_invalid_names() {
         let exporter = PrometheusExporter::new();
         exporter.record("good_name", 42);
-        exporter.record("bad name with space", 99);     // rejected
+        exporter.record("bad name with space", 99); // rejected
         exporter.record("forge\n# TYPE foo gauge", 100); // rejected
         exporter.record("another_good", 7);
 
@@ -326,11 +339,14 @@ mod tests {
             }
             // Split the value off
             let name_part = line.split_whitespace().next().expect("non-empty line");
-            let stripped = name_part.strip_prefix("shadowdag_").expect("prefix present");
+            let stripped = name_part
+                .strip_prefix("shadowdag_")
+                .expect("prefix present");
             assert!(
                 is_valid_metric_name(stripped),
                 "exported sample line has illegal metric name '{}': {}",
-                stripped, line
+                stripped,
+                line
             );
         }
     }

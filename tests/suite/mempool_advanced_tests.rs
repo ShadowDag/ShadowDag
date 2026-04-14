@@ -13,7 +13,10 @@ mod tests {
     // ── helpers ──────────────────────────────────────────────────────────
     fn tmp_mempool(suffix: &str) -> Mempool {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
         let pid = std::process::id();
         let path = format!("/tmp/mempool_adv_{}_{}_{}", suffix, pid, ts);
         let _ = std::fs::remove_dir_all(&path);
@@ -22,24 +25,30 @@ mod tests {
 
     /// Convert a short test name to a deterministic 64-char hex hash.
     fn th(name: &str) -> String {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(name.as_bytes()))
     }
 
     fn make_tx(hash: &str, fee: u64, amount: u64) -> Transaction {
         use crate::domain::transaction::transaction::TxInput;
         Transaction {
-            hash:      th(hash),
-            inputs:    vec![TxInput {
-                txid:      th(&format!("prev_{}", hash)),
-                index:     0,
-                owner:     "shadow1mempool".to_string(),
+            hash: th(hash),
+            inputs: vec![TxInput {
+                txid: th(&format!("prev_{}", hash)),
+                index: 0,
+                owner: "shadow1mempool".to_string(),
                 signature: "sig".to_string(),
-                pub_key:   "pk".to_string(),
+                pub_key: "pk".to_string(),
                 key_image: None,
                 ring_members: None,
             }],
-            outputs:   vec![TxOutput { address: "shadow1mempool".into(), amount, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            outputs: vec![TxOutput {
+                address: "shadow1mempool".into(),
+                amount,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -120,7 +129,10 @@ mod tests {
         pool.remove_transaction(&th("rm_tx_001"));
         assert_eq!(pool.count(), 1);
         let all = pool.get_all_transactions();
-        assert!(!all.iter().any(|t| t.hash == th("rm_tx_001")), "Removed TX must not appear in pool");
+        assert!(
+            !all.iter().any(|t| t.hash == th("rm_tx_001")),
+            "Removed TX must not appear in pool"
+        );
     }
 
     // ── 5. get_transaction by hash ────────────────────────────────────────
@@ -155,7 +167,11 @@ mod tests {
                 accepted += 1;
             }
         }
-        assert!(accepted > 900, "At least 900/1000 TXs must be accepted (accepted={})", accepted);
+        assert!(
+            accepted > 900,
+            "At least 900/1000 TXs must be accepted (accepted={})",
+            accepted
+        );
     }
 
     // ── 8. TX ordering: top-N for block ──────────────────────────────────
@@ -186,20 +202,26 @@ mod tests {
         let pool = tmp_mempool("conflict");
 
         let shared_input = TxInput {
-            txid:      th("shared_prev_tx_0000000000"),
-            index:     0,
-            owner:     "owner_conflict".into(),
+            txid: th("shared_prev_tx_0000000000"),
+            index: 0,
+            owner: "owner_conflict".into(),
             signature: "aabb".repeat(32),
-            pub_key:   "ccdd".repeat(16),
+            pub_key: "ccdd".repeat(16),
             key_image: None,
             ring_members: None,
         };
 
         let tx1 = Transaction {
-            hash:      "conflict_tx_001".to_string(),
-            inputs:    vec![shared_input.clone()],
-            outputs:   vec![TxOutput { address: "addr1".into(), amount: 1_000, commitment: None, range_proof: None, ephemeral_pubkey: None }],
-            fee:       MIN_RELAY_FEE,
+            hash: "conflict_tx_001".to_string(),
+            inputs: vec![shared_input.clone()],
+            outputs: vec![TxOutput {
+                address: "addr1".into(),
+                amount: 1_000,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
+            fee: MIN_RELAY_FEE,
             timestamp: 1_735_689_600,
             is_coinbase: false,
             tx_type: TxType::Transfer,
@@ -207,10 +229,16 @@ mod tests {
             ..Default::default()
         };
         let tx2 = Transaction {
-            hash:      "conflict_tx_002".to_string(),
-            inputs:    vec![shared_input],
-            outputs:   vec![TxOutput { address: "addr2".into(), amount: 1_000, commitment: None, range_proof: None, ephemeral_pubkey: None }],
-            fee:       MIN_RELAY_FEE,
+            hash: "conflict_tx_002".to_string(),
+            inputs: vec![shared_input],
+            outputs: vec![TxOutput {
+                address: "addr2".into(),
+                amount: 1_000,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
+            fee: MIN_RELAY_FEE,
             timestamp: 1_735_689_600,
             is_coinbase: false,
             tx_type: TxType::Transfer,
@@ -231,18 +259,24 @@ mod tests {
     fn orphan_tx_tracked_and_resolved() {
         let pool = tmp_mempool("orphan_tx");
         let orphan = Transaction {
-            hash:      "orphan_tx_hash_001".to_string(),
-            inputs:    vec![crate::domain::transaction::transaction::TxInput {
-                txid:      th("missing_parent_tx_0000000000"),
-                index:     0,
-                owner:     "owner".into(),
+            hash: "orphan_tx_hash_001".to_string(),
+            inputs: vec![crate::domain::transaction::transaction::TxInput {
+                txid: th("missing_parent_tx_0000000000"),
+                index: 0,
+                owner: "owner".into(),
                 signature: String::new(),
-                pub_key:   String::new(),
+                pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
             }],
-            outputs:   vec![TxOutput { address: "addr".into(), amount: 1_000, commitment: None, range_proof: None, ephemeral_pubkey: None }],
-            fee:       MIN_RELAY_FEE,
+            outputs: vec![TxOutput {
+                address: "addr".into(),
+                amount: 1_000,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
+            fee: MIN_RELAY_FEE,
             timestamp: 1_735_689_600,
             is_coinbase: false,
             tx_type: TxType::Transfer,
@@ -288,6 +322,9 @@ mod tests {
         }
         pool.remove_transaction(&th("aar_tx_00002"));
         let all = pool.get_all_transactions();
-        assert!(!all.iter().any(|t| t.hash == th("aar_tx_00002")), "Removed TX must not appear");
+        assert!(
+            !all.iter().any(|t| t.hash == th("aar_tx_00002")),
+            "Removed TX must not appear"
+        );
     }
 }

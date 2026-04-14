@@ -33,10 +33,10 @@
 //   - Per-message field limits enforced (hash lengths, list sizes, etc.)
 // ═══════════════════════════════════════════════════════════════════════════
 
+use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
-use sha2::{Sha256, Digest};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //                         PROTOCOL CONSTANTS
@@ -101,15 +101,15 @@ pub const MAX_REJECT_REASON_LEN: usize = 512;
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Service flag: full node (stores all blocks, validates everything).
-pub const SERVICE_NODE_NETWORK: u64   = 1 << 0;
+pub const SERVICE_NODE_NETWORK: u64 = 1 << 0;
 /// Service flag: can serve historical headers for IBD.
-pub const SERVICE_NODE_HEADERS: u64   = 1 << 1;
+pub const SERVICE_NODE_HEADERS: u64 = 1 << 1;
 /// Service flag: supports bloom filters (lightweight client).
-pub const SERVICE_NODE_BLOOM: u64     = 1 << 2;
+pub const SERVICE_NODE_BLOOM: u64 = 1 << 2;
 /// Service flag: supports UTXO snapshots for fast sync.
-pub const SERVICE_NODE_SNAPSHOT: u64  = 1 << 3;
+pub const SERVICE_NODE_SNAPSHOT: u64 = 1 << 3;
 /// Service flag: privacy layer enabled (CLSAG/Pedersen).
-pub const SERVICE_NODE_PRIVACY: u64   = 1 << 4;
+pub const SERVICE_NODE_PRIVACY: u64 = 1 << 4;
 /// Service flag: smart contract VM enabled.
 pub const SERVICE_NODE_CONTRACTS: u64 = 1 << 5;
 /// Service flag: can relay Dandelion++ stem transactions.
@@ -119,9 +119,8 @@ pub const SERVICE_NODE_DANDELION: u64 = 1 << 6;
 pub const REQUIRED_SERVICES: u64 = SERVICE_NODE_NETWORK;
 
 /// Default services advertised by a ShadowDAG node.
-pub const DEFAULT_SERVICES: u64 = SERVICE_NODE_NETWORK
-    | SERVICE_NODE_HEADERS
-    | SERVICE_NODE_DANDELION;
+pub const DEFAULT_SERVICES: u64 =
+    SERVICE_NODE_NETWORK | SERVICE_NODE_HEADERS | SERVICE_NODE_DANDELION;
 
 /// Check whether a peer's services include all required capabilities.
 #[inline]
@@ -141,27 +140,27 @@ pub fn has_required_services(services: u64) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum CommandId {
-    Version         = 0x01,
-    VerAck          = 0x02,
-    Ping            = 0x03,
-    Pong            = 0x04,
-    GetAddr         = 0x05,
-    Addr            = 0x06,
-    Inv             = 0x07,
-    GetData         = 0x08,
-    Block           = 0x09,
-    Tx              = 0x0A,
-    GetHeaders      = 0x0B,
-    Headers         = 0x0C,
-    GetBlock       = 0x0D,
-    Reject          = 0x0E,
+    Version = 0x01,
+    VerAck = 0x02,
+    Ping = 0x03,
+    Pong = 0x04,
+    GetAddr = 0x05,
+    Addr = 0x06,
+    Inv = 0x07,
+    GetData = 0x08,
+    Block = 0x09,
+    Tx = 0x0A,
+    GetHeaders = 0x0B,
+    Headers = 0x0C,
+    GetBlock = 0x0D,
+    Reject = 0x0E,
     PuzzleChallenge = 0x10,
-    PuzzleSolution  = 0x11,
+    PuzzleSolution = 0x11,
     // 0x20–0x2F reserved for privacy layer
-    ShadowTx        = 0x20,
-    OnionTx         = 0x21,
+    ShadowTx = 0x20,
+    OnionTx = 0x21,
     // 0x30–0x3F reserved for smart contract layer
-    GetMempool      = 0x30,
+    GetMempool = 0x30,
 }
 
 impl CommandId {
@@ -187,7 +186,7 @@ impl CommandId {
             0x20 => Some(Self::ShadowTx),
             0x21 => Some(Self::OnionTx),
             0x30 => Some(Self::GetMempool),
-            _    => None,
+            _ => None,
         }
     }
 
@@ -195,39 +194,44 @@ impl CommandId {
     pub fn allowed_before_handshake(self) -> bool {
         matches!(
             self,
-            Self::Version | Self::VerAck |
-            Self::PuzzleChallenge | Self::PuzzleSolution |
-            Self::Reject
+            Self::Version
+                | Self::VerAck
+                | Self::PuzzleChallenge
+                | Self::PuzzleSolution
+                | Self::Reject
         )
     }
 
     /// Whether this command carries a large payload (block/tx data).
     pub fn is_bulk_data(self) -> bool {
-        matches!(self, Self::Block | Self::Tx | Self::ShadowTx | Self::OnionTx)
+        matches!(
+            self,
+            Self::Block | Self::Tx | Self::ShadowTx | Self::OnionTx
+        )
     }
 
     /// Human-readable name for logging.
     pub fn name(self) -> &'static str {
         match self {
-            Self::Version         => "version",
-            Self::VerAck          => "verack",
-            Self::Ping            => "ping",
-            Self::Pong            => "pong",
-            Self::GetAddr         => "getaddr",
-            Self::Addr            => "addr",
-            Self::Inv             => "inv",
-            Self::GetData         => "getdata",
-            Self::Block           => "block",
-            Self::Tx              => "tx",
-            Self::GetHeaders      => "getheaders",
-            Self::Headers         => "headers",
-            Self::GetBlock       => "getblock",
-            Self::Reject          => "reject",
+            Self::Version => "version",
+            Self::VerAck => "verack",
+            Self::Ping => "ping",
+            Self::Pong => "pong",
+            Self::GetAddr => "getaddr",
+            Self::Addr => "addr",
+            Self::Inv => "inv",
+            Self::GetData => "getdata",
+            Self::Block => "block",
+            Self::Tx => "tx",
+            Self::GetHeaders => "getheaders",
+            Self::Headers => "headers",
+            Self::GetBlock => "getblock",
+            Self::Reject => "reject",
             Self::PuzzleChallenge => "puzzle_challenge",
-            Self::PuzzleSolution  => "puzzle_solution",
-            Self::ShadowTx        => "shadow_tx",
-            Self::OnionTx         => "onion_tx",
-            Self::GetMempool      => "getmempool",
+            Self::PuzzleSolution => "puzzle_solution",
+            Self::ShadowTx => "shadow_tx",
+            Self::OnionTx => "onion_tx",
+            Self::GetMempool => "getmempool",
         }
     }
 }
@@ -254,10 +258,10 @@ impl fmt::Display for CommandId {
 ///   7. Deserialize payload for the specific command
 #[derive(Debug, Clone, Copy)]
 pub struct WireHeader {
-    pub magic:       [u8; 4],
-    pub command_id:  u8,
+    pub magic: [u8; 4],
+    pub command_id: u8,
     pub payload_len: u32,
-    pub checksum:    [u8; 4],
+    pub checksum: [u8; 4],
 }
 
 impl WireHeader {
@@ -274,10 +278,10 @@ impl WireHeader {
     /// Decode a 13-byte buffer into a WireHeader.
     pub fn decode(buf: &[u8; WIRE_HEADER_SIZE]) -> Self {
         Self {
-            magic:       [buf[0], buf[1], buf[2], buf[3]],
-            command_id:  buf[4],
+            magic: [buf[0], buf[1], buf[2], buf[3]],
+            command_id: buf[4],
             payload_len: u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]),
-            checksum:    [buf[9], buf[10], buf[11], buf[12]],
+            checksum: [buf[9], buf[10], buf[11], buf[12]],
         }
     }
 
@@ -287,7 +291,7 @@ impl WireHeader {
             magic,
             command_id,
             payload_len: payload.len() as u32,
-            checksum:    compute_checksum(payload),
+            checksum: compute_checksum(payload),
         }
     }
 }
@@ -320,20 +324,28 @@ pub fn verify_checksum(data: &[u8], expected: [u8; 4]) -> bool {
 ///   100  — instant ban (unambiguously malicious)
 #[derive(Debug, Clone)]
 pub struct ProtocolError {
-    pub kind:      ProtocolErrorKind,
-    pub message:   String,
+    pub kind: ProtocolErrorKind,
+    pub message: String,
     pub ban_score: u32,
 }
 
 impl ProtocolError {
     pub fn new(kind: ProtocolErrorKind, message: impl Into<String>, ban_score: u32) -> Self {
-        Self { kind, message: message.into(), ban_score }
+        Self {
+            kind,
+            message: message.into(),
+            ban_score,
+        }
     }
 }
 
 impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}] {} (ban_score={})", self.kind, self.message, self.ban_score)
+        write!(
+            f,
+            "[{}] {} (ban_score={})",
+            self.kind, self.message, self.ban_score
+        )
     }
 }
 
@@ -382,24 +394,24 @@ pub enum ProtocolErrorKind {
 impl fmt::Display for ProtocolErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
-            Self::BadMagic            => "BAD_MAGIC",
-            Self::UnknownCommand      => "UNKNOWN_CMD",
-            Self::BadChecksum         => "BAD_CHECKSUM",
-            Self::OversizePayload     => "OVERSIZE",
-            Self::PrematureMessage    => "PREMATURE_MSG",
-            Self::HandshakeTimeout    => "HS_TIMEOUT",
-            Self::PuzzleTimeout       => "PUZZLE_TIMEOUT",
+            Self::BadMagic => "BAD_MAGIC",
+            Self::UnknownCommand => "UNKNOWN_CMD",
+            Self::BadChecksum => "BAD_CHECKSUM",
+            Self::OversizePayload => "OVERSIZE",
+            Self::PrematureMessage => "PREMATURE_MSG",
+            Self::HandshakeTimeout => "HS_TIMEOUT",
+            Self::PuzzleTimeout => "PUZZLE_TIMEOUT",
             Self::IncompatibleVersion => "INCOMPAT_VER",
-            Self::BpsMismatch         => "BPS_MISMATCH",
-            Self::ChainMismatch       => "CHAIN_MISMATCH",
-            Self::TimestampDrift      => "TIMESTAMP_DRIFT",
-            Self::FieldViolation      => "FIELD_VIOLATION",
-            Self::DuplicateHandshake  => "DUP_HANDSHAKE",
-            Self::InvalidTransition   => "INVALID_TRANS",
-            Self::DeserializeFailed   => "DESER_FAILED",
-            Self::IoError             => "IO_ERROR",
-            Self::RateLimited         => "RATE_LIMITED",
-            Self::Violation           => "VIOLATION",
+            Self::BpsMismatch => "BPS_MISMATCH",
+            Self::ChainMismatch => "CHAIN_MISMATCH",
+            Self::TimestampDrift => "TIMESTAMP_DRIFT",
+            Self::FieldViolation => "FIELD_VIOLATION",
+            Self::DuplicateHandshake => "DUP_HANDSHAKE",
+            Self::InvalidTransition => "INVALID_TRANS",
+            Self::DeserializeFailed => "DESER_FAILED",
+            Self::IoError => "IO_ERROR",
+            Self::RateLimited => "RATE_LIMITED",
+            Self::Violation => "VIOLATION",
         };
         f.write_str(s)
     }
@@ -461,14 +473,14 @@ impl HandshakeState {
 impl fmt::Display for HandshakeState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
-            Self::Init                 => "INIT",
-            Self::AwaitPuzzleSolution  => "AWAIT_PUZZLE_SOLUTION",
+            Self::Init => "INIT",
+            Self::AwaitPuzzleSolution => "AWAIT_PUZZLE_SOLUTION",
             Self::AwaitPuzzleChallenge => "AWAIT_PUZZLE_CHALLENGE",
-            Self::PuzzleVerified       => "PUZZLE_VERIFIED",
-            Self::AwaitVersion         => "AWAIT_VERSION",
-            Self::AwaitPeerVerAck      => "AWAIT_PEER_VERACK",
-            Self::Established          => "ESTABLISHED",
-            Self::Disconnecting        => "DISCONNECTING",
+            Self::PuzzleVerified => "PUZZLE_VERIFIED",
+            Self::AwaitVersion => "AWAIT_VERSION",
+            Self::AwaitPeerVerAck => "AWAIT_PEER_VERACK",
+            Self::Established => "ESTABLISHED",
+            Self::Disconnecting => "DISCONNECTING",
         };
         f.write_str(s)
     }
@@ -506,9 +518,7 @@ pub enum PeerLifecycle {
     /// Fully synced — normal relay mode.
     Normal,
     /// Misbehaving — limited to essential messages only.
-    Restricted {
-        reason: String,
-    },
+    Restricted { reason: String },
 }
 
 impl PeerLifecycle {
@@ -519,7 +529,10 @@ impl PeerLifecycle {
 
     /// Whether the peer is actively syncing (headers or blocks).
     pub fn is_syncing(&self) -> bool {
-        matches!(self, Self::SyncingHeaders { .. } | Self::SyncingBlocks { .. })
+        matches!(
+            self,
+            Self::SyncingHeaders { .. } | Self::SyncingBlocks { .. }
+        )
     }
 
     /// Whether the peer is restricted (misbehaving).
@@ -530,9 +543,17 @@ impl PeerLifecycle {
     /// Progress percentage (0–100) during sync, or 100 if normal.
     pub fn sync_progress_pct(&self) -> u32 {
         match self {
-            Self::SyncingHeaders { target_height, current_height }
-            | Self::SyncingBlocks { target_height, current_height } => {
-                if *target_height == 0 { return 0; }
+            Self::SyncingHeaders {
+                target_height,
+                current_height,
+            }
+            | Self::SyncingBlocks {
+                target_height,
+                current_height,
+            } => {
+                if *target_height == 0 {
+                    return 0;
+                }
                 ((current_height * 100) / target_height).min(100) as u32
             }
             Self::Normal => 100,
@@ -544,13 +565,17 @@ impl PeerLifecycle {
 impl fmt::Display for PeerLifecycle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Connected                    => write!(f, "CONNECTED"),
-            Self::SyncingHeaders { current_height, target_height } =>
-                write!(f, "SYNCING_HEADERS({}/{})", current_height, target_height),
-            Self::SyncingBlocks { current_height, target_height } =>
-                write!(f, "SYNCING_BLOCKS({}/{})", current_height, target_height),
-            Self::Normal                       => write!(f, "NORMAL"),
-            Self::Restricted { reason }        => write!(f, "RESTRICTED({})", reason),
+            Self::Connected => write!(f, "CONNECTED"),
+            Self::SyncingHeaders {
+                current_height,
+                target_height,
+            } => write!(f, "SYNCING_HEADERS({}/{})", current_height, target_height),
+            Self::SyncingBlocks {
+                current_height,
+                target_height,
+            } => write!(f, "SYNCING_BLOCKS({}/{})", current_height, target_height),
+            Self::Normal => write!(f, "NORMAL"),
+            Self::Restricted { reason } => write!(f, "RESTRICTED({})", reason),
         }
     }
 }
@@ -576,25 +601,25 @@ const BINCODE_TAG: usize = 4;
 
 pub fn payload_size_bounds(cmd: CommandId) -> (usize, usize) {
     match cmd {
-        CommandId::Version         => (BINCODE_TAG + 16, BINCODE_TAG + 1024),
-        CommandId::VerAck          => (BINCODE_TAG, BINCODE_TAG),
-        CommandId::Ping            => (BINCODE_TAG + 8, BINCODE_TAG + 8),
-        CommandId::Pong            => (BINCODE_TAG + 8, BINCODE_TAG + 8),
-        CommandId::GetAddr         => (BINCODE_TAG, BINCODE_TAG),
-        CommandId::Addr            => (BINCODE_TAG, BINCODE_TAG + 256 * 1024),
-        CommandId::Inv             => (BINCODE_TAG + 1, BINCODE_TAG + 512 * 1024),
-        CommandId::GetData         => (BINCODE_TAG + 1, BINCODE_TAG + 512 * 1024),
-        CommandId::Block           => (BINCODE_TAG + 60, MAX_MESSAGE_SIZE),
-        CommandId::Tx              => (BINCODE_TAG + 12, MAX_MESSAGE_SIZE),
-        CommandId::GetHeaders      => (BINCODE_TAG + 1, BINCODE_TAG + 1024),
-        CommandId::Headers         => (BINCODE_TAG + 1, BINCODE_TAG + 512 * 1024),
-        CommandId::GetBlock       => (BINCODE_TAG + 1, BINCODE_TAG + 1024),
-        CommandId::Reject          => (BINCODE_TAG + 1, BINCODE_TAG + MAX_REJECT_REASON_LEN + 64),
+        CommandId::Version => (BINCODE_TAG + 16, BINCODE_TAG + 1024),
+        CommandId::VerAck => (BINCODE_TAG, BINCODE_TAG),
+        CommandId::Ping => (BINCODE_TAG + 8, BINCODE_TAG + 8),
+        CommandId::Pong => (BINCODE_TAG + 8, BINCODE_TAG + 8),
+        CommandId::GetAddr => (BINCODE_TAG, BINCODE_TAG),
+        CommandId::Addr => (BINCODE_TAG, BINCODE_TAG + 256 * 1024),
+        CommandId::Inv => (BINCODE_TAG + 1, BINCODE_TAG + 512 * 1024),
+        CommandId::GetData => (BINCODE_TAG + 1, BINCODE_TAG + 512 * 1024),
+        CommandId::Block => (BINCODE_TAG + 60, MAX_MESSAGE_SIZE),
+        CommandId::Tx => (BINCODE_TAG + 12, MAX_MESSAGE_SIZE),
+        CommandId::GetHeaders => (BINCODE_TAG + 1, BINCODE_TAG + 1024),
+        CommandId::Headers => (BINCODE_TAG + 1, BINCODE_TAG + 512 * 1024),
+        CommandId::GetBlock => (BINCODE_TAG + 1, BINCODE_TAG + 1024),
+        CommandId::Reject => (BINCODE_TAG + 1, BINCODE_TAG + MAX_REJECT_REASON_LEN + 64),
         CommandId::PuzzleChallenge => (BINCODE_TAG + 4, BINCODE_TAG + 256),
-        CommandId::PuzzleSolution  => (BINCODE_TAG + 12, BINCODE_TAG + 512),
-        CommandId::ShadowTx        => (BINCODE_TAG + 12, MAX_MESSAGE_SIZE),
-        CommandId::OnionTx         => (BINCODE_TAG + 12, MAX_MESSAGE_SIZE),
-        CommandId::GetMempool      => (BINCODE_TAG, BINCODE_TAG),
+        CommandId::PuzzleSolution => (BINCODE_TAG + 12, BINCODE_TAG + 512),
+        CommandId::ShadowTx => (BINCODE_TAG + 12, MAX_MESSAGE_SIZE),
+        CommandId::OnionTx => (BINCODE_TAG + 12, MAX_MESSAGE_SIZE),
+        CommandId::GetMempool => (BINCODE_TAG, BINCODE_TAG),
     }
 }
 
@@ -627,14 +652,14 @@ pub fn validate_payload_size(cmd: CommandId, size: usize) -> Result<(), Protocol
 /// Validated BEFORE being stored — every field is bounds-checked.
 #[derive(Debug, Clone)]
 pub struct VersionPayload {
-    pub version:     u32,
-    pub height:      u64,
-    pub timestamp:   u64,
-    pub user_agent:  String,
-    pub bps:         u32,
-    pub chain_id:    u32,
-    pub services:    u64,
-    pub nonce:       u64,
+    pub version: u32,
+    pub height: u64,
+    pub timestamp: u64,
+    pub user_agent: String,
+    pub bps: u32,
+    pub chain_id: u32,
+    pub services: u64,
+    pub nonce: u64,
 }
 
 impl VersionPayload {
@@ -665,7 +690,10 @@ impl VersionPayload {
         if self.chain_id != CHAIN_ID {
             return Err(ProtocolError::new(
                 ProtocolErrorKind::ChainMismatch,
-                format!("chain_id 0x{:08X} != expected 0x{:08X}", self.chain_id, CHAIN_ID),
+                format!(
+                    "chain_id 0x{:08X} != expected 0x{:08X}",
+                    self.chain_id, CHAIN_ID
+                ),
                 100,
             ));
         }
@@ -679,7 +707,10 @@ impl VersionPayload {
         if drift > MAX_TIMESTAMP_DRIFT_SECS {
             return Err(ProtocolError::new(
                 ProtocolErrorKind::TimestampDrift,
-                format!("timestamp drift {}s exceeds max {}s", drift, MAX_TIMESTAMP_DRIFT_SECS),
+                format!(
+                    "timestamp drift {}s exceeds max {}s",
+                    drift, MAX_TIMESTAMP_DRIFT_SECS
+                ),
                 10, // not necessarily malicious — clocks drift
             ));
         }
@@ -688,14 +719,22 @@ impl VersionPayload {
         if self.user_agent.len() < MIN_USER_AGENT_LEN {
             return Err(ProtocolError::new(
                 ProtocolErrorKind::FieldViolation,
-                format!("user_agent too short ({} < {})", self.user_agent.len(), MIN_USER_AGENT_LEN),
+                format!(
+                    "user_agent too short ({} < {})",
+                    self.user_agent.len(),
+                    MIN_USER_AGENT_LEN
+                ),
                 20,
             ));
         }
         if self.user_agent.len() > MAX_USER_AGENT_LEN {
             return Err(ProtocolError::new(
                 ProtocolErrorKind::FieldViolation,
-                format!("user_agent too long ({} > {})", self.user_agent.len(), MAX_USER_AGENT_LEN),
+                format!(
+                    "user_agent too long ({} > {})",
+                    self.user_agent.len(),
+                    MAX_USER_AGENT_LEN
+                ),
                 20,
             ));
         }
@@ -713,8 +752,10 @@ impl VersionPayload {
         if !has_required_services(self.services) {
             return Err(ProtocolError::new(
                 ProtocolErrorKind::FieldViolation,
-                format!("insufficient services: 0x{:016X} missing required 0x{:016X}",
-                        self.services, REQUIRED_SERVICES),
+                format!(
+                    "insufficient services: 0x{:016X} missing required 0x{:016X}",
+                    self.services, REQUIRED_SERVICES
+                ),
                 10, // might be a light client, not necessarily malicious
             ));
         }
@@ -743,33 +784,33 @@ impl VersionPayload {
 /// One `ProtocolSession` per TCP connection, owned by the connection handler.
 pub struct ProtocolSession {
     /// Whether we initiated this connection (outbound) or accepted it (inbound).
-    pub is_outbound:      bool,
+    pub is_outbound: bool,
     /// Current handshake state.
-    pub state:            HandshakeState,
+    pub state: HandshakeState,
     /// Post-handshake lifecycle state.
-    pub lifecycle:        PeerLifecycle,
+    pub lifecycle: PeerLifecycle,
     /// Peer's version payload (populated after Version message received).
-    pub peer_version:     Option<VersionPayload>,
+    pub peer_version: Option<VersionPayload>,
     /// Our BPS — used for version validation.
-    pub our_bps:          u32,
+    pub our_bps: u32,
     /// Puzzle challenge we sent (inbound) or received (outbound).
     pub puzzle_challenge: Option<String>,
     /// Connection start time (for timeout enforcement).
-    pub connected_at:     u64,
+    pub connected_at: u64,
     /// Nonces we've seen (Ping/Pong anti-replay).
-    pub seen_nonces:      HashSet<u64>,
+    pub seen_nonces: HashSet<u64>,
     /// Insertion-order queue for FIFO nonce eviction (ring buffer).
     /// When seen_nonces reaches capacity, the oldest nonce is evicted
     /// instead of clearing the entire set.
-    nonce_order:          VecDeque<u64>,
+    nonce_order: VecDeque<u64>,
     /// Total messages received (for stats).
-    pub msgs_received:    u64,
+    pub msgs_received: u64,
     /// Total messages sent (for stats).
-    pub msgs_sent:        u64,
+    pub msgs_sent: u64,
     /// Total bytes received (for bandwidth tracking).
-    pub bytes_received:   u64,
+    pub bytes_received: u64,
     /// Total bytes sent (for bandwidth tracking).
-    pub bytes_sent:       u64,
+    pub bytes_sent: u64,
 }
 
 impl ProtocolSession {
@@ -781,18 +822,18 @@ impl ProtocolSession {
             .as_secs();
         Self {
             is_outbound,
-            state:            HandshakeState::Init,
-            lifecycle:        PeerLifecycle::Connected,
-            peer_version:     None,
+            state: HandshakeState::Init,
+            lifecycle: PeerLifecycle::Connected,
+            peer_version: None,
             our_bps,
             puzzle_challenge: None,
-            connected_at:     now,
-            seen_nonces:      HashSet::with_capacity(64),
-            nonce_order:      VecDeque::with_capacity(64),
-            msgs_received:    0,
-            msgs_sent:        0,
-            bytes_received:   0,
-            bytes_sent:       0,
+            connected_at: now,
+            seen_nonces: HashSet::with_capacity(64),
+            nonce_order: VecDeque::with_capacity(64),
+            msgs_received: 0,
+            msgs_sent: 0,
+            bytes_received: 0,
+            bytes_sent: 0,
         }
     }
 
@@ -836,10 +877,11 @@ impl ProtocolSession {
 
         // Puzzle phase gets its own longer timeout
         let timeout = match self.state {
-            HandshakeState::AwaitPuzzleSolution |
-            HandshakeState::AwaitPuzzleChallenge => PUZZLE_TIMEOUT_SECS,
-            HandshakeState::Disconnecting        => return Ok(()),
-            _                                    => HANDSHAKE_TIMEOUT_SECS,
+            HandshakeState::AwaitPuzzleSolution | HandshakeState::AwaitPuzzleChallenge => {
+                PUZZLE_TIMEOUT_SECS
+            }
+            HandshakeState::Disconnecting => return Ok(()),
+            _ => HANDSHAKE_TIMEOUT_SECS,
         };
 
         if elapsed > timeout {
@@ -849,8 +891,10 @@ impl ProtocolSession {
                 } else {
                     ProtocolErrorKind::HandshakeTimeout
                 },
-                format!("state {} timed out after {}s (limit {}s)",
-                        self.state, elapsed, timeout),
+                format!(
+                    "state {} timed out after {}s (limit {}s)",
+                    self.state, elapsed, timeout
+                ),
                 0, // not malicious, just slow
             ));
         }
@@ -871,7 +915,13 @@ impl ProtocolSession {
 
         if self.state.is_established() {
             // Block handshake commands after connection is established
-            if matches!(cmd, CommandId::Version | CommandId::VerAck | CommandId::PuzzleChallenge | CommandId::PuzzleSolution) {
+            if matches!(
+                cmd,
+                CommandId::Version
+                    | CommandId::VerAck
+                    | CommandId::PuzzleChallenge
+                    | CommandId::PuzzleSolution
+            ) {
                 return Err(ProtocolError::new(
                     ProtocolErrorKind::DuplicateHandshake,
                     format!("{:?} not allowed after handshake", cmd),
@@ -910,8 +960,7 @@ impl ProtocolSession {
 
     /// Transition: we received a puzzle challenge (outbound connection).
     pub fn received_puzzle_challenge(&mut self, challenge: &str) -> Result<(), ProtocolError> {
-        if self.state != HandshakeState::Init
-            && self.state != HandshakeState::AwaitPuzzleChallenge
+        if self.state != HandshakeState::Init && self.state != HandshakeState::AwaitPuzzleChallenge
         {
             return Err(ProtocolError::new(
                 ProtocolErrorKind::InvalidTransition,
@@ -926,9 +975,9 @@ impl ProtocolSession {
     /// Transition: puzzle verified successfully.
     pub fn puzzle_verified(&mut self) -> Result<(), ProtocolError> {
         match self.state {
-            HandshakeState::AwaitPuzzleSolution |
-            HandshakeState::Init |
-            HandshakeState::AwaitPuzzleChallenge => {
+            HandshakeState::AwaitPuzzleSolution
+            | HandshakeState::Init
+            | HandshakeState::AwaitPuzzleChallenge => {
                 self.state = HandshakeState::PuzzleVerified;
                 Ok(())
             }
@@ -1074,7 +1123,9 @@ impl ProtocolSession {
 
     /// Restrict peer due to misbehavior.
     pub fn restrict(&mut self, reason: impl Into<String>) {
-        self.lifecycle = PeerLifecycle::Restricted { reason: reason.into() };
+        self.lifecycle = PeerLifecycle::Restricted {
+            reason: reason.into(),
+        };
     }
 
     /// Whether the peer is in normal relay mode.
@@ -1134,8 +1185,14 @@ pub fn validate_header(
             ProtocolErrorKind::BadMagic,
             format!(
                 "magic {:02X}{:02X}{:02X}{:02X} != expected {:02X}{:02X}{:02X}{:02X}",
-                header.magic[0], header.magic[1], header.magic[2], header.magic[3],
-                expected_magic[0], expected_magic[1], expected_magic[2], expected_magic[3],
+                header.magic[0],
+                header.magic[1],
+                header.magic[2],
+                header.magic[3],
+                expected_magic[0],
+                expected_magic[1],
+                expected_magic[2],
+                expected_magic[3],
             ),
             100,
         ));
@@ -1154,7 +1211,10 @@ pub fn validate_header(
     if header.payload_len as usize > MAX_MESSAGE_SIZE {
         return Err(ProtocolError::new(
             ProtocolErrorKind::OversizePayload,
-            format!("payload {} bytes > max {} bytes", header.payload_len, MAX_MESSAGE_SIZE),
+            format!(
+                "payload {} bytes > max {} bytes",
+                header.payload_len, MAX_MESSAGE_SIZE
+            ),
             100,
         ));
     }
@@ -1172,10 +1232,7 @@ pub fn validate_header(
 }
 
 /// Validate a payload's checksum after reading it from the wire.
-pub fn validate_payload_checksum(
-    payload: &[u8],
-    expected: [u8; 4],
-) -> Result<(), ProtocolError> {
+pub fn validate_payload_checksum(payload: &[u8], expected: [u8; 4]) -> Result<(), ProtocolError> {
     if !verify_checksum(payload, expected) {
         return Err(ProtocolError::new(
             ProtocolErrorKind::BadChecksum,
@@ -1209,7 +1266,11 @@ pub fn validate_inv_items(items: &[(String, String)]) -> Result<(), ProtocolErro
         if hash.len() != MAX_HASH_HEX_LEN {
             return Err(ProtocolError::new(
                 ProtocolErrorKind::FieldViolation,
-                format!("inv hash length {} != required {}", hash.len(), MAX_HASH_HEX_LEN),
+                format!(
+                    "inv hash length {} != required {}",
+                    hash.len(),
+                    MAX_HASH_HEX_LEN
+                ),
                 50,
             ));
         }
@@ -1249,7 +1310,11 @@ pub fn validate_headers_list(hashes: &[String]) -> Result<(), ProtocolError> {
         if h.len() != MAX_HASH_HEX_LEN {
             return Err(ProtocolError::new(
                 ProtocolErrorKind::FieldViolation,
-                format!("header hash length {} != required {}", h.len(), MAX_HASH_HEX_LEN),
+                format!(
+                    "header hash length {} != required {}",
+                    h.len(),
+                    MAX_HASH_HEX_LEN
+                ),
                 50,
             ));
         }
@@ -1269,7 +1334,11 @@ pub fn validate_reject(reason: &str) -> Result<(), ProtocolError> {
     if reason.len() > MAX_REJECT_REASON_LEN {
         return Err(ProtocolError::new(
             ProtocolErrorKind::FieldViolation,
-            format!("reject reason too long ({} > {})", reason.len(), MAX_REJECT_REASON_LEN),
+            format!(
+                "reject reason too long ({} > {})",
+                reason.len(),
+                MAX_REJECT_REASON_LEN
+            ),
             10,
         ));
     }
@@ -1285,7 +1354,11 @@ pub fn validate_hash_hex(hash: &str) -> Result<(), ProtocolError> {
     if hash.len() != MAX_HASH_HEX_LEN {
         return Err(ProtocolError::new(
             ProtocolErrorKind::FieldViolation,
-            format!("hash length {} != required {} (SHA-256 hex)", hash.len(), MAX_HASH_HEX_LEN),
+            format!(
+                "hash length {} != required {} (SHA-256 hex)",
+                hash.len(),
+                MAX_HASH_HEX_LEN
+            ),
             50,
         ));
     }
@@ -1304,23 +1377,19 @@ pub fn validate_hash_hex(hash: &str) -> Result<(), ProtocolError> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Build a Version payload for outgoing handshake.
-pub fn build_version_payload(
-    node_id: &str,
-    best_height: u64,
-    bps: u32,
-) -> VersionPayload {
+pub fn build_version_payload(node_id: &str, best_height: u64, bps: u32) -> VersionPayload {
     VersionPayload {
-        version:    PROTOCOL_VERSION,
-        height:     best_height,
-        timestamp:  SystemTime::now()
+        version: PROTOCOL_VERSION,
+        height: best_height,
+        timestamp: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
         user_agent: format!("ShadowDAG/{} {}", env!("CARGO_PKG_VERSION"), node_id),
         bps,
-        chain_id:   CHAIN_ID,
-        services:   DEFAULT_SERVICES,
-        nonce:      rand_nonce(),
+        chain_id: CHAIN_ID,
+        services: DEFAULT_SERVICES,
+        nonce: rand_nonce(),
     }
 }
 
@@ -1344,11 +1413,11 @@ fn rand_nonce() -> u64 {
 /// New code should use WireHeader + ProtocolSession directly.
 #[derive(Debug, Clone)]
 pub struct NetworkMessage {
-    pub magic:      [u8; 4],
-    pub msg_type:   CommandId,
-    pub payload:    Vec<u8>,
-    pub checksum:   [u8; 4],
-    pub timestamp:  u64,
+    pub magic: [u8; 4],
+    pub msg_type: CommandId,
+    pub payload: Vec<u8>,
+    pub checksum: [u8; 4],
+    pub timestamp: u64,
 }
 
 impl NetworkMessage {
@@ -1378,12 +1447,16 @@ impl NetworkMessage {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if !self.is_valid_magic() {
             return Err(ProtocolError::new(
-                ProtocolErrorKind::BadMagic, "wrong network magic", 100,
+                ProtocolErrorKind::BadMagic,
+                "wrong network magic",
+                100,
             ));
         }
         if !self.is_valid_checksum() {
             return Err(ProtocolError::new(
-                ProtocolErrorKind::BadChecksum, "checksum mismatch", 100,
+                ProtocolErrorKind::BadChecksum,
+                "checksum mismatch",
+                100,
             ));
         }
         if self.payload.len() > MAX_MESSAGE_SIZE {
@@ -1442,16 +1515,30 @@ mod tests {
     #[test]
     fn all_command_ids_roundtrip() {
         let cmds = [
-            CommandId::Version, CommandId::VerAck, CommandId::Ping, CommandId::Pong,
-            CommandId::GetAddr, CommandId::Addr, CommandId::Inv, CommandId::GetData,
-            CommandId::Block, CommandId::Tx, CommandId::GetHeaders, CommandId::Headers,
-            CommandId::GetBlock, CommandId::Reject, CommandId::PuzzleChallenge,
-            CommandId::PuzzleSolution, CommandId::ShadowTx, CommandId::OnionTx,
+            CommandId::Version,
+            CommandId::VerAck,
+            CommandId::Ping,
+            CommandId::Pong,
+            CommandId::GetAddr,
+            CommandId::Addr,
+            CommandId::Inv,
+            CommandId::GetData,
+            CommandId::Block,
+            CommandId::Tx,
+            CommandId::GetHeaders,
+            CommandId::Headers,
+            CommandId::GetBlock,
+            CommandId::Reject,
+            CommandId::PuzzleChallenge,
+            CommandId::PuzzleSolution,
+            CommandId::ShadowTx,
+            CommandId::OnionTx,
             CommandId::GetMempool,
         ];
         for cmd in cmds {
             let byte = cmd as u8;
-            let parsed = CommandId::from_byte(byte).expect(&format!("0x{:02X} should parse", byte));
+            let parsed =
+                CommandId::from_byte(byte).unwrap_or_else(|| panic!("0x{:02X} should parse", byte));
             assert_eq!(parsed, cmd);
         }
     }
@@ -1562,10 +1649,17 @@ mod tests {
 
         // Receive peer's version
         let ver = VersionPayload {
-            version: PROTOCOL_VERSION, height: 1000,
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            version: PROTOCOL_VERSION,
+            height: 1000,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             user_agent: "ShadowDAG/0.1.0 test-peer".to_string(),
-            bps: DEFAULT_BPS, chain_id: CHAIN_ID, services: DEFAULT_SERVICES, nonce: 42,
+            bps: DEFAULT_BPS,
+            chain_id: CHAIN_ID,
+            services: DEFAULT_SERVICES,
+            nonce: 42,
         };
         session.received_version(ver).unwrap();
         assert_eq!(session.state, HandshakeState::AwaitPeerVerAck);
@@ -1583,10 +1677,17 @@ mod tests {
         session.sent_version().unwrap();
 
         let ver = VersionPayload {
-            version: PROTOCOL_VERSION, height: 100,
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            version: PROTOCOL_VERSION,
+            height: 100,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             user_agent: "ShadowDAG/0.1.0 test".to_string(),
-            bps: DEFAULT_BPS, chain_id: CHAIN_ID, services: DEFAULT_SERVICES, nonce: 1,
+            bps: DEFAULT_BPS,
+            chain_id: CHAIN_ID,
+            services: DEFAULT_SERVICES,
+            nonce: 1,
         };
         session.received_version(ver.clone()).unwrap();
 
@@ -1608,8 +1709,14 @@ mod tests {
         let mut session = ProtocolSession::new(false, DEFAULT_BPS);
         session.state = HandshakeState::Established;
 
-        for cmd in [CommandId::Tx, CommandId::Block, CommandId::Inv,
-                    CommandId::Ping, CommandId::GetAddr, CommandId::ShadowTx] {
+        for cmd in [
+            CommandId::Tx,
+            CommandId::Block,
+            CommandId::Inv,
+            CommandId::Ping,
+            CommandId::GetAddr,
+            CommandId::ShadowTx,
+        ] {
             assert!(session.check_command_allowed(cmd).is_ok());
         }
     }
@@ -1619,10 +1726,17 @@ mod tests {
     #[test]
     fn version_zero_rejected() {
         let ver = VersionPayload {
-            version: 0, height: 0,
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            version: 0,
+            height: 0,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             user_agent: "ShadowDAG/0.1.0 test".to_string(),
-            bps: DEFAULT_BPS, chain_id: CHAIN_ID, services: DEFAULT_SERVICES, nonce: 1,
+            bps: DEFAULT_BPS,
+            chain_id: CHAIN_ID,
+            services: DEFAULT_SERVICES,
+            nonce: 1,
         };
         let err = ver.validate(DEFAULT_BPS).unwrap_err();
         assert_eq!(err.kind, ProtocolErrorKind::IncompatibleVersion);
@@ -1631,10 +1745,17 @@ mod tests {
     #[test]
     fn bps_mismatch_rejected() {
         let ver = VersionPayload {
-            version: PROTOCOL_VERSION, height: 0,
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            version: PROTOCOL_VERSION,
+            height: 0,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             user_agent: "ShadowDAG/0.1.0 test".to_string(),
-            bps: 32, chain_id: CHAIN_ID, services: DEFAULT_SERVICES, nonce: 1,
+            bps: 32,
+            chain_id: CHAIN_ID,
+            services: DEFAULT_SERVICES,
+            nonce: 1,
         };
         let err = ver.validate(10).unwrap_err();
         assert_eq!(err.kind, ProtocolErrorKind::BpsMismatch);
@@ -1643,10 +1764,14 @@ mod tests {
     #[test]
     fn timestamp_drift_rejected() {
         let ver = VersionPayload {
-            version: PROTOCOL_VERSION, height: 0,
+            version: PROTOCOL_VERSION,
+            height: 0,
             timestamp: 1000, // way in the past
             user_agent: "ShadowDAG/0.1.0 test".to_string(),
-            bps: DEFAULT_BPS, chain_id: CHAIN_ID, services: DEFAULT_SERVICES, nonce: 1,
+            bps: DEFAULT_BPS,
+            chain_id: CHAIN_ID,
+            services: DEFAULT_SERVICES,
+            nonce: 1,
         };
         let err = ver.validate(DEFAULT_BPS).unwrap_err();
         assert_eq!(err.kind, ProtocolErrorKind::TimestampDrift);
@@ -1655,10 +1780,17 @@ mod tests {
     #[test]
     fn user_agent_too_short_rejected() {
         let ver = VersionPayload {
-            version: PROTOCOL_VERSION, height: 0,
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            version: PROTOCOL_VERSION,
+            height: 0,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             user_agent: "ab".to_string(),
-            bps: DEFAULT_BPS, chain_id: CHAIN_ID, services: DEFAULT_SERVICES, nonce: 1,
+            bps: DEFAULT_BPS,
+            chain_id: CHAIN_ID,
+            services: DEFAULT_SERVICES,
+            nonce: 1,
         };
         let err = ver.validate(DEFAULT_BPS).unwrap_err();
         assert_eq!(err.kind, ProtocolErrorKind::FieldViolation);
@@ -1667,10 +1799,17 @@ mod tests {
     #[test]
     fn user_agent_too_long_rejected() {
         let ver = VersionPayload {
-            version: PROTOCOL_VERSION, height: 0,
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            version: PROTOCOL_VERSION,
+            height: 0,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             user_agent: "x".repeat(MAX_USER_AGENT_LEN + 1),
-            bps: DEFAULT_BPS, chain_id: CHAIN_ID, services: DEFAULT_SERVICES, nonce: 1,
+            bps: DEFAULT_BPS,
+            chain_id: CHAIN_ID,
+            services: DEFAULT_SERVICES,
+            nonce: 1,
         };
         let err = ver.validate(DEFAULT_BPS).unwrap_err();
         assert_eq!(err.kind, ProtocolErrorKind::FieldViolation);
@@ -1679,10 +1818,17 @@ mod tests {
     #[test]
     fn valid_version_accepted() {
         let ver = VersionPayload {
-            version: PROTOCOL_VERSION, height: 50_000,
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            version: PROTOCOL_VERSION,
+            height: 50_000,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             user_agent: "ShadowDAG/0.1.0 id:abcdef1234567890".to_string(),
-            bps: DEFAULT_BPS, chain_id: CHAIN_ID, services: DEFAULT_SERVICES, nonce: 42,
+            bps: DEFAULT_BPS,
+            chain_id: CHAIN_ID,
+            services: DEFAULT_SERVICES,
+            nonce: 42,
         };
         assert!(ver.validate(DEFAULT_BPS).is_ok());
         assert_eq!(ver.peer_identity(), Some("abcdef1234567890"));
@@ -1693,8 +1839,8 @@ mod tests {
     #[test]
     fn nonce_replay_detected() {
         let mut session = ProtocolSession::new(true, DEFAULT_BPS);
-        assert!(session.record_nonce(12345));   // first time → ok
-        assert!(!session.record_nonce(12345));  // replay → rejected
+        assert!(session.record_nonce(12345)); // first time → ok
+        assert!(!session.record_nonce(12345)); // replay → rejected
     }
 
     #[test]
@@ -1798,7 +1944,9 @@ mod tests {
         let mut session = ProtocolSession::new(true, DEFAULT_BPS);
         session.begin_disconnect();
         assert!(!session.is_alive());
-        let err = session.check_command_allowed(CommandId::Version).unwrap_err();
+        let err = session
+            .check_command_allowed(CommandId::Version)
+            .unwrap_err();
         assert_eq!(err.kind, ProtocolErrorKind::InvalidTransition);
     }
 
@@ -1815,10 +1963,17 @@ mod tests {
     #[test]
     fn version_insufficient_services_rejected() {
         let ver = VersionPayload {
-            version: PROTOCOL_VERSION, height: 0,
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            version: PROTOCOL_VERSION,
+            height: 0,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             user_agent: "ShadowDAG/0.1.0 test".to_string(),
-            bps: DEFAULT_BPS, chain_id: CHAIN_ID, services: 0, nonce: 1,
+            bps: DEFAULT_BPS,
+            chain_id: CHAIN_ID,
+            services: 0,
+            nonce: 1,
         };
         let err = ver.validate(DEFAULT_BPS).unwrap_err();
         assert_eq!(err.kind, ProtocolErrorKind::FieldViolation);
@@ -1846,7 +2001,10 @@ mod tests {
 
         // Reaching target transitions to block sync
         session.update_header_sync(1000);
-        assert!(matches!(session.lifecycle, PeerLifecycle::SyncingBlocks { .. }));
+        assert!(matches!(
+            session.lifecycle,
+            PeerLifecycle::SyncingBlocks { .. }
+        ));
     }
 
     #[test]
@@ -1854,7 +2012,7 @@ mod tests {
         let mut session = ProtocolSession::new(true, DEFAULT_BPS);
         session.begin_header_sync(100);
         session.update_header_sync(100); // → SyncingBlocks
-        session.update_block_sync(100);  // → Normal
+        session.update_block_sync(100); // → Normal
         assert!(session.lifecycle.is_normal());
         assert!(session.is_relay_ready() || !session.is_established()); // needs established too
     }
@@ -1885,14 +2043,14 @@ mod tests {
 
     #[test]
     fn payload_size_verack_exact_discriminant() {
-        assert!(validate_payload_size(CommandId::VerAck, 4).is_ok());  // bincode enum tag
+        assert!(validate_payload_size(CommandId::VerAck, 4).is_ok()); // bincode enum tag
         assert!(validate_payload_size(CommandId::VerAck, 3).is_err());
         assert!(validate_payload_size(CommandId::VerAck, 5).is_err());
     }
 
     #[test]
     fn payload_size_ping_exactly_12() {
-        assert!(validate_payload_size(CommandId::Ping, 12).is_ok());  // 4 tag + 8 nonce
+        assert!(validate_payload_size(CommandId::Ping, 12).is_ok()); // 4 tag + 8 nonce
         assert!(validate_payload_size(CommandId::Ping, 11).is_err());
         assert!(validate_payload_size(CommandId::Ping, 13).is_err());
     }
@@ -1906,7 +2064,7 @@ mod tests {
 
     #[test]
     fn payload_size_getmempool_exact_discriminant() {
-        assert!(validate_payload_size(CommandId::GetMempool, 4).is_ok());  // bincode enum tag
+        assert!(validate_payload_size(CommandId::GetMempool, 4).is_ok()); // bincode enum tag
         assert!(validate_payload_size(CommandId::GetMempool, 3).is_err());
         assert!(validate_payload_size(CommandId::GetMempool, 5).is_err());
     }
@@ -1922,11 +2080,17 @@ mod tests {
         session.sent_version().unwrap();
 
         let ver = VersionPayload {
-            version: PROTOCOL_VERSION, height: 100,
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            version: PROTOCOL_VERSION,
+            height: 100,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             user_agent: "ShadowDAG/0.1.0 test".to_string(),
-            bps: DEFAULT_BPS, chain_id: CHAIN_ID,
-            services: SERVICE_NODE_NETWORK | SERVICE_NODE_PRIVACY, nonce: 1,
+            bps: DEFAULT_BPS,
+            chain_id: CHAIN_ID,
+            services: SERVICE_NODE_NETWORK | SERVICE_NODE_PRIVACY,
+            nonce: 1,
         };
         session.received_version(ver).unwrap();
 

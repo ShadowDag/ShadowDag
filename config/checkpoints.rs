@@ -8,7 +8,7 @@ use crate::config::genesis::genesis::genesis_hash;
 #[derive(Debug, Clone)]
 pub struct CheckpointEntry {
     pub height: u64,
-    pub hash:   String,
+    pub hash: String,
 }
 
 impl CheckpointEntry {
@@ -21,9 +21,7 @@ pub struct Checkpoints;
 
 impl Checkpoints {
     pub fn all() -> Vec<CheckpointEntry> {
-        vec![
-            CheckpointEntry::new(0, genesis_hash()),
-        ]
+        vec![CheckpointEntry::new(0, genesis_hash())]
     }
 
     /// Check if a block hash is valid at the given height against HARDCODED
@@ -160,6 +158,9 @@ mod tests {
 
     #[test]
     fn checkpoint_count_correct() {
-        assert!(Checkpoints::count() >= 1, "At least genesis checkpoint must exist");
+        assert!(
+            Checkpoints::count() >= 1,
+            "At least genesis checkpoint must exist"
+        );
     }
 }

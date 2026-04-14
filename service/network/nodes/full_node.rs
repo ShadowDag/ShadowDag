@@ -3,31 +3,35 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use once_cell::sync::Lazy;
 
 use crate::domain::block::block::Block;
 use crate::domain::utxo::utxo_set::UtxoSet;
 
-use crate::engine::consensus::validation::block_validator::BlockValidator;
 use crate::config::node::node_config::NetworkMode;
+use crate::engine::consensus::validation::block_validator::BlockValidator;
 
+use crate::engine::consensus::difficulty::retarget::{
+    BlockTimeRecord, RetargetEngine, SHORT_WINDOW,
+};
 use crate::engine::dag::core::dag_manager::DagManager;
-use crate::engine::dag::ghostdag::ghostdag::{GhostDag, DagBlock};
-use crate::engine::consensus::difficulty::retarget::{RetargetEngine, BlockTimeRecord, SHORT_WINDOW};
+use crate::engine::dag::ghostdag::ghostdag::{DagBlock, GhostDag};
 
-use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
-use crate::service::network::dos_guard::{DosGuard, DosVerdict, MsgType};
-use crate::errors::{NodeError, ConsensusError};
 use crate::domain::transaction::transaction::TxType;
-use crate::domain::transaction::tx_receipt::{TxReceipt, ReceiptStore, compute_receipt_root};
-use crate::runtime::vm::core::vm::ExecutionResult;
-use crate::runtime::vm::core::execution_env::{ExecutionEnvironment, BlockContext, CallContext, CallOutcome};
+use crate::domain::transaction::tx_receipt::{compute_receipt_root, ReceiptStore, TxReceipt};
+use crate::errors::{ConsensusError, NodeError};
+use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
 use crate::runtime::vm::contracts::contract_storage::ContractStorage;
-use crate::{slog_info, slog_warn, slog_error};
+use crate::runtime::vm::core::execution_env::{
+    BlockContext, CallContext, CallOutcome, ExecutionEnvironment,
+};
+use crate::runtime::vm::core::vm::ExecutionResult;
+use crate::service::network::dos_guard::{DosGuard, DosVerdict, MsgType};
+use crate::{slog_error, slog_info, slog_warn};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Mining template state — per-node, not per-process
@@ -63,14 +67,14 @@ use crate::{slog_info, slog_warn, slog_error};
 /// state can no longer leak into another's mining payloads.
 pub struct MiningTemplateState {
     next_difficulty: AtomicU64,
-    dag_tips:        Mutex<Vec<String>>,
+    dag_tips: Mutex<Vec<String>>,
 }
 
 impl MiningTemplateState {
     pub fn new() -> Self {
         Self {
             next_difficulty: AtomicU64::new(1),
-            dag_tips:        Mutex::new(Vec::new()),
+            dag_tips: Mutex::new(Vec::new()),
         }
     }
 
@@ -83,10 +87,7 @@ impl MiningTemplateState {
     }
 
     pub fn dag_tips(&self) -> Vec<String> {
-        self.dag_tips
-            .lock()
-            .map(|t| t.clone())
-            .unwrap_or_default()
+        self.dag_tips.lock().map(|t| t.clone()).unwrap_or_default()
     }
 
     pub fn set_dag_tips(&self, tips: Vec<String>) {
@@ -170,7 +171,7 @@ pub struct FullNode {
     /// Orphan pool: blocks whose parents haven't arrived yet.
     /// Key: block hash, Value: (block, timestamp received).
     /// When a parent arrives, orphans are re-processed automatically.
-    orphan_pool: Mutex<HashMap<String, (Block, u64, String)>>,  // block_hash → (block, timestamp, peer_id)
+    orphan_pool: Mutex<HashMap<String, (Block, u64, String)>>, // block_hash → (block, timestamp, peer_id)
     /// Reverse index: parent_hash → vec of orphan block hashes waiting for it.
     orphan_by_parent: Mutex<HashMap<String, Vec<String>>>,
     /// Per-peer orphan count (DoS protection: ban peers flooding orphans)
@@ -218,11 +219,11 @@ impl FullNode {
             let start_idx = blocks.len().saturating_sub(SHORT_WINDOW);
             for block in &blocks[start_idx..] {
                 retarget.on_new_block(BlockTimeRecord {
-                    height:          block.header.height,
-                    timestamp:       block.header.timestamp,
-                    difficulty:      block.header.difficulty,
+                    height: block.header.height,
+                    timestamp: block.header.timestamp,
+                    difficulty: block.header.difficulty,
                     dag_block_count: 1, // historical seed — no DAG width data
-                    blue_score:      block.header.blue_score,
+                    blue_score: block.header.blue_score,
                 });
             }
             let seeded_diff = retarget.ema_difficulty();
@@ -254,9 +255,11 @@ impl FullNode {
         // caller that still uses the `get_next_difficulty` /
         // `get_dag_tips` free functions sees the same values.
         let mining_state = Arc::new(MiningTemplateState::new());
-        mining_state.set_next_difficulty(
-            if seed_count > 1 { retarget.ema_difficulty() } else { genesis_diff }
-        );
+        mining_state.set_next_difficulty(if seed_count > 1 {
+            retarget.ema_difficulty()
+        } else {
+            genesis_diff
+        });
         if !initial_tips.is_empty() {
             mining_state.set_dag_tips(initial_tips.clone());
         }
@@ -298,21 +301,35 @@ impl FullNode {
         // The exact check_block_size (below) uses the real serialized size limit.
         // This estimate is a cheap pre-filter that rejects obviously oversized blocks
         // before the more expensive serialization-based check.
-        let block_size = block.canonical_size_estimate();
-        match self.dos_guard.check(peer_id, &MsgType::Block, block_size) {
-            DosVerdict::Allow => {},
+        let block_size_estimate = block.canonical_size_estimate();
+        match self
+            .dos_guard
+            .check(peer_id, &MsgType::Block, block_size_estimate)
+        {
+            DosVerdict::Allow => {}
             DosVerdict::BanActive => {
-                return Err(NodeError::PeerBanned { peer: peer_id.to_string(), reason: "peer is banned".to_string() });
-            },
+                return Err(NodeError::PeerBanned {
+                    peer: peer_id.to_string(),
+                    reason: "peer is banned".to_string(),
+                });
+            }
             verdict => {
-                return Err(NodeError::PeerBanned { peer: peer_id.to_string(), reason: format!("DOS_REJECTED: {:?}", verdict) });
-            },
+                return Err(NodeError::PeerBanned {
+                    peer: peer_id.to_string(),
+                    reason: format!("DOS_REJECTED: {:?}", verdict),
+                });
+            }
         }
 
         // ── L0.25: Exact serialized size check ────────────────────────
-        // DosGuard::check uses canonical_size_estimate which under-counts;
-        // this uses the real DoS guard size limit for a hard reject.
-        if let Err(e) = self.dos_guard.check_block_size(block_size) {
+        // DosGuard::check uses canonical_size_estimate which under-counts.
+        // Serialize once and enforce the exact byte-size limit.
+        let exact_block_size = bincode::serialize(block)
+            .map(|bytes| bytes.len())
+            .map_err(|e| {
+                NodeError::BlockRejected(format!("failed to serialize block for size check: {}", e))
+            })?;
+        if let Err(e) = self.dos_guard.check_block_size(exact_block_size) {
             return Err(NodeError::PeerBanned {
                 peer: peer_id.to_string(),
                 reason: format!("BLOCK_TOO_LARGE: {}", e),
@@ -321,7 +338,13 @@ impl FullNode {
 
         // ── L0.5: Per-peer rate limiting ─────────────────────────────
         if self.is_peer_rate_limited(peer_id) {
-            return Err(NodeError::PeerBanned { peer: peer_id.to_string(), reason: format!("RATE_LIMITED: exceeds {} blocks/min", MAX_BLOCKS_PER_PEER_PER_MIN) });
+            return Err(NodeError::PeerBanned {
+                peer: peer_id.to_string(),
+                reason: format!(
+                    "RATE_LIMITED: exceeds {} blocks/min",
+                    MAX_BLOCKS_PER_PEER_PER_MIN
+                ),
+            });
         }
 
         // ── L1 → L2 → L3 → DAG → L4 ────────────────────────────────
@@ -344,10 +367,10 @@ impl FullNode {
     /// parallel blocks at the same height are kept so the median correctly
     /// reflects the "weight" of blocks at that timestamp.
     fn collect_ancestor_timestamps(&self, block: &Block) -> Vec<u64> {
-        use std::collections::{VecDeque, HashSet};
+        use std::collections::{HashSet, VecDeque};
 
         const TARGET_ANCESTOR_COUNT: usize = 32; // Collect up to 32 ancestors
-        const MAX_WALK_DEPTH: usize = 16;        // Walk up to 16 DAG levels (>= MEDIAN_TIME_SPAN=11 + headroom for DAG branching)
+        const MAX_WALK_DEPTH: usize = 16; // Walk up to 16 DAG levels (>= MEDIAN_TIME_SPAN=11 + headroom for DAG branching)
 
         let mut timestamps = Vec::with_capacity(TARGET_ANCESTOR_COUNT);
         let mut visited = HashSet::with_capacity(TARGET_ANCESTOR_COUNT);
@@ -419,7 +442,9 @@ impl FullNode {
         // retarget would be more precise but requires walking the
         // parent chain for every incoming block — acceptable for now.
         let expected_diff = {
-            let retarget = self.retarget.lock()
+            let retarget = self
+                .retarget
+                .lock()
                 .map_err(|e| NodeError::Other(format!("Retarget lock poisoned: {}", e)))?;
             Some(retarget.ema_difficulty())
         };
@@ -427,7 +452,11 @@ impl FullNode {
         let ancestor_ts = self.collect_ancestor_timestamps(block);
 
         let result = BlockValidator::validate_block_full_with_difficulty(
-            block, &self.utxo_set, &ancestor_ts, &self.network, expected_diff
+            block,
+            &self.utxo_set,
+            &ancestor_ts,
+            &self.network,
+            expected_diff,
         );
         if !result.valid {
             return Err(NodeError::BlockRejected(format!(
@@ -440,16 +469,24 @@ impl FullNode {
 
         // ─── PHASE 2 START ─── (stateful: reads block_store, dag_manager) ───
         if self.dag_manager.block_exists(&block.header.hash) {
-            return Err(NodeError::BlockRejected(format!("Block {} already exists in DAG", &block.header.hash)));
+            return Err(NodeError::BlockRejected(format!(
+                "Block {} already exists in DAG",
+                &block.header.hash
+            )));
         }
 
         match BlockValidator::validate_parents_exist(block, &self.block_store, &self.dag_manager) {
-            Ok(()) => {},
+            Ok(()) => {}
             Err(e) if e.to_string().contains("not found") => {
                 self.add_orphan(block.clone(), peer_id);
                 return Err(NodeError::BlockRejected(format!("ORPHAN: {}", e)));
-            },
-            Err(e) => return Err(NodeError::BlockRejected(format!("Parent validation failed: {}", e))),
+            }
+            Err(e) => {
+                return Err(NodeError::BlockRejected(format!(
+                    "Parent validation failed: {}",
+                    e
+                )))
+            }
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -471,7 +508,10 @@ impl FullNode {
         if let Err(e) = self.dag_manager.add_block_validated(block, true) {
             // Clean up persisted block — DAG rejected it, so it must not remain in BlockStore
             let _ = self.block_store.delete_block(&block.header.hash);
-            return Err(NodeError::BlockRejected(format!("DAG insertion failed: {}", e)));
+            return Err(NodeError::BlockRejected(format!(
+                "DAG insertion failed: {}",
+                e
+            )));
         }
 
         let dag_block = DagBlock {
@@ -481,12 +521,14 @@ impl FullNode {
             timestamp: block.header.timestamp,
         };
         if let Err(e) = self.ghostdag.add_block(dag_block) {
-            // Cleanup: remove from BlockStore since GHOSTDAG rejected
+            // Roll back DAG topology + BlockStore so no stale topology remains.
+            if let Err(re) = self.dag_manager.remove_block_topology(&block.header.hash) {
+                slog_error!("node", "dag_topology_rollback_failed",
+                    hash => &block.header.hash, error => &re.to_string());
+            }
             let _ = self.block_store.delete_block(&block.header.hash);
-            // Note: DAG manager doesn't support remove, so log the inconsistency
             slog_error!("node", "ghostdag_add_failed_cleanup",
-                hash => &block.header.hash, error => &e.to_string(),
-                note => "block removed from BlockStore; DAG entry may be stale until reindex");
+                hash => &block.header.hash, error => &e.to_string());
             return Err(NodeError::BlockRejected(format!("GHOSTDAG: {}", e)));
         }
 
@@ -506,10 +548,8 @@ impl FullNode {
         // GHOSTDAG orders A before B, A's txs execute first.
         // ═══════════════════════════════════════════════════════════════
         if let Err(e) = self.recompute_virtual_chain() {
-            // Best-effort cleanup: DAG/GHOSTDAG don't support remove, but
-            // we can at least remove the block from BlockStore to prevent
-            // the inconsistency from persisting across restarts.
-            let _ = self.block_store.delete_block(&block.header.hash);
+            // Keep BlockStore aligned with DAG/GHOSTDAG.
+            // Deleting only from BlockStore creates stale topology.
             slog_error!("node", "virtual_chain_recompute_failed_after_insert",
                 hash => &block.header.hash, error => &e.to_string());
             return Err(e);
@@ -532,7 +572,9 @@ impl FullNode {
         // retarget would be more precise but requires walking the
         // parent chain for every incoming block — acceptable for now.
         let expected_diff = {
-            let retarget = self.retarget.lock()
+            let retarget = self
+                .retarget
+                .lock()
                 .map_err(|e| NodeError::Other(format!("Retarget lock poisoned: {}", e)))?;
             Some(retarget.ema_difficulty())
         };
@@ -540,10 +582,16 @@ impl FullNode {
         let ancestor_ts = self.collect_ancestor_timestamps(block);
 
         let result = BlockValidator::validate_block_full_with_difficulty(
-            block, &self.utxo_set, &ancestor_ts, &self.network, expected_diff
+            block,
+            &self.utxo_set,
+            &ancestor_ts,
+            &self.network,
+            expected_diff,
         );
         if !result.valid {
-            return Err(NodeError::BlockRejected(result.reason.unwrap_or_else(|| "unknown".to_string())));
+            return Err(NodeError::BlockRejected(
+                result.reason.unwrap_or_else(|| "unknown".to_string()),
+            ));
         }
 
         if self.dag_manager.block_exists(&block.header.hash) {
@@ -563,7 +611,10 @@ impl FullNode {
         if let Err(e) = self.dag_manager.add_block_validated(block, true) {
             // Clean up persisted block — DAG rejected it, so it must not remain in BlockStore
             let _ = self.block_store.delete_block(&block.header.hash);
-            return Err(NodeError::BlockRejected(format!("DAG insertion failed: {}", e)));
+            return Err(NodeError::BlockRejected(format!(
+                "DAG insertion failed: {}",
+                e
+            )));
         }
 
         let dag_block = DagBlock {
@@ -573,20 +624,19 @@ impl FullNode {
             timestamp: block.header.timestamp,
         };
         if let Err(e) = self.ghostdag.add_block(dag_block) {
-            // Cleanup: remove from BlockStore since GHOSTDAG rejected
+            if let Err(re) = self.dag_manager.remove_block_topology(&block.header.hash) {
+                slog_error!("node", "dag_topology_rollback_failed",
+                    hash => &block.header.hash, error => &re.to_string());
+            }
             let _ = self.block_store.delete_block(&block.header.hash);
-            // Note: DAG manager doesn't support remove, so log the inconsistency
             slog_error!("node", "ghostdag_add_failed_cleanup",
-                hash => &block.header.hash, error => &e.to_string(),
-                note => "block removed from BlockStore; DAG entry may be stale until reindex");
+                hash => &block.header.hash, error => &e.to_string());
             return Err(NodeError::BlockRejected(format!("GHOSTDAG: {}", e)));
         }
 
         if let Err(e) = self.recompute_virtual_chain() {
-            // Best-effort cleanup: DAG/GHOSTDAG don't support remove, but
-            // we can at least remove the block from BlockStore to prevent
-            // the inconsistency from persisting across restarts.
-            let _ = self.block_store.delete_block(&block.header.hash);
+            // Keep BlockStore aligned with DAG/GHOSTDAG.
+            // Deleting only from BlockStore creates stale topology.
             slog_error!("node", "virtual_chain_recompute_failed_after_insert",
                 hash => &block.header.hash, error => &e.to_string());
             return Err(e);
@@ -602,8 +652,14 @@ impl FullNode {
     pub fn select_best_tip(tips: &[String], ghostdag: &GhostDag) -> Option<String> {
         tips.iter()
             .max_by(|a, b| {
-                ghostdag.get_blue_score(a).cmp(&ghostdag.get_blue_score(b))
-                    .then_with(|| ghostdag.get_chain_height(a).cmp(&ghostdag.get_chain_height(b)))
+                ghostdag
+                    .get_blue_score(a)
+                    .cmp(&ghostdag.get_blue_score(b))
+                    .then_with(|| {
+                        ghostdag
+                            .get_chain_height(a)
+                            .cmp(&ghostdag.get_chain_height(b))
+                    })
                     .then_with(|| b.cmp(a)) // lower hash wins
             })
             .cloned()
@@ -619,7 +675,9 @@ impl FullNode {
     pub fn recompute_virtual_chain(&self) -> Result<(), NodeError> {
         // Get the new best tip from GHOSTDAG
         let tips = self.ghostdag.get_tips();
-        if tips.is_empty() { return Ok(()); }
+        if tips.is_empty() {
+            return Ok(());
+        }
 
         // Use canonical tip selection: blue_score -> height -> hash
         let best_tip = match Self::select_best_tip(&tips, &self.ghostdag) {
@@ -627,8 +685,7 @@ impl FullNode {
             None => return Ok(()),
         };
 
-        let current_best = self.block_store.get_best_hash()
-            .unwrap_or_default();
+        let current_best = self.block_store.get_best_hash().unwrap_or_default();
 
         if best_tip == current_best {
             return Ok(()); // No chain change
@@ -645,7 +702,9 @@ impl FullNode {
             let mut cursor = current_best.clone();
             while !cursor.is_empty() {
                 old_chain_set.insert(cursor.clone());
-                cursor = self.block_store.get_block(&cursor)
+                cursor = self
+                    .block_store
+                    .get_block(&cursor)
                     .and_then(|b| b.header.selected_parent.clone())
                     .unwrap_or_default();
             }
@@ -688,7 +747,8 @@ impl FullNode {
         if new_chain.len() as u64 > MAX_REORG_DEPTH {
             return Err(NodeError::BlockRejected(format!(
                 "reorg depth {} exceeds MAX_REORG_DEPTH {}",
-                new_chain.len(), MAX_REORG_DEPTH
+                new_chain.len(),
+                MAX_REORG_DEPTH
             )));
         }
 
@@ -700,7 +760,8 @@ impl FullNode {
             while !cursor.is_empty() && cursor != fork_point {
                 if rollback_count >= MAX_REORG_DEPTH {
                     return Err(NodeError::BlockRejected(format!(
-                        "reorg rollback depth {} exceeds MAX_REORG_DEPTH", rollback_count
+                        "reorg rollback depth {} exceeds MAX_REORG_DEPTH",
+                        rollback_count
                     )));
                 }
                 self.utxo_set.rollback_block_undo(&cursor).map_err(|e| {
@@ -712,7 +773,9 @@ impl FullNode {
                 rolled_back_old.push(cursor.clone());
                 rollback_count += 1;
                 // Walk to parent via selected_parent
-                cursor = self.block_store.get_block(&cursor)
+                cursor = self
+                    .block_store
+                    .get_block(&cursor)
                     .and_then(|b| b.header.selected_parent.clone())
                     .unwrap_or_default();
             }
@@ -787,9 +850,14 @@ impl FullNode {
                                     );
                                     // Re-execute contracts for the old block to restore state
                                     let (_, _, _, env) = self.execute_contract_transactions(
-                                        &old_block, &self.contract_storage);
+                                        &old_block,
+                                        &self.contract_storage,
+                                    );
                                     if let Err(pe) = env.persist_with_undo(
-                                        &self.contract_storage, hash, None, None,
+                                        &self.contract_storage,
+                                        hash,
+                                        None,
+                                        None,
                                     ) {
                                         slog_error!("node", "CRITICAL_contract_restore_failed",
                                             block => hash, error => &format!("{}", pe));
@@ -797,8 +865,10 @@ impl FullNode {
                                 }
                             }
                             return Err(NodeError::Consensus(ConsensusError::BlockValidation(
-                                format!("contract state persistence failed for block {}: {}",
-                                    block_hash, e)
+                                format!(
+                                    "contract state persistence failed for block {}: {}",
+                                    block_hash, e
+                                ),
                             )));
                         }
 
@@ -815,7 +885,10 @@ impl FullNode {
                         // TODO: refactor persist_receipts_batch to return Result<()>
                         // so callers can handle failures explicitly.
                         use crate::domain::transaction::tx_receipt::persist_receipts_batch;
-                        persist_receipts_batch(self.contract_storage.shared_db().as_ref(), &receipts);
+                        persist_receipts_batch(
+                            self.contract_storage.shared_db().as_ref(),
+                            &receipts,
+                        );
 
                         // NOTE: receipt_root and state_root are NOT included in the
                         // PoW hash (shadowhash). This is by design: they are computed
@@ -845,20 +918,26 @@ impl FullNode {
                         // Record VM metrics for monitoring dashboards and
                         // run a quick invariant check on receipt/state roots.
                         {
-                            use crate::runtime::vm::testing::observability::VM_METRICS;
                             use crate::runtime::vm::testing::invariant_checker::InvariantChecker;
+                            use crate::runtime::vm::testing::observability::VM_METRICS;
 
                             VM_METRICS.record_block();
 
-                            let has_contract_txs = block.body.transactions.iter()
-                                .any(|tx| matches!(tx.tx_type, TxType::ContractCreate | TxType::ContractCall));
+                            let has_contract_txs = block.body.transactions.iter().any(|tx| {
+                                matches!(tx.tx_type, TxType::ContractCreate | TxType::ContractCall)
+                            });
                             if has_contract_txs {
                                 VM_METRICS.record_call();
                             }
 
                             // Quick invariant check: verify receipt_root and state_root
                             if let (Some(ref rr), Some(ref sr)) = (&receipt_root, &state_root) {
-                                if !InvariantChecker::quick_check(Some(rr), Some(sr), &receipts, &env) {
+                                if !InvariantChecker::quick_check(
+                                    Some(rr),
+                                    Some(sr),
+                                    &receipts,
+                                    &env,
+                                ) {
                                     slog_error!("node", "INVARIANT_VIOLATION",
                                         block => block_hash, height => &block.header.height.to_string());
                                     VM_METRICS.record_violation();
@@ -872,11 +951,20 @@ impl FullNode {
                                     for hash in rolled_back_old.iter().rev() {
                                         if let Some(old_block) = self.block_store.get_block(hash) {
                                             let _ = self.utxo_set.apply_block_dag_ordered(
-                                                &old_block.body.transactions, old_block.header.height, hash);
-                                            let (_, _, _, env) = self.execute_contract_transactions(
-                                                &old_block, &self.contract_storage);
+                                                &old_block.body.transactions,
+                                                old_block.header.height,
+                                                hash,
+                                            );
+                                            let (_, _, _, env) = self
+                                                .execute_contract_transactions(
+                                                    &old_block,
+                                                    &self.contract_storage,
+                                                );
                                             if let Err(pe) = env.persist_with_undo(
-                                                &self.contract_storage, hash, None, None,
+                                                &self.contract_storage,
+                                                hash,
+                                                None,
+                                                None,
                                             ) {
                                                 slog_error!("node", "CRITICAL_contract_restore_failed",
                                                     block => hash, error => &format!("{}", pe));
@@ -897,41 +985,50 @@ impl FullNode {
                         // This is the DEFINITIVE coinbase check.
                         use crate::config::consensus::emission_schedule::EmissionSchedule;
                         let expected_reward = EmissionSchedule::block_reward(block.header.height);
-                        let expected_total = expected_reward.checked_add(applied_fees)
-                    .ok_or_else(|| {
-                        // Rollback partially-applied new chain (UTXO + contract)
-                        for hash in applied_new.iter().rev() {
-                            let _ = self.utxo_set.rollback_block_undo(hash);
-                            self.rollback_contract_block(hash);
-                        }
-                        // Best-effort: re-apply the old chain to restore the
-                        // previous consistent state. If this also fails, the
-                        // node is in an unrecoverable state and should restart
-                        // with full UTXO rebuild.
-                        for hash in rolled_back_old.iter().rev() {
-                            if let Some(old_block) = self.block_store.get_block(hash) {
-                                let _ = self.utxo_set.apply_block_dag_ordered(
-                                    &old_block.body.transactions,
-                                    old_block.header.height,
-                                    hash,
-                                );
-                                // Re-execute contracts for the old block to restore state
-                                let (_, _, _, env) = self.execute_contract_transactions(
-                                    &old_block, &self.contract_storage);
-                                if let Err(pe) = env.persist_with_undo(
-                                    &self.contract_storage, hash, None, None,
-                                ) {
-                                    slog_error!("node", "CRITICAL_contract_restore_failed",
-                                        block => hash, error => &format!("{}", pe));
+                        let expected_total =
+                            expected_reward.checked_add(applied_fees).ok_or_else(|| {
+                                // Rollback partially-applied new chain (UTXO + contract)
+                                for hash in applied_new.iter().rev() {
+                                    let _ = self.utxo_set.rollback_block_undo(hash);
+                                    self.rollback_contract_block(hash);
                                 }
-                            }
-                        }
-                        NodeError::Consensus(ConsensusError::BlockValidation("reward + fees overflow".into()))
-                    })?;
+                                // Best-effort: re-apply the old chain to restore the
+                                // previous consistent state. If this also fails, the
+                                // node is in an unrecoverable state and should restart
+                                // with full UTXO rebuild.
+                                for hash in rolled_back_old.iter().rev() {
+                                    if let Some(old_block) = self.block_store.get_block(hash) {
+                                        let _ = self.utxo_set.apply_block_dag_ordered(
+                                            &old_block.body.transactions,
+                                            old_block.header.height,
+                                            hash,
+                                        );
+                                        // Re-execute contracts for the old block to restore state
+                                        let (_, _, _, env) = self.execute_contract_transactions(
+                                            &old_block,
+                                            &self.contract_storage,
+                                        );
+                                        if let Err(pe) = env.persist_with_undo(
+                                            &self.contract_storage,
+                                            hash,
+                                            None,
+                                            None,
+                                        ) {
+                                            slog_error!("node", "CRITICAL_contract_restore_failed",
+                                        block => hash, error => &format!("{}", pe));
+                                        }
+                                    }
+                                }
+                                NodeError::Consensus(ConsensusError::BlockValidation(
+                                    "reward + fees overflow".into(),
+                                ))
+                            })?;
 
                         if let Some(cb) = block.body.transactions.first() {
                             if cb.is_coinbase() {
-                                let actual_total: u64 = match cb.outputs.iter()
+                                let actual_total: u64 = match cb
+                                    .outputs
+                                    .iter()
                                     .try_fold(0u64, |acc, o| acc.checked_add(o.amount))
                                 {
                                     Some(t) => t,
@@ -947,17 +1044,25 @@ impl FullNode {
                                         // node is in an unrecoverable state and should restart
                                         // with full UTXO rebuild.
                                         for hash in rolled_back_old.iter().rev() {
-                                            if let Some(old_block) = self.block_store.get_block(hash) {
+                                            if let Some(old_block) =
+                                                self.block_store.get_block(hash)
+                                            {
                                                 let _ = self.utxo_set.apply_block_dag_ordered(
                                                     &old_block.body.transactions,
                                                     old_block.header.height,
                                                     hash,
                                                 );
                                                 // Re-execute contracts for the old block to restore state
-                                                let (_, _, _, env) = self.execute_contract_transactions(
-                                                    &old_block, &self.contract_storage);
+                                                let (_, _, _, env) = self
+                                                    .execute_contract_transactions(
+                                                        &old_block,
+                                                        &self.contract_storage,
+                                                    );
                                                 if let Err(pe) = env.persist_with_undo(
-                                                    &self.contract_storage, hash, None, None,
+                                                    &self.contract_storage,
+                                                    hash,
+                                                    None,
+                                                    None,
                                                 ) {
                                                     slog_error!("node", "CRITICAL_contract_restore_failed",
                                                         block => hash, error => &format!("{}", pe));
@@ -965,7 +1070,8 @@ impl FullNode {
                                             }
                                         }
                                         return Err(NodeError::BlockRejected(format!(
-                                            "coinbase output overflow in {}", block_hash
+                                            "coinbase output overflow in {}",
+                                            block_hash
                                         )));
                                     }
                                 };
@@ -988,10 +1094,16 @@ impl FullNode {
                                                 hash,
                                             );
                                             // Re-execute contracts for the old block to restore state
-                                            let (_, _, _, env) = self.execute_contract_transactions(
-                                                &old_block, &self.contract_storage);
+                                            let (_, _, _, env) = self
+                                                .execute_contract_transactions(
+                                                    &old_block,
+                                                    &self.contract_storage,
+                                                );
                                             if let Err(pe) = env.persist_with_undo(
-                                                &self.contract_storage, hash, None, None,
+                                                &self.contract_storage,
+                                                hash,
+                                                None,
+                                                None,
                                             ) {
                                                 slog_error!("node", "CRITICAL_contract_restore_failed",
                                                     block => hash, error => &format!("{}", pe));
@@ -1028,17 +1140,20 @@ impl FullNode {
                                 );
                                 // Re-execute contracts for the old block to restore state
                                 let (_, _, _, env) = self.execute_contract_transactions(
-                                    &old_block, &self.contract_storage);
-                                if let Err(pe) = env.persist_with_undo(
-                                    &self.contract_storage, hash, None, None,
-                                ) {
+                                    &old_block,
+                                    &self.contract_storage,
+                                );
+                                if let Err(pe) =
+                                    env.persist_with_undo(&self.contract_storage, hash, None, None)
+                                {
                                     slog_error!("node", "CRITICAL_contract_restore_failed",
                                         block => hash, error => &format!("{}", pe));
                                 }
                             }
                         }
                         return Err(NodeError::BlockRejected(format!(
-                            "apply_block_dag_ordered failed for {}: {}", block_hash, e
+                            "apply_block_dag_ordered failed for {}: {}",
+                            block_hash, e
                         )));
                     }
                 }
@@ -1060,18 +1175,19 @@ impl FullNode {
                             hash,
                         );
                         // Re-execute contracts for the old block to restore state
-                        let (_, _, _, env) = self.execute_contract_transactions(
-                            &old_block, &self.contract_storage);
-                        if let Err(pe) = env.persist_with_undo(
-                            &self.contract_storage, hash, None, None,
-                        ) {
+                        let (_, _, _, env) =
+                            self.execute_contract_transactions(&old_block, &self.contract_storage);
+                        if let Err(pe) =
+                            env.persist_with_undo(&self.contract_storage, hash, None, None)
+                        {
                             slog_error!("node", "CRITICAL_contract_restore_failed",
                                 block => hash, error => &format!("{}", pe));
                         }
                     }
                 }
                 return Err(NodeError::BlockRejected(format!(
-                    "block {} missing from store during virtual chain apply", block_hash
+                    "block {} missing from store during virtual chain apply",
+                    block_hash
                 )));
             }
         }
@@ -1096,18 +1212,17 @@ impl FullNode {
                         hash,
                     );
                     // Re-execute contracts for the old block to restore state
-                    let (_, _, _, env) = self.execute_contract_transactions(
-                        &old_block, &self.contract_storage);
-                    if let Err(pe) = env.persist_with_undo(
-                        &self.contract_storage, hash, None, None,
-                    ) {
+                    let (_, _, _, env) =
+                        self.execute_contract_transactions(&old_block, &self.contract_storage);
+                    if let Err(pe) = env.persist_with_undo(&self.contract_storage, hash, None, None)
+                    {
                         slog_error!("node", "CRITICAL_contract_restore_failed",
                             block => hash, error => &format!("{}", pe));
                     }
                 }
             }
             return Err(NodeError::Consensus(ConsensusError::BlockValidation(
-                format!("failed to persist best_hash for tip {}", best_tip)
+                format!("failed to persist best_hash for tip {}", best_tip),
             )));
         }
 
@@ -1116,14 +1231,15 @@ impl FullNode {
             if let Ok(mut retarget) = self.retarget.lock() {
                 // Count total DAG blocks at this height for DAG-aware difficulty.
                 // This gives the retarget engine visibility into parallel blocks.
-                let dag_width = (self.block_store.blocks_at_height(best_block.header.height) as u64).max(1);
+                let dag_width =
+                    (self.block_store.blocks_at_height(best_block.header.height) as u64).max(1);
 
                 let next_diff = retarget.on_new_block(BlockTimeRecord {
-                    height:          best_block.header.height,
-                    timestamp:       best_block.header.timestamp,
-                    difficulty:      best_block.header.difficulty,
+                    height: best_block.header.height,
+                    timestamp: best_block.header.timestamp,
+                    difficulty: best_block.header.difficulty,
                     dag_block_count: dag_width,
-                    blue_score:      best_block.header.blue_score,
+                    blue_score: best_block.header.blue_score,
                 });
                 // Publish for RPC getblocktemplate — write to both
                 // the per-instance cell (the canonical reader for
@@ -1180,9 +1296,7 @@ impl FullNode {
                                         break;
                                     }
                                 }
-                                cursor = b.header.selected_parent
-                                    .clone()
-                                    .unwrap_or_default();
+                                cursor = b.header.selected_parent.clone().unwrap_or_default();
                             } else {
                                 break;
                             }
@@ -1190,7 +1304,8 @@ impl FullNode {
                     }
                     if !to_prune.is_empty() {
                         let pruned = self.utxo_set.prune_finalized_undo_data(&to_prune);
-                        let contract_pruned = self.contract_storage.prune_finalized_undo_data(&to_prune);
+                        let contract_pruned =
+                            self.contract_storage.prune_finalized_undo_data(&to_prune);
                         if pruned > 0 || contract_pruned > 0 {
                             slog_info!("node", "pruned_undo_entries",
                                 utxo_count => &pruned.to_string(),
@@ -1244,10 +1359,7 @@ impl FullNode {
                 .collect();
             if !tx_hashes.is_empty() {
                 use crate::domain::transaction::tx_receipt::delete_receipts_for_block;
-                delete_receipts_for_block(
-                    self.contract_storage.shared_db().as_ref(),
-                    &tx_hashes,
-                );
+                delete_receipts_for_block(self.contract_storage.shared_db().as_ref(), &tx_hashes);
                 self.receipt_store.remove_tx_hashes(&tx_hashes);
             }
         }
@@ -1275,7 +1387,12 @@ impl FullNode {
         &self,
         block: &Block,
         contract_storage: &ContractStorage,
-    ) -> (Vec<TxReceipt>, Option<String>, Option<String>, ExecutionEnvironment) {
+    ) -> (
+        Vec<TxReceipt>,
+        Option<String>,
+        Option<String>,
+        ExecutionEnvironment,
+    ) {
         // Thread the node's actual network through to the VM so
         // `resolve_address` fallbacks use the right prefix.
         let network_short = self.network.short_name().to_string();
@@ -1308,7 +1425,9 @@ impl FullNode {
         for tx in &block.body.transactions {
             match tx.tx_type {
                 TxType::ContractCreate => {
-                    let deployer = tx.inputs.first()
+                    let deployer = tx
+                        .inputs
+                        .first()
                         .map(|i| i.owner.clone())
                         .unwrap_or_default();
                     if let Err(e) = env.load_contract_from_storage(contract_storage, &deployer) {
@@ -1333,7 +1452,8 @@ impl FullNode {
                             crate::slog_error!("vm", "contract_call_missing_contract_address",
                                 tx => &tx.hash);
                             preload_error = Some(format!(
-                                "ContractCall tx '{}' has no contract_address", tx.hash
+                                "ContractCall tx '{}' has no contract_address",
+                                tx.hash
                             ));
                             break;
                         }
@@ -1347,7 +1467,9 @@ impl FullNode {
                         ));
                         break;
                     }
-                    let caller = tx.inputs.first()
+                    let caller = tx
+                        .inputs
+                        .first()
                         .map(|i| i.owner.clone())
                         .unwrap_or_default();
                     if let Err(e) = env.load_contract_from_storage(contract_storage, &caller) {
@@ -1370,27 +1492,39 @@ impl FullNode {
         // contract code runs against corrupt state.
         if let Some(msg) = preload_error {
             for (tx_index, tx) in block.body.transactions.iter().enumerate() {
-                let is_contract_tx = matches!(
-                    tx.tx_type,
-                    TxType::ContractCreate | TxType::ContractCall
-                );
+                let is_contract_tx =
+                    matches!(tx.tx_type, TxType::ContractCreate | TxType::ContractCall);
                 if is_contract_tx {
                     has_contract_txs = true;
                     receipts.push(TxReceipt::from_execution(
                         &tx.hash,
-                        &ExecutionResult::Error { gas_used: 0, message: msg.clone() },
-                        &block.header.hash, block.header.height, tx_index as u32,
+                        &ExecutionResult::Error {
+                            gas_used: 0,
+                            message: msg.clone(),
+                        },
+                        &block.header.hash,
+                        block.header.height,
+                        tx_index as u32,
                     ));
                 } else {
                     receipts.push(TxReceipt::from_execution(
                         &tx.hash,
-                        &ExecutionResult::Success { gas_used: 0, return_data: vec![], logs: vec![] },
-                        &block.header.hash, block.header.height, tx_index as u32,
+                        &ExecutionResult::Success {
+                            gas_used: 0,
+                            return_data: vec![],
+                            logs: vec![],
+                        },
+                        &block.header.hash,
+                        block.header.height,
+                        tx_index as u32,
                     ));
                 }
             }
             let (receipt_root, state_root) = if has_contract_txs {
-                (Some(compute_receipt_root(&receipts)), Some(env.state.state_root()))
+                (
+                    Some(compute_receipt_root(&receipts)),
+                    Some(env.state.state_root()),
+                )
             } else {
                 (None, None)
             };
@@ -1424,37 +1558,52 @@ impl FullNode {
                                 Err(_) => {
                                     receipts.push(TxReceipt::from_execution(
                                         &tx.hash,
-                                        &ExecutionResult::Error { gas_used: 0, message: "invalid deploy payload".into() },
-                                        &block.header.hash, block.header.height, tx_index as u32,
+                                        &ExecutionResult::Error {
+                                            gas_used: 0,
+                                            message: "invalid deploy payload".into(),
+                                        },
+                                        &block.header.hash,
+                                        block.header.height,
+                                        tx_index as u32,
                                     ));
                                     continue;
-                                },
+                                }
                             },
                             None => {
                                 receipts.push(TxReceipt::from_execution(
                                     &tx.hash,
-                                    &ExecutionResult::Error { gas_used: 0, message: "missing deploy payload".into() },
-                                    &block.header.hash, block.header.height, tx_index as u32,
+                                    &ExecutionResult::Error {
+                                        gas_used: 0,
+                                        message: "missing deploy payload".into(),
+                                    },
+                                    &block.header.hash,
+                                    block.header.height,
+                                    tx_index as u32,
                                 ));
                                 continue;
-                            },
+                            }
                         }
                     };
 
-                    let deployer = tx.inputs.first()
+                    let deployer = tx
+                        .inputs
+                        .first()
                         .map(|i| i.owner.clone())
                         .unwrap_or_default();
                     if deployer.is_empty() {
                         receipts.push(TxReceipt::from_execution(
                             &tx.hash,
-                            &ExecutionResult::Error { gas_used: 0, message: "ContractCreate missing deployer (no inputs)".into() },
-                            &block.header.hash, block.header.height, tx_index as u32,
+                            &ExecutionResult::Error {
+                                gas_used: 0,
+                                message: "ContractCreate missing deployer (no inputs)".into(),
+                            },
+                            &block.header.hash,
+                            block.header.height,
+                            tx_index as u32,
                         ));
                         continue;
                     }
-                    let value = tx.outputs.first()
-                        .map(|o| o.amount)
-                        .unwrap_or(0);
+                    let value = tx.outputs.first().map(|o| o.amount).unwrap_or(0);
                     let gas_limit = tx.gas_limit.unwrap_or(10_000_000u64);
 
                     // Compute the contract address via the canonical
@@ -1524,7 +1673,9 @@ impl FullNode {
                                 gas_used: 0,
                                 message: format!("init code set failed: {}", e),
                             },
-                            &block.header.hash, block.header.height, tx_index as u32,
+                            &block.header.hash,
+                            block.header.height,
+                            tx_index as u32,
                         ));
                         continue;
                     }
@@ -1544,7 +1695,11 @@ impl FullNode {
                     // Phase 2: Run the constructor.
                     let outcome = env.execute_frame(&call_ctx);
                     let exec_result = match outcome {
-                        CallOutcome::Success { gas_used, return_data, logs } => {
+                        CallOutcome::Success {
+                            gas_used,
+                            return_data,
+                            logs,
+                        } => {
                             // Phase 3: If the constructor RETURNed a non-empty
                             // payload, that's the RUNTIME code — replace the
                             // init code with it and validate (EIP-3541, size).
@@ -1624,7 +1779,9 @@ impl FullNode {
                                         gas_used,
                                         message: format!("deploy commit failed: {}", e),
                                     },
-                                    &block.header.hash, block.header.height, tx_index as u32,
+                                    &block.header.hash,
+                                    block.header.height,
+                                    tx_index as u32,
                                 ));
                                 continue;
                             }
@@ -1632,9 +1789,16 @@ impl FullNode {
                                 slog_error!("node", "deployer_nonce_increment_failed",
                                     tx => &tx.hash, deployer => &deployer, error => &format!("{}", e));
                             }
-                            ExecutionResult::Success { gas_used, return_data, logs }
+                            ExecutionResult::Success {
+                                gas_used,
+                                return_data,
+                                logs,
+                            }
                         }
-                        CallOutcome::Revert { gas_used, return_data } => {
+                        CallOutcome::Revert {
+                            gas_used,
+                            return_data,
+                        } => {
                             // Revert path: roll back the init
                             // code + constructor effects, not just
                             // the call's own snapshot. The
@@ -1644,7 +1808,10 @@ impl FullNode {
                             // OUTSIDE that nested snapshot, so we
                             // still need to rewind our own one.
                             env.state.rollback(deploy_snapshot).ok();
-                            ExecutionResult::Revert { gas_used, reason: String::from_utf8_lossy(&return_data).to_string() }
+                            ExecutionResult::Revert {
+                                gas_used,
+                                reason: String::from_utf8_lossy(&return_data).to_string(),
+                            }
                         }
                         CallOutcome::Failure { gas_used } => {
                             // Same rollback reasoning as Revert.
@@ -1667,8 +1834,11 @@ impl FullNode {
                     };
 
                     let mut receipt = TxReceipt::from_execution(
-                        &tx.hash, &exec_result, &block.header.hash,
-                        block.header.height, tx_index as u32,
+                        &tx.hash,
+                        &exec_result,
+                        &block.header.hash,
+                        block.header.height,
+                        tx_index as u32,
                     );
                     receipt.contract_addr = Some(contract_addr.clone());
 
@@ -1704,7 +1874,9 @@ impl FullNode {
                                     gas_used: 0,
                                     message: "ContractCall missing contract_address".into(),
                                 },
-                                &block.header.hash, block.header.height, tx_index as u32,
+                                &block.header.hash,
+                                block.header.height,
+                                tx_index as u32,
                             ));
                             continue;
                         }
@@ -1718,36 +1890,51 @@ impl FullNode {
                                 Err(_) => {
                                     receipts.push(TxReceipt::from_execution(
                                         &tx.hash,
-                                        &ExecutionResult::Error { gas_used: 0, message: "invalid calldata".into() },
-                                        &block.header.hash, block.header.height, tx_index as u32,
+                                        &ExecutionResult::Error {
+                                            gas_used: 0,
+                                            message: "invalid calldata".into(),
+                                        },
+                                        &block.header.hash,
+                                        block.header.height,
+                                        tx_index as u32,
                                     ));
                                     continue;
-                                },
+                                }
                             },
                             None => {
                                 receipts.push(TxReceipt::from_execution(
                                     &tx.hash,
-                                    &ExecutionResult::Error { gas_used: 0, message: "missing calldata".into() },
-                                    &block.header.hash, block.header.height, tx_index as u32,
+                                    &ExecutionResult::Error {
+                                        gas_used: 0,
+                                        message: "missing calldata".into(),
+                                    },
+                                    &block.header.hash,
+                                    block.header.height,
+                                    tx_index as u32,
                                 ));
                                 continue;
-                            },
+                            }
                         }
                     };
-                    let caller = tx.inputs.first()
+                    let caller = tx
+                        .inputs
+                        .first()
                         .map(|i| i.owner.clone())
                         .unwrap_or_default();
                     if caller.is_empty() {
                         receipts.push(TxReceipt::from_execution(
                             &tx.hash,
-                            &ExecutionResult::Error { gas_used: 0, message: "ContractCall missing caller (no inputs)".into() },
-                            &block.header.hash, block.header.height, tx_index as u32,
+                            &ExecutionResult::Error {
+                                gas_used: 0,
+                                message: "ContractCall missing caller (no inputs)".into(),
+                            },
+                            &block.header.hash,
+                            block.header.height,
+                            tx_index as u32,
                         ));
                         continue;
                     }
-                    let value = tx.outputs.first()
-                        .map(|o| o.amount)
-                        .unwrap_or(0);
+                    let value = tx.outputs.first().map(|o| o.amount).unwrap_or(0);
                     let gas_limit = tx.gas_limit.unwrap_or(10_000_000u64);
 
                     // Lazy-load the target's code from disk on
@@ -1759,7 +1946,8 @@ impl FullNode {
                     // permissions, corruption) silently dropped
                     // the contract's runtime code and the CALL
                     // executed as if it were an empty address.
-                    if let Some(code_hex) = contract_storage.get_state(&format!("code:{}", target)) {
+                    if let Some(code_hex) = contract_storage.get_state(&format!("code:{}", target))
+                    {
                         match hex::decode(&code_hex) {
                             Ok(code) => {
                                 if env.state.get_code(&target).is_empty() {
@@ -1772,7 +1960,9 @@ impl FullNode {
                                                 gas_used: 0,
                                                 message: format!("load contract code: {}", e),
                                             },
-                                            &block.header.hash, block.header.height, tx_index as u32,
+                                            &block.header.hash,
+                                            block.header.height,
+                                            tx_index as u32,
                                         ));
                                         continue;
                                     }
@@ -1787,7 +1977,9 @@ impl FullNode {
                                         gas_used: 0,
                                         message: format!("contract code is not valid hex: {}", e),
                                     },
-                                    &block.header.hash, block.header.height, tx_index as u32,
+                                    &block.header.hash,
+                                    block.header.height,
+                                    tx_index as u32,
                                 ));
                                 continue;
                             }
@@ -1808,12 +2000,22 @@ impl FullNode {
 
                     let outcome = env.execute_frame(&call_ctx);
                     let exec_result = match outcome {
-                        CallOutcome::Success { gas_used, return_data, logs } => {
-                            ExecutionResult::Success { gas_used, return_data, logs }
-                        }
-                        CallOutcome::Revert { gas_used, return_data } => {
-                            ExecutionResult::Revert { gas_used, reason: String::from_utf8_lossy(&return_data).to_string() }
-                        }
+                        CallOutcome::Success {
+                            gas_used,
+                            return_data,
+                            logs,
+                        } => ExecutionResult::Success {
+                            gas_used,
+                            return_data,
+                            logs,
+                        },
+                        CallOutcome::Revert {
+                            gas_used,
+                            return_data,
+                        } => ExecutionResult::Revert {
+                            gas_used,
+                            reason: String::from_utf8_lossy(&return_data).to_string(),
+                        },
                         CallOutcome::Failure { gas_used } => {
                             // See the ContractCreate branch above
                             // for why Failure → Error, not OutOfGas.
@@ -1825,8 +2027,11 @@ impl FullNode {
                     };
 
                     let receipt = TxReceipt::from_execution(
-                        &tx.hash, &exec_result, &block.header.hash,
-                        block.header.height, tx_index as u32,
+                        &tx.hash,
+                        &exec_result,
+                        &block.header.hash,
+                        block.header.height,
+                        tx_index as u32,
                     );
 
                     match &exec_result {
@@ -1848,8 +2053,14 @@ impl FullNode {
                     // Non-contract TXs get empty receipts for receipt root computation
                     receipts.push(TxReceipt::from_execution(
                         &tx.hash,
-                        &ExecutionResult::Success { gas_used: 0, return_data: vec![], logs: vec![] },
-                        &block.header.hash, block.header.height, tx_index as u32,
+                        &ExecutionResult::Success {
+                            gas_used: 0,
+                            return_data: vec![],
+                            logs: vec![],
+                        },
+                        &block.header.hash,
+                        block.header.height,
+                        tx_index as u32,
                     ));
                 }
             }
@@ -1917,7 +2128,8 @@ impl FullNode {
         // Register in reverse index: for each parent → this orphan
         if let Ok(mut by_parent) = self.orphan_by_parent.lock() {
             for parent_hash in &block.header.parents {
-                by_parent.entry(parent_hash.clone())
+                by_parent
+                    .entry(parent_hash.clone())
                     .or_insert_with(Vec::new)
                     .push(block_hash.clone());
             }
@@ -1940,7 +2152,8 @@ impl FullNode {
             .as_secs();
 
         if let Ok(mut timestamps) = self.peer_block_timestamps.lock() {
-            let entry = timestamps.entry(peer_id.to_string())
+            let entry = timestamps
+                .entry(peer_id.to_string())
                 .or_insert_with(Vec::new);
 
             // Remove timestamps older than 60 seconds
@@ -1976,9 +2189,7 @@ impl FullNode {
             }
 
             let waiting: Vec<String> = match self.orphan_by_parent.lock() {
-                Ok(mut by_parent) => {
-                    by_parent.remove(&current_parent).unwrap_or_default()
-                }
+                Ok(mut by_parent) => by_parent.remove(&current_parent).unwrap_or_default(),
                 Err(_) => continue,
             };
 
@@ -2000,7 +2211,9 @@ impl FullNode {
                         if let Ok(mut counts) = self.orphan_count_by_peer.lock() {
                             if let Some(c) = counts.get_mut(&peer_id) {
                                 *c = c.saturating_sub(1);
-                                if *c == 0 { counts.remove(&peer_id); }
+                                if *c == 0 {
+                                    counts.remove(&peer_id);
+                                }
                             }
                         }
                         queue.push((hash, chain_depth + 1));
@@ -2012,8 +2225,7 @@ impl FullNode {
                         }
                         if let Ok(mut by_parent) = self.orphan_by_parent.lock() {
                             for p in &block.header.parents {
-                                let list = by_parent.entry(p.clone())
-                                    .or_insert_with(Vec::new);
+                                let list = by_parent.entry(p.clone()).or_insert_with(Vec::new);
                                 if !list.contains(&hash) {
                                     list.push(hash.clone());
                                 }
@@ -2025,7 +2237,9 @@ impl FullNode {
                         if let Ok(mut counts) = self.orphan_count_by_peer.lock() {
                             if let Some(c) = counts.get_mut(&peer_id) {
                                 *c = c.saturating_sub(1);
-                                if *c == 0 { counts.remove(&peer_id); }
+                                if *c == 0 {
+                                    counts.remove(&peer_id);
+                                }
                             }
                         }
                         slog_warn!("node", "orphan_processing_failed",
@@ -2048,12 +2262,15 @@ impl FullNode {
             Err(_) => return,
         };
 
-        let expired: Vec<String> = pool.iter()
+        let expired: Vec<String> = pool
+            .iter()
             .filter(|(_, (_, ts, _))| now.saturating_sub(*ts) > ORPHAN_EXPIRY_SECS)
             .map(|(hash, _)| hash.clone())
             .collect();
 
-        if expired.is_empty() { return; }
+        if expired.is_empty() {
+            return;
+        }
 
         // Clean up reverse index
         if let Ok(mut by_parent) = self.orphan_by_parent.lock() {
@@ -2077,7 +2294,9 @@ impl FullNode {
                 if let Some((_, _, peer_id)) = pool.get(hash) {
                     if let Some(c) = counts.get_mut(peer_id) {
                         *c = c.saturating_sub(1);
-                        if *c == 0 { counts.remove(peer_id); }
+                        if *c == 0 {
+                            counts.remove(peer_id);
+                        }
                     }
                 }
             }
@@ -2090,13 +2309,13 @@ impl FullNode {
 
     /// Process genesis block — same pipeline minus parent validation.
     pub fn process_genesis(&self, block: &Block) -> Result<(), NodeError> {
-
         // ═══════════════════════════════════════════════════════════════
         // PHASE 1: VALIDATE (read-only — NO state changes)
         // ═══════════════════════════════════════════════════════════════
 
         // 1a: Structural validation (PoW, coinbase, etc.)
-        let result = BlockValidator::validate_block_full_with_network(block, &self.utxo_set, &self.network);
+        let result =
+            BlockValidator::validate_block_full_with_network(block, &self.utxo_set, &self.network);
         if !result.valid {
             return Err(NodeError::BlockRejected(format!(
                 "Genesis validation failed: {}",
@@ -2107,8 +2326,9 @@ impl FullNode {
 
         // 1b: UTXO validation BEFORE any writes (genesis coinbase only)
         use crate::domain::utxo::utxo_validator::UtxoValidator;
-        UtxoValidator::validate_block_utxos(block, &self.utxo_set, 0)
-            .map_err(|e| NodeError::BlockRejected(format!("Genesis UTXO validation failed: {}", e)))?;
+        UtxoValidator::validate_block_utxos(block, &self.utxo_set, 0).map_err(|e| {
+            NodeError::BlockRejected(format!("Genesis UTXO validation failed: {}", e))
+        })?;
 
         // ═══════════════════════════════════════════════════════════════
         // PHASE 2: COMMIT (block is fully validated)
@@ -2116,13 +2336,20 @@ impl FullNode {
 
         // Save block
         if !self.block_store.save_block(block) {
-            return Err(NodeError::BlockRejected("Failed to save genesis to BlockStore".to_string()));
+            return Err(NodeError::BlockRejected(
+                "Failed to save genesis to BlockStore".to_string(),
+            ));
         }
 
         // DAG insertion — genesis MUST succeed, otherwise the node starts
         // with an inconsistent state from the very first block.
-        self.dag_manager.add_block_validated(block, true)
-            .map_err(|e| NodeError::BlockRejected(format!("Genesis DAG insertion failed (fatal): {}", e)))?;
+        if let Err(e) = self.dag_manager.add_block_validated(block, true) {
+            let _ = self.block_store.delete_block(&block.header.hash);
+            return Err(NodeError::BlockRejected(format!(
+                "Genesis DAG insertion failed (fatal): {}",
+                e
+            )));
+        }
 
         // GHOSTDAG ordering
         let dag_block = DagBlock {
@@ -2132,30 +2359,44 @@ impl FullNode {
             timestamp: block.header.timestamp,
         };
         if let Err(e) = self.ghostdag.add_block(dag_block) {
-            // Cleanup: remove from BlockStore since GHOSTDAG rejected
+            if let Err(re) = self.dag_manager.remove_block_topology(&block.header.hash) {
+                slog_error!("node", "dag_topology_rollback_failed",
+                    hash => &block.header.hash, error => &re.to_string());
+            }
             let _ = self.block_store.delete_block(&block.header.hash);
             slog_error!("node", "ghostdag_add_failed_cleanup",
-                hash => &block.header.hash, error => &e.to_string(),
-                note => "block removed from BlockStore; DAG entry may be stale until reindex");
+                hash => &block.header.hash, error => &e.to_string());
             return Err(NodeError::BlockRejected(format!("GHOSTDAG: {}", e)));
         }
 
         // UTXO write + commitment ATOMICALLY (validation already passed in Phase 1)
-        let _commitment = self.utxo_set.apply_block_write_with_commitment(
-            &block.body.transactions, 0, &block.header.hash
-        ).map_err(|e| {
-            // Cleanup: remove block from BlockStore since UTXO failed
-            let _ = self.block_store.delete_block(&block.header.hash);
-            slog_error!("node", "genesis_utxo_failed_cleanup",
+        let _commitment = self
+            .utxo_set
+            .apply_block_write_with_commitment(&block.body.transactions, 0, &block.header.hash)
+            .map_err(|e| {
+                // Genesis failure rollback: clear GHOSTDAG state and remove the
+                // just-inserted genesis topology/block so startup remains clean.
+                self.ghostdag.clear_all();
+                let _ = self.dag_manager.remove_block_topology(&block.header.hash);
+                let _ = self.block_store.delete_block(&block.header.hash);
+                slog_error!("node", "genesis_utxo_failed_cleanup",
                 error => &format!("{}", e),
-                note => "BlockStore cleaned; DAG entry may be stale until reindex");
-            NodeError::BlockRejected(format!("Genesis UTXO write failed: {}", e))
-        })?;
+                note => "rolled back genesis topology and storage");
+                NodeError::BlockRejected(format!("Genesis UTXO write failed: {}", e))
+            })?;
 
         // Genesis is always best
         if !self.block_store.update_best_hash(&block.header.hash) {
+            let _ = self.utxo_set.rollback_block_undo(&block.header.hash);
+            self.rollback_contract_block(&block.header.hash);
+            self.ghostdag.clear_all();
+            let _ = self.dag_manager.remove_block_topology(&block.header.hash);
+            let _ = self.block_store.delete_block(&block.header.hash);
+            slog_error!("node", "genesis_best_hash_persist_failed_cleanup",
+                hash => &block.header.hash,
+                note => "rolled back genesis UTXO/DAG/GHOSTDAG/BlockStore");
             return Err(NodeError::BlockRejected(
-                "Failed to persist best_hash for genesis block".to_string()
+                "Failed to persist best_hash for genesis block".to_string(),
             ));
         }
 
@@ -2165,7 +2406,6 @@ impl FullNode {
     pub fn get_tips(&self) -> Vec<String> {
         self.ghostdag.get_tips()
     }
-
 }
 
 impl crate::domain::traits::block_processor::BlockProcessor for FullNode {

@@ -8,16 +8,21 @@ mod tests {
     use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
     use crate::domain::transaction::tx_hash::TxHash;
     use crate::domain::transaction::tx_validator::{
-        TxValidator, validate_tx,
-        MIN_TX_FEE, MAX_TX_INPUTS, MAX_TX_OUTPUTS, DUST_LIMIT,
+        validate_tx, TxValidator, DUST_LIMIT, MAX_TX_INPUTS, MAX_TX_OUTPUTS, MIN_TX_FEE,
     };
 
     // ── helpers ──────────────────────────────────────────────────────────
     fn coinbase(hash: &str, amount: u64, fee: u64) -> Transaction {
         Transaction {
-            hash:      hash.to_string(),
-            inputs:    vec![],
-            outputs:   vec![TxOutput { address: "shadow1addr".into(), amount, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            hash: hash.to_string(),
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                address: "shadow1addr".into(),
+                amount,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee,
             timestamp: 1_735_689_600,
             is_coinbase: true,
@@ -30,9 +35,15 @@ mod tests {
     // Build a Transaction whose hash matches TxHash::hash()
     fn valid_coinbase_with_real_hash(amount: u64, fee: u64) -> Transaction {
         let mut tx = Transaction {
-            hash:      String::new(),
-            inputs:    vec![],
-            outputs:   vec![TxOutput { address: "shadow1addr".into(), amount, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            hash: String::new(),
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                address: "shadow1addr".into(),
+                amount,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee,
             timestamp: 1_735_689_600,
             is_coinbase: true,
@@ -141,20 +152,26 @@ mod tests {
     fn tx_too_many_inputs_rejected() {
         let inputs: Vec<TxInput> = (0..(MAX_TX_INPUTS + 1))
             .map(|i| TxInput {
-                txid:      format!("prev_{:040}", i),
-                index:     0,
-                owner:     "owner".into(),
+                txid: format!("prev_{:040}", i),
+                index: 0,
+                owner: "owner".into(),
                 signature: "aabbcc".repeat(10),
-                pub_key:   "aabbcc".repeat(5),
+                pub_key: "aabbcc".repeat(5),
                 key_image: None,
                 ring_members: None,
             })
             .collect();
         let mut tx = Transaction {
-            hash:      "tx_big_inputs".to_string(),
+            hash: "tx_big_inputs".to_string(),
             inputs,
-            outputs:   vec![TxOutput { address: "addr".into(), amount: DUST_LIMIT, commitment: None, range_proof: None, ephemeral_pubkey: None }],
-            fee:       MIN_TX_FEE,
+            outputs: vec![TxOutput {
+                address: "addr".into(),
+                amount: DUST_LIMIT,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
+            fee: MIN_TX_FEE,
             timestamp: 1_735_689_600,
             is_coinbase: false,
             tx_type: TxType::Transfer,
@@ -162,20 +179,29 @@ mod tests {
             ..Default::default()
         };
         tx.hash = TxHash::hash(&tx);
-        assert!(!validate_tx(&tx), "TX with > MAX_TX_INPUTS must be rejected");
+        assert!(
+            !validate_tx(&tx),
+            "TX with > MAX_TX_INPUTS must be rejected"
+        );
     }
 
     // ── 12. Max outputs limit ─────────────────────────────────────────────
     #[test]
     fn tx_too_many_outputs_rejected() {
         let outputs: Vec<TxOutput> = (0..(MAX_TX_OUTPUTS + 1))
-            .map(|_| TxOutput { address: "addr".into(), amount: DUST_LIMIT, commitment: None, range_proof: None, ephemeral_pubkey: None })
+            .map(|_| TxOutput {
+                address: "addr".into(),
+                amount: DUST_LIMIT,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            })
             .collect();
         let mut tx = Transaction {
-            hash:      "tx_big_outputs".to_string(),
-            inputs:    vec![],
+            hash: "tx_big_outputs".to_string(),
+            inputs: vec![],
             outputs,
-            fee:       0,
+            fee: 0,
             timestamp: 1_735_689_600,
             is_coinbase: true,
             tx_type: TxType::Transfer,
@@ -183,7 +209,10 @@ mod tests {
             ..Default::default()
         };
         tx.hash = TxHash::hash(&tx);
-        assert!(!validate_tx(&tx), "TX with > MAX_TX_OUTPUTS must be rejected");
+        assert!(
+            !validate_tx(&tx),
+            "TX with > MAX_TX_OUTPUTS must be rejected"
+        );
     }
 
     // ── 13. is_coinbase() check ───────────────────────────────────────────
@@ -198,12 +227,21 @@ mod tests {
         let tx = Transaction {
             hash: "hash_with_input".to_string(),
             inputs: vec![TxInput {
-                txid: "prev".into(), index: 0,
-                owner: "owner".into(), signature: "sig".into(), pub_key: "pk".into(),
+                txid: "prev".into(),
+                index: 0,
+                owner: "owner".into(),
+                signature: "sig".into(),
+                pub_key: "pk".into(),
                 key_image: None,
                 ring_members: None,
             }],
-            outputs: vec![TxOutput { address: "addr".into(), amount: DUST_LIMIT, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            outputs: vec![TxOutput {
+                address: "addr".into(),
+                amount: DUST_LIMIT,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee: MIN_TX_FEE,
             timestamp: 1_735_689_600,
             is_coinbase: false,
@@ -221,8 +259,20 @@ mod tests {
             hash: "h".to_string(),
             inputs: vec![],
             outputs: vec![
-                TxOutput { address: "a1".into(), amount: 1_000, commitment: None, range_proof: None, ephemeral_pubkey: None },
-                TxOutput { address: "a2".into(), amount: 2_000, commitment: None, range_proof: None, ephemeral_pubkey: None },
+                TxOutput {
+                    address: "a1".into(),
+                    amount: 1_000,
+                    commitment: None,
+                    range_proof: None,
+                    ephemeral_pubkey: None,
+                },
+                TxOutput {
+                    address: "a2".into(),
+                    amount: 2_000,
+                    commitment: None,
+                    range_proof: None,
+                    ephemeral_pubkey: None,
+                },
             ],
             fee: 0,
             timestamp: 0,
@@ -244,14 +294,20 @@ mod tests {
             index: 0,
             owner: "owner".into(),
             signature: "a".repeat(128),
-            pub_key:   "b".repeat(64),
+            pub_key: "b".repeat(64),
             key_image: None,
             ring_members: None,
         };
         let tx = Transaction {
             hash: "dup_input_tx".to_string(),
             inputs: vec![dup_input.clone(), dup_input],
-            outputs: vec![TxOutput { address: "addr".into(), amount: DUST_LIMIT, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            outputs: vec![TxOutput {
+                address: "addr".into(),
+                amount: DUST_LIMIT,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee: MIN_TX_FEE,
             timestamp: 1_735_689_600,
             is_coinbase: false,
@@ -266,9 +322,15 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         let key = format!("{}:{}", tx.inputs[0].txid, tx.inputs[0].index);
         // First insertion must succeed (returns true)
-        assert!(seen.insert(key.clone()), "First insertion of key must succeed");
+        assert!(
+            seen.insert(key.clone()),
+            "First insertion of key must succeed"
+        );
         // Second insertion of same key must return false → duplicate detected
-        assert!(!seen.insert(key.clone()), "Second insertion of same key must return false → duplicate detected");
+        assert!(
+            !seen.insert(key.clone()),
+            "Second insertion of same key must return false → duplicate detected"
+        );
     }
 
     // ── 16. Signing message is not empty ─────────────────────────────────
@@ -284,10 +346,7 @@ mod tests {
     fn signing_message_differs_across_transactions() {
         let tx1 = valid_coinbase_with_real_hash(1_000, 1);
         let tx2 = valid_coinbase_with_real_hash(2_000, 1);
-        assert_ne!(
-            TxHash::signing_message(&tx1),
-            TxHash::signing_message(&tx2)
-        );
+        assert_ne!(TxHash::signing_message(&tx1), TxHash::signing_message(&tx2));
     }
 
     // ── 18. Fee calculation consistency ───────────────────────────────────
@@ -310,10 +369,9 @@ mod tests {
     #[test]
     fn s_equals_l_not_canonical() {
         const ED25519_L: [u8; 32] = [
-            0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58,
-            0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+            0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9,
+            0xde, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x10,
         ];
         assert!(!TxValidator::s_is_canonical(&ED25519_L));
     }
@@ -332,17 +390,17 @@ mod tests {
         let outputs: Vec<TxOutput> = (0..3_000)
             .map(|i| TxOutput {
                 address: format!("shadow1addr{:040}", i),
-                amount:  DUST_LIMIT,
+                amount: DUST_LIMIT,
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
             })
             .collect();
         let tx = Transaction {
-            hash:      "big_tx_outputs".to_string(),
-            inputs:    vec![],
+            hash: "big_tx_outputs".to_string(),
+            inputs: vec![],
             outputs,
-            fee:       0,
+            fee: 0,
             timestamp: 1_735_689_600,
             is_coinbase: true,
             tx_type: TxType::Transfer,

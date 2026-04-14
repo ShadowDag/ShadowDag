@@ -14,18 +14,18 @@ use crate::engine::mining::pow::pow_validator::PowValidator;
 use crate::{slog_info, slog_warn};
 
 pub struct MineResult {
-    pub nonce:     u64,
-    pub hash:      String,
-    pub hashrate:  f64,
-    pub time_ms:   u128,
+    pub nonce: u64,
+    pub hash: String,
+    pub hashrate: f64,
+    pub time_ms: u128,
 }
 
 pub struct GpuMiner {
-    pub device_id:    u32,
-    pub difficulty:   u64,
-    pub hashrate:     f64,
-    pub threads:      usize,
-    pub batch_size:   u64,
+    pub device_id: u32,
+    pub difficulty: u64,
+    pub hashrate: f64,
+    pub threads: usize,
+    pub batch_size: u64,
 }
 
 impl GpuMiner {
@@ -60,22 +60,21 @@ impl GpuMiner {
     pub fn mine(&mut self, mut block: Block) -> Option<Block> {
         slog_info!("gpu", "gpu_mining_started", height => block.header.height, difficulty => self.difficulty, threads => self.threads);
 
-        let start    = Instant::now();
-        let found    = Arc::new(AtomicBool::new(false));
+        let start = Instant::now();
+        let found = Arc::new(AtomicBool::new(false));
         let found_nonce = Arc::new(AtomicU64::new(0));
         let hash_count = Arc::new(AtomicU64::new(0));
         let _found_hash = Arc::new(std::sync::Mutex::new(String::new()));
 
         let difficulty = self.difficulty;
         let total_nonces: u64 = u64::MAX;
-        let batch    = self.batch_size;
+        let batch = self.batch_size;
         // +1 to cover the remainder nonces that integer division drops
-        let num_batches = total_nonces / batch + if total_nonces % batch != 0 { 1 } else { 0 };
+        let num_batches = total_nonces / batch + u64::from(!total_nonces.is_multiple_of(batch));
 
         let t_hash_count = hash_count.clone();
-        let result: Option<(u64, String)> = (0..num_batches)
-            .into_par_iter()
-            .find_map_any(|batch_idx| {
+        let result: Option<(u64, String)> =
+            (0..num_batches).into_par_iter().find_map_any(|batch_idx| {
                 if found.load(Ordering::Relaxed) {
                     return None;
                 }
@@ -84,7 +83,7 @@ impl GpuMiner {
                     Some(n) => n,
                     None => return None, // nonce space exhausted
                 };
-                let end_nonce   = start_nonce.saturating_add(batch);
+                let end_nonce = start_nonce.saturating_add(batch);
                 let mut local_count: u64 = 0;
 
                 for nonce in start_nonce..end_nonce {
@@ -115,10 +114,12 @@ impl GpuMiner {
             let hashes_tried = hash_count.load(Ordering::Relaxed);
             self.hashrate = if elapsed_ms > 0 {
                 (hashes_tried as f64 / elapsed_ms as f64) / 1000.0
-            } else { 0.0 };
+            } else {
+                0.0
+            };
 
             block.header.nonce = nonce;
-            block.header.hash  = hash.clone();
+            block.header.hash = hash.clone();
 
             slog_info!("gpu", "gpu_block_found", nonce => nonce, hash_prefix => &hash[..16], time_ms => elapsed_ms, hashrate_mhs => format!("{:.2}", self.hashrate));
             Some(block)
@@ -139,19 +140,22 @@ impl GpuMiner {
 
     pub fn benchmark(&mut self) -> f64 {
         use crate::config::genesis::genesis::create_genesis_block;
-        let block   = create_genesis_block();
-        let start   = Instant::now();
-        let iters   = 100_000u64;
+        let block = create_genesis_block();
+        let start = Instant::now();
+        let iters = 100_000u64;
 
-        let count: u64 = (0..iters).into_par_iter().filter(|&nonce| {
-            let mut b = block.clone();
-            b.header.nonce = nonce;
-            let h = shadow_hash(&b);
-            PowValidator::hash_meets_target(&h, 1)
-        }).count() as u64;
+        let count: u64 = (0..iters)
+            .into_par_iter()
+            .filter(|&nonce| {
+                let mut b = block.clone();
+                b.header.nonce = nonce;
+                let h = shadow_hash(&b);
+                PowValidator::hash_meets_target(&h, 1)
+            })
+            .count() as u64;
 
         let elapsed_ms = start.elapsed().as_millis().max(1);
-        self.hashrate  = (iters as f64 / elapsed_ms as f64) / 1000.0;
+        self.hashrate = (iters as f64 / elapsed_ms as f64) / 1000.0;
 
         slog_info!("gpu", "gpu_benchmark_result", hashrate_mhs => format!("{:.2}", self.hashrate), hashes => iters, time_ms => elapsed_ms, valid => count);
         self.hashrate

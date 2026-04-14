@@ -13,12 +13,12 @@ impl LogConfig {
     pub const LOG_LEVEL: &'static str = "INFO";
     /// Log path — resolved at runtime via base_data_dir().
     /// This constant is a fallback only; use log_dir() for the actual path.
-    pub const LOG_PATH:  &'static str = "logs";
+    pub const LOG_PATH: &'static str = "logs";
 
     pub fn log_dir() -> std::path::PathBuf {
         crate::config::node::node_config::NetworkMode::base_data_dir().join("logs")
     }
-    pub const MAX_LOG_SIZE_MB: u64    = 100;
+    pub const MAX_LOG_SIZE_MB: u64 = 100;
 
     /// Initialize the logging system. Safe to call multiple times (only runs once).
     ///
@@ -51,7 +51,10 @@ impl LogConfig {
                 crate::telemetry::logging::structured::Level::Info,
             );
 
-            log::info!("[ShadowDAG] Logging initialized at level {}", Self::LOG_LEVEL);
+            log::info!(
+                "[ShadowDAG] Logging initialized at level {}",
+                Self::LOG_LEVEL
+            );
         });
     }
 
@@ -67,10 +70,10 @@ impl LogConfig {
             let filter = match level.to_uppercase().as_str() {
                 "TRACE" => log::LevelFilter::Trace,
                 "DEBUG" => log::LevelFilter::Debug,
-                "INFO"  => log::LevelFilter::Info,
-                "WARN"  => log::LevelFilter::Warn,
+                "INFO" => log::LevelFilter::Info,
+                "WARN" => log::LevelFilter::Warn,
                 "ERROR" => log::LevelFilter::Error,
-                _       => log::LevelFilter::Info,
+                _ => log::LevelFilter::Info,
             };
 
             env_logger::Builder::new()
@@ -82,8 +85,7 @@ impl LogConfig {
             // and pass it through, so env_logger and structured agree.
             // `Level::from_str` defaults to Info on unknown input, matching
             // the `_ => LevelFilter::Info` fallback above.
-            let structured_level =
-                crate::telemetry::logging::structured::Level::from_str(level);
+            let structured_level = crate::telemetry::logging::structured::Level::from_str(level);
             crate::telemetry::logging::structured::init_with_level(structured_level);
 
             log::info!("[ShadowDAG] Logging initialized at level {}", level);

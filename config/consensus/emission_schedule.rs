@@ -95,6 +95,29 @@ impl EmissionSchedule {
     /// The BPS rate scales the interval so emission stays TIME-BASED.
     /// Includes MAX_SUPPLY enforcement to prevent exceeding 21 billion SDAG.
     pub fn block_reward_at_bps(height: u64, bps: u64) -> u64 {
+        let reward = Self::base_block_reward_at_bps(height, bps);
+        if reward == 0 {
+            return 0;
+        }
+
+        // MAX_SUPPLY enforcement: if total emission has reached the cap, stop rewarding.
+        // Use the non-recursive total_emitted helper to avoid reward<->emitted recursion.
+        let max_supply = crate::config::consensus::consensus_params::ConsensusParams::MAX_SUPPLY;
+        let emitted = if height == 0 {
+            0
+        } else {
+            Self::total_emitted_raw_at_bps(height - 1, bps).min(max_supply)
+        };
+        if emitted >= max_supply {
+            return 0;
+        }
+        reward.min(max_supply - emitted)
+    }
+
+    /// Reward curve without MAX_SUPPLY clipping.
+    /// This is used internally by total-emission calculations to avoid
+    /// recursive reward->emitted->reward dependency.
+    fn base_block_reward_at_bps(height: u64, bps: u64) -> u64 {
         let interval = Self::reduction_interval_for_bps(bps);
         let step = (height / interval) as u32;
 
@@ -105,21 +128,40 @@ impl EmissionSchedule {
         let factor = Self::decay_factor(step);
 
         // reward = INITIAL_REWARD * factor / PRECISION
-        let reward = (INITIAL_REWARD as u128)
-            .saturating_mul(factor)
-            / PRECISION;
+        let reward = (INITIAL_REWARD as u128).saturating_mul(factor) / PRECISION;
 
         let reward = reward as u64;
-        if reward < MIN_REWARD { return 0; }
-
-        // MAX_SUPPLY enforcement: if total emission has reached the cap, stop rewarding
-        let max_supply = crate::config::consensus::consensus_params::ConsensusParams::MAX_SUPPLY;
-        let emitted = if height == 0 { 0 } else { Self::total_emitted_at_bps(height - 1, bps) };
-        if emitted >= max_supply {
-            return 0;
+        if reward < MIN_REWARD {
+            0
+        } else {
+            reward
         }
-        let remaining = max_supply - emitted;
-        reward.min(remaining)
+    }
+
+    /// Raw cumulative emission without MAX_SUPPLY clipping.
+    fn total_emitted_raw_at_bps(height: u64, bps: u64) -> u64 {
+        let interval = Self::reduction_interval_for_bps(bps);
+        let mut total: u64 = 0;
+        let mut h: u64 = 0;
+
+        while h <= height {
+            let step = (h / interval) as u32;
+            let step_end = (step as u64)
+                .saturating_add(1)
+                .saturating_mul(interval)
+                .min(height.saturating_add(1));
+            let blocks_in_step = step_end - h;
+            let reward = Self::base_block_reward_at_bps(h, bps);
+
+            if reward == 0 {
+                break;
+            }
+
+            total = total.saturating_add(blocks_in_step.saturating_mul(reward));
+            h = step_end;
+        }
+
+        total
     }
 
     /// Estimate total cumulative emission up to a given height.
@@ -132,7 +174,8 @@ impl EmissionSchedule {
 
         let mut total: u128 = 0;
         // Sum rewards for each completed step
-        for s in 0..steps.min(MAX_STEPS) { // Cap at MAX_STEPS
+        for s in 0..steps.min(MAX_STEPS) {
+            // Cap at MAX_STEPS
             let factor = Self::decay_factor(s);
             let step_reward = (INITIAL_REWARD as u128).saturating_mul(factor) / PRECISION;
             total = total.saturating_add(step_reward * interval as u128);
@@ -203,7 +246,9 @@ impl EmissionSchedule {
     /// Approximate percentage of initial reward remaining
     pub fn reward_percent(height: u64) -> f64 {
         let reward = Self::block_reward(height);
-        if INITIAL_REWARD == 0 { return 0.0; }
+        if INITIAL_REWARD == 0 {
+            return 0.0;
+        }
         (reward as f64 / INITIAL_REWARD as f64) * 100.0
     }
 
@@ -215,23 +260,7 @@ impl EmissionSchedule {
 
     /// Total emitted from genesis to height with specific BPS rate.
     pub fn total_emitted_at_bps(height: u64, bps: u64) -> u64 {
-        let interval = Self::reduction_interval_for_bps(bps);
-        let mut total: u64 = 0;
-        let mut h: u64 = 0;
-
-        while h <= height {
-            let step = (h / interval) as u32;
-            let step_end = (step as u64).saturating_add(1).saturating_mul(interval).min(height.saturating_add(1));
-            let blocks_in_step = step_end - h;
-            let reward = Self::block_reward_at_bps(h, bps);
-
-            if reward == 0 { break; }
-
-            total = total.saturating_add(blocks_in_step.saturating_mul(reward));
-            h = step_end;
-        }
-
-        total
+        Self::total_emitted_raw_at_bps(height, bps).min(ConsensusParams::MAX_SUPPLY)
     }
 
     /// Theoretical max supply (sum of geometric series), capped at 21 billion SDAG.
@@ -242,10 +271,9 @@ impl EmissionSchedule {
         //     ≈ 6.82 × 10^18 satoshis ≈ 68.2 billion SDAG (theoretical)
         // Capped at ConsensusParams::MAX_SUPPLY = 21 billion SDAG
         let den_minus_num = (DECAY_DEN - DECAY_NUM) as u128; // 38
-        let theoretical: u128 = (INITIAL_REWARD as u128)
-            * (REDUCTION_INTERVAL as u128)
-            * (DECAY_DEN as u128)
-            / den_minus_num;
+        let theoretical: u128 =
+            (INITIAL_REWARD as u128) * (REDUCTION_INTERVAL as u128) * (DECAY_DEN as u128)
+                / den_minus_num;
 
         (theoretical.min(ConsensusParams::MAX_SUPPLY as u128)) as u64
     }
@@ -292,22 +320,34 @@ impl EmissionSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::consensus::consensus_params::ConsensusParams;
 
     #[test]
     fn initial_reward_correct() {
         assert_eq!(EmissionSchedule::block_reward(0), INITIAL_REWARD);
         assert_eq!(EmissionSchedule::block_reward(1), INITIAL_REWARD);
-        assert_eq!(EmissionSchedule::block_reward(REDUCTION_INTERVAL - 1), INITIAL_REWARD);
+        assert_eq!(
+            EmissionSchedule::block_reward(REDUCTION_INTERVAL - 1),
+            INITIAL_REWARD
+        );
     }
 
     #[test]
     fn first_reduction_is_small() {
         let before = EmissionSchedule::block_reward(REDUCTION_INTERVAL - 1);
-        let after  = EmissionSchedule::block_reward(REDUCTION_INTERVAL);
+        let after = EmissionSchedule::block_reward(REDUCTION_INTERVAL);
         // Should drop by ~0.38%, NOT 50%
         let drop_pct = ((before - after) as f64 / before as f64) * 100.0;
-        assert!(drop_pct < 1.0, "First reduction should be <1%, got {:.2}%", drop_pct);
-        assert!(drop_pct > 0.1, "First reduction should be >0.1%, got {:.2}%", drop_pct);
+        assert!(
+            drop_pct < 1.0,
+            "First reduction should be <1%, got {:.2}%",
+            drop_pct
+        );
+        assert!(
+            drop_pct > 0.1,
+            "First reduction should be >0.1%, got {:.2}%",
+            drop_pct
+        );
         assert!(after > 0, "Reward must be positive after first reduction");
     }
 
@@ -319,10 +359,17 @@ mod tests {
             let h2 = (step + 1) * REDUCTION_INTERVAL;
             let r1 = EmissionSchedule::block_reward(h1);
             let r2 = EmissionSchedule::block_reward(h2);
-            if r1 == 0 { break; }
+            if r1 == 0 {
+                break;
+            }
             let drop_pct = ((r1 - r2) as f64 / r1 as f64) * 100.0;
-            assert!(drop_pct < 2.0,
-                "Step {} to {}: drop should be <2%, got {:.2}%", step, step+1, drop_pct);
+            assert!(
+                drop_pct < 2.0,
+                "Step {} to {}: drop should be <2%, got {:.2}%",
+                step,
+                step + 1,
+                drop_pct
+            );
         }
     }
 
@@ -332,9 +379,94 @@ mod tests {
         let half_steps = 182u64;
         let h = half_steps * REDUCTION_INTERVAL;
         let reward = EmissionSchedule::block_reward(h);
-        let ratio = reward as f64 / INITIAL_REWARD as f64;
-        assert!(ratio > 0.4 && ratio < 0.6,
-            "After ~5.5 years, reward should be ~50% of initial, got {:.1}%", ratio * 100.0);
+        let emitted_before = EmissionSchedule::total_emitted(h.saturating_sub(1));
+        if emitted_before >= ConsensusParams::MAX_SUPPLY {
+            assert_eq!(reward, 0, "reward must be zero after MAX_SUPPLY is reached");
+        } else {
+            let ratio = reward as f64 / INITIAL_REWARD as f64;
+            assert!(
+                ratio > 0.4 && ratio < 0.6,
+                "After ~5.5 years, reward should be ~50% of initial, got {:.1}%",
+                ratio * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn ten_year_schedule_daily_checkpoints_are_monotonic() {
+        let bps = ConsensusParams::BLOCKS_PER_SECOND;
+        let one_day_secs: u64 = 24 * 60 * 60;
+        let ten_year_secs: u64 = 10 * 365 * one_day_secs;
+        let days = ten_year_secs / one_day_secs;
+
+        let mut prev_reward = EmissionSchedule::block_reward_at_bps(0, bps);
+        let mut prev_emitted = EmissionSchedule::total_emitted_at_bps(0, bps);
+
+        for day in 1..=days {
+            let height = day.saturating_mul(one_day_secs).saturating_mul(bps);
+            let reward = EmissionSchedule::block_reward_at_bps(height, bps);
+            let emitted = EmissionSchedule::total_emitted_at_bps(height, bps);
+
+            assert!(
+                reward <= prev_reward,
+                "Reward increased on day {}: {} -> {}",
+                day,
+                prev_reward,
+                reward
+            );
+            assert!(
+                emitted >= prev_emitted,
+                "Total emitted decreased on day {}: {} -> {}",
+                day,
+                prev_emitted,
+                emitted
+            );
+            assert!(
+                emitted <= ConsensusParams::MAX_SUPPLY,
+                "Total emitted exceeded max supply on day {}",
+                day
+            );
+
+            let miner = (reward * ConsensusParams::MINER_PERCENT) / 100;
+            let dev = reward - miner;
+            assert_eq!(miner + dev, reward, "Reward split mismatch on day {}", day);
+
+            prev_reward = reward;
+            prev_emitted = emitted;
+        }
+    }
+
+    #[test]
+    fn ten_year_reduction_boundaries_remain_smooth() {
+        let bps = ConsensusParams::BLOCKS_PER_SECOND;
+        let interval = EmissionSchedule::reduction_interval_for_bps(bps);
+        let steps_in_ten_years: u64 = (10 * 365 * 24 * 60 * 60) / REDUCTION_INTERVAL_SECS;
+
+        for step in 1..=steps_in_ten_years {
+            let before_h = step.saturating_mul(interval).saturating_sub(1);
+            let after_h = step.saturating_mul(interval);
+            let before = EmissionSchedule::block_reward_at_bps(before_h, bps);
+            let after = EmissionSchedule::block_reward_at_bps(after_h, bps);
+
+            if before == 0 {
+                break;
+            }
+
+            assert!(
+                after <= before,
+                "Reward increased at step {} boundary: {} -> {}",
+                step,
+                before,
+                after
+            );
+            let drop_pct = ((before - after) as f64 / before as f64) * 100.0;
+            assert!(
+                drop_pct < 1.0,
+                "Step {} drop too abrupt: {:.4}%",
+                step,
+                drop_pct
+            );
+        }
     }
 
     #[test]
@@ -370,12 +502,18 @@ mod tests {
 
     #[test]
     fn blocks_until_reduction_at_start() {
-        assert_eq!(EmissionSchedule::blocks_until_reduction(0), REDUCTION_INTERVAL);
+        assert_eq!(
+            EmissionSchedule::blocks_until_reduction(0),
+            REDUCTION_INTERVAL
+        );
     }
 
     #[test]
     fn blocks_until_reduction_near_end() {
-        assert_eq!(EmissionSchedule::blocks_until_reduction(REDUCTION_INTERVAL - 1), 1);
+        assert_eq!(
+            EmissionSchedule::blocks_until_reduction(REDUCTION_INTERVAL - 1),
+            1
+        );
     }
 
     #[test]
@@ -396,8 +534,13 @@ mod tests {
         for step in 1..200 {
             let h = step * REDUCTION_INTERVAL;
             let reward = EmissionSchedule::block_reward(h);
-            assert!(reward <= prev,
-                "Reward must never increase: step {} = {}, prev = {}", step, reward, prev);
+            assert!(
+                reward <= prev,
+                "Reward must never increase: step {} = {}, prev = {}",
+                step,
+                reward,
+                prev
+            );
             prev = reward;
         }
     }
@@ -406,7 +549,10 @@ mod tests {
     fn emission_curve_preview() {
         // Print the emission curve for visual verification
         eprintln!("\n=== ShadowDAG Smooth Emission Curve ===");
-        eprintln!("{:<8} {:<12} {:<15} {:<10}", "Step", "~Months", "Reward (SDAG)", "% of Initial");
+        eprintln!(
+            "{:<8} {:<12} {:<15} {:<10}",
+            "Step", "~Months", "Reward (SDAG)", "% of Initial"
+        );
         for step in [0, 6, 12, 24, 60, 120, 182, 240, 365, 500, 1000] {
             let h = step as u64 * REDUCTION_INTERVAL;
             let reward = EmissionSchedule::block_reward(h);
@@ -432,8 +578,16 @@ mod tests {
         let supply = EmissionSchedule::max_supply();
         let sdag = supply as f64 / 100_000_000.0;
         // Should be in the billions range
-        assert!(sdag > 1_000_000_000.0, "Max supply should be >1B SDAG, got {:.0}", sdag);
-        assert!(sdag < 100_000_000_000.0, "Max supply should be <100B SDAG, got {:.0}", sdag);
+        assert!(
+            sdag > 1_000_000_000.0,
+            "Max supply should be >1B SDAG, got {:.0}",
+            sdag
+        );
+        assert!(
+            sdag < 100_000_000_000.0,
+            "Max supply should be <100B SDAG, got {:.0}",
+            sdag
+        );
         eprintln!("Max Supply: {:.2} billion SDAG", sdag / 1_000_000_000.0);
     }
 
@@ -445,6 +599,11 @@ mod tests {
         for step in 0..MAX_STEPS {
             let h = (step as u64) * REDUCTION_INTERVAL;
             let reward = EmissionSchedule::block_reward(h);
+            let emitted_before = EmissionSchedule::total_emitted(h.saturating_sub(1));
+            if emitted_before >= ConsensusParams::MAX_SUPPLY {
+                assert_eq!(reward, 0, "reward must be zero once MAX_SUPPLY is reached");
+                break;
+            }
             assert!(
                 reward > 0 || step >= MAX_STEPS - 1,
                 "Reward zeroed too early at step {}",
@@ -456,9 +615,19 @@ mod tests {
     #[test]
     fn height_at_50_percent() {
         let h = EmissionSchedule::height_at_percent(50.0);
-        let _reward = EmissionSchedule::block_reward(h);
+        let reward = EmissionSchedule::block_reward(h);
         let pct = EmissionSchedule::reward_percent(h);
-        assert!(pct < 55.0 && pct > 30.0,
-            "At 50% height {}, reward should be ~50%, got {:.1}%", h, pct);
+        let emitted_before = EmissionSchedule::total_emitted(h.saturating_sub(1));
+        if emitted_before >= ConsensusParams::MAX_SUPPLY {
+            assert_eq!(reward, 0, "reward must be zero once MAX_SUPPLY is reached");
+            assert_eq!(pct, 0.0);
+        } else {
+            assert!(
+                pct < 55.0 && pct > 30.0,
+                "At 50% height {}, reward should be ~50%, got {:.1}%",
+                h,
+                pct
+            );
+        }
     }
 }

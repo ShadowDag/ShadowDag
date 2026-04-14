@@ -14,19 +14,19 @@
 //   - Submit mined blocks back to the DAG
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options};
+use rocksdb::{Options, DB};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::domain::block::block::Block;
-use crate::engine::mining::miner::miner::Miner;
-use crate::engine::mining::miner::block_template::BlockTemplateBuilder;
-use crate::engine::dag::tips::tip_manager::TipManager;
-use crate::engine::dag::core::dag_manager::DagManager;
-use crate::domain::utxo::utxo_set::UtxoSet;
 use crate::domain::traits::tx_pool::TxPool;
+use crate::domain::utxo::utxo_set::UtxoSet;
+use crate::engine::dag::core::dag_manager::DagManager;
+use crate::engine::dag::tips::tip_manager::TipManager;
+use crate::engine::mining::miner::block_template::BlockTemplateBuilder;
+use crate::engine::mining::miner::miner::Miner;
 use crate::errors::ConsensusError;
-use crate::{slog_info, slog_error};
+use crate::{slog_error, slog_info};
 
 pub struct MinerControllerStore {
     db: DB,
@@ -37,17 +37,20 @@ impl MinerControllerStore {
         let mut opts = Options::default();
         opts.create_if_missing(true);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| crate::errors::StorageError::OpenFailed {
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| {
+            crate::errors::StorageError::OpenFailed {
                 path: path.to_string(),
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         Ok(Self { db })
     }
 
     pub fn store_job(&self, id: &str, job: &str) {
-        if let Err(_e) = self.db.put(id, job) { slog_error!("mining", "controller_store_put_failed", error => _e); }
+        if let Err(_e) = self.db.put(id, job) {
+            slog_error!("mining", "controller_store_put_failed", error => _e);
+        }
     }
 }
 
@@ -58,22 +61,28 @@ impl MinerControllerStore {
 /// exist, pulls mempool transactions, and creates coinbase with the correct
 /// emission reward including the 5% dev fee split.
 pub struct MinerController<'a> {
-    pub miner:       &'a Miner,
+    pub miner: &'a Miner,
     pub tip_manager: &'a TipManager,
     pub dag_manager: &'a DagManager,
-    pub mempool:     &'a dyn TxPool,
-    pub utxo_set:    &'a UtxoSet,
+    pub mempool: &'a dyn TxPool,
+    pub utxo_set: &'a UtxoSet,
 }
 
 impl<'a> MinerController<'a> {
     pub fn new(
-        miner:       &'a Miner,
+        miner: &'a Miner,
         tip_manager: &'a TipManager,
         dag_manager: &'a DagManager,
-        mempool:     &'a dyn TxPool,
-        utxo_set:    &'a UtxoSet,
+        mempool: &'a dyn TxPool,
+        utxo_set: &'a UtxoSet,
     ) -> Self {
-        Self { miner, tip_manager, dag_manager, mempool, utxo_set }
+        Self {
+            miner,
+            tip_manager,
+            dag_manager,
+            mempool,
+            utxo_set,
+        }
     }
 
     /// Build a block template from current DAG tips and mine it.
@@ -86,23 +95,16 @@ impl<'a> MinerController<'a> {
     /// 5. Create coinbase with emission schedule reward + 5% dev fee
     /// 6. Mine the block (find valid nonce via PoW)
     /// 7. Return the mined block for submission to the DAG
-    pub fn build_and_mine(
-        &self,
-        miner_address: &str,
-    ) -> Result<Block, ConsensusError> {
+    pub fn build_and_mine(&self, miner_address: &str) -> Result<Block, ConsensusError> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        // Use the latest retarget difficulty, not the static
-        // self.miner.difficulty which was set at construction
-        // and never updated — it may be stale by many epochs.
-        let current_difficulty = {
-            use crate::service::network::nodes::full_node::get_next_difficulty;
-            let d = get_next_difficulty();
-            if d > 0 { d } else { self.miner.difficulty }
-        };
+        // Avoid process-global difficulty state here. Controllers should use
+        // the miner instance difficulty configured by the node that owns this
+        // controller.
+        let current_difficulty = self.miner.difficulty.max(1);
 
         // Build template using DAG tips as parents
         let block = BlockTemplateBuilder::build_from_dag(
@@ -125,7 +127,7 @@ impl<'a> MinerController<'a> {
 
         if mined_block.header.hash.is_empty() {
             return Err(ConsensusError::Other(
-                "nonce space exhausted — request new template".to_string()
+                "nonce space exhausted — request new template".to_string(),
             ));
         }
 
@@ -158,10 +160,7 @@ impl<'a> MinerController<'a> {
     }
 
     /// Full mining cycle: build template, mine, submit to DAG.
-    pub fn mine_and_submit(
-        &self,
-        miner_address: &str,
-    ) -> Result<Block, ConsensusError> {
+    pub fn mine_and_submit(&self, miner_address: &str) -> Result<Block, ConsensusError> {
         let block = self.build_and_mine(miner_address)?;
         self.submit_block(&block)?;
         Ok(block)

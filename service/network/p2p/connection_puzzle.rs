@@ -13,9 +13,9 @@
 // but expensive at scale for an attacker with 10,000 fake nodes.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 
 /// Puzzle difficulty (leading hex zeros required).
 /// 3 = ~4096 hashes average (~0.1ms on modern CPU) — trivial for
@@ -39,8 +39,8 @@ pub struct ConnectionChallenge {
 #[derive(Debug, Clone)]
 pub struct ChallengeSolution {
     pub challenge: String,
-    pub nonce:     u64,
-    pub hash:      String,
+    pub nonce: u64,
+    pub hash: String,
 }
 
 pub struct ConnectionPuzzle;
@@ -61,7 +61,10 @@ impl ConnectionPuzzle {
             .unwrap_or_default()
             .as_secs();
 
-        ConnectionChallenge { challenge, created_at: now }
+        ConnectionChallenge {
+            challenge,
+            created_at: now,
+        }
     }
 
     /// Solve a challenge (done by the connecting peer)
@@ -89,14 +92,18 @@ impl ConnectionPuzzle {
     /// Verify a challenge solution
     pub fn verify(challenge: &ConnectionChallenge, solution: &ChallengeSolution) -> bool {
         // Check challenge matches
-        if solution.challenge != challenge.challenge { return false; }
+        if solution.challenge != challenge.challenge {
+            return false;
+        }
 
         // Check expiry
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if now.saturating_sub(challenge.created_at) > PUZZLE_EXPIRY_SECS { return false; }
+        if now.saturating_sub(challenge.created_at) > PUZZLE_EXPIRY_SECS {
+            return false;
+        }
 
         // Verify hash
         let mut h = Sha256::new();
@@ -104,7 +111,9 @@ impl ConnectionPuzzle {
         h.update(solution.nonce.to_le_bytes());
         let computed = hex::encode(h.finalize());
 
-        if computed != solution.hash { return false; }
+        if computed != solution.hash {
+            return false;
+        }
 
         // Check difficulty
         let target = "0".repeat(PUZZLE_DIFFICULTY);

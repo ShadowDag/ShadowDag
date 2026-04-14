@@ -14,18 +14,18 @@
 //   - Iteration with prefix filtering
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options, WriteBatch};
+use rocksdb::{Options, WriteBatch, DB};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
-use sha2::{Sha256, Digest};
 
 use crate::errors::StorageError;
 use crate::slog_error;
 
 /// Prefix for contract state keys
-const PFX_STATE:    &str = "state:";
+const PFX_STATE: &str = "state:";
 /// Prefix for state root
-const PFX_ROOT:     &str = "stateroot:";
+const PFX_ROOT: &str = "stateroot:";
 
 pub struct StateStore {
     db: Arc<DB>,
@@ -38,8 +38,10 @@ impl StateStore {
         opts.set_write_buffer_size(64 * 1024 * 1024); // 64 MB
         opts.set_max_write_buffer_number(3);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         Ok(Self { db: Arc::new(db) })
     }
@@ -98,7 +100,9 @@ impl StateStore {
                 }
             };
             let k_str = String::from_utf8_lossy(&k);
-            if !k_str.starts_with(PFX_STATE) { break; }
+            if !k_str.starts_with(PFX_STATE) {
+                break;
+            }
 
             let mut h = Sha256::new();
             h.update(&k);
@@ -115,13 +119,16 @@ impl StateStore {
             if hashes.len() % 2 == 1 {
                 hashes.push(hashes.last().cloned().unwrap_or_default());
             }
-            hashes = hashes.chunks(2).map(|pair| {
-                let mut h = Sha256::new();
-                h.update(b"ShadowDAG_StateRoot_v1");
-                h.update(&pair[0]);
-                h.update(&pair[1]);
-                h.finalize().to_vec()
-            }).collect();
+            hashes = hashes
+                .chunks(2)
+                .map(|pair| {
+                    let mut h = Sha256::new();
+                    h.update(b"ShadowDAG_StateRoot_v1");
+                    h.update(&pair[0]);
+                    h.update(&pair[1]);
+                    h.finalize().to_vec()
+                })
+                .collect();
         }
 
         hex::encode(&hashes[0])
@@ -139,15 +146,13 @@ impl StateStore {
     pub fn get_state_root(&self, height: u64) -> Option<String> {
         let key = format!("{}{}", PFX_ROOT, height);
         match self.db.get(key.as_bytes()) {
-            Ok(Some(v)) => {
-                match String::from_utf8(v.to_vec()) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        slog_error!("storage", "state_root_utf8_error", height => height, error => e);
-                        None
-                    }
+            Ok(Some(v)) => match String::from_utf8(v.to_vec()) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    slog_error!("storage", "state_root_utf8_error", height => height, error => e);
+                    None
                 }
-            }
+            },
             Ok(None) => None,
             Err(e) => {
                 slog_error!("storage", "state_root_read_error", height => height, error => e);
@@ -173,7 +178,9 @@ impl StateStore {
                 }
             };
             let k_str = String::from_utf8_lossy(&k).to_string();
-            if !k_str.starts_with(&prefix) { break; }
+            if !k_str.starts_with(&prefix) {
+                break;
+            }
             let key = k_str[prefix.len()..].to_string();
             keys.push(key);
         }
@@ -197,7 +204,9 @@ impl StateStore {
     }
 
     /// Get the underlying DB reference
-    pub fn raw_db(&self) -> &DB { &self.db }
+    pub fn raw_db(&self) -> &DB {
+        &self.db
+    }
 }
 
 #[cfg(test)]
@@ -206,7 +215,9 @@ mod tests {
 
     fn make_store() -> StateStore {
         let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         StateStore::new(&format!("/tmp/test_state_{}", ts)).unwrap()
     }
 

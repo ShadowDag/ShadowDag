@@ -4,9 +4,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use rocksdb::{
-    DB, Options, WriteOptions, ReadOptions, WriteBatch,
-    BlockBasedOptions, Cache, SliceTransform,
-    IteratorMode, Direction,
+    BlockBasedOptions, Cache, Direction, IteratorMode, Options, ReadOptions, SliceTransform,
+    WriteBatch, WriteOptions, DB,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -21,20 +20,18 @@ pub struct ConsensusValidatorStore {
 }
 
 impl ConsensusValidatorStore {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
 
     pub fn new(path: &str) -> Result<Self, ConsensusError> {
-
         let mut opts = Options::default();
         opts.create_if_missing(true);
 
         opts.increase_parallelism(
             std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4) as i32
+                .unwrap_or(4) as i32,
         );
 
         opts.optimize_level_style_compaction(512 * 1024 * 1024);
@@ -52,8 +49,10 @@ impl ConsensusValidatorStore {
         opts.set_block_based_table_factory(&block_opts);
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(1));
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         // Consensus validation state — must be durable across crashes.
         let mut write_opts = WriteOptions::default();
@@ -76,7 +75,10 @@ impl ConsensusValidatorStore {
 
     #[inline(always)]
     pub fn store_result(&self, key: &str, value: &str) -> bool {
-        match self.db.put_opt(key.as_bytes(), value.as_bytes(), &self.write_opts) {
+        match self
+            .db
+            .put_opt(key.as_bytes(), value.as_bytes(), &self.write_opts)
+        {
             Ok(_) => true,
             Err(e) => {
                 slog_error!("consensus", "store_result_failed", key => key, error => &e.to_string());
@@ -90,7 +92,6 @@ impl ConsensusValidatorStore {
     // ─────────────────────────────────────────
 
     pub fn store_batch(&self, items: &[(&str, &str)]) -> bool {
-
         if items.is_empty() {
             return true;
         }
@@ -115,7 +116,6 @@ impl ConsensusValidatorStore {
     // ─────────────────────────────────────────
 
     pub fn delete_batch(&self, keys: &[&str]) -> bool {
-
         if keys.is_empty() {
             return true;
         }
@@ -172,9 +172,7 @@ impl ConsensusValidatorStore {
     #[inline(always)]
     pub fn get_result(&self, key: &str) -> Option<String> {
         match self.db.get_pinned_opt(key.as_bytes(), &self.read_opts) {
-            Ok(Some(v)) => {
-                std::str::from_utf8(v.as_ref()).ok().map(str::to_owned)
-            }
+            Ok(Some(v)) => std::str::from_utf8(v.as_ref()).ok().map(str::to_owned),
             Ok(None) => None,
             Err(e) => {
                 slog_error!("consensus", "get_result_db_error", key => key, error => &e.to_string());
@@ -236,7 +234,6 @@ impl ConsensusValidatorStore {
 
     #[inline(always)]
     pub fn mark_rejected(&self, hash: &str, reason: &str) -> bool {
-
         let mut value = Vec::with_capacity(reason.len() + 9);
         value.extend_from_slice(b"rejected:");
         value.extend_from_slice(reason.as_bytes());
@@ -255,7 +252,6 @@ impl ConsensusValidatorStore {
     // ─────────────────────────────────────────
 
     pub fn get_status(&self, hash: &str) -> Option<ValidationStatus> {
-
         let val = self.get_result(hash)?;
 
         if val == "ok" {
@@ -274,13 +270,11 @@ impl ConsensusValidatorStore {
     // ─────────────────────────────────────────
 
     pub fn clear_prefix(&self, prefix: &str) -> bool {
-
         let mut batch = WriteBatch::default();
 
-        let iter = self.db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            Direction::Forward,
-        ));
+        let iter = self
+            .db
+            .iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward));
 
         for item in iter {
             match item {

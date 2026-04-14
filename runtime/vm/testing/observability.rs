@@ -38,16 +38,36 @@ impl VmMetrics {
         }
     }
 
-    pub fn record_block(&self) { self.blocks_processed.fetch_add(1, Ordering::Relaxed); }
-    pub fn record_deploy(&self) { self.contracts_deployed.fetch_add(1, Ordering::Relaxed); }
-    pub fn record_call(&self) { self.contract_calls.fetch_add(1, Ordering::Relaxed); }
-    pub fn record_gas(&self, gas: u64) { self.total_gas_used.fetch_add(gas, Ordering::Relaxed); }
-    pub fn record_revert(&self) { self.reverts.fetch_add(1, Ordering::Relaxed); }
-    pub fn record_oog(&self) { self.oog_failures.fetch_add(1, Ordering::Relaxed); }
-    pub fn record_reorg(&self) { self.reorgs.fetch_add(1, Ordering::Relaxed); }
-    pub fn record_violation(&self) { self.invariant_violations.fetch_add(1, Ordering::Relaxed); }
-    pub fn record_receipt(&self) { self.receipts_stored.fetch_add(1, Ordering::Relaxed); }
-    pub fn record_logs(&self, count: u64) { self.logs_emitted.fetch_add(count, Ordering::Relaxed); }
+    pub fn record_block(&self) {
+        self.blocks_processed.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_deploy(&self) {
+        self.contracts_deployed.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_call(&self) {
+        self.contract_calls.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_gas(&self, gas: u64) {
+        self.total_gas_used.fetch_add(gas, Ordering::Relaxed);
+    }
+    pub fn record_revert(&self) {
+        self.reverts.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_oog(&self) {
+        self.oog_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_reorg(&self) {
+        self.reorgs.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_violation(&self) {
+        self.invariant_violations.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_receipt(&self) {
+        self.receipts_stored.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_logs(&self, count: u64) {
+        self.logs_emitted.fetch_add(count, Ordering::Relaxed);
+    }
 
     /// Format metrics as a human-readable summary.
     pub fn summary(&self) -> String {
@@ -123,15 +143,24 @@ impl ExitCriteria {
             failures.push(format!("blocks {} < min {}", blocks, self.min_blocks));
         }
         if violations > self.max_violations {
-            failures.push(format!("violations {} > max {}", violations, self.max_violations));
+            failures.push(format!(
+                "violations {} > max {}",
+                violations, self.max_violations
+            ));
         }
         let revert_pct = reverts * 100 / calls;
         if revert_pct > self.max_revert_rate_pct {
-            failures.push(format!("revert rate {}% > max {}%", revert_pct, self.max_revert_rate_pct));
+            failures.push(format!(
+                "revert rate {}% > max {}%",
+                revert_pct, self.max_revert_rate_pct
+            ));
         }
         let oog_pct = oogs * 100 / calls;
         if oog_pct > self.max_oog_rate_pct {
-            failures.push(format!("OOG rate {}% > max {}%", oog_pct, self.max_oog_rate_pct));
+            failures.push(format!(
+                "OOG rate {}% > max {}%",
+                oog_pct, self.max_oog_rate_pct
+            ));
         }
 
         (failures.is_empty(), failures)
@@ -156,7 +185,10 @@ mod tests {
     #[test]
     fn exit_criteria_pass() {
         let m = VmMetrics::new();
-        for _ in 0..1000 { m.record_block(); m.record_call(); }
+        for _ in 0..1000 {
+            m.record_block();
+            m.record_call();
+        }
         let (pass, _) = ExitCriteria::default().check(&m);
         assert!(pass, "1000 clean blocks should pass");
     }
@@ -164,7 +196,10 @@ mod tests {
     #[test]
     fn exit_criteria_fail_violations() {
         let m = VmMetrics::new();
-        for _ in 0..1000 { m.record_block(); m.record_call(); }
+        for _ in 0..1000 {
+            m.record_block();
+            m.record_call();
+        }
         m.record_violation();
         let (pass, failures) = ExitCriteria::default().check(&m);
         assert!(!pass);
@@ -174,7 +209,10 @@ mod tests {
     #[test]
     fn exit_criteria_fail_too_few_blocks() {
         let m = VmMetrics::new();
-        for _ in 0..10 { m.record_block(); m.record_call(); }
+        for _ in 0..10 {
+            m.record_block();
+            m.record_call();
+        }
         let (pass, failures) = ExitCriteria::default().check(&m);
         assert!(!pass);
         assert!(failures.iter().any(|f| f.contains("blocks")));

@@ -18,7 +18,7 @@
 //     the three states explicitly.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options};
+use rocksdb::{Options, DB};
 use std::path::Path;
 
 use crate::errors::StorageError;
@@ -33,11 +33,10 @@ impl Logger {
         let mut opts = Options::default();
         opts.create_if_missing(true);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed {
-                path: path.to_string(),
-                reason: e.to_string(),
-            })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         Ok(Self { db })
     }
@@ -149,7 +148,7 @@ mod tests {
     fn corrupt_utf8_is_err_in_strict_mode() {
         let l = Logger::new(&tmp_path()).expect("open logger");
         // Plant raw non-UTF8 bytes under a real key.
-        l.db.put("id:bad", &[0xff, 0xfe, 0xfd]).expect("raw put");
+        l.db.put("id:bad", [0xff, 0xfe, 0xfd]).expect("raw put");
 
         // Non-strict returns None (logs may_be_false_negative)
         assert!(l.get_log("id:bad").is_none());

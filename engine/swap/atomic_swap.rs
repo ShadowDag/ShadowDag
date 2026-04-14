@@ -19,18 +19,18 @@
 // ShadowDAG implements HTLC natively in the UTXO layer.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use sha2::{Sha256, Digest};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// HTLC lock duration constants (all values are in BLOCKS, not seconds).
-pub const DEFAULT_INITIATOR_TIMEOUT: u64 = 86400;    // 24 hours worth of blocks
-pub const DEFAULT_PARTICIPANT_TIMEOUT: u64 = 43200;   // 12 hours worth of blocks
+pub const DEFAULT_INITIATOR_TIMEOUT: u64 = 86400; // 24 hours worth of blocks
+pub const DEFAULT_PARTICIPANT_TIMEOUT: u64 = 43200; // 12 hours worth of blocks
 
 /// Minimum timeout in BLOCKS (not seconds).
 /// At 10 BPS, 36 000 blocks = 1 hour. Adjust if semantics should be time-based.
 pub const MIN_TIMEOUT_BLOCKS: u64 = 36_000;
 
-pub const SECRET_SIZE: usize = 32;                     // 256-bit secret
+pub const SECRET_SIZE: usize = 32; // 256-bit secret
 
 /// Atomic swap state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,23 +51,23 @@ pub enum SwapState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HTLC {
     /// SHA256 hash of the secret
-    pub secret_hash:     String,
+    pub secret_hash: String,
     /// Address that can claim with the secret
-    pub recipient:       String,
+    pub recipient: String,
     /// Address that can refund after timeout
-    pub sender:          String,
+    pub sender: String,
     /// Amount locked in the HTLC
-    pub amount:          u64,
+    pub amount: u64,
     /// Block height at which the HTLC expires
-    pub timeout_height:  u64,
+    pub timeout_height: u64,
     /// Current state
-    pub state:           SwapState,
+    pub state: SwapState,
     /// The secret (only set after redeem)
-    pub secret:          Option<String>,
+    pub secret: Option<String>,
     /// Chain identifier (for cross-chain tracking)
-    pub chain:           String,
+    pub chain: String,
     /// Creation timestamp
-    pub created_at:      u64,
+    pub created_at: u64,
 }
 
 /// Atomic swap engine
@@ -98,15 +98,15 @@ impl AtomicSwap {
         timeout_blocks: u64,
     ) -> HTLC {
         HTLC {
-            secret_hash:    secret_hash.to_string(),
-            recipient:      recipient.to_string(),
-            sender:         sender.to_string(),
+            secret_hash: secret_hash.to_string(),
+            recipient: recipient.to_string(),
+            sender: sender.to_string(),
             amount,
             timeout_height: current_height + timeout_blocks.max(MIN_TIMEOUT_BLOCKS),
-            state:          SwapState::Initiated,
-            secret:         None,
-            chain:          "SDAG".to_string(),
-            created_at:     current_height,
+            state: SwapState::Initiated,
+            secret: None,
+            chain: "SDAG".to_string(),
+            created_at: current_height,
         }
     }
 
@@ -216,7 +216,7 @@ mod tests {
         let mut htlc = AtomicSwap::initiate(&hash, "SD1a", "SD1b", 500, 100, 86400);
 
         assert!(!AtomicSwap::refund(&mut htlc, 50000)); // Not expired
-        assert!(AtomicSwap::refund(&mut htlc, 200000));  // Expired
+        assert!(AtomicSwap::refund(&mut htlc, 200000)); // Expired
         assert_eq!(htlc.state, SwapState::Refunded);
     }
 

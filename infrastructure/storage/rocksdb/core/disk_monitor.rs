@@ -7,7 +7,7 @@
 // Prevents database corruption from out-of-disk writes.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::{slog_warn, slog_error};
+use crate::{slog_error, slog_warn};
 
 /// Minimum free disk space (1 GB) — below this, node enters safe mode
 pub const MIN_FREE_SPACE_BYTES: u64 = 1_073_741_824; // 1 GB
@@ -29,14 +29,18 @@ pub enum DiskStatus {
 }
 
 impl DiskStatus {
-    pub fn is_ok(&self) -> bool { matches!(self, DiskStatus::Ok { .. }) }
-    pub fn is_critical(&self) -> bool { matches!(self, DiskStatus::Critical { .. }) }
+    pub fn is_ok(&self) -> bool {
+        matches!(self, DiskStatus::Ok { .. })
+    }
+    pub fn is_critical(&self) -> bool {
+        matches!(self, DiskStatus::Critical { .. })
+    }
 
     pub fn free_gb(&self) -> f64 {
         match self {
-            DiskStatus::Ok { free_bytes } |
-            DiskStatus::Warning { free_bytes } |
-            DiskStatus::Critical { free_bytes } => *free_bytes as f64 / 1_073_741_824.0,
+            DiskStatus::Ok { free_bytes }
+            | DiskStatus::Warning { free_bytes }
+            | DiskStatus::Critical { free_bytes } => *free_bytes as f64 / 1_073_741_824.0,
             DiskStatus::Unknown => 0.0,
         }
     }
@@ -122,7 +126,12 @@ impl DiskMonitor {
             let mut total: u64 = 0;
             let mut total_free: u64 = 0;
             let ret = unsafe {
-                GetDiskFreeSpaceExW(wide.as_ptr(), &mut free_available, &mut total, &mut total_free)
+                GetDiskFreeSpaceExW(
+                    wide.as_ptr(),
+                    &mut free_available,
+                    &mut total,
+                    &mut total_free,
+                )
             };
             if ret != 0 {
                 return Some(free_available);
@@ -144,7 +153,9 @@ mod tests {
 
     #[test]
     fn ok_status() {
-        let status = DiskStatus::Ok { free_bytes: 50_000_000_000 };
+        let status = DiskStatus::Ok {
+            free_bytes: 50_000_000_000,
+        };
         assert!(status.is_ok());
         assert!(!status.is_critical());
         assert!(status.free_gb() > 40.0);
@@ -152,7 +163,9 @@ mod tests {
 
     #[test]
     fn critical_status() {
-        let status = DiskStatus::Critical { free_bytes: 500_000_000 };
+        let status = DiskStatus::Critical {
+            free_bytes: 500_000_000,
+        };
         assert!(status.is_critical());
         assert!(!status.is_ok());
     }

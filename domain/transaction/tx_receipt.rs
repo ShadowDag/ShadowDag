@@ -10,7 +10,7 @@
 //                                ↘ Rejected / Expired
 // ═══════════════════════════════════════════════════════════════════════════
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,11 +25,22 @@ pub enum TxStatus {
     /// Transaction accepted into mempool
     InMempool,
     /// Transaction included in a block (with block hash)
-    InBlock { block_hash: String, block_height: u64 },
+    InBlock {
+        block_hash: String,
+        block_height: u64,
+    },
     /// Transaction has N confirmations
-    Confirmed { block_hash: String, block_height: u64, confirmations: u64 },
+    Confirmed {
+        block_hash: String,
+        block_height: u64,
+        confirmations: u64,
+    },
     /// Transaction reached finality (irreversible)
-    Final { block_hash: String, block_height: u64, confirmations: u64 },
+    Final {
+        block_hash: String,
+        block_height: u64,
+        confirmations: u64,
+    },
     /// Transaction rejected (with reason)
     Rejected { reason: String },
     /// Transaction expired from mempool
@@ -46,7 +57,10 @@ impl TxStatus {
         matches!(self, TxStatus::Final { .. })
     }
     pub fn is_failed(&self) -> bool {
-        matches!(self, TxStatus::Rejected { .. } | TxStatus::Expired | TxStatus::Replaced { .. })
+        matches!(
+            self,
+            TxStatus::Rejected { .. } | TxStatus::Expired | TxStatus::Replaced { .. }
+        )
     }
 }
 
@@ -54,25 +68,25 @@ impl TxStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxReceipt {
     /// Transaction hash
-    pub tx_hash:        String,
+    pub tx_hash: String,
     /// Current status
-    pub status:         TxStatus,
+    pub status: TxStatus,
     /// Fee paid
-    pub fee:            u64,
+    pub fee: u64,
     /// Gas used (for contract transactions)
-    pub gas_used:       u64,
+    pub gas_used: u64,
     /// Contract address (if contract creation)
-    pub contract_addr:  Option<String>,
+    pub contract_addr: Option<String>,
     /// Log entries from contract execution
-    pub logs:           Vec<ReceiptLog>,
+    pub logs: Vec<ReceiptLog>,
     /// When the transaction was first seen
-    pub submitted_at:   u64,
+    pub submitted_at: u64,
     /// When the status was last updated
-    pub updated_at:     u64,
+    pub updated_at: u64,
     /// Number of outputs
-    pub output_count:   usize,
+    pub output_count: usize,
     /// Total output value
-    pub total_value:    u64,
+    pub total_value: u64,
     /// Whether execution succeeded (true) or reverted/failed (false)
     pub execution_success: bool,
     /// Return data from contract execution (hex-encoded)
@@ -90,9 +104,9 @@ pub struct TxReceipt {
 /// Log entry in a receipt (from contract execution)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReceiptLog {
-    pub contract:  String,
-    pub topics:    Vec<String>,    // 0-4 indexed topics
-    pub data:      String,         // Non-indexed data (hex)
+    pub contract: String,
+    pub topics: Vec<String>, // 0-4 indexed topics
+    pub data: String,        // Non-indexed data (hex)
     pub log_index: usize,
 }
 
@@ -101,21 +115,21 @@ impl TxReceipt {
         let now = now_secs();
         Self {
             tx_hash,
-            status:        TxStatus::Pending,
+            status: TxStatus::Pending,
             fee,
-            gas_used:      0,
+            gas_used: 0,
             contract_addr: None,
-            logs:          vec![],
-            submitted_at:  now,
-            updated_at:    now,
+            logs: vec![],
+            submitted_at: now,
+            updated_at: now,
             output_count,
             total_value,
             execution_success: false,
-            return_data:       None,
-            revert_reason:     None,
-            vm_version:        0,
-            tx_index:          None,
-            block_height:      None,
+            return_data: None,
+            revert_reason: None,
+            vm_version: 0,
+            tx_index: None,
+            block_height: None,
         }
     }
 
@@ -129,27 +143,49 @@ impl TxReceipt {
     ) -> Self {
         let now = now_secs();
         let (execution_success, gas_used, logs, return_data, revert_reason) = match outcome {
-            ExecutionResult::Success { gas_used, return_data, logs } => {
-                let receipt_logs: Vec<ReceiptLog> = logs.iter().enumerate().map(|(i, log)| {
-                    ReceiptLog {
-                        contract: log.contract.clone(),
-                        topics: log.topics.iter().map(|t| {
-                            let h = t.to_hex();
-                            // Pad to 64 hex chars (32 bytes)
-                            format!("{:0>64}", h)
-                        }).collect(),
-                        data: hex::encode(&log.data),
-                        log_index: i,
-                    }
-                }).collect();
-                (true, *gas_used, receipt_logs, Some(hex::encode(return_data)), None)
+            ExecutionResult::Success {
+                gas_used,
+                return_data,
+                logs,
+            } => {
+                let receipt_logs: Vec<ReceiptLog> = logs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, log)| {
+                        ReceiptLog {
+                            contract: log.contract.clone(),
+                            topics: log
+                                .topics
+                                .iter()
+                                .map(|t| {
+                                    let h = t.to_hex();
+                                    // Pad to 64 hex chars (32 bytes)
+                                    format!("{:0>64}", h)
+                                })
+                                .collect(),
+                            data: hex::encode(&log.data),
+                            log_index: i,
+                        }
+                    })
+                    .collect();
+                (
+                    true,
+                    *gas_used,
+                    receipt_logs,
+                    Some(hex::encode(return_data)),
+                    None,
+                )
             }
             ExecutionResult::Revert { gas_used, reason } => {
                 (false, *gas_used, vec![], None, Some(reason.clone()))
             }
-            ExecutionResult::OutOfGas { gas_used } => {
-                (false, *gas_used, vec![], None, Some("out of gas".to_string()))
-            }
+            ExecutionResult::OutOfGas { gas_used } => (
+                false,
+                *gas_used,
+                vec![],
+                None,
+                Some("out of gas".to_string()),
+            ),
             ExecutionResult::Error { gas_used, message } => {
                 (false, *gas_used, vec![], None, Some(message.clone()))
             }
@@ -193,9 +229,17 @@ impl TxReceipt {
 
     pub fn set_confirmed(&mut self, block_hash: &str, block_height: u64, confirmations: u64) {
         if confirmations >= 100 {
-            self.status = TxStatus::Final { block_hash: block_hash.to_string(), block_height, confirmations };
+            self.status = TxStatus::Final {
+                block_hash: block_hash.to_string(),
+                block_height,
+                confirmations,
+            };
         } else {
-            self.status = TxStatus::Confirmed { block_hash: block_hash.to_string(), block_height, confirmations };
+            self.status = TxStatus::Confirmed {
+                block_hash: block_hash.to_string(),
+                block_height,
+                confirmations,
+            };
         }
         self.updated_at = now_secs();
     }
@@ -248,7 +292,11 @@ impl ReceiptStore {
 
     /// Get receipt for a transaction
     pub fn get(&self, tx_hash: &str) -> Option<TxReceipt> {
-        self.receipts.read().unwrap_or_else(|e| e.into_inner()).get(tx_hash).cloned()
+        self.receipts
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(tx_hash)
+            .cloned()
     }
 
     /// Update status of a transaction
@@ -278,12 +326,15 @@ impl ReceiptStore {
         let mut receipts = self.receipts.write().unwrap_or_else(|e| e.into_inner());
         for receipt in receipts.values_mut() {
             let (bh, bht) = match &receipt.status {
-                TxStatus::InBlock { block_hash, block_height } => {
-                    (block_hash.clone(), *block_height)
-                }
-                TxStatus::Confirmed { block_hash, block_height, .. } => {
-                    (block_hash.clone(), *block_height)
-                }
+                TxStatus::InBlock {
+                    block_hash,
+                    block_height,
+                } => (block_hash.clone(), *block_height),
+                TxStatus::Confirmed {
+                    block_hash,
+                    block_height,
+                    ..
+                } => (block_hash.clone(), *block_height),
                 _ => continue,
             };
             let confs = current_height.saturating_sub(bht);
@@ -297,13 +348,21 @@ impl ReceiptStore {
 
     /// Get all pending transactions
     pub fn pending(&self) -> Vec<TxReceipt> {
-        self.receipts.read().unwrap_or_else(|e| e.into_inner()).values()
+        self.receipts
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
             .filter(|r| matches!(r.status, TxStatus::Pending | TxStatus::InMempool))
             .cloned()
             .collect()
     }
 
-    pub fn count(&self) -> usize { self.receipts.read().unwrap_or_else(|e| e.into_inner()).len() }
+    pub fn count(&self) -> usize {
+        self.receipts
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
 
     /// Remove the in-memory entries for the given TX hashes.
     ///
@@ -330,7 +389,8 @@ impl ReceiptStore {
 
     fn evict_old(&self, receipts: &mut HashMap<String, TxReceipt>) {
         // Remove final/rejected/expired receipts that are oldest
-        let mut candidates: Vec<(String, u64)> = receipts.iter()
+        let mut candidates: Vec<(String, u64)> = receipts
+            .iter()
             .filter(|(_, r)| r.status.is_final() || r.status.is_failed())
             .map(|(h, r)| (h.clone(), r.updated_at))
             .collect();
@@ -346,7 +406,7 @@ impl ReceiptStore {
 /// Compute a deterministic receipt root from a list of receipts.
 /// SHA-256 of concatenated (tx_hash | execution_success_byte | gas_used_le_bytes) for each receipt.
 pub fn compute_receipt_root(receipts: &[TxReceipt]) -> String {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for r in receipts {
         hasher.update(r.tx_hash.as_bytes());
@@ -415,7 +475,10 @@ pub fn delete_receipts_for_block(db: &rocksdb::DB, tx_hashes: &[String]) {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -466,12 +529,20 @@ mod tests {
         store.track(TxReceipt::new_pending("tx1".into(), 10, 1, 100));
         store.mark_in_block("tx1", "block_abc", 42);
         let r = store.get("tx1").unwrap();
-        assert!(matches!(r.status, TxStatus::InBlock { block_height: 42, .. }));
+        assert!(matches!(
+            r.status,
+            TxStatus::InBlock {
+                block_height: 42,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn rejected_is_failed() {
-        let status = TxStatus::Rejected { reason: "double spend".into() };
+        let status = TxStatus::Rejected {
+            reason: "double spend".into(),
+        };
         assert!(status.is_failed());
         assert!(!status.is_confirmed());
     }

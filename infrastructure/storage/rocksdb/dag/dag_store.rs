@@ -3,8 +3,8 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options};
-use serde::{Serialize, Deserialize};
+use rocksdb::{Options, DB};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::errors::StorageError;
@@ -14,12 +14,10 @@ use crate::slog_error;
 pub struct DagNode {
     pub hash: String,
     pub parents: Vec<String>,
-
 }
 
 pub struct DagStore {
     db: DB,
-
 }
 
 impl DagStore {
@@ -27,8 +25,10 @@ impl DagStore {
         let mut opts = Options::default();
         opts.create_if_missing(true);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         Ok(Self { db })
     }
@@ -47,15 +47,13 @@ impl DagStore {
 
     pub fn get_node(&self, hash: &str) -> Option<DagNode> {
         match self.db.get(hash) {
-            Ok(Some(data)) => {
-                match bincode::deserialize(&data) {
-                    Ok(node) => Some(node),
-                    Err(e) => {
-                        slog_error!("storage", "dag_node_deserialize_error", hash => hash, error => e);
-                        None
-                    }
+            Ok(Some(data)) => match bincode::deserialize(&data) {
+                Ok(node) => Some(node),
+                Err(e) => {
+                    slog_error!("storage", "dag_node_deserialize_error", hash => hash, error => e);
+                    None
                 }
-            }
+            },
             Ok(None) => None,
             Err(e) => {
                 slog_error!("storage", "dag_node_read_error", hash => hash, error => e);
@@ -63,5 +61,4 @@ impl DagStore {
             }
         }
     }
-
 }

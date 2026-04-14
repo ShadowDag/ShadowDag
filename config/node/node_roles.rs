@@ -13,8 +13,8 @@ pub enum NodeRole {
 impl NodeRole {
     pub fn description(&self) -> &'static str {
         match self {
-            NodeRole::FullNode   => "Full Node — stores all data",
-            NodeRole::LightNode  => "Light Node — mobile & lightweight",
+            NodeRole::FullNode => "Full Node — stores all data",
+            NodeRole::LightNode => "Light Node — mobile & lightweight",
             NodeRole::ShadowNode => "Shadow Node — hides transaction origin",
         }
     }

@@ -16,14 +16,13 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{slog_info, slog_warn, slog_error};
+use crate::{slog_error, slog_info, slog_warn};
 
 /// Global running flag — checked by all subsystems to coordinate shutdown.
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Shutdown state: 0=running, 1=shutting_down, 2=stopped
 static SHUTDOWN_STATE: AtomicU8 = AtomicU8::new(0);
-
 
 use std::sync::Mutex;
 static SHUTDOWN_HOOKS: Mutex<Vec<Box<dyn FnOnce() + Send>>> = Mutex::new(Vec::new());
@@ -175,7 +174,7 @@ fn install_ctrlc_handler() {
             #[cfg(unix)]
             {
                 // On Unix, use raw signal() via extern "C" (no libc crate needed)
-                const SIGINT: i32  = 2;
+                const SIGINT: i32 = 2;
                 const SIGTERM: i32 = 15;
 
                 extern "C" {
@@ -189,7 +188,7 @@ fn install_ctrlc_handler() {
                 }
 
                 unsafe {
-                    let r1 = signal(SIGINT,  signal_handler);
+                    let r1 = signal(SIGINT, signal_handler);
                     let r2 = signal(SIGTERM, signal_handler);
                     // SIG_ERR = usize::MAX on most platforms
                     if r1 == usize::MAX || r2 == usize::MAX {
@@ -232,7 +231,8 @@ fn install_ctrlc_handler() {
 
             // Trigger graceful shutdown
             Lifecycle::on_stop();
-        }) {
+        })
+    {
         slog_error!("lifecycle", "signal_handler_spawn_failed", error => e);
         // Continue startup but warn that graceful shutdown won't work
     }
@@ -289,8 +289,8 @@ mod tests {
 
     #[test]
     fn shutdown_hook_runs() {
-        use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
 
         RUNNING.store(true, Ordering::SeqCst);
         SHUTDOWN_STATE.store(0, Ordering::SeqCst);

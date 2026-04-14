@@ -3,16 +3,16 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::{slog_info, slog_warn, slog_error};
+use crate::errors::NetworkError;
+use crate::{slog_error, slog_info, slog_warn};
+use rocksdb::DB;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use rocksdb::DB;
-use crate::errors::NetworkError;
 
-pub const TOKEN_TTL_SECS:    u64   = 3_600;
-pub const MAX_FAILED_LOGINS: u32   = 5;
-pub const LOCKOUT_SECS:      u64   = 900;
+pub const TOKEN_TTL_SECS: u64 = 3_600;
+pub const MAX_FAILED_LOGINS: u32 = 5;
+pub const LOCKOUT_SECS: u64 = 900;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AuthRole {
@@ -32,16 +32,16 @@ impl AuthRole {
 
 #[derive(Debug, Clone)]
 pub struct AuthUser {
-    pub username:      String,
+    pub username: String,
     pub password_hash: String,
-    pub role:          AuthRole,
+    pub role: AuthRole,
 }
 
 #[derive(Debug, Clone)]
 pub struct AuthToken {
-    pub token:      String,
-    pub username:   String,
-    pub role:       AuthRole,
+    pub token: String,
+    pub username: String,
+    pub role: AuthRole,
     pub expires_at: u64,
 }
 
@@ -53,15 +53,15 @@ impl AuthToken {
 
 #[derive(Debug, Default)]
 struct LoginAttempts {
-    failed:     u32,
+    failed: u32,
     locked_until: u64,
 }
 
 pub struct RpcAuthManager {
-    users:    HashMap<String, AuthUser>,
-    tokens:   HashMap<String, AuthToken>,
+    users: HashMap<String, AuthUser>,
+    tokens: HashMap<String, AuthToken>,
     attempts: HashMap<String, LoginAttempts>,
-    db:       Option<Arc<DB>>,
+    db: Option<Arc<DB>>,
 }
 
 impl Default for RpcAuthManager {
@@ -73,20 +73,20 @@ impl Default for RpcAuthManager {
 impl RpcAuthManager {
     pub fn new() -> Self {
         Self {
-            users:    HashMap::new(),
-            tokens:   HashMap::new(),
+            users: HashMap::new(),
+            tokens: HashMap::new(),
             attempts: HashMap::new(),
-            db:       None,
+            db: None,
         }
     }
 
     /// Create with RocksDB persistence — users survive restart.
     pub fn new_persistent(db: Arc<DB>) -> Self {
         let mut mgr = Self {
-            users:    HashMap::new(),
-            tokens:   HashMap::new(),
+            users: HashMap::new(),
+            tokens: HashMap::new(),
             attempts: HashMap::new(),
-            db:       Some(db.clone()),
+            db: Some(db.clone()),
         };
         // Recover users from DB
         mgr.recover_users_from_db();
@@ -122,9 +122,9 @@ impl RpcAuthManager {
             let key = format!("rpc:user:{}", user.username);
             // Store as: role_byte + password_hash
             let role_byte = match user.role {
-                AuthRole::Admin    => 0u8,
+                AuthRole::Admin => 0u8,
                 AuthRole::ReadOnly => 1u8,
-                AuthRole::Miner    => 2u8,
+                AuthRole::Miner => 2u8,
             };
             let value = format!("{}:{}", role_byte, user.password_hash);
             if let Err(e) = db.put(key.as_bytes(), value.as_bytes()) {
@@ -152,7 +152,9 @@ impl RpcAuthManager {
                 }
             };
             let key_str = String::from_utf8_lossy(&k);
-            if !key_str.starts_with("rpc:user:") { break; }
+            if !key_str.starts_with("rpc:user:") {
+                break;
+            }
             let username = key_str.trim_start_matches("rpc:user:").to_string();
             let value_str = String::from_utf8_lossy(&v);
             let parts: Vec<&str> = value_str.splitn(2, ':').collect();
@@ -166,11 +168,14 @@ impl RpcAuthManager {
                         continue; // Skip corrupt entries instead of granting access
                     }
                 };
-                self.users.insert(username.clone(), AuthUser {
-                    username,
-                    password_hash: parts[1].to_string(),
-                    role,
-                });
+                self.users.insert(
+                    username.clone(),
+                    AuthUser {
+                        username,
+                        password_hash: parts[1].to_string(),
+                        role,
+                    },
+                );
             }
         }
     }
@@ -179,7 +184,7 @@ impl RpcAuthManager {
         let salt = generate_salt();
         let hash = salted_hash(password, &salt);
         let user = AuthUser {
-            username:      username.to_string(),
+            username: username.to_string(),
             password_hash: hash,
             role,
         };
@@ -205,7 +210,9 @@ impl RpcAuthManager {
 
     pub fn login(&mut self, username: &str, password: &str) -> Result<String, NetworkError> {
         // Check user exists BEFORE creating an attempts entry (avoids memory leak from nonexistent usernames)
-        let user = self.users.get(username)
+        let user = self
+            .users
+            .get(username)
             .ok_or_else(|| NetworkError::Other("Invalid credentials".to_string()))?;
         let user = user.clone();
 
@@ -230,9 +237,9 @@ impl RpcAuthManager {
 
         let token_str = generate_token(username);
         let token = AuthToken {
-            token:      token_str.clone(),
-            username:   username.to_string(),
-            role:       user.role.clone(),
+            token: token_str.clone(),
+            username: username.to_string(),
+            role: user.role.clone(),
             expires_at: now_secs() + TOKEN_TTL_SECS,
         };
         self.tokens.insert(token_str.clone(), token);
@@ -252,11 +259,15 @@ impl RpcAuthManager {
     }
 
     pub fn is_admin(&mut self, token: &str) -> bool {
-        self.verify(token).map(|t| t.role == AuthRole::Admin).unwrap_or(false)
+        self.verify(token)
+            .map(|t| t.role == AuthRole::Admin)
+            .unwrap_or(false)
     }
 
     pub fn can_write(&mut self, token: &str) -> bool {
-        self.verify(token).map(|t| t.role.can_write()).unwrap_or(false)
+        self.verify(token)
+            .map(|t| t.role.can_write())
+            .unwrap_or(false)
     }
 
     pub fn logout(&mut self, token: &str) -> bool {
@@ -282,7 +293,7 @@ fn now_secs() -> u64 {
 /// Password hashing with per-user salt and HMAC-SHA256 iterated KDF.
 /// This is NOT just SHA-256 — it uses 10,000 iterations to slow brute force.
 fn salted_hash(password: &str, salt: &[u8]) -> String {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     const KDF_ITERATIONS: u32 = 10_000;
 
     // Initial: H(domain || salt || password)
@@ -327,14 +338,18 @@ fn verify_password(password: &str, stored: &str) -> bool {
     };
     let expected = salted_hash(password, &salt);
     // Constant-time comparison to prevent timing attacks
-    expected.len() == stored.len() && expected.as_bytes().iter()
-        .zip(stored.as_bytes().iter())
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+    expected.len() == stored.len()
+        && expected
+            .as_bytes()
+            .iter()
+            .zip(stored.as_bytes().iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
 }
 
 /// Legacy simple hash (for backward compat during migration)
 fn simple_hash_legacy(input: &str) -> String {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(b"ShadowDAG_Auth_Hash_v1");
     h.update(input.as_bytes());
@@ -350,8 +365,8 @@ fn generate_random_password() -> String {
 }
 
 fn generate_token(username: &str) -> String {
-    use sha2::{Sha256, Digest};
     use rand::RngCore;
+    use sha2::{Digest, Sha256};
     let mut entropy = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut entropy);
     let mut h = Sha256::new();

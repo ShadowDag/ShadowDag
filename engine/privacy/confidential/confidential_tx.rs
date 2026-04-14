@@ -11,9 +11,9 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::domain::transaction::transaction::Transaction;
-use crate::engine::privacy::confidential::pedersen_commitment::PedersenCommitment;
 use crate::engine::privacy::confidential::bulletproofs::{Bulletproof, BulletproofResult};
 use crate::engine::privacy::confidential::pedersen::RealPedersenCommitment;
+use crate::engine::privacy::confidential::pedersen_commitment::PedersenCommitment;
 use crate::engine::privacy::confidential::range_proof::{self, RangeProof};
 use crate::errors::CryptoError;
 
@@ -25,8 +25,8 @@ use crate::errors::CryptoError;
 pub struct ConfidentialResult {
     pub commitment_hex: String,
     pub range_proof_ok: bool,
-    pub tx_hash:        String,
-    pub proof:          Option<BulletproofResult>,
+    pub tx_hash: String,
+    pub proof: Option<BulletproofResult>,
 }
 
 /// Result of making a transaction confidential using real cryptography.
@@ -54,9 +54,10 @@ impl ConfidentialTx {
              simulation for TX {}. For production, use hide_amount_real().",
             tx.hash,
         );
-        tx.outputs.iter().map(|output| {
-            Bulletproof::prove(output.amount)
-        }).collect()
+        tx.outputs
+            .iter()
+            .map(|output| Bulletproof::prove(output.amount))
+            .collect()
     }
 
     /// Hide all output amounts using REAL Pedersen commitments and Borromean range proofs.
@@ -64,9 +65,10 @@ impl ConfidentialTx {
     /// Each output gets a `RealPedersenCommitment` (Ristretto point) and a
     /// `RangeProof` (Borromean ring signatures proving value in [0, 2^64)).
     pub fn hide_amount_real(tx: &Transaction) -> Vec<(RealPedersenCommitment, RangeProof)> {
-        tx.outputs.iter().map(|output| {
-            Self::create_confidential_output_real(output.amount)
-        }).collect()
+        tx.outputs
+            .iter()
+            .map(|output| Self::create_confidential_output_real(output.amount))
+            .collect()
     }
 
     /// Hide amounts and return a single confidential result for the first output (LEGACY path).
@@ -138,8 +140,12 @@ impl ConfidentialTx {
     /// and range proof.
     #[allow(deprecated)]
     pub fn verify_confidential(result: &ConfidentialResult) -> bool {
-        if result.commitment_hex.is_empty() { return false; }
-        if !result.range_proof_ok { return false; }
+        if result.commitment_hex.is_empty() {
+            return false;
+        }
+        if !result.range_proof_ok {
+            return false;
+        }
 
         // Verify the range proof cryptographically (LEGACY path)
         match &result.proof {
@@ -173,16 +179,20 @@ impl ConfidentialTx {
     /// For production, use `verify_all_outputs_real()`.
     #[allow(deprecated)]
     pub fn verify_all_outputs(proofs: &[BulletproofResult]) -> bool {
-        if proofs.is_empty() { return false; }
+        if proofs.is_empty() {
+            return false;
+        }
         proofs.iter().all(Bulletproof::verify_range_proof)
     }
 
     /// Verify all outputs using REAL Borromean range proof verification.
     pub fn verify_all_outputs_real(outputs: &[(RealPedersenCommitment, RangeProof)]) -> bool {
-        if outputs.is_empty() { return false; }
-        outputs.iter().all(|(commitment, proof)| {
-            range_proof::verify(&commitment.commitment, proof)
-        })
+        if outputs.is_empty() {
+            return false;
+        }
+        outputs
+            .iter()
+            .all(|(commitment, proof)| range_proof::verify(&commitment.commitment, proof))
     }
 
     /// Create a confidential output using REAL Pedersen commitments and
@@ -199,9 +209,9 @@ impl ConfidentialTx {
     /// Check that sum of input commitments equals sum of output commitments
     /// (conservation of value — no inflation)
     pub fn verify_balance(
-        input_commitments:  &[String],
+        input_commitments: &[String],
         output_commitments: &[String],
-        fee_commitment:     &str,
+        fee_commitment: &str,
     ) -> bool {
         if input_commitments.is_empty() || output_commitments.is_empty() {
             return false;
@@ -246,7 +256,13 @@ mod tests {
         Transaction {
             hash: "test_ct_tx".to_string(),
             inputs: vec![],
-            outputs: vec![TxOutput { address: "addr".into(), amount, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            outputs: vec![TxOutput {
+                address: "addr".into(),
+                amount,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee: 1,
             timestamp: 1735689600,
             is_coinbase: false,
@@ -279,9 +295,27 @@ mod tests {
             hash: "multi".into(),
             inputs: vec![],
             outputs: vec![
-                TxOutput { address: "a".into(), amount: 100, commitment: None, range_proof: None, ephemeral_pubkey: None },
-                TxOutput { address: "b".into(), amount: 200, commitment: None, range_proof: None, ephemeral_pubkey: None },
-                TxOutput { address: "c".into(), amount: 300, commitment: None, range_proof: None, ephemeral_pubkey: None },
+                TxOutput {
+                    address: "a".into(),
+                    amount: 100,
+                    commitment: None,
+                    range_proof: None,
+                    ephemeral_pubkey: None,
+                },
+                TxOutput {
+                    address: "b".into(),
+                    amount: 200,
+                    commitment: None,
+                    range_proof: None,
+                    ephemeral_pubkey: None,
+                },
+                TxOutput {
+                    address: "c".into(),
+                    amount: 300,
+                    commitment: None,
+                    range_proof: None,
+                    ephemeral_pubkey: None,
+                },
             ],
             fee: 1,
             timestamp: 1000,
@@ -337,9 +371,27 @@ mod tests {
             hash: "multi_real".into(),
             inputs: vec![],
             outputs: vec![
-                TxOutput { address: "a".into(), amount: 100, commitment: None, range_proof: None, ephemeral_pubkey: None },
-                TxOutput { address: "b".into(), amount: 200, commitment: None, range_proof: None, ephemeral_pubkey: None },
-                TxOutput { address: "c".into(), amount: 300, commitment: None, range_proof: None, ephemeral_pubkey: None },
+                TxOutput {
+                    address: "a".into(),
+                    amount: 100,
+                    commitment: None,
+                    range_proof: None,
+                    ephemeral_pubkey: None,
+                },
+                TxOutput {
+                    address: "b".into(),
+                    amount: 200,
+                    commitment: None,
+                    range_proof: None,
+                    ephemeral_pubkey: None,
+                },
+                TxOutput {
+                    address: "c".into(),
+                    amount: 300,
+                    commitment: None,
+                    range_proof: None,
+                    ephemeral_pubkey: None,
+                },
             ],
             fee: 1,
             timestamp: 1000,

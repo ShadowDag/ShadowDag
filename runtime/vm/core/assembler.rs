@@ -27,8 +27,8 @@
 //   STOP
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::collections::BTreeMap;
 use hex;
+use std::collections::BTreeMap;
 // IMPORTANT: this assembler MUST use the consensus-correct opcode table
 // from `vm::OpCode`, which mirrors the authoritative `v1_spec` byte
 // layout (e.g. JUMPDEST = 0x82). The parallel `core::opcodes::OpCode`
@@ -45,13 +45,13 @@ use hex;
 // BLAKE3, ORIGIN, NEQ, MIN, MAX, BLOCKHEIGHT, CHAINID — is rejected
 // rather than emitted, because the live v1 VM has no opcode at
 // those byte slots.
-use crate::runtime::vm::core::vm::OpCode;
 use crate::runtime::vm::core::v1_spec::byte_for_mnemonic;
+use crate::runtime::vm::core::vm::OpCode;
 
 /// Assembly error
 #[derive(Debug, Clone)]
 pub struct AsmError {
-    pub line:    usize,
+    pub line: usize,
     pub message: String,
 }
 
@@ -74,7 +74,9 @@ impl Assembler {
         // Pass 1: Assemble and collect labels
         for (line_num, raw_line) in source.lines().enumerate() {
             let line = raw_line.split(';').next().unwrap_or("").trim();
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
 
             // Label definition
             if let Some(rest) = line.strip_prefix(':') {
@@ -85,7 +87,9 @@ impl Assembler {
             }
 
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.is_empty() { continue; }
+            if parts.is_empty() {
+                continue;
+            }
 
             let mnemonic = parts[0].to_uppercase();
             let operand = parts.get(1).copied();
@@ -99,7 +103,10 @@ impl Assembler {
                 "PUSH1" => {
                     let val = Self::parse_operand(operand, line_num)?;
                     if val > 0xFF {
-                        return Err(AsmError { line: line_num, message: format!("PUSH1 value too large: max 255, got {}", val) });
+                        return Err(AsmError {
+                            line: line_num,
+                            message: format!("PUSH1 value too large: max 255, got {}", val),
+                        });
                     }
                     bytecode.push(Self::v1_byte("PUSH1", line_num)?);
                     bytecode.push(val as u8);
@@ -107,7 +114,10 @@ impl Assembler {
                 "PUSH2" => {
                     let val = Self::parse_operand(operand, line_num)?;
                     if val > 0xFFFF {
-                        return Err(AsmError { line: line_num, message: format!("PUSH2 value too large: max 65535, got {}", val) });
+                        return Err(AsmError {
+                            line: line_num,
+                            message: format!("PUSH2 value too large: max 65535, got {}", val),
+                        });
                     }
                     bytecode.push(Self::v1_byte("PUSH2", line_num)?);
                     bytecode.extend_from_slice(&(val as u16).to_be_bytes());
@@ -115,7 +125,10 @@ impl Assembler {
                 "PUSH4" => {
                     let val = Self::parse_operand(operand, line_num)?;
                     if val > 0xFFFF_FFFF {
-                        return Err(AsmError { line: line_num, message: format!("PUSH4 value too large: max 4294967295, got {}", val) });
+                        return Err(AsmError {
+                            line: line_num,
+                            message: format!("PUSH4 value too large: max 4294967295, got {}", val),
+                        });
                     }
                     bytecode.push(Self::v1_byte("PUSH4", line_num)?);
                     bytecode.extend_from_slice(&(val as u32).to_be_bytes());
@@ -196,8 +209,10 @@ impl Assembler {
 
         // Pass 2: Resolve label references (4-byte big-endian offsets)
         for (pos, label, line) in &label_refs {
-            let dest = labels.get(label)
-                .ok_or_else(|| AsmError { line: *line, message: format!("Undefined label: {}", label) })?;
+            let dest = labels.get(label).ok_or_else(|| AsmError {
+                line: *line,
+                message: format!("Undefined label: {}", label),
+            })?;
             let bytes = (*dest as u32).to_be_bytes();
             bytecode[*pos..*pos + 4].copy_from_slice(&bytes);
         }
@@ -279,37 +294,59 @@ impl Assembler {
     }
 
     fn parse_operand(operand: Option<&str>, line: usize) -> Result<u64, AsmError> {
-        let s = operand.ok_or_else(|| AsmError { line, message: "Missing operand".to_string() })?;
+        let s = operand.ok_or_else(|| AsmError {
+            line,
+            message: "Missing operand".to_string(),
+        })?;
 
         if s.starts_with("0x") || s.starts_with("0X") {
-            u64::from_str_radix(&s[2..], 16)
-                .map_err(|e| AsmError { line, message: format!("Invalid hex: {}", e) })
+            u64::from_str_radix(&s[2..], 16).map_err(|e| AsmError {
+                line,
+                message: format!("Invalid hex: {}", e),
+            })
         } else {
-            s.parse::<u64>()
-                .map_err(|e| AsmError { line, message: format!("Invalid number: {}", e) })
+            s.parse::<u64>().map_err(|e| AsmError {
+                line,
+                message: format!("Invalid number: {}", e),
+            })
         }
     }
 
     /// Parse a hex operand into exactly `expected_len` bytes.
     /// Accepts "0x"-prefixed or bare hex strings and zero-pads on the left
     /// if the caller supplies fewer hex digits than `expected_len * 2`.
-    fn parse_hex_bytes(operand: Option<&str>, expected_len: usize, line: usize) -> Result<Vec<u8>, AsmError> {
-        let s = operand.ok_or_else(|| AsmError { line, message: "Missing operand".to_string() })?;
-        let hex_str = if s.starts_with("0x") || s.starts_with("0X") { &s[2..] } else { s };
+    fn parse_hex_bytes(
+        operand: Option<&str>,
+        expected_len: usize,
+        line: usize,
+    ) -> Result<Vec<u8>, AsmError> {
+        let s = operand.ok_or_else(|| AsmError {
+            line,
+            message: "Missing operand".to_string(),
+        })?;
+        let hex_str = if s.starts_with("0x") || s.starts_with("0X") {
+            &s[2..]
+        } else {
+            s
+        };
 
         if hex_str.len() > expected_len * 2 {
             return Err(AsmError {
                 line,
                 message: format!(
                     "PUSH{} operand too large: max {} hex digits, got {}",
-                    expected_len, expected_len * 2, hex_str.len()
+                    expected_len,
+                    expected_len * 2,
+                    hex_str.len()
                 ),
             });
         }
 
-        let decoded = hex::decode(
-            format!("{:0>width$}", hex_str, width = expected_len * 2)
-        ).map_err(|e| AsmError { line, message: format!("Invalid hex: {}", e) })?;
+        let decoded = hex::decode(format!("{:0>width$}", hex_str, width = expected_len * 2))
+            .map_err(|e| AsmError {
+                line,
+                message: format!("Invalid hex: {}", e),
+            })?;
 
         Ok(decoded)
     }
@@ -378,7 +415,10 @@ mod tests {
         let source = ":start\nPUSH1 1\nPUSH1 0\nJUMP :start";
         let bytecode = Assembler::assemble(source).unwrap();
         assert_eq!(bytecode[0], 0x82, "JUMPDEST must be the v1 byte 0x82");
-        assert_eq!(bytecode[5], 0x12, "PUSH4 must be the v1 byte 0x12 (PUSH2 is 0x11)");
+        assert_eq!(
+            bytecode[5], 0x12,
+            "PUSH4 must be the v1 byte 0x12 (PUSH2 is 0x11)"
+        );
         // 4-byte big-endian offset to :start (byte 0)
         assert_eq!(&bytecode[6..10], &[0x00, 0x00, 0x00, 0x00]);
         assert_eq!(bytecode[10], 0x80); // JUMP
@@ -400,10 +440,17 @@ mod tests {
         // Then 260 NOPs, then JUMPDEST at byte 6 + 260 = 266
         assert_eq!(bytecode[0], 0x12, "PUSH4 must be the v1 byte 0x12");
         let offset = u32::from_be_bytes([bytecode[1], bytecode[2], bytecode[3], bytecode[4]]);
-        assert_eq!(offset, 266, "label must resolve to offset 266, got {}", offset);
+        assert_eq!(
+            offset, 266,
+            "label must resolve to offset 266, got {}",
+            offset
+        );
         // JUMPDEST at the target — 0x82 in v1 / vm::OpCode (was 0x05
         // in the obsolete `core::opcodes::OpCode` table).
-        assert_eq!(bytecode[266], 0x82, "JUMPDEST at label must be the v1 byte 0x82");
+        assert_eq!(
+            bytecode[266], 0x82,
+            "JUMPDEST at label must be the v1 byte 0x82"
+        );
     }
 
     #[test]
@@ -426,9 +473,9 @@ mod tests {
     fn disassemble_shows_gas_costs() {
         let bytecode = vec![0x10, 5, 0x51, 0x00]; // PUSH1 5, SSTORE, STOP
         let disasm = Assembler::disassemble(&bytecode);
-        assert!(disasm.contains("gas=3"));   // PUSH1
+        assert!(disasm.contains("gas=3")); // PUSH1
         assert!(disasm.contains("gas=5000")); // SSTORE
-        assert!(disasm.contains("gas=0"));    // STOP
+        assert!(disasm.contains("gas=0")); // STOP
     }
 
     #[test]

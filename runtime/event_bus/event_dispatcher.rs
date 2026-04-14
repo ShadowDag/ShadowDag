@@ -55,7 +55,9 @@ pub struct EventDispatcher {
 
 impl EventDispatcher {
     pub fn new(path: &str) -> Result<Self, StorageError> {
-        Ok(Self { bus: EventBus::new(path)? })
+        Ok(Self {
+            bus: EventBus::new(path)?,
+        })
     }
 
     /// Dispatch an event. The payload is stored as the value under an
@@ -124,7 +126,10 @@ mod tests {
         let d = EventDispatcher::new(&tmp_path()).expect("open dispatcher");
         let id1 = d.dispatch(EventType::BlockAdded, "same-payload");
         let id2 = d.dispatch(EventType::BlockAdded, "same-payload");
-        assert_ne!(id1, id2, "duplicate (event, payload) must produce distinct ids");
+        assert_ne!(
+            id1, id2,
+            "duplicate (event, payload) must produce distinct ids"
+        );
         // Both must be independently retrievable
         assert_eq!(d.get(&id1).as_deref(), Some("same-payload"));
         assert_eq!(d.get(&id2).as_deref(), Some("same-payload"));
@@ -149,7 +154,11 @@ mod tests {
         let id = d.dispatch(EventType::BlockAdded, &huge);
         // With the new format the id is <prefix>:{u128}:{u64} which is
         // well under a few hundred bytes no matter how big the payload.
-        assert!(id.len() < 256, "id length exploded with big payload: {}", id.len());
+        assert!(
+            id.len() < 256,
+            "id length exploded with big payload: {}",
+            id.len()
+        );
     }
 
     #[test]

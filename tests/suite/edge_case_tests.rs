@@ -7,6 +7,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     // ── u64 Boundary Tests ──────────────────────────────────────────
 
@@ -143,7 +144,10 @@ mod tests {
         let key = [0x42u8; 32];
         let standard = Address::from_public_key(&key, "mainnet");
         let schnorr = Address::from_schnorr_key(&key, "mainnet");
-        assert_ne!(standard.value, schnorr.value, "Different address types must differ");
+        assert_ne!(
+            standard.value, schnorr.value,
+            "Different address types must differ"
+        );
     }
 
     // ── Atomic Swap Edge Cases ──────────────────────────────────────
@@ -181,11 +185,17 @@ mod tests {
         use crate::engine::dex::order_book::*;
         let mut book = OrderBook::new(TradingPair::new("A", "B"));
         let order = Order {
-            id: "z1".into(), owner: "o".into(),
+            id: "z1".into(),
+            owner: "o".into(),
             pair: TradingPair::new("A", "B"),
-            side: OrderSide::Buy, order_type: OrderType::Limit,
-            price: 100, amount: 0, filled: 0,
-            status: OrderStatus::Open, timestamp: 0, block_height: 0,
+            side: OrderSide::Buy,
+            order_type: OrderType::Limit,
+            price: 100,
+            amount: 0,
+            filled: 0,
+            status: OrderStatus::Open,
+            timestamp: 0,
+            block_height: 0,
         };
         let trades = book.place_order(order).unwrap();
         assert!(trades.is_empty());
@@ -283,6 +293,6 @@ mod tests {
     fn past_median_time_even_count() {
         use crate::engine::consensus::difficulty::difficulty::Difficulty;
         let pmt = Difficulty::past_median_time(&[10, 20, 30, 40]);
-        assert!(pmt >= 10 && pmt <= 40);
+        assert!((10..=40).contains(&pmt));
     }
 }

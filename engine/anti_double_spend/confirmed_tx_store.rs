@@ -10,7 +10,7 @@
 // and block validator can reject exact replays.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{DB, Options, WriteBatch, WriteOptions, ReadOptions};
+use rocksdb::{Options, ReadOptions, WriteBatch, WriteOptions, DB};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -41,11 +41,10 @@ impl ConfirmedTxStore {
         opts.increase_parallelism(2);
         opts.optimize_level_style_compaction(256 * 1024 * 1024);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed {
-                path: path.to_string(),
-                reason: e.to_string(),
-            })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         // Confirmed TX tracking is consensus-adjacent — durable writes.
         let mut write_opts = WriteOptions::default();
@@ -61,8 +60,8 @@ impl ConfirmedTxStore {
     }
 
     pub fn open_default() -> Result<Self, StorageError> {
-        let path = crate::config::node::node_config::NetworkMode::base_data_dir()
-            .join("confirmed_txs");
+        let path =
+            crate::config::node::node_config::NetworkMode::base_data_dir().join("confirmed_txs");
         Self::new(&path.to_string_lossy())
     }
 
@@ -129,9 +128,8 @@ impl ConfirmedTxStore {
 
                 let should_delete = match self.db.get_pinned_opt(&ctx_key, &self.read_opts) {
                     Ok(Some(stored)) if stored.len() >= 8 => {
-                        let stored_height = u64::from_be_bytes(
-                            stored[..8].try_into().unwrap_or([0; 8]),
-                        );
+                        let stored_height =
+                            u64::from_be_bytes(stored[..8].try_into().unwrap_or([0; 8]));
                         stored_height == height
                     }
                     _ => false,
@@ -226,9 +224,8 @@ impl ConfirmedTxStore {
 
                 let should_delete = match self.db.get_pinned_opt(&ctx_key, &self.read_opts) {
                     Ok(Some(stored)) if stored.len() >= 8 => {
-                        let stored_height = u64::from_be_bytes(
-                            stored[..8].try_into().unwrap_or([0; 8]),
-                        );
+                        let stored_height =
+                            u64::from_be_bytes(stored[..8].try_into().unwrap_or([0; 8]));
                         // Only delete if the ctx entry still points to this (old) height
                         stored_height == height
                     }

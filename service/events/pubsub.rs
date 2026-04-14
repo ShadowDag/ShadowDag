@@ -21,11 +21,11 @@
 // Delivery: via WebSocket or long-polling HTTP connections
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 use crate::errors::NetworkError;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Maximum events per topic buffer
 pub const MAX_BUFFER_SIZE: usize = 1_000;
@@ -54,29 +54,29 @@ impl Topic {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
-            "blocks"       => Topic::Blocks,
+            "blocks" => Topic::Blocks,
             "transactions" | "tx" => Topic::Transactions,
-            "dag_tips"     => Topic::DagTips,
-            "finality"     => Topic::Finality,
-            "mining"       => Topic::Mining,
-            "privacy"      => Topic::Privacy,
-            "contracts"    => Topic::Contracts,
-            "chain_reorg"  => Topic::ChainReorg,
-            other          => Topic::Custom(other.to_string()),
+            "dag_tips" => Topic::DagTips,
+            "finality" => Topic::Finality,
+            "mining" => Topic::Mining,
+            "privacy" => Topic::Privacy,
+            "contracts" => Topic::Contracts,
+            "chain_reorg" => Topic::ChainReorg,
+            other => Topic::Custom(other.to_string()),
         }
     }
 
     pub fn name(&self) -> &str {
         match self {
-            Topic::Blocks       => "blocks",
+            Topic::Blocks => "blocks",
             Topic::Transactions => "transactions",
-            Topic::DagTips      => "dag_tips",
-            Topic::Finality     => "finality",
-            Topic::Mining       => "mining",
-            Topic::Privacy      => "privacy",
-            Topic::Contracts    => "contracts",
-            Topic::ChainReorg   => "chain_reorg",
-            Topic::Custom(s)    => s,
+            Topic::DagTips => "dag_tips",
+            Topic::Finality => "finality",
+            Topic::Mining => "mining",
+            Topic::Privacy => "privacy",
+            Topic::Contracts => "contracts",
+            Topic::ChainReorg => "chain_reorg",
+            Topic::Custom(s) => s,
         }
     }
 }
@@ -84,32 +84,35 @@ impl Topic {
 /// A published event
 #[derive(Debug, Clone)]
 pub struct Event {
-    pub id:        u64,
-    pub topic:     Topic,
-    pub payload:   String,
+    pub id: u64,
+    pub topic: Topic,
+    pub payload: String,
     pub timestamp: u64,
 }
 
 /// A subscription
 #[derive(Debug, Clone)]
 pub struct Subscription {
-    pub id:         u64,
-    pub client_id:  String,
-    pub topic:      Topic,
+    pub id: u64,
+    pub client_id: String,
+    pub topic: Topic,
     pub created_at: u64,
     /// Filter: only deliver events matching this prefix (optional)
-    pub filter:     Option<String>,
+    pub filter: Option<String>,
 }
 
 /// Client notification queue
 struct ClientQueue {
-    events:    VecDeque<Event>,
-    max_size:  usize,
+    events: VecDeque<Event>,
+    max_size: usize,
 }
 
 impl ClientQueue {
     fn new() -> Self {
-        Self { events: VecDeque::with_capacity(64), max_size: MAX_BUFFER_SIZE }
+        Self {
+            events: VecDeque::with_capacity(64),
+            max_size: MAX_BUFFER_SIZE,
+        }
     }
 
     fn push(&mut self, event: Event) {
@@ -124,23 +127,25 @@ impl ClientQueue {
         self.events.drain(..count).collect()
     }
 
-    fn len(&self) -> usize { self.events.len() }
+    fn len(&self) -> usize {
+        self.events.len()
+    }
 }
 
 /// Pub-Sub Manager
 pub struct PubSub {
     /// Topic → list of subscriptions
-    subscriptions:    RwLock<HashMap<Topic, Vec<Subscription>>>,
+    subscriptions: RwLock<HashMap<Topic, Vec<Subscription>>>,
     /// Client → notification queue
-    client_queues:    RwLock<HashMap<String, ClientQueue>>,
+    client_queues: RwLock<HashMap<String, ClientQueue>>,
     /// Next event ID
-    next_event_id:    AtomicU64,
+    next_event_id: AtomicU64,
     /// Next subscription ID
-    next_sub_id:      AtomicU64,
+    next_sub_id: AtomicU64,
     /// Total events published
-    total_published:  AtomicU64,
+    total_published: AtomicU64,
     /// Total events delivered
-    total_delivered:  AtomicU64,
+    total_delivered: AtomicU64,
 }
 
 impl Default for PubSub {
@@ -152,40 +157,54 @@ impl Default for PubSub {
 impl PubSub {
     pub fn new() -> Self {
         Self {
-            subscriptions:   RwLock::new(HashMap::new()),
-            client_queues:   RwLock::new(HashMap::new()),
-            next_event_id:   AtomicU64::new(1),
-            next_sub_id:     AtomicU64::new(1),
+            subscriptions: RwLock::new(HashMap::new()),
+            client_queues: RwLock::new(HashMap::new()),
+            next_event_id: AtomicU64::new(1),
+            next_sub_id: AtomicU64::new(1),
             total_published: AtomicU64::new(0),
             total_delivered: AtomicU64::new(0),
         }
     }
 
     /// Subscribe a client to a topic
-    pub fn subscribe(&self, client_id: &str, topic: Topic, filter: Option<String>) -> Result<u64, NetworkError> {
-        let mut subs = self.subscriptions.write().unwrap_or_else(|e| e.into_inner());
+    pub fn subscribe(
+        &self,
+        client_id: &str,
+        topic: Topic,
+        filter: Option<String>,
+    ) -> Result<u64, NetworkError> {
+        let mut subs = self
+            .subscriptions
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
 
         // Check per-client limit
-        let client_count = subs.values()
+        let client_count = subs
+            .values()
             .flat_map(|v| v.iter())
             .filter(|s| s.client_id == client_id)
             .count();
 
         if client_count >= MAX_SUBS_PER_CLIENT {
-            return Err(NetworkError::RateLimited(format!("Max {} subscriptions per client", MAX_SUBS_PER_CLIENT)));
+            return Err(NetworkError::RateLimited(format!(
+                "Max {} subscriptions per client",
+                MAX_SUBS_PER_CLIENT
+            )));
         }
 
         // Check total limit
         let total: usize = subs.values().map(|v| v.len()).sum();
         if total >= MAX_TOTAL_SUBS {
-            return Err(NetworkError::RateLimited("Max subscriptions reached".to_string()));
+            return Err(NetworkError::RateLimited(
+                "Max subscriptions reached".to_string(),
+            ));
         }
 
         let sub_id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         let sub = Subscription {
-            id:         sub_id,
-            client_id:  client_id.to_string(),
-            topic:      topic.clone(),
+            id: sub_id,
+            client_id: client_id.to_string(),
+            topic: topic.clone(),
             created_at: now_secs(),
             filter,
         };
@@ -193,7 +212,9 @@ impl PubSub {
         subs.entry(topic).or_default().push(sub);
 
         // Create client queue if needed
-        self.client_queues.write().unwrap_or_else(|e| e.into_inner())
+        self.client_queues
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .entry(client_id.to_string())
             .or_insert_with(ClientQueue::new);
 
@@ -202,26 +223,37 @@ impl PubSub {
 
     /// Unsubscribe from a topic
     pub fn unsubscribe(&self, client_id: &str, sub_id: u64) -> bool {
-        let mut subs = self.subscriptions.write().unwrap_or_else(|e| e.into_inner());
+        let mut subs = self
+            .subscriptions
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let mut found = false;
         for topic_subs in subs.values_mut() {
             let before = topic_subs.len();
             topic_subs.retain(|s| !(s.id == sub_id && s.client_id == client_id));
-            if topic_subs.len() < before { found = true; }
+            if topic_subs.len() < before {
+                found = true;
+            }
         }
         found
     }
 
     /// Unsubscribe a client from everything
     pub fn unsubscribe_all(&self, client_id: &str) -> usize {
-        let mut subs = self.subscriptions.write().unwrap_or_else(|e| e.into_inner());
+        let mut subs = self
+            .subscriptions
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let mut removed = 0;
         for topic_subs in subs.values_mut() {
             let before = topic_subs.len();
             topic_subs.retain(|s| s.client_id != client_id);
             removed += before - topic_subs.len();
         }
-        self.client_queues.write().unwrap_or_else(|e| e.into_inner()).remove(client_id);
+        self.client_queues
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(client_id);
         removed
     }
 
@@ -231,8 +263,8 @@ impl PubSub {
         self.total_published.fetch_add(1, Ordering::Relaxed);
 
         let event = Event {
-            id:        event_id,
-            topic:     topic.clone(),
+            id: event_id,
+            topic: topic.clone(),
             payload,
             timestamp: now_secs(),
         };
@@ -240,12 +272,17 @@ impl PubSub {
         // Find all subscribers for this topic
         let subs = self.subscriptions.read().unwrap_or_else(|e| e.into_inner());
         if let Some(topic_subs) = subs.get(&topic) {
-            let mut queues = self.client_queues.write().unwrap_or_else(|e| e.into_inner());
+            let mut queues = self
+                .client_queues
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
 
             for sub in topic_subs {
                 // Apply filter if set
                 if let Some(ref filter) = sub.filter {
-                    if !event.payload.contains(filter) { continue; }
+                    if !event.payload.contains(filter) {
+                        continue;
+                    }
                 }
 
                 if let Some(queue) = queues.get_mut(&sub.client_id) {
@@ -262,7 +299,8 @@ impl PubSub {
     pub fn publish_block(&self, hash: &str, height: u64, tx_count: usize) -> u64 {
         let payload = serde_json::json!({
             "hash": hash, "height": height, "tx_count": tx_count
-        }).to_string();
+        })
+        .to_string();
         self.publish(Topic::Blocks, payload)
     }
 
@@ -270,7 +308,8 @@ impl PubSub {
     pub fn publish_tx(&self, hash: &str, fee: u64) -> u64 {
         let payload = serde_json::json!({
             "hash": hash, "fee": fee
-        }).to_string();
+        })
+        .to_string();
         self.publish(Topic::Transactions, payload)
     }
 
@@ -278,13 +317,17 @@ impl PubSub {
     pub fn publish_reorg(&self, old_tip: &str, new_tip: &str, depth: u64) -> u64 {
         let payload = serde_json::json!({
             "old_tip": old_tip, "new_tip": new_tip, "depth": depth
-        }).to_string();
+        })
+        .to_string();
         self.publish(Topic::ChainReorg, payload)
     }
 
     /// Poll: get pending events for a client
     pub fn poll(&self, client_id: &str, limit: usize) -> Vec<Event> {
-        let mut queues = self.client_queues.write().unwrap_or_else(|e| e.into_inner());
+        let mut queues = self
+            .client_queues
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         match queues.get_mut(client_id) {
             Some(queue) => queue.drain(limit),
             None => vec![],
@@ -299,25 +342,42 @@ impl PubSub {
 
     /// Stats
     pub fn total_subscriptions(&self) -> usize {
-        self.subscriptions.read().unwrap_or_else(|e| e.into_inner()).values().map(|v| v.len()).sum()
+        self.subscriptions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|v| v.len())
+            .sum()
     }
     pub fn total_clients(&self) -> usize {
-        self.client_queues.read().unwrap_or_else(|e| e.into_inner()).len()
+        self.client_queues
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
-    pub fn total_published(&self) -> u64 { self.total_published.load(Ordering::Relaxed) }
-    pub fn total_delivered(&self) -> u64 { self.total_delivered.load(Ordering::Relaxed) }
+    pub fn total_published(&self) -> u64 {
+        self.total_published.load(Ordering::Relaxed)
+    }
+    pub fn total_delivered(&self) -> u64 {
+        self.total_delivered.load(Ordering::Relaxed)
+    }
 
     pub fn status(&self) -> String {
         format!(
             "PubSub: {} subs | {} clients | {} published | {} delivered",
-            self.total_subscriptions(), self.total_clients(),
-            self.total_published(), self.total_delivered()
+            self.total_subscriptions(),
+            self.total_clients(),
+            self.total_published(),
+            self.total_delivered()
         )
     }
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -359,7 +419,8 @@ mod tests {
     #[test]
     fn filter_works() {
         let ps = PubSub::new();
-        ps.subscribe("c", Topic::Blocks, Some("important".to_string())).unwrap();
+        ps.subscribe("c", Topic::Blocks, Some("important".to_string()))
+            .unwrap();
 
         ps.publish(Topic::Blocks, "regular block".to_string());
         ps.publish(Topic::Blocks, "important block event".to_string());
@@ -392,7 +453,8 @@ mod tests {
     fn per_client_limit() {
         let ps = PubSub::new();
         for i in 0..MAX_SUBS_PER_CLIENT {
-            ps.subscribe("c", Topic::Custom(format!("t{}", i)), None).unwrap();
+            ps.subscribe("c", Topic::Custom(format!("t{}", i)), None)
+                .unwrap();
         }
         assert!(ps.subscribe("c", Topic::Blocks, None).is_err());
     }

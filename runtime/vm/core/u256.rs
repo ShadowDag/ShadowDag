@@ -12,8 +12,8 @@
 // All arithmetic is wrapping (modular 2^256) — same as Ethereum EVM.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::fmt;
 use crate::slog_warn;
+use std::fmt;
 
 /// 256-bit unsigned integer
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -21,8 +21,8 @@ pub struct U256(pub [u64; 4]); // Little-endian limbs
 
 impl U256 {
     pub const ZERO: U256 = U256([0, 0, 0, 0]);
-    pub const ONE:  U256 = U256([1, 0, 0, 0]);
-    pub const MAX:  U256 = U256([u64::MAX, u64::MAX, u64::MAX, u64::MAX]);
+    pub const ONE: U256 = U256([1, 0, 0, 0]);
+    pub const MAX: U256 = U256([u64::MAX, u64::MAX, u64::MAX, u64::MAX]);
 
     /// Create from a u64 value
     pub const fn from_u64(v: u64) -> Self {
@@ -56,9 +56,15 @@ impl U256 {
 
     /// Number of leading zeros across all 256 bits
     pub fn leading_zeros(&self) -> u32 {
-        if self.0[3] != 0 { return self.0[3].leading_zeros(); }
-        if self.0[2] != 0 { return 64 + self.0[2].leading_zeros(); }
-        if self.0[1] != 0 { return 128 + self.0[1].leading_zeros(); }
+        if self.0[3] != 0 {
+            return self.0[3].leading_zeros();
+        }
+        if self.0[2] != 0 {
+            return 64 + self.0[2].leading_zeros();
+        }
+        if self.0[1] != 0 {
+            return 128 + self.0[1].leading_zeros();
+        }
         192 + self.0[0].leading_zeros()
     }
 
@@ -69,7 +75,9 @@ impl U256 {
 
     /// Get specific byte (0 = least significant)
     pub fn byte(&self, index: usize) -> u8 {
-        if index >= 32 { return 0; }
+        if index >= 32 {
+            return 0;
+        }
         let limb = index / 8;
         let shift = (index % 8) * 8;
         ((self.0[limb] >> shift) & 0xFF) as u8
@@ -82,7 +90,7 @@ impl U256 {
         let (r0, c0) = self.0[0].overflowing_add(rhs.0[0]);
         let (r1, c1) = self.0[1].carrying_add(rhs.0[1], c0);
         let (r2, c2) = self.0[2].carrying_add(rhs.0[2], c1);
-        let (r3, _)  = self.0[3].carrying_add(rhs.0[3], c2);
+        let (r3, _) = self.0[3].carrying_add(rhs.0[3], c2);
         U256([r0, r1, r2, r3])
     }
 
@@ -91,7 +99,7 @@ impl U256 {
         let (r0, b0) = self.0[0].overflowing_sub(rhs.0[0]);
         let (r1, b1) = self.0[1].borrowing_sub(rhs.0[1], b0);
         let (r2, b2) = self.0[2].borrowing_sub(rhs.0[2], b1);
-        let (r3, _)  = self.0[3].borrowing_sub(rhs.0[3], b2);
+        let (r3, _) = self.0[3].borrowing_sub(rhs.0[3], b2);
         U256([r0, r1, r2, r3])
     }
 
@@ -101,7 +109,9 @@ impl U256 {
         for i in 0..4 {
             let mut carry: u64 = 0;
             for j in 0..4 {
-                if i + j >= 4 { break; }
+                if i + j >= 4 {
+                    break;
+                }
                 let prod = (self.0[i] as u128) * (rhs.0[j] as u128)
                     + (result.0[i + j] as u128)
                     + (carry as u128);
@@ -114,9 +124,15 @@ impl U256 {
 
     /// Division (returns quotient). Division by zero returns 0.
     pub fn checked_div(self, rhs: U256) -> U256 {
-        if rhs.is_zero() { return U256::ZERO; }
-        if self < rhs { return U256::ZERO; }
-        if self == rhs { return U256::ONE; }
+        if rhs.is_zero() {
+            return U256::ZERO;
+        }
+        if self < rhs {
+            return U256::ZERO;
+        }
+        if self == rhs {
+            return U256::ONE;
+        }
 
         // Long division
         let mut quotient = U256::ZERO;
@@ -137,7 +153,9 @@ impl U256 {
 
     /// Modulo (returns remainder). Mod by zero returns 0.
     pub fn checked_mod(self, rhs: U256) -> U256 {
-        if rhs.is_zero() { return U256::ZERO; }
+        if rhs.is_zero() {
+            return U256::ZERO;
+        }
 
         let mut remainder = U256::ZERO;
         for i in (0..256).rev() {
@@ -154,7 +172,9 @@ impl U256 {
 
     /// Exponentiation (modular, bounded to prevent DoS)
     pub fn wrapping_pow(self, exp: U256) -> U256 {
-        if exp.is_zero() { return U256::ONE; }
+        if exp.is_zero() {
+            return U256::ONE;
+        }
         let mut result = U256::ONE;
         let mut base = self;
         let mut e = exp;
@@ -174,20 +194,32 @@ impl U256 {
 
     #[allow(clippy::should_implement_trait)]
     pub fn bitand(self, rhs: U256) -> U256 {
-        U256([self.0[0] & rhs.0[0], self.0[1] & rhs.0[1],
-              self.0[2] & rhs.0[2], self.0[3] & rhs.0[3]])
+        U256([
+            self.0[0] & rhs.0[0],
+            self.0[1] & rhs.0[1],
+            self.0[2] & rhs.0[2],
+            self.0[3] & rhs.0[3],
+        ])
     }
 
     #[allow(clippy::should_implement_trait)]
     pub fn bitor(self, rhs: U256) -> U256 {
-        U256([self.0[0] | rhs.0[0], self.0[1] | rhs.0[1],
-              self.0[2] | rhs.0[2], self.0[3] | rhs.0[3]])
+        U256([
+            self.0[0] | rhs.0[0],
+            self.0[1] | rhs.0[1],
+            self.0[2] | rhs.0[2],
+            self.0[3] | rhs.0[3],
+        ])
     }
 
     #[allow(clippy::should_implement_trait)]
     pub fn bitxor(self, rhs: U256) -> U256 {
-        U256([self.0[0] ^ rhs.0[0], self.0[1] ^ rhs.0[1],
-              self.0[2] ^ rhs.0[2], self.0[3] ^ rhs.0[3]])
+        U256([
+            self.0[0] ^ rhs.0[0],
+            self.0[1] ^ rhs.0[1],
+            self.0[2] ^ rhs.0[2],
+            self.0[3] ^ rhs.0[3],
+        ])
     }
 
     pub fn bitnot(self) -> U256 {
@@ -197,8 +229,12 @@ impl U256 {
     /// Shift left by `n` bits
     #[allow(clippy::needless_range_loop, clippy::should_implement_trait)]
     pub fn shl(self, n: u32) -> U256 {
-        if n >= 256 { return U256::ZERO; }
-        if n == 0 { return self; }
+        if n >= 256 {
+            return U256::ZERO;
+        }
+        if n == 0 {
+            return self;
+        }
 
         let limb_shift = (n / 64) as usize;
         let bit_shift = n % 64;
@@ -216,8 +252,12 @@ impl U256 {
     /// Shift right by `n` bits
     #[allow(clippy::needless_range_loop, clippy::should_implement_trait)]
     pub fn shr(self, n: u32) -> U256 {
-        if n >= 256 { return U256::ZERO; }
-        if n == 0 { return self; }
+        if n >= 256 {
+            return U256::ZERO;
+        }
+        if n == 0 {
+            return self;
+        }
 
         let limb_shift = (n / 64) as usize;
         let bit_shift = n % 64;
@@ -248,7 +288,9 @@ impl U256 {
     // ── Helpers ──────────────────────────────────────────────────
 
     fn bit(&self, index: usize) -> bool {
-        if index >= 256 { return false; }
+        if index >= 256 {
+            return false;
+        }
         let limb = index / 64;
         let bit = index % 64;
         (self.0[limb] >> bit) & 1 == 1
@@ -288,8 +330,14 @@ impl U256 {
         for i in 0..4 {
             let offset = (3 - i) * 8;
             limbs[i] = u64::from_be_bytes([
-                bytes[offset], bytes[offset+1], bytes[offset+2], bytes[offset+3],
-                bytes[offset+4], bytes[offset+5], bytes[offset+6], bytes[offset+7],
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+                bytes[offset + 4],
+                bytes[offset + 5],
+                bytes[offset + 6],
+                bytes[offset + 7],
             ]);
         }
         U256(limbs)
@@ -300,7 +348,7 @@ impl U256 {
         let mut bytes = [0u8; 32];
         for i in 0..4 {
             let offset = (3 - i) * 8;
-            bytes[offset..offset+8].copy_from_slice(&self.0[i].to_be_bytes());
+            bytes[offset..offset + 8].copy_from_slice(&self.0[i].to_be_bytes());
         }
         bytes
     }
@@ -314,7 +362,9 @@ impl U256 {
         }
         let padded = format!("{:0>64}", s);
         let bytes = hex::decode(&padded).ok()?;
-        if bytes.len() != 32 { return None; }
+        if bytes.len() != 32 {
+            return None;
+        }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
         Some(Self::from_be_bytes(&arr))
@@ -367,19 +417,31 @@ impl fmt::Display for U256 {
 // ── From traits ─────────────────────────────────────────────────
 
 impl From<u64> for U256 {
-    fn from(v: u64) -> Self { U256::from_u64(v) }
+    fn from(v: u64) -> Self {
+        U256::from_u64(v)
+    }
 }
 
 impl From<u128> for U256 {
-    fn from(v: u128) -> Self { U256::from_u128(v) }
+    fn from(v: u128) -> Self {
+        U256::from_u128(v)
+    }
 }
 
 impl From<bool> for U256 {
-    fn from(v: bool) -> Self { if v { U256::ONE } else { U256::ZERO } }
+    fn from(v: bool) -> Self {
+        if v {
+            U256::ONE
+        } else {
+            U256::ZERO
+        }
+    }
 }
 
 impl From<usize> for U256 {
-    fn from(v: usize) -> Self { U256::from_u64(v as u64) }
+    fn from(v: usize) -> Self {
+        U256::from_u64(v as u64)
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -453,19 +515,28 @@ mod tests {
         let b = U256::from_u64(2);
         let r = a.wrapping_mul(b);
         assert_eq!(r.0[0], u64::MAX - 1); // lower 64 bits
-        assert_eq!(r.0[1], 1);             // carry
+        assert_eq!(r.0[1], 1); // carry
     }
 
     #[test]
     fn division() {
-        assert_eq!(U256::from_u64(100).checked_div(U256::from_u64(3)).as_u64(), 33);
-        assert_eq!(U256::from_u64(100).checked_div(U256::from_u64(100)), U256::ONE);
+        assert_eq!(
+            U256::from_u64(100).checked_div(U256::from_u64(3)).as_u64(),
+            33
+        );
+        assert_eq!(
+            U256::from_u64(100).checked_div(U256::from_u64(100)),
+            U256::ONE
+        );
         assert_eq!(U256::from_u64(10).checked_div(U256::ZERO), U256::ZERO);
     }
 
     #[test]
     fn modulo() {
-        assert_eq!(U256::from_u64(100).checked_mod(U256::from_u64(3)).as_u64(), 1);
+        assert_eq!(
+            U256::from_u64(100).checked_mod(U256::from_u64(3)).as_u64(),
+            1
+        );
         assert_eq!(U256::from_u64(10).checked_mod(U256::ZERO), U256::ZERO);
     }
 

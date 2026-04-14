@@ -196,9 +196,7 @@ mod tests {
 
     #[test]
     fn failure_consumes_all_gas() {
-        let r = ExecutionResult::failure(
-            1_000_000, ExecutionStatus::OutOfGas, "out of gas".into()
-        );
+        let r = ExecutionResult::failure(1_000_000, ExecutionStatus::OutOfGas, "out of gas".into());
         assert_eq!(r.gas_used, 1_000_000);
     }
 

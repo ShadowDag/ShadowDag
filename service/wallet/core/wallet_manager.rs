@@ -3,9 +3,9 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::service::wallet::storage::wallet_db::WalletDB;
-use crate::service::wallet::core::wallet::Wallet;
 use crate::errors::WalletError;
+use crate::service::wallet::core::wallet::Wallet;
+use crate::service::wallet::storage::wallet_db::WalletDB;
 
 pub struct WalletManager {
     db: WalletDB,

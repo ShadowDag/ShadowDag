@@ -4,11 +4,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use rocksdb::{
-    DB, Options,
-    WriteOptions, ReadOptions,
-    WriteBatch,
-    BlockBasedOptions, SliceTransform, Cache,
-    IteratorMode, Direction,
+    BlockBasedOptions, Cache, Direction, IteratorMode, Options, ReadOptions, SliceTransform,
+    WriteBatch, WriteOptions, DB,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -29,7 +26,6 @@ pub struct ForkChoiceStore {
 }
 
 impl ForkChoiceStore {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
@@ -53,12 +49,12 @@ impl ForkChoiceStore {
         opts.set_block_based_table_factory(&block_opts);
 
         // 🔥 Prefix extractor
-        opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(
-            CHOICE_PREFIX.len(),
-        ));
+        opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(CHOICE_PREFIX.len()));
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         // Fork choice is consensus-critical — must survive crashes.
         let mut write_opts = WriteOptions::default();
@@ -198,7 +194,11 @@ impl ForkChoiceStore {
         iter_opts.set_total_order_seek(false);
         let mut upper = CHOICE_PREFIX.to_vec();
         if let Some(last) = upper.last_mut() {
-            if *last != u8::MAX { *last += 1; } else { upper.push(0x00); }
+            if *last != u8::MAX {
+                *last += 1;
+            } else {
+                upper.push(0x00);
+            }
         }
         iter_opts.set_iterate_upper_bound(upper);
 
@@ -254,7 +254,11 @@ impl ForkChoiceStore {
         iter_opts.set_total_order_seek(false);
         let mut upper = CHOICE_PREFIX.to_vec();
         if let Some(last) = upper.last_mut() {
-            if *last != u8::MAX { *last += 1; } else { upper.push(0x00); }
+            if *last != u8::MAX {
+                *last += 1;
+            } else {
+                upper.push(0x00);
+            }
         }
         iter_opts.set_iterate_upper_bound(upper);
 
@@ -380,7 +384,9 @@ mod tests {
     #[test]
     fn batch_store_split() {
         let store = ForkChoiceStore::new(&tmp_path()).unwrap();
-        store.store_batch_split(&[("b1", 10), ("b2", 20), ("b3", 30)]).unwrap();
+        store
+            .store_batch_split(&[("b1", 10), ("b2", 20), ("b3", 30)])
+            .unwrap();
         assert_eq!(store.get_choice("b1"), Some(10));
         assert_eq!(store.get_choice("b2"), Some(20));
         assert_eq!(store.get_choice("b3"), Some(30));

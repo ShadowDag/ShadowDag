@@ -424,4 +424,3 @@ pub enum PrivacyError {
     #[error("[Privacy] {0}")]
     Other(String),
 }
-

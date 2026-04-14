@@ -1,0 +1,28 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.43s
+     Running `target\debug\shadowdag-miner.exe --address=SR0263d93f811385561bee088a4d7e691dd6703e135e7293634406677806369317463d87ba35 --network=regtest --rpc=127.0.0.1:29432 --threads=1`
+[1776193810.630] INFO  [miner] config network=regtest address=SR0263d9...87ba35 dev_address=SR1a0b1c...6f7a8b threads=1 rpc=127.0.0.1:29432 genesis=ec4447ead9c53767 reward=Height: 0 | Step: 0 | Reward: 1000000000 sat (100.00%) | Miner: 950000000 | Dev: 50000000 | Next reduction in: 25920000 blocks
+[1776193810.633] INFO  [miner] mining_loop_started
+[1776193810.638] INFO  [miner] connected_to_node height=0 difficulty=1
+[1776193810.727] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193810.817] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193810.915] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193811.006] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193811.097] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193811.188] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193811.278] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193811.367] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193811.458] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193811.549] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193811.639] ERROR [miner] block_rejected reason=Rate limit exceeded: max 100 requests/min
+[1776193816.732] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193816.821] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193816.912] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193817.003] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193817.093] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193822.186] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193822.275] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193822.366] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193822.456] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193827.555] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193827.646] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>
+[1776193827.737] ERROR [miner] block_rejected reason=Authentication required. Use Authorization: Bearer <token>

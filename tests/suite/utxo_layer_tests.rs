@@ -32,7 +32,10 @@ mod utxo_set_tests {
         let mut m = new_mock();
         m.add_test_utxo("tx3:0", 200, "shadow1carol");
         m.spend_utxo_str("tx3:0").unwrap();
-        assert!(!m.exists_str("tx3:0"), "Spent utxo must not exist as unspent");
+        assert!(
+            !m.exists_str("tx3:0"),
+            "Spent utxo must not exist as unspent"
+        );
     }
 
     #[test]
@@ -55,23 +58,29 @@ mod utxo_set_tests {
 
 #[cfg(test)]
 mod utxo_validator_tests {
-    use crate::domain::utxo::utxo_set::UtxoSet;
     use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
+    use crate::domain::utxo::utxo_set::UtxoSet;
 
     fn mock_tx_with_input(txid: &str, idx: u32, owner: &str) -> Transaction {
         Transaction {
-            hash:      format!("tx_{}", txid),
-            inputs:    vec![TxInput {
-                txid:      txid.to_string(),
-                index:     idx,
-                owner:     owner.to_string(),
+            hash: format!("tx_{}", txid),
+            inputs: vec![TxInput {
+                txid: txid.to_string(),
+                index: idx,
+                owner: owner.to_string(),
                 signature: String::new(),
-                pub_key:   String::new(),
+                pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
             }],
-            outputs:   vec![TxOutput { address: "dest".to_string(), amount: 100, commitment: None, range_proof: None, ephemeral_pubkey: None }],
-            fee:       1,
+            outputs: vec![TxOutput {
+                address: "dest".to_string(),
+                amount: 100,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
+            fee: 1,
             timestamp: 1735689600,
             is_coinbase: false,
             tx_type: TxType::Transfer,
@@ -83,9 +92,18 @@ mod utxo_validator_tests {
     #[test]
     fn coinbase_always_valid() {
         let cb = Transaction {
-            hash: "cb".to_string(), inputs: vec![],
-            outputs: vec![TxOutput { address: "miner".to_string(), amount: 10, commitment: None, range_proof: None, ephemeral_pubkey: None }],
-            fee: 0, timestamp: 0, is_coinbase: true,
+            hash: "cb".to_string(),
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                address: "miner".to_string(),
+                amount: 10,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
+            fee: 0,
+            timestamp: 0,
+            is_coinbase: true,
             tx_type: TxType::Transfer,
             payload_hash: None,
             ..Default::default()
@@ -97,7 +115,7 @@ mod utxo_validator_tests {
 
     #[test]
     fn missing_utxo_fails() {
-        let _tx  = mock_tx_with_input("notexist", 0, "shadow1x");
+        let _tx = mock_tx_with_input("notexist", 0, "shadow1x");
         let mock = UtxoSet::new_empty();
 
         assert!(!mock.exists_str("notexist:0"));
@@ -111,18 +129,32 @@ mod utxo_validator_tests {
         let tx = Transaction {
             hash: "txdup".to_string(),
             inputs: vec![
-                TxInput { txid: "dup".to_string(), index: 0, owner: "shadow1x".to_string(),
-                          signature: String::new(), pub_key: String::new(),
- key_image: None,
- ring_members: None,
+                TxInput {
+                    txid: "dup".to_string(),
+                    index: 0,
+                    owner: "shadow1x".to_string(),
+                    signature: String::new(),
+                    pub_key: String::new(),
+                    key_image: None,
+                    ring_members: None,
                 },
-                TxInput { txid: "dup".to_string(), index: 0, owner: "shadow1x".to_string(),
-                          signature: String::new(), pub_key: String::new(),
- key_image: None,
- ring_members: None,
+                TxInput {
+                    txid: "dup".to_string(),
+                    index: 0,
+                    owner: "shadow1x".to_string(),
+                    signature: String::new(),
+                    pub_key: String::new(),
+                    key_image: None,
+                    ring_members: None,
                 },
             ],
-            outputs: vec![TxOutput { address: "dest".to_string(), amount: 90, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            outputs: vec![TxOutput {
+                address: "dest".to_string(),
+                amount: 90,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee: 10,
             timestamp: 0,
             is_coinbase: false,
@@ -136,7 +168,10 @@ mod utxo_validator_tests {
         let mut has_dup = false;
         for i in &tx.inputs {
             let k = format!("{}:{}", i.txid, i.index);
-            if !seen.insert(k) { has_dup = true; break; }
+            if !seen.insert(k) {
+                has_dup = true;
+                break;
+            }
         }
         assert!(has_dup, "Duplicate input should be detected");
     }
@@ -144,19 +179,28 @@ mod utxo_validator_tests {
 
 #[cfg(test)]
 mod utxo_spend_tests {
-    use crate::domain::utxo::utxo_set::UtxoSet;
     use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
+    use crate::domain::utxo::utxo_set::UtxoSet;
 
     fn simple_tx(txid_in: &str, hash: &str, amount_out: u64) -> Transaction {
         Transaction {
             hash: hash.to_string(),
             inputs: vec![TxInput {
-                txid: txid_in.to_string(), index: 0, owner: "shadow1alice".to_string(),
-                signature: String::new(), pub_key: String::new(),
+                txid: txid_in.to_string(),
+                index: 0,
+                owner: "shadow1alice".to_string(),
+                signature: String::new(),
+                pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
             }],
-            outputs: vec![TxOutput { address: "shadow1bob".to_string(), amount: amount_out, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            outputs: vec![TxOutput {
+                address: "shadow1bob".to_string(),
+                amount: amount_out,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee: 0,
             timestamp: 1735689600,
             is_coinbase: false,
@@ -180,7 +224,10 @@ mod utxo_spend_tests {
         for tx in &[tx1, tx2] {
             for input in &tx.inputs {
                 let key = format!("{}:{}", input.txid, input.index);
-                if spent.contains(&key) { conflict = true; break; }
+                if spent.contains(&key) {
+                    conflict = true;
+                    break;
+                }
                 spent.insert(key);
             }
         }

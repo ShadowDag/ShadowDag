@@ -16,7 +16,9 @@ macro_rules! pop1 {
     ($stack:expr, $gas:expr, $snapshot:expr, $self:expr) => {
         if $stack.is_empty() {
             $self.state.rollback($snapshot).ok();
-            return CallOutcome::Failure { gas_used: $gas.gas_used() };
+            return CallOutcome::Failure {
+                gas_used: $gas.gas_used(),
+            };
         } else {
             $stack.pop().unwrap()
         }
@@ -27,7 +29,9 @@ macro_rules! pop2 {
     ($stack:expr, $gas:expr, $snapshot:expr, $self:expr) => {
         if $stack.len() < 2 {
             $self.state.rollback($snapshot).ok();
-            return CallOutcome::Failure { gas_used: $gas.gas_used() };
+            return CallOutcome::Failure {
+                gas_used: $gas.gas_used(),
+            };
         } else {
             ($stack.pop().unwrap(), $stack.pop().unwrap())
         }
@@ -36,23 +40,22 @@ macro_rules! pop2 {
 
 // ── Imports ──────────────────────────────────────────────────────────────
 
+use sha2::{Digest, Sha256};
+use sha3::Keccak256;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use sha2::{Sha256, Digest};
-use sha3::Keccak256;
 
 use crate::errors::VmError;
-use crate::runtime::vm::core::u256::U256;
+use crate::runtime::vm::contracts::contract_deployer::ContractDeployer;
+use crate::runtime::vm::contracts::contract_storage::{ContractStorage, PendingBatch};
 use crate::runtime::vm::core::state_manager::StateManager;
+use crate::runtime::vm::core::u256::U256;
 use crate::runtime::vm::core::vm::{
-    OpCode, LogEntry, MAX_STACK_SIZE, MAX_MEMORY_SIZE,
-    MAX_CODE_SIZE, MEMORY_GAS_PER_WORD,
+    LogEntry, OpCode, MAX_CODE_SIZE, MAX_MEMORY_SIZE, MAX_STACK_SIZE, MEMORY_GAS_PER_WORD,
 };
 use crate::runtime::vm::core::vm_address::VmAddressBody;
 use crate::runtime::vm::gas::gas_meter::{GasMeter, GasResult};
-use crate::runtime::vm::contracts::contract_deployer::ContractDeployer;
 use crate::runtime::vm::precompiles::precompile_registry::PrecompileRegistry;
-use crate::runtime::vm::contracts::contract_storage::{ContractStorage, PendingBatch};
 use crate::slog_error;
 
 /// Maximum call depth for nested calls
@@ -83,21 +86,25 @@ pub struct BlockContext {
 impl BlockContext {
     /// Construct a BlockContext with a default network of `"mainnet"`.
     pub fn new(timestamp: u64, block_hash: String) -> Self {
-        Self { timestamp, block_hash, network: "mainnet".to_string() }
+        Self {
+            timestamp,
+            block_hash,
+            network: "mainnet".to_string(),
+        }
     }
 }
 
 /// Per-call execution context
 #[derive(Debug, Clone)]
 pub struct CallContext {
-    pub address: String,        // Contract whose storage is accessed
-    pub code_address: String,   // Contract whose code is executed
-    pub caller: String,         // msg.sender
-    pub value: u64,             // msg.value
-    pub gas_limit: u64,         // Gas for this call
-    pub calldata: Vec<u8>,      // Input data
-    pub is_static: bool,        // STATICCALL flag (propagated to nested calls)
-    pub depth: usize,           // Current call depth
+    pub address: String,      // Contract whose storage is accessed
+    pub code_address: String, // Contract whose code is executed
+    pub caller: String,       // msg.sender
+    pub value: u64,           // msg.value
+    pub gas_limit: u64,       // Gas for this call
+    pub calldata: Vec<u8>,    // Input data
+    pub is_static: bool,      // STATICCALL flag (propagated to nested calls)
+    pub depth: usize,         // Current call depth
     /// Marks the frame as a DELEGATECALL or CALLCODE child. When
     /// `true`, `execute_frame` MUST NOT perform the
     /// `caller -> address` value transfer at frame entry — the
@@ -383,7 +390,10 @@ impl ExecutionEnvironment {
             }
 
             // Persist account metadata (balance|nonce|code_hash)
-            let meta = format!("{}|{}|{}", account.balance, account.nonce, account.code_hash);
+            let meta = format!(
+                "{}|{}|{}",
+                account.balance, account.nonce, account.code_hash
+            );
             batch.put(format!("account:{}", addr), meta);
 
             // Persist code if contract
@@ -524,7 +534,10 @@ impl ExecutionEnvironment {
             }
 
             // Buffer new account state
-            let meta = format!("{}|{}|{}", account.balance, account.nonce, account.code_hash);
+            let meta = format!(
+                "{}|{}|{}",
+                account.balance, account.nonce, account.code_hash
+            );
             modified_keys.push((account_key.clone(), old_val));
             let db_key = format!("contract:{}", account_key);
             wb.put(db_key.as_bytes(), meta.as_bytes());
@@ -632,8 +645,7 @@ impl ExecutionEnvironment {
                 if let Ok(full_key_str) = std::str::from_utf8(&raw_key) {
                     let slot_key_suffix = full_key_str[db_prefix.len()..].to_string();
                     match std::str::from_utf8(&raw_value) {
-                        Ok(v) => destroyed_slots
-                            .push((slot_key_suffix, v.to_string())),
+                        Ok(v) => destroyed_slots.push((slot_key_suffix, v.to_string())),
                         Err(e) => {
                             crate::slog_error!("vm",
                                 "persist_with_undo_destroyed_slot_value_not_utf8",
@@ -770,10 +782,7 @@ impl ExecutionEnvironment {
             .map_err(|e| {
                 slog_error!("vm", "load_contract_account_read_failed",
                     contract => addr, error => &format!("{}", e));
-                VmError::ContractError(format!(
-                    "failed to read account row for '{}': {}",
-                    addr, e
-                ))
+                VmError::ContractError(format!("failed to read account row for '{}': {}", addr, e))
             })?;
 
         // Track the metadata `code_hash` so we can cross-check it
@@ -789,7 +798,8 @@ impl ExecutionEnvironment {
                     contract => addr, field_count => parts.len(), raw => &meta);
                 return Err(VmError::ContractError(format!(
                     "corrupt account metadata for '{}': expected 3 pipe-separated fields, got {}",
-                    addr, parts.len()
+                    addr,
+                    parts.len()
                 )));
             }
 
@@ -855,20 +865,14 @@ impl ExecutionEnvironment {
             .map_err(|e| {
                 slog_error!("vm", "load_contract_code_read_failed",
                     contract => addr, error => &format!("{}", e));
-                VmError::ContractError(format!(
-                    "failed to read code row for '{}': {}",
-                    addr, e
-                ))
+                VmError::ContractError(format!("failed to read code row for '{}': {}", addr, e))
             })?;
 
         if let Some(code_hex) = code_hex_opt {
             let code = hex::decode(&code_hex).map_err(|e| {
                 slog_error!("vm", "load_contract_code_hex_corrupt",
                     contract => addr, error => &format!("{}", e));
-                VmError::ContractError(format!(
-                    "corrupt contract code hex for '{}': {}",
-                    addr, e
-                ))
+                VmError::ContractError(format!("corrupt contract code hex for '{}': {}", addr, e))
             })?;
 
             // Verify code_hash from account metadata matches the
@@ -959,11 +963,7 @@ impl ExecutionEnvironment {
     /// This centralizes every memory-expansion site so each opcode
     /// handler calls exactly ONE helper instead of the scattered
     /// `while memory.len() < …` loops that bypass gas accounting.
-    fn charge_and_expand_memory(
-        gas: &mut GasMeter,
-        memory: &mut Vec<u8>,
-        needed: usize,
-    ) -> bool {
+    fn charge_and_expand_memory(gas: &mut GasMeter, memory: &mut Vec<u8>, needed: usize) -> bool {
         if needed == 0 || needed <= memory.len() {
             return true;
         }
@@ -992,7 +992,7 @@ impl ExecutionEnvironment {
     ///   - memory expansion gas charge fails.
     ///
     /// This replaces the inline
-    /// ```ignore
+    /// ```text
     /// if args_len > 0 && args_offset + args_len <= memory.len() {
     ///     memory[args_offset..args_offset+args_len].to_vec()
     /// } else {
@@ -1061,7 +1061,9 @@ impl ExecutionEnvironment {
         // `call_depth_limit_rejects_at_exactly_max` for the pinned
         // boundary.
         if ctx.depth >= MAX_CALL_DEPTH {
-            return CallOutcome::Failure { gas_used: ctx.gas_limit };
+            return CallOutcome::Failure {
+                gas_used: ctx.gas_limit,
+            };
         }
 
         // Register the frame's caller, storage address, and code address
@@ -1135,8 +1137,13 @@ impl ExecutionEnvironment {
             //     `value > 0` fell through to the transfer call
             //     anyway — the fix in this file's main transfer
             //     check didn't cover it.
-            if ctx.value > 0 && !ctx.is_static && !ctx.is_delegate
-                && self.state.transfer(&ctx.caller, &ctx.address, ctx.value).is_err()
+            if ctx.value > 0
+                && !ctx.is_static
+                && !ctx.is_delegate
+                && self
+                    .state
+                    .transfer(&ctx.caller, &ctx.address, ctx.value)
+                    .is_err()
             {
                 return CallOutcome::Failure { gas_used: 0 };
             }
@@ -1148,7 +1155,9 @@ impl ExecutionEnvironment {
         }
 
         if code.len() > MAX_CODE_SIZE {
-            return CallOutcome::Failure { gas_used: ctx.gas_limit };
+            return CallOutcome::Failure {
+                gas_used: ctx.gas_limit,
+            };
         }
 
         // Take state snapshot for rollback on failure
@@ -1167,8 +1176,13 @@ impl ExecutionEnvironment {
         // parent's debit and (depending on whose storage the
         // delegatecall ran in) either silently minting value via
         // the from==to bug or producing a wrong cross-account move.
-        if ctx.value > 0 && !ctx.is_static && !ctx.is_delegate
-            && self.state.transfer(&ctx.caller, &ctx.address, ctx.value).is_err()
+        if ctx.value > 0
+            && !ctx.is_static
+            && !ctx.is_delegate
+            && self
+                .state
+                .transfer(&ctx.caller, &ctx.address, ctx.value)
+                .is_err()
         {
             self.state.rollback(snapshot).ok();
             return CallOutcome::Failure { gas_used: 0 };
@@ -1187,7 +1201,9 @@ impl ExecutionEnvironment {
         let init_mem_cost = (init_mem_size as u64 / 32) * MEMORY_GAS_PER_WORD;
         if let GasResult::OutOfGas { .. } = gas.consume(init_mem_cost) {
             self.state.rollback(snapshot).ok();
-            return CallOutcome::Failure { gas_used: gas.gas_used() };
+            return CallOutcome::Failure {
+                gas_used: gas.gas_used(),
+            };
         }
 
         // Copy calldata into memory
@@ -1205,7 +1221,9 @@ impl ExecutionEnvironment {
 
             if let GasResult::OutOfGas { .. } = gas.consume(cost) {
                 self.state.rollback(snapshot).ok();
-                return CallOutcome::Failure { gas_used: gas.gas_used() };
+                return CallOutcome::Failure {
+                    gas_used: gas.gas_used(),
+                };
             }
 
             match op {
@@ -1219,110 +1237,260 @@ impl ExecutionEnvironment {
                     };
                 }
 
-                OpCode::NOP => { pc += 1; continue; }
+                OpCode::NOP => {
+                    pc += 1;
+                    continue;
+                }
 
                 // ── PUSH ─────────────────────────────────────
                 OpCode::PUSH1 => {
-                    if pc + 1 >= code.len() { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
-                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if pc + 1 >= code.len() {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     stack.push(U256::from_u64(code[pc + 1] as u64));
-                    pc += 2; continue;
+                    pc += 2;
+                    continue;
                 }
                 OpCode::PUSH2 => {
-                    if pc + 2 >= code.len() { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
-                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
-                    let v = u16::from_be_bytes([code[pc+1], code[pc+2]]);
+                    if pc + 2 >= code.len() {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
+                    let v = u16::from_be_bytes([code[pc + 1], code[pc + 2]]);
                     stack.push(U256::from_u64(v as u64));
-                    pc += 3; continue;
+                    pc += 3;
+                    continue;
                 }
                 OpCode::PUSH4 => {
-                    if pc + 4 >= code.len() { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
-                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
-                    let v = u32::from_be_bytes([code[pc+1], code[pc+2], code[pc+3], code[pc+4]]);
+                    if pc + 4 >= code.len() {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
+                    let v = u32::from_be_bytes([
+                        code[pc + 1],
+                        code[pc + 2],
+                        code[pc + 3],
+                        code[pc + 4],
+                    ]);
                     stack.push(U256::from_u64(v as u64));
-                    pc += 5; continue;
+                    pc += 5;
+                    continue;
                 }
                 OpCode::PUSH8 => {
-                    if pc + 8 >= code.len() { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
-                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if pc + 8 >= code.len() {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let mut buf = [0u8; 8];
-                    buf.copy_from_slice(&code[pc+1..pc+9]);
+                    buf.copy_from_slice(&code[pc + 1..pc + 9]);
                     stack.push(U256::from_u64(u64::from_be_bytes(buf)));
-                    pc += 9; continue;
+                    pc += 9;
+                    continue;
                 }
                 OpCode::PUSH16 | OpCode::PUSH32 => {
                     let size = if op == OpCode::PUSH16 { 16 } else { 32 };
-                    if pc + size >= code.len() { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
-                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
-                    let hex_str = hex::encode(&code[pc+1..pc+1+size]);
+                    if pc + size >= code.len() {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
+                    let hex_str = hex::encode(&code[pc + 1..pc + 1 + size]);
                     stack.push(U256::from_hex(&hex_str).unwrap_or(U256::ZERO));
-                    pc += 1 + size; continue;
+                    pc += 1 + size;
+                    continue;
                 }
 
                 // ── Stack ops ────────────────────────────────
                 OpCode::POP => {
-                    if stack.is_empty() { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.is_empty() {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     stack.pop();
                 }
                 OpCode::DUP => {
-                    if stack.is_empty() { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
-                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.is_empty() {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let top = *stack.last().unwrap();
                     stack.push(top);
                 }
                 OpCode::SWAP => {
-                    if stack.len() < 2 { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() < 2 {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let len = stack.len();
                     stack.swap(len - 1, len - 2);
                 }
 
                 // ── Arithmetic ───────────────────────────────
-                OpCode::ADD => { let (a, b) = pop2!(stack, gas, snapshot, self); stack.push(a.wrapping_add(b)); }
-                OpCode::SUB => { let (a, b) = pop2!(stack, gas, snapshot, self); stack.push(a.wrapping_sub(b)); }
-                OpCode::MUL => { let (a, b) = pop2!(stack, gas, snapshot, self); stack.push(a.wrapping_mul(b)); }
+                OpCode::ADD => {
+                    let (a, b) = pop2!(stack, gas, snapshot, self);
+                    stack.push(a.wrapping_add(b));
+                }
+                OpCode::SUB => {
+                    let (a, b) = pop2!(stack, gas, snapshot, self);
+                    stack.push(a.wrapping_sub(b));
+                }
+                OpCode::MUL => {
+                    let (a, b) = pop2!(stack, gas, snapshot, self);
+                    stack.push(a.wrapping_mul(b));
+                }
                 OpCode::DIV => {
                     let (a, b) = pop2!(stack, gas, snapshot, self);
-                    stack.push(if b.is_zero() { U256::ZERO } else { a.checked_div(b) });
+                    stack.push(if b.is_zero() {
+                        U256::ZERO
+                    } else {
+                        a.checked_div(b)
+                    });
                 }
                 OpCode::MOD => {
                     let (a, b) = pop2!(stack, gas, snapshot, self);
-                    stack.push(if b.is_zero() { U256::ZERO } else { a.checked_mod(b) });
+                    stack.push(if b.is_zero() {
+                        U256::ZERO
+                    } else {
+                        a.checked_mod(b)
+                    });
                 }
                 OpCode::EXP => {
                     let (base, exp) = pop2!(stack, gas, snapshot, self);
                     let exp_val = exp.as_u64().min(255);
                     let mut result = U256::ONE;
-                    for _ in 0..exp_val { result = result.wrapping_mul(base); }
+                    for _ in 0..exp_val {
+                        result = result.wrapping_mul(base);
+                    }
                     stack.push(result);
                 }
                 OpCode::ADDMOD => {
-                    if stack.len() < 3 { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() < 3 {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let a = stack.pop().unwrap();
                     let b = stack.pop().unwrap();
                     let n = stack.pop().unwrap();
-                    stack.push(if n.is_zero() { U256::ZERO } else { a.wrapping_add(b).checked_mod(n) });
+                    stack.push(if n.is_zero() {
+                        U256::ZERO
+                    } else {
+                        a.wrapping_add(b).checked_mod(n)
+                    });
                 }
                 OpCode::MULMOD => {
-                    if stack.len() < 3 { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() < 3 {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let a = stack.pop().unwrap();
                     let b = stack.pop().unwrap();
                     let n = stack.pop().unwrap();
-                    stack.push(if n.is_zero() { U256::ZERO } else { a.wrapping_mul(b).checked_mod(n) });
+                    stack.push(if n.is_zero() {
+                        U256::ZERO
+                    } else {
+                        a.wrapping_mul(b).checked_mod(n)
+                    });
                 }
 
                 // ── Comparison ───────────────────────────────
-                OpCode::EQ => { let (a, b) = pop2!(stack, gas, snapshot, self); stack.push(if a == b { U256::ONE } else { U256::ZERO }); }
-                OpCode::LT => { let (a, b) = pop2!(stack, gas, snapshot, self); stack.push(if a < b { U256::ONE } else { U256::ZERO }); }
-                OpCode::GT => { let (a, b) = pop2!(stack, gas, snapshot, self); stack.push(if a > b { U256::ONE } else { U256::ZERO }); }
-                OpCode::ISZERO => { let a = pop1!(stack, gas, snapshot, self); stack.push(if a.is_zero() { U256::ONE } else { U256::ZERO }); }
+                OpCode::EQ => {
+                    let (a, b) = pop2!(stack, gas, snapshot, self);
+                    stack.push(if a == b { U256::ONE } else { U256::ZERO });
+                }
+                OpCode::LT => {
+                    let (a, b) = pop2!(stack, gas, snapshot, self);
+                    stack.push(if a < b { U256::ONE } else { U256::ZERO });
+                }
+                OpCode::GT => {
+                    let (a, b) = pop2!(stack, gas, snapshot, self);
+                    stack.push(if a > b { U256::ONE } else { U256::ZERO });
+                }
+                OpCode::ISZERO => {
+                    let a = pop1!(stack, gas, snapshot, self);
+                    stack.push(if a.is_zero() { U256::ONE } else { U256::ZERO });
+                }
 
                 // ── Bitwise ──────────────────────────────────
-                OpCode::AND => { let (a, b) = pop2!(stack, gas, snapshot, self); stack.push(a.bitand(b)); }
-                OpCode::OR  => { let (a, b) = pop2!(stack, gas, snapshot, self); stack.push(a.bitor(b)); }
-                OpCode::XOR => { let (a, b) = pop2!(stack, gas, snapshot, self); stack.push(a.bitxor(b)); }
-                OpCode::NOT => { let a = pop1!(stack, gas, snapshot, self); stack.push(a.bitnot()); }
-                OpCode::SHL => { let (a, b) = pop2!(stack, gas, snapshot, self); stack.push(b.shl(a.as_u64() as u32)); }
-                OpCode::SHR => { let (a, b) = pop2!(stack, gas, snapshot, self); stack.push(b.shr(a.as_u64() as u32)); }
+                OpCode::AND => {
+                    let (a, b) = pop2!(stack, gas, snapshot, self);
+                    stack.push(a.bitand(b));
+                }
+                OpCode::OR => {
+                    let (a, b) = pop2!(stack, gas, snapshot, self);
+                    stack.push(a.bitor(b));
+                }
+                OpCode::XOR => {
+                    let (a, b) = pop2!(stack, gas, snapshot, self);
+                    stack.push(a.bitxor(b));
+                }
+                OpCode::NOT => {
+                    let a = pop1!(stack, gas, snapshot, self);
+                    stack.push(a.bitnot());
+                }
+                OpCode::SHL => {
+                    let (a, b) = pop2!(stack, gas, snapshot, self);
+                    stack.push(b.shl(a.as_u64() as u32));
+                }
+                OpCode::SHR => {
+                    let (a, b) = pop2!(stack, gas, snapshot, self);
+                    stack.push(b.shr(a.as_u64() as u32));
+                }
 
                 // ── Storage ──────────────────────────────────
                 OpCode::SLOAD => {
@@ -1345,25 +1513,32 @@ impl ExecutionEnvironment {
                                     key => &key,
                                     raw => &raw);
                                 self.state.rollback(snapshot).ok();
-                                return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
                             }
-                        }
+                        },
                     };
                     stack.push(val);
                 }
                 OpCode::SSTORE => {
                     if ctx.is_static {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
                     let (slot, val) = pop2!(stack, gas, snapshot, self);
                     let key = format!("slot:{}", slot);
-                    self.state.storage_store(&ctx.address, &key, &format!("0x{}", val.to_hex()));
+                    self.state
+                        .storage_store(&ctx.address, &key, &format!("0x{}", val.to_hex()));
                 }
                 OpCode::SDELETE => {
                     if ctx.is_static {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
                     let slot = pop1!(stack, gas, snapshot, self);
                     let key = format!("slot:{}", slot);
@@ -1464,14 +1639,16 @@ impl ExecutionEnvironment {
                     // was effectively a constant anyway.
                     if stack.is_empty() {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
                     let requested = stack.pop().unwrap();
                     let mut hasher = <Sha256 as Digest>::new();
                     Digest::update(&mut hasher, b"ShadowDAG_BLOCKHASH_v2");
                     Digest::update(&mut hasher, self.block_ctx.block_hash.as_bytes());
                     Digest::update(&mut hasher, b":");
-                    Digest::update(&mut hasher, &requested.to_be_bytes());
+                    Digest::update(&mut hasher, requested.to_be_bytes());
                     let mut out = [0u8; 32];
                     out.copy_from_slice(&Digest::finalize(hasher));
                     stack.push(U256::from_be_bytes(&out));
@@ -1497,9 +1674,12 @@ impl ExecutionEnvironment {
                     let d = dest.as_u64() as usize;
                     if !jump_dests.contains(&d) {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
-                    pc = d; continue;
+                    pc = d;
+                    continue;
                 }
                 OpCode::JUMPI => {
                     let (dest, cond) = pop2!(stack, gas, snapshot, self);
@@ -1507,9 +1687,12 @@ impl ExecutionEnvironment {
                         let d = dest.as_u64() as usize;
                         if !jump_dests.contains(&d) {
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
-                        pc = d; continue;
+                        pc = d;
+                        continue;
                     }
                 }
                 OpCode::JUMPDEST => { /* marker only */ }
@@ -1519,14 +1702,18 @@ impl ExecutionEnvironment {
                     let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
                     if offset + 32 > MAX_MEMORY_SIZE {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
                     if !Self::charge_and_expand_memory(&mut gas, &mut memory, offset + 32) {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
                     let mut buf = [0u8; 32];
-                    buf.copy_from_slice(&memory[offset..offset+32]);
+                    buf.copy_from_slice(&memory[offset..offset + 32]);
                     stack.push(U256::from_be_bytes(&buf));
                 }
                 OpCode::MSTORE => {
@@ -1534,21 +1721,27 @@ impl ExecutionEnvironment {
                     let offset = offset_val.as_u64() as usize;
                     if offset + 32 > MAX_MEMORY_SIZE {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
                     if !Self::charge_and_expand_memory(&mut gas, &mut memory, offset + 32) {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
                     let bytes = val.to_be_bytes();
-                    memory[offset..offset+32].copy_from_slice(&bytes);
+                    memory[offset..offset + 32].copy_from_slice(&bytes);
                 }
 
                 // ── Logging ──────────────────────────────────
                 OpCode::LOG => {
                     if ctx.is_static {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
                     let data_val = pop1!(stack, gas, snapshot, self);
                     logs.push(LogEntry {
@@ -1574,7 +1767,9 @@ impl ExecutionEnvironment {
                 OpCode::RETURN => {
                     if stack.len() < 2 {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
                     let offset = stack.pop().unwrap().as_u64() as usize;
                     let size = stack.pop().unwrap().as_u64() as usize;
@@ -1591,13 +1786,13 @@ impl ExecutionEnvironment {
                     // Use the zero-padding helper so both the
                     // overflow and the out-of-bounds cases become
                     // consensus-correct.
-                    match Self::read_memory_zero_padded(
-                        &mut gas, &mut memory, offset, size,
-                    ) {
+                    match Self::read_memory_zero_padded(&mut gas, &mut memory, offset, size) {
                         Some(data) => return_data = data,
                         None => {
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
                     }
                     self.state.commit(snapshot).ok();
@@ -1621,7 +1816,9 @@ impl ExecutionEnvironment {
                 OpCode::REVERT => {
                     if stack.len() < 2 {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
                     let offset = stack.pop().unwrap().as_u64() as usize;
                     let size = stack.pop().unwrap().as_u64() as usize;
@@ -1629,13 +1826,13 @@ impl ExecutionEnvironment {
                     // REVERT must still produce the exact `size`
                     // bytes the contract asked for, zero-filling any
                     // window past the end of memory.
-                    match Self::read_memory_zero_padded(
-                        &mut gas, &mut memory, offset, size,
-                    ) {
+                    match Self::read_memory_zero_padded(&mut gas, &mut memory, offset, size) {
                         Some(data) => return_data = data,
                         None => {
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
                     }
                     self.state.rollback(snapshot).ok();
@@ -1648,10 +1845,14 @@ impl ExecutionEnvironment {
                 // ══════════════════════════════════════════════
                 //  CALL OPCODES
                 // ══════════════════════════════════════════════
-
                 OpCode::CALL => {
                     // Stack: [gas, addr, value, argsOffset, argsLen, retOffset, retLen]
-                    if stack.len() < 7 { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() < 7 {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let req_gas = stack.pop().unwrap().as_u64();
                     let addr = stack.pop().unwrap();
                     let call_value = stack.pop().unwrap().as_u64();
@@ -1676,7 +1877,8 @@ impl ExecutionEnvironment {
                     if ctx.is_static && call_value > 0 {
                         self.last_return_data.clear();
                         stack.push(U256::ZERO); // failure
-                        pc += 1; continue;
+                        pc += 1;
+                        continue;
                     }
 
                     // Resolve the popped stack body back to the target's
@@ -1716,7 +1918,9 @@ impl ExecutionEnvironment {
                     if extra_gas > 0 {
                         if let GasResult::OutOfGas { .. } = gas.consume(extra_gas) {
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
                     }
 
@@ -1724,12 +1928,22 @@ impl ExecutionEnvironment {
                     let remaining = gas.gas_remaining();
                     let max_allowed = remaining - remaining / 64;
                     let mut child_gas = req_gas.min(max_allowed);
-                    if call_value > 0 { child_gas += CALL_STIPEND; }
+                    if call_value > 0 {
+                        child_gas += CALL_STIPEND;
+                    }
 
                     // Reserve child gas from parent
-                    if let GasResult::OutOfGas { .. } = gas.consume(child_gas.saturating_sub(if call_value > 0 { CALL_STIPEND } else { 0 })) {
+                    if let GasResult::OutOfGas { .. } =
+                        gas.consume(child_gas.saturating_sub(if call_value > 0 {
+                            CALL_STIPEND
+                        } else {
+                            0
+                        }))
+                    {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
 
                     // Read calldata from memory
@@ -1740,12 +1954,17 @@ impl ExecutionEnvironment {
                     // empty Vec) and an `args_offset + args_len`
                     // overflow fails cleanly rather than wrapping.
                     let calldata = match Self::read_memory_zero_padded(
-                        &mut gas, &mut memory, args_offset, args_len,
+                        &mut gas,
+                        &mut memory,
+                        args_offset,
+                        args_len,
                     ) {
                         Some(cd) => cd,
                         None => {
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
                     };
 
@@ -1769,13 +1988,16 @@ impl ExecutionEnvironment {
                         // bytes through RETURNDATACOPY.
                         self.last_return_data.clear();
                         if call_value > 0 {
-                            if let Err(_e) = self.state.transfer(&ctx.address, &target_addr, call_value) {
+                            if let Err(_e) =
+                                self.state.transfer(&ctx.address, &target_addr, call_value)
+                            {
                                 // Insufficient balance or overflow:
                                 // CALL returns 0 for failure but the
                                 // gas reserved for the child stays
                                 // consumed (matches EVM).
                                 stack.push(U256::ZERO);
-                                pc += 1; continue;
+                                pc += 1;
+                                continue;
                             }
                         }
 
@@ -1786,11 +2008,18 @@ impl ExecutionEnvironment {
                             self.last_return_data = result.output.clone();
                             if ret_len > 0 && !result.output.is_empty() {
                                 let copy_len = ret_len.min(result.output.len());
-                                if !Self::charge_and_expand_memory(&mut gas, &mut memory, ret_offset + copy_len) {
+                                if !Self::charge_and_expand_memory(
+                                    &mut gas,
+                                    &mut memory,
+                                    ret_offset + copy_len,
+                                ) {
                                     self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                    return CallOutcome::Failure {
+                                        gas_used: gas.gas_used(),
+                                    };
                                 }
-                                memory[ret_offset..ret_offset + copy_len].copy_from_slice(&result.output[..copy_len]);
+                                memory[ret_offset..ret_offset + copy_len]
+                                    .copy_from_slice(&result.output[..copy_len]);
                             }
                             stack.push(U256::ONE);
                         } else {
@@ -1805,7 +2034,8 @@ impl ExecutionEnvironment {
                             self.last_return_data.clear();
                             stack.push(U256::ZERO);
                         }
-                        pc += 1; continue;
+                        pc += 1;
+                        continue;
                     }
 
                     // Reset last_return_data BEFORE invoking the child
@@ -1831,21 +2061,35 @@ impl ExecutionEnvironment {
                     let outcome = self.execute_frame(&child_ctx);
 
                     match &outcome {
-                        CallOutcome::Success { gas_used, return_data: rd, .. } => {
+                        CallOutcome::Success {
+                            gas_used,
+                            return_data: rd,
+                            ..
+                        } => {
                             gas.return_gas(child_gas.saturating_sub(*gas_used));
                             self.last_return_data = rd.clone();
                             // Write return data to memory
                             if ret_len > 0 && !rd.is_empty() {
                                 let copy_len = ret_len.min(rd.len());
-                                if !Self::charge_and_expand_memory(&mut gas, &mut memory, ret_offset + copy_len) {
+                                if !Self::charge_and_expand_memory(
+                                    &mut gas,
+                                    &mut memory,
+                                    ret_offset + copy_len,
+                                ) {
                                     self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                    return CallOutcome::Failure {
+                                        gas_used: gas.gas_used(),
+                                    };
                                 }
-                                memory[ret_offset..ret_offset+copy_len].copy_from_slice(&rd[..copy_len]);
+                                memory[ret_offset..ret_offset + copy_len]
+                                    .copy_from_slice(&rd[..copy_len]);
                             }
                             stack.push(U256::ONE); // success
                         }
-                        CallOutcome::Revert { gas_used, return_data: rd } => {
+                        CallOutcome::Revert {
+                            gas_used,
+                            return_data: rd,
+                        } => {
                             gas.return_gas(child_gas.saturating_sub(*gas_used));
                             self.last_return_data = rd.clone();
                             // EVM semantics: revert return data is ALSO
@@ -1857,11 +2101,18 @@ impl ExecutionEnvironment {
                             // reason on either outcome.
                             if ret_len > 0 && !rd.is_empty() {
                                 let copy_len = ret_len.min(rd.len());
-                                if !Self::charge_and_expand_memory(&mut gas, &mut memory, ret_offset + copy_len) {
+                                if !Self::charge_and_expand_memory(
+                                    &mut gas,
+                                    &mut memory,
+                                    ret_offset + copy_len,
+                                ) {
                                     self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                    return CallOutcome::Failure {
+                                        gas_used: gas.gas_used(),
+                                    };
                                 }
-                                memory[ret_offset..ret_offset+copy_len].copy_from_slice(&rd[..copy_len]);
+                                memory[ret_offset..ret_offset + copy_len]
+                                    .copy_from_slice(&rd[..copy_len]);
                             }
                             stack.push(U256::ZERO); // failure
                         }
@@ -1876,7 +2127,12 @@ impl ExecutionEnvironment {
 
                 OpCode::STATICCALL => {
                     // Stack: [gas, addr, argsOffset, argsLen, retOffset, retLen]
-                    if stack.len() < 6 { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() < 6 {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let req_gas = stack.pop().unwrap().as_u64();
                     let addr = stack.pop().unwrap();
                     let args_offset = stack.pop().unwrap().as_u64() as usize;
@@ -1890,7 +2146,9 @@ impl ExecutionEnvironment {
 
                     if let GasResult::OutOfGas { .. } = gas.consume(child_gas) {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
 
                     // Build the child frame's calldata using the
@@ -1900,12 +2158,17 @@ impl ExecutionEnvironment {
                     // empty Vec) and an `args_offset + args_len`
                     // overflow fails cleanly rather than wrapping.
                     let calldata = match Self::read_memory_zero_padded(
-                        &mut gas, &mut memory, args_offset, args_len,
+                        &mut gas,
+                        &mut memory,
+                        args_offset,
+                        args_len,
                     ) {
                         Some(cd) => cd,
                         None => {
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
                     };
 
@@ -1923,18 +2186,26 @@ impl ExecutionEnvironment {
                             self.last_return_data = result.output.clone();
                             if ret_len > 0 && !result.output.is_empty() {
                                 let copy_len = ret_len.min(result.output.len());
-                                if !Self::charge_and_expand_memory(&mut gas, &mut memory, ret_offset + copy_len) {
+                                if !Self::charge_and_expand_memory(
+                                    &mut gas,
+                                    &mut memory,
+                                    ret_offset + copy_len,
+                                ) {
                                     self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                    return CallOutcome::Failure {
+                                        gas_used: gas.gas_used(),
+                                    };
                                 }
-                                memory[ret_offset..ret_offset + copy_len].copy_from_slice(&result.output[..copy_len]);
+                                memory[ret_offset..ret_offset + copy_len]
+                                    .copy_from_slice(&result.output[..copy_len]);
                             }
                             stack.push(U256::ONE);
                         } else {
                             self.last_return_data.clear();
                             stack.push(U256::ZERO);
                         }
-                        pc += 1; continue;
+                        pc += 1;
+                        continue;
                     }
 
                     self.last_return_data.clear();
@@ -1953,20 +2224,34 @@ impl ExecutionEnvironment {
 
                     let outcome = self.execute_frame(&child_ctx);
                     match &outcome {
-                        CallOutcome::Success { gas_used, return_data: rd, .. } => {
+                        CallOutcome::Success {
+                            gas_used,
+                            return_data: rd,
+                            ..
+                        } => {
                             gas.return_gas(child_gas.saturating_sub(*gas_used));
                             self.last_return_data = rd.clone();
                             if ret_len > 0 && !rd.is_empty() {
                                 let copy_len = ret_len.min(rd.len());
-                                if !Self::charge_and_expand_memory(&mut gas, &mut memory, ret_offset + copy_len) {
+                                if !Self::charge_and_expand_memory(
+                                    &mut gas,
+                                    &mut memory,
+                                    ret_offset + copy_len,
+                                ) {
                                     self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                    return CallOutcome::Failure {
+                                        gas_used: gas.gas_used(),
+                                    };
                                 }
-                                memory[ret_offset..ret_offset+copy_len].copy_from_slice(&rd[..copy_len]);
+                                memory[ret_offset..ret_offset + copy_len]
+                                    .copy_from_slice(&rd[..copy_len]);
                             }
                             stack.push(U256::ONE);
                         }
-                        CallOutcome::Revert { gas_used, return_data: rd } => {
+                        CallOutcome::Revert {
+                            gas_used,
+                            return_data: rd,
+                        } => {
                             gas.return_gas(child_gas.saturating_sub(*gas_used));
                             self.last_return_data = rd.clone();
                             // Mirror success path: also copy revert
@@ -1974,11 +2259,18 @@ impl ExecutionEnvironment {
                             // retOffset/retLen window.
                             if ret_len > 0 && !rd.is_empty() {
                                 let copy_len = ret_len.min(rd.len());
-                                if !Self::charge_and_expand_memory(&mut gas, &mut memory, ret_offset + copy_len) {
+                                if !Self::charge_and_expand_memory(
+                                    &mut gas,
+                                    &mut memory,
+                                    ret_offset + copy_len,
+                                ) {
                                     self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                    return CallOutcome::Failure {
+                                        gas_used: gas.gas_used(),
+                                    };
                                 }
-                                memory[ret_offset..ret_offset+copy_len].copy_from_slice(&rd[..copy_len]);
+                                memory[ret_offset..ret_offset + copy_len]
+                                    .copy_from_slice(&rd[..copy_len]);
                             }
                             stack.push(U256::ZERO);
                         }
@@ -1991,7 +2283,12 @@ impl ExecutionEnvironment {
 
                 OpCode::DELEGATECALL => {
                     // Stack: [gas, addr, argsOffset, argsLen, retOffset, retLen]
-                    if stack.len() < 6 { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() < 6 {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let req_gas = stack.pop().unwrap().as_u64();
                     let code_addr = stack.pop().unwrap();
                     let args_offset = stack.pop().unwrap().as_u64() as usize;
@@ -2004,7 +2301,9 @@ impl ExecutionEnvironment {
                     let child_gas = req_gas.min(max_allowed);
                     if let GasResult::OutOfGas { .. } = gas.consume(child_gas) {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
 
                     // Build the child frame's calldata using the
@@ -2014,12 +2313,17 @@ impl ExecutionEnvironment {
                     // empty Vec) and an `args_offset + args_len`
                     // overflow fails cleanly rather than wrapping.
                     let calldata = match Self::read_memory_zero_padded(
-                        &mut gas, &mut memory, args_offset, args_len,
+                        &mut gas,
+                        &mut memory,
+                        args_offset,
+                        args_len,
                     ) {
                         Some(cd) => cd,
                         None => {
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
                     };
 
@@ -2038,10 +2342,10 @@ impl ExecutionEnvironment {
                     // `address`, and re-transferring them produces wrong
                     // bookkeeping (or, before the from==to fix, a free mint).
                     let child_ctx = CallContext {
-                        address: ctx.address.clone(),      // storage = caller's
-                        code_address: target_code,          // code = target's
-                        caller: ctx.caller.clone(),         // preserved
-                        value: ctx.value,                   // preserved
+                        address: ctx.address.clone(), // storage = caller's
+                        code_address: target_code,    // code = target's
+                        caller: ctx.caller.clone(),   // preserved
+                        value: ctx.value,             // preserved
                         gas_limit: child_gas,
                         calldata,
                         is_static: ctx.is_static,
@@ -2051,30 +2355,51 @@ impl ExecutionEnvironment {
 
                     let outcome = self.execute_frame(&child_ctx);
                     match &outcome {
-                        CallOutcome::Success { gas_used, return_data: rd, .. } => {
+                        CallOutcome::Success {
+                            gas_used,
+                            return_data: rd,
+                            ..
+                        } => {
                             gas.return_gas(child_gas.saturating_sub(*gas_used));
                             self.last_return_data = rd.clone();
                             if ret_len > 0 && !rd.is_empty() {
                                 let copy_len = ret_len.min(rd.len());
-                                if !Self::charge_and_expand_memory(&mut gas, &mut memory, ret_offset + copy_len) {
+                                if !Self::charge_and_expand_memory(
+                                    &mut gas,
+                                    &mut memory,
+                                    ret_offset + copy_len,
+                                ) {
                                     self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                    return CallOutcome::Failure {
+                                        gas_used: gas.gas_used(),
+                                    };
                                 }
-                                memory[ret_offset..ret_offset+copy_len].copy_from_slice(&rd[..copy_len]);
+                                memory[ret_offset..ret_offset + copy_len]
+                                    .copy_from_slice(&rd[..copy_len]);
                             }
                             stack.push(U256::ONE);
                         }
-                        CallOutcome::Revert { gas_used, return_data: rd } => {
+                        CallOutcome::Revert {
+                            gas_used,
+                            return_data: rd,
+                        } => {
                             gas.return_gas(child_gas.saturating_sub(*gas_used));
                             self.last_return_data = rd.clone();
                             // Mirror success path: copy revert returndata too.
                             if ret_len > 0 && !rd.is_empty() {
                                 let copy_len = ret_len.min(rd.len());
-                                if !Self::charge_and_expand_memory(&mut gas, &mut memory, ret_offset + copy_len) {
+                                if !Self::charge_and_expand_memory(
+                                    &mut gas,
+                                    &mut memory,
+                                    ret_offset + copy_len,
+                                ) {
                                     self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                    return CallOutcome::Failure {
+                                        gas_used: gas.gas_used(),
+                                    };
                                 }
-                                memory[ret_offset..ret_offset+copy_len].copy_from_slice(&rd[..copy_len]);
+                                memory[ret_offset..ret_offset + copy_len]
+                                    .copy_from_slice(&rd[..copy_len]);
                             }
                             stack.push(U256::ZERO);
                         }
@@ -2087,7 +2412,12 @@ impl ExecutionEnvironment {
 
                 OpCode::CALLCODE => {
                     // Stack: [gas, addr, value, argsOffset, argsLen, retOffset, retLen]
-                    if stack.len() < 7 { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() < 7 {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let req_gas = stack.pop().unwrap().as_u64();
                     let code_addr = stack.pop().unwrap();
                     let call_value = stack.pop().unwrap().as_u64();
@@ -2106,24 +2436,41 @@ impl ExecutionEnvironment {
                     if ctx.is_static && call_value > 0 {
                         self.last_return_data.clear();
                         stack.push(U256::ZERO);
-                        pc += 1; continue;
+                        pc += 1;
+                        continue;
                     }
 
-                    let extra_gas = if call_value > 0 { CALL_VALUE_TRANSFER_GAS } else { 0 };
+                    let extra_gas = if call_value > 0 {
+                        CALL_VALUE_TRANSFER_GAS
+                    } else {
+                        0
+                    };
                     if extra_gas > 0 {
                         if let GasResult::OutOfGas { .. } = gas.consume(extra_gas) {
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
                     }
 
                     let remaining = gas.gas_remaining();
                     let max_allowed = remaining - remaining / 64;
                     let mut child_gas = req_gas.min(max_allowed);
-                    if call_value > 0 { child_gas += CALL_STIPEND; }
-                    if let GasResult::OutOfGas { .. } = gas.consume(child_gas.saturating_sub(if call_value > 0 { CALL_STIPEND } else { 0 })) {
+                    if call_value > 0 {
+                        child_gas += CALL_STIPEND;
+                    }
+                    if let GasResult::OutOfGas { .. } =
+                        gas.consume(child_gas.saturating_sub(if call_value > 0 {
+                            CALL_STIPEND
+                        } else {
+                            0
+                        }))
+                    {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
 
                     // Build the child frame's calldata using the
@@ -2133,12 +2480,17 @@ impl ExecutionEnvironment {
                     // empty Vec) and an `args_offset + args_len`
                     // overflow fails cleanly rather than wrapping.
                     let calldata = match Self::read_memory_zero_padded(
-                        &mut gas, &mut memory, args_offset, args_len,
+                        &mut gas,
+                        &mut memory,
+                        args_offset,
+                        args_len,
                     ) {
                         Some(cd) => cd,
                         None => {
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
                     };
 
@@ -2154,9 +2506,9 @@ impl ExecutionEnvironment {
                     // mark `is_delegate: true` to skip the entry-point
                     // value transfer.
                     let child_ctx = CallContext {
-                        address: ctx.address.clone(),       // storage = caller's
-                        code_address: target_code,           // code = target's
-                        caller: ctx.address.clone(),         // msg.sender = this contract
+                        address: ctx.address.clone(), // storage = caller's
+                        code_address: target_code,    // code = target's
+                        caller: ctx.address.clone(),  // msg.sender = this contract
                         value: call_value,
                         gas_limit: child_gas,
                         calldata,
@@ -2167,30 +2519,51 @@ impl ExecutionEnvironment {
 
                     let outcome = self.execute_frame(&child_ctx);
                     match &outcome {
-                        CallOutcome::Success { gas_used, return_data: rd, .. } => {
+                        CallOutcome::Success {
+                            gas_used,
+                            return_data: rd,
+                            ..
+                        } => {
                             gas.return_gas(child_gas.saturating_sub(*gas_used));
                             self.last_return_data = rd.clone();
                             if ret_len > 0 && !rd.is_empty() {
                                 let copy_len = ret_len.min(rd.len());
-                                if !Self::charge_and_expand_memory(&mut gas, &mut memory, ret_offset + copy_len) {
+                                if !Self::charge_and_expand_memory(
+                                    &mut gas,
+                                    &mut memory,
+                                    ret_offset + copy_len,
+                                ) {
                                     self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                    return CallOutcome::Failure {
+                                        gas_used: gas.gas_used(),
+                                    };
                                 }
-                                memory[ret_offset..ret_offset+copy_len].copy_from_slice(&rd[..copy_len]);
+                                memory[ret_offset..ret_offset + copy_len]
+                                    .copy_from_slice(&rd[..copy_len]);
                             }
                             stack.push(U256::ONE);
                         }
-                        CallOutcome::Revert { gas_used, return_data: rd } => {
+                        CallOutcome::Revert {
+                            gas_used,
+                            return_data: rd,
+                        } => {
                             gas.return_gas(child_gas.saturating_sub(*gas_used));
                             self.last_return_data = rd.clone();
                             // Mirror success path: copy revert returndata too.
                             if ret_len > 0 && !rd.is_empty() {
                                 let copy_len = ret_len.min(rd.len());
-                                if !Self::charge_and_expand_memory(&mut gas, &mut memory, ret_offset + copy_len) {
+                                if !Self::charge_and_expand_memory(
+                                    &mut gas,
+                                    &mut memory,
+                                    ret_offset + copy_len,
+                                ) {
                                     self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                    return CallOutcome::Failure {
+                                        gas_used: gas.gas_used(),
+                                    };
                                 }
-                                memory[ret_offset..ret_offset+copy_len].copy_from_slice(&rd[..copy_len]);
+                                memory[ret_offset..ret_offset + copy_len]
+                                    .copy_from_slice(&rd[..copy_len]);
                             }
                             stack.push(U256::ZERO);
                         }
@@ -2204,11 +2577,21 @@ impl ExecutionEnvironment {
                 OpCode::CREATE => {
                     // Stack: [value, offset, length] -> [address or 0]
                     if ctx.is_static {
-                        if stack.len() >= 3 { stack.pop(); stack.pop(); stack.pop(); }
+                        if stack.len() >= 3 {
+                            stack.pop();
+                            stack.pop();
+                            stack.pop();
+                        }
                         stack.push(U256::ZERO);
-                        pc += 1; continue;
+                        pc += 1;
+                        continue;
                     }
-                    if stack.len() < 3 { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() < 3 {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let create_value = stack.pop().unwrap().as_u64();
                     let offset = stack.pop().unwrap().as_u64() as usize;
                     let length = stack.pop().unwrap().as_u64() as usize;
@@ -2224,12 +2607,16 @@ impl ExecutionEnvironment {
                     // init code read uses the memory window as-is
                     // with zero bytes past the end.
                     let init_code = match Self::read_memory_zero_padded(
-                        &mut gas, &mut memory, offset, length,
+                        &mut gas,
+                        &mut memory,
+                        offset,
+                        length,
                     ) {
                         Some(code) => code,
                         None => {
                             stack.push(U256::ZERO);
-                            pc += 1; continue;
+                            pc += 1;
+                            continue;
                         }
                     };
 
@@ -2237,7 +2624,9 @@ impl ExecutionEnvironment {
                     let byte_cost = init_code.len() as u64 * CODE_DEPOSIT_GAS_PER_BYTE;
                     if let GasResult::OutOfGas { .. } = gas.consume(byte_cost) {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
 
                     // Compute address. compute_create_address now returns
@@ -2248,13 +2637,16 @@ impl ExecutionEnvironment {
                     // synthesize state from garbage) we treat the CREATE
                     // as a Failure outcome rather than proceeding.
                     let nonce = self.state.get_nonce(&ctx.address);
-                    let new_addr = match ContractDeployer::compute_create_address(&ctx.address, nonce) {
-                        Ok(addr) => addr,
-                        Err(_) => {
-                            self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
-                        }
-                    };
+                    let new_addr =
+                        match ContractDeployer::compute_create_address(&ctx.address, nonce) {
+                            Ok(addr) => addr,
+                            Err(_) => {
+                                self.state.rollback(snapshot).ok();
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
+                            }
+                        };
 
                     // Increment caller's nonce BEFORE taking the CREATE
                     // sub-snapshot so the bump is preserved across a
@@ -2277,7 +2669,9 @@ impl ExecutionEnvironment {
                     // it as a CallOutcome::Failure for the whole frame.
                     if let Err(_e) = self.state.increment_nonce(&ctx.address) {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
 
                     // Collision check. EVM semantics (EIP-684): a CREATE
@@ -2294,7 +2688,8 @@ impl ExecutionEnvironment {
                         || self.state.get_nonce(&new_addr) != 0;
                     if collision {
                         stack.push(U256::ZERO);
-                        pc += 1; continue;
+                        pc += 1;
+                        continue;
                     }
 
                     // EIP-150 gas for init code execution
@@ -2303,7 +2698,9 @@ impl ExecutionEnvironment {
                     let child_gas = max_allowed;
                     if let GasResult::OutOfGas { .. } = gas.consume(child_gas) {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
 
                     // Sub-snapshot AFTER the nonce increment. Anything
@@ -2333,7 +2730,8 @@ impl ExecutionEnvironment {
                     if let Err(_e) = self.state.set_code(&new_addr, init_code) {
                         self.state.rollback(create_snapshot).ok();
                         stack.push(U256::ZERO);
-                        pc += 1; continue;
+                        pc += 1;
+                        continue;
                     }
 
                     // Execute init code. execute_frame handles the
@@ -2359,7 +2757,11 @@ impl ExecutionEnvironment {
                     let outcome = self.execute_frame(&child_ctx);
 
                     match outcome {
-                        CallOutcome::Success { gas_used: child_used, return_data: runtime_code, .. } => {
+                        CallOutcome::Success {
+                            gas_used: child_used,
+                            return_data: runtime_code,
+                            ..
+                        } => {
                             gas.return_gas(child_gas.saturating_sub(child_used));
                             if !runtime_code.is_empty() {
                                 // Store runtime code. Fail-closed: if
@@ -2372,7 +2774,8 @@ impl ExecutionEnvironment {
                                 if let Err(_e) = self.state.set_code(&new_addr, runtime_code) {
                                     self.state.rollback(create_snapshot).ok();
                                     stack.push(U256::ZERO);
-                                    pc += 1; continue;
+                                    pc += 1;
+                                    continue;
                                 }
                             }
                             self.created_in_tx.insert(new_addr.clone());
@@ -2410,21 +2813,33 @@ impl ExecutionEnvironment {
                 OpCode::CREATE2 => {
                     // Stack: [value, offset, length, salt] -> [address or 0]
                     if ctx.is_static {
-                        if stack.len() >= 4 { stack.pop(); stack.pop(); stack.pop(); stack.pop(); }
+                        if stack.len() >= 4 {
+                            stack.pop();
+                            stack.pop();
+                            stack.pop();
+                            stack.pop();
+                        }
                         stack.push(U256::ZERO);
-                        pc += 1; continue;
+                        pc += 1;
+                        continue;
                     }
-                    if stack.len() < 4 { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() < 4 {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let create_value = stack.pop().unwrap().as_u64();
                     let offset = stack.pop().unwrap().as_u64() as usize;
                     let length = stack.pop().unwrap().as_u64() as usize;
                     let salt = stack.pop().unwrap();
 
                     let init_code = if length > 0 && offset + length <= memory.len() {
-                        memory[offset..offset+length].to_vec()
+                        memory[offset..offset + length].to_vec()
                     } else {
                         stack.push(U256::ZERO);
-                        pc += 1; continue;
+                        pc += 1;
+                        continue;
                     };
 
                     // Charge per-byte + hashing cost
@@ -2432,7 +2847,9 @@ impl ExecutionEnvironment {
                     let hash_cost = (init_code.len() as u64).div_ceil(32) * CREATE2_WORD_GAS;
                     if let GasResult::OutOfGas { .. } = gas.consume(byte_cost + hash_cost) {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
 
                     // Same fail-closed rationale as CREATE above: a bogus
@@ -2440,12 +2857,16 @@ impl ExecutionEnvironment {
                     // contract address.
                     let salt_bytes = salt.to_be_bytes();
                     let new_addr = match ContractDeployer::compute_create2_address(
-                        &ctx.address, &salt_bytes, &init_code,
+                        &ctx.address,
+                        &salt_bytes,
+                        &init_code,
                     ) {
                         Ok(addr) => addr,
                         Err(_) => {
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
                     };
 
@@ -2457,7 +2878,9 @@ impl ExecutionEnvironment {
                     // stale (un-bumped) nonce.
                     if let Err(_e) = self.state.increment_nonce(&ctx.address) {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
 
                     // EIP-684 collision check: also reject when the
@@ -2468,7 +2891,8 @@ impl ExecutionEnvironment {
                         || self.state.get_nonce(&new_addr) != 0;
                     if collision {
                         stack.push(U256::ZERO);
-                        pc += 1; continue;
+                        pc += 1;
+                        continue;
                     }
 
                     let remaining = gas.gas_remaining();
@@ -2476,7 +2900,9 @@ impl ExecutionEnvironment {
                     let child_gas = max_allowed;
                     if let GasResult::OutOfGas { .. } = gas.consume(child_gas) {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
 
                     // Sub-snapshot AFTER the nonce increment. Any
@@ -2493,7 +2919,8 @@ impl ExecutionEnvironment {
                     if let Err(_e) = self.state.set_code(&new_addr, init_code) {
                         self.state.rollback(create_snapshot).ok();
                         stack.push(U256::ZERO);
-                        pc += 1; continue;
+                        pc += 1;
+                        continue;
                     }
 
                     let child_ctx = CallContext {
@@ -2511,13 +2938,18 @@ impl ExecutionEnvironment {
                     let outcome = self.execute_frame(&child_ctx);
 
                     match outcome {
-                        CallOutcome::Success { gas_used: child_used, return_data: runtime_code, .. } => {
+                        CallOutcome::Success {
+                            gas_used: child_used,
+                            return_data: runtime_code,
+                            ..
+                        } => {
                             gas.return_gas(child_gas.saturating_sub(child_used));
                             if !runtime_code.is_empty() {
                                 if let Err(_e) = self.state.set_code(&new_addr, runtime_code) {
                                     self.state.rollback(create_snapshot).ok();
                                     stack.push(U256::ZERO);
-                                    pc += 1; continue;
+                                    pc += 1;
+                                    continue;
                                 }
                             }
                             self.created_in_tx.insert(new_addr.clone());
@@ -2543,11 +2975,20 @@ impl ExecutionEnvironment {
                 OpCode::SELFDESTRUCT => {
                     // Stack: [beneficiary]
                     if ctx.is_static {
-                        if !stack.is_empty() { stack.pop(); }
+                        if !stack.is_empty() {
+                            stack.pop();
+                        }
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
-                    if stack.is_empty() { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.is_empty() {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let beneficiary_val = stack.pop().unwrap();
                     // Resolve the beneficiary body back to its
                     // ShadowDAG string via the runtime registry. This
@@ -2575,21 +3016,26 @@ impl ExecutionEnvironment {
                     let balance = self.state.get_balance(&ctx.address);
                     if self.created_in_tx.contains(&ctx.address) {
                         if balance > 0 {
-                            if let Err(e) = self.state.transfer(&ctx.address, &beneficiary, balance) {
+                            if let Err(e) = self.state.transfer(&ctx.address, &beneficiary, balance)
+                            {
                                 crate::slog_error!("vm", "selfdestruct_transfer_failed",
                                     contract => &ctx.address,
                                     beneficiary => &beneficiary,
                                     balance => balance,
                                     error => &e.to_string());
                                 self.state.rollback(snapshot).ok();
-                                return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
                             }
                         }
                         if let Err(e) = self.state.destroy_account(&ctx.address) {
                             crate::slog_error!("vm", "selfdestruct_destroy_failed",
                                 contract => &ctx.address, error => &e.to_string());
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
                         self.destroyed_contracts.insert(ctx.address.clone());
                     } else if balance > 0 {
@@ -2601,7 +3047,9 @@ impl ExecutionEnvironment {
                                 balance => balance,
                                 error => &e.to_string());
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
                     }
 
@@ -2615,22 +3063,42 @@ impl ExecutionEnvironment {
 
                 // ── Context (extended) ───────────────────────
                 OpCode::ADDRESS => {
-                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     // Push the current frame's 20-byte canonical body
                     // right-aligned in a U256 (EVM layout). See CALLER
                     // above for the round-trip rationale.
                     stack.push(VmAddressBody::from_any(&ctx.address).to_u256());
                 }
                 OpCode::PC => {
-                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     stack.push(U256::from_u64(pc as u64));
                 }
                 OpCode::GAS => {
-                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     stack.push(U256::from_u64(gas.gas_remaining()));
                 }
                 OpCode::GASLIMIT => {
-                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     stack.push(U256::from_u64(ctx.gas_limit));
                 }
 
@@ -2640,16 +3108,25 @@ impl ExecutionEnvironment {
                     let offset = offset_val.as_u64() as usize;
                     if offset + 1 > MAX_MEMORY_SIZE {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
                     if !Self::charge_and_expand_memory(&mut gas, &mut memory, offset + 1) {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
                     memory[offset] = (val.as_u64() & 0xFF) as u8;
                 }
                 OpCode::MSIZE => {
-                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     // Round up to nearest multiple of 32
                     let size = memory.len().div_ceil(32) * 32;
                     stack.push(U256::from_u64(size as u64));
@@ -2659,7 +3136,9 @@ impl ExecutionEnvironment {
                 OpCode::LOG1 | OpCode::LOG2 | OpCode::LOG3 | OpCode::LOG4 => {
                     if ctx.is_static {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
                     let num_topics = match op {
                         OpCode::LOG1 => 1usize,
@@ -2671,7 +3150,9 @@ impl ExecutionEnvironment {
                     // Need offset + length + num_topics items on stack
                     if stack.len() < 2 + num_topics {
                         self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
                     }
                     let offset = stack.pop().unwrap().as_u64() as usize;
                     let length = stack.pop().unwrap().as_u64() as usize;
@@ -2685,7 +3166,9 @@ impl ExecutionEnvironment {
                     } else {
                         if !Self::charge_and_expand_memory(&mut gas, &mut memory, offset + length) {
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
                         memory[offset..offset + length].to_vec()
                     };
@@ -2699,7 +3182,12 @@ impl ExecutionEnvironment {
                 // ── Call data ───────────────────────────────
                 OpCode::CALLDATALOAD => {
                     let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
-                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let mut buf = [0u8; 32];
                     for (i, byte) in buf.iter_mut().enumerate() {
                         if offset + i < ctx.calldata.len() {
@@ -2709,11 +3197,21 @@ impl ExecutionEnvironment {
                     stack.push(U256::from_be_bytes(&buf));
                 }
                 OpCode::CALLDATASIZE => {
-                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     stack.push(U256::from_u64(ctx.calldata.len() as u64));
                 }
                 OpCode::CALLDATACOPY => {
-                    if stack.len() < 3 { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() < 3 {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let dest = stack.pop().unwrap().as_u64() as usize;
                     let offset = stack.pop().unwrap().as_u64() as usize;
                     let length = stack.pop().unwrap().as_u64() as usize;
@@ -2722,16 +3220,22 @@ impl ExecutionEnvironment {
                             Some(end) => end,
                             None => {
                                 self.state.rollback(snapshot).ok();
-                                return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
                             }
                         };
                         if dest_end > MAX_MEMORY_SIZE {
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
                         if !Self::charge_and_expand_memory(&mut gas, &mut memory, dest_end) {
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
                         for i in 0..length {
                             // `offset + i` is checked against
@@ -2748,11 +3252,21 @@ impl ExecutionEnvironment {
                     }
                 }
                 OpCode::CODESIZE => {
-                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     stack.push(U256::from_u64(code.len() as u64));
                 }
                 OpCode::CODECOPY => {
-                    if stack.len() < 3 { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() < 3 {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let dest = stack.pop().unwrap().as_u64() as usize;
                     let offset = stack.pop().unwrap().as_u64() as usize;
                     let length = stack.pop().unwrap().as_u64() as usize;
@@ -2761,16 +3275,22 @@ impl ExecutionEnvironment {
                             Some(end) => end,
                             None => {
                                 self.state.rollback(snapshot).ok();
-                                return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
                             }
                         };
                         if dest_end > MAX_MEMORY_SIZE {
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
                         if !Self::charge_and_expand_memory(&mut gas, &mut memory, dest_end) {
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
                         for i in 0..length {
                             let src_idx = offset.checked_add(i);
@@ -2783,7 +3303,12 @@ impl ExecutionEnvironment {
                 }
                 OpCode::EXTCODESIZE => {
                     let addr_val = pop1!(stack, gas, snapshot, self);
-                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     // Resolve the popped body back to its ShadowDAG
                     // address via the runtime registry so the code
                     // lookup hits the same key the contract was
@@ -2793,11 +3318,21 @@ impl ExecutionEnvironment {
                     stack.push(U256::from_u64(ext_code.len() as u64));
                 }
                 OpCode::RETURNDATASIZE => {
-                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     stack.push(U256::from_u64(self.last_return_data.len() as u64));
                 }
                 OpCode::RETURNDATACOPY => {
-                    if stack.len() < 3 { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() < 3 {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let dest = stack.pop().unwrap().as_u64() as usize;
                     let offset = stack.pop().unwrap().as_u64() as usize;
                     let length = stack.pop().unwrap().as_u64() as usize;
@@ -2813,35 +3348,51 @@ impl ExecutionEnvironment {
                             Some(e) => e,
                             None => {
                                 self.state.rollback(snapshot).ok();
-                                return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
                             }
                         };
                         if src_end > self.last_return_data.len() {
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
                         let dest_end = match dest.checked_add(length) {
                             Some(e) => e,
                             None => {
                                 self.state.rollback(snapshot).ok();
-                                return CallOutcome::Failure { gas_used: gas.gas_used() };
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
                             }
                         };
                         if dest_end > MAX_MEMORY_SIZE {
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
                         if !Self::charge_and_expand_memory(&mut gas, &mut memory, dest_end) {
                             self.state.rollback(snapshot).ok();
-                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
                         }
-                        memory[dest..dest + length].copy_from_slice(&self.last_return_data[offset..offset + length]);
+                        memory[dest..dest + length]
+                            .copy_from_slice(&self.last_return_data[offset..offset + length]);
                     }
                 }
 
                 // ── Extended stack (DUP2-DUP8, SWAP2-SWAP4) ─
-                OpCode::DUP2 | OpCode::DUP3 | OpCode::DUP4 | OpCode::DUP5 |
-                OpCode::DUP6 | OpCode::DUP7 | OpCode::DUP8 => {
+                OpCode::DUP2
+                | OpCode::DUP3
+                | OpCode::DUP4
+                | OpCode::DUP5
+                | OpCode::DUP6
+                | OpCode::DUP7
+                | OpCode::DUP8 => {
                     let n = match op {
                         OpCode::DUP2 => 2usize,
                         OpCode::DUP3 => 3,
@@ -2852,8 +3403,18 @@ impl ExecutionEnvironment {
                         OpCode::DUP8 => 8,
                         _ => unreachable!(),
                     };
-                    if stack.len() < n { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
-                    if stack.len() >= MAX_STACK_SIZE { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() < n {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let idx = stack.len() - n;
                     let val = stack[idx];
                     stack.push(val);
@@ -2861,21 +3422,26 @@ impl ExecutionEnvironment {
                 OpCode::SWAP2 | OpCode::SWAP3 | OpCode::SWAP4 => {
                     let n = match op {
                         OpCode::SWAP2 => 3usize, // swap top with 3rd from top
-                        OpCode::SWAP3 => 4,       // swap top with 4th from top
-                        OpCode::SWAP4 => 5,       // swap top with 5th from top
+                        OpCode::SWAP3 => 4,      // swap top with 4th from top
+                        OpCode::SWAP4 => 5,      // swap top with 5th from top
                         _ => unreachable!(),
                     };
-                    if stack.len() < n { self.state.rollback(snapshot).ok(); return CallOutcome::Failure { gas_used: gas.gas_used() }; }
+                    if stack.len() < n {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let len = stack.len();
                     stack.swap(len - 1, len - n);
                 }
 
                 OpCode::INVALID => {
                     self.state.rollback(snapshot).ok();
-                    return CallOutcome::Failure { gas_used: gas.gas_used() };
-                }
-
-                // All opcodes are covered — INVALID terminates above
+                    return CallOutcome::Failure {
+                        gas_used: gas.gas_used(),
+                    };
+                } // All opcodes are covered — INVALID terminates above
             }
 
             pc += 1;
@@ -2938,7 +3504,8 @@ fn is_precompile_addr(addr: &str) -> Option<u8> {
     // precompile: `SD1c01` would strip to `01` and parse as
     // precompile 1, even though it's a 5-char address string
     // that no legitimate ShadowDAG tooling would emit.
-    let body = if let Some(rest) = addr.strip_prefix("SD1")
+    let body = if let Some(rest) = addr
+        .strip_prefix("SD1")
         .or_else(|| addr.strip_prefix("ST1"))
         .or_else(|| addr.strip_prefix("SR1"))
     {
@@ -2947,8 +3514,10 @@ fn is_precompile_addr(addr: &str) -> Option<u8> {
         // form and should NOT be auto-stripped; fall through to
         // the raw-body interpretation.
         let looks_canonical_with_subtype = rest.len() == 41
-            && matches!(rest.as_bytes().first(),
-                Some(b'c') | Some(b't') | Some(b's') | Some(b'k') | Some(b'h'));
+            && matches!(
+                rest.as_bytes().first(),
+                Some(b'c') | Some(b't') | Some(b's') | Some(b'k') | Some(b'h')
+            );
         let looks_canonical_no_subtype = rest.len() == 40;
 
         if looks_canonical_with_subtype {
@@ -3109,10 +3678,10 @@ mod tests {
         let mut env = make_env();
         // PUSH1 5, PUSH1 3, ADD, STOP
         let code: Vec<u8> = vec![
-            0x10, 5,   // PUSH1 5
-            0x10, 3,   // PUSH1 3
-            0x20,      // ADD
-            0x00,      // STOP
+            0x10, 5, // PUSH1 5
+            0x10, 3,    // PUSH1 3
+            0x20, // ADD
+            0x00, // STOP
         ];
         env.state.set_code("contract1", code.clone()).unwrap();
         let ctx = CallContext {
@@ -3135,9 +3704,9 @@ mod tests {
         let mut env = make_env();
         // PUSH1 42, PUSH1 0, SSTORE -- should fail in static context
         let code: Vec<u8> = vec![
-            0x10, 42,  // PUSH1 42
-            0x10, 0,   // PUSH1 0
-            0x51,      // SSTORE
+            0x10, 42, // PUSH1 42
+            0x10, 0,    // PUSH1 0
+            0x51, // SSTORE
         ];
         env.state.set_code("target", code).unwrap();
         let ctx = CallContext {
@@ -3275,7 +3844,7 @@ mod tests {
         // Bytecode: PUSH1 0xFF (beneficiary), SELFDESTRUCT
         let code: Vec<u8> = vec![
             0x10, 0xFF, // PUSH1 0xFF (beneficiary address)
-            0xB8,       // SELFDESTRUCT
+            0xB8, // SELFDESTRUCT
         ];
         env.state.set_code("contract", code).unwrap();
         let ctx = CallContext {
@@ -3304,10 +3873,10 @@ mod tests {
         // PUSH1 0 (offset), CALLDATALOAD, PUSH1 0 (slot), SSTORE, STOP
         let runtime_code: Vec<u8> = vec![
             0x10, 0,    // PUSH1 0 (offset)
-            0xC0,       // CALLDATALOAD
+            0xC0, // CALLDATALOAD
             0x10, 0,    // PUSH1 0 (slot)
-            0x51,       // SSTORE  (stores calldata[0..32] at slot 0)
-            0x00,       // STOP
+            0x51, // SSTORE  (stores calldata[0..32] at slot 0)
+            0x00, // STOP
         ];
 
         let mut env = make_env();
@@ -3329,7 +3898,10 @@ mod tests {
             is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
-        assert!(matches!(result, CallOutcome::Success { .. }), "Contract call should succeed");
+        assert!(
+            matches!(result, CallOutcome::Success { .. }),
+            "Contract call should succeed"
+        );
 
         // Verify storage was written
         let stored = env.state.storage_load("contract1", "slot:0");
@@ -3381,16 +3953,16 @@ mod tests {
         //   STOP
         let mut code_a: Vec<u8> = Vec::with_capacity(64);
         code_a.push(0x15); // PUSH32
-        for _ in 0..27 { code_a.push(0x00); }
+        code_a.extend(std::iter::repeat_n(0x00, 27));
         code_a.extend_from_slice(&[0x10, 0x00, 0x10, 0x00, 0xB7]);
         code_a.extend_from_slice(&[
-            0x10, 0x00,   // PUSH1 0   (MSTORE offset)
-            0x91,         // MSTORE
-            0x10, 0x05,   // PUSH1 5   (CREATE length)
-            0x10, 0x1B,   // PUSH1 27  (CREATE offset)
-            0x10, 0x32,   // PUSH1 50  (CREATE value)
-            0xB4,         // CREATE
-            0x00,         // STOP
+            0x10, 0x00, // PUSH1 0   (MSTORE offset)
+            0x91, // MSTORE
+            0x10, 0x05, // PUSH1 5   (CREATE length)
+            0x10, 0x1B, // PUSH1 27  (CREATE offset)
+            0x10, 0x32, // PUSH1 50  (CREATE value)
+            0xB4, // CREATE
+            0x00, // STOP
         ]);
         env.state.set_code(parent, code_a).unwrap();
 
@@ -3494,13 +4066,13 @@ mod tests {
         // Opcodes (from v1_spec.rs): CALLER=0x70, BALANCE=0x74,
         // MSTORE=0x91, RETURN=0xB6, PUSH1=0x10.
         let code: Vec<u8> = vec![
-            0x70,        // CALLER
-            0x74,        // BALANCE
-            0x10, 0,     // PUSH1 0        (MSTORE offset)
-            0x91,        // MSTORE
-            0x10, 32,    // PUSH1 32       (RETURN length)
-            0x10, 0,     // PUSH1 0        (RETURN offset)
-            0xB6,        // RETURN
+            0x70, // CALLER
+            0x74, // BALANCE
+            0x10, 0,    // PUSH1 0        (MSTORE offset)
+            0x91, // MSTORE
+            0x10, 32, // PUSH1 32       (RETURN length)
+            0x10, 0,    // PUSH1 0        (RETURN offset)
+            0xB6, // RETURN
         ];
         env.state.set_code("contract", code).unwrap();
 
@@ -3585,15 +4157,15 @@ mod tests {
             // Stack order for CALL: gas, addr, value, argsOffset,
             // argsLen, retOffset, retLen — pushed in reverse.
             let code_a: Vec<u8> = vec![
-                0x10, 0,     // PUSH1 0 (retLen)
-                0x10, 0,     // PUSH1 0 (retOffset)
-                0x10, 0,     // PUSH1 0 (argsLen)
-                0x10, 0,     // PUSH1 0 (argsOffset)
-                0x10, 50,    // PUSH1 50 (value)
-                0x10, 0x0a,  // PUSH1 0x0a (target addr — fresh in one run)
+                0x10, 0, // PUSH1 0 (retLen)
+                0x10, 0, // PUSH1 0 (retOffset)
+                0x10, 0, // PUSH1 0 (argsLen)
+                0x10, 0, // PUSH1 0 (argsOffset)
+                0x10, 50, // PUSH1 50 (value)
+                0x10, 0x0a, // PUSH1 0x0a (target addr — fresh in one run)
                 0x12, 0x00, 0x00, 0xC3, 0x50, // PUSH4 50000 (gas)
-                0xB0,        // CALL
-                0x00,        // STOP
+                0xB0, // CALL
+                0x00, // STOP
             ];
             env.state.set_code("contract_a", code_a).unwrap();
             env.state.set_balance("contract_a", 1_000).unwrap();
@@ -3659,18 +4231,20 @@ mod tests {
         // PUSH1 50 (value), PUSH1 addr, PUSH4 gas, CALL, STOP
         //
         // Set up contract B also at address "0b" so we can push a small numeric address
-        env.state.set_code("0b", vec![0x71, 0x10, 0, 0x51, 0x00]).unwrap();
+        env.state
+            .set_code("0b", vec![0x71, 0x10, 0, 0x51, 0x00])
+            .unwrap();
 
         let code_a: Vec<u8> = vec![
-            0x10, 0,     // PUSH1 0 (retLen)
-            0x10, 0,     // PUSH1 0 (retOffset)
-            0x10, 0,     // PUSH1 0 (argsLen)
-            0x10, 0,     // PUSH1 0 (argsOffset)
-            0x10, 50,    // PUSH1 50 (value)
-            0x10, 0x0b,  // PUSH1 0x0b (target addr)
+            0x10, 0, // PUSH1 0 (retLen)
+            0x10, 0, // PUSH1 0 (retOffset)
+            0x10, 0, // PUSH1 0 (argsLen)
+            0x10, 0, // PUSH1 0 (argsOffset)
+            0x10, 50, // PUSH1 50 (value)
+            0x10, 0x0b, // PUSH1 0x0b (target addr)
             0x12, 0x00, 0x00, 0xC3, 0x50, // PUSH4 50000 (gas)
-            0xB0,        // CALL
-            0x00,        // STOP
+            0xB0, // CALL
+            0x00, // STOP
         ];
         env.state.set_code("contract_a", code_a).unwrap();
         env.state.set_balance("contract_a", 1000).unwrap();
@@ -3687,7 +4261,10 @@ mod tests {
             is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
-        assert!(matches!(result, CallOutcome::Success { .. }), "A calling B should succeed");
+        assert!(
+            matches!(result, CallOutcome::Success { .. }),
+            "A calling B should succeed"
+        );
     }
 
     #[test]
@@ -3695,7 +4272,9 @@ mod tests {
         let mut env = make_env();
 
         // Target contract tries SSTORE -- should fail under STATICCALL
-        env.state.set_code("target", vec![0x10, 1, 0x10, 0, 0x51, 0x00]).unwrap();
+        env.state
+            .set_code("target", vec![0x10, 1, 0x10, 0, 0x51, 0x00])
+            .unwrap();
 
         let ctx = CallContext {
             address: "target".into(),
@@ -3709,7 +4288,10 @@ mod tests {
             is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
-        assert!(matches!(result, CallOutcome::Failure { .. }), "SSTORE in static context must fail");
+        assert!(
+            matches!(result, CallOutcome::Failure { .. }),
+            "SSTORE in static context must fail"
+        );
 
         // Verify no storage was written
         assert!(env.state.storage_load("target", "slot:0").is_none());
@@ -3721,12 +4303,14 @@ mod tests {
 
         // Library code: stores value 42 in slot 0, then STOP
         // PUSH1 42, PUSH1 0, SSTORE, STOP
-        env.state.set_code("library", vec![0x10, 42, 0x10, 0, 0x51, 0x00]).unwrap();
+        env.state
+            .set_code("library", vec![0x10, 42, 0x10, 0, 0x51, 0x00])
+            .unwrap();
 
         // Execute via DELEGATECALL context: address="caller_contract" but code_address="library"
         let ctx = CallContext {
-            address: "caller_contract".into(),     // storage context
-            code_address: "library".into(),        // code source
+            address: "caller_contract".into(), // storage context
+            code_address: "library".into(),    // code source
             caller: "user".into(),
             value: 0,
             gas_limit: 100_000,
@@ -3739,10 +4323,16 @@ mod tests {
         assert!(matches!(result, CallOutcome::Success { .. }));
 
         // Storage written to CALLER's contract, not library's
-        assert!(env.state.storage_load("caller_contract", "slot:0").is_some(),
-            "Storage should be in caller_contract");
-        assert!(env.state.storage_load("library", "slot:0").is_none(),
-            "Library storage should be untouched");
+        assert!(
+            env.state
+                .storage_load("caller_contract", "slot:0")
+                .is_some(),
+            "Storage should be in caller_contract"
+        );
+        assert!(
+            env.state.storage_load("library", "slot:0").is_none(),
+            "Library storage should be untouched"
+        );
     }
 
     #[test]
@@ -3752,12 +4342,12 @@ mod tests {
         // Contract: SSTORE(slot=0, val=99), then REVERT
         // PUSH1 99, PUSH1 0, SSTORE, PUSH1 0, PUSH1 0, REVERT
         let code: Vec<u8> = vec![
-            0x10, 99,   // PUSH1 99
+            0x10, 99, // PUSH1 99
             0x10, 0,    // PUSH1 0
-            0x51,       // SSTORE
-            0x10, 0,    // PUSH1 0 (size)
+            0x51, // SSTORE
+            0x10, 0, // PUSH1 0 (size)
             0x10, 0,    // PUSH1 0 (offset)
-            0xB7,       // REVERT
+            0xB7, // REVERT
         ];
         env.state.set_code("contract", code).unwrap();
 
@@ -3776,8 +4366,10 @@ mod tests {
         assert!(matches!(result, CallOutcome::Revert { .. }));
 
         // Storage should NOT have the value (reverted)
-        assert!(env.state.storage_load("contract", "slot:0").is_none(),
-            "REVERT should discard SSTORE");
+        assert!(
+            env.state.storage_load("contract", "slot:0").is_none(),
+            "REVERT should discard SSTORE"
+        );
     }
 
     #[test]
@@ -3785,20 +4377,25 @@ mod tests {
         let mut env = make_env();
         // CALLDATASIZE, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
         let code: Vec<u8> = vec![
-            0xC1,       // CALLDATASIZE
+            0xC1, // CALLDATASIZE
             0x10, 0,    // PUSH1 0
-            0x91,       // MSTORE
-            0x10, 32,   // PUSH1 32
+            0x91, // MSTORE
+            0x10, 32, // PUSH1 32
             0x10, 0,    // PUSH1 0
-            0xB6,       // RETURN
+            0xB6, // RETURN
         ];
         env.state.set_code("c", code).unwrap();
 
         let ctx = CallContext {
-            address: "c".into(), code_address: "c".into(),
-            caller: "u".into(), value: 0, gas_limit: 100_000,
+            address: "c".into(),
+            code_address: "c".into(),
+            caller: "u".into(),
+            value: 0,
+            gas_limit: 100_000,
             calldata: vec![1, 2, 3, 4, 5], // 5 bytes
-            is_static: false, depth: 0, is_delegate: false,
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         match result {
@@ -3818,17 +4415,23 @@ mod tests {
         // PUSH2 0xDEAD, PUSH1 0, MSTORE, PUSH1 2, PUSH1 30, RETURN
         let code: Vec<u8> = vec![
             0x11, 0xDE, 0xAD, // PUSH2 0xDEAD
-            0x10, 0,           // PUSH1 0
-            0x91,              // MSTORE
-            0x10, 2,           // PUSH1 2 (size)
-            0x10, 30,          // PUSH1 30 (offset)
-            0xB6,              // RETURN
+            0x10, 0,    // PUSH1 0
+            0x91, // MSTORE
+            0x10, 2, // PUSH1 2 (size)
+            0x10, 30,   // PUSH1 30 (offset)
+            0xB6, // RETURN
         ];
         env.state.set_code("c", code).unwrap();
         let ctx = CallContext {
-            address: "c".into(), code_address: "c".into(),
-            caller: "u".into(), value: 0, gas_limit: 100_000,
-            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
+            address: "c".into(),
+            code_address: "c".into(),
+            caller: "u".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         match result {
@@ -3845,19 +4448,27 @@ mod tests {
         let mut env = make_env();
         // Infinite loop: JUMPDEST, PUSH1 0, JUMP
         let code: Vec<u8> = vec![
-            0x82,      // JUMPDEST at position 0
-            0x10, 0,   // PUSH1 0
-            0x80,      // JUMP back to 0
+            0x82, // JUMPDEST at position 0
+            0x10, 0,    // PUSH1 0
+            0x80, // JUMP back to 0
         ];
         env.state.set_code("c", code).unwrap();
         let ctx = CallContext {
-            address: "c".into(), code_address: "c".into(),
-            caller: "u".into(), value: 0,
+            address: "c".into(),
+            code_address: "c".into(),
+            caller: "u".into(),
+            value: 0,
             gas_limit: 100, // Very low gas
-            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
-        assert!(matches!(result, CallOutcome::Failure { .. }), "Should run out of gas");
+        assert!(
+            matches!(result, CallOutcome::Failure { .. }),
+            "Should run out of gas"
+        );
     }
 
     #[test]
@@ -3870,9 +4481,15 @@ mod tests {
         env.state.set_code("c", code).unwrap();
 
         let ctx = CallContext {
-            address: "c".into(), code_address: "c".into(),
-            caller: "u".into(), value: 0, gas_limit: 100_000,
-            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
+            address: "c".into(),
+            code_address: "c".into(),
+            caller: "u".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
         };
         env.execute_frame(&ctx);
 
@@ -3882,9 +4499,15 @@ mod tests {
         env.state.set_code("c", code2).unwrap();
 
         let ctx2 = CallContext {
-            address: "c".into(), code_address: "c".into(),
-            caller: "u".into(), value: 0, gas_limit: 100_000,
-            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
+            address: "c".into(),
+            code_address: "c".into(),
+            caller: "u".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx2);
         assert!(matches!(result, CallOutcome::Success { .. }));
@@ -3899,25 +4522,34 @@ mod tests {
         let mut env = make_env();
         // CODESIZE, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
         let code: Vec<u8> = vec![
-            0xC3,       // CODESIZE
+            0xC3, // CODESIZE
             0x10, 0,    // PUSH1 0
-            0x91,       // MSTORE
-            0x10, 32,   // PUSH1 32 (size)
+            0x91, // MSTORE
+            0x10, 32, // PUSH1 32 (size)
             0x10, 0,    // PUSH1 0 (offset)
-            0xB6,       // RETURN
+            0xB6, // RETURN
         ];
         let code_len = code.len(); // 9 bytes
         env.state.set_code("c", code).unwrap();
         let ctx = CallContext {
-            address: "c".into(), code_address: "c".into(),
-            caller: "u".into(), value: 0, gas_limit: 100_000,
-            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
+            address: "c".into(),
+            code_address: "c".into(),
+            caller: "u".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         match result {
             CallOutcome::Success { return_data, .. } => {
                 assert_eq!(return_data.len(), 32);
-                assert_eq!(return_data[31], code_len as u8, "CODESIZE should equal code length");
+                assert_eq!(
+                    return_data[31], code_len as u8,
+                    "CODESIZE should equal code length"
+                );
             }
             _ => panic!("Expected success"),
         }
@@ -3929,14 +4561,20 @@ mod tests {
         // PUSH1 0xFF, LOG0, STOP
         let code: Vec<u8> = vec![
             0x10, 0xFF, // PUSH1 0xFF (data value)
-            0xA0,       // LOG0
-            0x00,       // STOP
+            0xA0, // LOG0
+            0x00, // STOP
         ];
         env.state.set_code("c", code).unwrap();
         let ctx = CallContext {
-            address: "c".into(), code_address: "c".into(),
-            caller: "u".into(), value: 0, gas_limit: 100_000,
-            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
+            address: "c".into(),
+            code_address: "c".into(),
+            caller: "u".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         match result {
@@ -3953,25 +4591,34 @@ mod tests {
         let mut env = make_env();
         // PUSH1 10, PUSH1 20, DUP2 (should dup 10), PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
         let code: Vec<u8> = vec![
-            0x10, 10,   // PUSH1 10  (bottom)
+            0x10, 10, // PUSH1 10  (bottom)
             0x10, 20,   // PUSH1 20  (top)
-            0xD0,       // DUP2 (duplicate 10)
+            0xD0, // DUP2 (duplicate 10)
             0x10, 0,    // PUSH1 0
-            0x91,       // MSTORE
-            0x10, 32,   // PUSH1 32
+            0x91, // MSTORE
+            0x10, 32, // PUSH1 32
             0x10, 0,    // PUSH1 0
-            0xB6,       // RETURN
+            0xB6, // RETURN
         ];
         env.state.set_code("c", code).unwrap();
         let ctx = CallContext {
-            address: "c".into(), code_address: "c".into(),
-            caller: "u".into(), value: 0, gas_limit: 100_000,
-            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
+            address: "c".into(),
+            code_address: "c".into(),
+            caller: "u".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         match result {
             CallOutcome::Success { return_data, .. } => {
-                assert_eq!(return_data[31], 10, "DUP2 should duplicate second element (10)");
+                assert_eq!(
+                    return_data[31], 10,
+                    "DUP2 should duplicate second element (10)"
+                );
             }
             _ => panic!("Expected success"),
         }
@@ -3986,19 +4633,27 @@ mod tests {
 
         let code: Vec<u8> = vec![
             0x10, 0x01, // PUSH1 1 (beneficiary addr as small number)
-            0xB8,       // SELFDESTRUCT
+            0xB8, // SELFDESTRUCT
         ];
         env.state.set_code("contract", code).unwrap();
         let ctx = CallContext {
-            address: "contract".into(), code_address: "contract".into(),
-            caller: "user".into(), value: 0, gas_limit: 100_000,
-            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
+            address: "contract".into(),
+            code_address: "contract".into(),
+            caller: "user".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Success { .. }));
         // Contract should NOT be in destroyed set (EIP-6780)
-        assert!(!env.destroyed_contracts.contains("contract"),
-            "Contract not created in this tx should NOT be destroyed");
+        assert!(
+            !env.destroyed_contracts.contains("contract"),
+            "Contract not created in this tx should NOT be destroyed"
+        );
     }
 
     #[test]
@@ -4009,12 +4664,21 @@ mod tests {
 
         // Try to send 1000 (more than balance)
         let ctx = CallContext {
-            address: "target".into(), code_address: "target".into(),
-            caller: "sender".into(), value: 1000, gas_limit: 100_000,
-            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
+            address: "target".into(),
+            code_address: "target".into(),
+            caller: "sender".into(),
+            value: 1000,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
-        assert!(matches!(result, CallOutcome::Failure { .. }), "Insufficient balance should fail");
+        assert!(
+            matches!(result, CallOutcome::Failure { .. }),
+            "Insufficient balance should fail"
+        );
     }
 
     #[test]
@@ -4022,26 +4686,37 @@ mod tests {
         let mut env = make_env();
         // GAS, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
         let code: Vec<u8> = vec![
-            0x03,       // GAS
+            0x03, // GAS
             0x10, 0,    // PUSH1 0
-            0x91,       // MSTORE
-            0x10, 32,   // PUSH1 32
+            0x91, // MSTORE
+            0x10, 32, // PUSH1 32
             0x10, 0,    // PUSH1 0
-            0xB6,       // RETURN
+            0xB6, // RETURN
         ];
         env.state.set_code("c", code).unwrap();
         let ctx = CallContext {
-            address: "c".into(), code_address: "c".into(),
-            caller: "u".into(), value: 0, gas_limit: 100_000,
-            calldata: vec![], is_static: false, depth: 0, is_delegate: false,
+            address: "c".into(),
+            code_address: "c".into(),
+            caller: "u".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
         };
         let result = env.execute_frame(&ctx);
         match result {
             CallOutcome::Success { return_data, .. } => {
                 // Gas should be a non-zero value less than 100_000
-                let gas_val = return_data.iter().fold(0u64, |acc, &b| acc * 256 + b as u64);
-                assert!(gas_val > 0 && gas_val < 100_000,
-                    "GAS should return remaining gas, got {}", gas_val);
+                let gas_val = return_data
+                    .iter()
+                    .fold(0u64, |acc, &b| acc * 256 + b as u64);
+                assert!(
+                    gas_val > 0 && gas_val < 100_000,
+                    "GAS should return remaining gas, got {}",
+                    gas_val
+                );
             }
             _ => panic!("Expected success"),
         }
@@ -4069,7 +4744,12 @@ mod tests {
         };
         match env.execute_frame(&ctx) {
             CallOutcome::Success { return_data, .. } => {
-                assert_eq!(return_data.len(), 32, "expected 32-byte return, got {:?}", return_data);
+                assert_eq!(
+                    return_data.len(),
+                    32,
+                    "expected 32-byte return, got {:?}",
+                    return_data
+                );
                 let mut out = [0u8; 32];
                 out.copy_from_slice(&return_data);
                 out
@@ -4096,8 +4776,11 @@ mod tests {
         let mut hasher = S::new();
         hasher.update([0u8; 32]);
         let expected = hasher.finalize();
-        assert_eq!(&got[..], &expected[..],
-            "SHA256 opcode must hash the raw 32-byte value, not its hex string");
+        assert_eq!(
+            &got[..],
+            &expected[..],
+            "SHA256 opcode must hash the raw 32-byte value, not its hex string"
+        );
     }
 
     /// KECCAK opcode must use actual Keccak-256 (not SHA-256) on the
@@ -4121,7 +4804,7 @@ mod tests {
 
         // And sanity-check: this must NOT equal SHA-256 of the same
         // input — that's the bug we just fixed.
-        use sha2::{Digest as _, Sha256 as S};
+        use sha2::Sha256 as S;
         let mut sha = S::new();
         sha.update([0u8; 32]);
         let sha_hash = sha.finalize();
@@ -4150,14 +4833,17 @@ mod tests {
         });
         // PUSH1 0, BLOCKHASH, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
         let code = vec![
-            0x10, 0,          // PUSH1 0   (requested block number)
-            0x73,             // BLOCKHASH
-            0x10, 0, 0x91,    // PUSH1 0 MSTORE
+            0x10, 0,    // PUSH1 0   (requested block number)
+            0x73, // BLOCKHASH
+            0x10, 0, 0x91, // PUSH1 0 MSTORE
             0x10, 32, 0x10, 0, 0xB6, // PUSH1 32 PUSH1 0 RETURN
         ];
         let got = run_and_read_u256(&mut env, code.clone());
-        assert!(got.iter().any(|&b| b != 0),
-            "BLOCKHASH must return a non-zero digest for a non-hex block identifier, got {:?}", got);
+        assert!(
+            got.iter().any(|&b| b != 0),
+            "BLOCKHASH must return a non-zero digest for a non-hex block identifier, got {:?}",
+            got
+        );
 
         // Re-execute the same block → same result (deterministic).
         let mut env2 = ExecutionEnvironment::new(BlockContext {
@@ -4166,7 +4852,10 @@ mod tests {
             network: "mainnet".into(),
         });
         let got2 = run_and_read_u256(&mut env2, code);
-        assert_eq!(got, got2, "BLOCKHASH must be deterministic for a given block");
+        assert_eq!(
+            got, got2,
+            "BLOCKHASH must be deterministic for a given block"
+        );
     }
 
     /// BLOCKHASH must pop one word from the stack. The previous
@@ -4185,12 +4874,7 @@ mod tests {
                 network: "mainnet".into(),
             });
             // PUSH1 <arg>, BLOCKHASH, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
-            let code = vec![
-                0x10, arg,
-                0x73,
-                0x10, 0, 0x91,
-                0x10, 32, 0x10, 0, 0xB6,
-            ];
+            let code = vec![0x10, arg, 0x73, 0x10, 0, 0x91, 0x10, 32, 0x10, 0, 0xB6];
             run_and_read_u256(&mut env, code)
         }
 
@@ -4226,10 +4910,13 @@ mod tests {
             // The stack convention for MSTORE is `(offset, val) =
             // pop2()` with val on top, so push val first then offset.
             let mut code = vec![
-                0x10, 0xAA,                        // PUSH1 0xAA  (val — stack bottom)
-                0x11, (offset >> 8) as u8, (offset & 0xff) as u8, // PUSH2 offset (top)
-                0x91,                              // MSTORE
-                0x00,                              // STOP
+                0x10,
+                0xAA, // PUSH1 0xAA  (val — stack bottom)
+                0x11,
+                (offset >> 8) as u8,
+                (offset & 0xff) as u8, // PUSH2 offset (top)
+                0x91,                  // MSTORE
+                0x00,                  // STOP
             ];
             // Guard against accidental misencoding: a sanity byte.
             code.push(0x00);
@@ -4259,7 +4946,8 @@ mod tests {
             "MSTORE at offset 2048 must cost more gas than MSTORE at offset 0 \
              (small={}, large={}). If they're equal, memory expansion is still \
              being done without charging the meter.",
-            small, large
+            small,
+            large
         );
     }
 
@@ -4336,12 +5024,18 @@ mod tests {
         // have silently dropped.
         let big_dec = "184467440737095516150"; // u64::MAX * 10
         let parsed = parse_storage_value(big_dec);
-        assert_ne!(parsed, U256::ZERO,
-            "decimal value larger than u64::MAX must NOT silently parse as ZERO");
+        assert_ne!(
+            parsed,
+            U256::ZERO,
+            "decimal value larger than u64::MAX must NOT silently parse as ZERO"
+        );
 
         // And the value must round-trip via the same parser.
         let expected = parse_decimal_u256(big_dec).expect("must parse");
-        assert_eq!(parsed, expected, "parse_storage_value must agree with parse_decimal_u256");
+        assert_eq!(
+            parsed, expected,
+            "parse_storage_value must agree with parse_decimal_u256"
+        );
     }
 
     /// `U256::MAX` itself must round-trip cleanly through the
@@ -4349,12 +5043,16 @@ mod tests {
     /// length check.
     #[test]
     fn parse_decimal_u256_handles_u256_max_exactly() {
-        let max_dec = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+        let max_dec =
+            "115792089237316195423570985008687907853269984665640564039457584007913129639935";
         let parsed = parse_decimal_u256(max_dec).expect("U256::MAX must parse");
         // Re-encode to bytes and verify all 32 bytes are 0xFF.
         let bytes = parsed.to_be_bytes();
-        assert!(bytes.iter().all(|&b| b == 0xFF),
-            "U256::MAX must decode to all 0xFF bytes, got: {:?}", bytes);
+        assert!(
+            bytes.iter().all(|&b| b == 0xFF),
+            "U256::MAX must decode to all 0xFF bytes, got: {:?}",
+            bytes
+        );
     }
 
     /// Anything strictly larger than `U256::MAX` must be rejected
@@ -4362,14 +5060,19 @@ mod tests {
     #[test]
     fn parse_decimal_u256_rejects_overflow() {
         // U256::MAX + 1
-        let too_big = "115792089237316195423570985008687907853269984665640564039457584007913129639936";
-        assert!(parse_decimal_u256(too_big).is_none(),
-            "value U256::MAX + 1 must be rejected, not silently wrapped");
+        let too_big =
+            "115792089237316195423570985008687907853269984665640564039457584007913129639936";
+        assert!(
+            parse_decimal_u256(too_big).is_none(),
+            "value U256::MAX + 1 must be rejected, not silently wrapped"
+        );
 
         // 79 digits — guaranteed overflow regardless of leading digit.
         let way_too_big = "9".repeat(79);
-        assert!(parse_decimal_u256(&way_too_big).is_none(),
-            "79-digit decimal must be rejected up front");
+        assert!(
+            parse_decimal_u256(&way_too_big).is_none(),
+            "79-digit decimal must be rejected up front"
+        );
 
         // 100 digits.
         let absurd = "1".repeat(100);
@@ -4418,10 +5121,10 @@ mod tests {
         //   (no operands on the stack for RETURN — it expects
         //    [offset, size] but the SSTORE consumed both items)
         let code = vec![
-            0x10, 42,   // PUSH1 42
+            0x10, 42, // PUSH1 42
             0x10, 0,    // PUSH1 0
-            0x51,       // SSTORE  (stack becomes empty)
-            0xB6,       // RETURN  (empty stack → fault)
+            0x51, // SSTORE  (stack becomes empty)
+            0xB6, // RETURN  (empty stack → fault)
         ];
         env.state.set_code("probe", code).unwrap();
         let ctx = CallContext {
@@ -4438,7 +5141,8 @@ mod tests {
         let result = env.execute_frame(&ctx);
         assert!(
             matches!(result, CallOutcome::Failure { .. }),
-            "RETURN with empty stack must fail, got {:?}", result
+            "RETURN with empty stack must fail, got {:?}",
+            result
         );
         // The earlier SSTORE must have been rolled back.
         assert!(
@@ -4457,8 +5161,8 @@ mod tests {
         // PUSH1 7, REVERT — stack has one item when REVERT runs,
         // so the `stack.len() < 2` branch fires.
         let code = vec![
-            0x10, 7,   // PUSH1 7
-            0xB7,      // REVERT — underflow
+            0x10, 7,    // PUSH1 7
+            0xB7, // REVERT — underflow
         ];
         env.state.set_code("probe2", code).unwrap();
         let ctx = CallContext {
@@ -4475,7 +5179,8 @@ mod tests {
         let result = env.execute_frame(&ctx);
         assert!(
             matches!(result, CallOutcome::Failure { .. }),
-            "REVERT with stack.len() < 2 must fail, got {:?}", result
+            "REVERT with stack.len() < 2 must fail, got {:?}",
+            result
         );
     }
 
@@ -4495,28 +5200,44 @@ mod tests {
         // Bare hex (old behaviour still works). `is_precompile_addr`
         // expects a raw hex body or a ShadowDAG-prefixed address,
         // NOT a `0x`-prefixed form, so we don't assert on `"0x02"`.
-        assert_eq!(is_precompile_addr("02"),   Some(2));
-        assert_eq!(is_precompile_addr("9"),    Some(9));
+        assert_eq!(is_precompile_addr("02"), Some(2));
+        assert_eq!(is_precompile_addr("9"), Some(9));
 
         // SD1c-prefixed canonical 40-char hex body, right-aligned
         let sd1c_02 = format!("SD1c{}", "0".repeat(38) + "02");
         let sd1c_09 = format!("SD1c{}", "0".repeat(39) + "9");
-        assert_eq!(is_precompile_addr(&sd1c_02), Some(2),
-            "canonical SD1c address for precompile 2 must be detected");
-        assert_eq!(is_precompile_addr(&sd1c_09), Some(9),
-            "canonical SD1c address for precompile 9 must be detected");
+        assert_eq!(
+            is_precompile_addr(&sd1c_02),
+            Some(2),
+            "canonical SD1c address for precompile 2 must be detected"
+        );
+        assert_eq!(
+            is_precompile_addr(&sd1c_09),
+            Some(9),
+            "canonical SD1c address for precompile 9 must be detected"
+        );
 
         // Other network / subtype markers
-        assert_eq!(is_precompile_addr(&format!("ST1t{}", "0".repeat(38) + "03")), Some(3));
-        assert_eq!(is_precompile_addr(&format!("SR1s{}", "0".repeat(38) + "04")), Some(4));
+        assert_eq!(
+            is_precompile_addr(&format!("ST1t{}", "0".repeat(38) + "03")),
+            Some(3)
+        );
+        assert_eq!(
+            is_precompile_addr(&format!("SR1s{}", "0".repeat(38) + "04")),
+            Some(4)
+        );
 
         // Address that LOOKS structurally similar but is not a
         // precompile slot must still return None.
-        assert!(is_precompile_addr(&format!("SD1c{}", "0".repeat(36) + "abcd")).is_none(),
-            "non-precompile canonical address must not be misidentified");
+        assert!(
+            is_precompile_addr(&format!("SD1c{}", "0".repeat(36) + "abcd")).is_none(),
+            "non-precompile canonical address must not be misidentified"
+        );
         // And a precompile beyond the 0x01..=0x09 window.
-        assert!(is_precompile_addr(&format!("SD1c{}", "0".repeat(38) + "0a")).is_none(),
-            "precompile slot 0x0a (> 9) must not be accepted");
+        assert!(
+            is_precompile_addr(&format!("SD1c{}", "0".repeat(38) + "0a")).is_none(),
+            "precompile slot 0x0a (> 9) must not be accepted"
+        );
         // An address with no precompile slot at all.
         assert!(is_precompile_addr("SD1ccafecafecafecafecafecafecafecafecafecafe").is_none());
     }
@@ -4544,7 +5265,7 @@ mod tests {
             address: "library".into(),
             code_address: "library".into(),
             caller: "caller".into(),
-            value: 500,   // value set, but must NOT move under delegate semantics
+            value: 500, // value set, but must NOT move under delegate semantics
             gas_limit: 100_000,
             calldata: vec![],
             is_static: false,
@@ -4552,8 +5273,11 @@ mod tests {
             is_delegate: true,
         };
         let result = env.execute_frame(&ctx);
-        assert!(matches!(result, CallOutcome::Success { .. }),
-            "delegate frame must succeed, got {:?}", result);
+        assert!(
+            matches!(result, CallOutcome::Success { .. }),
+            "delegate frame must succeed, got {:?}",
+            result
+        );
 
         assert_eq!(
             env.state.get_balance("caller"),
@@ -4587,15 +5311,21 @@ mod tests {
             calldata: vec![],
             is_static: false,
             depth: 0,
-            is_delegate: false,   // regular CALL semantics
+            is_delegate: false, // regular CALL semantics
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Success { .. }));
 
-        assert_eq!(env.state.get_balance("caller"), 500,
-            "normal call must debit caller by value");
-        assert_eq!(env.state.get_balance("target"), 500,
-            "normal call must credit target by value");
+        assert_eq!(
+            env.state.get_balance("caller"),
+            500,
+            "normal call must debit caller by value"
+        );
+        assert_eq!(
+            env.state.get_balance("target"),
+            500,
+            "normal call must credit target by value"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -4633,8 +5363,10 @@ mod tests {
         env.state.rollback(snap).expect("rollback must succeed");
 
         // Post-rollback: both the account AND the storage are back.
-        assert!(env.state.get_account("victim").is_some(),
-            "rolled-back account must be present");
+        assert!(
+            env.state.get_account("victim").is_some(),
+            "rolled-back account must be present"
+        );
         assert_eq!(
             env.state.storage_load("victim", "slot:0"),
             Some("0x2a".to_string()),
@@ -4655,9 +5387,7 @@ mod tests {
     //        path is actually hit.
     // ─────────────────────────────────────────────────────────────
 
-    fn tmp_contract_storage()
-        -> crate::runtime::vm::contracts::contract_storage::ContractStorage
-    {
+    fn tmp_contract_storage() -> crate::runtime::vm::contracts::contract_storage::ContractStorage {
         use crate::runtime::vm::contracts::contract_storage::ContractStorage;
         let dir = std::env::temp_dir().join(format!(
             "shadowdag_persist_regression_{}",
@@ -4890,39 +5620,36 @@ mod tests {
     //          zero bytes, not `Vec::new()`.
     #[test]
     fn read_memory_zero_padded_zero_fills_past_end() {
-        let mut env = make_env();
         let mut memory: Vec<u8> = vec![0xAA, 0xBB, 0xCC];
         let mut gas = GasMeter::new(1_000_000);
 
         // Read 8 bytes starting at offset 1 from a 3-byte buffer.
         // Expected: [BB, CC, 0, 0, 0, 0, 0, 0].
-        let data = ExecutionEnvironment::read_memory_zero_padded(
-            &mut gas, &mut memory, 1, 8,
-        ).expect("zero-pad read must succeed after expansion");
+        let data = ExecutionEnvironment::read_memory_zero_padded(&mut gas, &mut memory, 1, 8)
+            .expect("zero-pad read must succeed after expansion");
 
         assert_eq!(data.len(), 8);
         assert_eq!(&data[..2], &[0xBB, 0xCC]);
-        assert!(data[2..].iter().all(|&b| b == 0),
-            "bytes past the original end must be zero, got {:?}", data);
-
-        let _ = env;
+        assert!(
+            data[2..].iter().all(|&b| b == 0),
+            "bytes past the original end must be zero, got {:?}",
+            data
+        );
     }
 
     // M-P0-10 — offset + length overflow fails the frame closed.
     #[test]
     fn read_memory_zero_padded_rejects_checked_add_overflow() {
-        let mut env = make_env();
         let mut memory: Vec<u8> = Vec::new();
         let mut gas = GasMeter::new(1_000_000);
 
         // `usize::MAX + 1` → checked_add overflow → None.
-        let result = ExecutionEnvironment::read_memory_zero_padded(
-            &mut gas, &mut memory, usize::MAX, 1,
+        let result =
+            ExecutionEnvironment::read_memory_zero_padded(&mut gas, &mut memory, usize::MAX, 1);
+        assert!(
+            result.is_none(),
+            "checked_add overflow must return None, not wrap"
         );
-        assert!(result.is_none(),
-            "checked_add overflow must return None, not wrap");
-
-        let _ = env;
     }
 
     // M-P0-8 — RETURN with out-of-bounds memory must zero-pad to the
@@ -4939,12 +5666,12 @@ mod tests {
         // to be 0x42 and the remaining 7 to be zero — not an empty
         // return (the old bug).
         let code = vec![
-            0x10, 0x42,     // PUSH1 0x42  (val)
-            0x10, 0,        // PUSH1 0     (offset)
-            0x92,           // MSTORE8
-            0x10, 8,        // PUSH1 8   (size)
-            0x10, 0,        // PUSH1 0   (offset)
-            0xB6,           // RETURN
+            0x10, 0x42, // PUSH1 0x42  (val)
+            0x10, 0,    // PUSH1 0     (offset)
+            0x92, // MSTORE8
+            0x10, 8, // PUSH1 8   (size)
+            0x10, 0,    // PUSH1 0   (offset)
+            0xB6, // RETURN
         ];
         env.state.set_code("probe", code).unwrap();
         let ctx = CallContext {
@@ -4960,12 +5687,17 @@ mod tests {
         };
         match env.execute_frame(&ctx) {
             CallOutcome::Success { return_data, .. } => {
-                assert_eq!(return_data.len(), 8,
-                    "RETURN with out-of-bounds window must produce the requested size, got {:?}", return_data);
-                assert_eq!(return_data[0], 0x42,
-                    "first byte must be the MSTORE8 value");
-                assert!(return_data[1..].iter().all(|&b| b == 0),
-                    "remaining bytes must be zero-filled");
+                assert_eq!(
+                    return_data.len(),
+                    8,
+                    "RETURN with out-of-bounds window must produce the requested size, got {:?}",
+                    return_data
+                );
+                assert_eq!(return_data[0], 0x42, "first byte must be the MSTORE8 value");
+                assert!(
+                    return_data[1..].iter().all(|&b| b == 0),
+                    "remaining bytes must be zero-filled"
+                );
             }
             other => panic!("expected Success, got {:?}", other),
         }
@@ -4985,21 +5717,30 @@ mod tests {
             address: "nowhere".into(),
             code_address: "nowhere".into(),
             caller: "caller".into(),
-            value: 500,                  // value is set
+            value: 500, // value is set
             gas_limit: 100_000,
             calldata: vec![],
             is_static: false,
             depth: 0,
-            is_delegate: true,           // delegate → parent already paid
+            is_delegate: true, // delegate → parent already paid
         };
         let result = env.execute_frame(&ctx);
-        assert!(matches!(result, CallOutcome::Success { .. }),
-            "delegate to empty code must succeed, got {:?}", result);
+        assert!(
+            matches!(result, CallOutcome::Success { .. }),
+            "delegate to empty code must succeed, got {:?}",
+            result
+        );
 
-        assert_eq!(env.state.get_balance("caller"), 1_000,
-            "delegate to empty code must not debit caller");
-        assert_eq!(env.state.get_balance("nowhere"), 0,
-            "delegate to empty code must not credit target");
+        assert_eq!(
+            env.state.get_balance("caller"),
+            1_000,
+            "delegate to empty code must not debit caller"
+        );
+        assert_eq!(
+            env.state.get_balance("nowhere"),
+            0,
+            "delegate to empty code must not credit target"
+        );
     }
 
     // M-P0-11/P1-7 — load_contract_from_storage must reject code that
@@ -5014,8 +5755,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let storage = ContractStorage::new(dir.to_str().unwrap())
-            .expect("open contract storage");
+        let storage = ContractStorage::new(dir.to_str().unwrap()).expect("open contract storage");
 
         // Plant an account row with a FAKE code_hash that doesn't
         // correspond to the code we're about to plant.
@@ -5032,11 +5772,17 @@ mod tests {
 
         let mut env = make_env();
         let result = env.load_contract_from_storage(&storage, "victim");
-        assert!(result.is_err(),
-            "code_hash mismatch must be rejected, got {:?}", result);
+        assert!(
+            result.is_err(),
+            "code_hash mismatch must be rejected, got {:?}",
+            result
+        );
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("code_hash mismatch"),
-            "error must describe the mismatch, got: {}", msg);
+        assert!(
+            msg.contains("code_hash mismatch"),
+            "error must describe the mismatch, got: {}",
+            msg
+        );
     }
 
     // M-P1-2 — resolve_address probes every ShadowDAG subtype, not
@@ -5056,7 +5802,9 @@ mod tests {
         // popping the EOA body.
         let body = VmAddressBody::from_any(&eoa_addr).to_u256();
         let resolved = env.resolve_address(body);
-        assert_eq!(resolved, eoa_addr,
-            "resolve_address must probe the 't' subtype for loaded EOAs");
+        assert_eq!(
+            resolved, eoa_addr,
+            "resolve_address must probe the 't' subtype for loaded EOAs"
+        );
     }
 }

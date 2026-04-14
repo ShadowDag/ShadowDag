@@ -15,11 +15,13 @@
 //   shadowdag-node genesis                  # Show genesis block info
 // ═══════════════════════════════════════════════════════════════════════════
 
-use shadowdag::daemon::DaemonNode;
-use shadowdag::config::node::node_config::{NodeConfig, NetworkMode};
-use shadowdag::config::genesis::genesis::{genesis_info, verify_genesis_detailed, create_genesis_block_for};
 use shadowdag::config::consensus::emission_schedule::EmissionSchedule;
-use shadowdag::{slog_info, slog_error};
+use shadowdag::config::genesis::genesis::{
+    create_genesis_block_for, genesis_info, verify_genesis_detailed,
+};
+use shadowdag::config::node::node_config::{NetworkMode, NodeConfig};
+use shadowdag::daemon::DaemonNode;
+use shadowdag::{slog_error, slog_info};
 
 // ── Boot error type ─────────────────────────────────────────────────────
 // Lightweight enum for CLI-level errors that don't belong in the library.
@@ -41,10 +43,10 @@ impl BootError {
     /// Error category for structured logging
     fn category(&self) -> &'static str {
         match self {
-            BootError::InvalidArg(_)   => "config",
+            BootError::InvalidArg(_) => "config",
             BootError::GenesisFailed(_) => "genesis",
-            BootError::InitFailed(_)    => "init",
-            BootError::StartFailed(_)   => "start",
+            BootError::InitFailed(_) => "init",
+            BootError::StartFailed(_) => "start",
         }
     }
 }
@@ -52,10 +54,10 @@ impl BootError {
 impl std::fmt::Display for BootError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BootError::InvalidArg(msg)   => write!(f, "invalid argument: {}", msg),
+            BootError::InvalidArg(msg) => write!(f, "invalid argument: {}", msg),
             BootError::GenesisFailed(msg) => write!(f, "genesis verification failed: {}", msg),
-            BootError::InitFailed(msg)    => write!(f, "initialization failed: {}", msg),
-            BootError::StartFailed(msg)   => write!(f, "start failed: {}", msg),
+            BootError::InitFailed(msg) => write!(f, "initialization failed: {}", msg),
+            BootError::StartFailed(msg) => write!(f, "start failed: {}", msg),
         }
     }
 }
@@ -67,10 +69,22 @@ fn main() {
     // Handle subcommands (these never fail -- no Result needed)
     if args.len() > 1 {
         match args[1].as_str() {
-            "info" | "--info" => { print_info(); return; }
-            "genesis" | "--genesis" => { print_genesis(&args); return; }
-            "version" | "--version" | "-v" => { print_version(); return; }
-            "help" | "--help" | "-h" => { print_help(); return; }
+            "info" | "--info" => {
+                print_info();
+                return;
+            }
+            "genesis" | "--genesis" => {
+                print_genesis(&args);
+                return;
+            }
+            "version" | "--version" | "-v" => {
+                print_version();
+                return;
+            }
+            "help" | "--help" | "-h" => {
+                print_help();
+                return;
+            }
             _ => {} // Fall through to node startup
         }
     }
@@ -151,7 +165,9 @@ fn run(args: &[String]) -> Result<(), BootError> {
     let genesis = create_genesis_block_for(&cfg.network);
     if let Err(reason) = verify_genesis_detailed(&genesis, &cfg.network) {
         return Err(BootError::GenesisFailed(format!(
-            "{} (network: {})", reason, cfg.network.name()
+            "{} (network: {})",
+            reason,
+            cfg.network.name()
         )));
     }
 
@@ -173,16 +189,17 @@ fn run(args: &[String]) -> Result<(), BootError> {
     if let Err(e) = cfg.init_dirs() {
         return Err(BootError::InitFailed(format!(
             "failed to initialize data directories at '{}': {}",
-            cfg.data_dir.display(), e
+            cfg.data_dir.display(),
+            e
         )));
     }
 
     // ── Phase 4: Initialize daemon (DB, DAG, consensus) ──────────────
-    let mut daemon = DaemonNode::new(cfg)
-        .map_err(|e| BootError::InitFailed(e.to_string()))?;
+    let mut daemon = DaemonNode::new(cfg).map_err(|e| BootError::InitFailed(e.to_string()))?;
 
     // ── Phase 5: Start network services (P2P, RPC) ───────────────────
-    daemon.start()
+    daemon
+        .start()
         .map_err(|e| BootError::StartFailed(e.to_string()))?;
 
     slog_info!("node", "all_services_started");
@@ -197,7 +214,8 @@ fn parse_config(args: &[String]) -> Result<NodeConfig, BootError> {
     let network_mode = parse_flag(args, "--network", "mainnet")?;
     let network: NetworkMode = network_mode.parse().map_err(|_| {
         BootError::InvalidArg(format!(
-            "--network '{}' is not valid. Use: mainnet, testnet, or regtest", network_mode
+            "--network '{}' is not valid. Use: mainnet, testnet, or regtest",
+            network_mode
         ))
     })?;
 
@@ -212,9 +230,15 @@ fn parse_config(args: &[String]) -> Result<NodeConfig, BootError> {
     let data_dir: Option<String> = parse_flag_opt(args, "--data-dir")?;
 
     let mut cfg = NodeConfig::for_network(network);
-    if let Some(port) = rpc_port { cfg.rpc_port = port; }
-    if let Some(port) = p2p_port { cfg.p2p_port = port; }
-    if let Some(dir)  = data_dir { cfg.data_dir = std::path::PathBuf::from(dir); }
+    if let Some(port) = rpc_port {
+        cfg.rpc_port = port;
+    }
+    if let Some(port) = p2p_port {
+        cfg.p2p_port = port;
+    }
+    if let Some(dir) = data_dir {
+        cfg.data_dir = std::path::PathBuf::from(dir);
+    }
 
     Ok(cfg)
 }
@@ -250,7 +274,7 @@ fn print_genesis(args: &[String]) {
         }
     };
     let mode: NetworkMode = match network.parse() {
-        Ok(m)  => m,
+        Ok(m) => m,
         Err(_) => {
             slog_error!("node", "invalid_network", value => &network);
             return;
@@ -291,12 +315,14 @@ fn parse_flag(args: &[String], name: &str, default: &str) -> Result<String, Boot
 fn parse_port(s: &str, flag_name: &str) -> Result<u16, BootError> {
     let port = s.parse::<u16>().map_err(|_| {
         BootError::InvalidArg(format!(
-            "{} value '{}' is not valid (must be 1-65535)", flag_name, s
+            "{} value '{}' is not valid (must be 1-65535)",
+            flag_name, s
         ))
     })?;
     if port == 0 {
         return Err(BootError::InvalidArg(format!(
-            "{} value '0' is not valid (must be 1-65535)", flag_name
+            "{} value '0' is not valid (must be 1-65535)",
+            flag_name
         )));
     }
     Ok(port)
@@ -312,14 +338,16 @@ fn parse_flag_opt(args: &[String], name: &str) -> Result<Option<String>, BootErr
             return match args.get(i + 1) {
                 Some(val) if !val.starts_with("--") => Ok(Some(val.clone())),
                 _ => Err(BootError::InvalidArg(format!(
-                    "{} requires a value (e.g. {}=VALUE)", name, name
+                    "{} requires a value (e.g. {}=VALUE)",
+                    name, name
                 ))),
             };
         }
         if let Some(val) = arg.strip_prefix(&format!("{}=", name)) {
             if val.is_empty() {
                 return Err(BootError::InvalidArg(format!(
-                    "{} requires a non-empty value", name
+                    "{} requires a non-empty value",
+                    name
                 )));
             }
             return Ok(Some(val.to_string()));

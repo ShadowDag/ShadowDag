@@ -25,8 +25,8 @@
 //   - Difficulty adjusts per-second, not per-block
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
-use std::sync::atomic::{AtomicU64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// BPS rate profiles
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -44,19 +44,19 @@ pub enum BpsProfile {
 impl BpsProfile {
     pub fn bps(&self) -> u32 {
         match self {
-            BpsProfile::Standard       => 1,
+            BpsProfile::Standard => 1,
             BpsProfile::HighThroughput => 10,
-            BpsProfile::Ultra          => 32,
-            BpsProfile::Custom(n)      => (*n).clamp(1, 64),
+            BpsProfile::Ultra => 32,
+            BpsProfile::Custom(n) => (*n).clamp(1, 64),
         }
     }
 
     pub fn from_bps(bps: u32) -> Self {
         match bps {
-            1  => BpsProfile::Standard,
+            1 => BpsProfile::Standard,
             10 => BpsProfile::HighThroughput,
             32 => BpsProfile::Ultra,
-            n  => BpsProfile::Custom(n),
+            n => BpsProfile::Custom(n),
         }
     }
 }
@@ -65,29 +65,29 @@ impl BpsProfile {
 #[derive(Debug, Clone)]
 pub struct BpsParams {
     /// Blocks per second
-    pub bps:                 u32,
+    pub bps: u32,
     /// Target time between blocks in milliseconds
-    pub block_interval_ms:   u64,
+    pub block_interval_ms: u64,
     /// GHOSTDAG K parameter (scales with BPS)
-    pub ghostdag_k:          usize,
+    pub ghostdag_k: usize,
     /// Maximum parents per block (scales with BPS)
-    pub max_parents:         usize,
+    pub max_parents: usize,
     /// Difficulty adjustment window (in seconds, not blocks)
     pub difficulty_window_sec: u64,
     /// Maximum DAG width (parallel blocks at same height)
-    pub max_dag_width:       usize,
+    pub max_dag_width: usize,
     /// Merge depth (finality depth in seconds)
-    pub merge_depth_sec:     u64,
+    pub merge_depth_sec: u64,
     /// Pruning depth (in seconds)
-    pub pruning_depth_sec:   u64,
+    pub pruning_depth_sec: u64,
     /// Median time window (number of blocks)
-    pub median_time_window:  usize,
+    pub median_time_window: usize,
     /// Maximum block size (bytes) — smaller at higher BPS
-    pub max_block_size:      usize,
+    pub max_block_size: usize,
     /// Maximum transactions per block — smaller at higher BPS
-    pub max_block_txs:       usize,
+    pub max_block_txs: usize,
     /// Theoretical max TPS
-    pub max_tps:             u64,
+    pub max_tps: u64,
 }
 
 impl BpsParams {
@@ -98,41 +98,47 @@ impl BpsParams {
 
         Self {
             bps,
-            block_interval_ms:    1000 / bps_u64,
-            ghostdag_k:           (18 * bps as usize).max(18),
-            max_parents:          (8 * bps as usize).min(256),
+            block_interval_ms: 1000 / bps_u64,
+            ghostdag_k: (18 * bps as usize).max(18),
+            max_parents: (8 * bps as usize).min(256),
             difficulty_window_sec: 60, // Always 60 seconds regardless of BPS
-            max_dag_width:        bps as usize * 4,
-            merge_depth_sec:      3600,      // 1 hour finality
-            pruning_depth_sec:    86400 * 3, // 3 days
-            median_time_window:   (263 * bps as usize).min(2048),
-            max_block_size:       2 * 1024 * 1024, // 2 MB per block regardless of BPS
-            max_block_txs:        10_000,          // Constant per-block capacity
-            max_tps:              bps_u64 * 10_000, // BPS * txs_per_block
+            max_dag_width: bps as usize * 4,
+            merge_depth_sec: 3600,        // 1 hour finality
+            pruning_depth_sec: 86400 * 3, // 3 days
+            median_time_window: (263 * bps as usize).min(2048),
+            max_block_size: 2 * 1024 * 1024, // 2 MB per block regardless of BPS
+            max_block_txs: 10_000,           // Constant per-block capacity
+            max_tps: bps_u64 * 10_000,       // BPS * txs_per_block
         }
     }
 
-    pub fn standard()       -> Self { Self::for_bps(1) }
-    pub fn high_throughput() -> Self { Self::for_bps(10) }
-    pub fn ultra()          -> Self { Self::for_bps(32) }
+    pub fn standard() -> Self {
+        Self::for_bps(1)
+    }
+    pub fn high_throughput() -> Self {
+        Self::for_bps(10)
+    }
+    pub fn ultra() -> Self {
+        Self::for_bps(32)
+    }
 }
 
 /// BPS Engine — manages block production timing and DAG width
 pub struct BpsEngine {
     /// Current BPS profile
-    profile:         BpsProfile,
+    profile: BpsProfile,
     /// Computed parameters
-    params:          BpsParams,
+    params: BpsParams,
     /// Blocks produced in current second
     blocks_this_sec: AtomicU32,
     /// Current second timestamp
-    current_sec:     AtomicU64,
+    current_sec: AtomicU64,
     /// Total blocks produced
-    total_blocks:    AtomicU64,
+    total_blocks: AtomicU64,
     /// Total transactions processed
-    total_txs:       AtomicU64,
+    total_txs: AtomicU64,
     /// Start time for throughput measurement
-    start_time:      Instant,
+    start_time: Instant,
 }
 
 impl BpsEngine {
@@ -142,10 +148,10 @@ impl BpsEngine {
             profile,
             params,
             blocks_this_sec: AtomicU32::new(0),
-            current_sec:     AtomicU64::new(Self::now_secs()),
-            total_blocks:    AtomicU64::new(0),
-            total_txs:       AtomicU64::new(0),
-            start_time:      Instant::now(),
+            current_sec: AtomicU64::new(Self::now_secs()),
+            total_blocks: AtomicU64::new(0),
+            total_txs: AtomicU64::new(0),
+            start_time: Instant::now(),
         }
     }
 
@@ -158,7 +164,11 @@ impl BpsEngine {
 
         if now != sec {
             // New second — try to reset (CAS prevents double-reset)
-            if self.current_sec.compare_exchange(sec, now, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            if self
+                .current_sec
+                .compare_exchange(sec, now, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
                 self.blocks_this_sec.store(0, Ordering::SeqCst);
             }
         }
@@ -169,7 +179,11 @@ impl BpsEngine {
             if count >= self.params.bps {
                 return false;
             }
-            if self.blocks_this_sec.compare_exchange(count, count + 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            if self
+                .blocks_this_sec
+                .compare_exchange(count, count + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
                 return true;
             }
             // CAS failed — another thread incremented, retry
@@ -198,28 +212,44 @@ impl BpsEngine {
     /// Current observed throughput (blocks per second)
     pub fn observed_bps(&self) -> f64 {
         let elapsed = self.start_time.elapsed().as_secs_f64();
-        if elapsed < 0.001 { return 0.0; }
+        if elapsed < 0.001 {
+            return 0.0;
+        }
         self.total_blocks.load(Ordering::Relaxed) as f64 / elapsed
     }
 
     /// Current observed TPS (transactions per second)
     pub fn observed_tps(&self) -> f64 {
         let elapsed = self.start_time.elapsed().as_secs_f64();
-        if elapsed < 0.001 { return 0.0; }
+        if elapsed < 0.001 {
+            return 0.0;
+        }
         self.total_txs.load(Ordering::Relaxed) as f64 / elapsed
     }
 
     /// Get current parameters
-    pub fn params(&self) -> &BpsParams { &self.params }
-    pub fn profile(&self) -> &BpsProfile { &self.profile }
-    pub fn bps(&self) -> u32 { self.params.bps }
+    pub fn params(&self) -> &BpsParams {
+        &self.params
+    }
+    pub fn profile(&self) -> &BpsProfile {
+        &self.profile
+    }
+    pub fn bps(&self) -> u32 {
+        self.params.bps
+    }
 
     /// Get total stats
-    pub fn total_blocks(&self) -> u64 { self.total_blocks.load(Ordering::Relaxed) }
-    pub fn total_txs(&self) -> u64 { self.total_txs.load(Ordering::Relaxed) }
+    pub fn total_blocks(&self) -> u64 {
+        self.total_blocks.load(Ordering::Relaxed)
+    }
+    pub fn total_txs(&self) -> u64 {
+        self.total_txs.load(Ordering::Relaxed)
+    }
 
     /// Maximum theoretical TPS for current profile
-    pub fn max_tps(&self) -> u64 { self.params.max_tps }
+    pub fn max_tps(&self) -> u64 {
+        self.params.max_tps
+    }
 
     /// Human-readable status
     pub fn status(&self) -> String {
@@ -234,11 +264,17 @@ impl BpsEngine {
     }
 
     fn now_secs() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 
     fn now_ms() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
     }
 }
 

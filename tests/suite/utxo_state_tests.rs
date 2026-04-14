@@ -5,9 +5,9 @@
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use crate::infrastructure::storage::rocksdb::utxo::utxo_store::UtxoStore;
     use crate::domain::utxo::utxo_set::UtxoSet;
+    use crate::infrastructure::storage::rocksdb::utxo::utxo_store::UtxoStore;
+    use std::sync::Arc;
 
     // ── helpers ──────────────────────────────────────────────────────────
     fn tmp_store(suffix: &str) -> UtxoStore {
@@ -28,7 +28,12 @@ mod tests {
     #[test]
     fn create_utxo_and_retrieve() {
         let store = tmp_utxo_set("create");
-        store.add_utxo_str("txhash_0001:0", "owner_a".into(), 5_000, "shadow1addr_a".into());
+        store.add_utxo_str(
+            "txhash_0001:0",
+            "owner_a".into(),
+            5_000,
+            "shadow1addr_a".into(),
+        );
 
         let utxo = store.get_utxo_str("txhash_0001:0");
         assert!(utxo.is_some(), "utxo must be found after insertion");
@@ -42,7 +47,12 @@ mod tests {
     #[test]
     fn spend_utxo_marks_it_spent() {
         let store = tmp_utxo_set("spend");
-        store.add_utxo_str("txhash_0002:0", "owner_b".into(), 3_000, "shadow1addr_b".into());
+        store.add_utxo_str(
+            "txhash_0002:0",
+            "owner_b".into(),
+            3_000,
+            "shadow1addr_b".into(),
+        );
         store.spend_utxo_str("txhash_0002:0").unwrap();
 
         let utxo = store.get_utxo_str("txhash_0002:0");
@@ -62,7 +72,12 @@ mod tests {
     #[test]
     fn exists_returns_true_after_add() {
         let store = tmp_utxo_set("exists");
-        store.add_utxo_str("txhash_0004:0", "owner_d".into(), 1_000, "shadow1addr_d".into());
+        store.add_utxo_str(
+            "txhash_0004:0",
+            "owner_d".into(),
+            1_000,
+            "shadow1addr_d".into(),
+        );
         assert!(store.exists_str("txhash_0004:0"));
     }
 
@@ -76,7 +91,12 @@ mod tests {
     #[test]
     fn exists_spendable_returns_true_for_unspent_regular_utxo() {
         let store = tmp_utxo_set("spendable_regular");
-        store.add_utxo_str("txhash_0005:0", "owner_e".into(), 2_000, "shadow1addr_e".into());
+        store.add_utxo_str(
+            "txhash_0005:0",
+            "owner_e".into(),
+            2_000,
+            "shadow1addr_e".into(),
+        );
         // Non-coinbase utxo → no maturity check
         assert!(store.exists_spendable_str("txhash_0005:0", 100));
     }
@@ -84,7 +104,12 @@ mod tests {
     #[test]
     fn exists_spendable_returns_false_for_spent_utxo() {
         let store = tmp_utxo_set("spendable_spent");
-        store.add_utxo_str("txhash_0006:0", "owner_f".into(), 2_000, "shadow1addr_f".into());
+        store.add_utxo_str(
+            "txhash_0006:0",
+            "owner_f".into(),
+            2_000,
+            "shadow1addr_f".into(),
+        );
         store.spend_utxo_str("txhash_0006:0").unwrap();
         assert!(!store.exists_spendable_str("txhash_0006:0", 100));
     }
@@ -129,9 +154,24 @@ mod tests {
     fn get_balance_sums_unspent_utxos_for_address() {
         let store = tmp_utxo_set("balance_sum");
         let addr = "shadow1balance_addr".to_string();
-        store.add_utxo_str("aa00000000000000000000000000000000000000000000000000000000000001:0", "owner".into(), 1_000, addr.clone());
-        store.add_utxo_str("aa00000000000000000000000000000000000000000000000000000000000002:0", "owner".into(), 2_000, addr.clone());
-        store.add_utxo_str("aa00000000000000000000000000000000000000000000000000000000000003:0", "owner".into(), 3_000, addr.clone());
+        store.add_utxo_str(
+            "aa00000000000000000000000000000000000000000000000000000000000001:0",
+            "owner".into(),
+            1_000,
+            addr.clone(),
+        );
+        store.add_utxo_str(
+            "aa00000000000000000000000000000000000000000000000000000000000002:0",
+            "owner".into(),
+            2_000,
+            addr.clone(),
+        );
+        store.add_utxo_str(
+            "aa00000000000000000000000000000000000000000000000000000000000003:0",
+            "owner".into(),
+            3_000,
+            addr.clone(),
+        );
 
         let balance = store.get_balance(&addr);
         assert_eq!(balance, 6_000, "Balance must sum all unspent utxos");
@@ -141,9 +181,21 @@ mod tests {
     fn get_balance_excludes_spent_utxos() {
         let store = tmp_utxo_set("balance_spent");
         let addr = "shadow1balance_spent_addr".to_string();
-        store.add_utxo_str("bb00000000000000000000000000000000000000000000000000000000000001:0", "owner".into(), 5_000, addr.clone());
-        store.add_utxo_str("bb00000000000000000000000000000000000000000000000000000000000002:0", "owner".into(), 3_000, addr.clone());
-        store.spend_utxo_str("bb00000000000000000000000000000000000000000000000000000000000001:0").unwrap();
+        store.add_utxo_str(
+            "bb00000000000000000000000000000000000000000000000000000000000001:0",
+            "owner".into(),
+            5_000,
+            addr.clone(),
+        );
+        store.add_utxo_str(
+            "bb00000000000000000000000000000000000000000000000000000000000002:0",
+            "owner".into(),
+            3_000,
+            addr.clone(),
+        );
+        store
+            .spend_utxo_str("bb00000000000000000000000000000000000000000000000000000000000001:0")
+            .unwrap();
 
         let balance = store.get_balance(&addr);
         assert_eq!(balance, 3_000, "Spent utxos must not count towards balance");
@@ -156,7 +208,10 @@ mod tests {
         store.add_utxo_str("ds_tx_001:0", "owner_ds".into(), 5_000, "shadow1ds".into());
         store.spend_utxo_checked_str("ds_tx_001:0", 200).unwrap(); // first spend OK
         let result = store.spend_utxo_checked_str("ds_tx_001:0", 200);
-        assert!(result.is_err(), "Second spend of same utxo must return error");
+        assert!(
+            result.is_err(),
+            "Second spend of same utxo must return error"
+        );
     }
 
     // ── 9. Persistence across reopen (simulates node restart) ────────────
@@ -169,7 +224,12 @@ mod tests {
         {
             let store = UtxoStore::new(path.as_str()).expect("open failed");
             let utxo_set = UtxoSet::new(Arc::new(store));
-            utxo_set.add_utxo_str("persist_tx:0", "owner_p".into(), 9_999, "shadow1persist".into());
+            utxo_set.add_utxo_str(
+                "persist_tx:0",
+                "owner_p".into(),
+                9_999,
+                "shadow1persist".into(),
+            );
         }
 
         // Second session: reopen and check
@@ -223,8 +283,18 @@ mod tests {
     #[test]
     fn balance_is_per_address() {
         let store = tmp_utxo_set("per_addr");
-        store.add_utxo_str("cc00000000000000000000000000000000000000000000000000000000000001:0", "owner_x".into(), 5_000, "shadow1_x".into());
-        store.add_utxo_str("cc00000000000000000000000000000000000000000000000000000000000002:0", "owner_y".into(), 8_000, "shadow1_y".into());
+        store.add_utxo_str(
+            "cc00000000000000000000000000000000000000000000000000000000000001:0",
+            "owner_x".into(),
+            5_000,
+            "shadow1_x".into(),
+        );
+        store.add_utxo_str(
+            "cc00000000000000000000000000000000000000000000000000000000000002:0",
+            "owner_y".into(),
+            8_000,
+            "shadow1_y".into(),
+        );
 
         assert_eq!(store.get_balance("shadow1_x"), 5_000);
         assert_eq!(store.get_balance("shadow1_y"), 8_000);

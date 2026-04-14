@@ -3,13 +3,12 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// Transaction type for VM routing. Transfer transactions go through the
 /// UTXO layer; ContractCreate and ContractCall are executed through
 /// ShadowVM v1 during block processing (see full_node.rs).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TxType {
     #[default]
     Transfer,
@@ -29,14 +28,13 @@ pub enum TxType {
     DexOrder,
 }
 
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TxInput {
-    pub txid:      String,
-    pub index:     u32,
-    pub owner:     String,
+    pub txid: String,
+    pub index: u32,
+    pub owner: String,
     pub signature: String,
-    pub pub_key:   String,
+    pub pub_key: String,
     /// Key image for double-spend prevention in privacy transactions.
     /// Hex-encoded compressed Ristretto point. None for transparent TXs.
     #[serde(default)]
@@ -50,7 +48,7 @@ pub struct TxInput {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TxOutput {
     pub address: String,
-    pub amount:  u64,
+    pub amount: u64,
     /// Pedersen commitment hiding the real amount (hex).
     /// None for transparent TXs — amount field is used directly.
     #[serde(default)]
@@ -67,11 +65,11 @@ pub struct TxOutput {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Transaction {
-    pub hash:        String,
-    pub inputs:      Vec<TxInput>,
-    pub outputs:     Vec<TxOutput>,
-    pub fee:         u64,
-    pub timestamp:   u64,
+    pub hash: String,
+    pub inputs: Vec<TxInput>,
+    pub outputs: Vec<TxOutput>,
+    pub fee: u64,
+    pub timestamp: u64,
     #[serde(default)]
     pub is_coinbase: bool,
     #[serde(default)]
@@ -102,31 +100,44 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn new(
-        hash:      String,
-        inputs:    Vec<TxInput>,
-        outputs:   Vec<TxOutput>,
-        fee:       u64,
+        hash: String,
+        inputs: Vec<TxInput>,
+        outputs: Vec<TxOutput>,
+        fee: u64,
         timestamp: u64,
     ) -> Self {
         Self {
-            hash, inputs, outputs, fee, timestamp,
-            is_coinbase: false, tx_type: TxType::Transfer, payload_hash: None,
-            gas_limit: None, deploy_code: None, calldata: None,
-            contract_address: None, vm_version: None,
+            hash,
+            inputs,
+            outputs,
+            fee,
+            timestamp,
+            is_coinbase: false,
+            tx_type: TxType::Transfer,
+            payload_hash: None,
+            gas_limit: None,
+            deploy_code: None,
+            calldata: None,
+            contract_address: None,
+            vm_version: None,
         }
     }
 
-    pub fn new_coinbase(
-        hash:    String,
-        outputs: Vec<TxOutput>,
-        fee:     u64,
-        timestamp: u64,
-    ) -> Self {
+    pub fn new_coinbase(hash: String, outputs: Vec<TxOutput>, fee: u64, timestamp: u64) -> Self {
         Self {
-            hash, inputs: vec![], outputs, fee, timestamp,
-            is_coinbase: true, tx_type: TxType::Transfer, payload_hash: None,
-            gas_limit: None, deploy_code: None, calldata: None,
-            contract_address: None, vm_version: None,
+            hash,
+            inputs: vec![],
+            outputs,
+            fee,
+            timestamp,
+            is_coinbase: true,
+            tx_type: TxType::Transfer,
+            payload_hash: None,
+            gas_limit: None,
+            deploy_code: None,
+            calldata: None,
+            contract_address: None,
+            vm_version: None,
         }
     }
 
@@ -171,20 +182,20 @@ impl Transaction {
         let mut buf = Vec::with_capacity(
             8 + 8 + // fee + timestamp
             4 + self.inputs.len() * 48 +
-            4 + self.outputs.len() * 48
+            4 + self.outputs.len() * 48,
         );
 
         // 1. tx_type discriminant (u8) — prevents cross-type hash collisions
         let tx_type_byte: u8 = match self.tx_type {
-            TxType::Transfer       => 0x00,
-            TxType::Confidential   => 0x01,
+            TxType::Transfer => 0x00,
+            TxType::Confidential => 0x01,
             TxType::ContractCreate => 0x02,
-            TxType::ContractCall   => 0x03,
-            TxType::AtomicSwap     => 0x04,
-            TxType::MultiSig       => 0x05,
-            TxType::TokenTransfer  => 0x06,
-            TxType::SwapTx         => 0x07,
-            TxType::DexOrder       => 0x08,
+            TxType::ContractCall => 0x03,
+            TxType::AtomicSwap => 0x04,
+            TxType::MultiSig => 0x05,
+            TxType::TokenTransfer => 0x06,
+            TxType::SwapTx => 0x07,
+            TxType::DexOrder => 0x08,
         };
         buf.push(tx_type_byte);
 
@@ -200,7 +211,9 @@ impl Transaction {
         // 3. inputs — sorted by (txid, index) for determinism
         let mut sorted_indices: Vec<usize> = (0..self.inputs.len()).collect();
         sorted_indices.sort_unstable_by(|&a, &b| {
-            self.inputs[a].txid.cmp(&self.inputs[b].txid)
+            self.inputs[a]
+                .txid
+                .cmp(&self.inputs[b].txid)
                 .then(self.inputs[a].index.cmp(&self.inputs[b].index))
         });
 
@@ -361,29 +374,67 @@ impl Transaction {
 }
 
 impl TxInput {
-    pub fn new(txid: String, index: u32, owner: String, signature: String, pub_key: String) -> Self {
-        Self { txid, index, owner, signature, pub_key, key_image: None, ring_members: None }
+    pub fn new(
+        txid: String,
+        index: u32,
+        owner: String,
+        signature: String,
+        pub_key: String,
+    ) -> Self {
+        Self {
+            txid,
+            index,
+            owner,
+            signature,
+            pub_key,
+            key_image: None,
+            ring_members: None,
+        }
     }
 
     /// Create a privacy input with key image and ring members
     pub fn new_confidential(
-        txid: String, index: u32, owner: String,
-        signature: String, pub_key: String,
-        key_image: String, ring_members: Vec<String>,
+        txid: String,
+        index: u32,
+        owner: String,
+        signature: String,
+        pub_key: String,
+        key_image: String,
+        ring_members: Vec<String>,
     ) -> Self {
-        Self { txid, index, owner, signature, pub_key, key_image: Some(key_image), ring_members: Some(ring_members) }
+        Self {
+            txid,
+            index,
+            owner,
+            signature,
+            pub_key,
+            key_image: Some(key_image),
+            ring_members: Some(ring_members),
+        }
     }
 }
 
 impl TxOutput {
     /// Create a transparent output (plaintext amount)
     pub fn new(address: String, amount: u64) -> Self {
-        Self { address, amount, commitment: None, range_proof: None, ephemeral_pubkey: None }
+        Self {
+            address,
+            amount,
+            commitment: None,
+            range_proof: None,
+            ephemeral_pubkey: None,
+        }
     }
 
     /// Create a confidential output (hidden amount with commitment + range proof)
     pub fn new_confidential(address: String, commitment: String, range_proof: String) -> Self {
-        Self { address, amount: 0, commitment: Some(commitment), range_proof: Some(range_proof), ephemeral_pubkey: None }
+        Self {
+            address,
+            amount: 0,
+            commitment: Some(commitment),
+            range_proof: Some(range_proof),
+            ephemeral_pubkey: None,
+        }
     }
 
     /// Returns true if this output uses a Pedersen commitment

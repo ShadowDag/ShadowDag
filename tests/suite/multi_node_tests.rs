@@ -6,10 +6,8 @@
 
 #[cfg(test)]
 mod multi_node_determinism {
+    use crate::domain::transaction::tx_receipt::{compute_receipt_root, TxReceipt};
     use crate::runtime::vm::core::execution_env::*;
-    use crate::runtime::vm::core::vm::OpCode;
-    use crate::runtime::vm::core::state_manager::StateManager;
-    use crate::domain::transaction::tx_receipt::{TxReceipt, compute_receipt_root};
 
     const PUSH1: u8 = 0x10;
     const SSTORE: u8 = 0x51;
@@ -20,7 +18,6 @@ mod multi_node_determinism {
     const MSTORE: u8 = 0x91;
     const RETURN: u8 = 0xB6;
     const REVERT: u8 = 0xB7;
-    const CALL: u8 = 0xB0;
 
     fn make_env(block_hash: &str) -> ExecutionEnvironment {
         ExecutionEnvironment::new(BlockContext {
@@ -30,7 +27,11 @@ mod multi_node_determinism {
         })
     }
 
-    fn deploy_and_call(env: &mut ExecutionEnvironment, code: Vec<u8>, calldata: Vec<u8>) -> CallOutcome {
+    fn deploy_and_call(
+        env: &mut ExecutionEnvironment,
+        code: Vec<u8>,
+        calldata: Vec<u8>,
+    ) -> CallOutcome {
         env.state.set_code("contract", code).unwrap();
         let ctx = CallContext {
             address: "contract".into(),
@@ -60,10 +61,19 @@ mod multi_node_determinism {
         let result_a = deploy_and_call(&mut node_a, code.clone(), vec![]);
         let result_b = deploy_and_call(&mut node_b, code, vec![]);
 
-        let gas_a = match result_a { CallOutcome::Success { gas_used, .. } => gas_used, _ => panic!("A failed") };
-        let gas_b = match result_b { CallOutcome::Success { gas_used, .. } => gas_used, _ => panic!("B failed") };
+        let gas_a = match result_a {
+            CallOutcome::Success { gas_used, .. } => gas_used,
+            _ => panic!("A failed"),
+        };
+        let gas_b = match result_b {
+            CallOutcome::Success { gas_used, .. } => gas_used,
+            _ => panic!("B failed"),
+        };
 
-        assert_eq!(gas_a, gas_b, "Same code must produce identical gas on different nodes");
+        assert_eq!(
+            gas_a, gas_b,
+            "Same code must produce identical gas on different nodes"
+        );
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -72,9 +82,7 @@ mod multi_node_determinism {
     #[test]
     fn determinism_same_storage_state() {
         let code = vec![
-            PUSH1, 99, PUSH1, 0, SSTORE,
-            PUSH1, 77, PUSH1, 1, SSTORE,
-            STOP
+            PUSH1, 99, PUSH1, 0, SSTORE, PUSH1, 77, PUSH1, 1, SSTORE, STOP,
         ];
         let block_hash = "bb".repeat(32);
 
@@ -128,8 +136,14 @@ mod multi_node_determinism {
         let result_a = deploy_and_call(&mut node_a, code.clone(), vec![]);
         let result_b = deploy_and_call(&mut node_b, code, vec![]);
 
-        let gas_a = match result_a { CallOutcome::Success { gas_used, .. } => gas_used, _ => 0 };
-        let gas_b = match result_b { CallOutcome::Success { gas_used, .. } => gas_used, _ => 0 };
+        let gas_a = match result_a {
+            CallOutcome::Success { gas_used, .. } => gas_used,
+            _ => 0,
+        };
+        let gas_b = match result_b {
+            CallOutcome::Success { gas_used, .. } => gas_used,
+            _ => 0,
+        };
 
         // Build receipts
         let mut r_a = TxReceipt::new_pending("tx1".to_string(), 100, 1, 0);
@@ -162,25 +176,37 @@ mod multi_node_determinism {
             // TX 1: deploy and run code1
             env.state.set_code("contract", code1.clone()).unwrap();
             let ctx1 = CallContext {
-                address: "contract".into(), code_address: "contract".into(),
-                caller: "user".into(), value: 0, gas_limit: 10_000_000,
-                calldata: vec![], is_static: false, depth: 0, is_delegate: false,
+                address: "contract".into(),
+                code_address: "contract".into(),
+                caller: "user".into(),
+                value: 0,
+                gas_limit: 10_000_000,
+                calldata: vec![],
+                is_static: false,
+                depth: 0,
+                is_delegate: false,
             };
             env.execute_frame(&ctx1);
 
             // TX 2: update code and run code2
             env.state.set_code("contract", code2.clone()).unwrap();
             let ctx2 = CallContext {
-                address: "contract".into(), code_address: "contract".into(),
-                caller: "user".into(), value: 0, gas_limit: 10_000_000,
-                calldata: vec![], is_static: false, depth: 0, is_delegate: false,
+                address: "contract".into(),
+                code_address: "contract".into(),
+                caller: "user".into(),
+                value: 0,
+                gas_limit: 10_000_000,
+                calldata: vec![],
+                is_static: false,
+                depth: 0,
+                is_delegate: false,
             };
             env.execute_frame(&ctx2);
 
             // Verify state
             let slot0 = env.state.storage_load("contract", "slot:0");
             let slot1 = env.state.storage_load("contract", "slot:1");
-            let root = env.state.state_root();
+            let _root = env.state.state_root();
 
             // All nodes must agree
             assert!(slot0.is_some(), "{}: slot 0 should exist", label);
@@ -218,8 +244,10 @@ mod multi_node_determinism {
         deploy_and_call(&mut node_b, clean_code, vec![]);
 
         // Both should have the same storage state (empty — revert undid everything)
-        assert!(node_a.state.storage_load("contract", "slot:0").is_none(),
-            "Reverted storage should be empty");
+        assert!(
+            node_a.state.storage_load("contract", "slot:0").is_none(),
+            "Reverted storage should be empty"
+        );
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -227,10 +255,7 @@ mod multi_node_determinism {
     // ═════════════════════════════════════════════════════════════
     #[test]
     fn determinism_return_data() {
-        let code = vec![
-            PUSH1, 0xAB, PUSH1, 0, MSTORE,
-            PUSH1, 1, PUSH1, 31, RETURN,
-        ];
+        let code = vec![PUSH1, 0xAB, PUSH1, 0, MSTORE, PUSH1, 1, PUSH1, 31, RETURN];
         let block_hash = "11".repeat(32);
 
         let mut node_a = make_env(&block_hash);
@@ -239,8 +264,14 @@ mod multi_node_determinism {
         let result_a = deploy_and_call(&mut node_a, code.clone(), vec![]);
         let result_b = deploy_and_call(&mut node_b, code, vec![]);
 
-        let data_a = match result_a { CallOutcome::Success { return_data, .. } => return_data, _ => vec![] };
-        let data_b = match result_b { CallOutcome::Success { return_data, .. } => return_data, _ => vec![] };
+        let data_a = match result_a {
+            CallOutcome::Success { return_data, .. } => return_data,
+            _ => vec![],
+        };
+        let data_b = match result_b {
+            CallOutcome::Success { return_data, .. } => return_data,
+            _ => vec![],
+        };
 
         assert_eq!(data_a, data_b, "Return data must be identical across nodes");
         assert_eq!(data_a, vec![0xAB], "Return data should be 0xAB");

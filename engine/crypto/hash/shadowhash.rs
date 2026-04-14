@@ -3,15 +3,13 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rocksdb::{
-    DB, Options, WriteOptions, ReadOptions,
-    WriteBatch,
-    BlockBasedOptions, SliceTransform, Cache,
-};
-use std::path::Path;
 use crate::errors::StorageError;
 use crate::slog_error;
 use crate::slog_warn;
+use rocksdb::{
+    BlockBasedOptions, Cache, Options, ReadOptions, SliceTransform, WriteBatch, WriteOptions, DB,
+};
+use std::path::Path;
 
 use crate::domain::block::block::Block;
 use crate::engine::mining::algorithms::shadowhash::shadow_hash as algo_shadow_hash;
@@ -53,7 +51,6 @@ pub struct ShadowHashStore {
 }
 
 impl ShadowHashStore {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
@@ -65,7 +62,7 @@ impl ShadowHashStore {
         opts.increase_parallelism(
             std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4) as i32
+                .unwrap_or(4) as i32,
         );
 
         opts.optimize_level_style_compaction(256 * 1024 * 1024);
@@ -86,11 +83,12 @@ impl ShadowHashStore {
         opts.set_level_zero_slowdown_writes_trigger(20);
         opts.set_level_zero_stop_writes_trigger(36);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| crate::errors::StorageError::OpenFailed {
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| {
+            crate::errors::StorageError::OpenFailed {
                 path: path.to_string(),
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(false);
@@ -157,12 +155,10 @@ impl ShadowHashStore {
     // ─────────────────────────────────────────
     #[inline(always)]
     pub fn get_hash(&self, key: &str) -> Result<Option<String>, StorageError> {
-        Self::with_key(key, |k| {
-            match self.db.get_pinned_opt(k, &self.read_opts) {
-                Ok(Some(v)) => Ok(Self::slice_to_string(&v)),
-                Ok(None) => Ok(None),
-                Err(e) => Err(StorageError::Other(format!("get_hash: {}", e))),
-            }
+        Self::with_key(key, |k| match self.db.get_pinned_opt(k, &self.read_opts) {
+            Ok(Some(v)) => Ok(Self::slice_to_string(&v)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(StorageError::Other(format!("get_hash: {}", e))),
         })
     }
 
@@ -249,7 +245,9 @@ impl ShadowHashStore {
     // ─────────────────────────────────────────
     #[inline(always)]
     pub fn flush(&self) -> Result<(), StorageError> {
-        self.db.flush().map_err(|e| StorageError::WriteFailed(format!("flush: {}", e)))
+        self.db
+            .flush()
+            .map_err(|e| StorageError::WriteFailed(format!("flush: {}", e)))
     }
 
     // ─────────────────────────────────────────

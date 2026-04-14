@@ -23,19 +23,21 @@
 //   5. One-time private key: x = hs + s  (for spending)
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::errors::CryptoError;
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
-use sha2::{Sha256, Digest};
 use rand::rngs::OsRng;
 use rand::RngCore;
-use crate::errors::CryptoError;
+use sha2::{Digest, Sha256};
 
-const DOMAIN_DH:  &[u8] = b"ShadowDAG_StealthDH_v1";
+const DOMAIN_DH: &[u8] = b"ShadowDAG_StealthDH_v1";
 const DOMAIN_SIMPLE: &[u8] = b"ShadowDAG_Stealth_v1";
 
 /// Generator point G (Ristretto basepoint)
-fn g() -> RistrettoPoint { RISTRETTO_BASEPOINT_POINT }
+fn g() -> RistrettoPoint {
+    RISTRETTO_BASEPOINT_POINT
+}
 
 /// Derive a deterministic Scalar from a shared-secret RistrettoPoint.
 ///
@@ -80,17 +82,17 @@ pub struct StealthAddressResult {
     /// Ephemeral public key R that the sender broadcasts (64 hex chars, compressed)
     pub ephemeral_pubkey: String,
     /// The one-time public key P on the curve (compressed, 64 hex chars)
-    pub one_time_pubkey:  String,
+    pub one_time_pubkey: String,
 }
 
 /// Stealth address keys published by the recipient.
 /// Private keys are Scalars; public keys are RistrettoPoints.
 #[derive(Debug, Clone)]
 pub struct StealthKeys {
-    pub view_private:  Scalar,
-    pub view_public:   RistrettoPoint,
+    pub view_private: Scalar,
+    pub view_public: RistrettoPoint,
     pub spend_private: Scalar,
-    pub spend_public:  RistrettoPoint,
+    pub spend_public: RistrettoPoint,
 }
 
 impl StealthKeys {
@@ -143,7 +145,7 @@ impl StealthAddress {
     /// public keys. The returned `ephemeral_pubkey` must be included in the
     /// transaction so the recipient can scan for it.
     pub fn generate_full(
-        recipient_view_pub:  &RistrettoPoint,
+        recipient_view_pub: &RistrettoPoint,
         recipient_spend_pub: &RistrettoPoint,
     ) -> Result<StealthAddressResult, CryptoError> {
         Self::generate_full_for_network(recipient_view_pub, recipient_spend_pub, "mainnet")
@@ -151,7 +153,7 @@ impl StealthAddress {
 
     /// Generate a stealth address using real ECDH on Ristretto with explicit network.
     pub fn generate_full_for_network(
-        recipient_view_pub:  &RistrettoPoint,
+        recipient_view_pub: &RistrettoPoint,
         recipient_spend_pub: &RistrettoPoint,
         network: &str,
     ) -> Result<StealthAddressResult, CryptoError> {
@@ -176,7 +178,7 @@ impl StealthAddress {
         Ok(StealthAddressResult {
             one_time_address: addr,
             ephemeral_pubkey: hex::encode(big_r.compress().as_bytes()),
-            one_time_pubkey:  hex::encode(compressed.as_bytes()),
+            one_time_pubkey: hex::encode(compressed.as_bytes()),
         })
     }
 
@@ -188,19 +190,23 @@ impl StealthAddress {
     /// even if the same ephemeral key were reused.  The scanner must use the
     /// same context values when checking ownership.
     pub fn generate_full_with_context(
-        recipient_view_pub:  &RistrettoPoint,
+        recipient_view_pub: &RistrettoPoint,
         recipient_spend_pub: &RistrettoPoint,
         tx_hash: &str,
         output_index: usize,
     ) -> Result<StealthAddressResult, CryptoError> {
         Self::generate_full_with_context_for_network(
-            recipient_view_pub, recipient_spend_pub, tx_hash, output_index, "mainnet",
+            recipient_view_pub,
+            recipient_spend_pub,
+            tx_hash,
+            output_index,
+            "mainnet",
         )
     }
 
     /// Generate a stealth address with domain separation context and explicit network.
     pub fn generate_full_with_context_for_network(
-        recipient_view_pub:  &RistrettoPoint,
+        recipient_view_pub: &RistrettoPoint,
         recipient_spend_pub: &RistrettoPoint,
         tx_hash: &str,
         output_index: usize,
@@ -218,23 +224,27 @@ impl StealthAddress {
         Ok(StealthAddressResult {
             one_time_address: addr,
             ephemeral_pubkey: hex::encode(big_r.compress().as_bytes()),
-            one_time_pubkey:  hex::encode(compressed.as_bytes()),
+            one_time_pubkey: hex::encode(compressed.as_bytes()),
         })
     }
 
     /// Generate from raw 32-byte compressed keys (convenience wrapper).
     pub fn generate_full_from_bytes(
-        view_pub_bytes:  &[u8; 32],
+        view_pub_bytes: &[u8; 32],
         spend_pub_bytes: &[u8; 32],
     ) -> Result<StealthAddressResult, CryptoError> {
         let view_pub = CompressedRistretto::from_slice(view_pub_bytes)
             .map_err(|e| CryptoError::InvalidKey(format!("Invalid view pubkey: {}", e)))?
             .decompress()
-            .ok_or(CryptoError::InvalidKey("View pubkey not on curve".to_string()))?;
+            .ok_or(CryptoError::InvalidKey(
+                "View pubkey not on curve".to_string(),
+            ))?;
         let spend_pub = CompressedRistretto::from_slice(spend_pub_bytes)
             .map_err(|e| CryptoError::InvalidKey(format!("Invalid spend pubkey: {}", e)))?
             .decompress()
-            .ok_or(CryptoError::InvalidKey("Spend pubkey not on curve".to_string()))?;
+            .ok_or(CryptoError::InvalidKey(
+                "Spend pubkey not on curve".to_string(),
+            ))?;
         Self::generate_full(&view_pub, &spend_pub)
     }
 
@@ -245,18 +255,24 @@ impl StealthAddress {
     /// from the transaction to recompute the same shared secret.
     pub fn scan(
         ephemeral_pubkey: &RistrettoPoint,
-        view_private:     &Scalar,
-        spend_public:     &RistrettoPoint,
+        view_private: &Scalar,
+        spend_public: &RistrettoPoint,
         candidate_address: &str,
     ) -> Result<bool, CryptoError> {
-        Self::scan_for_network(ephemeral_pubkey, view_private, spend_public, candidate_address, "mainnet")
+        Self::scan_for_network(
+            ephemeral_pubkey,
+            view_private,
+            spend_public,
+            candidate_address,
+            "mainnet",
+        )
     }
 
     /// Check if a stealth address belongs to us with explicit network.
     pub fn scan_for_network(
         ephemeral_pubkey: &RistrettoPoint,
-        view_private:     &Scalar,
-        spend_public:     &RistrettoPoint,
+        view_private: &Scalar,
+        spend_public: &RistrettoPoint,
         candidate_address: &str,
         network: &str,
     ) -> Result<bool, CryptoError> {
@@ -276,20 +292,26 @@ impl StealthAddress {
     /// Convenience scan from raw bytes.
     pub fn scan_from_bytes(
         ephemeral_pub_bytes: &[u8; 32],
-        view_priv_bytes:     &[u8; 32],
-        spend_pub_bytes:     &[u8; 32],
-        candidate_address:   &str,
+        view_priv_bytes: &[u8; 32],
+        spend_pub_bytes: &[u8; 32],
+        candidate_address: &str,
     ) -> Result<bool, CryptoError> {
         let eph = CompressedRistretto::from_slice(ephemeral_pub_bytes)
             .map_err(|e| CryptoError::InvalidKey(format!("Invalid ephemeral pubkey: {}", e)))?
             .decompress()
-            .ok_or(CryptoError::InvalidKey("Ephemeral pubkey not on curve".to_string()))?;
+            .ok_or(CryptoError::InvalidKey(
+                "Ephemeral pubkey not on curve".to_string(),
+            ))?;
         let spend_pub = CompressedRistretto::from_slice(spend_pub_bytes)
             .map_err(|e| CryptoError::InvalidKey(format!("Invalid spend pubkey: {}", e)))?
             .decompress()
-            .ok_or(CryptoError::InvalidKey("Spend pubkey not on curve".to_string()))?;
-        let view_priv = Option::from(Scalar::from_canonical_bytes(*view_priv_bytes))
-            .ok_or_else(|| CryptoError::InvalidKey("View private key is not canonical".to_string()))?;
+            .ok_or(CryptoError::InvalidKey(
+                "Spend pubkey not on curve".to_string(),
+            ))?;
+        let view_priv =
+            Option::from(Scalar::from_canonical_bytes(*view_priv_bytes)).ok_or_else(|| {
+                CryptoError::InvalidKey("View private key is not canonical".to_string())
+            })?;
         Self::scan(&eph, &view_priv, &spend_pub, candidate_address)
     }
 
@@ -298,8 +320,8 @@ impl StealthAddress {
     /// x = hs + s, where hs is the hash scalar and s is the spend private key.
     pub fn derive_one_time_private_key(
         ephemeral_pubkey: &RistrettoPoint,
-        view_private:     &Scalar,
-        spend_private:    &Scalar,
+        view_private: &Scalar,
+        spend_private: &Scalar,
     ) -> Result<Scalar, CryptoError> {
         let shared_secret = view_private * ephemeral_pubkey;
         let hs = derive_hash_scalar(&shared_secret)?;
@@ -308,13 +330,13 @@ impl StealthAddress {
 
     /// Generate a new stealth key set for a recipient (real curve keys).
     pub fn generate_keys() -> StealthKeys {
-        let view_priv  = Scalar::random(&mut OsRng);
+        let view_priv = Scalar::random(&mut OsRng);
         let spend_priv = Scalar::random(&mut OsRng);
         StealthKeys {
-            view_private:  view_priv,
-            view_public:   view_priv * g(),
+            view_private: view_priv,
+            view_public: view_priv * g(),
             spend_private: spend_priv,
-            spend_public:  spend_priv * g(),
+            spend_public: spend_priv * g(),
         }
     }
 }
@@ -343,10 +365,7 @@ mod tests {
     #[test]
     fn full_stealth_flow() {
         let keys = StealthAddress::generate_keys();
-        let result = StealthAddress::generate_full(
-            &keys.view_public,
-            &keys.spend_public,
-        ).unwrap();
+        let result = StealthAddress::generate_full(&keys.view_public, &keys.spend_public).unwrap();
 
         assert!(result.one_time_address.starts_with("SD1s"));
         assert_eq!(result.ephemeral_pubkey.len(), 64);
@@ -369,16 +388,17 @@ mod tests {
         let keys = StealthAddress::generate_keys();
 
         // Sender creates stealth address for recipient
-        let result = StealthAddress::generate_full(
-            &keys.view_public,
-            &keys.spend_public,
-        ).unwrap();
+        let result = StealthAddress::generate_full(&keys.view_public, &keys.spend_public).unwrap();
 
         // Recipient scans — must detect their own address
         let eph_bytes: [u8; 32] = hex::decode(&result.ephemeral_pubkey)
-            .unwrap().try_into().unwrap();
+            .unwrap()
+            .try_into()
+            .unwrap();
         let eph = CompressedRistretto::from_slice(&eph_bytes)
-            .unwrap().decompress().unwrap();
+            .unwrap()
+            .decompress()
+            .unwrap();
 
         assert!(
             StealthAddress::scan(
@@ -386,7 +406,8 @@ mod tests {
                 &keys.view_private,
                 &keys.spend_public,
                 &result.one_time_address,
-            ).unwrap(),
+            )
+            .unwrap(),
             "Recipient must detect their own stealth output"
         );
     }
@@ -394,18 +415,20 @@ mod tests {
     #[test]
     fn scan_rejects_wrong_recipient() {
         let alice = StealthAddress::generate_keys();
-        let bob   = StealthAddress::generate_keys();
+        let bob = StealthAddress::generate_keys();
 
         // Sender sends to Alice
-        let result = StealthAddress::generate_full(
-            &alice.view_public,
-            &alice.spend_public,
-        ).unwrap();
+        let result =
+            StealthAddress::generate_full(&alice.view_public, &alice.spend_public).unwrap();
 
         let eph_bytes: [u8; 32] = hex::decode(&result.ephemeral_pubkey)
-            .unwrap().try_into().unwrap();
+            .unwrap()
+            .try_into()
+            .unwrap();
         let eph = CompressedRistretto::from_slice(&eph_bytes)
-            .unwrap().decompress().unwrap();
+            .unwrap()
+            .decompress()
+            .unwrap();
 
         // Bob tries to scan — must fail
         assert!(
@@ -414,7 +437,8 @@ mod tests {
                 &bob.view_private,
                 &bob.spend_public,
                 &result.one_time_address,
-            ).unwrap(),
+            )
+            .unwrap(),
             "Wrong recipient must not match"
         );
     }
@@ -422,7 +446,7 @@ mod tests {
     #[test]
     fn different_recipients_different_addresses() {
         let alice = StealthAddress::generate_keys();
-        let bob   = StealthAddress::generate_keys();
+        let bob = StealthAddress::generate_keys();
 
         let r1 = StealthAddress::generate_full(&alice.view_public, &alice.spend_public).unwrap();
         let r2 = StealthAddress::generate_full(&bob.view_public, &bob.spend_public).unwrap();
@@ -433,32 +457,39 @@ mod tests {
     #[test]
     fn spend_key_derivation_from_stealth() {
         let keys = StealthAddress::generate_keys();
-        let result = StealthAddress::generate_full(
-            &keys.view_public,
-            &keys.spend_public,
-        ).unwrap();
+        let result = StealthAddress::generate_full(&keys.view_public, &keys.spend_public).unwrap();
 
         let eph_bytes: [u8; 32] = hex::decode(&result.ephemeral_pubkey)
-            .unwrap().try_into().unwrap();
+            .unwrap()
+            .try_into()
+            .unwrap();
         let eph = CompressedRistretto::from_slice(&eph_bytes)
-            .unwrap().decompress().unwrap();
+            .unwrap()
+            .decompress()
+            .unwrap();
 
         // Derive the one-time private key
         let one_time_priv = StealthAddress::derive_one_time_private_key(
             &eph,
             &keys.view_private,
             &keys.spend_private,
-        ).unwrap();
+        )
+        .unwrap();
 
         // The corresponding public key must equal the one-time pubkey from generation
         let derived_pub = one_time_priv * g();
         let expected_bytes: [u8; 32] = hex::decode(&result.one_time_pubkey)
-            .unwrap().try_into().unwrap();
+            .unwrap()
+            .try_into()
+            .unwrap();
         let expected_pub = CompressedRistretto::from_slice(&expected_bytes)
-            .unwrap().decompress().unwrap();
+            .unwrap()
+            .decompress()
+            .unwrap();
 
         assert_eq!(
-            derived_pub.compress(), expected_pub.compress(),
+            derived_pub.compress(),
+            expected_pub.compress(),
             "One-time private key must correspond to the one-time public key"
         );
     }

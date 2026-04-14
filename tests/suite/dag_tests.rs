@@ -5,14 +5,14 @@
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use std::collections::HashSet;
+    use crate::config::consensus::consensus_params::ConsensusParams;
     use crate::domain::block::block::Block;
-    use crate::domain::block::block_header::BlockHeader;
     use crate::domain::block::block_body::BlockBody;
+    use crate::domain::block::block_header::BlockHeader;
     use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
     use crate::engine::dag::core::dag_manager::DagManager;
-    use crate::config::consensus::consensus_params::ConsensusParams;
+    use std::collections::HashSet;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     // ── helpers ──────────────────────────────────────────────────────────
     fn now_ts() -> u64 {
@@ -24,10 +24,16 @@ mod tests {
 
     fn coinbase_tx(hash: &str) -> Transaction {
         Transaction {
-            hash:      hash.to_string(),
-            inputs:    vec![],
-            outputs:   vec![TxOutput { address: "shadow1miner".into(), amount: 10_000, commitment: None, range_proof: None, ephemeral_pubkey: None }],
-            fee:       0,
+            hash: hash.to_string(),
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                address: "shadow1miner".into(),
+                amount: 10_000,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
+            fee: 0,
             timestamp: now_ts(),
             is_coinbase: true,
             tx_type: TxType::Transfer,
@@ -39,16 +45,28 @@ mod tests {
     fn make_block(hash: &str, parents: Vec<String>, height: u64, ts: u64) -> Block {
         Block {
             header: BlockHeader::new_with_defaults(
-                1, hash.to_string(), parents,
-                format!("merkle_{}", hash), ts, 0,
-                ConsensusParams::GENESIS_DIFFICULTY, height,
+                1,
+                hash.to_string(),
+                parents,
+                format!("merkle_{}", hash),
+                ts,
+                0,
+                ConsensusParams::GENESIS_DIFFICULTY,
+                height,
             ),
-            body: BlockBody { transactions: vec![coinbase_tx(&format!("cb_{}", hash))] },
+            body: BlockBody {
+                transactions: vec![coinbase_tx(&format!("cb_{}", hash))],
+            },
         }
     }
 
     fn genesis() -> Block {
-        make_block("genesis_dag_000000000000", vec![], 0, ConsensusParams::GENESIS_TIMESTAMP)
+        make_block(
+            "genesis_dag_000000000000",
+            vec![],
+            0,
+            ConsensusParams::GENESIS_TIMESTAMP,
+        )
     }
 
     fn tmp_dag(suffix: &str) -> DagManager {
@@ -64,14 +82,30 @@ mod tests {
         let g = genesis();
         dag.add_block_validated(&g, true).unwrap();
 
-        let b1 = make_block("linear_b1_aaaaaaa", vec![g.header.hash.clone()], 1, now_ts());
-        let b2 = make_block("linear_b2_bbbbbbb", vec![b1.header.hash.clone()], 2, now_ts());
+        let b1 = make_block(
+            "linear_b1_aaaaaaa",
+            vec![g.header.hash.clone()],
+            1,
+            now_ts(),
+        );
+        let b2 = make_block(
+            "linear_b2_bbbbbbb",
+            vec![b1.header.hash.clone()],
+            2,
+            now_ts(),
+        );
         dag.add_block_validated(&b1, true).unwrap();
         dag.add_block_validated(&b2, true).unwrap();
 
         let ancestors = dag.get_ancestors("linear_b2_bbbbbbb");
-        assert!(ancestors.contains("linear_b1_aaaaaaa"), "b2 must have b1 as ancestor");
-        assert!(ancestors.contains("genesis_dag_000000000000"), "b2 must have genesis as ancestor");
+        assert!(
+            ancestors.contains("linear_b1_aaaaaaa"),
+            "b2 must have b1 as ancestor"
+        );
+        assert!(
+            ancestors.contains("genesis_dag_000000000000"),
+            "b2 must have genesis as ancestor"
+        );
     }
 
     // ── 2. Parents correctly stored ──────────────────────────────────────
@@ -81,7 +115,12 @@ mod tests {
         let g = genesis();
         dag.add_block_validated(&g, true).unwrap();
 
-        let b1 = make_block("parents_b1_cccccc", vec![g.header.hash.clone()], 1, now_ts());
+        let b1 = make_block(
+            "parents_b1_cccccc",
+            vec![g.header.hash.clone()],
+            1,
+            now_ts(),
+        );
         dag.add_block_validated(&b1, true).unwrap();
 
         let parents = dag.get_parents("parents_b1_cccccc");
@@ -95,7 +134,12 @@ mod tests {
         let g = genesis();
         dag.add_block_validated(&g, true).unwrap();
 
-        let b1 = make_block("children_b1_dddddd", vec![g.header.hash.clone()], 1, now_ts());
+        let b1 = make_block(
+            "children_b1_dddddd",
+            vec![g.header.hash.clone()],
+            1,
+            now_ts(),
+        );
         dag.add_block_validated(&b1, true).unwrap();
 
         let children = dag.get_children(&g.header.hash);
@@ -112,7 +156,8 @@ mod tests {
         let orphan = make_block(
             "orphan_block_eeeee",
             vec!["unknown_parent_fffff".to_string()],
-            1, now_ts(),
+            1,
+            now_ts(),
         );
         // DagManager permits storage but doesn't resolve ancestry via unknown parent
         let _ = dag.add_block_validated(&orphan, true);
@@ -139,7 +184,8 @@ mod tests {
         let merge = make_block(
             "merge_block_iiiiii",
             vec![b1.header.hash.clone(), b2.header.hash.clone()],
-            2, now_ts(),
+            2,
+            now_ts(),
         );
         dag.add_block_validated(&merge, true).unwrap();
 
@@ -163,7 +209,12 @@ mod tests {
             let hash = format!("blk100_{:020}", i);
             let block = make_block(&hash, vec![prev_hash.clone()], (i + 1) as u64, ts);
             let result = dag.add_block_validated(&block, true);
-            assert!(result.is_ok(), "Block {} at same timestamp must be accepted: {:?}", i, result);
+            assert!(
+                result.is_ok(),
+                "Block {} at same timestamp must be accepted: {:?}",
+                i,
+                result
+            );
             prev_hash = hash;
         }
         assert_eq!(dag.dag_size(), 101, "DAG must contain genesis + 100 blocks");
@@ -222,7 +273,8 @@ mod tests {
         let merge = make_block(
             "ua_merge_qqqqqq",
             vec![b1.header.hash.clone(), b2.header.hash.clone()],
-            2, now_ts(),
+            2,
+            now_ts(),
         );
         dag.add_block_validated(&merge, true).unwrap();
 
@@ -238,6 +290,7 @@ mod tests {
 
     // ── 10. select_parent returns a valid tip ─────────────────────────────
     #[test]
+    #[allow(deprecated)]
     fn select_parent_returns_valid_tip() {
         let dag = tmp_dag("select_parent");
         let g = genesis();
@@ -248,12 +301,12 @@ mod tests {
 
         let tips = dag.get_tips();
         let selected = dag.select_parent_simple(&tips);
-        assert!(selected.is_some(), "select_parent must return Some when tips exist");
-        let sel = selected.unwrap();
         assert!(
-            dag.block_exists(&sel),
-            "Selected parent must exist in DAG"
+            selected.is_some(),
+            "select_parent must return Some when tips exist"
         );
+        let sel = selected.unwrap();
+        assert!(dag.block_exists(&sel), "Selected parent must exist in DAG");
     }
 
     // ── 11. Large DAG — 500 linear blocks ────────────────────────────────
@@ -280,7 +333,12 @@ mod tests {
         let g = genesis();
         dag.add_block_validated(&g, true).unwrap();
 
-        let b1 = make_block("acyclic_b1_ssssss", vec![g.header.hash.clone()], 1, now_ts());
+        let b1 = make_block(
+            "acyclic_b1_ssssss",
+            vec![g.header.hash.clone()],
+            1,
+            now_ts(),
+        );
         dag.add_block_validated(&b1, true).unwrap();
 
         let ancestors = dag.get_ancestors("acyclic_b1_ssssss");

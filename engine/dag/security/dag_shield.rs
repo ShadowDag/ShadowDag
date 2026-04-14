@@ -8,13 +8,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::domain::block::block::Block;
 use crate::domain::transaction::transaction::Transaction;
-use crate::engine::dag::security::spam_filter::SpamFilter;
+use crate::engine::dag::security::dos_protection::{
+    DosProtection, MAX_DAG_PARENTS, MAX_FUTURE_TIMESTAMP_SECS, MAX_OUTPUT_AMOUNT, MAX_TX_INPUTS,
+    MAX_TX_OUTPUTS, MAX_TX_SIZE_BYTES, MIN_TX_SIZE_BYTES,
+};
 use crate::engine::dag::security::flood_protection::FloodProtection;
 use crate::engine::dag::security::selfish_mining_guard::SelfishMiningGuard;
-use crate::engine::dag::security::dos_protection::{
-    DosProtection, MAX_DAG_PARENTS, MAX_TX_INPUTS, MAX_TX_OUTPUTS,
-    MAX_OUTPUT_AMOUNT, MAX_FUTURE_TIMESTAMP_SECS, MIN_TX_SIZE_BYTES, MAX_TX_SIZE_BYTES,
-};
+use crate::engine::dag::security::spam_filter::SpamFilter;
 
 /// Rejection reason with severity for ban scoring.
 #[derive(Debug, Clone)]
@@ -25,15 +25,32 @@ pub struct ShieldRejection {
 }
 
 impl ShieldRejection {
-    #[inline] fn minor(reason: &'static str) -> Self { Self { reason, ban_score: 10 } }
-    #[inline] fn moderate(reason: &'static str) -> Self { Self { reason, ban_score: 25 } }
-    #[inline] fn severe(reason: &'static str) -> Self { Self { reason, ban_score: 50 } }
+    #[inline]
+    fn minor(reason: &'static str) -> Self {
+        Self {
+            reason,
+            ban_score: 10,
+        }
+    }
+    #[inline]
+    fn moderate(reason: &'static str) -> Self {
+        Self {
+            reason,
+            ban_score: 25,
+        }
+    }
+    #[inline]
+    fn severe(reason: &'static str) -> Self {
+        Self {
+            reason,
+            ban_score: 50,
+        }
+    }
 }
 
 pub struct DagShield;
 
 impl DagShield {
-
     // ═══════════════════════════════════════════════════════════════
     //  BLOCK VALIDATION (full — used by block_validator L1)
     //
@@ -45,13 +62,15 @@ impl DagShield {
 
     /// Full block shield with rejection reason + ban severity.
     pub fn validate_block(block: &Block) -> Result<(), ShieldRejection> {
-
         // ─────────────────────────────────────────
         // 0. Genesis (special rules)
         // ─────────────────────────────────────────
         if block.header.height == 0 {
-            return if Self::validate_genesis(block) { Ok(()) }
-                   else { Err(ShieldRejection::severe("invalid genesis")) };
+            return if Self::validate_genesis(block) {
+                Ok(())
+            } else {
+                Err(ShieldRejection::severe("invalid genesis"))
+            };
         }
 
         // ─────────────────────────────────────────
@@ -81,7 +100,9 @@ impl DagShield {
         // 3. Selfish mining (O(1) — parent count)
         // ─────────────────────────────────────────
         if !SelfishMiningGuard::validate(block) {
-            return Err(ShieldRejection::moderate("selfish mining (too few parents)"));
+            return Err(ShieldRejection::moderate(
+                "selfish mining (too few parents)",
+            ));
         }
 
         // ─────────────────────────────────────────
@@ -135,7 +156,10 @@ impl DagShield {
             return Err(ShieldRejection::severe("too many parents"));
         }
         // Reject far-future/far-past timestamps (wall clock only, cheap)
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         if block.header.timestamp > now + MAX_FUTURE_TIMESTAMP_SECS {
             return Err(ShieldRejection::minor("future timestamp"));
         }
@@ -187,7 +211,10 @@ impl DagShield {
         }
 
         // Timestamp: reject far-future or ancient TXs
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         if tx.timestamp > now + 120 {
             return Err(ShieldRejection::minor("future TX timestamp"));
         }
@@ -257,7 +284,6 @@ impl DagShield {
     // Genesis validation (strict)
     // ─────────────────────────────────────────
     fn validate_genesis(block: &Block) -> bool {
-
         let txs = &block.body.transactions;
 
         if txs.len() != 1 {
@@ -287,7 +313,6 @@ impl DagShield {
     // Coinbase validation
     // ─────────────────────────────────────────
     fn validate_coinbase(block: &Block) -> bool {
-
         let txs = &block.body.transactions;
 
         if txs.is_empty() {
@@ -307,7 +332,6 @@ impl DagShield {
         let mut count = 0;
 
         for (i, tx) in txs.iter().enumerate() {
-
             // Reject empty junk tx
             if tx.inputs.is_empty() && tx.outputs.is_empty() {
                 return false;
@@ -333,19 +357,16 @@ impl DagShield {
     // Double spend inside block
     // ─────────────────────────────────────────
     fn detect_double_spend(block: &Block) -> bool {
-
         let mut estimated_inputs = 0usize;
 
         for tx in &block.body.transactions {
             estimated_inputs = estimated_inputs.saturating_add(tx.inputs.len());
         }
 
-        let mut seen_inputs: HashSet<(&str, u32)> =
-            HashSet::with_capacity(estimated_inputs);
+        let mut seen_inputs: HashSet<(&str, u32)> = HashSet::with_capacity(estimated_inputs);
 
         for tx in &block.body.transactions {
             for input in &tx.inputs {
-
                 if input.index > 10_000_000 || input.index == u32::MAX {
                     return false;
                 }
@@ -374,7 +395,6 @@ impl DagShield {
     // DAG validation
     // ─────────────────────────────────────────
     fn detect_dag_anomaly(block: &Block) -> bool {
-
         let parents = &block.header.parents;
 
         if parents.is_empty() {
@@ -388,7 +408,6 @@ impl DagShield {
         let mut unique: HashSet<&str> = HashSet::with_capacity(parents.len());
 
         for parent in parents {
-
             if parent.is_empty() {
                 return false;
             }
@@ -416,13 +435,16 @@ impl DagShield {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
     use crate::domain::block::block::Block;
-    use crate::domain::block::block_header::BlockHeader;
     use crate::domain::block::block_body::BlockBody;
+    use crate::domain::block::block_header::BlockHeader;
+    use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
 
     fn now_secs() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 
     fn valid_hash() -> String {
@@ -570,7 +592,7 @@ mod tests {
 
     fn make_block(height: u64, num_parents: usize) -> Block {
         let parents: Vec<String> = (0..num_parents)
-            .map(|i| format!("{}{}", "b".repeat(63), format!("{:x}", i)))
+            .map(|i| format!("{}{:x}", "b".repeat(63), i))
             .collect();
         Block {
             header: BlockHeader::new_with_defaults(

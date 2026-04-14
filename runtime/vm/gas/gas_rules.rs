@@ -31,8 +31,8 @@
 // branches → state divergence between honest validators.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::runtime::vm::gas::gas_meter::{GasMeter, GasResult};
 use crate::errors::VmError;
+use crate::runtime::vm::gas::gas_meter::{GasMeter, GasResult};
 
 /// Maximum gas per transaction (10 million)
 pub const MAX_GAS_PER_TX: u64 = 10_000_000;
@@ -60,12 +60,10 @@ impl GasRules {
     pub fn charge(&mut self, _key: &str, cost: u64) -> Result<u64, VmError> {
         match self.meter.consume(cost) {
             GasResult::Ok(remaining) => Ok(remaining),
-            GasResult::OutOfGas { .. } => {
-                Err(VmError::OutOfGas {
-                    used:  self.meter.gas_used(),
-                    limit: self.meter.gas_limit(),
-                })
-            }
+            GasResult::OutOfGas { .. } => Err(VmError::OutOfGas {
+                used: self.meter.gas_used(),
+                limit: self.meter.gas_limit(),
+            }),
         }
     }
 

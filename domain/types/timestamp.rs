@@ -95,7 +95,10 @@ mod tests {
     #[test]
     fn is_valid_rejects_far_future() {
         let now = TimestampHelper::now();
-        assert!(!TimestampHelper::is_valid(now + MAX_FUTURE_DRIFT_MS + 1, now));
+        assert!(!TimestampHelper::is_valid(
+            now + MAX_FUTURE_DRIFT_MS + 1,
+            now
+        ));
     }
 
     #[test]

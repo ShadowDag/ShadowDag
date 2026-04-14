@@ -7,14 +7,13 @@
 pub struct DifficultyWindow;
 
 impl DifficultyWindow {
-
     // ─────────────────────────────────────────
     // CONFIG
     // ─────────────────────────────────────────
-    pub const SMALL_WINDOW:  u64 = 10;
+    pub const SMALL_WINDOW: u64 = 10;
     pub const MEDIUM_WINDOW: u64 = 20;
-    pub const LARGE_WINDOW:  u64 = 60;
-    pub const XL_WINDOW:     u64 = 120;
+    pub const LARGE_WINDOW: u64 = 60;
+    pub const XL_WINDOW: u64 = 120;
 
     pub const THRESHOLD_1: u64 = 10;
     pub const THRESHOLD_2: u64 = 100;
@@ -63,8 +62,7 @@ impl DifficultyWindow {
     pub fn expected_timespan(height: u64, target_block_time: u64) -> u64 {
         Self::validate_config();
 
-        Self::sample_size_const(height)
-            .saturating_mul(target_block_time)
+        Self::sample_size_const(height).saturating_mul(target_block_time)
     }
 
     // ─────────────────────────────────────────
@@ -87,8 +85,7 @@ impl DifficultyWindow {
 
         let scaled = base.saturating_mul(scale);
 
-        scaled
-            .clamp(Self::SMALL_WINDOW, Self::XL_WINDOW)
+        scaled.clamp(Self::SMALL_WINDOW, Self::XL_WINDOW)
     }
 
     // ─────────────────────────────────────────

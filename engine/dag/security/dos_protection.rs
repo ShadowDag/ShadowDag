@@ -19,7 +19,8 @@ pub const MAX_TX_SIZE_BYTES: usize = 100 * 1024;
 pub const MAX_TX_INPUTS: usize = 50;
 pub const MAX_TX_OUTPUTS: usize = 100;
 
-pub const MAX_DAG_PARENTS: usize = crate::config::consensus::consensus_params::ConsensusParams::MAX_PARENTS;
+pub const MAX_DAG_PARENTS: usize =
+    crate::config::consensus::consensus_params::ConsensusParams::MAX_PARENTS;
 
 pub const MAX_MEMPOOL_TX_COUNT: usize =
     crate::config::consensus::mempool_config::MempoolConfig::MAX_MEMPOOL_SIZE;
@@ -40,12 +41,10 @@ pub const MAX_PAST_TIMESTAMP_DRIFT: u64 = 600;
 pub struct DosProtection;
 
 impl DosProtection {
-
     // ─────────────────────────────────────────
     // BLOCK VALIDATION
     // ─────────────────────────────────────────
     pub fn validate_block(block: &Block) -> DosCheckResult {
-
         let txs = &block.body.transactions;
 
         if txs.is_empty() {
@@ -60,7 +59,6 @@ impl DosProtection {
         let mut coinbase_count = 0;
 
         for (i, tx) in txs.iter().enumerate() {
-
             // 🔥 Validate tx داخليًا (مهم جدًا)
             if !Self::validate_transaction(tx).is_ok() {
                 return DosCheckResult::fail("Invalid transaction inside block".to_string());
@@ -128,7 +126,7 @@ impl DosProtection {
         // Size (آخر خطوة)
         let bytes = match bincode::serialize(block) {
             Ok(b) => b,
-            Err(_) => return DosCheckResult::fail("Serialization fail".to_string())
+            Err(_) => return DosCheckResult::fail("Serialization fail".to_string()),
         };
 
         if bytes.len() > MAX_BLOCK_SIZE_BYTES {
@@ -142,7 +140,6 @@ impl DosProtection {
     // TRANSACTION VALIDATION
     // ─────────────────────────────────────────
     pub fn validate_transaction(tx: &Transaction) -> DosCheckResult {
-
         if tx.outputs.is_empty() {
             return DosCheckResult::fail("No outputs".to_string());
         }
@@ -152,7 +149,7 @@ impl DosProtection {
         // Serialize
         let bytes = match bincode::serialize(tx) {
             Ok(b) => b,
-            Err(_) => return DosCheckResult::fail("Serialization fail".to_string())
+            Err(_) => return DosCheckResult::fail("Serialization fail".to_string()),
         };
 
         let size = bytes.len();
@@ -195,7 +192,6 @@ impl DosProtection {
         let mut total: u128 = 0;
 
         for output in &tx.outputs {
-
             if output.amount == 0 {
                 return DosCheckResult::fail("Zero output".to_string());
             }
@@ -210,7 +206,7 @@ impl DosProtection {
 
             total = match total.checked_add(output.amount as u128) {
                 Some(v) => v,
-                None => return DosCheckResult::fail("Overflow".to_string())
+                None => return DosCheckResult::fail("Overflow".to_string()),
             };
         }
 
@@ -220,10 +216,9 @@ impl DosProtection {
 
         // Coinbase
         // Coinbase structural check only (fee validation is L4 Execution)
-        if is_coinbase
-            && tx.fee != 0 {
-                return DosCheckResult::fail("Coinbase fee must be zero".to_string());
-            }
+        if is_coinbase && tx.fee != 0 {
+            return DosCheckResult::fail("Coinbase fee must be zero".to_string());
+        }
 
         // NOTE: Fee amount, fee-per-byte, and fee-vs-total checks belong in
         // the Execution layer (L4), not in DoS protection (L1).
@@ -243,11 +238,17 @@ pub struct DosCheckResult {
 
 impl DosCheckResult {
     pub fn pass() -> Self {
-        Self { passed: true, reason: None }
+        Self {
+            passed: true,
+            reason: None,
+        }
     }
 
     pub fn fail(reason: String) -> Self {
-        Self { passed: false, reason: Some(reason) }
+        Self {
+            passed: false,
+            reason: Some(reason),
+        }
     }
 
     pub fn is_ok(&self) -> bool {

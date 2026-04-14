@@ -14,10 +14,10 @@
 //   4. Relay hopping: route through multiple shadow nodes
 // ═══════════════════════════════════════════════════════════════════════════
 
-use rand::seq::SliceRandom;
 use rand::rngs::OsRng;
+use rand::seq::SliceRandom;
 use rand::RngCore;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 use crate::engine::privacy::shadow_pool::shadow_pool::ShadowPool;
 use crate::engine::privacy::shadow_pool::shadow_transaction::ShadowTransaction;
@@ -68,7 +68,9 @@ impl ShadowMixer {
 
     /// Shuffle a batch of shadow transactions (temporal mixing)
     pub fn shuffle_batch(batch: &mut [ShadowTransaction]) {
-        if batch.len() < 2 { return; }
+        if batch.len() < 2 {
+            return;
+        }
         batch.shuffle(&mut OsRng);
     }
 
@@ -125,7 +127,13 @@ mod tests {
         let tx = Transaction {
             hash: hash.to_string(),
             inputs: vec![],
-            outputs: vec![TxOutput { address: "addr".into(), amount: 100, commitment: None, range_proof: None, ephemeral_pubkey: None }],
+            outputs: vec![TxOutput {
+                address: "addr".into(),
+                amount: 100,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
             fee: 1,
             timestamp: 1735689600,
             is_coinbase: false,
@@ -142,7 +150,10 @@ mod tests {
         let tag1 = ShadowMixer::generate_mix_tag(&batch);
         let tag2 = ShadowMixer::generate_mix_tag(&batch);
         // Mix tags now include random entropy, so they should differ
-        assert_ne!(tag1, tag2, "Mix tags must be unique per round to prevent replay");
+        assert_ne!(
+            tag1, tag2,
+            "Mix tags must be unique per round to prevent replay"
+        );
     }
 
     #[test]
@@ -168,8 +179,10 @@ mod tests {
         let new_order: Vec<String> = batch.iter().map(|s| s.tx.hash.clone()).collect();
 
         // With 20 elements, probability of same order is 1/20! ≈ 0
-        assert_ne!(original_order, new_order,
-            "Shuffle must change transaction order");
+        assert_ne!(
+            original_order, new_order,
+            "Shuffle must change transaction order"
+        );
     }
 
     #[test]
@@ -182,16 +195,23 @@ mod tests {
         let mut shuffled_hashes: Vec<String> = batch.iter().map(|s| s.tx.hash.clone()).collect();
         shuffled_hashes.sort();
 
-        assert_eq!(original_hashes, shuffled_hashes,
-            "Shuffle must not lose or duplicate transactions");
+        assert_eq!(
+            original_hashes, shuffled_hashes,
+            "Shuffle must not lose or duplicate transactions"
+        );
     }
 
     #[test]
     fn random_jitter_within_bounds() {
         for _ in 0..100 {
             let j = ShadowMixer::random_jitter();
-            assert!((MIN_JITTER_MS..=MAX_JITTER_MS).contains(&j),
-                "Jitter {} out of bounds [{}, {}]", j, MIN_JITTER_MS, MAX_JITTER_MS);
+            assert!(
+                (MIN_JITTER_MS..=MAX_JITTER_MS).contains(&j),
+                "Jitter {} out of bounds [{}, {}]",
+                j,
+                MIN_JITTER_MS,
+                MAX_JITTER_MS
+            );
         }
     }
 }

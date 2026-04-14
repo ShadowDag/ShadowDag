@@ -4,9 +4,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, Options,
-    WriteBatch, WriteOptions, ReadOptions,
-    DBCompressionType, IteratorMode,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, IteratorMode, Options,
+    ReadOptions, WriteBatch, WriteOptions, DB,
 };
 
 use dashmap::DashSet;
@@ -15,14 +14,14 @@ use rayon::ThreadPool;
 use rayon::ThreadPoolBuilder;
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crate::domain::block::block::Block;
-use crate::domain::traits::sync_peers::SyncPeers;
 use crate::domain::traits::block_processor::BlockProcessor;
+use crate::domain::traits::sync_peers::SyncPeers;
 use crate::errors::{DagError, StorageError};
-use crate::{slog_warn, slog_error, slog_debug};
+use crate::{slog_debug, slog_error, slog_warn};
 
 // Column Families
 const CF_DEFAULT: &str = "default";
@@ -55,7 +54,6 @@ impl DagSync {
         peer_manager: Arc<dyn SyncPeers>,
         full_node: Arc<dyn BlockProcessor>,
     ) -> Result<Self, DagError> {
-
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
@@ -74,8 +72,12 @@ impl DagSync {
             ColumnFamilyDescriptor::new(CF_SYNC, opts.clone()),
         ];
 
-        let db = DB::open_cf_descriptors(&opts, Path::new(path), cfs)
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open_cf_descriptors(&opts, Path::new(path), cfs).map_err(|e| {
+            StorageError::OpenFailed {
+                path: path.to_string(),
+                reason: e.to_string(),
+            }
+        })?;
 
         let mut read_opts = ReadOptions::default();
         read_opts.set_total_order_seek(false);
@@ -89,7 +91,9 @@ impl DagSync {
         let pool = ThreadPoolBuilder::new()
             .num_threads(8)
             .build()
-            .map_err(|e| DagError::Other(format!("[DagSync] failed to build thread pool: {}", e)))?;
+            .map_err(|e| {
+                DagError::Other(format!("[DagSync] failed to build thread pool: {}", e))
+            })?;
 
         Ok(Self {
             db: Arc::new(db),
@@ -150,7 +154,10 @@ impl DagSync {
         //////////////////////////////////////////////////////////////
         let cf = match self.cf_sync() {
             Some(cf) => cf,
-            None => { slog_error!("dag", "dag_sync_no_cf_read"); return; }
+            None => {
+                slog_error!("dag", "dag_sync_no_cf_read");
+                return;
+            }
         };
         match self.db.get_cf_opt(cf, hash, &self.read_opts) {
             Ok(Some(_)) => {
@@ -195,12 +202,11 @@ impl DagSync {
                 return;
             }
 
-            if self.inflight.compare_exchange(
-                current,
-                current + 1,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ).is_ok() {
+            if self
+                .inflight
+                .compare_exchange(current, current + 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
                 break;
             }
         }
@@ -221,7 +227,11 @@ impl DagSync {
             let mut batch = WriteBatch::default();
             let cf = match self.cf_sync() {
                 Some(cf) => cf,
-                None => { slog_error!("dag", "dag_sync_no_cf_write"); self.inflight.fetch_sub(1, Ordering::Release); return; }
+                None => {
+                    slog_error!("dag", "dag_sync_no_cf_write");
+                    self.inflight.fetch_sub(1, Ordering::Release);
+                    return;
+                }
             };
             batch.put_cf(cf, hash, b"1");
 
@@ -229,7 +239,11 @@ impl DagSync {
                 let mut batch2 = WriteBatch::default();
                 let cf = match self.cf_sync() {
                     Some(cf) => cf,
-                    None => { slog_error!("dag", "dag_sync_no_cf_retry_write"); self.inflight.fetch_sub(1, Ordering::Release); return; }
+                    None => {
+                        slog_error!("dag", "dag_sync_no_cf_retry_write");
+                        self.inflight.fetch_sub(1, Ordering::Release);
+                        return;
+                    }
                 };
                 batch2.put_cf(cf, hash, b"1");
 
@@ -263,17 +277,16 @@ impl DagSync {
     }
 
     fn build_locator(&self) -> Vec<String> {
-        self.full_node
-            .get_tips()
-            .into_iter()
-            .take(32)
-            .collect()
+        self.full_node.get_tips().into_iter().take(32).collect()
     }
 
     pub fn debug_iterate(&self) {
         let cf = match self.cf_sync() {
             Some(cf) => cf,
-            None => { slog_error!("dag", "dag_sync_no_cf_debug_iterate"); return; }
+            None => {
+                slog_error!("dag", "dag_sync_no_cf_debug_iterate");
+                return;
+            }
         };
         let iter = self.db.iterator_cf(cf, IteratorMode::Start);
 

@@ -3,15 +3,15 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::errors::NetworkError;
 use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use crate::errors::NetworkError;
 
-pub const MAX_OUTBOUND:          usize = 8;
-pub const MAX_INBOUND:           usize = 56;
+pub const MAX_OUTBOUND: usize = 8;
+pub const MAX_INBOUND: usize = 56;
 pub const MAX_TOTAL_CONNECTIONS: usize = 64;
-pub const CONNECT_TIMEOUT_SECS:  u64   = 5;
-pub const DISCONNECT_COOLDOWN:   u64   = 60;
+pub const CONNECT_TIMEOUT_SECS: u64 = 5;
+pub const DISCONNECT_COOLDOWN: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionState {
@@ -31,16 +31,16 @@ pub enum ConnectionDir {
 
 #[derive(Debug)]
 pub struct Connection {
-    pub id:          u64,
-    pub address:     String,
-    pub direction:   ConnectionDir,
-    pub state:       ConnectionState,
+    pub id: u64,
+    pub address: String,
+    pub direction: ConnectionDir,
+    pub state: ConnectionState,
     pub connected_at: Instant,
-    pub last_seen:   Instant,
-    pub bytes_sent:  u64,
-    pub bytes_recv:  u64,
-    pub user_agent:  String,
-    pub version:     u32,
+    pub last_seen: Instant,
+    pub bytes_sent: u64,
+    pub bytes_recv: u64,
+    pub user_agent: String,
+    pub version: u32,
     pub best_height: u64,
 }
 
@@ -48,29 +48,31 @@ impl Connection {
     pub fn new_outbound(id: u64, address: impl Into<String>) -> Self {
         Self {
             id,
-            address:      address.into(),
-            direction:    ConnectionDir::Outbound,
-            state:        ConnectionState::Connecting,
+            address: address.into(),
+            direction: ConnectionDir::Outbound,
+            state: ConnectionState::Connecting,
             connected_at: Instant::now(),
-            last_seen:    Instant::now(),
-            bytes_sent:   0,
-            bytes_recv:   0,
-            user_agent:   String::new(),
-            version:      0,
-            best_height:  0,
+            last_seen: Instant::now(),
+            bytes_sent: 0,
+            bytes_recv: 0,
+            user_agent: String::new(),
+            version: 0,
+            best_height: 0,
         }
     }
 
     pub fn new_inbound(id: u64, address: impl Into<String>) -> Self {
         let mut conn = Self::new_outbound(id, address);
         conn.direction = ConnectionDir::Inbound;
-        conn.state     = ConnectionState::Handshaking;
+        conn.state = ConnectionState::Handshaking;
         conn
     }
 
     pub fn is_active(&self) -> bool {
-        matches!(self.state,
-            ConnectionState::Connecting | ConnectionState::Handshaking | ConnectionState::Connected)
+        matches!(
+            self.state,
+            ConnectionState::Connecting | ConnectionState::Handshaking | ConnectionState::Connected
+        )
     }
 
     pub fn uptime_secs(&self) -> u64 {
@@ -79,21 +81,21 @@ impl Connection {
 }
 
 pub struct ConnectionManager {
-    connections:       HashMap<u64, Connection>,
-    banned_addrs:      HashMap<String, u64>,
-    self_addrs:        HashSet<String>,
-    next_id:           u64,
-    local_addr:        String,
+    connections: HashMap<u64, Connection>,
+    banned_addrs: HashMap<String, u64>,
+    self_addrs: HashSet<String>,
+    next_id: u64,
+    local_addr: String,
 }
 
 impl ConnectionManager {
     pub fn new(local_addr: impl Into<String>) -> Self {
         Self {
-            connections:  HashMap::new(),
+            connections: HashMap::new(),
             banned_addrs: HashMap::new(),
-            self_addrs:   HashSet::new(),
-            next_id:      1,
-            local_addr:   local_addr.into(),
+            self_addrs: HashSet::new(),
+            next_id: 1,
+            local_addr: local_addr.into(),
         }
     }
 
@@ -109,7 +111,9 @@ impl ConnectionManager {
         let expiry = now_secs() + duration_secs;
         self.banned_addrs.insert(address.to_string(), expiry);
 
-        let ids: Vec<u64> = self.connections.values()
+        let ids: Vec<u64> = self
+            .connections
+            .values()
             .filter(|c| c.address == address)
             .map(|c| c.id)
             .collect();
@@ -119,7 +123,8 @@ impl ConnectionManager {
     }
 
     pub fn is_banned(&self, address: &str) -> bool {
-        self.banned_addrs.get(address)
+        self.banned_addrs
+            .get(address)
             .map(|&expiry| now_secs() < expiry)
             .unwrap_or(false)
     }
@@ -131,24 +136,28 @@ impl ConnectionManager {
 
     pub fn open_connection(&mut self, address: &str) -> Result<u64, NetworkError> {
         if self.is_self(address) {
-            return Err(NetworkError::ConnectionFailed(
-                format!("Rejected self-connection to {}", address)
-            ));
+            return Err(NetworkError::ConnectionFailed(format!(
+                "Rejected self-connection to {}",
+                address
+            )));
         }
         if self.is_banned(address) {
             return Err(NetworkError::PeerBanned(address.to_string()));
         }
-        let outbound_count = self.connections.values()
+        let outbound_count = self
+            .connections
+            .values()
             .filter(|c| matches!(c.direction, ConnectionDir::Outbound) && c.is_active())
             .count();
         if outbound_count >= MAX_OUTBOUND {
-            return Err(NetworkError::ConnectionFailed(
-                format!("Max outbound reached ({})", MAX_OUTBOUND)
-            ));
+            return Err(NetworkError::ConnectionFailed(format!(
+                "Max outbound reached ({})",
+                MAX_OUTBOUND
+            )));
         }
         if self.total_active() >= MAX_TOTAL_CONNECTIONS {
             return Err(NetworkError::ConnectionFailed(
-                "Max total connections reached".to_string()
+                "Max total connections reached".to_string(),
             ));
         }
         let id = self.next_id;
@@ -161,24 +170,29 @@ impl ConnectionManager {
     pub fn accept_connection(&mut self, address: &str) -> Result<u64, NetworkError> {
         // Reject self-connections on inbound too (mirrors open_connection check)
         if self.is_self(address) {
-            return Err(NetworkError::ConnectionFailed(
-                format!("Rejected inbound self-connection from {}", address)
-            ));
+            return Err(NetworkError::ConnectionFailed(format!(
+                "Rejected inbound self-connection from {}",
+                address
+            )));
         }
         if self.is_banned(address) {
             return Err(NetworkError::PeerBanned(address.to_string()));
         }
-        let inbound_count = self.connections.values()
+        let inbound_count = self
+            .connections
+            .values()
             .filter(|c| matches!(c.direction, ConnectionDir::Inbound) && c.is_active())
             .count();
         if inbound_count >= MAX_INBOUND {
-            return Err(NetworkError::ConnectionFailed(
-                format!("Max inbound reached ({})", MAX_INBOUND)
-            ));
+            return Err(NetworkError::ConnectionFailed(format!(
+                "Max inbound reached ({})",
+                MAX_INBOUND
+            )));
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.connections.insert(id, Connection::new_inbound(id, address));
+        self.connections
+            .insert(id, Connection::new_inbound(id, address));
         Ok(id)
     }
 
@@ -193,21 +207,24 @@ impl ConnectionManager {
     }
 
     pub fn on_handshake_complete(
-        &mut self, id: u64,
-        user_agent: &str, version: u32, best_height: u64,
+        &mut self,
+        id: u64,
+        user_agent: &str,
+        version: u32,
+        best_height: u64,
     ) {
         if let Some(conn) = self.connections.get_mut(&id) {
-            conn.state       = ConnectionState::Connected;
-            conn.user_agent  = user_agent.to_string();
-            conn.version     = version;
+            conn.state = ConnectionState::Connected;
+            conn.user_agent = user_agent.to_string();
+            conn.version = version;
             conn.best_height = best_height;
-            conn.last_seen   = Instant::now();
+            conn.last_seen = Instant::now();
         }
     }
 
     pub fn on_message_received(&mut self, id: u64, bytes: u64) {
         if let Some(conn) = self.connections.get_mut(&id) {
-            conn.last_seen  = Instant::now();
+            conn.last_seen = Instant::now();
             conn.bytes_recv += bytes;
         }
     }
@@ -223,19 +240,22 @@ impl ConnectionManager {
     }
 
     pub fn outbound_count(&self) -> usize {
-        self.connections.values()
+        self.connections
+            .values()
             .filter(|c| matches!(c.direction, ConnectionDir::Outbound) && c.is_active())
             .count()
     }
 
     pub fn inbound_count(&self) -> usize {
-        self.connections.values()
+        self.connections
+            .values()
             .filter(|c| matches!(c.direction, ConnectionDir::Inbound) && c.is_active())
             .count()
     }
 
     pub fn connected_addresses(&self) -> Vec<String> {
-        self.connections.values()
+        self.connections
+            .values()
             .filter(|c| c.is_active())
             .map(|c| c.address.clone())
             .collect()
@@ -278,8 +298,10 @@ mod tests {
     #[test]
     fn reject_inbound_self_connection() {
         let mut mgr = mgr();
-        assert!(mgr.accept_connection("0.0.0.0:9333").is_err(),
-            "Inbound self-connection must be rejected");
+        assert!(
+            mgr.accept_connection("0.0.0.0:9333").is_err(),
+            "Inbound self-connection must be rejected"
+        );
     }
 
     #[test]

@@ -3,15 +3,13 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::errors::StorageError;
 use rocksdb::{
-    DB, Options, WriteOptions, ReadOptions,
-    WriteBatch,
-    BlockBasedOptions, Cache, SliceTransform,
-    DBCompressionType,
+    BlockBasedOptions, Cache, DBCompressionType, Options, ReadOptions, SliceTransform, WriteBatch,
+    WriteOptions, DB,
 };
 use std::path::Path;
 use zeroize::Zeroizing;
-use crate::errors::StorageError;
 
 // prefix
 const KEY_PREFIX: &[u8] = b"pk:";
@@ -26,7 +24,6 @@ pub struct PrivateKeyStore {
 }
 
 impl PrivateKeyStore {
-
     // ─────────────────────────────────────────
     // INIT
     // ─────────────────────────────────────────
@@ -38,7 +35,7 @@ impl PrivateKeyStore {
         opts.increase_parallelism(
             std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4) as i32
+                .unwrap_or(4) as i32,
         );
 
         opts.optimize_level_style_compaction(256 * 1024 * 1024);
@@ -58,8 +55,10 @@ impl PrivateKeyStore {
         opts.set_block_based_table_factory(&block_opts);
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(PREFIX_LEN));
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| StorageError::OpenFailed { path: path.to_string(), reason: e.to_string() })?;
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| StorageError::OpenFailed {
+            path: path.to_string(),
+            reason: e.to_string(),
+        })?;
 
         let mut write_opts = WriteOptions::default();
         write_opts.disable_wal(false);
@@ -105,7 +104,8 @@ impl PrivateKeyStore {
     #[inline(always)]
     pub fn store(&self, key_id: &str, key: &[u8]) -> Result<(), StorageError> {
         self.with_key(key_id, |k| {
-            self.db.put_opt(k, key, &self.write_opts)
+            self.db
+                .put_opt(k, key, &self.write_opts)
                 .map_err(|e| StorageError::WriteFailed(format!("store failed: {}", e)))
         })
     }
@@ -116,7 +116,8 @@ impl PrivateKeyStore {
     #[inline(always)]
     pub fn load(&self, key_id: &str) -> Option<Zeroizing<Vec<u8>>> {
         self.with_key(key_id, |k| {
-            self.db.get_pinned_opt(k, &self.read_opts)
+            self.db
+                .get_pinned_opt(k, &self.read_opts)
                 .ok()
                 .flatten()
                 .map(|v| Zeroizing::new(v.to_vec()))
@@ -138,7 +139,8 @@ impl PrivateKeyStore {
     #[inline(always)]
     pub fn delete(&self, key_id: &str) -> Result<(), StorageError> {
         self.with_key(key_id, |k| {
-            self.db.delete_opt(k, &self.write_opts)
+            self.db
+                .delete_opt(k, &self.write_opts)
                 .map_err(|e| StorageError::WriteFailed(format!("delete failed: {}", e)))
         })
     }
@@ -149,7 +151,8 @@ impl PrivateKeyStore {
     #[inline(always)]
     pub fn exists(&self, key_id: &str) -> bool {
         self.with_key(key_id, |k| {
-            self.db.get_pinned_opt(k, &self.read_opts)
+            self.db
+                .get_pinned_opt(k, &self.read_opts)
                 .map(|v| v.is_some())
                 .unwrap_or(false)
         })
@@ -183,7 +186,8 @@ impl PrivateKeyStore {
             batch.put(k, value);
         }
 
-        self.db.write_opt(batch, &self.write_opts)
+        self.db
+            .write_opt(batch, &self.write_opts)
             .map_err(|e| StorageError::WriteFailed(format!("batch write: {}", e)))
     }
 
@@ -199,21 +203,19 @@ impl PrivateKeyStore {
             batch.delete(k);
         }
 
-        self.db.write_opt(batch, &self.write_opts)
+        self.db
+            .write_opt(batch, &self.write_opts)
             .map_err(|e| StorageError::WriteFailed(format!("batch delete: {}", e)))
     }
 
     // ─────────────────────────────────────────
     // MULTI GET PINNED
     // ─────────────────────────────────────────
-    pub fn multi_get_pinned(
-        &self,
-        keys: &[&str]
-    ) -> Vec<Option<Vec<u8>>> {
-
+    pub fn multi_get_pinned(&self, keys: &[&str]) -> Vec<Option<Vec<u8>>> {
         let key_buffers = Self::build_keys(keys);
 
-        self.db.multi_get_opt(key_buffers.iter(), &self.read_opts)
+        self.db
+            .multi_get_opt(key_buffers.iter(), &self.read_opts)
             .into_iter()
             .map(|r| r.ok().flatten())
             .collect()
@@ -225,7 +227,8 @@ impl PrivateKeyStore {
     pub fn multi_get(&self, keys: &[&str]) -> Vec<Option<Vec<u8>>> {
         let key_buffers = Self::build_keys(keys);
 
-        self.db.multi_get_opt(key_buffers.iter(), &self.read_opts)
+        self.db
+            .multi_get_opt(key_buffers.iter(), &self.read_opts)
             .into_iter()
             .map(|r| r.ok().flatten().map(|v| v.to_vec()))
             .collect()
@@ -237,7 +240,8 @@ impl PrivateKeyStore {
     pub fn multi_get_no_cache(&self, keys: &[&str]) -> Vec<Option<Vec<u8>>> {
         let key_buffers = Self::build_keys(keys);
 
-        self.db.multi_get_opt(key_buffers.iter(), &self.read_opts_no_cache)
+        self.db
+            .multi_get_opt(key_buffers.iter(), &self.read_opts_no_cache)
             .into_iter()
             .map(|r| r.ok().flatten().map(|v| v.to_vec()))
             .collect()
@@ -247,7 +251,8 @@ impl PrivateKeyStore {
     // FLUSH
     // ─────────────────────────────────────────
     pub fn flush(&self) -> Result<(), StorageError> {
-        self.db.flush()
+        self.db
+            .flush()
             .map_err(|e| StorageError::WriteFailed(format!("flush: {}", e)))
     }
 }

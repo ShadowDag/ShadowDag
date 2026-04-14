@@ -4,37 +4,37 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use std::collections::VecDeque;
-pub const TARGET_BLOCK_TIME_SECS:   u64 = 1;
-pub const SHORT_WINDOW:             usize = 144;
-pub const LONG_WINDOW:              usize = 2016;
+pub const TARGET_BLOCK_TIME_SECS: u64 = 1;
+pub const SHORT_WINDOW: usize = 144;
+pub const LONG_WINDOW: usize = 2016;
 
 /// Maximum timestamp drift allowed between a DAG block and its parents.
 /// Tighter than the block validator's MAX_TIMESTAMP_JUMP_SECS (30s) to
 /// prevent timewarp in high-BPS DAGs where many blocks share timestamps.
-pub const MAX_DAG_TIMESTAMP_DRIFT:  u64 = 5;
+pub const MAX_DAG_TIMESTAMP_DRIFT: u64 = 5;
 
-pub const EMA_ALPHA_NUM:            u64 = 1;
-pub const EMA_ALPHA_DEN:            u64 = 20;
+pub const EMA_ALPHA_NUM: u64 = 1;
+pub const EMA_ALPHA_DEN: u64 = 20;
 
 /// Max per-block adjustment: 4x up, 4x down.
 /// Must converge fast enough that a difficulty mismatch (e.g. genesis → real
 /// hashrate) is corrected within ~20 blocks, not 200.
-pub const MAX_ADJUST_UP:            u64 = 4;
-pub const MAX_ADJUST_DOWN:          u64 = 4;
+pub const MAX_ADJUST_UP: u64 = 4;
+pub const MAX_ADJUST_DOWN: u64 = 4;
 
 /// Difficulty is a numeric value where target = MAX_TARGET / difficulty.
 /// Higher difficulty = harder to mine. Unified with pow_validator.rs.
 /// Range: 1 (easiest) to u64::MAX / 2 (theoretical maximum).
-pub const MIN_DIFFICULTY:           u64 = 1;
-pub const MAX_DIFFICULTY:           u64 = u64::MAX / 2;
+pub const MIN_DIFFICULTY: u64 = 1;
+pub const MAX_DIFFICULTY: u64 = u64::MAX / 2;
 
-pub const CLIFF_DETECT_RATIO:       u64 = 10;
-pub const MAX_BLOCK_SPACING:        u64 = TARGET_BLOCK_TIME_SECS * 10;
+pub const CLIFF_DETECT_RATIO: u64 = 10;
+pub const MAX_BLOCK_SPACING: u64 = TARGET_BLOCK_TIME_SECS * 10;
 
 #[derive(Debug, Clone)]
 pub struct BlockTimeRecord {
-    pub height:     u64,
-    pub timestamp:  u64,
+    pub height: u64,
+    pub timestamp: u64,
     pub difficulty: u64,
     /// Total number of DAG blocks at this height level (including parallel blocks).
     /// When only the best-tip chain is observed, this defaults to 1.
@@ -49,10 +49,10 @@ pub struct BlockTimeRecord {
 
 pub struct RetargetEngine {
     short_window: VecDeque<BlockTimeRecord>,
-    long_window:  VecDeque<BlockTimeRecord>,
+    long_window: VecDeque<BlockTimeRecord>,
     /// EMA difficulty — stored as u64 (NOT float) for consensus determinism.
     /// Integer EMA: ema = ema_prev + (new - ema_prev) / 20
-    ema_diff:     u64,
+    ema_diff: u64,
     /// Expected blocks per second (from consensus params). Used to scale
     /// the effective block rate for DAG-aware difficulty.
     expected_bps: u64,
@@ -66,15 +66,15 @@ pub struct RetargetEngine {
     /// Used to stabilize difficulty under DAG conditions where total block
     /// rate fluctuates due to latency and parallelism.
     blue_score_window_start: u64,
-    blue_score_window_end:   u64,
+    blue_score_window_end: u64,
 }
 
 impl RetargetEngine {
     pub fn new(initial_difficulty: u64) -> Self {
         Self {
             short_window: VecDeque::new(),
-            long_window:  VecDeque::new(),
-            ema_diff:     initial_difficulty,
+            long_window: VecDeque::new(),
+            ema_diff: initial_difficulty,
             // Backward-compatible default for chain-only callers.
             // DAG-aware callers should use `new_with_bps`.
             expected_bps: 1,
@@ -88,8 +88,8 @@ impl RetargetEngine {
     pub fn new_with_bps(initial_difficulty: u64, bps: u64) -> Self {
         Self {
             short_window: VecDeque::new(),
-            long_window:  VecDeque::new(),
-            ema_diff:     initial_difficulty,
+            long_window: VecDeque::new(),
+            ema_diff: initial_difficulty,
             expected_bps: bps.max(1),
             dag_blocks_in_window: 0,
             blue_score_window_start: 0,
@@ -112,12 +112,13 @@ impl RetargetEngine {
         // Scale window sizes by BPS so we always cover ~the same wall-clock time.
         // At 10 BPS, SHORT_WINDOW=144 covers ~14s; we want ~60s → scale by BPS/2
         let effective_short = SHORT_WINDOW.max(self.expected_bps as usize * 15);
-        let effective_long  = LONG_WINDOW.max(self.expected_bps as usize * 200);
+        let effective_long = LONG_WINDOW.max(self.expected_bps as usize * 200);
 
         self.short_window.push_back(rec.clone());
         while self.short_window.len() > effective_short {
             if let Some(old) = self.short_window.pop_front() {
-                self.dag_blocks_in_window = self.dag_blocks_in_window
+                self.dag_blocks_in_window = self
+                    .dag_blocks_in_window
                     .saturating_sub(old.dag_block_count.max(1));
             }
         }
@@ -148,12 +149,12 @@ impl RetargetEngine {
             // We can't see the actual sub-second timing, so we count
             // same-timestamp pairs as a proxy for "too fast".
             let base = self.window_average_difficulty(&self.short_window);
-            let ema  = self.ema_diff;
+            let ema = self.ema_diff;
             let mut blended = ((base as u128 + ema as u128) / 2) as u64;
 
             if n >= 2 {
                 let first_ts = self.short_window.front().map(|r| r.timestamp).unwrap_or(0);
-                let last_ts  = self.short_window.back().map(|r| r.timestamp).unwrap_or(0);
+                let last_ts = self.short_window.back().map(|r| r.timestamp).unwrap_or(0);
                 let span = last_ts.saturating_sub(first_ts).max(1);
                 let blocks = (n - 1) as u64;
 
@@ -243,11 +244,9 @@ impl RetargetEngine {
         //   1. process_block -> validate + DAG/GHOSTDAG insert
         //   2. recompute_virtual_chain -> retarget.on_new_block
         // Any path that bypasses step 1 breaks this assumption.
-        if n >= 10
-            && self.blue_score_window_end > self.blue_score_window_start
-        {
+        if n >= 10 && self.blue_score_window_end > self.blue_score_window_start {
             let first_ts = self.short_window.front().map(|r| r.timestamp).unwrap_or(0);
-            let last_ts  = self.short_window.back().map(|r| r.timestamp).unwrap_or(0);
+            let last_ts = self.short_window.back().map(|r| r.timestamp).unwrap_or(0);
             let time_span = last_ts.saturating_sub(first_ts).max(1);
 
             let blue_delta = self.blue_score_window_end - self.blue_score_window_start;
@@ -267,7 +266,8 @@ impl RetargetEngine {
                 if blue_pct > 0 && blue_pct != 100 {
                     // Blend: 70% block-rate blended_time + 30% blue-rate adjusted time
                     let blue_adjusted = (blended_time as u128 * 100 / blue_pct as u128) as u64;
-                    blended_time = ((blended_time as u128 * 7 + blue_adjusted as u128 * 3) / 10) as u64;
+                    blended_time =
+                        ((blended_time as u128 * 7 + blue_adjusted as u128 * 3) / 10) as u64;
                     blended_time = blended_time.max(1);
                 }
             }
@@ -326,13 +326,12 @@ impl RetargetEngine {
     fn adjust_difficulty(&self, current_diff: u64, actual_time: u64) -> u64 {
         let actual_time = actual_time.max(1);
 
-        let nd = (current_diff as u128)
-            .saturating_mul(TARGET_BLOCK_TIME_SECS as u128)
+        let nd = (current_diff as u128).saturating_mul(TARGET_BLOCK_TIME_SECS as u128)
             / actual_time as u128;
 
         let nd = nd as u64;
 
-        let max_up   = current_diff.saturating_mul(MAX_ADJUST_UP);
+        let max_up = current_diff.saturating_mul(MAX_ADJUST_UP);
         let max_down = current_diff / MAX_ADJUST_DOWN;
 
         nd.clamp(max_down, max_up)
@@ -340,7 +339,9 @@ impl RetargetEngine {
 
     fn compute_lwma(&self, window: &VecDeque<BlockTimeRecord>) -> u64 {
         let n = window.len();
-        if n < 2 { return TARGET_BLOCK_TIME_SECS; }
+        if n < 2 {
+            return TARGET_BLOCK_TIME_SECS;
+        }
 
         let mut weighted_sum = 0u128;
         let mut weight_total = 0u128;
@@ -375,7 +376,9 @@ impl RetargetEngine {
     /// 🔥 DETERMINISTIC integer average — NO FLOAT for consensus safety
     fn compute_average_time_integer(&self, window: &VecDeque<BlockTimeRecord>) -> u64 {
         let n = window.len();
-        if n < 2 { return TARGET_BLOCK_TIME_SECS; }
+        if n < 2 {
+            return TARGET_BLOCK_TIME_SECS;
+        }
 
         let mut times: Vec<u64> = window.iter().map(|r| r.timestamp).collect();
         times.sort_unstable();
@@ -389,7 +392,9 @@ impl RetargetEngine {
         let clamped_span = span.min(max_span).max(1);
 
         let denom = (n - 1) as u64;
-        if denom == 0 { return TARGET_BLOCK_TIME_SECS; }
+        if denom == 0 {
+            return TARGET_BLOCK_TIME_SECS;
+        }
 
         // Integer division with rounding: (span + denom/2) / denom
         (clamped_span + denom / 2) / denom
@@ -429,9 +434,12 @@ impl RetargetEngine {
 
     pub fn median_past_time(&self, last_n: usize) -> u64 {
         let n = last_n.min(self.long_window.len());
-        if n == 0 { return 0; }
+        if n == 0 {
+            return 0;
+        }
 
-        let mut ts: Vec<u64> = self.long_window
+        let mut ts: Vec<u64> = self
+            .long_window
             .iter()
             .rev()
             .take(n)
@@ -442,9 +450,15 @@ impl RetargetEngine {
         ts[n / 2]
     }
 
-    pub fn short_window_len(&self) -> usize { self.short_window.len() }
-    pub fn long_window_len(&self)  -> usize { self.long_window.len() }
-    pub fn ema_difficulty(&self)   -> u64   { self.ema_diff }
+    pub fn short_window_len(&self) -> usize {
+        self.short_window.len()
+    }
+    pub fn long_window_len(&self) -> usize {
+        self.long_window.len()
+    }
+    pub fn ema_difficulty(&self) -> u64 {
+        self.ema_diff
+    }
 
     /// Blue score rate: blue_score_delta / time_span (blue blocks per second).
     /// More stable than raw block rate because GHOSTDAG filters red blocks.
@@ -454,9 +468,11 @@ impl RetargetEngine {
             return 0;
         }
         let first_ts = self.short_window.front().map(|r| r.timestamp).unwrap_or(0);
-        let last_ts  = self.short_window.back().map(|r| r.timestamp).unwrap_or(0);
+        let last_ts = self.short_window.back().map(|r| r.timestamp).unwrap_or(0);
         let span = last_ts.saturating_sub(first_ts).max(1);
-        let delta = self.blue_score_window_end.saturating_sub(self.blue_score_window_start);
+        let delta = self
+            .blue_score_window_end
+            .saturating_sub(self.blue_score_window_start);
         delta / span
     }
 }
@@ -465,30 +481,39 @@ impl RetargetEngine {
 pub fn adjust_difficulty(current: u64, actual_secs: u64) -> u64 {
     let actual_secs = actual_secs.max(1);
 
-    let nd = (current as u128)
-        .saturating_mul(TARGET_BLOCK_TIME_SECS as u128)
-        / actual_secs as u128;
+    let nd = (current as u128).saturating_mul(TARGET_BLOCK_TIME_SECS as u128) / actual_secs as u128;
 
     let nd = nd as u64;
 
-    let max_up   = current.saturating_mul(MAX_ADJUST_UP);
+    let max_up = current.saturating_mul(MAX_ADJUST_UP);
     let max_down = current / MAX_ADJUST_DOWN;
 
     nd.clamp(max_down, max_up)
         .clamp(MIN_DIFFICULTY, MAX_DIFFICULTY)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn block(h: u64, ts: u64, diff: u64) -> BlockTimeRecord {
-        BlockTimeRecord { height: h, timestamp: ts, difficulty: diff, dag_block_count: 1, blue_score: h }
+        BlockTimeRecord {
+            height: h,
+            timestamp: ts,
+            difficulty: diff,
+            dag_block_count: 1,
+            blue_score: h,
+        }
     }
 
     fn scored_block(h: u64, ts: u64, diff: u64, dag_count: u64, blue: u64) -> BlockTimeRecord {
-        BlockTimeRecord { height: h, timestamp: ts, difficulty: diff, dag_block_count: dag_count, blue_score: blue }
+        BlockTimeRecord {
+            height: h,
+            timestamp: ts,
+            difficulty: diff,
+            dag_block_count: dag_count,
+            blue_score: blue,
+        }
     }
 
     #[test]
@@ -523,7 +548,12 @@ mod tests {
             let _ = engine.on_new_block(r);
         }
         let diff = engine.ema_difficulty();
-        assert!(diff > init, "EMA should track upward from {}: got {}", init, diff);
+        assert!(
+            diff > init,
+            "EMA should track upward from {}: got {}",
+            init,
+            diff
+        );
     }
 
     #[test]
@@ -569,10 +599,10 @@ mod tests {
     #[test]
     fn validate_difficulty_strict_equality() {
         let engine = RetargetEngine::new(32);
-        assert!(engine.validate_difficulty(32, 32));   // exact match
-        assert!(!engine.validate_difficulty(28, 32));   // 28 != 32 → rejected
-        assert!(!engine.validate_difficulty(36, 32));   // 36 != 32 → rejected
-        assert!(!engine.validate_difficulty(10, 32));   // far off → rejected
+        assert!(engine.validate_difficulty(32, 32)); // exact match
+        assert!(!engine.validate_difficulty(28, 32)); // 28 != 32 → rejected
+        assert!(!engine.validate_difficulty(36, 32)); // 36 != 32 → rejected
+        assert!(!engine.validate_difficulty(10, 32)); // far off → rejected
     }
 
     // ── DAG-aware tests ─────────────────────────────────────────────
@@ -593,8 +623,12 @@ mod tests {
 
         // With DAG-aware + blue-rate stabilization enabled, difficulty should
         // not fall below baseline under higher DAG throughput.
-        assert!(diff >= init,
-            "DAG-aware diff should not decrease: init={}, got={}", init, diff);
+        assert!(
+            diff >= init,
+            "DAG-aware diff should not decrease: init={}, got={}",
+            init,
+            diff
+        );
     }
 
     #[test]
@@ -608,8 +642,11 @@ mod tests {
 
         // At BPS=10, effective short window = max(144, 10*15) = 150
         // So we should have 150 entries in short_window (not 144)
-        assert!(engine.short_window_len() >= 150,
-            "Window should scale with BPS: got {}", engine.short_window_len());
+        assert!(
+            engine.short_window_len() >= 150,
+            "Window should scale with BPS: got {}",
+            engine.short_window_len()
+        );
     }
 
     #[test]
@@ -625,8 +662,12 @@ mod tests {
         }
 
         // Should stay roughly stable (chain-only view sees 1 block/sec = target)
-        assert!(diff >= init / 3 && diff <= init * 3,
-            "Backward compat: init={}, got={}", init, diff);
+        assert!(
+            diff >= init / 3 && diff <= init * 3,
+            "Backward compat: init={}, got={}",
+            init,
+            diff
+        );
     }
 
     #[test]
@@ -663,6 +704,10 @@ mod tests {
 
         // Blue rate should be ~10, not ~50
         let bsr = engine.blue_score_rate();
-        assert!(bsr < 20, "Blue rate should reflect honest rate ~10, got {}", bsr);
+        assert!(
+            bsr < 20,
+            "Blue rate should reflect honest rate ~10, got {}",
+            bsr
+        );
     }
 }

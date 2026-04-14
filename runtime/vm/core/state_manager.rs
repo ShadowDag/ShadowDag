@@ -12,9 +12,9 @@
 //   - Merkle state root computation
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::collections::BTreeMap;
-use sha2::{Sha256, Digest};
 use crate::errors::VmError;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 /// An account in the state
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -70,9 +70,17 @@ impl Account {
 #[derive(Debug, Clone)]
 pub enum StateChange {
     /// Account balance changed
-    BalanceChange { address: String, old_balance: u64, new_balance: u64 },
+    BalanceChange {
+        address: String,
+        old_balance: u64,
+        new_balance: u64,
+    },
     /// Account nonce incremented
-    NonceChange { address: String, old_nonce: u64, new_nonce: u64 },
+    NonceChange {
+        address: String,
+        old_nonce: u64,
+        new_nonce: u64,
+    },
     /// Account created
     AccountCreated { address: String },
     /// Account destroyed (SELFDESTRUCT). Carries BOTH the account row
@@ -89,9 +97,18 @@ pub enum StateChange {
         storage: BTreeMap<String, String>,
     },
     /// Storage value changed
-    StorageChange { address: String, key: String, old_value: Option<String>, new_value: Option<String> },
+    StorageChange {
+        address: String,
+        key: String,
+        old_value: Option<String>,
+        new_value: Option<String>,
+    },
     /// Contract code changed
-    CodeChanged { address: String, old_code_hash: String, old_code: Vec<u8> },
+    CodeChanged {
+        address: String,
+        old_code_hash: String,
+        old_code: Vec<u8>,
+    },
 }
 
 /// State snapshot ID
@@ -136,10 +153,14 @@ impl StateManager {
     pub fn get_or_create_account(&mut self, address: &str) -> &Account {
         if !self.accounts.contains_key(address) {
             let acc = Account::new_eoa(address.to_string(), 0);
-            self.journal.push(StateChange::AccountCreated { address: address.to_string() });
+            self.journal.push(StateChange::AccountCreated {
+                address: address.to_string(),
+            });
             self.accounts.insert(address.to_string(), acc);
         }
-        self.accounts.entry(address.to_string()).or_insert_with(|| Account::new_eoa(address.to_string(), 0))
+        self.accounts
+            .entry(address.to_string())
+            .or_insert_with(|| Account::new_eoa(address.to_string(), 0))
     }
 
     /// Get balance
@@ -217,14 +238,18 @@ impl StateManager {
     /// Set account balance (with journal entry)
     pub fn set_balance(&mut self, address: &str, new_balance: u64) -> Result<(), VmError> {
         self.get_or_create_account(address);
-        let account = self.accounts.get_mut(address)
-            .ok_or_else(|| VmError::Other(format!(
-                "account missing after get_or_create for {}", address
-            )))?;
+        let account = self.accounts.get_mut(address).ok_or_else(|| {
+            VmError::Other(format!(
+                "account missing after get_or_create for {}",
+                address
+            ))
+        })?;
         let old_balance = account.balance;
         account.balance = new_balance;
         self.journal.push(StateChange::BalanceChange {
-            address: address.to_string(), old_balance, new_balance
+            address: address.to_string(),
+            old_balance,
+            new_balance,
         });
         Ok(())
     }
@@ -249,10 +274,12 @@ impl StateManager {
     /// boundary.
     pub fn increment_nonce(&mut self, address: &str) -> Result<u64, VmError> {
         self.get_or_create_account(address);
-        let account = self.accounts.get_mut(address)
-            .ok_or_else(|| VmError::Other(format!(
-                "account missing after get_or_create for {}", address
-            )))?;
+        let account = self.accounts.get_mut(address).ok_or_else(|| {
+            VmError::Other(format!(
+                "account missing after get_or_create for {}",
+                address
+            ))
+        })?;
         let old_nonce = account.nonce;
         let new_nonce = old_nonce.checked_add(1).ok_or_else(|| {
             VmError::ContractError(format!(
@@ -265,7 +292,9 @@ impl StateManager {
         })?;
         account.nonce = new_nonce;
         self.journal.push(StateChange::NonceChange {
-            address: address.to_string(), old_nonce, new_nonce
+            address: address.to_string(),
+            old_nonce,
+            new_nonce,
         });
         Ok(new_nonce)
     }
@@ -285,14 +314,18 @@ impl StateManager {
     /// node for the duration of `nonce` journal-appends.
     pub fn set_nonce(&mut self, address: &str, new_nonce: u64) -> Result<(), VmError> {
         self.get_or_create_account(address);
-        let account = self.accounts.get_mut(address)
-            .ok_or_else(|| VmError::Other(format!(
-                "account missing after get_or_create for {}", address
-            )))?;
+        let account = self.accounts.get_mut(address).ok_or_else(|| {
+            VmError::Other(format!(
+                "account missing after get_or_create for {}",
+                address
+            ))
+        })?;
         let old_nonce = account.nonce;
         account.nonce = new_nonce;
         self.journal.push(StateChange::NonceChange {
-            address: address.to_string(), old_nonce, new_nonce
+            address: address.to_string(),
+            old_nonce,
+            new_nonce,
         });
         Ok(())
     }
@@ -300,10 +333,12 @@ impl StateManager {
     /// Deploy contract code to an address
     pub fn set_code(&mut self, address: &str, code: Vec<u8>) -> Result<(), VmError> {
         self.get_or_create_account(address);
-        let account = self.accounts.get_mut(address)
-            .ok_or_else(|| VmError::Other(format!(
-                "account missing after get_or_create for {}", address
-            )))?;
+        let account = self.accounts.get_mut(address).ok_or_else(|| {
+            VmError::Other(format!(
+                "account missing after get_or_create for {}",
+                address
+            ))
+        })?;
 
         // Record old state for rollback
         let old_code_hash = account.code_hash.clone();
@@ -330,7 +365,8 @@ impl StateManager {
 
     /// Get contract code
     pub fn get_code(&self, address: &str) -> Vec<u8> {
-        self.accounts.get(address)
+        self.accounts
+            .get(address)
             .map(|a| a.code.clone())
             .unwrap_or_default()
     }
@@ -347,8 +383,9 @@ impl StateManager {
     /// that later got reverted came back with its slots zeroed out,
     /// which is consensus-visible silent state corruption.
     pub fn destroy_account(&mut self, address: &str) -> Result<(), VmError> {
-        let account = self.accounts.remove(address)
-            .ok_or_else(|| VmError::Other(format!("cannot destroy non-existent account: {}", address)))?;
+        let account = self.accounts.remove(address).ok_or_else(|| {
+            VmError::Other(format!("cannot destroy non-existent account: {}", address))
+        })?;
         // Snapshot the storage map BEFORE removing it so the journal
         // entry carries everything needed to undo the destroy.
         let storage = self.storage.remove(address).unwrap_or_default();
@@ -364,9 +401,7 @@ impl StateManager {
 
     /// Read from contract storage
     pub fn storage_load(&self, address: &str, key: &str) -> Option<String> {
-        self.storage.get(address)
-            .and_then(|m| m.get(key))
-            .cloned()
+        self.storage.get(address).and_then(|m| m.get(key)).cloned()
     }
 
     /// Write to contract storage (with journal entry)
@@ -413,9 +448,14 @@ impl StateManager {
 
     /// Rollback to a snapshot (undoes all changes since snapshot)
     pub fn rollback(&mut self, snapshot_id: SnapshotId) -> Result<(), VmError> {
-        let journal_pos = self.snapshots.get(snapshot_id)
+        let journal_pos = self
+            .snapshots
+            .get(snapshot_id)
             .copied()
-            .ok_or(VmError::Other(format!("invalid snapshot ID: {}", snapshot_id)))?;
+            .ok_or(VmError::Other(format!(
+                "invalid snapshot ID: {}",
+                snapshot_id
+            )))?;
 
         // Replay journal entries in reverse to undo changes
         while self.journal.len() > journal_pos {
@@ -435,7 +475,8 @@ impl StateManager {
         if snapshot_id >= self.snapshots.len() {
             return Err(VmError::Other(format!(
                 "commit: invalid snapshot_id {} (only {} snapshots exist)",
-                snapshot_id, self.snapshots.len()
+                snapshot_id,
+                self.snapshots.len()
             )));
         }
         self.snapshots.truncate(snapshot_id);
@@ -445,12 +486,18 @@ impl StateManager {
     /// Undo a single state change
     fn undo_change(&mut self, change: StateChange) {
         match change {
-            StateChange::BalanceChange { address, old_balance, .. } => {
+            StateChange::BalanceChange {
+                address,
+                old_balance,
+                ..
+            } => {
                 if let Some(acc) = self.accounts.get_mut(&address) {
                     acc.balance = old_balance;
                 }
             }
-            StateChange::NonceChange { address, old_nonce, .. } => {
+            StateChange::NonceChange {
+                address, old_nonce, ..
+            } => {
                 if let Some(acc) = self.accounts.get_mut(&address) {
                     acc.nonce = old_nonce;
                 }
@@ -459,7 +506,11 @@ impl StateManager {
                 self.accounts.remove(&address);
                 self.storage.remove(&address);
             }
-            StateChange::AccountDestroyed { address, account, storage } => {
+            StateChange::AccountDestroyed {
+                address,
+                account,
+                storage,
+            } => {
                 // Re-materialize BOTH the account row and the full
                 // pre-destroy storage map. The previous undo only
                 // restored the account and silently dropped the
@@ -469,22 +520,26 @@ impl StateManager {
                     self.storage.insert(address, storage);
                 }
             }
-            StateChange::StorageChange { address, key, old_value, .. } => {
-                match old_value {
-                    Some(v) => {
-                        self.storage
-                            .entry(address)
-                            .or_default()
-                            .insert(key, v);
-                    }
-                    None => {
-                        if let Some(m) = self.storage.get_mut(&address) {
-                            m.remove(&key);
-                        }
+            StateChange::StorageChange {
+                address,
+                key,
+                old_value,
+                ..
+            } => match old_value {
+                Some(v) => {
+                    self.storage.entry(address).or_default().insert(key, v);
+                }
+                None => {
+                    if let Some(m) = self.storage.get_mut(&address) {
+                        m.remove(&key);
                     }
                 }
-            }
-            StateChange::CodeChanged { address, old_code_hash, old_code } => {
+            },
+            StateChange::CodeChanged {
+                address,
+                old_code_hash,
+                old_code,
+            } => {
                 if let Some(acc) = self.accounts.get_mut(&address) {
                     acc.code_hash = old_code_hash;
                     acc.code = old_code;
@@ -585,15 +640,25 @@ mod tests {
         let result = sm.transfer("alice", "bob", 5);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("overflow"), "expected overflow error, got: {}", msg);
+        assert!(
+            msg.contains("overflow"),
+            "expected overflow error, got: {}",
+            msg
+        );
 
         // Crucially, both sides must be unchanged — the transfer must be
         // atomic. With the old saturating_add, alice was debited in full
         // but bob only credited by 3, leaking 2 out of existence.
-        assert_eq!(sm.get_balance("alice"), before_alice,
-            "alice must not be debited when the credit side overflows");
-        assert_eq!(sm.get_balance("bob"), before_bob,
-            "bob must not be partially credited when the transfer overflows");
+        assert_eq!(
+            sm.get_balance("alice"),
+            before_alice,
+            "alice must not be debited when the credit side overflows"
+        );
+        assert_eq!(
+            sm.get_balance("bob"),
+            before_bob,
+            "bob must not be partially credited when the transfer overflows"
+        );
     }
 
     #[test]
@@ -648,7 +713,10 @@ mod tests {
     fn storage_ops() {
         let mut sm = StateManager::new();
         sm.storage_store("contract_a", "key1", "value1");
-        assert_eq!(sm.storage_load("contract_a", "key1"), Some("value1".to_string()));
+        assert_eq!(
+            sm.storage_load("contract_a", "key1"),
+            Some("value1".to_string())
+        );
 
         sm.storage_delete("contract_a", "key1");
         assert_eq!(sm.storage_load("contract_a", "key1"), None);
@@ -698,19 +766,27 @@ mod tests {
         assert_eq!(sm.get_nonce("alice"), u64::MAX);
 
         let result = sm.increment_nonce("alice");
-        assert!(result.is_err(), "increment past u64::MAX must error, got: {:?}", result);
+        assert!(
+            result.is_err(),
+            "increment past u64::MAX must error, got: {:?}",
+            result
+        );
         let msg = format!("{}", result.unwrap_err());
         assert!(
             msg.contains("nonce overflow"),
-            "error must describe the overflow, got: {}", msg
+            "error must describe the overflow, got: {}",
+            msg
         );
 
         // The nonce must be UNCHANGED by the failed increment —
         // saturation would silently lose the failure signal AND
         // freeze the value at u64::MAX, which is exactly the
         // corruption we're refusing.
-        assert_eq!(sm.get_nonce("alice"), u64::MAX,
-            "failed increment must not mutate the nonce");
+        assert_eq!(
+            sm.get_nonce("alice"),
+            u64::MAX,
+            "failed increment must not mutate the nonce"
+        );
     }
 
     #[test]
@@ -778,8 +854,11 @@ mod tests {
             res.is_err(),
             "self-transfer > balance must still be rejected"
         );
-        assert_eq!(sm.get_balance("alice"), 10,
-            "rejected self-transfer must not mutate balance");
+        assert_eq!(
+            sm.get_balance("alice"),
+            10,
+            "rejected self-transfer must not mutate balance"
+        );
     }
 
     /// P0-5: `destroy_account` journals storage so a rollback can
@@ -800,8 +879,10 @@ mod tests {
         assert!(sm.storage_load("v", "slot:0").is_none());
 
         sm.rollback(snap).expect("rollback");
-        assert!(sm.get_account("v").is_some(),
-            "rollback must restore account");
+        assert!(
+            sm.get_account("v").is_some(),
+            "rollback must restore account"
+        );
         assert_eq!(
             sm.storage_load("v", "slot:0"),
             Some("one".to_string()),

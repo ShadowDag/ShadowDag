@@ -20,11 +20,19 @@ pub struct BlockRules;
 impl BlockRules {
     /// Quick validation (header only, no UTXO check)
     pub fn validate_header_only(block: &Block, pow: &dyn PowChecker) -> bool {
-        if block.header.hash.is_empty() { return false; }
-        if block.header.difficulty == 0 { return false; }
-        if block.header.height > 0 && block.header.parents.is_empty() { return false; }
+        if block.header.hash.is_empty() {
+            return false;
+        }
+        if block.header.difficulty == 0 {
+            return false;
+        }
+        if block.header.height > 0 && block.header.parents.is_empty() {
+            return false;
+        }
         // Prevent DoS: reject blocks with too many parents (GHOSTDAG = O(parents²))
-        if block.header.parents.len() > crate::config::consensus::consensus_params::ConsensusParams::MAX_PARENTS {
+        if block.header.parents.len()
+            > crate::config::consensus::consensus_params::ConsensusParams::MAX_PARENTS
+        {
             return false;
         }
         // Reject blocks with timestamps too far in the future

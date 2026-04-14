@@ -5,29 +5,29 @@
 
 #[cfg(test)]
 mod tx_hash_tests {
-    use crate::domain::transaction::tx_hash::TxHash;
     use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
+    use crate::domain::transaction::tx_hash::TxHash;
 
     fn make_tx() -> Transaction {
         Transaction {
-            hash:      String::new(),
-            inputs:    vec![TxInput {
-                txid:      "prev001".to_string(),
-                index:     0,
-                owner:     "shadow1alice".to_string(),
+            hash: String::new(),
+            inputs: vec![TxInput {
+                txid: "prev001".to_string(),
+                index: 0,
+                owner: "shadow1alice".to_string(),
                 signature: String::new(),
-                pub_key:   String::new(),
+                pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
             }],
-            outputs:   vec![TxOutput {
+            outputs: vec![TxOutput {
                 address: "shadow1bob".to_string(),
-                amount:  1000,
+                amount: 1000,
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
             }],
-            fee:       10,
+            fee: 10,
             timestamp: 1735689600,
             is_coinbase: false,
             tx_type: TxType::Transfer,
@@ -71,10 +71,16 @@ mod tx_hash_tests {
     #[test]
     fn coinbase_has_no_inputs() {
         let cb = Transaction {
-            hash:      "cb001".to_string(),
-            inputs:    vec![],
-            outputs:   vec![TxOutput { address: "shadow1miner".to_string(), amount: 950, commitment: None, range_proof: None, ephemeral_pubkey: None }],
-            fee:       0,
+            hash: "cb001".to_string(),
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                address: "shadow1miner".to_string(),
+                amount: 950,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
+            fee: 0,
             timestamp: 1735689600,
             is_coinbase: true,
             tx_type: TxType::Transfer,
@@ -92,10 +98,16 @@ mod decoy_tests {
 
     fn fake_tx(hash: &str) -> Transaction {
         Transaction {
-            hash:      hash.to_string(),
-            inputs:    vec![],
-            outputs:   vec![TxOutput { address: "shadow1x".to_string(), amount: 1, commitment: None, range_proof: None, ephemeral_pubkey: None }],
-            fee:       0,
+            hash: hash.to_string(),
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                address: "shadow1x".to_string(),
+                amount: 1,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+            }],
+            fee: 0,
             timestamp: 1735689600,
             is_coinbase: false,
             tx_type: TxType::Transfer,
@@ -147,16 +159,26 @@ mod decoy_tests {
 #[cfg(test)]
 mod tx_builder_tests {
     use crate::domain::transaction::tx_builder::{
-        generate_keypair, build_transaction, build_coinbase_at_height
+        build_coinbase_at_height, build_transaction, generate_keypair,
     };
 
     #[test]
     fn coinbase_is_deterministic() {
         let t1 = build_coinbase_at_height(
-            "shadow1miner".into(), "shadow1dev".into(), 10, 95, 1735689600, 1
+            "shadow1miner".into(),
+            "shadow1dev".into(),
+            10,
+            95,
+            1735689600,
+            1,
         );
         let t2 = build_coinbase_at_height(
-            "shadow1miner".into(), "shadow1dev".into(), 10, 95, 1735689600, 1
+            "shadow1miner".into(),
+            "shadow1dev".into(),
+            10,
+            95,
+            1735689600,
+            1,
         );
         assert_eq!(t1.hash, t2.hash);
     }
@@ -185,9 +207,17 @@ mod tx_builder_tests {
             &kp.private_key_hex,
             &kp.public_key_hex,
         );
-        assert!(result.is_ok(), "build_transaction must succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "build_transaction must succeed: {:?}",
+            result
+        );
         let tx = result.unwrap();
         assert!(!tx.inputs[0].signature.is_empty(), "Signature must be set");
-        assert_eq!(tx.inputs[0].signature.len(), 128, "ed25519 sig = 64 bytes = 128 hex chars");
+        assert_eq!(
+            tx.inputs[0].signature.len(),
+            128,
+            "ed25519 sig = 64 bytes = 128 hex chars"
+        );
     }
 }

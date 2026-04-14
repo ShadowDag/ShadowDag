@@ -4,24 +4,19 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use pqcrypto_falcon::falcon512;
-use pqcrypto_traits::sign::{PublicKey, DetachedSignature};
+use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
 
-use rocksdb::{
-    DB, Options,
-    WriteOptions, ReadOptions,
-    SliceTransform,
-};
+use rocksdb::{Options, ReadOptions, SliceTransform, WriteOptions, DB};
 
-use std::path::Path;
 use crate::slog_error;
+use std::path::Path;
 
 // ─────────────────────────────────────────
 // PREFIX
 // ─────────────────────────────────────────
 const SIG_PREFIX: &[u8] = b"fsig:";
-const PK_PREFIX:  &[u8] = b"fpk:";
+const PK_PREFIX: &[u8] = b"fpk:";
 const PREFIX_LEN: usize = 5;
-
 
 // ─────────────────────────────────────────
 // DATA STRUCTS
@@ -30,12 +25,12 @@ const PREFIX_LEN: usize = 5;
 pub struct FalconKeypair {
     pub public_key: falcon512::PublicKey,
     pub secret_key: falcon512::SecretKey,
-    pub pk_hex:     String,
+    pub pk_hex: String,
 }
 
 pub struct FalconSignatureData {
-    pub signature:   falcon512::DetachedSignature,
-    pub sig_hex:     String,
+    pub signature: falcon512::DetachedSignature,
+    pub sig_hex: String,
     pub message_len: usize,
 }
 
@@ -46,7 +41,6 @@ pub struct FalconSignatureData {
 pub struct FalconSigner;
 
 impl FalconSigner {
-
     #[inline(always)]
     pub fn generate_keypair() -> FalconKeypair {
         let (pk, sk) = falcon512::keypair();
@@ -72,8 +66,8 @@ impl FalconSigner {
     #[inline(always)]
     pub fn verify(
         message: &[u8],
-        sig:     &falcon512::DetachedSignature,
-        pk:      &falcon512::PublicKey,
+        sig: &falcon512::DetachedSignature,
+        pk: &falcon512::PublicKey,
     ) -> bool {
         falcon512::verify_detached_signature(sig, message, pk).is_ok()
     }
@@ -95,7 +89,6 @@ pub struct FalconStore {
 }
 
 impl FalconStore {
-
     pub fn new(path: &str) -> Result<Self, crate::errors::StorageError> {
         let mut opts = Options::default();
 
@@ -105,16 +98,17 @@ impl FalconStore {
         opts.increase_parallelism(
             std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4) as i32
+                .unwrap_or(4) as i32,
         );
 
         opts.optimize_level_style_compaction(256 * 1024 * 1024);
 
-        let db = DB::open(&opts, Path::new(path))
-            .map_err(|e| crate::errors::StorageError::OpenFailed {
+        let db = DB::open(&opts, Path::new(path)).map_err(|e| {
+            crate::errors::StorageError::OpenFailed {
                 path: path.to_string(),
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         let mut write_opts = WriteOptions::default();
         write_opts.disable_wal(false);
@@ -125,7 +119,11 @@ impl FalconStore {
         read_opts.fill_cache(true);
         read_opts.set_prefix_same_as_start(true);
 
-        Ok(Self { db, write_opts, read_opts })
+        Ok(Self {
+            db,
+            write_opts,
+            read_opts,
+        })
     }
 
     // ─────────────────────────────────────────
@@ -193,7 +191,8 @@ impl FalconStore {
     pub fn multi_get_signatures(&self, keys: &[&str]) -> Vec<Option<Vec<u8>>> {
         let db_keys = self.build_keys(SIG_PREFIX, keys);
 
-        self.db.multi_get(db_keys)
+        self.db
+            .multi_get(db_keys)
             .into_iter()
             .map(|r| match r {
                 Ok(opt) => opt.map(|v| v.to_vec()),
@@ -257,7 +256,9 @@ impl FalconStore {
     pub fn clear_signatures(&self) {
         let iter = self.db.prefix_iterator(SIG_PREFIX);
         for (k, _) in iter.flatten() {
-            if !k.starts_with(SIG_PREFIX) { break; }
+            if !k.starts_with(SIG_PREFIX) {
+                break;
+            }
             if let Err(e) = self.db.delete(&*k) {
                 slog_error!("crypto", "falcon_clear_sig_failed", error => e);
             }
@@ -267,7 +268,9 @@ impl FalconStore {
     pub fn clear_public_keys(&self) {
         let iter = self.db.prefix_iterator(PK_PREFIX);
         for (k, _) in iter.flatten() {
-            if !k.starts_with(PK_PREFIX) { break; }
+            if !k.starts_with(PK_PREFIX) {
+                break;
+            }
             if let Err(e) = self.db.delete(&*k) {
                 slog_error!("crypto", "falcon_clear_pk_failed", error => e);
             }

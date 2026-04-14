@@ -27,31 +27,51 @@ pub const MAX_HEADER_TIME_GAP_SECS: u64 = 3_600;
 #[derive(Debug, Clone)]
 pub enum ChainVerifyResult {
     Valid,
-    InvalidGenesis { expected: String, got: String },
-    InvalidPoW { height: u64, hash: String },
-    TimestampGap { height: u64, gap_secs: u64 },
-    TimestampBackward { height: u64, timestamp: u64, prev_timestamp: u64 },
-    CheckpointMismatch { height: u64, expected: String, got: String },
-    InsufficientWork { cumulative: u64, required: u64 },
+    InvalidGenesis {
+        expected: String,
+        got: String,
+    },
+    InvalidPoW {
+        height: u64,
+        hash: String,
+    },
+    TimestampGap {
+        height: u64,
+        gap_secs: u64,
+    },
+    TimestampBackward {
+        height: u64,
+        timestamp: u64,
+        prev_timestamp: u64,
+    },
+    CheckpointMismatch {
+        height: u64,
+        expected: String,
+        got: String,
+    },
+    InsufficientWork {
+        cumulative: u64,
+        required: u64,
+    },
     EmptyChain,
 }
 
 /// Known checkpoints (hardcoded)
 pub struct Checkpoint {
     pub height: u64,
-    pub hash:   String,
+    pub hash: String,
 }
 
 pub struct ChainVerifier {
-    genesis_hash:  String,
-    checkpoints:   Vec<Checkpoint>,
+    genesis_hash: String,
+    checkpoints: Vec<Checkpoint>,
 }
 
 impl ChainVerifier {
     pub fn new(genesis_hash: &str) -> Self {
         Self {
             genesis_hash: genesis_hash.to_string(),
-            checkpoints:  Vec::new(),
+            checkpoints: Vec::new(),
         }
     }
 
@@ -89,7 +109,9 @@ impl ChainVerifier {
                     got: format!("starts at height {}", headers[0].height),
                 };
             }
-            let has_matching_checkpoint = self.checkpoints.iter()
+            let has_matching_checkpoint = self
+                .checkpoints
+                .iter()
                 .any(|cp| cp.height == headers[0].height && cp.hash == headers[0].hash);
             if !has_matching_checkpoint {
                 // No checkpoint covers this starting height — reject
@@ -118,16 +140,23 @@ impl ChainVerifier {
             {
                 use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
                 let recomputed = shadow_hash_raw_full(
-                    header.version, header.height, header.timestamp,
-                    header.nonce, header.extra_nonce, header.difficulty,
-                    &header.merkle_root, &header.parents,
+                    header.version,
+                    header.height,
+                    header.timestamp,
+                    header.nonce,
+                    header.extra_nonce,
+                    header.difficulty,
+                    &header.merkle_root,
+                    &header.parents,
                 );
                 if recomputed != header.hash {
                     return ChainVerifyResult::InvalidPoW {
                         height: header.height,
-                        hash: format!("hash mismatch: claimed {} != computed {}",
+                        hash: format!(
+                            "hash mismatch: claimed {} != computed {}",
                             &header.hash[..header.hash.len().min(16)],
-                            &recomputed[..recomputed.len().min(16)]),
+                            &recomputed[..recomputed.len().min(16)]
+                        ),
                     };
                 }
             }
@@ -172,7 +201,10 @@ impl ChainVerifier {
                 if !header.parents.iter().any(|p| p == ph) {
                     return ChainVerifyResult::InvalidPoW {
                         height: header.height,
-                        hash: format!("parent continuity: expected parent {}", &ph[..ph.len().min(16)]),
+                        hash: format!(
+                            "parent continuity: expected parent {}",
+                            &ph[..ph.len().min(16)]
+                        ),
                     };
                 }
             }
@@ -185,7 +217,11 @@ impl ChainVerifier {
                 if header.height != prev_height + 1 {
                     return ChainVerifyResult::InvalidPoW {
                         height: header.height,
-                        hash: format!("height gap: expected {} got {}", prev_height + 1, header.height),
+                        hash: format!(
+                            "height gap: expected {} got {}",
+                            prev_height + 1,
+                            header.height
+                        ),
                     };
                 }
             }
@@ -261,27 +297,64 @@ mod tests {
 
     /// Build a header with a real shadow_hash_raw_full so the hash
     /// recomputation check passes during verify_header_chain.
-    fn make_header(height: u64, difficulty: u64, timestamp: u64, parents: Vec<String>) -> BlockHeader {
+    fn make_header(
+        height: u64,
+        difficulty: u64,
+        timestamp: u64,
+        parents: Vec<String>,
+    ) -> BlockHeader {
         use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
         let merkle_root = "mr".to_string();
-        let hash = shadow_hash_raw_full(1, height, timestamp, 0, 0, difficulty, &merkle_root, &parents);
+        let hash = shadow_hash_raw_full(
+            1,
+            height,
+            timestamp,
+            0,
+            0,
+            difficulty,
+            &merkle_root,
+            &parents,
+        );
         BlockHeader {
-            version: 1, hash, parents,
-            merkle_root, timestamp, nonce: 0,
-            difficulty, height, blue_score: 0, selected_parent: None,
-            utxo_commitment: None, extra_nonce: 0,
-            receipt_root: None, state_root: None,
+            version: 1,
+            hash,
+            parents,
+            merkle_root,
+            timestamp,
+            nonce: 0,
+            difficulty,
+            height,
+            blue_score: 0,
+            selected_parent: None,
+            utxo_commitment: None,
+            extra_nonce: 0,
+            receipt_root: None,
+            state_root: None,
         }
     }
 
     /// Build a header with a WRONG hash (for negative tests).
-    fn make_header_bad_hash(height: u64, hash: &str, difficulty: u64, timestamp: u64) -> BlockHeader {
+    fn make_header_bad_hash(
+        height: u64,
+        hash: &str,
+        difficulty: u64,
+        timestamp: u64,
+    ) -> BlockHeader {
         BlockHeader {
-            version: 1, hash: hash.to_string(), parents: vec![],
-            merkle_root: "mr".into(), timestamp, nonce: 0,
-            difficulty, height, blue_score: 0, selected_parent: None,
-            utxo_commitment: None, extra_nonce: 0,
-            receipt_root: None, state_root: None,
+            version: 1,
+            hash: hash.to_string(),
+            parents: vec![],
+            merkle_root: "mr".into(),
+            timestamp,
+            nonce: 0,
+            difficulty,
+            height,
+            blue_score: 0,
+            selected_parent: None,
+            utxo_commitment: None,
+            extra_nonce: 0,
+            receipt_root: None,
+            state_root: None,
         }
     }
 
@@ -296,7 +369,10 @@ mod tests {
             let prev_hash = headers.last().unwrap().hash.clone();
             headers.push(make_header(i, 1, 1000 + i * 100, vec![prev_hash]));
         }
-        assert!(matches!(cv.verify_header_chain(&headers), ChainVerifyResult::Valid));
+        assert!(matches!(
+            cv.verify_header_chain(&headers),
+            ChainVerifyResult::Valid
+        ));
     }
 
     #[test]
@@ -342,7 +418,10 @@ mod tests {
     #[test]
     fn empty_chain() {
         let cv = ChainVerifier::new("0000genesis");
-        assert!(matches!(cv.verify_header_chain(&[]), ChainVerifyResult::EmptyChain));
+        assert!(matches!(
+            cv.verify_header_chain(&[]),
+            ChainVerifyResult::EmptyChain
+        ));
     }
 
     #[test]

@@ -23,8 +23,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
-use std::sync::{RwLock, OnceLock};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{OnceLock, RwLock};
 use std::time::Instant;
 
 // ── Global singleton ────────────────────────────────────────────────────
@@ -43,16 +43,26 @@ pub struct Counter {
 }
 
 impl Counter {
-    fn new() -> Self { Self { value: AtomicU64::new(0) } }
+    fn new() -> Self {
+        Self {
+            value: AtomicU64::new(0),
+        }
+    }
 
     #[inline]
-    pub fn inc(&self) { self.value.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc(&self) {
+        self.value.fetch_add(1, Ordering::Relaxed);
+    }
 
     #[inline]
-    pub fn inc_by(&self, n: u64) { self.value.fetch_add(n, Ordering::Relaxed); }
+    pub fn inc_by(&self, n: u64) {
+        self.value.fetch_add(n, Ordering::Relaxed);
+    }
 
     #[inline]
-    pub fn get(&self) -> u64 { self.value.load(Ordering::Relaxed) }
+    pub fn get(&self) -> u64 {
+        self.value.load(Ordering::Relaxed)
+    }
 }
 
 // ── Gauge (arbitrary value, can go up and down) ─────────────────────────
@@ -62,22 +72,36 @@ pub struct Gauge {
 }
 
 impl Gauge {
-    fn new() -> Self { Self { value: AtomicI64::new(0) } }
+    fn new() -> Self {
+        Self {
+            value: AtomicI64::new(0),
+        }
+    }
 
     #[inline]
-    pub fn set(&self, v: i64) { self.value.store(v, Ordering::Relaxed); }
+    pub fn set(&self, v: i64) {
+        self.value.store(v, Ordering::Relaxed);
+    }
 
     #[inline]
-    pub fn inc(&self) { self.value.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc(&self) {
+        self.value.fetch_add(1, Ordering::Relaxed);
+    }
 
     #[inline]
-    pub fn dec(&self) { self.value.fetch_sub(1, Ordering::Relaxed); }
+    pub fn dec(&self) {
+        self.value.fetch_sub(1, Ordering::Relaxed);
+    }
 
     #[inline]
-    pub fn add(&self, n: i64) { self.value.fetch_add(n, Ordering::Relaxed); }
+    pub fn add(&self, n: i64) {
+        self.value.fetch_add(n, Ordering::Relaxed);
+    }
 
     #[inline]
-    pub fn get(&self) -> i64 { self.value.load(Ordering::Relaxed) }
+    pub fn get(&self) -> i64 {
+        self.value.load(Ordering::Relaxed)
+    }
 }
 
 // ── Histogram (latency / distribution tracking) ─────────────────────────
@@ -85,21 +109,21 @@ impl Gauge {
 /// A simple histogram with fixed buckets for latency tracking.
 /// Buckets: 0.1ms, 0.5ms, 1ms, 5ms, 10ms, 50ms, 100ms, 500ms, 1s, 5s, 10s, +Inf
 pub struct Histogram {
-    buckets:   [AtomicU64; 12],
-    sum:       AtomicU64,  // sum of observations × 1000 (microseconds)
-    count:     AtomicU64,
+    buckets: [AtomicU64; 12],
+    sum: AtomicU64, // sum of observations × 1000 (microseconds)
+    count: AtomicU64,
 }
 
 const BUCKET_BOUNDS: [f64; 11] = [
-    0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0
+    0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0,
 ];
 
 impl Histogram {
     fn new() -> Self {
         Self {
             buckets: std::array::from_fn(|_| AtomicU64::new(0)),
-            sum:     AtomicU64::new(0),
-            count:   AtomicU64::new(0),
+            sum: AtomicU64::new(0),
+            count: AtomicU64::new(0),
         }
     }
 
@@ -107,7 +131,8 @@ impl Histogram {
     #[inline]
     pub fn observe(&self, value_ms: f64) {
         self.count.fetch_add(1, Ordering::Relaxed);
-        self.sum.fetch_add((value_ms * 1000.0) as u64, Ordering::Relaxed);
+        self.sum
+            .fetch_add((value_ms * 1000.0) as u64, Ordering::Relaxed);
 
         for (i, &bound) in BUCKET_BOUNDS.iter().enumerate() {
             if value_ms <= bound {
@@ -121,17 +146,24 @@ impl Histogram {
 
     /// Start a timer that auto-records when dropped.
     pub fn start_timer(&self) -> HistogramTimer<'_> {
-        HistogramTimer { histogram: self, start: Instant::now() }
+        HistogramTimer {
+            histogram: self,
+            start: Instant::now(),
+        }
     }
 
-    pub fn get_count(&self) -> u64 { self.count.load(Ordering::Relaxed) }
-    pub fn get_sum_ms(&self) -> f64 { self.sum.load(Ordering::Relaxed) as f64 / 1000.0 }
+    pub fn get_count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+    pub fn get_sum_ms(&self) -> f64 {
+        self.sum.load(Ordering::Relaxed) as f64 / 1000.0
+    }
 }
 
 /// RAII timer — records elapsed time on drop.
 pub struct HistogramTimer<'a> {
     histogram: &'a Histogram,
-    start:     Instant,
+    start: Instant,
 }
 
 impl<'a> Drop for HistogramTimer<'a> {
@@ -148,8 +180,8 @@ pub struct MetricsRegistry {
     // HashMap rehashes. The HashMap moves its entries; Box<T> does not.
     // We leak the &'static reference via Box::leak, which is safe because
     // the registry is a OnceLock global with 'static lifetime.
-    counters:   RwLock<HashMap<&'static str, &'static Counter>>,
-    gauges:     RwLock<HashMap<&'static str, &'static Gauge>>,
+    counters: RwLock<HashMap<&'static str, &'static Counter>>,
+    gauges: RwLock<HashMap<&'static str, &'static Gauge>>,
     histograms: RwLock<HashMap<&'static str, &'static Histogram>>,
     start_time: Instant,
 }
@@ -163,8 +195,8 @@ impl Default for MetricsRegistry {
 impl MetricsRegistry {
     pub fn new() -> Self {
         Self {
-            counters:   RwLock::new(HashMap::new()),
-            gauges:     RwLock::new(HashMap::new()),
+            counters: RwLock::new(HashMap::new()),
+            gauges: RwLock::new(HashMap::new()),
             histograms: RwLock::new(HashMap::new()),
             start_time: Instant::now(),
         }
@@ -246,7 +278,10 @@ impl MetricsRegistry {
         // Uptime
         out.push_str("# HELP shadowdag_uptime_seconds Node uptime\n");
         out.push_str("# TYPE shadowdag_uptime_seconds gauge\n");
-        out.push_str(&format!("shadowdag_uptime_seconds {}\n\n", self.uptime_secs()));
+        out.push_str(&format!(
+            "shadowdag_uptime_seconds {}\n\n",
+            self.uptime_secs()
+        ));
 
         // Counters
         if let Ok(map) = self.counters.read() {
@@ -255,7 +290,10 @@ impl MetricsRegistry {
             for name in names {
                 let prom_name = prom_name(name);
                 let val = map[*name].get();
-                out.push_str(&format!("# HELP shadowdag_{} ShadowDAG counter\n", prom_name));
+                out.push_str(&format!(
+                    "# HELP shadowdag_{} ShadowDAG counter\n",
+                    prom_name
+                ));
                 out.push_str(&format!("# TYPE shadowdag_{} counter\n", prom_name));
                 out.push_str(&format!("shadowdag_{} {}\n\n", prom_name, val));
             }
@@ -281,7 +319,10 @@ impl MetricsRegistry {
             for name in names {
                 let prom_name = prom_name(name);
                 let h = &map[*name];
-                out.push_str(&format!("# HELP shadowdag_{} ShadowDAG histogram (ms)\n", prom_name));
+                out.push_str(&format!(
+                    "# HELP shadowdag_{} ShadowDAG histogram (ms)\n",
+                    prom_name
+                ));
                 out.push_str(&format!("# TYPE shadowdag_{} histogram\n", prom_name));
 
                 let mut cumulative = 0u64;
@@ -297,8 +338,16 @@ impl MetricsRegistry {
                     "shadowdag_{}_bucket{{le=\"+Inf\"}} {}\n",
                     prom_name, cumulative
                 ));
-                out.push_str(&format!("shadowdag_{}_sum {:.3}\n", prom_name, h.get_sum_ms()));
-                out.push_str(&format!("shadowdag_{}_count {}\n\n", prom_name, h.get_count()));
+                out.push_str(&format!(
+                    "shadowdag_{}_sum {:.3}\n",
+                    prom_name,
+                    h.get_sum_ms()
+                ));
+                out.push_str(&format!(
+                    "shadowdag_{}_count {}\n\n",
+                    prom_name,
+                    h.get_count()
+                ));
             }
         }
 
@@ -335,7 +384,10 @@ impl MetricsRegistry {
                 let h = &map[*name];
                 parts.push(format!(
                     "\"{}_count\":{},\"{}_sum_ms\":{:.3}",
-                    name, h.get_count(), name, h.get_sum_ms()
+                    name,
+                    h.get_count(),
+                    name,
+                    h.get_sum_ms()
                 ));
             }
         }
@@ -383,9 +435,9 @@ impl MetricsRegistry {
 /// Point-in-time snapshot of all metrics.
 pub struct MetricsSnapshot {
     pub uptime_secs: u64,
-    pub counters:    Vec<(&'static str, u64)>,
-    pub gauges:      Vec<(&'static str, i64)>,
-    pub histograms:  Vec<(&'static str, u64, f64)>, // (name, count, sum_ms)
+    pub counters: Vec<(&'static str, u64)>,
+    pub gauges: Vec<(&'static str, i64)>,
+    pub histograms: Vec<(&'static str, u64, f64)>, // (name, count, sum_ms)
 }
 
 /// Convert dotted metric name to Prometheus-compatible underscore format.

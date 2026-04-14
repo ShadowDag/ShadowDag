@@ -3,33 +3,33 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::sync::Arc;
 use rocksdb::DB;
+use std::sync::Arc;
 
 use crate::errors::MempoolError;
-use crate::slog_warn;
-use crate::runtime::event_bus::event_bus::EventBus; // ✅ إضافة
+use crate::runtime::event_bus::event_bus::EventBus;
+use crate::slog_warn; // ✅ إضافة
 
 use crate::domain::transaction::transaction::Transaction;
 use crate::domain::utxo::utxo_set::UtxoSet;
 use crate::engine::dag::security::dos_protection::DosProtection;
 use crate::infrastructure::storage::rocksdb::utxo::utxo_store::UtxoStore;
 use crate::service::mempool::core::mempool::Mempool;
-use crate::service::mempool::pools::tx_pool::{TxPool, TxPoolResult};
-use crate::service::mempool::pools::orphan_pool::OrphanPool;
 use crate::service::mempool::fees::fee_market::FeeMarket;
-use crate::service::network::p2p::p2p::{P2PMessage, push_outbound_to_peer};
+use crate::service::mempool::pools::orphan_pool::OrphanPool;
+use crate::service::mempool::pools::tx_pool::{TxPool, TxPoolResult};
+use crate::service::network::p2p::p2p::{push_outbound_to_peer, P2PMessage};
 use crate::service::network::p2p::peer_manager::PeerManager;
-use crate::service::network::relay::tx_relay::broadcast as tx_broadcast;
 use crate::service::network::propagation::dandelion::{DandelionRelay, RelayAction};
+use crate::service::network::relay::tx_relay::broadcast as tx_broadcast;
 
 pub struct MempoolManager {
-    pub tx_pool:     TxPool,
+    pub tx_pool: TxPool,
     pub orphan_pool: OrphanPool,
-    utxo_set:        UtxoSet,
-    peer_manager:    PeerManager,
-    current_height:  u64,
-    dandelion:       DandelionRelay,
+    utxo_set: UtxoSet,
+    peer_manager: Arc<PeerManager>,
+    current_height: u64,
+    dandelion: DandelionRelay,
 
     event_bus: EventBus, // ✅ إضافة
 }
@@ -41,31 +41,40 @@ impl MempoolManager {
     }
 
     pub fn new_with_peers_path(db: Arc<DB>, peers_path: &str) -> Result<Self, MempoolError> {
-        let utxo_store = Arc::new(
-            UtxoStore::new(db.clone())
-                .map_err(|e| MempoolError::Storage(crate::errors::StorageError::OpenFailed {
-                    path: "utxo_store".to_string(),
-                    reason: e.to_string(),
-                }))?
-        );
-        let mempool    = Mempool::new(db.clone())
-            .map_err(|e| MempoolError::Storage(crate::errors::StorageError::Other(e.to_string())))?;
-        Ok(Self {
-            tx_pool:        TxPool::new(mempool),
-            orphan_pool:    OrphanPool::new(),
-            utxo_set:       UtxoSet::new(utxo_store as Arc<dyn crate::domain::traits::utxo_backend::UtxoBackend>),
-            peer_manager:   PeerManager::new_default_path(peers_path)
-                .map_err(|e| MempoolError::Storage(crate::errors::StorageError::Other(e.to_string())))?,
-            current_height: 0,
-            dandelion:      DandelionRelay::new(),
+        let peer_manager = Arc::new(PeerManager::new_default_path(peers_path).map_err(|e| {
+            MempoolError::Storage(crate::errors::StorageError::Other(e.to_string()))
+        })?);
+        Self::new_with_peer_manager(db, peer_manager)
+    }
 
-            event_bus: EventBus::new(db.clone())
-                .map_err(MempoolError::Storage)?,
+    pub fn new_with_peer_manager(
+        db: Arc<DB>,
+        peer_manager: Arc<PeerManager>,
+    ) -> Result<Self, MempoolError> {
+        let utxo_store = Arc::new(UtxoStore::new(db.clone()).map_err(|e| {
+            MempoolError::Storage(crate::errors::StorageError::OpenFailed {
+                path: "utxo_store".to_string(),
+                reason: e.to_string(),
+            })
+        })?);
+        let mempool = Mempool::new(db.clone()).map_err(|e| {
+            MempoolError::Storage(crate::errors::StorageError::Other(e.to_string()))
+        })?;
+        Ok(Self {
+            tx_pool: TxPool::new(mempool),
+            orphan_pool: OrphanPool::new(),
+            utxo_set: UtxoSet::new(
+                utxo_store as Arc<dyn crate::domain::traits::utxo_backend::UtxoBackend>,
+            ),
+            peer_manager,
+            current_height: 0,
+            dandelion: DandelionRelay::new(),
+
+            event_bus: EventBus::new(db.clone()).map_err(MempoolError::Storage)?,
         })
     }
 
-    pub fn initialize(&self) {
-    }
+    pub fn initialize(&self) {}
 
     pub fn add_transaction(&mut self, tx: Transaction) -> TxPoolResult {
         let dos = DosProtection::validate_transaction(&tx);
@@ -90,7 +99,7 @@ impl MempoolManager {
                     }
                     RelayAction::Fluff => {
                         // Fluff phase: broadcast to all peers
-                        tx_broadcast(&tx, &self.peer_manager);
+                        tx_broadcast(&tx, self.peer_manager.as_ref());
                     }
                     RelayAction::Drop => {
                         // Already seen — skip broadcast
@@ -105,19 +114,18 @@ impl MempoolManager {
             TxPoolResult::Orphan => {
                 self.orphan_pool.add(tx.clone(), self.current_height);
             }
-            TxPoolResult::Duplicate => {
-            }
-            TxPoolResult::DoubleSpend => {
-            }
-            TxPoolResult::Invalid | TxPoolResult::Rejected => {
-            }
+            TxPoolResult::Duplicate => {}
+            TxPoolResult::DoubleSpend => {}
+            TxPoolResult::Invalid | TxPoolResult::Rejected => {}
         }
 
         result
     }
 
     pub fn collect_for_block(&self, limit: usize) -> Vec<Transaction> {
-        self.tx_pool.mempool.select_transactions_for_block(&self.utxo_set, limit)
+        self.tx_pool
+            .mempool
+            .select_transactions_for_block(&self.utxo_set, limit)
     }
 
     pub fn on_new_block(&mut self, height: u64, confirmed_txids: &[String]) {
