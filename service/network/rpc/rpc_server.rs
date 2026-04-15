@@ -768,7 +768,9 @@ impl RpcServer {
                     .unwrap_or(false);
                 let is_localhost = peer_ip.is_some_and(|ip| ip.is_loopback());
                 if requires_auth(&req.method)
-                    && !(allow_local_noauth && is_localhost && req.method == "submitblock")
+                    && !(allow_local_noauth && is_localhost && matches!(req.method.as_str(),
+                        "submitblock" | "deploy_contract" | "call_contract" | "estimate_gas"
+                        | "sendrawtransaction" | "stop"))
                 {
                     match &auth_token {
                         Some(token) => {
