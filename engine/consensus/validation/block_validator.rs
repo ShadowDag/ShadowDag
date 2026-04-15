@@ -346,14 +346,16 @@ impl BlockValidator {
             // one or more EMA steps. A ±5% tolerance covers normal retarget
             // drift without opening the door to difficulty gaming.
             //
-            // Why not strict equality: the miner fetches expected_difficulty
-            // from getblocktemplate, mines for seconds/minutes, then submits.
-            // By then the node may have accepted other blocks and retargeted.
-            // Strict equality rejects every block mined on a slightly stale
-            // template — which is ALL blocks under normal operation.
-            let tolerance = expected / 20; // 5%
-            let min_allowed = expected.saturating_sub(tolerance);
-            let max_allowed = expected.saturating_add(tolerance);
+            // Why not strict equality: in a DAG with 10 BPS, the EMA retarget
+            // can move substantially between getblocktemplate and submitblock.
+            // Each node sees blocks arrive in different order, so their EMA
+            // states diverge. A ±50% tolerance covers normal EMA drift across
+            // the network while still rejecting difficulty gaming (>2x or <0.5x).
+            //
+            // On mainnet with stable hashrate this can be tightened, but for
+            // testnet bootstrap and early chain growth, wide tolerance is needed.
+            let min_allowed = expected / 2;
+            let max_allowed = expected.saturating_mul(2);
             if block.header.difficulty < min_allowed || block.header.difficulty > max_allowed {
                 return Err(ConsensusError::BlockValidation(format!(
                     "difficulty {} outside allowed range [{}, {}] (expected ~{})",
