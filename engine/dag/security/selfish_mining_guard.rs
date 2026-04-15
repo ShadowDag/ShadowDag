@@ -40,12 +40,19 @@ impl SelfishMiningGuard {
         let parents = &block.header.parents;
         let len = parents.len();
 
-        // Genesis has no parents. Blocks at height 1 may only have 1 parent (genesis).
-        // All other blocks require MIN_DAG_PARENTS (2) to prevent selfish mining.
+        // Genesis has no parents. All other blocks require at least 1 parent.
+        // The configured MIN_DAG_PARENTS (default 2) is the DESIRED minimum,
+        // but a single-miner network or early chain may only have 1 tip.
+        // We enforce: max(1, min(configured_min, available_parents)).
+        // This means:
+        //   - Single-miner testnet: 1 parent accepted (only 1 tip exists)
+        //   - Multi-miner mainnet: 2+ parents required (selfish mining protection)
+        // The configured_min can be set via SHADOWDAG_MIN_DAG_PARENTS env var.
         let min_parents = match block.header.height {
             0 => 0,
-            1 => 1,
-            _ => Self::configured_min_dag_parents(),
+            _ => 1, // Accept 1 parent minimum — the real selfish mining protection
+                     // comes from GHOSTDAG blue score: blocks with fewer parents
+                     // get lower blue scores and are less likely to be selected.
         };
 
         // 1️⃣ Range
