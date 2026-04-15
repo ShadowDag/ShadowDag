@@ -1,0 +1,34 @@
+[Unit]
+Description=ShadowDAG Node (testnet)
+Documentation=https://github.com/ShadowDag/ShadowDag
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ShadowDag
+ExecStart=/opt/ShadowDag/target/release/shadowdag-node --network=testnet
+
+# Graceful shutdown — RocksDB must close cleanly
+KillSignal=SIGTERM
+TimeoutStopSec=90
+SendSIGKILL=yes
+
+# Auto-restart on crash (but not on clean exit)
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Logs to journalctl
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=shadowdag-node
+
+[Install]
+WantedBy=multi-user.target
