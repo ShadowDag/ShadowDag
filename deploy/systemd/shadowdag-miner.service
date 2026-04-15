@@ -1,0 +1,33 @@
+[Unit]
+Description=ShadowDAG Miner (testnet)
+Documentation=https://github.com/ShadowDag/ShadowDag
+After=shadowdag-node.service
+Requires=shadowdag-node.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ShadowDag
+EnvironmentFile=/etc/shadowdag/miner.env
+
+# Wait up to 60s for the node's RPC to come up before starting the miner
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do curl -sf localhost:19332 -d "{\"jsonrpc\":\"2.0\",\"method\":\"getblockcount\",\"id\":1}" >/dev/null && exit 0; sleep 2; done; exit 1'
+
+ExecStart=/opt/ShadowDag/target/release/shadowdag-miner --network=testnet --address=${MINER_ADDRESS} --threads=${MINER_THREADS} --rpc=127.0.0.1:19332
+
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=15
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=shadowdag-miner
+
+[Install]
+WantedBy=multi-user.target

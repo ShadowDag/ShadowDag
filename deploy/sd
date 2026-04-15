@@ -1,0 +1,135 @@
+#!/bin/bash
+# ═══════════════════════════════════════════════════════════════════════════
+#  sd — ShadowDAG operator shortcut
+#
+#  One-character subcommands for the common operations so you don't have to
+#  type "systemctl ..." twenty times a day.
+#
+#  Install to /usr/local/bin/sd (the install-systemd.sh script does this).
+# ═══════════════════════════════════════════════════════════════════════════
+set -euo pipefail
+
+RPC_PORT="${RPC_PORT:-19332}"
+NODE_UNIT="shadowdag-node.service"
+MINER_UNIT="shadowdag-miner.service"
+
+rpc() {
+    curl -s --max-time 5 "localhost:${RPC_PORT}" \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"$1\",\"id\":1}" \
+        || echo '{"error":"rpc unreachable"}'
+}
+
+case "${1:-help}" in
+    status|s)
+        echo "═══ Services ═══"
+        systemctl --no-pager status "$NODE_UNIT" "$MINER_UNIT" 2>/dev/null | \
+            grep -E "●|Active:|Main PID:|Tasks:" || true
+        echo
+        echo "═══ Block Height ═══"
+        rpc getblockcount
+        echo
+        echo "═══ Mining Info ═══"
+        rpc getmininginfo
+        echo
+        echo "═══ Sync Status ═══"
+        rpc getsyncstatus
+        echo
+        echo "═══ DAG Tips ═══"
+        rpc gettips
+        echo
+        ;;
+
+    node|n)
+        exec journalctl -u "$NODE_UNIT" -f --no-hostname
+        ;;
+
+    miner|m)
+        exec journalctl -u "$MINER_UNIT" -f --no-hostname
+        ;;
+
+    both|b)
+        exec journalctl -u "$NODE_UNIT" -u "$MINER_UNIT" -f --no-hostname
+        ;;
+
+    errors|e)
+        echo "═══ Recent errors (last hour) ═══"
+        journalctl -u "$NODE_UNIT" -u "$MINER_UNIT" \
+            --since "1 hour ago" -p err --no-pager --no-hostname || true
+        ;;
+
+    tail|t)
+        lines="${2:-100}"
+        journalctl -u "$NODE_UNIT" -u "$MINER_UNIT" -n "$lines" --no-pager --no-hostname
+        ;;
+
+    restart|r)
+        echo "→ restarting node..."
+        systemctl restart "$NODE_UNIT"
+        echo "  waiting for RPC..."
+        for i in $(seq 1 30); do
+            if curl -sf --max-time 2 "localhost:${RPC_PORT}" \
+                -d '{"jsonrpc":"2.0","method":"getblockcount","id":1}' > /dev/null 2>&1; then
+                break
+            fi
+            sleep 1
+        done
+        echo "→ restarting miner..."
+        systemctl restart "$MINER_UNIT"
+        echo "✓ done"
+        systemctl --no-pager status "$NODE_UNIT" "$MINER_UNIT" | grep -E "●|Active:"
+        ;;
+
+    stop)
+        echo "→ stopping miner..."
+        systemctl stop "$MINER_UNIT"
+        echo "→ stopping node (waiting for graceful shutdown)..."
+        systemctl stop "$NODE_UNIT"
+        echo "✓ stopped"
+        ;;
+
+    start)
+        echo "→ starting node..."
+        systemctl start "$NODE_UNIT"
+        sleep 5
+        echo "→ starting miner..."
+        systemctl start "$MINER_UNIT"
+        echo "✓ started"
+        systemctl --no-pager status "$NODE_UNIT" "$MINER_UNIT" | grep -E "●|Active:"
+        ;;
+
+    peers|p)
+        rpc getpeerinfo
+        echo
+        ;;
+
+    height|h)
+        rpc getblockcount
+        ;;
+
+    *)
+        cat <<EOF
+sd — ShadowDAG operator shortcut
+
+Usage: sd <command>
+
+Monitoring:
+  s | status     full health snapshot (services + block height + mining info)
+  n | node       live node logs (follow)
+  m | miner      live miner logs (follow)
+  b | both       live logs for both, merged
+  e | errors     errors in the last hour
+  t | tail [N]   last N log lines from both services (default 100)
+  p | peers      current peer list
+  h | height     current block height
+
+Control:
+  start          start node then miner
+  stop           stop miner then node (graceful)
+  r | restart    restart both (waits for RPC between)
+
+Environment:
+  RPC_PORT       RPC port to query (default: 19332)
+EOF
+        ;;
+esac

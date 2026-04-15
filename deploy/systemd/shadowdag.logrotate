@@ -1,0 +1,17 @@
+# ShadowDAG log rotation
+# Install to /etc/logrotate.d/shadowdag
+#
+# Note: systemd journal already handles rotation via journald.conf.
+# This file only applies if you also redirect output to plain log files
+# (e.g. via StandardOutput=append:/var/log/...).
+
+/var/log/shadowdag-*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    create 0640 root root
+}
