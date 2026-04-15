@@ -142,42 +142,22 @@ impl RetargetEngine {
         let n = self.short_window.len();
 
         if n < 10 {
-            // Not enough data — use aggressive heuristic to converge fast.
+            // Not enough data — keep difficulty stable until we have a
+            // meaningful window. The previous aggressive heuristic
+            // (multiplying by blocks/span ratio) caused difficulty to
+            // spike 10-50x in the first few blocks on a fresh testnet,
+            // making it impossible for a single miner to keep up.
             //
-            // The core problem: at 1-second timestamp resolution, if blocks
-            // arrive in <1s they get the SAME timestamp as their predecessor.
-            // We can't see the actual sub-second timing, so we count
-            // same-timestamp pairs as a proxy for "too fast".
-            let base = self.window_average_difficulty(&self.short_window);
-            let ema = self.ema_diff;
-            let mut blended = ((base as u128 + ema as u128) / 2) as u64;
+            // With < 10 blocks we simply hold the current EMA and let
+            // the normal EMA path (below) handle convergence once the
+            // window fills. This is safe because:
+            //   - A single miner can't produce enough work to game the
+            //     system in < 10 blocks
+            //   - The EMA smoothing kicks in naturally at n >= 10
+            let blended = self.ema_diff;
 
-            if n >= 2 {
-                let first_ts = self.short_window.front().map(|r| r.timestamp).unwrap_or(0);
-                let last_ts = self.short_window.back().map(|r| r.timestamp).unwrap_or(0);
-                let span = last_ts.saturating_sub(first_ts).max(1);
-                let blocks = (n - 1) as u64;
-
-                // If blocks/second > 1, mining is too fast — boost aggressively
-                if blocks > span {
-                    // E.g. 5 blocks in 1 second → ratio=5 → multiply difficulty by 5
-                    // Clamp ratio to MAX_ADJUST_UP to prevent bypassing the cap
-                    let ratio = (blocks / span).min(MAX_ADJUST_UP);
-                    blended = blended.saturating_mul(ratio.max(2));
-                }
-
-                // Also count same-timestamp pairs for extra sensitivity
-                let same_ts = self.count_same_timestamp_pairs();
-                if same_ts > 0 {
-                    let boost = (same_ts + 1).min(MAX_ADJUST_UP);
-                    blended = blended.saturating_mul(boost);
-                }
-
-                // Clamp early convergence boost to MAX_ADJUST_UP
-                let current_difficulty = self.window_average_difficulty(&self.short_window);
-                let max_allowed = current_difficulty.saturating_mul(MAX_ADJUST_UP);
-                blended = blended.min(max_allowed);
-            }
+            // Early convergence heuristic disabled — the EMA handles it
+            // at n >= 10. Aggressive boosting caused 10-50x spikes.
 
             self.ema_diff = self.clamp(blended);
             return self.ema_diff;
