@@ -24,6 +24,17 @@ pub const MAX_DAG_PARENTS: usize =
 pub struct SelfishMiningGuard;
 
 impl SelfishMiningGuard {
+    #[inline]
+    fn configured_min_dag_parents() -> usize {
+        // Optional override for small/dev networks where only one DAG tip may exist.
+        // Mainnet keeps the secure default (2) unless explicitly overridden.
+        std::env::var("SHADOWDAG_MIN_DAG_PARENTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(MIN_DAG_PARENTS)
+            .clamp(1, MAX_DAG_PARENTS)
+    }
+
     #[inline(always)]
     pub fn validate(block: &Block) -> bool {
         let parents = &block.header.parents;
@@ -34,7 +45,7 @@ impl SelfishMiningGuard {
         let min_parents = match block.header.height {
             0 => 0,
             1 => 1,
-            _ => MIN_DAG_PARENTS,
+            _ => Self::configured_min_dag_parents(),
         };
 
         // 1️⃣ Range
