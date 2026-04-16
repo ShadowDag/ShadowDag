@@ -982,6 +982,35 @@ impl BlockValidator {
             )));
         }
 
+        // Enforce the 95/5 miner/dev split on the BASE emission reward.
+        // This prevents miners from stealing the dev share by setting
+        // outputs[1] to 1 satoshi while claiming the rest.
+        // Fees (if any) may go entirely to the miner, but the base
+        // emission must be split correctly.
+        {
+            use crate::config::genesis::genesis::{DEV_REWARD_PCT, MINER_REWARD_PCT};
+            let expected_miner_base = (expected_reward * MINER_REWARD_PCT) / 100;
+            let expected_dev_base = expected_reward - expected_miner_base;
+            // Dev share must be at least the expected amount
+            if cb.outputs[1].amount < expected_dev_base {
+                return Err(ConsensusError::BlockValidation(format!(
+                    "dev reward {} below minimum {} ({}% of {})",
+                    cb.outputs[1].amount, expected_dev_base, DEV_REWARD_PCT, expected_reward
+                )));
+            }
+            // Miner share (base) must not exceed expected
+            // (miner can get more from fees, but base reward is capped)
+            if cb.outputs[0].amount > expected_miner_base + total_declared_fees {
+                return Err(ConsensusError::BlockValidation(format!(
+                    "miner reward {} exceeds max {} (base {} + fees {})",
+                    cb.outputs[0].amount,
+                    expected_miner_base + total_declared_fees,
+                    expected_miner_base,
+                    total_declared_fees
+                )));
+            }
+        }
+
         // Outputs must sum to declared actual_total (internal consistency)
         let output_sum: u64 = cb.outputs[0]
             .amount

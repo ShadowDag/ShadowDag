@@ -609,16 +609,19 @@ pub fn payload_size_bounds(cmd: CommandId) -> (usize, usize) {
         CommandId::Addr => (BINCODE_TAG, BINCODE_TAG + 256 * 1024),
         CommandId::Inv => (BINCODE_TAG + 1, BINCODE_TAG + 512 * 1024),
         CommandId::GetData => (BINCODE_TAG + 1, BINCODE_TAG + 512 * 1024),
-        CommandId::Block => (BINCODE_TAG + 60, MAX_MESSAGE_SIZE),
-        CommandId::Tx => (BINCODE_TAG + 12, MAX_MESSAGE_SIZE),
+        // Block: up to 2 MiB (MAX_BLOCK_SIZE is 2 MB per consensus)
+        CommandId::Block => (BINCODE_TAG + 60, 2 * 1024 * 1024),
+        // Tx: max 256 KiB (prevents single giant TXs with millions of inputs)
+        CommandId::Tx => (BINCODE_TAG + 12, 256 * 1024),
         CommandId::GetHeaders => (BINCODE_TAG + 1, BINCODE_TAG + 1024),
         CommandId::Headers => (BINCODE_TAG + 1, BINCODE_TAG + 512 * 1024),
         CommandId::GetBlock => (BINCODE_TAG + 1, BINCODE_TAG + 1024),
         CommandId::Reject => (BINCODE_TAG + 1, BINCODE_TAG + MAX_REJECT_REASON_LEN + 64),
         CommandId::PuzzleChallenge => (BINCODE_TAG + 4, BINCODE_TAG + 256),
         CommandId::PuzzleSolution => (BINCODE_TAG + 12, BINCODE_TAG + 512),
-        CommandId::ShadowTx => (BINCODE_TAG + 12, MAX_MESSAGE_SIZE),
-        CommandId::OnionTx => (BINCODE_TAG + 12, MAX_MESSAGE_SIZE),
+        // Privacy/stealth TXs: max 512 KiB (larger due to ring signatures)
+        CommandId::ShadowTx => (BINCODE_TAG + 12, 512 * 1024),
+        CommandId::OnionTx => (BINCODE_TAG + 12, 512 * 1024),
         CommandId::GetMempool => (BINCODE_TAG, BINCODE_TAG),
     }
 }
