@@ -61,6 +61,11 @@ use crate::slog_error;
 /// Maximum call depth for nested calls
 pub const MAX_CALL_DEPTH: usize = 1024;
 
+/// Maximum number of warm storage slots tracked per transaction.
+/// Prevents unbounded memory growth from transactions that touch
+/// millions of unique storage slots.
+pub const MAX_WARM_SLOTS: usize = 10_000;
+
 /// Gas costs for call-related operations
 pub const CALL_VALUE_TRANSFER_GAS: u64 = 9_000;
 pub const NEW_ACCOUNT_GAS: u64 = 25_000;
@@ -153,6 +158,7 @@ pub struct ExecutionEnvironment {
     /// EIP-2929 warm storage tracking — addresses and storage slots
     /// accessed during this transaction. First access (cold) costs more;
     /// subsequent accesses (warm) are cheaper.
+    /// Capped at MAX_WARM_SLOTS to prevent unbounded memory growth.
     pub warm_addresses: HashSet<String>,
     pub warm_storage_slots: HashSet<(String, String)>,
     /// Optional handle to the persistent contract storage, used
@@ -1593,7 +1599,10 @@ impl ExecutionEnvironment {
                     let extra_cost = if self.warm_storage_slots.contains(&slot_key) {
                         100u64 // warm
                     } else {
-                        self.warm_storage_slots.insert(slot_key);
+                        // Cap warm tracking to prevent memory bombs
+                        if self.warm_storage_slots.len() < MAX_WARM_SLOTS {
+                            self.warm_storage_slots.insert(slot_key);
+                        }
                         2100u64 // cold
                     };
                     if let GasResult::OutOfGas { .. } = gas.consume(extra_cost) {

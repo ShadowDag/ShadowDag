@@ -1,5 +1,5 @@
 [Unit]
-Description=ShadowDAG Node (testnet)
+Description=ShadowDAG Node
 Documentation=https://github.com/ShadowDag/ShadowDag
 After=network-online.target
 Wants=network-online.target
