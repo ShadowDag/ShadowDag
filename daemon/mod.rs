@@ -46,6 +46,7 @@ use crate::service::network::p2p::p2p::{
     requeue_pending_blocks, requeue_pending_txs, P2PMessage, P2P,
 };
 use crate::service::network::p2p::peer_manager::PeerManager;
+use crate::service::network::contract_ide::ContractIdeServer;
 use crate::service::network::explorer::ExplorerServer;
 use crate::service::network::rpc::rpc_server::RpcServer;
 
@@ -320,6 +321,14 @@ impl DaemonNode {
                 .start()
                 .map_err(|e| NodeError::Init(format!("Explorer start failed: {}", e)))?;
             slog_info!("daemon", "explorer_started", port => self.cfg.explorer_port);
+        }
+
+        // ── Contract IDE ──────────────────────────────────────────
+        if self.cfg.enable_ide {
+            let ide = ContractIdeServer::new(self.cfg.ide_port, self.cfg.rpc_port);
+            ide.start()
+                .map_err(|e| NodeError::Init(format!("IDE start failed: {}", e)))?;
+            slog_info!("daemon", "ide_started", port => self.cfg.ide_port);
         }
 
         slog_info!("daemon", "node_running", network => self.cfg.network.name());
