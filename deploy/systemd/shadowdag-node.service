@@ -4,6 +4,12 @@ Documentation=https://github.com/ShadowDag/ShadowDag
 After=network-online.target
 Wants=network-online.target
 
+# Start rate limiting: if the node crashes more than 5 times in 5 minutes
+# systemd will give up. These directives must live in [Unit], not [Service]
+# — older systemd versions warn (and newer ones reject) on the latter.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=root
@@ -18,8 +24,6 @@ SendSIGKILL=yes
 # Auto-restart on crash (but not on clean exit)
 Restart=on-failure
 RestartSec=10
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 # Resource limits
 LimitNOFILE=65536

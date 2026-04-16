@@ -4,6 +4,11 @@ Documentation=https://github.com/ShadowDag/ShadowDag
 After=shadowdag-node.service
 Requires=shadowdag-node.service
 
+# Start rate limiting belongs in [Unit], not [Service]. Older systemd
+# versions warn (and newer ones reject) on the latter.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=root
@@ -23,8 +28,6 @@ TimeoutStopSec=30
 
 Restart=on-failure
 RestartSec=15
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 LimitNOFILE=65536
 
