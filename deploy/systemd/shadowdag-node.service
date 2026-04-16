@@ -15,7 +15,7 @@ Type=simple
 User=root
 WorkingDirectory=/opt/ShadowDag
 EnvironmentFile=/etc/shadowdag/node.env
-ExecStart=/opt/ShadowDag/target/release/shadowdag-node --network=${NETWORK} --enable-stratum --enable-explorer
+ExecStart=/opt/ShadowDag/target/release/shadowdag-node --network=${NETWORK} --enable-stratum --enable-explorer --enable-ide
 
 # Graceful shutdown — RocksDB must close cleanly
 KillSignal=SIGTERM

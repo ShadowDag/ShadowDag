@@ -234,6 +234,10 @@ pub struct NodeConfig {
     pub enable_explorer: bool,
     /// HTTP port for the blockchain explorer (default: 8080).
     pub explorer_port: u16,
+    /// Enable the smart contract IDE web interface.
+    pub enable_ide: bool,
+    /// HTTP port for the contract IDE (default: 3000).
+    pub ide_port: u16,
 }
 
 impl NodeConfig {
@@ -256,6 +260,8 @@ impl NodeConfig {
             stratum_port: 7779,
             enable_explorer: false,
             explorer_port: 8080,
+            enable_ide: false,
+            ide_port: 3000,
         }
     }
 

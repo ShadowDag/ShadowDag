@@ -421,6 +421,7 @@ pub mod service {
         pub mod protocol {
             pub mod messages;
         }
+        pub mod contract_ide;
         pub mod explorer;
     }
     pub mod wallet {
