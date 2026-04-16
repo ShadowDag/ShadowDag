@@ -64,8 +64,16 @@ case "${1:-help}" in
         ;;
 
     restart|r)
-        echo "→ restarting node..."
-        systemctl restart "$NODE_UNIT"
+        # Safe restart: stop miner FIRST so no new blocks arrive during
+        # node shutdown, preventing UTXO commitment corruption.
+        echo "→ stopping miner (drain pending work)..."
+        systemctl stop "$MINER_UNIT" 2>/dev/null
+        sleep 3
+        echo "→ stopping node (graceful RocksDB flush)..."
+        systemctl stop "$NODE_UNIT"
+        sleep 5
+        echo "→ starting node..."
+        systemctl start "$NODE_UNIT"
         echo "  waiting for RPC..."
         for i in $(seq 1 30); do
             if curl -sf --max-time 2 "localhost:${RPC_PORT}" \
@@ -74,8 +82,8 @@ case "${1:-help}" in
             fi
             sleep 1
         done
-        echo "→ restarting miner..."
-        systemctl restart "$MINER_UNIT"
+        echo "→ starting miner..."
+        systemctl start "$MINER_UNIT"
         echo "✓ done"
         systemctl --no-pager status "$NODE_UNIT" "$MINER_UNIT" | grep -E "●|Active:"
         ;;
