@@ -1093,6 +1093,39 @@ impl ExecutionEnvironment {
     }
 
     /// Execute a call frame. This is the reentrant core of the VM.
+    /// Execute a child frame with reentrancy protection.
+    ///
+    /// For non-delegate calls, the child's storage address is tracked in
+    /// `reentrant_guard`. If the address is already present (a contract
+    /// attempting to re-enter itself), the call is rejected with Failure.
+    /// The address is ALWAYS removed after the frame exits, regardless
+    /// of outcome (success, revert, or failure).
+    ///
+    /// DELEGATECALL is exempt because it runs the target's CODE in the
+    /// caller's storage context — no reentrant storage access occurs.
+    pub fn execute_frame_guarded(&mut self, ctx: &CallContext) -> CallOutcome {
+        // Reentrancy check (non-delegate only)
+        if !ctx.is_delegate && self.reentrant_guard.contains(&ctx.address) {
+            return CallOutcome::Failure {
+                gas_used: ctx.gas_limit,
+            };
+        }
+        // Insert guard key before execution
+        let guard_key = if !ctx.is_delegate {
+            self.reentrant_guard.insert(ctx.address.clone());
+            Some(ctx.address.clone())
+        } else {
+            None
+        };
+        // Execute the frame
+        let outcome = self.execute_frame(ctx);
+        // ALWAYS remove guard key on exit (regardless of outcome)
+        if let Some(key) = guard_key {
+            self.reentrant_guard.remove(&key);
+        }
+        outcome
+    }
+
     pub fn execute_frame(&mut self, ctx: &CallContext) -> CallOutcome {
         // Depth check.
         //
@@ -1116,22 +1149,12 @@ impl ExecutionEnvironment {
             };
         }
 
-        // ── Reentrancy guard ─────────────────────────────────────
-        // Reject calls to contracts that are already executing on the
-        // current call stack. This prevents reentrancy attacks at the
-        // protocol level — no contract can re-enter itself (directly
-        // or via an intermediary chain).
-        //
-        // The guard is bypassed for DELEGATECALL because it executes
-        // the target's CODE in the CALLER's context (storage address
-        // doesn't change), so no reentrant storage access occurs.
-        if !ctx.is_delegate && ctx.depth > 0 && self.reentrant_guard.contains(&ctx.address) {
-            return CallOutcome::Failure {
-                gas_used: ctx.gas_limit,
-            };
-        }
-        // Add this frame's storage address to the guard set
-        self.reentrant_guard.insert(ctx.address.clone());
+        // NOTE: Reentrancy guard is NOT checked here. It is checked and
+        // managed at each CALL/STATICCALL/CREATE site within the opcode
+        // handlers below. This ensures proper insert-before + remove-after
+        // semantics without modifying 121 return points in execute_frame.
+        // See the `reentrant_guard` insert/remove pairs at CALL, CALLCODE,
+        // DELEGATECALL, STATICCALL, CREATE, and CREATE2 handlers.
 
         // Register the frame's caller, storage address, and code address
         // in the runtime address registry so that every later CALLER /
@@ -2153,7 +2176,7 @@ impl ExecutionEnvironment {
                         is_delegate: false,
                     };
 
-                    let outcome = self.execute_frame(&child_ctx);
+                    let outcome = self.execute_frame_guarded(&child_ctx);
 
                     match &outcome {
                         CallOutcome::Success {
@@ -2307,7 +2330,7 @@ impl ExecutionEnvironment {
                         is_delegate: false,
                     };
 
-                    let outcome = self.execute_frame(&child_ctx);
+                    let outcome = self.execute_frame_guarded(&child_ctx);
                     match &outcome {
                         CallOutcome::Success {
                             gas_used,
@@ -2432,7 +2455,7 @@ impl ExecutionEnvironment {
                         is_delegate: true,
                     };
 
-                    let outcome = self.execute_frame(&child_ctx);
+                    let outcome = self.execute_frame_guarded(&child_ctx);
                     match &outcome {
                         CallOutcome::Success {
                             gas_used,
@@ -2590,7 +2613,7 @@ impl ExecutionEnvironment {
                         is_delegate: true,
                     };
 
-                    let outcome = self.execute_frame(&child_ctx);
+                    let outcome = self.execute_frame_guarded(&child_ctx);
                     match &outcome {
                         CallOutcome::Success {
                             gas_used,
@@ -2821,7 +2844,7 @@ impl ExecutionEnvironment {
                         is_delegate: false,
                     };
 
-                    let outcome = self.execute_frame(&child_ctx);
+                    let outcome = self.execute_frame_guarded(&child_ctx);
 
                     match outcome {
                         CallOutcome::Success {
@@ -3002,7 +3025,7 @@ impl ExecutionEnvironment {
                         is_delegate: false,
                     };
 
-                    let outcome = self.execute_frame(&child_ctx);
+                    let outcome = self.execute_frame_guarded(&child_ctx);
 
                     match outcome {
                         CallOutcome::Success {

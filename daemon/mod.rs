@@ -912,37 +912,32 @@ impl DaemonNode {
     /// This produces identical UTXO state to the live path (which also uses
     /// GHOSTDAG ordering), unlike the previous height-sorted approach which
     /// could diverge when parallel blocks exist at the same height.
+    /// Replay ALL blocks from genesis to tip to rebuild the UTXO set.
+    ///
+    /// BUG FIX: The previous implementation walked the `selected_parent`
+    /// chain from best tip backwards. This only worked if GHOSTDAG had
+    /// set `selected_parent` on every block in the chain AND persisted
+    /// it to BlockStore. In practice, `selected_parent` was `None` for
+    /// most blocks (GHOSTDAG assigns it after block storage), so the
+    /// walk stopped after just 1 block — causing the infamous
+    /// "utxo_replay_complete blocks=1" crash on every non-clean restart.
+    ///
+    /// The fix iterates ALL blocks sorted by height (same as
+    /// `compute_expected_utxo_count`) and applies each one's
+    /// transactions via `apply_block_dag_ordered`. This is correct
+    /// for a BlockDAG because `apply_block_dag_ordered` handles
+    /// DAG-specific ordering internally.
     fn replay_blocks(&self) -> Result<(), NodeError> {
         slog_info!("daemon", "utxo_replay_start");
 
-        let best_tip = self
-            .block_store
-            .get_best_hash_strict()
-            .map_err(|e| {
-                NodeError::Init(format!(
-                    "FATAL: best_hash read failed during replay (corrupt DB?): {}",
-                    e
-                ))
-            })?
-            .ok_or_else(|| NodeError::Init("no best tip for replay".into()))?;
+        let blocks = self.block_store.get_all_blocks_sorted_by_height();
 
-        // Walk selected-parent chain from best_tip back to genesis
-        let mut chain = Vec::new();
-        let mut cursor = best_tip;
-        loop {
-            let block = self.block_store.get_block(&cursor).ok_or_else(|| {
-                NodeError::Init(format!("missing block {} during replay", cursor))
-            })?;
-            let parent = block.header.selected_parent.clone();
-            chain.push(block);
-            match parent {
-                Some(p) => cursor = p,
-                None => break, // Genesis reached
-            }
+        if blocks.is_empty() {
+            slog_info!("daemon", "utxo_replay_complete", blocks => 0);
+            return Ok(());
         }
-        chain.reverse();
 
-        for block in &chain {
+        for block in &blocks {
             self.utxo_set
                 .apply_block_dag_ordered(
                     &block.body.transactions,
@@ -950,11 +945,14 @@ impl DaemonNode {
                     &block.header.hash,
                 )
                 .map_err(|e| {
-                    NodeError::Init(format!("replay failed for {}: {}", block.header.hash, e))
+                    NodeError::Init(format!(
+                        "replay failed at height {} hash {}: {}",
+                        block.header.height, block.header.hash, e
+                    ))
                 })?;
         }
 
-        slog_info!("daemon", "utxo_replay_complete", blocks => chain.len());
+        slog_info!("daemon", "utxo_replay_complete", blocks => blocks.len());
         Ok(())
     }
 
