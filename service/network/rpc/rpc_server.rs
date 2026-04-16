@@ -306,15 +306,14 @@ impl RpcState {
         // Persistent admin password: stored in RocksDB under "rpc:admin_password"
         // First run: generate + store. Subsequent runs: load from DB.
         // NOTE: no data_dir available here — falls back to cwd for password file.
-        // In production, set SHADOWDAG_DISALLOW_CWD_PASSWORDS to reject this
-        // fallback and force callers to use new_for_network with an explicit
-        // data_dir.
-        if std::env::var("SHADOWDAG_DISALLOW_CWD_PASSWORDS").is_ok() {
+        // SECURITY: CWD password-file fallback is disabled by default.
+        // Callers that truly need this legacy behavior must opt in explicitly.
+        if std::env::var("SHADOWDAG_ALLOW_CWD_PASSWORDS").is_err() {
             return Err(NetworkError::Other(
-                "RpcState::new() uses CWD for password file — set SHADOWDAG_ALLOW_CWD_PASSWORDS or use new_for_network with explicit data_dir".into()
+                "RpcState::new() refuses CWD password fallback by default; use new_for_network with explicit data_dir, or set SHADOWDAG_ALLOW_CWD_PASSWORDS=1 for legacy behavior".into()
             ));
         }
-        slog_warn!("rpc", "rpc_new_without_data_dir", note => "admin password will use cwd — prefer new_for_network with explicit data_dir");
+        slog_warn!("rpc", "rpc_new_without_data_dir", note => "legacy mode enabled: admin password may use cwd");
         let admin_password = Self::load_or_create_admin_password(&db, None)?;
         let block_store = BlockStore::new(db.clone()).map_err(NetworkError::Storage)?;
         // NO fallback — RPC MUST use the same UTXO state as the node.
@@ -535,6 +534,15 @@ impl RpcServer {
         if let Ok(mut s) = self.state.lock() {
             s.p2p_port = p2p_port;
             s.rpc_port = rpc_port;
+        }
+    }
+
+    /// Inject the contract storage so deploy/call/verify RPC methods work.
+    /// Called by the daemon after construction since the RPC server is created
+    /// before the FullNode (which owns the ContractStorage).
+    pub fn set_contract_storage(&self, cs: Arc<ContractStorage>) {
+        if let Ok(mut s) = self.state.lock() {
+            s.contract_storage = Some(cs);
         }
     }
 
@@ -781,15 +789,14 @@ impl RpcServer {
                 // effectively disabling auth for submitblock. In production:
                 //   - Do NOT set this env var behind a reverse proxy
                 //   - Use proper Bearer token authentication instead
-                //   - If you must use it, restrict to submitblock only (already done)
+                //   - If you must use it, keep it restricted to submitblock only
                 let allow_local_noauth = std::env::var("SHADOWDAG_RPC_LOCAL_NOAUTH")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
                 let is_localhost = peer_ip.is_some_and(|ip| ip.is_loopback());
                 if requires_auth(&req.method)
                     && !(allow_local_noauth && is_localhost && matches!(req.method.as_str(),
-                        "submitblock" | "deploy_contract" | "call_contract" | "estimate_gas"
-                        | "sendrawtransaction" | "stop"))
+                        "submitblock"))
                 {
                     match &auth_token {
                         Some(token) => {
