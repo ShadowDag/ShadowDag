@@ -10,12 +10,6 @@ pub struct BootstrapNodes;
 impl BootstrapNodes {
     pub fn mainnet() -> Vec<&'static str> {
         vec![
-            // DNS hostnames (resolved at startup via BootstrapManager)
-            "seed1.shadowdag.network:9333",
-            "seed2.shadowdag.network:9333",
-            "seed3.shadowdag.network:9333",
-            "seed4.shadowdag.network:9333",
-            // Static IP fallbacks (Utah, Dallas, LasVegas seed nodes)
             "144.172.105.147:9333",
             "172.86.90.70:9333",
             "45.61.151.206:9333",
