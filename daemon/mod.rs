@@ -85,6 +85,8 @@ pub struct DaemonNode {
     tx_index: Arc<Mutex<TxIndex>>,
     /// Dynamic finality manager — adjusts finality depth based on DAG health
     finality_manager: Mutex<FinalityManager>,
+    /// Contract storage for smart contract deployment and state
+    contract_storage: Arc<crate::runtime::vm::contracts::contract_storage::ContractStorage>,
     /// Optional Stratum V1 mining pool server (enabled via --enable-stratum)
     stratum_server: Option<Arc<StratumServer>>,
 }
@@ -161,7 +163,7 @@ impl DaemonNode {
             dag.clone(),
             ghostdag.clone(),
             cfg.network.clone(),
-            contract_storage,
+            contract_storage.clone(),
         ));
 
         // Initialize persistent indexes with shared DB (auto-recovers from disk)
@@ -194,6 +196,7 @@ impl DaemonNode {
             utxo_index,
             tx_index,
             finality_manager: Mutex::new(finality_mgr),
+            contract_storage,
             stratum_server,
         })
     }
@@ -291,6 +294,7 @@ impl DaemonNode {
         .map_err(|e| NodeError::Init(format!("Failed to init RPC server: {}", e)))?;
         rpc.set_network_name(self.cfg.network.name());
         rpc.set_network_ports(self.cfg.p2p_port, self.cfg.rpc_port);
+        rpc.set_contract_storage(Arc::clone(&self.contract_storage));
         rpc.start()
             .map_err(|e| NodeError::Init(format!("RPC start failed: {}", e)))?;
         slog_info!("daemon", "rpc_started", port => self.cfg.rpc_port);
