@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{json, Value};
 
 use crate::runtime::vm::core::assembler::Assembler;
+use crate::runtime::vm::lang as shadowlang;
 use crate::slog_info;
 
 pub mod html;
@@ -179,6 +180,7 @@ impl ContractIdeServer {
             }
 
             ("POST", "/api/compile") => Self::api_compile(&mut stream, &body),
+            ("POST", "/api/compile-lang") => Self::api_compile_lang(&mut stream, &body),
 
             ("POST", "/api/deploy") => {
                 let p: Value = serde_json::from_str(&body).unwrap_or(json!({}));
@@ -243,6 +245,54 @@ impl ContractIdeServer {
 
             _ => {
                 Self::send_response(&mut stream, 404, "text/plain", b"Not Found");
+            }
+        }
+    }
+
+    /// Compile ShadowLang (high-level Solidity-like) source to bytecode.
+    /// First transpiles to ShadowASM, then assembles to bytecode.
+    fn api_compile_lang(stream: &mut TcpStream, body: &str) {
+        let parsed: Value = serde_json::from_str(body).unwrap_or(json!({}));
+        let source = match parsed.get("source").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => {
+                Self::send_json(stream, &json!({"success": false, "error": "missing 'source' field"}));
+                return;
+            }
+        };
+
+        // Step 1: Transpile ShadowLang → ShadowASM
+        let asm = match shadowlang::compile(source) {
+            Ok(a) => a,
+            Err(e) => {
+                Self::send_json(stream, &json!({
+                    "success": false,
+                    "error": e.to_string(),
+                    "phase": "transpile",
+                }));
+                return;
+            }
+        };
+
+        // Step 2: Assemble ShadowASM → bytecode
+        match Assembler::assemble(&asm) {
+            Ok(bytecode) => {
+                let hex: String = bytecode.iter().map(|b| format!("{:02x}", b)).collect();
+                Self::send_json(stream, &json!({
+                    "success": true,
+                    "asm": asm,
+                    "bytecode": hex,
+                    "size": bytecode.len(),
+                    "language": "ShadowLang",
+                }));
+            }
+            Err(e) => {
+                Self::send_json(stream, &json!({
+                    "success": false,
+                    "error": e.to_string(),
+                    "phase": "assemble",
+                    "asm": asm,
+                }));
             }
         }
     }
