@@ -20,6 +20,10 @@
 // Ports:
 //   Mainnet: 17777 (binary gRPC)
 //   Testnet: 17778
+//
+// Bind behavior:
+//   Defaults to 127.0.0.1 for safety.
+//   Hardcoded to 127.0.0.1 — gRPC has no authentication.
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::{slog_error, slog_info};
@@ -412,7 +416,12 @@ impl GrpcServer {
 
     /// Start the TCP server
     pub fn start(&self) {
-        let addr = format!("0.0.0.0:{}", self.port);
+        // SECURITY: Always bind to localhost. gRPC has no authentication
+        // and exposes node info. Previously allowed override via
+        // SHADOWDAG_GRPC_BIND env var — removed to prevent accidental
+        // network exposure.
+        let bind_host = "127.0.0.1".to_string();
+        let addr = format!("{}:{}", bind_host, self.port);
 
         slog_info!("rpc", "grpc_server_listening", addr => &addr, protocol => "binary length-prefixed", max_message_size => MAX_MESSAGE_SIZE);
 
@@ -485,13 +494,7 @@ impl GrpcServer {
         // workaround for std TcpListener lacking a shutdown API.
         if let Ok(bound) = self.bound_addr.lock() {
             if let Some(addr) = *bound {
-                // Use 127.0.0.1 with the bound port to reach the listener
-                let loopback = std::net::SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                    addr.port(),
-                );
-                let _ =
-                    TcpStream::connect_timeout(&loopback, std::time::Duration::from_millis(100));
+                let _ = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100));
             }
         }
 
