@@ -14,7 +14,7 @@ StartLimitBurst=5
 Type=simple
 User=root
 WorkingDirectory=/opt/ShadowDag
-ExecStart=/opt/ShadowDag/target/release/shadowdag-node --network=testnet
+ExecStart=/opt/ShadowDag/target/release/shadowdag-node --network=testnet --enable-stratum --enable-explorer
 
 # Graceful shutdown — RocksDB must close cleanly
 KillSignal=SIGTERM

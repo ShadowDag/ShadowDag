@@ -107,6 +107,23 @@ case "${1:-help}" in
         rpc getblockcount
         ;;
 
+    pool)
+        echo "═══ Pool Stats ═══"
+        rpc getpoolstats
+        echo
+        echo "═══ Stratum Info ═══"
+        rpc getstratuminfo
+        echo
+        ;;
+
+    explorer)
+        EXPLORER_PORT="${EXPLORER_PORT:-8080}"
+        echo "═══ Explorer ═══"
+        echo "URL: http://$(hostname -I | awk '{print $1}'):${EXPLORER_PORT}"
+        curl -s --max-time 3 "http://localhost:${EXPLORER_PORT}/api/stats" || echo '{"error":"explorer not responding"}'
+        echo
+        ;;
+
     *)
         cat <<EOF
 sd — ShadowDAG operator shortcut
@@ -122,6 +139,8 @@ Monitoring:
   t | tail [N]   last N log lines from both services (default 100)
   p | peers      current peer list
   h | height     current block height
+  pool           stratum pool stats (workers, blocks found)
+  explorer       explorer URL + health check
 
 Control:
   start          start node then miner

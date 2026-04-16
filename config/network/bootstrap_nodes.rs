@@ -10,6 +10,7 @@ pub struct BootstrapNodes;
 impl BootstrapNodes {
     pub fn mainnet() -> Vec<&'static str> {
         vec![
+            // DNS hostnames (resolved at startup via BootstrapManager)
             "seed1.shadowdag.network:9333",
             "seed2.shadowdag.network:9333",
             "seed3.shadowdag.network:9333",
@@ -19,6 +20,12 @@ impl BootstrapNodes {
 
     pub fn testnet() -> Vec<&'static str> {
         vec![
+            // DNS hostnames (resolved at startup; create A records pointing
+            // to your testnet servers for dynamic peer discovery)
+            "seed1-testnet.shadowdag.network:19333",
+            "seed2-testnet.shadowdag.network:19333",
+            "seed3-testnet.shadowdag.network:19333",
+            // Static IP fallbacks (always reachable even without DNS)
             "144.172.105.147:19333",
             "172.86.90.70:19333",
             "45.61.151.206:19333",

@@ -421,6 +421,7 @@ pub mod service {
         pub mod protocol {
             pub mod messages;
         }
+        pub mod explorer;
     }
     pub mod wallet {
         pub mod core {

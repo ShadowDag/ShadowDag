@@ -226,6 +226,14 @@ pub struct NodeConfig {
     pub enable_rpc: bool,
     pub enable_mining: bool,
     pub miner_addr: String,
+    /// Enable the Stratum V1 mining pool server for external miners.
+    pub enable_stratum: bool,
+    /// TCP port for the Stratum mining pool (default: 7779).
+    pub stratum_port: u16,
+    /// Enable the built-in blockchain explorer web UI.
+    pub enable_explorer: bool,
+    /// HTTP port for the blockchain explorer (default: 8080).
+    pub explorer_port: u16,
 }
 
 impl NodeConfig {
@@ -244,6 +252,10 @@ impl NodeConfig {
             enable_rpc: true,
             enable_mining: false,
             miner_addr: String::new(),
+            enable_stratum: false,
+            stratum_port: 7779,
+            enable_explorer: false,
+            explorer_port: 8080,
         }
     }
 

@@ -46,8 +46,10 @@ use crate::service::network::p2p::p2p::{
     requeue_pending_blocks, requeue_pending_txs, P2PMessage, P2P,
 };
 use crate::service::network::p2p::peer_manager::PeerManager;
+use crate::service::network::explorer::ExplorerServer;
 use crate::service::network::rpc::rpc_server::RpcServer;
 
+use crate::engine::mining::stratum::stratum_server::{BlockTemplate, StratumServer};
 use crate::errors::NodeError;
 use crate::indexes::tx_index::TxIndex;
 use crate::indexes::utxo_index::UtxoIndex;
@@ -82,6 +84,8 @@ pub struct DaemonNode {
     tx_index: Arc<Mutex<TxIndex>>,
     /// Dynamic finality manager — adjusts finality depth based on DAG health
     finality_manager: Mutex<FinalityManager>,
+    /// Optional Stratum V1 mining pool server (enabled via --enable-stratum)
+    stratum_server: Option<Arc<StratumServer>>,
 }
 
 impl DaemonNode {
@@ -168,6 +172,14 @@ impl DaemonNode {
         finality_mgr = finality_mgr.with_db(db.clone());
         finality_mgr.load_checkpoints();
 
+        // Initialize Stratum pool server if enabled
+        let stratum_server = if cfg.enable_stratum {
+            slog_info!("daemon", "stratum_init", port => cfg.stratum_port);
+            Some(Arc::new(StratumServer::new(cfg.stratum_port)))
+        } else {
+            None
+        };
+
         Ok(Self {
             cfg,
             db,
@@ -181,6 +193,7 @@ impl DaemonNode {
             utxo_index,
             tx_index,
             finality_manager: Mutex::new(finality_mgr),
+            stratum_server,
         })
     }
 
@@ -286,6 +299,29 @@ impl DaemonNode {
             .map_err(|e| NodeError::Init(format!("P2P start failed: {}", e)))?;
         slog_info!("daemon", "p2p_listening", addr => p2p.listen_addr);
 
+        // ── Stratum pool ─────────────────────────────────────────
+        if let Some(ref stratum) = self.stratum_server {
+            // Register with RPC so getpoolstats can read live data
+            crate::service::network::rpc::rpc_server::register_stratum(Arc::clone(stratum));
+            let stratum_clone = Arc::clone(stratum);
+            std::thread::spawn(move || {
+                stratum_clone.start();
+            });
+            slog_info!("daemon", "stratum_started", port => self.cfg.stratum_port);
+        }
+
+        // ── Explorer web UI ────────────────────────────────────────
+        if self.cfg.enable_explorer {
+            // The explorer shares the same RpcState the RPC server uses,
+            // giving it direct access to BlockStore, UtxoSet, Mempool, etc.
+            let explorer_state = rpc.shared_state();
+            let explorer = ExplorerServer::new(self.cfg.explorer_port, explorer_state);
+            explorer
+                .start()
+                .map_err(|e| NodeError::Init(format!("Explorer start failed: {}", e)))?;
+            slog_info!("daemon", "explorer_started", port => self.cfg.explorer_port);
+        }
+
         slog_info!("daemon", "node_running", network => self.cfg.network.name());
 
         Ok(())
@@ -382,6 +418,26 @@ impl DaemonNode {
                             // Broadcast accepted block to peers (gossip propagation)
                             if let Ok(block_bytes) = bincode::serialize(block) {
                                 push_outbound(P2PMessage::Block { data: block_bytes });
+                            }
+
+                            // Notify Stratum pool with a fresh block template
+                            if let Some(ref stratum) = self.stratum_server {
+                                let template = BlockTemplate {
+                                    job_id: format!("{:x}", total_blocks_processed),
+                                    version: block.header.version,
+                                    prev_hash: block.header.hash.clone(),
+                                    parents: block.header.parents.clone(),
+                                    merkle_root: String::new(),
+                                    timestamp: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
+                                    difficulty: block.header.difficulty,
+                                    height: block.header.height + 1,
+                                    extra_nonce: 0,
+                                    clean_jobs: true,
+                                };
+                                stratum.update_template(template);
                             }
                         }
                         Err(e) => {
@@ -589,6 +645,10 @@ impl DaemonNode {
 
     pub fn tx_index(&self) -> Arc<Mutex<TxIndex>> {
         Arc::clone(&self.tx_index)
+    }
+
+    pub fn stratum_server(&self) -> &Option<Arc<StratumServer>> {
+        &self.stratum_server
     }
 
     // ── Crash Recovery ─────────────────────────────────────────

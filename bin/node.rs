@@ -228,6 +228,16 @@ fn parse_config(args: &[String]) -> Result<NodeConfig, BootError> {
         None => None,
     };
     let data_dir: Option<String> = parse_flag_opt(args, "--data-dir")?;
+    let stratum_port: Option<u16> = match parse_flag_opt(args, "--stratum-port")? {
+        Some(s) => Some(parse_port(&s, "--stratum-port")?),
+        None => None,
+    };
+    let explorer_port: Option<u16> = match parse_flag_opt(args, "--explorer-port")? {
+        Some(s) => Some(parse_port(&s, "--explorer-port")?),
+        None => None,
+    };
+    let enable_stratum = args.iter().any(|a| a == "--enable-stratum");
+    let enable_explorer = args.iter().any(|a| a == "--enable-explorer");
 
     let mut cfg = NodeConfig::for_network(network);
     if let Some(port) = rpc_port {
@@ -238,6 +248,18 @@ fn parse_config(args: &[String]) -> Result<NodeConfig, BootError> {
     }
     if let Some(dir) = data_dir {
         cfg.data_dir = std::path::PathBuf::from(dir);
+    }
+    if enable_stratum {
+        cfg.enable_stratum = true;
+    }
+    if let Some(port) = stratum_port {
+        cfg.stratum_port = port;
+    }
+    if enable_explorer {
+        cfg.enable_explorer = true;
+    }
+    if let Some(port) = explorer_port {
+        cfg.explorer_port = port;
     }
 
     Ok(cfg)
@@ -301,6 +323,10 @@ fn print_help() {
     println!("  --p2p-port=<port>                    P2P listen port (default: 9333)");
     println!("  --data-dir=<path>                    Data directory path");
     println!("  --devnet                             Start in DevNet mode (regtest + instant mining + faucet)");
+    println!("  --enable-stratum                     Enable Stratum V1 mining pool server");
+    println!("  --stratum-port=<port>                Stratum server port (default: 7779)");
+    println!("  --enable-explorer                    Enable built-in blockchain explorer web UI");
+    println!("  --explorer-port=<port>               Explorer HTTP port (default: 8080)");
 }
 
 fn parse_flag(args: &[String], name: &str, default: &str) -> Result<String, BootError> {
