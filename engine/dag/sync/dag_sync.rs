@@ -171,7 +171,7 @@ impl DagSync {
         //////////////////////////////////////////////////////////////
         // CACHE TRIM (no alloc)
         //////////////////////////////////////////////////////////////
-        let c = self.counter.fetch_add(1, Ordering::Relaxed);
+        let c = self.counter.fetch_add(1, Ordering::SeqCst);
 
         if c.is_multiple_of(1000) && self.seen_cache.len() > CACHE_LIMIT {
             let mut removed = 0;
@@ -194,7 +194,7 @@ impl DagSync {
         // never processed — lost forever.
         //////////////////////////////////////////////////////////////
         loop {
-            let current = self.inflight.load(Ordering::Relaxed);
+            let current = self.inflight.load(Ordering::Acquire);
 
             if current >= MAX_INFLIGHT_TASKS {
                 // Don't mark hash as seen — the block hasn't been processed.
@@ -204,7 +204,7 @@ impl DagSync {
 
             if self
                 .inflight
-                .compare_exchange(current, current + 1, Ordering::Acquire, Ordering::Relaxed)
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 break;

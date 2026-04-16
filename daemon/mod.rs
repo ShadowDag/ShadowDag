@@ -178,7 +178,7 @@ impl DaemonNode {
         // Initialize Stratum pool server if enabled
         let stratum_server = if cfg.enable_stratum {
             slog_info!("daemon", "stratum_init", port => cfg.stratum_port);
-            Some(Arc::new(StratumServer::new(cfg.stratum_port)))
+            Some(Arc::new(StratumServer::with_rpc_port(cfg.stratum_port, cfg.rpc_port)))
         } else {
             None
         };

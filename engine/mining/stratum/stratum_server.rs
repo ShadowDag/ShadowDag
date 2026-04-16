@@ -343,6 +343,8 @@ pub struct StratumServer {
     next_worker_id: AtomicU64,
     /// Server port
     port: u16,
+    /// Node RPC port (for submitting found blocks)
+    rpc_port: u16,
     /// Running flag
     running: AtomicBool,
     /// Total blocks found by pool
@@ -361,11 +363,16 @@ pub struct StratumServer {
 
 impl StratumServer {
     pub fn new(port: u16) -> Self {
+        Self::with_rpc_port(port, 9332)
+    }
+
+    pub fn with_rpc_port(port: u16, rpc_port: u16) -> Self {
         Self {
             workers: RwLock::new(HashMap::new()),
             current_template: RwLock::new(None),
             next_worker_id: AtomicU64::new(1),
             port,
+            rpc_port,
             running: AtomicBool::new(false),
             blocks_found: AtomicU64::new(0),
             _pool_hashrate: AtomicU64::new(0),
@@ -598,6 +605,42 @@ impl StratumServer {
             // Check if share also meets network difficulty (block found!)
             if self.meets_network_difficulty(nonce_hex, worker_extra_nonce, &template_snapshot) {
                 self.blocks_found.fetch_add(1, Ordering::Relaxed);
+
+                // Submit the found block to the node via RPC.
+                // Parse the nonce and submit via localhost JSON-RPC.
+                if let Ok(nonce) = u64::from_str_radix(nonce_hex, 16) {
+                    let combined_en = combine_extra_nonce(template_snapshot.extra_nonce, worker_extra_nonce);
+                    let rpc_body = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "submitblock",
+                        "params": [{
+                            "height": template_snapshot.height,
+                            "nonce": nonce,
+                            "extra_nonce": combined_en,
+                            "prev_hash": template_snapshot.prev_hash,
+                            "merkle_root": template_snapshot.merkle_root,
+                            "timestamp": template_snapshot.timestamp,
+                            "difficulty": template_snapshot.difficulty,
+                            "version": template_snapshot.version,
+                            "parents": template_snapshot.parents,
+                        }],
+                        "id": 1
+                    }).to_string();
+
+                    // Non-blocking submit — spawn a thread so we don't
+                    // delay the stratum response to the miner.
+                    let rpc_port = self.rpc_port;
+                    std::thread::spawn(move || {
+                        let addr = format!("127.0.0.1:{}", rpc_port);
+                        if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
+                            let request = format!(
+                                "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                rpc_body.len(), rpc_body
+                            );
+                            let _ = std::io::Write::write_all(&mut stream, request.as_bytes());
+                        }
+                    });
+                }
             }
 
             StratumResponse::ok(req.id, "true")
