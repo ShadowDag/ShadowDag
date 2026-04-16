@@ -9,7 +9,11 @@
 # ═══════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
-RPC_PORT="${RPC_PORT:-19332}"
+# Read from the node env file if it exists, fallback to 9332 (mainnet default)
+if [ -f /etc/shadowdag/node.env ]; then
+    . /etc/shadowdag/node.env
+fi
+RPC_PORT="${RPC_PORT:-9332}"
 NODE_UNIT="shadowdag-node.service"
 MINER_UNIT="shadowdag-miner.service"
 
