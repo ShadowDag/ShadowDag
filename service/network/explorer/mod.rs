@@ -127,6 +127,12 @@ impl ExplorerServer {
         let method = parts[0];
         let path = parts[1];
 
+        // Input sanitization: reject oversized paths (DoS prevention)
+        if path.len() > 512 {
+            Self::send_response(&mut stream, 414, "text/plain", b"URI Too Long");
+            return;
+        }
+
         if method != "GET" {
             Self::send_response(&mut stream, 405, "text/plain", b"Method Not Allowed");
             return;

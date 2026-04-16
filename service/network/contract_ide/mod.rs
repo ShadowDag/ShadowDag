@@ -307,6 +307,12 @@ impl ContractIdeServer {
             }
         };
 
+        // Input sanitization: limit source code size to 64 KB
+        if source.len() > 64 * 1024 {
+            Self::send_json(stream, &json!({"success": false, "error": "source code exceeds 64 KB limit"}));
+            return;
+        }
+
         match Assembler::assemble(source) {
             Ok(bytecode) => {
                 let hex: String = bytecode.iter().map(|b| format!("{:02x}", b)).collect();

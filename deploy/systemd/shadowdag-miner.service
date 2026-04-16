@@ -1,5 +1,5 @@
 [Unit]
-Description=ShadowDAG Miner (testnet)
+Description=ShadowDAG Miner
 Documentation=https://github.com/ShadowDag/ShadowDag
 After=shadowdag-node.service
 Requires=shadowdag-node.service

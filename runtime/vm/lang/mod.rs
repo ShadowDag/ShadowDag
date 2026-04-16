@@ -872,16 +872,87 @@ impl CodeGen {
             gen.storage_map.insert(var.name.clone(), var.slot);
         }
 
-        // Generate code for the FIRST function (default entry point)
-        // In a real compiler, we'd use function selectors. For now,
-        // the contract just executes the first function.
-        if let Some(func) = contract.functions.first() {
+        if contract.functions.len() == 1 {
+            // Single function — no dispatch needed, just emit the body
             gen.locals.clear();
-            gen.generate_function_body(&func.body)?;
+            // Register function parameters as locals (loaded from calldata)
+            for (i, (pname, _)) in contract.functions[0].params.iter().enumerate() {
+                let slot = gen.locals.len();
+                gen.locals.insert(pname.clone(), slot);
+                // Load parameter from calldata at offset i*32
+                gen.emit(&format!("PUSH1 {}", i * 32));
+                gen.emit("CALLDATALOAD");
+                let mem_offset = 256 + slot * 32;
+                gen.emit(&format!("PUSH2 {}", mem_offset));
+                gen.emit("MSTORE");
+            }
+            gen.generate_function_body(&contract.functions[0].body)?;
+            gen.emit("STOP");
+        } else if !contract.functions.is_empty() {
+            // Multiple functions — generate a selector-based dispatcher.
+            // The first 8 bytes of calldata are the function selector
+            // (first 8 bytes of SHA256(function_name)).
+            // Load selector: PUSH1 0 / CALLDATALOAD gives the first 32 bytes.
+            // We compare the high 8 bytes against each function's selector.
+            gen.emit("; ── Function Dispatcher ──");
+            gen.emit("PUSH1 0");
+            gen.emit("CALLDATALOAD");
+            // Shift right by 192 bits to get the top 8 bytes as selector
+            gen.emit("PUSH1 192");
+            gen.emit("SHR");
+
+            let mut func_labels = Vec::new();
+            for func in &contract.functions {
+                let label = gen.new_label(&format!("fn_{}", func.name));
+                // Simple selector: first 8 hex chars of function name hash
+                // For simplicity, use a sequential index as selector
+                let selector = func_labels.len() as u64;
+                func_labels.push((label.clone(), selector));
+                gen.emit(&format!("; check selector for {}()", func.name));
+                gen.emit("DUP");
+                gen.emit(&format!("PUSH1 {}", selector));
+                gen.emit("EQ");
+                gen.emit(&format!("PUSH4 {}", label));
+                gen.emit("JUMPI");
+            }
+
+            // No match — execute first function as default
+            gen.emit("POP ; drop selector");
+            gen.locals.clear();
+            gen.register_params(&contract.functions[0].params);
+            gen.generate_function_body(&contract.functions[0].body)?;
+            gen.emit("STOP");
+
+            // Generate each function body with its label
+            for (i, func) in contract.functions.iter().enumerate() {
+                gen.emit(&format!(
+                    "\n{}: JUMPDEST ; {}()",
+                    func_labels[i].0, func.name
+                ));
+                gen.emit("POP ; drop selector");
+                gen.locals.clear();
+                gen.register_params(&func.params);
+                gen.generate_function_body(&func.body)?;
+                gen.emit("STOP");
+            }
         }
 
-        gen.emit("STOP");
         Ok(gen.output)
+    }
+
+    /// Register function parameters as local variables, loading each
+    /// from calldata into a dedicated memory slot.
+    fn register_params(&mut self, params: &[(String, String)]) {
+        for (i, (pname, _)) in params.iter().enumerate() {
+            let slot = self.locals.len();
+            self.locals.insert(pname.clone(), slot);
+            // Load parameter from calldata at offset i*32
+            self.emit(&format!("PUSH1 {}", i * 32));
+            self.emit("CALLDATALOAD");
+            let mem_offset = 256 + slot * 32;
+            self.emit(&format!("PUSH2 {}", mem_offset));
+            self.emit("MSTORE");
+        }
     }
 
     fn generate_function_body(&mut self, stmts: &[Statement]) -> Result<(), CompileError> {
@@ -896,9 +967,14 @@ impl CodeGen {
             Statement::Let { name, value } => {
                 // Evaluate the expression (pushes result onto stack)
                 self.generate_expr(value)?;
-                // The value is now on top of the stack — track it
-                let pos = self.locals.len();
-                self.locals.insert(name.clone(), pos);
+                // Store in memory at a dedicated local variable slot.
+                // Locals use memory addresses 0x100+ (256+) to avoid
+                // collision with calldata/return data at 0x00-0xFF.
+                let slot = self.locals.len();
+                self.locals.insert(name.clone(), slot);
+                let mem_offset = 256 + slot * 32;
+                self.emit(&format!("PUSH2 {}", mem_offset));
+                self.emit("MSTORE");
             }
             Statement::Assign { name, value } => {
                 // Check if it's a storage variable
@@ -906,9 +982,20 @@ impl CodeGen {
                     self.generate_expr(value)?;
                     self.emit(&format!("PUSH1 {}", slot));
                     self.emit("SSTORE");
-                } else {
-                    // Local variable — just evaluate and track
+                } else if let Some(&slot) = self.locals.get(name.as_str()) {
+                    // Local variable — store in memory
                     self.generate_expr(value)?;
+                    let mem_offset = 256 + slot * 32;
+                    self.emit(&format!("PUSH2 {}", mem_offset));
+                    self.emit("MSTORE");
+                } else {
+                    // Unknown variable — treat as new local
+                    self.generate_expr(value)?;
+                    let slot = self.locals.len();
+                    self.locals.insert(name.clone(), slot);
+                    let mem_offset = 256 + slot * 32;
+                    self.emit(&format!("PUSH2 {}", mem_offset));
+                    self.emit("MSTORE");
                 }
             }
             Statement::If {
@@ -1018,9 +1105,16 @@ impl CodeGen {
                 if let Some(&slot) = self.storage_map.get(name.as_str()) {
                     self.emit(&format!("PUSH1 {}", slot));
                     self.emit("SLOAD");
+                } else if let Some(&slot) = self.locals.get(name.as_str()) {
+                    // Local variable — load from memory
+                    let mem_offset = 256 + slot * 32;
+                    self.emit(&format!("PUSH2 {}", mem_offset));
+                    self.emit("MLOAD");
                 } else {
-                    // Local variable — DUP from stack (simplified)
-                    self.emit("DUP");
+                    return Err(CompileError {
+                        message: format!("undefined variable: '{}'", name),
+                        line: 0,
+                    });
                 }
             }
             Expr::BinaryOp { left, op, right } => {
