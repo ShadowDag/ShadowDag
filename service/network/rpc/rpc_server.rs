@@ -1178,14 +1178,16 @@ impl RpcServer {
             // ── Admin ─────────────────────────────────────────────────
             "stop" => {
                 slog_info!("rpc", "stop_requested");
-                // Signal the process to exit after a short delay so the
-                // RPC response can be sent first. SharedState does not
-                // currently carry a shutdown flag/channel, so we use
-                // process::exit as a last resort.
+                // Send SIGTERM to ourselves for a graceful shutdown via the
+                // event loop's Ctrl+C handler. This ensures RocksDB is flushed
+                // and peers are cleanly disconnected — unlike process::exit(0)
+                // which was causing UTXO corruption on every stop.
                 std::thread::spawn(|| {
                     std::thread::sleep(Duration::from_millis(500));
-                    slog_info!("rpc", "shutting_down_via_stop_command");
-                    std::process::exit(0);
+                    slog_info!("rpc", "sending_sigterm_for_graceful_shutdown");
+                    unsafe {
+                        libc::raise(libc::SIGTERM);
+                    }
                 });
                 RpcResponse::ok(id, json!({"status": "shutdown_initiated"}))
             }
