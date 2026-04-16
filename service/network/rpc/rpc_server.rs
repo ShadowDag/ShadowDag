@@ -1249,11 +1249,21 @@ impl RpcServer {
                 // Use get_block_hashes_at_height to return ALL blocks at
                 // each height, not just a single one (which silently drops
                 // concurrent DAG branches).
+                // Cap total blocks returned (not just height range) to
+                // prevent memory exhaustion in DAGs where each height
+                // has many parallel blocks.
+                const MAX_TOTAL_BLOCKS: usize = 2000;
                 let mut blocks: Vec<serde_json::Value> = Vec::new();
                 for h in start_height..end_height {
                     let hashes = s.block_store.get_block_hashes_at_height(h);
                     for hash in &hashes {
                         blocks.push(json!({"height": h, "hash": hash}));
+                        if blocks.len() >= MAX_TOTAL_BLOCKS {
+                            break;
+                        }
+                    }
+                    if blocks.len() >= MAX_TOTAL_BLOCKS {
+                        break;
                     }
                 }
                 RpcResponse::ok(

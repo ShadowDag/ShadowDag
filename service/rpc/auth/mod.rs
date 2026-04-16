@@ -13,6 +13,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const TOKEN_TTL_SECS: u64 = 3_600;
 pub const MAX_FAILED_LOGINS: u32 = 5;
 pub const LOCKOUT_SECS: u64 = 900;
+pub const MAX_ACTIVE_TOKENS: usize = 10_000;
+pub const MAX_ACTIVE_TOKENS_PER_USER: usize = 16;
+const PBKDF2_ITERATIONS: u32 = 210_000;
+const PBKDF2_PREFIX: &str = "pbkdf2-sha256";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AuthRole {
@@ -235,6 +239,39 @@ impl RpcAuthManager {
         let a = self.attempts.entry(username.to_string()).or_default();
         a.failed = 0;
 
+        // Opportunistic hash migration:
+        // if a legacy hash verifies, immediately upgrade it to PBKDF2.
+        let mut upgraded_user: Option<AuthUser> = None;
+        if hash_needs_upgrade(&user.password_hash) {
+            let salt = generate_salt();
+            let new_hash = hash_password_pbkdf2(password, &salt, PBKDF2_ITERATIONS);
+            if let Some(entry) = self.users.get_mut(username) {
+                entry.password_hash = new_hash;
+                upgraded_user = Some(entry.clone());
+            }
+        }
+        if let Some(u) = upgraded_user.as_ref() {
+            let _ = self.persist_user(u);
+        }
+
+        // Keep token table bounded to avoid memory DoS from repeated logins.
+        self.prune_expired_tokens();
+        if self.tokens.len() >= MAX_ACTIVE_TOKENS {
+            return Err(NetworkError::Other(
+                "Too many active sessions; retry later".to_string(),
+            ));
+        }
+        let user_active_tokens = self
+            .tokens
+            .values()
+            .filter(|t| t.username == username && !t.is_expired())
+            .count();
+        if user_active_tokens >= MAX_ACTIVE_TOKENS_PER_USER {
+            return Err(NetworkError::Other(
+                "Too many active sessions for this user".to_string(),
+            ));
+        }
+
         let token_str = generate_token(username);
         let token = AuthToken {
             token: token_str.clone(),
@@ -291,29 +328,9 @@ fn now_secs() -> u64 {
 }
 
 /// Password hashing with per-user salt and HMAC-SHA256 iterated KDF.
-/// This is NOT just SHA-256 — it uses 10,000 iterations to slow brute force.
+/// Stored format: pbkdf2-sha256$<iterations>$<hex_salt>$<hex_hash>
 fn salted_hash(password: &str, salt: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    const KDF_ITERATIONS: u32 = 10_000;
-
-    // Initial: H(domain || salt || password)
-    let mut h = Sha256::new();
-    h.update(b"ShadowDAG_Auth_KDF_v2");
-    h.update(salt);
-    h.update(password.as_bytes());
-    let mut result = h.finalize().to_vec();
-
-    // Iterate to make brute force expensive
-    for i in 0..KDF_ITERATIONS {
-        let mut h = Sha256::new();
-        h.update(&result);
-        h.update(salt);
-        h.update(i.to_le_bytes());
-        result = h.finalize().to_vec();
-    }
-
-    // Store as: hex(salt) + ":" + hex(hash)
-    format!("{}:{}", hex::encode(salt), hex::encode(&result))
+    hash_password_pbkdf2(password, salt, PBKDF2_ITERATIONS)
 }
 
 /// Generate a random 16-byte salt
@@ -326,35 +343,45 @@ fn generate_salt() -> [u8; 16] {
 
 /// Verify password against stored salted hash
 fn verify_password(password: &str, stored: &str) -> bool {
+    // New format: pbkdf2-sha256$iter$salt_hex$hash_hex
+    if let Some(rest) = stored.strip_prefix(&(PBKDF2_PREFIX.to_string() + "$")) {
+        let parts: Vec<&str> = rest.split('$').collect();
+        if parts.len() != 3 {
+            return false;
+        }
+        let iterations = match parts[0].parse::<u32>() {
+            Ok(i) if i > 0 => i,
+            _ => return false,
+        };
+        let salt = match hex::decode(parts[1]) {
+            Ok(s) if !s.is_empty() => s,
+            _ => return false,
+        };
+        let expected = hash_password_pbkdf2(password, &salt, iterations);
+        return const_time_eq(expected.as_bytes(), stored.as_bytes());
+    }
+
     // Parse "hex_salt:hex_hash"
     let parts: Vec<&str> = stored.splitn(2, ':').collect();
     if parts.len() != 2 {
-        // Legacy: fall back to simple hash comparison
-        return stored == simple_hash_legacy(password);
+        // SECURITY: Legacy password hash support has been removed.
+        // Old SHA256-only hashes (no salt) are rejected outright.
+        // If you see this in production, re-generate the RPC password
+        // with: shadowdag-rotate-rpc-password
+        return false;
     }
     let salt = match hex::decode(parts[0]) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    let expected = salted_hash(password, &salt);
+    // Compatibility with older "salt:hash" format.
+    let expected = hash_password_v2_compat(password, &salt);
     // Constant-time comparison to prevent timing attacks
-    expected.len() == stored.len()
-        && expected
-            .as_bytes()
-            .iter()
-            .zip(stored.as_bytes().iter())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
+    const_time_eq(expected.as_bytes(), stored.as_bytes())
 }
 
-/// Legacy simple hash (for backward compat during migration)
-fn simple_hash_legacy(input: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"ShadowDAG_Auth_Hash_v1");
-    h.update(input.as_bytes());
-    hex::encode(h.finalize())
-}
+// simple_hash_legacy removed — legacy password support is no longer accepted.
+// Re-generate passwords with: shadowdag-rotate-rpc-password
 
 /// Generate a cryptographically random 32-char hex password
 fn generate_random_password() -> String {
@@ -375,6 +402,57 @@ fn generate_token(username: &str) -> String {
     h.update(now_secs().to_le_bytes());
     h.update(entropy);
     hex::encode(h.finalize())
+}
+
+fn const_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
+}
+
+fn hash_password_pbkdf2(password: &str, salt: &[u8], iterations: u32) -> String {
+    use pbkdf2::pbkdf2_hmac_array;
+    use sha2::Sha256;
+
+    let hash: [u8; 32] = pbkdf2_hmac_array::<Sha256, 32>(
+        password.as_bytes(),
+        salt,
+        iterations,
+    );
+    format!(
+        "{}${}${}${}",
+        PBKDF2_PREFIX,
+        iterations,
+        hex::encode(salt),
+        hex::encode(hash)
+    )
+}
+
+fn hash_password_v2_compat(password: &str, salt: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const KDF_ITERATIONS: u32 = 10_000;
+
+    let mut h = Sha256::new();
+    h.update(b"ShadowDAG_Auth_KDF_v2");
+    h.update(salt);
+    h.update(password.as_bytes());
+    let mut result = h.finalize().to_vec();
+
+    for i in 0..KDF_ITERATIONS {
+        let mut h = Sha256::new();
+        h.update(&result);
+        h.update(salt);
+        h.update(i.to_le_bytes());
+        result = h.finalize().to_vec();
+    }
+
+    format!("{}:{}", hex::encode(salt), hex::encode(&result))
+}
+
+fn hash_needs_upgrade(stored: &str) -> bool {
+    !stored.starts_with(&(PBKDF2_PREFIX.to_string() + "$"))
 }
 
 #[cfg(test)]
@@ -432,5 +510,33 @@ mod tests {
         auth.add_user("viewer", "view", AuthRole::ReadOnly);
         let token = auth.login("viewer", "view").unwrap();
         assert!(!auth.can_write(&token));
+    }
+
+    #[test]
+    fn pbkdf2_hash_roundtrip_verifies() {
+        let salt = generate_salt();
+        let stored = salted_hash("s3cret", &salt);
+        assert!(verify_password("s3cret", &stored));
+        assert!(!verify_password("wrong", &stored));
+    }
+
+    #[test]
+    fn legacy_v2_hash_migrates_after_successful_login() {
+        let mut auth = RpcAuthManager::new();
+        let salt = generate_salt();
+        let legacy = hash_password_v2_compat("pass123", &salt);
+        auth.users.insert(
+            "admin".to_string(),
+            AuthUser {
+                username: "admin".to_string(),
+                password_hash: legacy,
+                role: AuthRole::Admin,
+            },
+        );
+
+        let token = auth.login("admin", "pass123").expect("login should succeed");
+        assert!(!token.is_empty());
+        let upgraded = &auth.users.get("admin").unwrap().password_hash;
+        assert!(upgraded.starts_with("pbkdf2-sha256$"));
     }
 }

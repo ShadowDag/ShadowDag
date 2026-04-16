@@ -632,7 +632,21 @@ fn cmd_invisible(args: &[String]) {
 }
 
 fn cmd_export() {
-    // Export the EXISTING wallet's keypair, not a freshly generated one
+    // Security warning — export reveals wallet structure
+    eprintln!("╔══════════════════════════════════════════════════╗");
+    eprintln!("║  WARNING: This exports wallet data to stdout.   ║");
+    eprintln!("║  Do NOT share this output with anyone.          ║");
+    eprintln!("║  It contains public keys and address mappings.  ║");
+    eprintln!("╚══════════════════════════════════════════════════╝");
+    eprintln!();
+
+    // Require explicit --yes flag to prevent accidental export
+    let args: Vec<String> = std::env::args().collect();
+    if !args.iter().any(|a| a == "--yes" || a == "-y") {
+        eprintln!("Add --yes flag to confirm: shadowdag-wallet export --yes");
+        return;
+    }
+
     match load_and_unlock_wallet() {
         Ok(wallet) => {
             let address = wallet.address();
