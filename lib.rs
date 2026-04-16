@@ -338,6 +338,7 @@ pub mod runtime {
             pub mod gas_meter;
             pub mod gas_rules;
         }
+        pub mod lang;
         pub mod testing {
             pub mod invariant_checker;
             pub mod observability;
