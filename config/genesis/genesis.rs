@@ -44,10 +44,10 @@ pub const GENESIS_TIMESTAMP: u64 = 1_735_689_600; // 2025-01-01 00:00:00 UTC
 pub const GENESIS_DIFFICULTY: u64 = 8192;
 
 /// Developer wallet address — receives 5% of every block reward
-pub const OWNER_REWARD_ADDRESS: &str = "SD1a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b";
+pub const OWNER_REWARD_ADDRESS: &str = "SD009189b8a845c784b7d4dad00f43dd9ce1fe0a1ad044efe219e269cb27ef2a0d76336b08d9";
 
 /// Genesis miner address — receives the first coinbase reward (95%)
-pub const GENESIS_MINER_ADDRESS: &str = "SD1ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00";
+pub const GENESIS_MINER_ADDRESS: &str = "SD009189b8a845c784b7d4dad00f43dd9ce1fe0a1ad044efe219e269cb27ef2a0d76336b08d9";
 
 /// Block reward in base units (10 SDAG = 10 * 10^8 satoshis)
 pub const GENESIS_REWARD: u64 = 1_000_000_000; // 10.00000000 SDAG
