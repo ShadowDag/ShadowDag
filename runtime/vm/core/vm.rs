@@ -1472,16 +1472,32 @@ impl VM {
     }
 
     /// Calculate gas cost for memory expansion
+    /// Compute the gas cost for expanding memory from `current_size` to `needed`.
+    ///
+    /// Uses the EVM memory pricing formula with a quadratic component:
+    ///   cost(words) = words * 3 + words² / 512
+    ///
+    /// The linear term is cheap for small allocations; the quadratic term
+    /// makes large allocations progressively more expensive, preventing
+    /// memory bomb attacks where a single contract allocates the full
+    /// 1 MB memory limit for only ~3 M gas (well within the TX limit).
     fn memory_expansion_cost(current_size: usize, needed: usize) -> Option<u64> {
         if needed <= current_size || needed > MAX_MEMORY_SIZE {
             return None;
         }
         let new_size = needed.div_ceil(32) * 32;
-        let current_words = current_size / 32;
-        let new_words = new_size / 32;
-        let added_words = new_words.saturating_sub(current_words);
-        if added_words > 0 {
-            Some(added_words as u64 * MEMORY_GAS_PER_WORD)
+        let current_words = current_size as u64 / 32;
+        let new_words = new_size as u64 / 32;
+        if new_words <= current_words {
+            return None;
+        }
+        // EVM quadratic memory cost: cost(w) = w*3 + w²/512
+        let new_cost = new_words * MEMORY_GAS_PER_WORD + (new_words * new_words) / 512;
+        let old_cost =
+            current_words * MEMORY_GAS_PER_WORD + (current_words * current_words) / 512;
+        let delta = new_cost.saturating_sub(old_cost);
+        if delta > 0 {
+            Some(delta)
         } else {
             None
         }
