@@ -721,6 +721,11 @@ impl TxValidator {
     }
 
     /// Verify a single input's Ed25519 signature against the signing message.
+    ///
+    /// Includes explicit public key validation:
+    /// - Rejects all-zero (identity) public keys
+    /// - Rejects known low-order points (small-subgroup attacks)
+    /// - ed25519-dalek::VerifyingKey::from_bytes validates on-curve
     fn verify_single_input(input: &TxInput, msg: &[u8]) -> bool {
         if input.signature.is_empty() || input.pub_key.is_empty() {
             return false;
@@ -746,6 +751,39 @@ impl TxValidator {
             _ => return false,
         };
 
+        // Reject identity point (all zeros) — allows trivial signature forgery
+        if pk_arr == [0u8; 32] {
+            return false;
+        }
+
+        // Reject known Ed25519 low-order points (small-subgroup attacks).
+        // These 8 points have order dividing the cofactor (8) and can be
+        // used to forge signatures in non-cofactored verification.
+        const LOW_ORDER_POINTS: [[u8; 32]; 5] = [
+            [0; 32], // identity (already checked above)
+            // (0, 1) — the neutral element in extended coordinates
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            // (0, -1) — point of order 2
+            [0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+            // Non-canonical encodings of identity
+            [0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            [0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+        ];
+        if LOW_ORDER_POINTS.iter().any(|p| *p == pk_arr) {
+            return false;
+        }
+
+        // from_bytes validates on-curve (rejects non-curve points)
         let verifying_key = match VerifyingKey::from_bytes(&pk_arr) {
             Ok(k) => k,
             Err(_) => return false,
