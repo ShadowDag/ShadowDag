@@ -13,15 +13,12 @@ StartLimitBurst=5
 Type=simple
 User=root
 WorkingDirectory=/opt/ShadowDag
-EnvironmentFile=/etc/shadowdag/miner.env
+EnvironmentFile=/etc/shadowdag/node.env
 
-# Wait up to 90s for the node's RPC port to accept connections before
-# starting the miner. See deploy/systemd/wait-for-rpc.sh for why this is
-# a separate script instead of an inline curl (systemd quoting + curl -f
-# don't play well together during node startup).
-ExecStartPre=/bin/bash /opt/ShadowDag/deploy/systemd/wait-for-rpc.sh 19332 90
+# Wait up to 90s for the node's RPC port to accept connections.
+ExecStartPre=/bin/bash /opt/ShadowDag/deploy/systemd/wait-for-rpc.sh ${RPC_PORT} 90
 
-ExecStart=/opt/ShadowDag/target/release/shadowdag-miner --network=testnet --address=${MINER_ADDRESS} --threads=${MINER_THREADS} --rpc=127.0.0.1:19332
+ExecStart=/opt/ShadowDag/target/release/shadowdag-miner --network=${NETWORK} --address=${MINER_ADDRESS} --threads=${MINER_THREADS} --rpc=127.0.0.1:${RPC_PORT}
 
 KillSignal=SIGTERM
 TimeoutStopSec=30

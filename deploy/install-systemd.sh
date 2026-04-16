@@ -16,7 +16,7 @@ set -euo pipefail
 SHADOWDAG_DIR="${SHADOWDAG_DIR:-/opt/ShadowDag}"
 SYSTEMD_DIR="/etc/systemd/system"
 ENV_DIR="/etc/shadowdag"
-ENV_FILE="${ENV_DIR}/miner.env"
+ENV_FILE="${ENV_DIR}/node.env"
 
 if [[ $EUID -ne 0 ]]; then
     echo "ERROR: must run as root (sudo)" >&2
@@ -24,13 +24,23 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 <miner_address> [threads]" >&2
-    echo "Example: $0 ST1abc123... 1" >&2
+    echo "Usage: $0 <miner_address> [threads] [network]" >&2
+    echo "Example: $0 SD1abc123... 1 mainnet" >&2
+    echo "         $0 ST1abc123... 1 testnet" >&2
     exit 1
 fi
 
 MINER_ADDRESS="$1"
 MINER_THREADS="${2:-1}"
+NETWORK="${3:-mainnet}"
+
+# Set default ports based on network
+case "$NETWORK" in
+    mainnet) RPC_PORT=9332;  P2P_PORT=9333  ;;
+    testnet) RPC_PORT=19332; P2P_PORT=19333 ;;
+    regtest) RPC_PORT=29332; P2P_PORT=29333 ;;
+    *) echo "ERROR: unknown network '$NETWORK'" >&2; exit 1 ;;
+esac
 
 if [[ ! -d "$SHADOWDAG_DIR" ]]; then
     echo "ERROR: $SHADOWDAG_DIR does not exist" >&2
@@ -51,8 +61,11 @@ echo "════════════════════════�
 echo "  ShadowDAG systemd install"
 echo "═══════════════════════════════════════════"
 echo "  Shadowdag dir:  $SHADOWDAG_DIR"
+echo "  Network:        $NETWORK"
 echo "  Miner address:  $MINER_ADDRESS"
 echo "  Miner threads:  $MINER_THREADS"
+echo "  RPC port:       $RPC_PORT"
+echo "  P2P port:       $P2P_PORT"
 echo
 
 # ── 1. Stop any running processes from the old setup ───────────────────
@@ -68,11 +81,14 @@ if pgrep -f "shadowdag-(node|miner)" > /dev/null; then
 fi
 echo "  ✓ clean"
 
-# ── 2. Write miner environment file ────────────────────────────────────
+# ── 2. Write node environment file ─────────────────────────────────────
 echo "[2/6] Writing $ENV_FILE..."
 mkdir -p "$ENV_DIR"
 cat > "$ENV_FILE" <<EOF
-# ShadowDAG miner configuration (managed by install-systemd.sh)
+# ShadowDAG node configuration (managed by install-systemd.sh)
+NETWORK=$NETWORK
+RPC_PORT=$RPC_PORT
+P2P_PORT=$P2P_PORT
 MINER_ADDRESS=$MINER_ADDRESS
 MINER_THREADS=$MINER_THREADS
 EOF
