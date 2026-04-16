@@ -33,7 +33,20 @@ use crate::runtime::vm::core::vm_context::VMContext;
 use crate::service::mempool::core::mempool::Mempool;
 use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::service::rpc::auth::RpcAuthManager;
+use crate::engine::mining::stratum::stratum_server::StratumServer;
 use crate::{slog_error, slog_info, slog_warn};
+
+/// Global stratum server instance, set once at startup by the daemon.
+/// Lets the RPC `getpoolstats` method and the explorer read live worker/block
+/// counts without threading the StratumServer through every dispatch call.
+pub static STRATUM_INSTANCE: once_cell::sync::OnceCell<Arc<StratumServer>> =
+    once_cell::sync::OnceCell::new();
+
+/// Register the running StratumServer so RPC methods can query its state.
+/// Called once by the daemon after stratum initialization.
+pub fn register_stratum(server: Arc<StratumServer>) {
+    let _ = STRATUM_INSTANCE.set(server);
+}
 
 pub const RPC_PORT: u16 = 9332;
 pub const RPC_VERSION: &str = "2.0";
@@ -523,6 +536,12 @@ impl RpcServer {
             s.p2p_port = p2p_port;
             s.rpc_port = rpc_port;
         }
+    }
+
+    /// Return a clone of the shared state for other services (e.g. Explorer)
+    /// that need read access to BlockStore, UtxoSet, Mempool, etc.
+    pub fn shared_state(&self) -> SharedState {
+        Arc::clone(&self.state)
     }
 
     /// Derive a short network name (`"mainnet"` / `"testnet"` / `"regtest"`)
@@ -2380,15 +2399,27 @@ impl RpcServer {
     }
 
     fn cmd_getpoolstats(id: Value) -> RpcResponse {
-        RpcResponse::ok(
-            id,
-            json!({
-                "status":      "available",
-                "workers":     0,
-                "blocks_found": 0,
-                "pool_fee_pct": 2,
-            }),
-        )
+        if let Some(stratum) = STRATUM_INSTANCE.get() {
+            RpcResponse::ok(
+                id,
+                json!({
+                    "status":      "active",
+                    "workers":     stratum.worker_count(),
+                    "blocks_found": stratum.blocks_found(),
+                    "pool_fee_pct": 2,
+                }),
+            )
+        } else {
+            RpcResponse::ok(
+                id,
+                json!({
+                    "status":      "disabled",
+                    "workers":     0,
+                    "blocks_found": 0,
+                    "pool_fee_pct": 2,
+                }),
+            )
+        }
     }
 
     fn cmd_getchain(id: Value, state: &SharedState) -> RpcResponse {
