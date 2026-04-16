@@ -1563,6 +1563,21 @@ impl ExecutionEnvironment {
                 OpCode::SLOAD => {
                     let slot = pop1!(stack, gas, snapshot, self);
                     let key = format!("slot:{}", slot);
+
+                    // EIP-2929: cold storage access costs 2100 gas,
+                    // warm (already accessed in this TX) costs 100.
+                    let slot_key = (ctx.address.clone(), key.clone());
+                    let extra_cost = if self.warm_storage_slots.contains(&slot_key) {
+                        100u64 // warm
+                    } else {
+                        self.warm_storage_slots.insert(slot_key);
+                        2100u64 // cold
+                    };
+                    if let GasResult::OutOfGas { .. } = gas.consume(extra_cost) {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                    }
+
                     let val = match self.state.storage_load(&ctx.address, &key) {
                         None => U256::ZERO,
                         Some(raw) => match parse_storage_value_checked(&raw) {
@@ -1597,6 +1612,17 @@ impl ExecutionEnvironment {
                     }
                     let (slot, val) = pop2!(stack, gas, snapshot, self);
                     let key = format!("slot:{}", slot);
+
+                    // EIP-2929: cold SSTORE access adds 2100 gas on top of
+                    // the base SSTORE cost. Warm slots pay no surcharge.
+                    let slot_key = (ctx.address.clone(), key.clone());
+                    if !self.warm_storage_slots.contains(&slot_key) {
+                        self.warm_storage_slots.insert(slot_key);
+                        if let GasResult::OutOfGas { .. } = gas.consume(2100) {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure { gas_used: gas.gas_used() };
+                        }
+                    }
                     self.state
                         .storage_store(&ctx.address, &key, &format!("0x{}", val.to_hex()));
                 }
@@ -1722,15 +1748,20 @@ impl ExecutionEnvironment {
                 }
                 OpCode::BALANCE => {
                     let addr_val = pop1!(stack, gas, snapshot, self);
-                    // Resolve the stack body back to its ShadowDAG
-                    // string via the runtime registry (populated by
-                    // CALLER / ADDRESS / CREATE pushes and by the
-                    // frame-entry registration of ctx.caller /
-                    // ctx.address). Falls back to `{prefix}c{hex}` if
-                    // the body was inline-pushed without being
-                    // registered — wrong for EOAs/tokens, correct for
-                    // contract-type addresses on the current network.
                     let addr = self.resolve_address(addr_val);
+
+                    // EIP-2929: cold address access costs 2600, warm costs 100
+                    let extra = if self.warm_addresses.contains(&addr) {
+                        100u64
+                    } else {
+                        self.warm_addresses.insert(addr.clone());
+                        2600u64
+                    };
+                    if let GasResult::OutOfGas { .. } = gas.consume(extra) {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                    }
+
                     let balance = self.state.get_balance(&addr);
                     stack.push(U256::from_u64(balance));
                 }
