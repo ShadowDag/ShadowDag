@@ -298,34 +298,68 @@ impl BlockValidator {
         }
 
         // Per-TX structure + signature verification
-        for (i, tx) in block.body.transactions.iter().enumerate() {
-            if !tx.is_coinbase() {
-                if !TxValidator::validate_structure_for_network(tx, network) {
-                    return Err(ConsensusError::BlockValidation(format!(
-                        "tx {} structural validation failed",
-                        i
-                    )));
-                }
+        //
+        // Signature verification (Ed25519) is the most expensive per-TX
+        // check. For blocks with 4+ non-coinbase TXs, we run signature
+        // verification in parallel via rayon. Structural checks remain
+        // sequential (cheap, O(field count)) to preserve deterministic
+        // error ordering.
+        let non_coinbase: Vec<(usize, &Transaction)> = block
+            .body
+            .transactions
+            .iter()
+            .enumerate()
+            .filter(|(_, tx)| !tx.is_coinbase())
+            .collect();
+
+        // L2a: structural validation (sequential, cheap)
+        for &(i, tx) in &non_coinbase {
+            if !TxValidator::validate_structure_for_network(tx, network) {
+                return Err(ConsensusError::BlockValidation(format!(
+                    "tx {} structural validation failed",
+                    i
+                )));
+            }
+        }
+
+        // L2b: signature verification (parallel for 4+ TXs)
+        if non_coinbase.len() >= 4 {
+            use rayon::prelude::*;
+            let sig_fail = non_coinbase.par_iter().find_any(|&&(_, tx)| {
+                !TxValidator::verify_signatures_for_network(tx, network)
+            });
+            if let Some(&(i, _)) = sig_fail {
+                return Err(ConsensusError::BlockValidation(format!(
+                    "tx {} signature verification failed",
+                    i
+                )));
+            }
+        } else {
+            for &(i, tx) in &non_coinbase {
                 if !TxValidator::verify_signatures_for_network(tx, network) {
                     return Err(ConsensusError::BlockValidation(format!(
                         "tx {} signature verification failed",
                         i
                     )));
                 }
-                // Ring signature verification for confidential (privacy) transactions
-                if tx.is_confidential() && !RingValidator::validate(tx) {
-                    return Err(ConsensusError::BlockValidation(format!(
-                        "tx {} ring signature verification failed",
-                        i
-                    )));
-                }
-                // Validate swap/dex transaction payloads
-                if tx.tx_type == TxType::SwapTx {
-                    Self::validate_swap_tx(tx)?;
-                }
-                if tx.tx_type == TxType::DexOrder {
-                    Self::validate_dex_order_tx(tx)?;
-                }
+            }
+        }
+
+        // L2c: ring signature + swap validation (sequential)
+        for &(i, tx) in &non_coinbase {
+            // Ring signature verification for confidential (privacy) transactions
+            if tx.is_confidential() && !RingValidator::validate(tx) {
+                return Err(ConsensusError::BlockValidation(format!(
+                    "tx {} ring signature verification failed",
+                    i
+                )));
+            }
+            // Validate swap/dex transaction payloads
+            if tx.tx_type == TxType::SwapTx {
+                Self::validate_swap_tx(tx)?;
+            }
+            if tx.tx_type == TxType::DexOrder {
+                Self::validate_dex_order_tx(tx)?;
             }
         }
         Ok(())

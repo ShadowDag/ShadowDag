@@ -693,6 +693,11 @@ impl TxValidator {
     /// Network-aware signature verification -- uses the correct chain_id for
     /// the signing message so that testnet/regtest signatures are verified
     /// against the right message.
+    ///
+    /// For transactions with 4+ inputs, verification runs in parallel via
+    /// rayon. Below that threshold, the sequential path avoids thread-pool
+    /// overhead. Each input's Ed25519 signature is verified independently
+    /// against the transaction signing message.
     pub fn verify_signatures_for_network(tx: &Transaction, network: &NetworkMode) -> bool {
         if tx.inputs.is_empty() {
             return true;
@@ -700,47 +705,54 @@ impl TxValidator {
 
         let msg = TxHash::signing_message_for_network(tx, network);
 
-        for input in &tx.inputs {
-            if input.signature.is_empty() {
-                return false;
-            }
-            if input.pub_key.is_empty() {
-                return false;
-            }
-
-            let sig_bytes: [u8; 64] = match hex::decode(&input.signature) {
-                Ok(b) if b.len() == SIGNATURE_BYTES => match b.try_into() {
-                    Ok(a) => a,
-                    Err(_) => return false,
-                },
-                _ => return false,
-            };
-
-            if !Self::s_is_canonical(&sig_bytes[32..]) {
-                return false;
-            }
-
-            let pk_arr: [u8; 32] = match hex::decode(&input.pub_key) {
-                Ok(b) if b.len() == PUBKEY_BYTES => match b.try_into() {
-                    Ok(a) => a,
-                    Err(_) => return false,
-                },
-                _ => return false,
-            };
-
-            let verifying_key = match VerifyingKey::from_bytes(&pk_arr) {
-                Ok(k) => k,
-                Err(_) => return false,
-            };
-
-            let signature = Signature::from_bytes(&sig_bytes);
-
-            if verifying_key.verify(&msg, &signature).is_err() {
-                return false;
-            }
+        // Use parallel verification for transactions with many inputs (4+).
+        // Below that threshold, rayon overhead exceeds the crypto work.
+        if tx.inputs.len() >= 4 {
+            use rayon::prelude::*;
+            return tx.inputs.par_iter().all(|input| {
+                Self::verify_single_input(input, &msg)
+            });
         }
 
-        true
+        // Sequential path for small transactions
+        tx.inputs.iter().all(|input| {
+            Self::verify_single_input(input, &msg)
+        })
+    }
+
+    /// Verify a single input's Ed25519 signature against the signing message.
+    fn verify_single_input(input: &TxInput, msg: &[u8]) -> bool {
+        if input.signature.is_empty() || input.pub_key.is_empty() {
+            return false;
+        }
+
+        let sig_bytes: [u8; 64] = match hex::decode(&input.signature) {
+            Ok(b) if b.len() == SIGNATURE_BYTES => match b.try_into() {
+                Ok(a) => a,
+                Err(_) => return false,
+            },
+            _ => return false,
+        };
+
+        if !Self::s_is_canonical(&sig_bytes[32..]) {
+            return false;
+        }
+
+        let pk_arr: [u8; 32] = match hex::decode(&input.pub_key) {
+            Ok(b) if b.len() == PUBKEY_BYTES => match b.try_into() {
+                Ok(a) => a,
+                Err(_) => return false,
+            },
+            _ => return false,
+        };
+
+        let verifying_key = match VerifyingKey::from_bytes(&pk_arr) {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+
+        let signature = Signature::from_bytes(&sig_bytes);
+        verifying_key.verify(msg, &signature).is_ok()
     }
 
     pub fn build_signing_message(tx: &Transaction) -> Vec<u8> {
