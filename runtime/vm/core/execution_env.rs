@@ -145,6 +145,16 @@ pub struct ExecutionEnvironment {
     pub destroyed_contracts: HashSet<String>,
     pub created_in_tx: HashSet<String>,
     pub last_return_data: Vec<u8>,
+    /// Reentrancy guard — tracks contract addresses currently executing
+    /// on the call stack. A contract that attempts to re-enter itself
+    /// (directly or via an intermediary) is rejected with a Failure.
+    /// This prevents reentrancy attacks at the protocol level.
+    pub reentrant_guard: HashSet<String>,
+    /// EIP-2929 warm storage tracking — addresses and storage slots
+    /// accessed during this transaction. First access (cold) costs more;
+    /// subsequent accesses (warm) are cheaper.
+    pub warm_addresses: HashSet<String>,
+    pub warm_storage_slots: HashSet<(String, String)>,
     /// Optional handle to the persistent contract storage, used
     /// by `execute_frame` for LAZY-LOADING contract code that
     /// was never explicitly preloaded via
@@ -200,6 +210,9 @@ impl ExecutionEnvironment {
             destroyed_contracts: HashSet::new(),
             created_in_tx: HashSet::new(),
             last_return_data: Vec::new(),
+            reentrant_guard: HashSet::new(),
+            warm_addresses: HashSet::new(),
+            warm_storage_slots: HashSet::new(),
             address_registry: HashMap::new(),
             lazy_load_storage: None,
         }
@@ -271,6 +284,9 @@ impl ExecutionEnvironment {
     pub fn begin_tx(&mut self) {
         self.created_in_tx.clear();
         self.last_return_data.clear();
+        self.reentrant_guard.clear();
+        self.warm_addresses.clear();
+        self.warm_storage_slots.clear();
     }
 
     /// Register an address string in the runtime registry so that later
@@ -936,16 +952,25 @@ impl ExecutionEnvironment {
     /// CALLDATACOPY, RETURNDATACOPY, MSTORE8-with-expansion,
     /// CREATE init-code read, MLOAD / MSTORE on fresh memory, …)
     /// is the concrete gas-accounting hole the audit flagged.
+    /// Quadratic memory expansion cost (EVM-aligned):
+    ///   cost(w) = w * 3 + w² / 512
+    /// Prevents memory bomb attacks — large allocations are progressively
+    /// more expensive, making it uneconomical to fill the full 1 MB limit.
     fn memory_expansion_cost(current_len: usize, needed: usize) -> Option<u64> {
         if needed == 0 || needed <= current_len || needed > MAX_MEMORY_SIZE {
             return None;
         }
         let new_size = needed.div_ceil(32) * 32;
-        let cur_words = current_len / 32;
-        let new_words = new_size / 32;
-        let added = new_words.saturating_sub(cur_words);
-        if added > 0 {
-            Some(added as u64 * MEMORY_GAS_PER_WORD)
+        let cur_words = current_len as u64 / 32;
+        let new_words = new_size as u64 / 32;
+        if new_words <= cur_words {
+            return None;
+        }
+        let new_cost = new_words * MEMORY_GAS_PER_WORD + (new_words * new_words) / 512;
+        let old_cost = cur_words * MEMORY_GAS_PER_WORD + (cur_words * cur_words) / 512;
+        let delta = new_cost.saturating_sub(old_cost);
+        if delta > 0 {
+            Some(delta)
         } else {
             None
         }
@@ -1042,6 +1067,31 @@ impl ExecutionEnvironment {
         Some(memory[offset..end].to_vec())
     }
 
+    /// Copy return data into caller memory safely.
+    ///
+    /// Returns `false` on offset overflow or memory/gas expansion failure.
+    fn copy_return_data_into_memory(
+        gas: &mut GasMeter,
+        memory: &mut Vec<u8>,
+        ret_offset: usize,
+        ret_len: usize,
+        data: &[u8],
+    ) -> bool {
+        if ret_len == 0 || data.is_empty() {
+            return true;
+        }
+        let copy_len = ret_len.min(data.len());
+        let end = match ret_offset.checked_add(copy_len) {
+            Some(v) => v,
+            None => return false,
+        };
+        if !Self::charge_and_expand_memory(gas, memory, end) {
+            return false;
+        }
+        memory[ret_offset..end].copy_from_slice(&data[..copy_len]);
+        true
+    }
+
     /// Execute a call frame. This is the reentrant core of the VM.
     pub fn execute_frame(&mut self, ctx: &CallContext) -> CallOutcome {
         // Depth check.
@@ -1065,6 +1115,23 @@ impl ExecutionEnvironment {
                 gas_used: ctx.gas_limit,
             };
         }
+
+        // ── Reentrancy guard ─────────────────────────────────────
+        // Reject calls to contracts that are already executing on the
+        // current call stack. This prevents reentrancy attacks at the
+        // protocol level — no contract can re-enter itself (directly
+        // or via an intermediary chain).
+        //
+        // The guard is bypassed for DELEGATECALL because it executes
+        // the target's CODE in the CALLER's context (storage address
+        // doesn't change), so no reentrant storage access occurs.
+        if !ctx.is_delegate && ctx.depth > 0 && self.reentrant_guard.contains(&ctx.address) {
+            return CallOutcome::Failure {
+                gas_used: ctx.gas_limit,
+            };
+        }
+        // Add this frame's storage address to the guard set
+        self.reentrant_guard.insert(ctx.address.clone());
 
         // Register the frame's caller, storage address, and code address
         // in the runtime address registry so that every later CALLER /
@@ -2006,20 +2073,17 @@ impl ExecutionEnvironment {
                         if result.success {
                             gas.return_gas(child_gas.saturating_sub(result.gas_used));
                             self.last_return_data = result.output.clone();
-                            if ret_len > 0 && !result.output.is_empty() {
-                                let copy_len = ret_len.min(result.output.len());
-                                if !Self::charge_and_expand_memory(
-                                    &mut gas,
-                                    &mut memory,
-                                    ret_offset + copy_len,
-                                ) {
-                                    self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure {
-                                        gas_used: gas.gas_used(),
-                                    };
-                                }
-                                memory[ret_offset..ret_offset + copy_len]
-                                    .copy_from_slice(&result.output[..copy_len]);
+                            if !Self::copy_return_data_into_memory(
+                                &mut gas,
+                                &mut memory,
+                                ret_offset,
+                                ret_len,
+                                &result.output,
+                            ) {
+                                self.state.rollback(snapshot).ok();
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
                             }
                             stack.push(U256::ONE);
                         } else {
@@ -2068,21 +2132,17 @@ impl ExecutionEnvironment {
                         } => {
                             gas.return_gas(child_gas.saturating_sub(*gas_used));
                             self.last_return_data = rd.clone();
-                            // Write return data to memory
-                            if ret_len > 0 && !rd.is_empty() {
-                                let copy_len = ret_len.min(rd.len());
-                                if !Self::charge_and_expand_memory(
-                                    &mut gas,
-                                    &mut memory,
-                                    ret_offset + copy_len,
-                                ) {
-                                    self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure {
-                                        gas_used: gas.gas_used(),
-                                    };
-                                }
-                                memory[ret_offset..ret_offset + copy_len]
-                                    .copy_from_slice(&rd[..copy_len]);
+                            if !Self::copy_return_data_into_memory(
+                                &mut gas,
+                                &mut memory,
+                                ret_offset,
+                                ret_len,
+                                rd,
+                            ) {
+                                self.state.rollback(snapshot).ok();
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
                             }
                             stack.push(U256::ONE); // success
                         }
@@ -2099,20 +2159,17 @@ impl ExecutionEnvironment {
                             // copy here so a contract that uses CALL
                             // and reads from retOffset gets the revert
                             // reason on either outcome.
-                            if ret_len > 0 && !rd.is_empty() {
-                                let copy_len = ret_len.min(rd.len());
-                                if !Self::charge_and_expand_memory(
-                                    &mut gas,
-                                    &mut memory,
-                                    ret_offset + copy_len,
-                                ) {
-                                    self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure {
-                                        gas_used: gas.gas_used(),
-                                    };
-                                }
-                                memory[ret_offset..ret_offset + copy_len]
-                                    .copy_from_slice(&rd[..copy_len]);
+                            if !Self::copy_return_data_into_memory(
+                                &mut gas,
+                                &mut memory,
+                                ret_offset,
+                                ret_len,
+                                rd,
+                            ) {
+                                self.state.rollback(snapshot).ok();
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
                             }
                             stack.push(U256::ZERO); // failure
                         }
@@ -2184,20 +2241,17 @@ impl ExecutionEnvironment {
                         if result.success {
                             gas.return_gas(child_gas.saturating_sub(result.gas_used));
                             self.last_return_data = result.output.clone();
-                            if ret_len > 0 && !result.output.is_empty() {
-                                let copy_len = ret_len.min(result.output.len());
-                                if !Self::charge_and_expand_memory(
-                                    &mut gas,
-                                    &mut memory,
-                                    ret_offset + copy_len,
-                                ) {
-                                    self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure {
-                                        gas_used: gas.gas_used(),
-                                    };
-                                }
-                                memory[ret_offset..ret_offset + copy_len]
-                                    .copy_from_slice(&result.output[..copy_len]);
+                            if !Self::copy_return_data_into_memory(
+                                &mut gas,
+                                &mut memory,
+                                ret_offset,
+                                ret_len,
+                                &result.output,
+                            ) {
+                                self.state.rollback(snapshot).ok();
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
                             }
                             stack.push(U256::ONE);
                         } else {
@@ -2231,20 +2285,17 @@ impl ExecutionEnvironment {
                         } => {
                             gas.return_gas(child_gas.saturating_sub(*gas_used));
                             self.last_return_data = rd.clone();
-                            if ret_len > 0 && !rd.is_empty() {
-                                let copy_len = ret_len.min(rd.len());
-                                if !Self::charge_and_expand_memory(
-                                    &mut gas,
-                                    &mut memory,
-                                    ret_offset + copy_len,
-                                ) {
-                                    self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure {
-                                        gas_used: gas.gas_used(),
-                                    };
-                                }
-                                memory[ret_offset..ret_offset + copy_len]
-                                    .copy_from_slice(&rd[..copy_len]);
+                            if !Self::copy_return_data_into_memory(
+                                &mut gas,
+                                &mut memory,
+                                ret_offset,
+                                ret_len,
+                                rd,
+                            ) {
+                                self.state.rollback(snapshot).ok();
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
                             }
                             stack.push(U256::ONE);
                         }
@@ -2257,20 +2308,17 @@ impl ExecutionEnvironment {
                             // Mirror success path: also copy revert
                             // returndata into the caller's
                             // retOffset/retLen window.
-                            if ret_len > 0 && !rd.is_empty() {
-                                let copy_len = ret_len.min(rd.len());
-                                if !Self::charge_and_expand_memory(
-                                    &mut gas,
-                                    &mut memory,
-                                    ret_offset + copy_len,
-                                ) {
-                                    self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure {
-                                        gas_used: gas.gas_used(),
-                                    };
-                                }
-                                memory[ret_offset..ret_offset + copy_len]
-                                    .copy_from_slice(&rd[..copy_len]);
+                            if !Self::copy_return_data_into_memory(
+                                &mut gas,
+                                &mut memory,
+                                ret_offset,
+                                ret_len,
+                                rd,
+                            ) {
+                                self.state.rollback(snapshot).ok();
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
                             }
                             stack.push(U256::ZERO);
                         }
@@ -2362,20 +2410,17 @@ impl ExecutionEnvironment {
                         } => {
                             gas.return_gas(child_gas.saturating_sub(*gas_used));
                             self.last_return_data = rd.clone();
-                            if ret_len > 0 && !rd.is_empty() {
-                                let copy_len = ret_len.min(rd.len());
-                                if !Self::charge_and_expand_memory(
-                                    &mut gas,
-                                    &mut memory,
-                                    ret_offset + copy_len,
-                                ) {
-                                    self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure {
-                                        gas_used: gas.gas_used(),
-                                    };
-                                }
-                                memory[ret_offset..ret_offset + copy_len]
-                                    .copy_from_slice(&rd[..copy_len]);
+                            if !Self::copy_return_data_into_memory(
+                                &mut gas,
+                                &mut memory,
+                                ret_offset,
+                                ret_len,
+                                rd,
+                            ) {
+                                self.state.rollback(snapshot).ok();
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
                             }
                             stack.push(U256::ONE);
                         }
@@ -2386,20 +2431,17 @@ impl ExecutionEnvironment {
                             gas.return_gas(child_gas.saturating_sub(*gas_used));
                             self.last_return_data = rd.clone();
                             // Mirror success path: copy revert returndata too.
-                            if ret_len > 0 && !rd.is_empty() {
-                                let copy_len = ret_len.min(rd.len());
-                                if !Self::charge_and_expand_memory(
-                                    &mut gas,
-                                    &mut memory,
-                                    ret_offset + copy_len,
-                                ) {
-                                    self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure {
-                                        gas_used: gas.gas_used(),
-                                    };
-                                }
-                                memory[ret_offset..ret_offset + copy_len]
-                                    .copy_from_slice(&rd[..copy_len]);
+                            if !Self::copy_return_data_into_memory(
+                                &mut gas,
+                                &mut memory,
+                                ret_offset,
+                                ret_len,
+                                rd,
+                            ) {
+                                self.state.rollback(snapshot).ok();
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
                             }
                             stack.push(U256::ZERO);
                         }
@@ -2526,20 +2568,17 @@ impl ExecutionEnvironment {
                         } => {
                             gas.return_gas(child_gas.saturating_sub(*gas_used));
                             self.last_return_data = rd.clone();
-                            if ret_len > 0 && !rd.is_empty() {
-                                let copy_len = ret_len.min(rd.len());
-                                if !Self::charge_and_expand_memory(
-                                    &mut gas,
-                                    &mut memory,
-                                    ret_offset + copy_len,
-                                ) {
-                                    self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure {
-                                        gas_used: gas.gas_used(),
-                                    };
-                                }
-                                memory[ret_offset..ret_offset + copy_len]
-                                    .copy_from_slice(&rd[..copy_len]);
+                            if !Self::copy_return_data_into_memory(
+                                &mut gas,
+                                &mut memory,
+                                ret_offset,
+                                ret_len,
+                                rd,
+                            ) {
+                                self.state.rollback(snapshot).ok();
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
                             }
                             stack.push(U256::ONE);
                         }
@@ -2550,20 +2589,17 @@ impl ExecutionEnvironment {
                             gas.return_gas(child_gas.saturating_sub(*gas_used));
                             self.last_return_data = rd.clone();
                             // Mirror success path: copy revert returndata too.
-                            if ret_len > 0 && !rd.is_empty() {
-                                let copy_len = ret_len.min(rd.len());
-                                if !Self::charge_and_expand_memory(
-                                    &mut gas,
-                                    &mut memory,
-                                    ret_offset + copy_len,
-                                ) {
-                                    self.state.rollback(snapshot).ok();
-                                    return CallOutcome::Failure {
-                                        gas_used: gas.gas_used(),
-                                    };
-                                }
-                                memory[ret_offset..ret_offset + copy_len]
-                                    .copy_from_slice(&rd[..copy_len]);
+                            if !Self::copy_return_data_into_memory(
+                                &mut gas,
+                                &mut memory,
+                                ret_offset,
+                                ret_len,
+                                rd,
+                            ) {
+                                self.state.rollback(snapshot).ok();
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
                             }
                             stack.push(U256::ZERO);
                         }
@@ -5649,6 +5685,23 @@ mod tests {
         assert!(
             result.is_none(),
             "checked_add overflow must return None, not wrap"
+        );
+    }
+
+    #[test]
+    fn copy_return_data_into_memory_rejects_checked_add_overflow() {
+        let mut memory: Vec<u8> = Vec::new();
+        let mut gas = GasMeter::new(1_000_000);
+        let ok = ExecutionEnvironment::copy_return_data_into_memory(
+            &mut gas,
+            &mut memory,
+            usize::MAX,
+            1,
+            &[0xAA],
+        );
+        assert!(
+            !ok,
+            "ret_offset + copy_len overflow must fail closed (no wrap, no panic)"
         );
     }
 
