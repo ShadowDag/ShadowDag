@@ -250,38 +250,30 @@ fn handle_connection(mut stream: TcpStream, rpc_addr: &str, network: &str) {
 fn api_overview(stream: &mut TcpStream, rpc_addr: &str, network: &str) {
     let info = rpc_call(rpc_addr, "getnetworkinfo", &[]);
     let height_val = rpc_call(rpc_addr, "getblockcount", &[]);
-    let mempool = rpc_call(rpc_addr, "gettxpool", &[]);
+    let mempool = rpc_call(rpc_addr, "getmempoolinfo", &[]);
 
     let height = if height_val.is_number() {
         height_val.as_u64().unwrap_or(0)
     } else {
-        height_val.get("height").and_then(|v| v.as_u64()).unwrap_or(0)
+        height_val.get("best_height").and_then(|v| v.as_u64()).unwrap_or(0)
     };
-
     let peer_count = info.get("peer_count")
-        .or_else(|| info.get("connections"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-
     let version = info.get("version")
-        .or_else(|| info.get("node_version"))
         .and_then(|v| v.as_str())
         .unwrap_or("1.0.0");
-
-    let mempool_size = if mempool.is_number() {
-        mempool.as_u64().unwrap_or(0)
-    } else {
-        mempool.get("size")
-            .or_else(|| mempool.get("count"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-    };
-
-    let connected = !info.get("error").is_some() || peer_count > 0 || height > 0;
+    let mempool_size = mempool.get("size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let net_name = info.get("network")
+        .and_then(|v| v.as_str())
+        .unwrap_or(network);
+    let connected = info.get("error").is_none();
 
     let data = serde_json::json!({
         "node_version": version,
-        "network": network,
+        "network": net_name,
         "best_height": height,
         "best_hash": info.get("best_hash").and_then(|v| v.as_str()).unwrap_or(""),
         "peer_count": peer_count,
@@ -295,21 +287,13 @@ fn api_overview(stream: &mut TcpStream, rpc_addr: &str, network: &str) {
 
 fn api_network(stream: &mut TcpStream, rpc_addr: &str) {
     let info = rpc_call(rpc_addr, "getnetworkinfo", &[]);
-    let height_val = rpc_call(rpc_addr, "getblockcount", &[]);
-
-    let height = if height_val.is_number() {
-        height_val.as_u64().unwrap_or(0)
-    } else {
-        height_val.get("height").and_then(|v| v.as_u64()).unwrap_or(0)
-    };
+    let height = info.get("best_height").and_then(|v| v.as_u64()).unwrap_or(0);
 
     let data = serde_json::json!({
         "network": info.get("network").and_then(|v| v.as_str()).unwrap_or("unknown"),
         "p2p_port": info.get("p2p_port").and_then(|v| v.as_u64()).unwrap_or(0),
         "rpc_port": info.get("rpc_port").and_then(|v| v.as_u64()).unwrap_or(0),
-        "peer_count": info.get("peer_count")
-            .or_else(|| info.get("connections"))
-            .and_then(|v| v.as_u64()).unwrap_or(0),
+        "peer_count": info.get("peer_count").and_then(|v| v.as_u64()).unwrap_or(0),
         "best_height": height,
         "rpc_endpoint": rpc_addr,
     });
