@@ -1,0 +1,286 @@
+name: Desktop Wallet Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - 'wallet-*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag name (e.g. wallet-v1.0.0)'
+        required: true
+        default: 'wallet-v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Windows ──────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build desktop wallet
+        run: cargo build --release --bin shadowdag-wallet-desktop --features desktop
+
+      - name: Build CLI wallet
+        run: cargo build --release --bin shadowdag-wallet
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p DesktopWallet-windows-x86_64
+          cp target/release/shadowdag-wallet-desktop.exe DesktopWallet-windows-x86_64/
+          cp target/release/shadowdag-wallet.exe         DesktopWallet-windows-x86_64/
+          cat > DesktopWallet-windows-x86_64/README.txt << 'EOF'
+          ╔══════════════════════════════════════════════════╗
+          ║       ShadowDAG Desktop Wallet — Windows        ║
+          ╚══════════════════════════════════════════════════╝
+
+          FILES:
+            shadowdag-wallet-desktop.exe  — Desktop wallet (native window)
+            shadowdag-wallet.exe          — CLI wallet (terminal)
+
+          USAGE:
+            1. Make sure a ShadowDAG node is running (RPC on port 9332)
+            2. Double-click shadowdag-wallet-desktop.exe
+            3. The wallet window will open automatically
+
+          CLI OPTIONS:
+            shadowdag-wallet-desktop.exe --rpc=127.0.0.1:9332
+            shadowdag-wallet-desktop.exe --rpc=127.0.0.1:19332  (testnet)
+            shadowdag-wallet-desktop.exe --help
+
+          REQUIREMENTS:
+            - Windows 10/11 with WebView2 Runtime (included in Windows 11)
+            - A running ShadowDAG node for balance/network queries
+
+          CLI WALLET:
+            shadowdag-wallet.exe new              — Create new wallet
+            shadowdag-wallet.exe balance           — Check balance
+            shadowdag-wallet.exe send <to> <amount> — Send SDAG
+            shadowdag-wallet.exe info              — Show wallet info
+          EOF
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DesktopWallet-windows-x86_64
+          path: DesktopWallet-windows-x86_64/
+
+  # ── Linux ────────────────────────────────────────────────
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Build desktop wallet
+        run: cargo build --release --bin shadowdag-wallet-desktop --features desktop
+
+      - name: Build CLI wallet
+        run: cargo build --release --bin shadowdag-wallet
+
+      - name: Package
+        run: |
+          mkdir -p DesktopWallet-linux-x86_64
+          cp target/release/shadowdag-wallet-desktop DesktopWallet-linux-x86_64/
+          cp target/release/shadowdag-wallet         DesktopWallet-linux-x86_64/
+          chmod +x DesktopWallet-linux-x86_64/shadowdag-wallet-desktop
+          chmod +x DesktopWallet-linux-x86_64/shadowdag-wallet
+          cat > DesktopWallet-linux-x86_64/README.txt << 'EOF'
+          ╔══════════════════════════════════════════════════╗
+          ║       ShadowDAG Desktop Wallet — Linux          ║
+          ╚══════════════════════════════════════════════════╝
+
+          FILES:
+            shadowdag-wallet-desktop  — Desktop wallet (native window)
+            shadowdag-wallet          — CLI wallet (terminal)
+
+          USAGE:
+            1. Make sure a ShadowDAG node is running (RPC on port 9332)
+            2. Run: ./shadowdag-wallet-desktop
+            3. The wallet window will open automatically
+
+          REQUIREMENTS:
+            - WebKitGTK 4.1: sudo apt install libwebkit2gtk-4.1-0
+            - GTK 3: sudo apt install libgtk-3-0
+            - A running ShadowDAG node for balance/network queries
+
+          CLI OPTIONS:
+            ./shadowdag-wallet-desktop --rpc=127.0.0.1:9332
+            ./shadowdag-wallet-desktop --rpc=127.0.0.1:19332  (testnet)
+            ./shadowdag-wallet-desktop --help
+
+          CLI WALLET:
+            ./shadowdag-wallet new              — Create new wallet
+            ./shadowdag-wallet balance           — Check balance
+            ./shadowdag-wallet send <to> <amount> — Send SDAG
+            ./shadowdag-wallet info              — Show wallet info
+          EOF
+          tar czf DesktopWallet-linux-x86_64.tar.gz DesktopWallet-linux-x86_64/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DesktopWallet-linux-x86_64
+          path: DesktopWallet-linux-x86_64.tar.gz
+
+  # ── macOS ────────────────────────────────────────────────
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build desktop wallet
+        run: cargo build --release --bin shadowdag-wallet-desktop --features desktop
+
+      - name: Build CLI wallet
+        run: cargo build --release --bin shadowdag-wallet
+
+      - name: Package
+        run: |
+          mkdir -p DesktopWallet-macos-arm64
+          cp target/release/shadowdag-wallet-desktop DesktopWallet-macos-arm64/
+          cp target/release/shadowdag-wallet         DesktopWallet-macos-arm64/
+          chmod +x DesktopWallet-macos-arm64/shadowdag-wallet-desktop
+          chmod +x DesktopWallet-macos-arm64/shadowdag-wallet
+          cat > DesktopWallet-macos-arm64/README.txt << 'EOF'
+          ╔══════════════════════════════════════════════════╗
+          ║       ShadowDAG Desktop Wallet — macOS          ║
+          ╚══════════════════════════════════════════════════╝
+
+          FILES:
+            shadowdag-wallet-desktop  — Desktop wallet (native window)
+            shadowdag-wallet          — CLI wallet (terminal)
+
+          USAGE:
+            1. Make sure a ShadowDAG node is running (RPC on port 9332)
+            2. Run: ./shadowdag-wallet-desktop
+            3. The wallet window will open automatically
+
+          NOTE: macOS may show a security warning on first run.
+            Go to System Settings > Privacy & Security > click "Open Anyway"
+            Or run: xattr -d com.apple.quarantine shadowdag-wallet-desktop
+
+          CLI OPTIONS:
+            ./shadowdag-wallet-desktop --rpc=127.0.0.1:9332
+            ./shadowdag-wallet-desktop --rpc=127.0.0.1:19332  (testnet)
+            ./shadowdag-wallet-desktop --help
+
+          CLI WALLET:
+            ./shadowdag-wallet new              — Create new wallet
+            ./shadowdag-wallet balance           — Check balance
+            ./shadowdag-wallet send <to> <amount> — Send SDAG
+            ./shadowdag-wallet info              — Show wallet info
+          EOF
+          tar czf DesktopWallet-macos-arm64.tar.gz DesktopWallet-macos-arm64/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DesktopWallet-macos-arm64
+          path: DesktopWallet-macos-arm64.tar.gz
+
+  # ── Create Release ──────────────────────────────────────
+  release:
+    needs: [build-windows, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: DesktopWallet-windows-x86_64
+          path: DesktopWallet-windows-x86_64
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: DesktopWallet-linux-x86_64
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: DesktopWallet-macos-arm64
+
+      - name: Package Windows as zip
+        run: |
+          sudo apt-get install -y zip
+          zip -r DesktopWallet-windows-x86_64.zip DesktopWallet-windows-x86_64/
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "ShadowDAG Desktop Wallet — ${{ steps.tag.outputs.tag }}"
+          files: |
+            DesktopWallet-windows-x86_64.zip
+            DesktopWallet-linux-x86_64.tar.gz
+            DesktopWallet-macos-arm64.tar.gz
+          body: |
+            ## ShadowDAG Desktop Wallet
+
+            Native desktop wallet application for ShadowDAG.
+
+            ### Downloads
+
+            | Platform | File | Architecture |
+            |----------|------|-------------|
+            | **Windows** | `DesktopWallet-windows-x86_64.zip` | x86_64 |
+            | **Linux** | `DesktopWallet-linux-x86_64.tar.gz` | x86_64 |
+            | **macOS** | `DesktopWallet-macos-arm64.tar.gz` | ARM64 (Apple Silicon) |
+
+            ### Quick Start
+
+            1. Download the file for your OS
+            2. Extract the archive
+            3. Make sure a ShadowDAG node is running
+            4. Run `shadowdag-wallet-desktop`
+
+            ### What's Included
+
+            Each package contains:
+            - `shadowdag-wallet-desktop` — Native desktop wallet (GUI)
+            - `shadowdag-wallet` — CLI wallet (terminal)
+            - `README.txt` — Setup instructions
+
+            ### Requirements
+
+            | Platform | Requirement |
+            |----------|------------|
+            | Windows | WebView2 Runtime (included in Windows 11) |
+            | Linux | WebKitGTK 4.1 (`sudo apt install libwebkit2gtk-4.1-0`) |
+            | macOS | No extra dependencies (uses WKWebView) |
+
+            ### CLI Options
+
+            ```bash
+            shadowdag-wallet-desktop                        # Default (mainnet)
+            shadowdag-wallet-desktop --rpc=127.0.0.1:19332  # Testnet
+            shadowdag-wallet-desktop --network=testnet       # Force network
+            shadowdag-wallet-desktop --help                  # Show help
+            ```
