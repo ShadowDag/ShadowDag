@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Package release
+        run: |
+          VERSION=${GITHUB_REF_NAME}
+          DIR="shadowdag-${VERSION}-linux-x86_64"
+          mkdir -p "$DIR/bin" "$DIR/config" "$DIR/examples" "$DIR/deploy"
+
+          # Binaries
+          cp target/release/shadowdag-node   "$DIR/bin/"
+          cp target/release/shadowdag-miner  "$DIR/bin/"
+          cp target/release/shadowdag-wallet "$DIR/bin/"
+          cp target/release/shadowasm        "$DIR/bin/"
+
+          # Config & deploy
+          cp -r deploy/systemd "$DIR/deploy/"
+          cp deploy/install-systemd.sh "$DIR/deploy/"
+          cp deploy/sd "$DIR/deploy/"
+
+          # Examples
+          cp examples/*.sasm "$DIR/examples/"
+
+          # Docs
+          cp README.md LICENSE "$DIR/"
+
+          # Quick start guide
+          cat > "$DIR/QUICKSTART.md" << 'GUIDE'
+          # ShadowDAG Quick Start
+
+          ## 1. Run a Node
+          ```bash
+          ./bin/shadowdag-node --network=mainnet --enable-explorer --enable-ide
+          ```
+
+          ## 2. Start Mining
+          ```bash
+          ./bin/shadowdag-miner --network=mainnet --address=YOUR_ADDRESS --threads=2
+          ```
+
+          ## 3. Create a Wallet
+          ```bash
+          ./bin/shadowdag-wallet new mainnet
+          ```
+
+          ## 4. Open Explorer
+          http://localhost:8080
+
+          ## 5. Open Contract IDE
+          http://localhost:3000
+
+          ## Ports
+          - 9332: RPC
+          - 9333: P2P
+          - 7779: Stratum Pool
+          - 8080: Explorer
+          - 3000: Contract IDE
+          GUIDE
+
+          tar czf "${DIR}.tar.gz" "$DIR"
+          echo "ASSET=${DIR}.tar.gz" >> $GITHUB_ENV
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+          generate_release_notes: true
+          body: |
+            ## ShadowDAG ${{ github.ref_name }}
+
+            ### Downloads
+            - **Linux x86_64**: `shadowdag-${{ github.ref_name }}-linux-x86_64.tar.gz`
+
+            ### Quick Install (Linux)
+            ```bash
+            curl -sSf https://raw.githubusercontent.com/ShadowDag/ShadowDag/main/install.sh | bash
+            ```
+
+            ### Docker
+            ```bash
+            docker pull ghcr.io/shadowdag/shadowdag:latest
+            docker run -d -p 9332:9332 -p 9333:9333 -p 8080:8080 ghcr.io/shadowdag/shadowdag
+            ```
+
+            ### What's Included
+            - `shadowdag-node` — Full node with Explorer + Contract IDE
+            - `shadowdag-miner` — GPU/CPU miner
+            - `shadowdag-wallet` — Wallet management
+            - `shadowasm` — Smart contract assembler
+            - systemd service files + `sd` operator CLI
+            - Example smart contracts (.sasm)
+
+  build-docker:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/shadowdag/shadowdag:latest
+            ghcr.io/shadowdag/shadowdag:${{ github.ref_name }}

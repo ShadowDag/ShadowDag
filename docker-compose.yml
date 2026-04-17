@@ -1,0 +1,30 @@
+# ShadowDAG Docker Compose
+#
+# Usage:
+#   docker compose up -d           # Start node
+#   docker compose logs -f node    # View logs
+#   docker compose down            # Stop
+#
+# With mining:
+#   MINER_ADDRESS=SD0your_address docker compose up -d
+
+services:
+  node:
+    build: .
+    container_name: shadowdag-node
+    restart: unless-stopped
+    ports:
+      - "9332:9332"   # RPC
+      - "9333:9333"   # P2P
+      - "7779:7779"   # Stratum Pool
+      - "8080:8080"   # Blockchain Explorer
+      - "3000:3000"   # Contract IDE
+    volumes:
+      - shadowdag-data:/data
+    environment:
+      - NETWORK=mainnet
+      - MINER_ADDRESS=${MINER_ADDRESS:-}
+      - MINER_THREADS=${MINER_THREADS:-1}
+
+volumes:
+  shadowdag-data:
