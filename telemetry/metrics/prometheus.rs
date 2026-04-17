@@ -4,7 +4,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::{slog_error, slog_info, slog_warn};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::{Arc, Mutex};
 
 pub struct PrometheusExporter {
@@ -138,7 +138,14 @@ impl PrometheusExporter {
     ///
     /// Pulls live metrics from the global MetricsRegistry on every scrape.
     pub fn start_server(port: u16) {
-        let addr = format!("0.0.0.0:{}", port);
+        const PROM_READ_TIMEOUT_SECS: u64 = 5;
+        const MAX_REQUEST_LINE_BYTES: usize = 4096;
+        let bind_host = std::env::var("SHADOWDAG_PROMETHEUS_BIND")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let addr = format!("{}:{}", bind_host, port);
 
         std::thread::spawn(move || {
             let listener = match std::net::TcpListener::bind(&addr) {
@@ -161,46 +168,81 @@ impl PrometheusExporter {
                     }
                 };
 
-                let mut buf = [0u8; 2048];
-                let n = match std::io::Read::read(&mut &stream, &mut buf) {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(
+                    PROM_READ_TIMEOUT_SECS,
+                )));
+                let clone = match stream.try_clone() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        slog_error!("metrics", "prometheus_clone_failed", error => e.to_string());
+                        continue;
+                    }
+                };
+                let mut reader = BufReader::new(clone);
+                let mut request_line = String::new();
+                let req_read = {
+                    let mut limited = (&mut reader).take(MAX_REQUEST_LINE_BYTES as u64);
+                    limited.read_line(&mut request_line)
+                };
+                let req_size = match req_read {
                     Ok(n) => n,
                     Err(e) => {
                         slog_error!("metrics", "prometheus_read_failed", error => e.to_string());
                         continue;
                     }
                 };
-                let request = String::from_utf8_lossy(&buf[..n]);
+                if req_size == 0 {
+                    continue;
+                }
+                if request_line.len() >= MAX_REQUEST_LINE_BYTES && !request_line.ends_with('\n') {
+                    let mut writer = std::io::BufWriter::new(&stream);
+                    let _ = writer.write_all(
+                        b"HTTP/1.1 414 URI Too Long\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                    );
+                    let _ = writer.flush();
+                    continue;
+                }
+                let parts: Vec<&str> = request_line.split_whitespace().collect();
+                if parts.len() < 2 || parts[0] != "GET" {
+                    let mut writer = std::io::BufWriter::new(&stream);
+                    let _ = writer.write_all(
+                        b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                    );
+                    let _ = writer.flush();
+                    continue;
+                }
+                let route = parts[1];
 
-                let (content_type, body) = if request.contains("GET /debug") {
-                    ("application/json", crate::telemetry::diagnostics::collect())
-                } else if request.contains("GET /health") {
+                let (status_line, content_type, body) = if route == "/debug" {
+                    ("200 OK", "application/json", crate::telemetry::diagnostics::collect())
+                } else if route == "/health" {
                     (
+                        "200 OK",
                         "application/json",
                         format!(
                             "{{\"status\":\"up\",\"uptime_secs\":{}}}",
                             crate::telemetry::metrics::registry::global().uptime_secs()
                         ),
                     )
-                } else {
-                    // Default: /metrics → Prometheus text
+                } else if route == "/metrics" || route == "/" {
                     let registry = crate::telemetry::metrics::registry::global();
                     let mut body = registry.to_prometheus();
-
-                    // Also include any manually-recorded metrics from this exporter
                     if let Ok(m) = self_metrics_guard() {
                         let refs: Vec<(&str, u64)> =
                             m.iter().map(|(n, v)| (n.as_str(), *v)).collect();
                         body.push_str(&Self::export(&refs));
                     }
-
-                    ("text/plain; charset=utf-8", body)
+                    ("200 OK", "text/plain; charset=utf-8", body)
+                } else {
+                    ("404 Not Found", "text/plain; charset=utf-8", "Not Found".to_string())
                 };
 
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\n\
+                    "HTTP/1.1 {}\r\n\
                      Content-Type: {}\r\n\
                      Content-Length: {}\r\n\
                      Connection: close\r\n\r\n{}",
+                    status_line,
                     content_type,
                     body.len(),
                     body
@@ -351,3 +393,4 @@ mod tests {
         }
     }
 }
+

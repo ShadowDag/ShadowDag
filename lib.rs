@@ -424,6 +424,7 @@ pub mod service {
         }
         pub mod contract_ide;
         pub mod explorer;
+        pub mod wallet_ui;
     }
     pub mod wallet {
         pub mod core {

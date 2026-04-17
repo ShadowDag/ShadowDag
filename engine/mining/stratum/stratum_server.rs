@@ -669,9 +669,13 @@ impl StratumServer {
     /// requests, dispatches them via `handle_request`, and writes responses.
     pub fn start(self: &Arc<Self>) {
         self.running.store(true, Ordering::Relaxed);
-        slog_info!("stratum", "server_listening", port => self.port, vardiff_target => TARGET_SHARES_PER_MIN);
-
-        let addr = format!("0.0.0.0:{}", self.port);
+        let bind_host = std::env::var("SHADOWDAG_STRATUM_BIND")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let addr = format!("{}:{}", bind_host, self.port);
+        slog_info!("stratum", "server_listening", addr => &addr, vardiff_target => TARGET_SHARES_PER_MIN);
         let listener = match std::net::TcpListener::bind(&addr) {
             Ok(l) => l,
             Err(e) => {
@@ -692,15 +696,15 @@ impl StratumServer {
             match listener.accept() {
                 Ok((tcp_stream, _addr)) => {
                     // DoS protection: reject new connections when at capacity
-                    let current = self.active_connections.load(Ordering::Relaxed) as usize;
-                    if current >= MAX_CONNECTIONS {
+                    let prev = self.active_connections.fetch_add(1, Ordering::AcqRel) as usize;
+                    if prev >= MAX_CONNECTIONS {
+                        self.active_connections.fetch_sub(1, Ordering::Relaxed);
                         drop(tcp_stream); // immediately close the excess connection
                         slog_warn!("stratum", "connection_limit_reached",
-                            current => current, max => MAX_CONNECTIONS);
+                            current => prev, max => MAX_CONNECTIONS);
                         continue;
                     }
 
-                    self.active_connections.fetch_add(1, Ordering::Relaxed);
                     let server = Arc::clone(self);
                     std::thread::spawn(move || {
                         if let Err(e) = server.handle_connection(tcp_stream) {

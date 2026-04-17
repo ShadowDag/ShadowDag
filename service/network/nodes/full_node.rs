@@ -407,6 +407,49 @@ impl FullNode {
         timestamps
     }
 
+    /// Expected difficulty for validating an incoming block.
+    ///
+    /// Why this exists:
+    /// - `retarget.ema_difficulty()` represents the *next* difficulty from the
+    ///   current selected tip.
+    /// - Competing blocks at the same height can arrive after tip advanced.
+    ///   Those blocks should still be checked against that height's difficulty,
+    ///   not against the next-height value.
+    fn expected_difficulty_for_block(&self, block: &Block) -> Result<u64, NodeError> {
+        // Genesis keeps its own configured difficulty.
+        if block.header.height == 0 {
+            return Ok(block.header.difficulty.max(1));
+        }
+
+        // Read current best height (if any).
+        let best_height = self
+            .block_store
+            .get_best_hash()
+            .and_then(|h| self.block_store.get_block(&h))
+            .map(|b| b.header.height)
+            .unwrap_or(0);
+
+        // For same/older heights, anchor to already-known blocks at that height.
+        if block.header.height <= best_height {
+            let hashes = self.block_store.get_block_hashes_at_height(block.header.height);
+            for h in hashes {
+                if let Some(existing) = self.block_store.get_block(&h) {
+                    return Ok(existing.header.difficulty.max(1));
+                }
+            }
+            // Historical/side branch with no body available at this height (e.g. pruning):
+            // avoid false-negative rejects by falling back to the claimed header value.
+            return Ok(block.header.difficulty.max(1));
+        }
+
+        // For tip extension (height = best + 1), use the current retarget EMA.
+        let retarget = self
+            .retarget
+            .lock()
+            .map_err(|e| NodeError::Other(format!("Retarget lock poisoned: {}", e)))?;
+        Ok(retarget.ema_difficulty().max(1))
+    }
+
     fn process_block_inner(&self, block: &Block, peer_id: &str) -> Result<(), NodeError> {
         // ═══════════════════════════════════════════════════════════════
         // CONSENSUS-CRITICAL VALIDATION PIPELINE
@@ -441,13 +484,7 @@ impl FullNode {
         // becomes part of the selected chain. A per-parent-context
         // retarget would be more precise but requires walking the
         // parent chain for every incoming block — acceptable for now.
-        let expected_diff = {
-            let retarget = self
-                .retarget
-                .lock()
-                .map_err(|e| NodeError::Other(format!("Retarget lock poisoned: {}", e)))?;
-            Some(retarget.ema_difficulty())
-        };
+        let expected_diff = Some(self.expected_difficulty_for_block(block)?);
 
         let ancestor_ts = self.collect_ancestor_timestamps(block);
 
@@ -571,13 +608,7 @@ impl FullNode {
         // becomes part of the selected chain. A per-parent-context
         // retarget would be more precise but requires walking the
         // parent chain for every incoming block — acceptable for now.
-        let expected_diff = {
-            let retarget = self
-                .retarget
-                .lock()
-                .map_err(|e| NodeError::Other(format!("Retarget lock poisoned: {}", e)))?;
-            Some(retarget.ema_difficulty())
-        };
+        let expected_diff = Some(self.expected_difficulty_for_block(block)?);
 
         let ancestor_ts = self.collect_ancestor_timestamps(block);
 

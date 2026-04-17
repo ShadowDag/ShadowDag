@@ -208,6 +208,10 @@ pub fn push_pending_block(peer_id: &str, block: Block) -> bool {
         slog_warn!("p2p", "pending_block_queue_full");
         return false;
     }
+    // Drop duplicate block hashes already waiting in queue.
+    if q.iter().any(|(_, b)| b.header.hash == block.header.hash) {
+        return true;
+    }
 
     let mut pending = PEER_PENDING.lock();
     let entry = pending.entry(peer_id.to_string()).or_insert((0, 0));
@@ -232,6 +236,10 @@ pub fn push_pending_tx(peer_id: &str, tx: Transaction) -> bool {
     if q.len() >= 10_000 {
         slog_warn!("p2p", "pending_tx_queue_full");
         return false;
+    }
+    // Drop duplicate tx hashes already waiting in queue.
+    if q.iter().any(|(_, t)| t.hash == tx.hash) {
+        return true;
     }
 
     let mut pending = PEER_PENDING.lock();

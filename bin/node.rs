@@ -238,6 +238,11 @@ fn parse_config(args: &[String]) -> Result<NodeConfig, BootError> {
     };
     let enable_stratum = args.iter().any(|a| a == "--enable-stratum");
     let enable_explorer = args.iter().any(|a| a == "--enable-explorer");
+    let enable_wallet_ui = args.iter().any(|a| a == "--enable-wallet-ui");
+    let wallet_ui_port: Option<u16> = match parse_flag_opt(args, "--wallet-ui-port")? {
+        Some(s) => Some(parse_port(&s, "--wallet-ui-port")?),
+        None => None,
+    };
     let enable_ide = args.iter().any(|a| a == "--enable-ide");
     let ide_port: Option<u16> = match parse_flag_opt(args, "--ide-port")? {
         Some(s) => Some(parse_port(&s, "--ide-port")?),
@@ -265,6 +270,12 @@ fn parse_config(args: &[String]) -> Result<NodeConfig, BootError> {
     }
     if let Some(port) = explorer_port {
         cfg.explorer_port = port;
+    }
+    if enable_wallet_ui {
+        cfg.enable_wallet_ui = true;
+    }
+    if let Some(port) = wallet_ui_port {
+        cfg.wallet_ui_port = port;
     }
     if enable_ide {
         cfg.enable_ide = true;
@@ -338,6 +349,8 @@ fn print_help() {
     println!("  --stratum-port=<port>                Stratum server port (default: 7779)");
     println!("  --enable-explorer                    Enable built-in blockchain explorer web UI");
     println!("  --explorer-port=<port>               Explorer HTTP port (default: 8080)");
+    println!("  --enable-wallet-ui                   Enable desktop wallet web UI (localhost only)");
+    println!("  --wallet-ui-port=<port>              Wallet UI HTTP port (default: 8081)");
     println!("  --enable-ide                         Enable smart contract IDE web interface");
     println!("  --ide-port=<port>                    Contract IDE HTTP port (default: 3000)");
 }

@@ -168,10 +168,6 @@ impl BlockCache {
     }
 }
 
-// BlockCache is now Send + Sync via RwLock
-unsafe impl Send for BlockCache {}
-unsafe impl Sync for BlockCache {}
-
 #[cfg(test)]
 mod tests {
     use super::*;

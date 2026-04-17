@@ -21,6 +21,10 @@ cargo build --release
 # Testnet mode
 ./target/release/shadowdag-node --network testnet
 
+# Testnet with Explorer + Wallet UI
+./target/release/shadowdag-node --network testnet \
+  --enable-explorer --enable-wallet-ui
+
 # Or local devnet (instant blocks, ephemeral)
 ./target/release/shadowdag-node --devnet
 ```
@@ -95,6 +99,74 @@ curl -X POST http://localhost:19332 \
 ./target/release/shadowasm verify counter.pkg.json
 ```
 
+## 8. Block Explorer
+
+Start the node with `--enable-explorer` to access the built-in explorer at `http://localhost:8080`.
+
+**Features:**
+- Live dashboard with block height, peers, mempool stats
+- Block list with detail view (hash, parents, transactions)
+- Transaction detail view (inputs, outputs, type, status)
+- DAG visualization (interactive canvas graph)
+- Mempool viewer (pending transactions, total fees)
+- Rich list (top addresses by balance)
+- Network info (peers, versions, ports)
+- Universal search (block hash, height, TX hash, address)
+
+**Explorer API endpoints:**
+
+```bash
+# Stats
+curl -s http://localhost:19080/api/stats | jq
+
+# Latest blocks
+curl -s http://localhost:19080/api/blocks | jq
+
+# Block detail
+curl -s http://localhost:19080/api/block/BLOCK_HASH | jq
+
+# Transaction detail
+curl -s http://localhost:19080/api/tx/TX_HASH | jq
+
+# Address balance
+curl -s http://localhost:19080/api/address/SD1... | jq
+
+# Mempool
+curl -s http://localhost:19080/api/mempool | jq
+
+# DAG visualization data
+curl -s http://localhost:19080/api/dag | jq
+
+# Search
+curl -s http://localhost:19080/api/search/QUERY | jq
+```
+
+## 9. Desktop Wallet UI
+
+Start the node with `--enable-wallet-ui` to access the wallet at `http://localhost:8081`.
+
+The wallet UI runs on **localhost only** for security.
+
+**Features:**
+- Overview dashboard with balance and node status
+- Send SDAG with address validation
+- Receive view with address display and QR pattern
+- Transaction history (via CLI integration)
+- Address book with quick balance check
+- Settings with node connection info and CLI reference
+
+```bash
+# Start with custom port
+./target/release/shadowdag-node --network testnet \
+  --enable-wallet-ui --wallet-ui-port=8081
+
+# Check balance via API
+curl -s http://localhost:8081/api/wallet/balance/YOUR_ADDRESS | jq
+
+# Node overview
+curl -s http://localhost:8081/api/wallet/overview | jq
+```
+
 ## Network Info
 
 | Parameter | Value |
@@ -102,6 +174,9 @@ curl -X POST http://localhost:19332 \
 | Chain ID | 0xDA0C0002 (testnet) |
 | RPC Port | 19332 |
 | P2P Port | 19333 |
+| Explorer Port | 8080 (default, `--explorer-port`) |
+| Wallet UI Port | 8081 (default, `--wallet-ui-port`) |
+| Contract IDE Port | 3000 (default, `--ide-port`) |
 | Block Time | ~1 second |
 | VM Version | 1 |
 | Max Block Gas | 100,000,000 |
