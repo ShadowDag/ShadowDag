@@ -1,0 +1,9 @@
+target/
+.git/
+.github/
+.claude/
+.tmp/
+*.log
+*.md
+!README.md
+!LICENSE
