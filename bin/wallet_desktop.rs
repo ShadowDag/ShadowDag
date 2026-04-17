@@ -5,8 +5,14 @@
 //
 // shadowdag-wallet-desktop — Native desktop wallet application
 //
-// A standalone .exe that opens a native window (WebView2 on Windows) with
-// the full wallet interface embedded. No browser required.
+// A standalone .exe that opens a native window (WebView2 on Windows,
+// WebKitGTK on Linux, WKWebView on macOS) with the wallet UI embedded.
+//
+// Architecture:
+//   1. Starts a local HTTP server on a random port (127.0.0.1 only)
+//   2. Serves HTML at GET / and API at GET/POST /api/*
+//   3. Opens a native window with a webview pointing to the local server
+//   4. All traffic stays on localhost — nothing leaves the machine
 //
 // Build:
 //   cargo build --release --bin shadowdag-wallet-desktop --features desktop
@@ -26,14 +32,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tao::dpi::LogicalSize;
-use tao::event::{Event, StartCause, WindowEvent};
+use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop};
 use tao::window::WindowBuilder;
-use wry::WebViewBuilder;
+use wry::dpi::{LogicalPosition, LogicalSize as WryLogicalSize};
+use wry::{Rect, WebViewBuilder};
 
 const WALLET_HTML: &str = include_str!("../service/network/wallet_ui/html_standalone.html");
 
-const MAX_CONNECTIONS: usize = 8;
+const MAX_CONNECTIONS: usize = 16;
 const READ_TIMEOUT_SECS: u64 = 5;
 const MAX_REQUEST_LINE: usize = 4096;
 const MAX_HEADER_LINES: usize = 64;
@@ -42,7 +49,7 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 const RPC_TIMEOUT_SECS: u64 = 5;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// RPC Client
+// RPC Client — talks to a running ShadowDAG node
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn rpc_call(rpc_addr: &str, method: &str, params: &[serde_json::Value]) -> serde_json::Value {
@@ -106,11 +113,11 @@ fn rpc_call(rpc_addr: &str, method: &str, params: &[serde_json::Value]) -> serde
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Local API Server (background thread)
+// Local HTTP Server — serves HTML + API from the same origin
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn start_api_server(rpc_addr: String, network: String) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind API server");
+fn start_server(rpc_addr: String, network: String) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind server");
     let port = listener.local_addr().unwrap().port();
     let active = Arc::new(AtomicUsize::new(0));
 
@@ -128,7 +135,7 @@ fn start_api_server(rpc_addr: String, network: String) -> u16 {
                     let net = network.clone();
                     let active = Arc::clone(&active);
                     std::thread::spawn(move || {
-                        handle_api(stream, &rpc, &net);
+                        handle_request(stream, &rpc, &net);
                         active.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
@@ -140,7 +147,7 @@ fn start_api_server(rpc_addr: String, network: String) -> u16 {
     port
 }
 
-fn handle_api(mut stream: TcpStream, rpc_addr: &str, network: &str) {
+fn handle_request(mut stream: TcpStream, rpc_addr: &str, network: &str) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(READ_TIMEOUT_SECS)));
 
     let clone = match stream.try_clone() {
@@ -149,6 +156,7 @@ fn handle_api(mut stream: TcpStream, rpc_addr: &str, network: &str) {
     };
     let mut reader = BufReader::new(clone);
 
+    // ── Request line ──
     let mut request_line = String::new();
     {
         let mut limited = (&mut reader).take(MAX_REQUEST_LINE as u64);
@@ -157,7 +165,7 @@ fn handle_api(mut stream: TcpStream, rpc_addr: &str, network: &str) {
         }
     }
 
-    // Consume headers, extract content-length
+    // ── Headers ──
     let mut content_length: usize = 0;
     let mut header_line = String::new();
     let mut header_lines = 0usize;
@@ -192,7 +200,7 @@ fn handle_api(mut stream: TcpStream, rpc_addr: &str, network: &str) {
     let method = parts[0];
     let path = parts[1];
 
-    // Read body for POST
+    // ── Body (POST) ──
     let body = if method == "POST" && content_length > 0 && content_length <= MAX_BODY_BYTES {
         let mut buf = vec![0u8; content_length];
         if reader.read_exact(&mut buf).is_err() {
@@ -203,38 +211,34 @@ fn handle_api(mut stream: TcpStream, rpc_addr: &str, network: &str) {
         String::new()
     };
 
-    // CORS headers for webview
-    let cors = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n";
-
-    if method == "OPTIONS" {
-        let resp = format!(
-            "HTTP/1.1 204 No Content\r\n{}Connection: close\r\n\r\n",
-            cors
-        );
-        let _ = stream.write_all(resp.as_bytes());
-        return;
-    }
-
-    let json = match (method, path) {
-        ("GET", "/api/wallet/overview") => api_overview(rpc_addr, network),
-        ("GET", "/api/wallet/network") => api_network(rpc_addr),
+    // ── Route: HTML + API from same origin ──
+    match (method, path) {
+        // Serve the wallet HTML page
+        ("GET", "/" | "/index.html") => {
+            send_response(&mut stream, 200, "text/html; charset=utf-8", WALLET_HTML.as_bytes());
+        }
+        // API endpoints
+        ("GET", "/api/wallet/overview") => {
+            send_json(&mut stream, &api_overview(rpc_addr, network));
+        }
+        ("GET", "/api/wallet/network") => {
+            send_json(&mut stream, &api_network(rpc_addr));
+        }
         ("GET", p) if p.starts_with("/api/wallet/balance/") => {
             let addr = &p["/api/wallet/balance/".len()..];
-            api_balance(rpc_addr, addr)
+            send_json(&mut stream, &api_balance(rpc_addr, addr));
         }
-        ("POST", "/api/wallet/send") => api_send(rpc_addr, &body),
-        _ => serde_json::json!({"error": "not found"}),
-    };
-
-    let body_str = serde_json::to_string(&json).unwrap_or_else(|_| "{}".to_string());
-    let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{}",
-        body_str.len(),
-        cors,
-        body_str
-    );
-    let _ = stream.write_all(resp.as_bytes());
-    let _ = stream.flush();
+        ("POST", "/api/wallet/send") => {
+            send_json(&mut stream, &api_send(rpc_addr, &body));
+        }
+        // Favicon (prevent 404 noise)
+        ("GET", "/favicon.ico") => {
+            send_response(&mut stream, 204, "text/plain", b"");
+        }
+        _ => {
+            send_response(&mut stream, 404, "text/plain", b"Not Found");
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -249,32 +253,21 @@ fn api_overview(rpc_addr: &str, network: &str) -> serde_json::Value {
     let height = if height_val.is_number() {
         height_val.as_u64().unwrap_or(0)
     } else {
-        height_val
-            .get("height")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
+        height_val.get("height").and_then(|v| v.as_u64()).unwrap_or(0)
     };
-
-    let peer_count = info
-        .get("peer_count")
+    let peer_count = info.get("peer_count")
         .or_else(|| info.get("connections"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-
-    let version = info
-        .get("version")
+    let version = info.get("version")
         .or_else(|| info.get("node_version"))
         .and_then(|v| v.as_str())
         .unwrap_or("1.0.0");
-
     let mempool_size = if mempool.is_number() {
         mempool.as_u64().unwrap_or(0)
     } else {
-        mempool
-            .get("size")
-            .or_else(|| mempool.get("count"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
+        mempool.get("size").or_else(|| mempool.get("count"))
+            .and_then(|v| v.as_u64()).unwrap_or(0)
     };
 
     serde_json::json!({
@@ -292,14 +285,10 @@ fn api_overview(rpc_addr: &str, network: &str) -> serde_json::Value {
 fn api_network(rpc_addr: &str) -> serde_json::Value {
     let info = rpc_call(rpc_addr, "getnetworkinfo", &[]);
     let height_val = rpc_call(rpc_addr, "getblockcount", &[]);
-
     let height = if height_val.is_number() {
         height_val.as_u64().unwrap_or(0)
     } else {
-        height_val
-            .get("height")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
+        height_val.get("height").and_then(|v| v.as_u64()).unwrap_or(0)
     };
 
     serde_json::json!({
@@ -318,14 +307,10 @@ fn api_balance(rpc_addr: &str, addr: &str) -> serde_json::Value {
         "getbalancebyaddress",
         &[serde_json::Value::String(addr.to_string())],
     );
-
     let balance = if result.is_number() {
         result.as_u64().unwrap_or(0)
     } else {
-        result
-            .get("balance")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
+        result.get("balance").and_then(|v| v.as_u64()).unwrap_or(0)
     };
 
     serde_json::json!({
@@ -357,13 +342,40 @@ fn api_send(rpc_addr: &str, body: &str) -> serde_json::Value {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Main — native window
+// HTTP Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn send_json(stream: &mut TcpStream, data: &serde_json::Value) {
+    let body = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string());
+    send_response(stream, 200, "application/json", body.as_bytes());
+}
+
+fn send_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
+    let status_text = match status {
+        200 => "OK",
+        204 => "No Content",
+        400 => "Bad Request",
+        404 => "Not Found",
+        _ => "OK",
+    };
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status, status_text, content_type, body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.flush();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main — native window with embedded webview
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
+        // Temporarily show console for help on Windows
         println!("ShadowDAG Desktop Wallet v1.0.0");
         println!();
         println!("USAGE: shadowdag-wallet-desktop [OPTIONS]");
@@ -386,16 +398,11 @@ fn main() {
         }
     });
 
-    // Start background API server
-    let api_port = start_api_server(rpc_addr.clone(), network.clone());
+    // ── Start local server (HTML + API on same origin) ──
+    let server_port = start_server(rpc_addr, network.clone());
+    let url = format!("http://127.0.0.1:{}", server_port);
 
-    // Inject the API server URL into the HTML
-    let html = WALLET_HTML.replace(
-        "const API='';",
-        &format!("const API='http://127.0.0.1:{}';", api_port),
-    );
-
-    // Create native window with webview
+    // ── Create native window ──
     let event_loop = EventLoop::new();
 
     let window = WindowBuilder::new()
@@ -405,23 +412,42 @@ fn main() {
         .build(&event_loop)
         .expect("Failed to create window");
 
+    // ── Create webview with explicit bounds ──
+    let size = window.inner_size();
+
     let builder = WebViewBuilder::new_as_child(&window)
-        .with_html(&html);
+        .with_bounds(Rect {
+            position: LogicalPosition::new(0, 0).into(),
+            size: WryLogicalSize::new(size.width, size.height).into(),
+        })
+        .with_url(&url);
 
     #[cfg(debug_assertions)]
     let builder = builder.with_devtools(true);
 
-    let _webview = builder.build().expect("Failed to create webview");
+    let webview = builder.build().expect("Failed to create webview");
 
+    // ── Event loop with resize handling ──
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
         match event {
-            Event::NewEvents(StartCause::Init) => {}
+            Event::WindowEvent {
+                event: WindowEvent::Resized(new_size),
+                ..
+            } => {
+                // Resize webview to match window
+                let _ = webview.set_bounds(Rect {
+                    position: LogicalPosition::new(0, 0).into(),
+                    size: WryLogicalSize::new(new_size.width, new_size.height).into(),
+                });
+            }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
-            } => *control_flow = ControlFlow::Exit,
+            } => {
+                *control_flow = ControlFlow::Exit;
+            }
             _ => {}
         }
     });
