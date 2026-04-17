@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ShadowDAG Wallet</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0a0e14;--bg2:#0d1117;--card:#161b22;--card2:#1c2128;--border:#30363d;--border2:#21262d;--text:#c9d1d9;--text2:#e6edf3;--dim:#8b949e;--dim2:#6e7681;--accent:#58a6ff;--accent2:#1f6feb;--green:#3fb950;--green2:#238636;--green3:#2ea043;--red:#f85149;--orange:#d29922;--purple:#bc8cff;--cyan:#39d2e0;--radius:10px;--shadow:0 3px 12px rgba(0,0,0,.4)}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);line-height:1.6;min-height:100vh;display:flex}
+a{color:var(--accent);text-decoration:none}
+
+/* ── Sidebar ────────────────────────────────── */
+.sidebar{width:240px;background:var(--card);border-right:1px solid var(--border);min-height:100vh;padding:20px 0;flex-shrink:0;position:fixed;top:0;left:0;bottom:0;z-index:50}
+.sidebar .brand{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:8px}
+.sidebar .brand h1{font-size:18px;color:#fff;font-weight:700;display:flex;align-items:center;gap:8px}
+.sidebar .brand h1 span{background:linear-gradient(135deg,var(--accent),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.sidebar .brand .net{font-size:11px;color:var(--dim);margin-top:4px;display:flex;align-items:center;gap:6px}
+.sidebar .brand .net .dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
+.sidebar nav{padding:8px 12px}
+.sidebar nav button{display:flex;align-items:center;gap:10px;width:100%;padding:10px 14px;background:none;border:none;color:var(--dim);font-size:13px;font-weight:500;cursor:pointer;border-radius:8px;transition:all .15s;text-align:left}
+.sidebar nav button:hover{color:var(--text);background:var(--bg2)}
+.sidebar nav button.active{color:var(--accent);background:rgba(88,166,255,.1)}
+.sidebar nav button svg{flex-shrink:0;fill:currentColor;width:18px;height:18px}
+.sidebar .version{position:absolute;bottom:16px;left:0;right:0;text-align:center;font-size:11px;color:var(--dim2)}
+
+/* ── Main ───────────────────────────────────── */
+.main{margin-left:240px;flex:1;min-height:100vh}
+.topbar{background:var(--card);border-bottom:1px solid var(--border);padding:14px 28px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:40;backdrop-filter:blur(12px);background:rgba(22,27,34,.9)}
+.topbar h2{font-size:16px;color:#fff;font-weight:600}
+.topbar .status{display:flex;align-items:center;gap:12px;font-size:12px;color:var(--dim)}
+.topbar .status .chip{padding:4px 10px;border-radius:12px;font-weight:600;font-size:11px}
+.topbar .status .chip.online{background:rgba(63,185,80,.15);color:var(--green)}
+.content{padding:28px}
+
+/* ── Panels ─────────────────────────────────── */
+.panel{display:none}
+.panel.active{display:block;animation:fadeIn .2s ease}
+
+/* ── Overview ───────────────────────────────── */
+.balance-hero{background:linear-gradient(135deg,#161b22 0%,#1c2128 100%);border:1px solid var(--border);border-radius:var(--radius);padding:32px;margin-bottom:20px;position:relative;overflow:hidden}
+.balance-hero::before{content:'';position:absolute;top:-50%;right:-20%;width:300px;height:300px;background:radial-gradient(circle,rgba(88,166,255,.06) 0%,transparent 70%);pointer-events:none}
+.balance-hero .lbl{font-size:13px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;font-weight:600}
+.balance-hero .amount{font-size:42px;font-weight:700;color:#fff;margin:8px 0 4px;font-variant-numeric:tabular-nums}
+.balance-hero .amount .unit{font-size:18px;color:var(--accent);margin-left:4px}
+.balance-hero .sub{font-size:14px;color:var(--dim)}
+.balance-hero .addr{margin-top:16px;padding:10px 16px;background:var(--bg);border:1px solid var(--border);border-radius:8px;display:flex;align-items:center;gap:10px}
+.balance-hero .addr code{font-family:'SF Mono',SFMono-Regular,Consolas,monospace;font-size:13px;color:var(--text2);word-break:break-all;flex:1}
+.balance-hero .addr button{padding:6px 14px;background:var(--accent2);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;transition:background .15s;flex-shrink:0}
+.balance-hero .addr button:hover{background:var(--accent)}
+
+.quick-actions{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px}
+.quick-btn{display:flex;align-items:center;gap:12px;padding:18px 20px;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);cursor:pointer;transition:all .15s}
+.quick-btn:hover{border-color:var(--accent);transform:translateY(-1px);box-shadow:var(--shadow)}
+.quick-btn .icon{width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.quick-btn .icon.send{background:rgba(248,81,73,.12)}
+.quick-btn .icon.send svg{fill:var(--red)}
+.quick-btn .icon.recv{background:rgba(63,185,80,.12)}
+.quick-btn .icon.recv svg{fill:var(--green)}
+.quick-btn .info h3{font-size:14px;color:#fff;font-weight:600}
+.quick-btn .info p{font-size:12px;color:var(--dim)}
+
+.info-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+.info-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px}
+.info-card .lbl{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;font-weight:600}
+.info-card .val{font-size:20px;font-weight:700;color:#fff;margin-top:4px}
+.info-card .val.green{color:var(--green)}
+.info-card .val.cyan{color:var(--cyan)}
+.info-card .sub{font-size:11px;color:var(--dim2);margin-top:2px}
+
+/* ── Send Form ──────────────────────────────── */
+.form-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:28px;max-width:600px}
+.form-card h3{color:#fff;font-size:16px;margin-bottom:20px;display:flex;align-items:center;gap:8px}
+.form-group{margin-bottom:18px}
+.form-group label{display:block;font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;font-weight:600;margin-bottom:6px}
+.form-group input,.form-group textarea{width:100%;padding:10px 14px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:14px;font-family:inherit;outline:none;transition:border-color .2s}
+.form-group input:focus,.form-group textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,.12)}
+.form-group .hint{font-size:11px;color:var(--dim2);margin-top:4px}
+.form-group .error{font-size:11px;color:var(--red);margin-top:4px;display:none}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.btn-primary{padding:12px 28px;background:var(--green2);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:all .15s;display:inline-flex;align-items:center;gap:8px}
+.btn-primary:hover{background:var(--green3);transform:translateY(-1px)}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.btn-secondary{padding:10px 20px;background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:8px;font-size:13px;font-weight:500;cursor:pointer;transition:all .15s}
+.btn-secondary:hover{border-color:var(--accent);color:var(--accent)}
+
+.send-result{margin-top:16px;padding:16px;border-radius:8px;display:none}
+.send-result.success{display:block;background:rgba(63,185,80,.08);border:1px solid var(--green2);color:var(--green)}
+.send-result.error{display:block;background:rgba(248,81,73,.08);border:1px solid rgba(248,81,73,.3);color:var(--red)}
+
+/* ── Receive ────────────────────────────────── */
+.recv-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:28px;max-width:500px;text-align:center}
+.recv-card h3{margin-bottom:8px;color:#fff}
+.recv-card p{color:var(--dim);font-size:13px;margin-bottom:20px}
+.recv-qr{width:200px;height:200px;background:var(--card2);border:1px solid var(--border);border-radius:12px;margin:0 auto 20px;display:flex;align-items:center;justify-content:center;color:var(--dim);font-size:12px}
+.recv-addr{padding:12px 16px;background:var(--bg);border:1px solid var(--border);border-radius:8px;display:flex;align-items:center;gap:10px;text-align:left}
+.recv-addr code{font-family:'SF Mono',monospace;font-size:13px;color:var(--text2);word-break:break-all;flex:1}
+.recv-addr button{padding:6px 14px;background:var(--accent2);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600}
+
+/* ── History ────────────────────────────────── */
+.tbl-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:var(--radius);background:var(--card)}
+table{width:100%;border-collapse:collapse}
+th{background:var(--card2);text-align:left;padding:10px 14px;font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;font-weight:600;border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:10px 14px;font-size:13px;border-bottom:1px solid var(--border2)}
+tr:last-child td{border-bottom:none}
+.mono{font-family:'SF Mono',monospace;font-size:12px}
+.trunc{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:middle}
+.tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600}
+.tag-sent{background:rgba(248,81,73,.12);color:var(--red)}
+.tag-recv{background:rgba(63,185,80,.12);color:var(--green)}
+.tag-pending{background:rgba(210,153,34,.12);color:var(--orange)}
+.empty-state{text-align:center;padding:48px 20px;color:var(--dim)}
+.empty-state svg{fill:var(--dim2);margin-bottom:12px}
+.empty-state h3{color:var(--text);margin-bottom:4px}
+
+/* ── Address Book ───────────────────────────── */
+.addr-list{display:grid;gap:10px}
+.addr-item{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:14px 18px;display:flex;align-items:center;gap:14px;transition:border-color .15s}
+.addr-item:hover{border-color:var(--accent)}
+.addr-item .avatar{width:40px;height:40px;border-radius:10px;background:var(--accent2);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:16px;flex-shrink:0}
+.addr-item .info{flex:1;min-width:0}
+.addr-item .info .name{font-size:14px;color:#fff;font-weight:600}
+.addr-item .info .addr{font-size:12px;color:var(--dim);font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.addr-item .actions{display:flex;gap:6px}
+.addr-item .actions button{padding:6px 12px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--dim);font-size:12px;cursor:pointer;transition:all .15s}
+.addr-item .actions button:hover{border-color:var(--accent);color:var(--accent)}
+
+/* ── Settings ───────────────────────────────── */
+.setting-group{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:14px}
+.setting-group h4{color:#fff;font-size:14px;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.setting-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border2)}
+.setting-row:last-child{border-bottom:none}
+.setting-row .info .label{font-size:13px;color:var(--text)}
+.setting-row .info .desc{font-size:11px;color:var(--dim)}
+.setting-row .value{font-size:13px;color:var(--accent);font-family:monospace}
+
+/* ── Responsive ─────────────────────────────── */
+@media(max-width:768px){
+  .sidebar{width:60px;padding:12px 0}
+  .sidebar .brand h1 span,.sidebar .brand .net,.sidebar nav button span,.sidebar .version{display:none}
+  .sidebar .brand{padding:0 8px 16px}
+  .sidebar nav{padding:4px}
+  .sidebar nav button{justify-content:center;padding:10px}
+  .main{margin-left:60px}
+  .quick-actions{grid-template-columns:1fr}
+  .form-row{grid-template-columns:1fr}
+  .balance-hero .amount{font-size:28px}
+}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+</style>
+</head>
+<body>
+
+<!-- ═══ Sidebar ═══ -->
+<aside class="sidebar">
+  <div class="brand">
+    <h1><span>Shadow</span>DAG</h1>
+    <div class="net"><div class="dot"></div><span id="sideNet">connecting...</span></div>
+  </div>
+  <nav>
+    <button class="active" onclick="go('overview')">
+      <svg viewBox="0 0 16 16"><path d="M6.5 1.75a.75.75 0 00-1.5 0V5H1.75a.75.75 0 000 1.5H5v3.25a.75.75 0 001.5 0V6.5h3.25a.75.75 0 000-1.5H6.5V1.75z"/></svg>
+      <span>Overview</span>
+    </button>
+    <button onclick="go('send')">
+      <svg viewBox="0 0 16 16"><path d="M.143 2.31a.75.75 0 011.047-.167l6.655 4.81 6.5-4.796a.75.75 0 01.88 1.213l-6.944 5.125a.75.75 0 01-.89-.002L.31 3.357A.75.75 0 01.143 2.31z"/></svg>
+      <span>Send</span>
+    </button>
+    <button onclick="go('receive')">
+      <svg viewBox="0 0 16 16"><path d="M7.47 10.78a.75.75 0 001.06 0l3.75-3.75a.75.75 0 00-1.06-1.06L8.75 8.44V1.75a.75.75 0 00-1.5 0v6.69L4.78 5.97a.75.75 0 00-1.06 1.06l3.75 3.75zM3.75 13a.75.75 0 000 1.5h8.5a.75.75 0 000-1.5h-8.5z"/></svg>
+      <span>Receive</span>
+    </button>
+    <button onclick="go('history')">
+      <svg viewBox="0 0 16 16"><path d="M1.5 8a6.5 6.5 0 1113 0 6.5 6.5 0 01-13 0zM8 0a8 8 0 100 16A8 8 0 008 0zm.5 4.75a.75.75 0 00-1.5 0v3.5a.75.75 0 00.37.65l2.5 1.5a.75.75 0 10.76-1.3L8.5 7.96V4.75z"/></svg>
+      <span>History</span>
+    </button>
+    <button onclick="go('addresses')">
+      <svg viewBox="0 0 16 16"><path d="M2 2.5A2.5 2.5 0 014.5 0h8.75a.75.75 0 01.75.75v12.5a.75.75 0 01-.75.75h-2.5a.75.75 0 010-1.5h1.75v-2h-8a1 1 0 00-.714 1.7.75.75 0 01-1.072 1.05A2.495 2.495 0 012 11.5v-9z"/></svg>
+      <span>Addresses</span>
+    </button>
+    <button onclick="go('settings')">
+      <svg viewBox="0 0 16 16"><path d="M8 0a8.2 8.2 0 01.701.031C9.444.187 9.5.7 9.5 1.066V1.2c.001.096.033.188.088.263.28.382.78.46 1.153.24l.02-.012c.32-.193.693-.123.988.036A7.984 7.984 0 0113.2 3.176c.157.29.176.639-.013.842-.12.131-.163.305-.118.472.045.167.157.31.308.392.324.176.574.513.574.91v.02a7.93 7.93 0 010 2.376v.02c0 .397-.25.734-.574.91a.553.553 0 00-.308.392.512.512 0 00.118.472c.189.203.17.553.013.842a7.984 7.984 0 01-1.451 1.449c-.295.159-.668.229-.988.036l-.02-.012c-.374-.22-.873-.142-1.153.24a.513.513 0 00-.088.263v.134c0 .365-.056.879-.8 1.035A8.2 8.2 0 018 16a8.2 8.2 0 01-.7-.031c-.744-.156-.8-.67-.8-1.035v-.134a.512.512 0 00-.088-.263c-.28-.382-.78-.46-1.153-.24l-.02.012c-.32.193-.693.123-.988-.036A7.984 7.984 0 012.8 12.824c-.157-.29-.176-.639.013-.842.12-.131.163-.305.118-.472a.553.553 0 00-.308-.392c-.324-.176-.574-.513-.574-.91v-.02a7.93 7.93 0 010-2.376v-.02c0-.397.25-.734.574-.91a.553.553 0 00.308-.392.512.512 0 00-.118-.472c-.189-.203-.17-.553-.013-.842A7.984 7.984 0 014.25 3.176c.295-.159.668-.229.988-.036l.02.012c.374.22.873.142 1.153-.24A.513.513 0 006.5 2.65v-.134c0-.365.056-.879.8-1.035A8.2 8.2 0 018 0zM5 8a3 3 0 106 0 3 3 0 00-6 0z"/></svg>
+      <span>Settings</span>
+    </button>
+  </nav>
+  <div class="version" id="sideVersion">v1.0.0</div>
+</aside>
+
+<!-- ═══ Main ═══ -->
+<div class="main">
+<div class="topbar">
+  <h2 id="pageTitle">Overview</h2>
+  <div class="status">
+    <span id="topHeight">Height: -</span>
+    <span id="topPeers">Peers: -</span>
+    <span class="chip online" id="topStatus">Online</span>
+  </div>
+</div>
+
+<div class="content">
+
+<!-- ═══ Overview Panel ═══ -->
+<div id="p-overview" class="panel active">
+  <div class="balance-hero">
+    <div class="lbl">Total Balance</div>
+    <div class="amount" id="balAmount">0.00000000 <span class="unit">SDAG</span></div>
+    <div class="sub" id="balSats">0 satoshis</div>
+    <div class="addr">
+      <code id="walletAddr">Enter your address below to check balance</code>
+      <button onclick="copyAddr()">Copy</button>
+    </div>
+  </div>
+  <div class="quick-actions">
+    <div class="quick-btn" onclick="go('send')">
+      <div class="icon send"><svg width="22" height="22" viewBox="0 0 16 16"><path d="M.143 2.31a.75.75 0 011.047-.167l6.655 4.81 6.5-4.796a.75.75 0 01.88 1.213l-6.944 5.125a.75.75 0 01-.89-.002L.31 3.357A.75.75 0 01.143 2.31z"/></svg></div>
+      <div class="info"><h3>Send SDAG</h3><p>Transfer to an address</p></div>
+    </div>
+    <div class="quick-btn" onclick="go('receive')">
+      <div class="icon recv"><svg width="22" height="22" viewBox="0 0 16 16"><path d="M7.47 10.78a.75.75 0 001.06 0l3.75-3.75a.75.75 0 00-1.06-1.06L8.75 8.44V1.75a.75.75 0 00-1.5 0v6.69L4.78 5.97a.75.75 0 00-1.06 1.06l3.75 3.75zM3.75 13a.75.75 0 000 1.5h8.5a.75.75 0 000-1.5h-8.5z"/></svg></div>
+      <div class="info"><h3>Receive SDAG</h3><p>Show your wallet address</p></div>
+    </div>
+  </div>
+  <div class="info-grid" id="overviewGrid"></div>
+</div>
+
+<!-- ═══ Send Panel ═══ -->
+<div id="p-send" class="panel">
+  <div class="form-card">
+    <h3><svg width="18" height="18" viewBox="0 0 16 16" fill="var(--red)"><path d="M.143 2.31a.75.75 0 011.047-.167l6.655 4.81 6.5-4.796a.75.75 0 01.88 1.213l-6.944 5.125a.75.75 0 01-.89-.002L.31 3.357A.75.75 0 01.143 2.31z"/></svg> Send SDAG</h3>
+    <div class="form-group">
+      <label>Recipient Address</label>
+      <input id="sendTo" placeholder="SD..." maxlength="80">
+      <div class="hint">ShadowDAG address (starts with SD, ST, or SR)</div>
+      <div class="error" id="sendToErr"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>Amount (SDAG)</label>
+        <input id="sendAmount" type="number" step="0.00000001" min="0" placeholder="0.00000000">
+      </div>
+      <div class="form-group">
+        <label>Fee (sat)</label>
+        <input id="sendFee" type="number" value="1000" min="1" placeholder="1000">
+        <div class="hint">Recommended: 1000 sat</div>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>Memo (optional)</label>
+      <input id="sendMemo" placeholder="Payment for..." maxlength="100">
+    </div>
+    <button class="btn-primary" id="sendBtn" onclick="doSend()">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M.143 2.31a.75.75 0 011.047-.167l6.655 4.81 6.5-4.796a.75.75 0 01.88 1.213l-6.944 5.125a.75.75 0 01-.89-.002L.31 3.357A.75.75 0 01.143 2.31z"/></svg>
+      Prepare Transaction
+    </button>
+    <div class="send-result" id="sendResult"></div>
+  </div>
+</div>
+
+<!-- ═══ Receive Panel ═══ -->
+<div id="p-receive" class="panel">
+  <div class="recv-card">
+    <h3>Receive SDAG</h3>
+    <p>Share your address below to receive payments</p>
+    <div class="recv-qr" id="recvQr">QR Code<br>(scan with wallet)</div>
+    <div class="recv-addr">
+      <code id="recvAddr">-</code>
+      <button onclick="copyAddr()">Copy</button>
+    </div>
+    <div style="margin-top:16px">
+      <div class="form-group">
+        <label>Check balance for address</label>
+        <div style="display:flex;gap:8px">
+          <input id="checkAddr" placeholder="SD..." style="flex:1">
+          <button class="btn-secondary" onclick="checkBalance()">Check</button>
+        </div>
+      </div>
+      <div id="checkResult" style="margin-top:8px;font-size:13px;color:var(--dim)"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ══��� History Panel ═══ -->
+<div id="p-history" class="panel">
+  <div class="empty-state" id="historyEmpty">
+    <svg width="48" height="48" viewBox="0 0 16 16"><path d="M1.5 8a6.5 6.5 0 1113 0 6.5 6.5 0 01-13 0zM8 0a8 8 0 100 16A8 8 0 008 0zm.5 4.75a.75.75 0 00-1.5 0v3.5a.75.75 0 00.37.65l2.5 1.5a.75.75 0 10.76-1.3L8.5 7.96V4.75z"/></svg>
+    <h3>No Transaction History</h3>
+    <p>Transactions will appear here once you send or receive SDAG.<br>Use the CLI wallet for full transaction history.</p>
+  </div>
+  <div class="tbl-wrap" id="historyTable" style="display:none">
+    <table><thead><tr><th>Type</th><th>Hash</th><th>Amount</th><th>Fee</th><th>Status</th><th>Time</th></tr></thead>
+    <tbody id="historyBody"></tbody></table>
+  </div>
+  <div style="margin-top:16px;padding:16px;background:var(--card);border:1px solid var(--border);border-radius:var(--radius)">
+    <p style="font-size:13px;color:var(--dim)">For full transaction history, use the CLI:</p>
+    <code style="display:block;margin-top:8px;padding:10px;background:var(--bg);border-radius:6px;font-size:13px;color:var(--cyan)">shadowdag-wallet info</code>
+  </div>
+</div>
+
+<!-- ═══ Addresses Panel ═══ -->
+<div id="p-addresses" class="panel">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+    <h3 style="color:#fff">Address Book</h3>
+  </div>
+  <div class="addr-list" id="addrList">
+    <div class="empty-state">
+      <svg width="36" height="36" viewBox="0 0 16 16"><path d="M2 2.5A2.5 2.5 0 014.5 0h8.75a.75.75 0 01.75.75v12.5a.75.75 0 01-.75.75h-2.5a.75.75 0 010-1.5h1.75v-2h-8a1 1 0 00-.714 1.7.75.75 0 01-1.072 1.05A2.495 2.495 0 012 11.5v-9z"/></svg>
+      <h3>No Saved Addresses</h3>
+      <p>Use the CLI wallet to manage addresses:<br><code style="color:var(--cyan)">shadowdag-wallet info</code></p>
+    </div>
+  </div>
+  <div style="margin-top:20px">
+    <div class="form-group">
+      <label>Quick Balance Check</label>
+      <div style="display:flex;gap:8px">
+        <input id="addrCheck" placeholder="Enter any ShadowDAG address..." style="flex:1">
+        <button class="btn-secondary" onclick="quickCheck()">Check</button>
+      </div>
+      <div id="addrCheckResult" style="margin-top:8px;font-size:13px"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ Settings Panel ═══ -->
+<div id="p-settings" class="panel">
+  <div class="setting-group">
+    <h4><svg width="16" height="16" viewBox="0 0 16 16" fill="var(--accent)"><path d="M1.5 8a6.5 6.5 0 1113 0 6.5 6.5 0 01-13 0zM8 0a8 8 0 100 16A8 8 0 008 0z"/></svg> Node Connection</h4>
+    <div class="setting-row"><div class="info"><div class="label">Network</div><div class="desc">Current blockchain network</div></div><div class="value" id="setNetwork">-</div></div>
+    <div class="setting-row"><div class="info"><div class="label">RPC Port</div><div class="desc">JSON-RPC server port</div></div><div class="value" id="setRpc">-</div></div>
+    <div class="setting-row"><div class="info"><div class="label">P2P Port</div><div class="desc">Peer-to-peer network port</div></div><div class="value" id="setP2p">-</div></div>
+    <div class="setting-row"><div class="info"><div class="label">Peers</div><div class="desc">Connected peers</div></div><div class="value" id="setPeers">-</div></div>
+    <div class="setting-row"><div class="info"><div class="label">Block Height</div><div class="desc">Current chain tip</div></div><div class="value" id="setHeight">-</div></div>
+  </div>
+  <div class="setting-group">
+    <h4><svg width="16" height="16" viewBox="0 0 16 16" fill="var(--orange)"><path d="M8.22 1.754a.25.25 0 00-.44 0L1.698 13.132a.25.25 0 00.22.368h12.164a.25.25 0 00.22-.368L8.22 1.754z"/></svg> Wallet CLI Commands</h4>
+    <div class="setting-row"><div class="info"><div class="label">Create Wallet</div><div class="desc">Generate a new HD wallet</div></div><div class="value">shadowdag-wallet new</div></div>
+    <div class="setting-row"><div class="info"><div class="label">Check Balance</div><div class="desc">Query address balance</div></div><div class="value">shadowdag-wallet balance</div></div>
+    <div class="setting-row"><div class="info"><div class="label">Send SDAG</div><div class="desc">Transfer to address</div></div><div class="value">shadowdag-wallet send &lt;to&gt; &lt;amt&gt;</div></div>
+    <div class="setting-row"><div class="info"><div class="label">Wallet Info</div><div class="desc">Show wallet details</div></div><div class="value">shadowdag-wallet info</div></div>
+    <div class="setting-row"><div class="info"><div class="label">Deploy Contract</div><div class="desc">Deploy smart contract</div></div><div class="value">shadowdag-wallet deploy &lt;hex&gt;</div></div>
+  </div>
+</div>
+
+</div><!-- /content -->
+</div><!-- /main -->
+
+<script>
+const API='';
+let walletAddress='',currentView='overview';
+
+async function fetchJson(url,opts){
+  try{const r=await fetch(API+url,opts);return await r.json()}
+  catch(e){return{error:e.message}}
+}
+function fmt(n){return n==null?'-':Number(n).toLocaleString()}
+function fmtSdag(s){return s==null?'-':(s/1e8).toFixed(8)}
+function truncH(h,n){if(!h)return'-';n=n||10;return h.length>n*2?h.slice(0,n)+'\u2026'+h.slice(-n):h}
+
+/* ── Navigation ─────────────────────────────── */
+function go(view){
+  currentView=view;
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  document.getElementById('p-'+view).classList.add('active');
+  document.querySelectorAll('.sidebar nav button').forEach((b,i)=>{
+    const views=['overview','send','receive','history','addresses','settings'];
+    b.classList.toggle('active',views[i]===view);
+  });
+  const titles={overview:'Overview',send:'Send SDAG',receive:'Receive SDAG',history:'Transaction History',addresses:'Address Book',settings:'Settings'};
+  document.getElementById('pageTitle').textContent=titles[view]||view;
+}
+
+/* ── Overview ───────────────────────────────── */
+async function loadOverview(){
+  const d=await fetchJson('/api/wallet/overview');
+  if(d.error)return;
+  document.getElementById('sideNet').textContent=d.network||'unknown';
+  document.getElementById('sideVersion').textContent='v'+(d.node_version||'1.0.0');
+  document.getElementById('topHeight').textContent='Height: '+fmt(d.best_height);
+  document.getElementById('topPeers').textContent='Peers: '+fmt(d.peer_count);
+  document.getElementById('topStatus').textContent=d.peer_count>0?'Online':'Offline';
+  document.getElementById('topStatus').className='chip '+(d.peer_count>0?'online':'');
+
+  document.getElementById('overviewGrid').innerHTML=`
+    <div class="info-card"><div class="lbl">Block Height</div><div class="val">${fmt(d.best_height)}</div></div>
+    <div class="info-card"><div class="lbl">Connected Peers</div><div class="val green">${fmt(d.peer_count)}</div></div>
+    <div class="info-card"><div class="lbl">Mempool</div><div class="val">${fmt(d.mempool_size)}</div><div class="sub">pending txs</div></div>
+    <div class="info-card"><div class="lbl">Network</div><div class="val cyan" style="font-size:16px">${d.network||'-'}</div></div>
+    <div class="info-card"><div class="lbl">Chain</div><div class="val" style="font-size:14px">${d.chain_name||'-'}</div></div>
+    <div class="info-card"><div class="lbl">Max Supply</div><div class="val" style="font-size:16px">${fmt(d.max_supply?d.max_supply/1e8:0)}</div><div class="sub">SDAG</div></div>
+  `;
+
+  // Settings
+  document.getElementById('setNetwork').textContent=d.network||'-';
+}
+
+async function loadNetworkSettings(){
+  const n=await fetchJson('/api/wallet/network');
+  if(n.error)return;
+  document.getElementById('setRpc').textContent=n.rpc_port||'-';
+  document.getElementById('setP2p').textContent=n.p2p_port||'-';
+  document.getElementById('setPeers').textContent=fmt(n.peer_count);
+  document.getElementById('setHeight').textContent=fmt(n.best_height);
+}
+
+/* ── Balance ────────────────────────────────── */
+async function loadBalance(addr){
+  if(!addr)return;
+  const b=await fetchJson('/api/wallet/balance/'+encodeURIComponent(addr));
+  if(b.error)return;
+  walletAddress=addr;
+  document.getElementById('balAmount').innerHTML=fmtSdag(b.balance)+' <span class="unit">SDAG</span>';
+  document.getElementById('balSats').textContent=fmt(b.balance)+' satoshis';
+  document.getElementById('walletAddr').textContent=addr;
+  document.getElementById('recvAddr').textContent=addr;
+  localStorage.setItem('sdag_wallet_addr',addr);
+}
+
+async function checkBalance(){
+  const addr=document.getElementById('checkAddr').value.trim();
+  if(!addr)return;
+  const b=await fetchJson('/api/wallet/balance/'+encodeURIComponent(addr));
+  if(b.error){document.getElementById('checkResult').innerHTML='<span style="color:var(--red)">Error: '+b.error+'</span>';return}
+  document.getElementById('checkResult').innerHTML='Balance: <strong style="color:var(--green)">'+fmtSdag(b.balance)+' SDAG</strong> ('+fmt(b.balance)+' sat)';
+  loadBalance(addr);
+}
+
+async function quickCheck(){
+  const addr=document.getElementById('addrCheck').value.trim();
+  if(!addr)return;
+  const b=await fetchJson('/api/wallet/balance/'+encodeURIComponent(addr));
+  const el=document.getElementById('addrCheckResult');
+  if(b.error){el.innerHTML='<span style="color:var(--red)">Error</span>';return}
+  el.innerHTML='<span style="color:var(--green)">'+fmtSdag(b.balance)+' SDAG</span> ('+fmt(b.balance)+' sat)';
+}
+
+/* ── Send ───────────────────────────────────── */
+function validateAddress(addr){
+  if(!addr)return 'Address is required';
+  if(!addr.startsWith('SD')&&!addr.startsWith('ST')&&!addr.startsWith('SR'))return 'Must start with SD, ST, or SR';
+  if(addr.length<40)return 'Address too short';
+  return '';
+}
+
+async function doSend(){
+  const to=document.getElementById('sendTo').value.trim();
+  const amount=document.getElementById('sendAmount').value.trim();
+  const fee=document.getElementById('sendFee').value.trim();
+  const result=document.getElementById('sendResult');
+
+  const addrErr=validateAddress(to);
+  if(addrErr){document.getElementById('sendToErr').textContent=addrErr;document.getElementById('sendToErr').style.display='block';return}
+  document.getElementById('sendToErr').style.display='none';
+
+  if(!amount||parseFloat(amount)<=0){result.className='send-result error';result.innerHTML='Enter a valid amount';return}
+
+  const r=await fetchJson('/api/wallet/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({to,amount,fee})});
+  if(r.error){result.className='send-result error';result.innerHTML='Error: '+r.error;return}
+  result.className='send-result success';
+  result.innerHTML=`
+    <strong>Transaction Prepared</strong><br>
+    To: ${to}<br>Amount: ${amount} SDAG<br><br>
+    <span style="color:var(--dim)">Sign and broadcast using the CLI wallet:</span><br>
+    <code style="display:block;margin-top:6px;padding:8px;background:var(--bg);border-radius:4px;color:var(--cyan)">shadowdag-wallet send ${to} ${amount}</code>
+  `;
+}
+
+/* ── QR Code placeholder ────────────────────── */
+function drawQR(addr){
+  const el=document.getElementById('recvQr');
+  if(!addr){el.textContent='No address loaded';return}
+  // Simple visual representation (not a real QR)
+  const canvas=document.createElement('canvas');
+  canvas.width=180;canvas.height=180;
+  const ctx=canvas.getContext('2d');
+  ctx.fillStyle='#0d1117';ctx.fillRect(0,0,180,180);
+  // Draw a pattern based on address hash
+  ctx.fillStyle='#58a6ff';
+  for(let i=0;i<addr.length&&i<64;i++){
+    const c=addr.charCodeAt(i);
+    const x=(i%8)*22+4;
+    const y=Math.floor(i/8)*22+4;
+    if(c%2===0)ctx.fillRect(x,y,18,18);
+  }
+  // Center marker
+  ctx.fillStyle='#fff';ctx.fillRect(70,70,40,40);
+  ctx.fillStyle='#0d1117';ctx.fillRect(76,76,28,28);
+  ctx.fillStyle='#58a6ff';ctx.fillRect(82,82,16,16);
+
+  el.innerHTML='';el.appendChild(canvas);
+}
+
+/* ── Copy ───────────────────────────────────── */
+function copyAddr(){
+  const addr=walletAddress||document.getElementById('walletAddr').textContent;
+  if(addr&&addr!=='-'){
+    navigator.clipboard.writeText(addr).then(()=>{
+      // Brief visual feedback
+      const btns=document.querySelectorAll('.addr button, .recv-addr button');
+      btns.forEach(b=>{b.textContent='Copied!';setTimeout(()=>{b.textContent='Copy'},1500)});
+    }).catch(()=>{});
+  }
+}
+
+/* ── Init ───────────────────────────────────── */
+async function init(){
+  await loadOverview();
+  await loadNetworkSettings();
+
+  // Load saved address
+  const saved=localStorage.getItem('sdag_wallet_addr');
+  if(saved){
+    await loadBalance(saved);
+    drawQR(saved);
+  }
+}
+
+init();
+setInterval(()=>{
+  loadOverview();
+  if(walletAddress)loadBalance(walletAddress);
+},10000);
+</script>
+</body>
+</html>
