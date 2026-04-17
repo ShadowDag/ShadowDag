@@ -26,6 +26,8 @@ dev-mode = []
 # DO NOT enable in production — allows structurally-valid but cryptographically
 # unverified privacy transactions.
 ringct_bypass = []
+# Native desktop wallet GUI (requires WebView2 on Windows)
+desktop = ["tao", "wry"]
 
 [lib]
 name = "shadowdag"
@@ -58,6 +60,11 @@ path = "bin/shadowasm.rs"
 [[bin]]
 name = "shadowdag-wallet-ui"
 path = "bin/wallet_ui.rs"
+
+[[bin]]
+name = "shadowdag-wallet-desktop"
+path = "bin/wallet_desktop.rs"
+required-features = ["desktop"]
 
 [[bin]]
 name = "shadowdag-rotate-rpc-password"
@@ -153,6 +160,10 @@ thiserror          = "1"
 anyhow             = "1"
 byteorder          = "1"
 bytes              = "1"
+
+# ─── Desktop GUI (optional — for shadowdag-wallet-desktop) ────────────────
+tao                = { version = "0.30", optional = true }
+wry                = { version = "0.44", optional = true }
 
 [dev-dependencies]
 tempfile           = "3"
