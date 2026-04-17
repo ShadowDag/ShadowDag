@@ -234,6 +234,10 @@ pub struct NodeConfig {
     pub enable_explorer: bool,
     /// HTTP port for the blockchain explorer (default: 8080).
     pub explorer_port: u16,
+    /// Enable the desktop wallet web UI (localhost only).
+    pub enable_wallet_ui: bool,
+    /// HTTP port for the wallet UI (default: 8081).
+    pub wallet_ui_port: u16,
     /// Enable the smart contract IDE web interface.
     pub enable_ide: bool,
     /// HTTP port for the contract IDE (default: 3000).
@@ -260,6 +264,8 @@ impl NodeConfig {
             stratum_port: 7779,
             enable_explorer: false,
             explorer_port: 8080,
+            enable_wallet_ui: false,
+            wallet_ui_port: 8081,
             enable_ide: false,
             ide_port: 3000,
         }

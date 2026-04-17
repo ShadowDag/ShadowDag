@@ -21,11 +21,20 @@ Complete technical reference. All constants from the actual codebase.
 
 | Binary | File | Purpose |
 |--------|------|---------|
-| `shadowdag-node` | `node.rs` | Full node: P2P + RPC + consensus + GHOSTDAG |
+| `shadowdag-node` | `node.rs` | Full node: P2P + RPC + consensus + GHOSTDAG + Explorer + Wallet UI |
 | `shadowdag-miner` | `miner.rs` | Multi-threaded ShadowHash miner via RPC |
-| `shadowdag-wallet` | `wallet.rs` | HD wallet: stealth, invisible, multisig, send/receive |
+| `shadowdag-wallet` | `wallet.rs` | HD wallet CLI: stealth, invisible, multisig, send/receive, contracts |
 | `shadowdag-loadtest` | `loadtest.rs` | HTTP RPC load tester with auth token support |
 | `mine-genesis` | `mine_genesis.rs` | One-shot genesis block miner for all networks |
+
+**Node flags for web UIs:**
+
+| Flag | Default Port | Description |
+|------|-------------|-------------|
+| `--enable-explorer` | 8080 | Block explorer with DAG visualization |
+| `--enable-wallet-ui` | 8081 | Desktop wallet UI (localhost only) |
+| `--enable-ide` | 3000 | Smart contract IDE |
+| `--enable-stratum` | 7779 | Stratum V1 mining pool |
 
 ---
 
@@ -367,7 +376,92 @@ Multiplier = 2^(utilization x 6), capped at 64x
 
 ---
 
-## 11. RPC (`service/network/rpc/`)
+## 11. Web UIs (`service/network/explorer/`, `wallet_ui/`, `contract_ide/`)
+
+Three embedded web interfaces served directly from the node binary. No external dependencies or separate frontend builds required.
+
+### Block Explorer (`service/network/explorer/`)
+
+Advanced single-page application for browsing the blockchain.
+
+| Component | Details |
+|-----------|---------|
+| Default Port | 8080 (`--explorer-port`) |
+| Bind | Configurable via `SHADOWDAG_EXPLORER_BIND` (default: 127.0.0.1) |
+| Flag | `--enable-explorer` |
+| Architecture | Thread-per-connection HTTP (max 100 concurrent) |
+| Frontend | Embedded HTML/CSS/JS SPA (dark theme, responsive) |
+
+**API Endpoints:**
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | Explorer SPA (auto-refreshing dashboard) |
+| `GET /api/stats` | Network statistics (height, peers, mempool, chain info) |
+| `GET /api/blocks` | Latest 40 blocks with metadata |
+| `GET /api/block/{id}` | Block detail (by hash or height) with transactions |
+| `GET /api/tx/{hash}` | Transaction detail (inputs, outputs, type, status) |
+| `GET /api/address/{addr}` | Address balance (SDAG + satoshis) |
+| `GET /api/mempool` | Pending transactions list + total fees |
+| `GET /api/dag` | DAG graph data (nodes + edges for visualization) |
+| `GET /api/network` | Network info (peers, version, ports) |
+| `GET /api/richlist` | Top addresses by balance |
+| `GET /api/pool` | Mining pool status (Stratum) |
+| `GET /api/search/{query}` | Universal search (block/tx/address auto-detect) |
+
+**Frontend Features:**
+- Dashboard with live stats (auto-refresh every 5s)
+- Block list with detail view and parent chain navigation
+- Transaction viewer with inputs/outputs and confirmation status
+- DAG visualization (interactive Canvas-based graph)
+- Mempool viewer with fee statistics
+- Rich list (top addresses)
+- Network info with Stratum pool status
+- Universal search (hash, height, address)
+
+### Desktop Wallet UI (`service/network/wallet_ui/`)
+
+Browser-based wallet interface for managing SDAG. Runs on **localhost only** for security.
+
+| Component | Details |
+|-----------|---------|
+| Default Port | 8081 (`--wallet-ui-port`) |
+| Bind | 127.0.0.1 only (hardcoded, never network-exposed) |
+| Flag | `--enable-wallet-ui` |
+| Architecture | Thread-per-connection HTTP (max 10 concurrent) |
+| Methods | GET + POST (JSON body for send operations) |
+| Max Body | 64 KB |
+
+**API Endpoints:**
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | Wallet SPA (sidebar navigation) |
+| `GET /api/wallet/overview` | Node status + chain info |
+| `GET /api/wallet/balance/{addr}` | Address balance query |
+| `GET /api/wallet/network` | Network connection details |
+| `POST /api/wallet/send` | Prepare transaction (JSON: `{to, amount}`) |
+
+**Frontend Features:**
+- Overview with balance display and quick actions
+- Send form with address validation (SD/ST/SR prefixes)
+- Receive view with address display and QR pattern
+- Transaction history (CLI integration reference)
+- Address book with quick balance check
+- Settings with node connection info and CLI command reference
+
+### Contract IDE (`service/network/contract_ide/`)
+
+Web-based ShadowASM editor with syntax highlighting and in-process compilation.
+
+| Component | Details |
+|-----------|---------|
+| Default Port | 3000 (`--ide-port`) |
+| Flag | `--enable-ide` |
+
+---
+
+## 12. RPC & gRPC (`service/network/rpc/`)
 
 ### JSON-RPC over HTTP
 
@@ -384,7 +478,7 @@ Multiplier = 2^(utilization x 6), capped at 64x
 
 ---
 
-## 12. CI/CD (`.github/workflows/ci.yml`)
+## 13. CI/CD (`.github/workflows/ci.yml`)
 
 | Job | Command |
 |-----|---------|

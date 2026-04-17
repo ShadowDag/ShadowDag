@@ -16,6 +16,8 @@ A next-generation cryptocurrency combining DAG-based high throughput, Monero-lev
 | **Finality** | 200 blocks (~20s), dynamic 100-2,000 |
 | **Privacy** | CLSAG Ring Signatures + Pedersen Commitments + Stealth Addresses + Dandelion++ |
 | **Smart Contracts** | ShadowVM (90+ opcodes, deterministic, gas-metered) |
+| **Block Explorer** | Built-in web UI (DAG viz, mempool, TX viewer, rich list) |
+| **Desktop Wallet** | Browser-based wallet UI (send/receive, balance, address book) |
 | **Mining** | ShadowHash (ASIC-resistant, 256KB scratchpad) |
 | **Post-Quantum** | Falcon + Dilithium signature support |
 | **Emission** | Smooth decay (0.38%/month, ~5.5yr halving) |
@@ -112,6 +114,9 @@ shadowdag/                    130,415 lines of Rust across 328 files
 +-- service/                  High-level services
 |   +-- mempool/              TX pool (RBF, CPFP, surge pricing, eviction)
 |   +-- network/              P2P, RPC, gRPC, WebSocket, reputation, DoS guard
+|   |   +-- explorer/         Advanced block explorer web UI (DAG viz, mempool, rich list)
+|   |   +-- wallet_ui/        Desktop wallet web UI (send, receive, address book)
+|   |   +-- contract_ide/     Smart contract IDE (editor, deploy, execute)
 |   +-- wallet/               HD wallet, key manager, multisig, hardware wallet
 |
 +-- telemetry/                Logging (structured), Prometheus metrics, tracing
@@ -135,11 +140,25 @@ cargo build --release
 # Testnet
 ./target/release/shadowdag-node --network=testnet
 
-# Custom data directory
-./target/release/shadowdag-node --data-dir=/path/to/data
+# With Explorer + Wallet UI
+./target/release/shadowdag-node --network=testnet --enable-explorer --enable-wallet-ui
+
+# Custom ports
+./target/release/shadowdag-node --enable-explorer --explorer-port=8080 \
+  --enable-wallet-ui --wallet-ui-port=8081
 
 # Show node info
 ./target/release/shadowdag-node info
+```
+
+### Web UIs
+```bash
+# Start node with all web interfaces
+./target/release/shadowdag-node --enable-explorer --enable-wallet-ui --enable-ide
+
+# Explorer:   http://localhost:8080   (block viewer, DAG visualization, mempool)
+# Wallet UI:  http://localhost:8081   (send/receive, balance, address book)
+# Contract IDE: http://localhost:3000 (ShadowASM editor, deploy, execute)
 ```
 
 ### Create a Wallet
@@ -214,6 +233,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed technical documentation.
 ```
 +---------------------------------------------------+
 | CLI: shadowdag-node / shadowdag-miner / wallet     |
++---------------------------------------------------+
+| Web UIs: Explorer / Wallet UI / Contract IDE        |
 +---------------------------------------------------+
 | Service: Mempool, P2P, RPC, gRPC, WebSocket        |
 +---------------------------------------------------+

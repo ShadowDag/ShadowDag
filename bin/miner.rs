@@ -1,16 +1,16 @@
-// ═══════════════════════════════════════════════════════════════════════════
+﻿// â•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گ
 //                           S H A D O W D A G
-//                     © ShadowDAG Project — All Rights Reserved
-// ═══════════════════════════════════════════════════════════════════════════
+//                     آ© ShadowDAG Project â€” All Rights Reserved
+// â•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گ
 //
-// shadowdag-miner — Multi-threaded mining binary with RPC integration
+// shadowdag-miner â€” Multi-threaded mining binary with RPC integration
 //
 // Usage:
 //   shadowdag-miner --address=SD1your...       # Mine to address
 //   shadowdag-miner --threads=8                 # Set thread count
 //   shadowdag-miner --rpc=127.0.0.1:19332       # RPC address
 //   shadowdag-miner --network=testnet           # Mine on testnet
-// ═══════════════════════════════════════════════════════════════════════════
+// â•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گ
 
 use sha2::{Digest, Sha256};
 use shadowdag::config::consensus::consensus_params::ConsensusParams;
@@ -32,6 +32,13 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Debug, Default)]
+struct RpcAuthConfig {
+    bearer_token: Option<String>,
+    username: String,
+    password: Option<String>,
+}
 
 fn main() {
     shadowdag::telemetry::logging::structured::init();
@@ -88,6 +95,13 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         _ => 9332,
     };
     let rpc_addr = parse_flag(args, "--rpc", &format!("127.0.0.1:{}", rpc_port));
+    let mut rpc_auth = resolve_rpc_auth(args, &network, &rpc_addr);
+    if rpc_auth.bearer_token.is_none() {
+        if let Some(token) = rpc_login(&rpc_addr, &rpc_auth.username, rpc_auth.password.as_deref()) {
+            rpc_auth.bearer_token = Some(token);
+            slog_info!("miner", "rpc_login_ok", user => &rpc_auth.username);
+        }
+    }
 
     let owner_address = match network {
         NetworkMode::Mainnet => ConsensusParams::OWNER_REWARD_ADDRESS,
@@ -97,7 +111,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
     .to_string();
     let genesis = create_genesis_block_for(&network);
 
-    // Initialize rayon thread pool — fail loudly if it can't be built
+    // Initialize rayon thread pool â€” fail loudly if it can't be built
     if let Err(e) = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global()
@@ -106,10 +120,10 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         eprintln!("[miner] Falling back to default thread pool");
     }
 
-    println!("╔══════════════════════════════════════════════╗");
-    println!("║     S H A D O W D A G  —  Miner v1.0.0       ║");
-    println!("║     Multi-Threaded ShadowHash Mining           ║");
-    println!("╚══════════════════════════════════════════════╝");
+    println!("â•”â•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•—");
+    println!("â•‘     S H A D O W D A G  â€”  Miner v1.0.0       â•‘");
+    println!("â•‘     Multi-Threaded ShadowHash Mining           â•‘");
+    println!("â•ڑâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•‌");
     slog_info!("miner", "config",
         network => &network_str,
         address => format!("{}...{}", &miner_address[..8.min(miner_address.len())], &miner_address[miner_address.len().saturating_sub(6)..]),
@@ -121,14 +135,15 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
 
     let mut total_mined: u64 = 0;
     let mut total_accepted: u64 = 0;
+    let mut last_submitted_hash = String::new();
     let session_start = Instant::now();
 
     slog_info!("miner", "mining_loop_started");
 
     loop {
-        // ═══ STEP 1: Get fresh template from node EVERY block ═══
+        // â•گâ•گâ•گ STEP 1: Get fresh template from node EVERY block â•گâ•گâ•گ
         // This ensures we always mine on top of the latest tip.
-        let template = match rpc_get_template(&rpc_addr) {
+        let template = match rpc_get_template(&rpc_addr, rpc_auth.bearer_token.as_deref()) {
             Some(t) => t,
             None => {
                 if total_mined == 0 {
@@ -152,7 +167,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
             .unwrap_or_default()
             .as_secs();
 
-        // ═══ STEP 2: Build coinbase transaction ═══
+        // â•گâ•گâ•گ STEP 2: Build coinbase transaction â•گâ•گâ•گ
         let emission = EmissionSchedule::block_reward(height);
         // Coinbase reward = emission only.
         // Fees can only be included when the miner also includes the
@@ -208,7 +223,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
 
         let merkle_root = MerkleTree::build(std::slice::from_ref(&coinbase), height, &parents);
 
-        // ═══ STEP 3: Multi-threaded mining ═══
+        // â•گâ•گâ•گ STEP 3: Multi-threaded mining â•گâ•گâ•گ
         let start = Instant::now();
         let found = Arc::new(AtomicBool::new(false));
         let found_nonce = Arc::new(AtomicU64::new(0));
@@ -300,7 +315,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
 
         let fees_sdag = template.total_fees as f64 / 100_000_000.0;
         println!(
-            "⛏  Block #{} mined! hash={}... nonce={} time={:.1}s rate={:.0} H/s fees={:.8} SDAG",
+            "â›ڈ  Block #{} mined! hash={}... nonce={} time={:.1}s rate={:.0} H/s fees={:.8} SDAG",
             height,
             &hash[..16],
             nonce,
@@ -309,7 +324,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
             fees_sdag
         );
 
-        // ═══ STEP 4: Build full block and submit ═══
+        // â•گâ•گâ•گ STEP 4: Build full block and submit â•گâ•گâ•گ
         let block = Block {
             header: BlockHeader {
                 version: 1,
@@ -334,12 +349,22 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
 
         total_mined += 1;
 
-        match rpc_submit_block(&rpc_addr, &block) {
+        // Guard against duplicate submissions when template/state did not
+        // advance yet and we re-mined the exact same header.
+        if hash == last_submitted_hash {
+            slog_warn!("miner", "duplicate_block_skipped", hash => &hash[..16.min(hash.len())], height => height);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            continue;
+        }
+
+        match rpc_submit_block(&rpc_addr, &block, rpc_auth.bearer_token.as_deref()) {
             SubmitResult::Accepted => {
+                last_submitted_hash = hash.clone();
                 total_accepted += 1;
-                println!("    ✅ Accepted by node (queued for consensus)");
+                println!("    âœ… Accepted by node (queued for consensus)");
             }
-            SubmitResult::Rejected(reason) => {
+            SubmitResult::Unauthorized(reason) | SubmitResult::Rejected(reason) => {
+                last_submitted_hash = hash.clone();
                 slog_error!("miner", "block_rejected", reason => &reason);
             }
             SubmitResult::ConnError => {
@@ -357,16 +382,16 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
             };
             let reward_sdag = emission as f64 / 100_000_000.0;
             println!(
-                "📊 Stats: {} mined, {} accepted | {:.1} blocks/min | reward={:.2} SDAG | height={}",
+                "ًں“ٹ Stats: {} mined, {} accepted | {:.1} blocks/min | reward={:.2} SDAG | height={}",
                 total_mined, total_accepted, avg_rate, reward_sdag, height
             );
         }
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// â•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گ
 // RPC Communication
-// ═══════════════════════════════════════════════════════════════════════════
+// â•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گ
 
 struct BlockTemplate {
     height: u64,
@@ -378,13 +403,14 @@ struct BlockTemplate {
 
 enum SubmitResult {
     Accepted,
+    Unauthorized(String),
     Rejected(String),
     ConnError,
 }
 
 const MAX_RESPONSE: usize = 1_000_000; // 1 MB
 
-fn rpc_call(addr: &str, method: &str, params: &str) -> Option<String> {
+fn rpc_call(addr: &str, method: &str, params: &str, bearer_token: Option<&str>) -> Option<String> {
     let body = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"{}","params":[{}]}}"#,
         method, params
@@ -398,9 +424,13 @@ fn rpc_call(addr: &str, method: &str, params: &str) -> Option<String> {
         .set_write_timeout(Some(std::time::Duration::from_secs(10)))
         .ok();
 
+    let auth_header = bearer_token
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| format!("Authorization: Bearer {}\r\n", t))
+        .unwrap_or_default();
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        addr, body.len(), body
+        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        addr, auth_header, body.len(), body
     );
 
     stream.write_all(request.as_bytes()).ok()?;
@@ -461,8 +491,8 @@ fn rpc_call(addr: &str, method: &str, params: &str) -> Option<String> {
     }
 }
 
-fn rpc_get_template(addr: &str) -> Option<BlockTemplate> {
-    let response = rpc_call(addr, "getblocktemplate", "")?;
+fn rpc_get_template(addr: &str, bearer_token: Option<&str>) -> Option<BlockTemplate> {
+    let response = rpc_call(addr, "getblocktemplate", "", bearer_token)?;
 
     let parsed: serde_json::Value = serde_json::from_str(&response).ok()?;
     let result = parsed.get("result")?;
@@ -501,7 +531,7 @@ fn rpc_get_template(addr: &str) -> Option<BlockTemplate> {
     })
 }
 
-fn rpc_submit_block(addr: &str, block: &Block) -> SubmitResult {
+fn rpc_submit_block(addr: &str, block: &Block, bearer_token: Option<&str>) -> SubmitResult {
     // Serialize transactions via serde so the RPC server can reconstruct them.
     // Without transactions, DagShield rejects the block ("empty block body").
     let txs_json = match serde_json::to_value(&block.body.transactions) {
@@ -532,19 +562,24 @@ fn rpc_submit_block(addr: &str, block: &Block) -> SubmitResult {
         }
     };
     let params = format!(r#""{}""#, block_str.replace('"', r#"\""#));
-    match rpc_call(addr, "submitblock", &params) {
+    match rpc_call(addr, "submitblock", &params, bearer_token) {
         Some(response) => {
             match serde_json::from_str::<serde_json::Value>(&response) {
                 Ok(parsed) => {
                     // Check if the response contains a non-null error field
                     match parsed.get("error") {
                         Some(err) if !err.is_null() => {
+                            let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or_default();
                             let reason = err
                                 .get("message")
                                 .and_then(|m| m.as_str())
                                 .unwrap_or_else(|| err.as_str().unwrap_or("unknown error"))
                                 .to_string();
-                            SubmitResult::Rejected(reason)
+                            if code == -32001 || reason.to_ascii_lowercase().contains("authentication required") {
+                                SubmitResult::Unauthorized(reason)
+                            } else {
+                                SubmitResult::Rejected(reason)
+                            }
                         }
                         _ => SubmitResult::Accepted,
                     }
@@ -559,9 +594,101 @@ fn rpc_submit_block(addr: &str, block: &Block) -> SubmitResult {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+fn rpc_login(addr: &str, username: &str, password: Option<&str>) -> Option<String> {
+    let password = password?.trim();
+    if password.is_empty() {
+        return None;
+    }
+    let params_json = serde_json::json!({
+        "username": username,
+        "password": password
+    });
+    let params = serde_json::to_string(&params_json).ok()?;
+    let response = rpc_call(addr, "login", &params, None)?;
+    let parsed: serde_json::Value = serde_json::from_str(&response).ok()?;
+    parsed
+        .get("result")
+        .and_then(|r| r.get("token"))
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+}
+
+fn resolve_rpc_auth(args: &[String], network: &NetworkMode, rpc_addr: &str) -> RpcAuthConfig {
+    let mut cfg = RpcAuthConfig {
+        bearer_token: None,
+        username: parse_flag(
+            args,
+            "--rpc-user",
+            &std::env::var("SHADOWDAG_RPC_USER").unwrap_or_else(|_| "admin".to_string()),
+        ),
+        password: None,
+    };
+
+    if let Ok(tok) = std::env::var("SHADOWDAG_RPC_TOKEN") {
+        let t = tok.trim();
+        if !t.is_empty() {
+            cfg.bearer_token = Some(t.to_string());
+            return cfg;
+        }
+    }
+    if let Ok(Some(tok)) = parse_flag_opt(args, "--rpc-token") {
+        let t = tok.trim();
+        if !t.is_empty() {
+            cfg.bearer_token = Some(t.to_string());
+            return cfg;
+        }
+    }
+
+    if let Ok(pw) = std::env::var("SHADOWDAG_RPC_PASSWORD") {
+        let p = pw.trim();
+        if !p.is_empty() {
+            cfg.password = Some(p.to_string());
+            return cfg;
+        }
+    }
+    if let Ok(Some(pw)) = parse_flag_opt(args, "--rpc-password") {
+        let p = pw.trim();
+        if !p.is_empty() {
+            cfg.password = Some(p.to_string());
+            return cfg;
+        }
+    }
+
+    // Best-effort local default for single-node operation.
+    let is_local = rpc_addr.starts_with("127.0.0.1:") || rpc_addr.starts_with("localhost:");
+    if is_local {
+        let network_dir = match network {
+            NetworkMode::Testnet => "testnet",
+            NetworkMode::Regtest => "regtest",
+            NetworkMode::Mainnet => "mainnet",
+        };
+        let pw_file = std::env::var("SHADOWDAG_RPC_PASSWORD_FILE")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var("HOME").ok().map(|h| {
+                    std::path::PathBuf::from(h)
+                        .join(".shadowdag")
+                        .join(network_dir)
+                        .join("rpc_password")
+                })
+            });
+        if let Some(path) = pw_file {
+            if let Ok(raw) = std::fs::read_to_string(path) {
+                let p = raw.trim();
+                if !p.is_empty() {
+                    cfg.password = Some(p.to_string());
+                }
+            }
+        }
+    }
+
+    cfg
+}
+
+// â•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گ
 // Helpers
-// ═══════════════════════════════════════════════════════════════════════════
+// â•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گ
 
 fn print_help() {
     println!("ShadowDAG Miner v1.0.0");
@@ -574,6 +701,9 @@ fn print_help() {
     println!("  --network=<mainnet|testnet|regtest>  Network (default: mainnet)");
     println!("  --threads=<n>                        Mining threads (default: CPU count)");
     println!("  --rpc=<host:port>                    Node RPC address (default: 127.0.0.1:port)");
+    println!("  --rpc-token=<token>                  Bearer token for authenticated RPC");
+    println!("  --rpc-user=<name>                    RPC login username (default: admin)");
+    println!("  --rpc-password=<pass>                RPC login password");
     println!("  --help, -h                           Show this help");
     println!("  --version, -v                        Show version");
     println!();
@@ -585,7 +715,7 @@ fn print_help() {
 fn parse_flag(args: &[String], name: &str, default: &str) -> String {
     match parse_flag_opt(args, name) {
         Ok(Some(val)) => val,
-        Ok(None) => default.to_string(), // flag not present at all — use default
+        Ok(None) => default.to_string(), // flag not present at all â€” use default
         Err(msg) => {
             eprintln!("Error: {}", msg);
             std::process::exit(1);
@@ -618,3 +748,4 @@ fn parse_flag_opt(args: &[String], name: &str) -> Result<Option<String>, String>
 fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
+

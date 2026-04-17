@@ -48,6 +48,7 @@ use crate::service::network::p2p::p2p::{
 use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::service::network::contract_ide::ContractIdeServer;
 use crate::service::network::explorer::ExplorerServer;
+use crate::service::network::wallet_ui::WalletUiServer;
 use crate::service::network::rpc::rpc_server::RpcServer;
 
 use crate::engine::mining::stratum::stratum_server::{BlockTemplate, StratumServer};
@@ -325,6 +326,16 @@ impl DaemonNode {
                 .start()
                 .map_err(|e| NodeError::Init(format!("Explorer start failed: {}", e)))?;
             slog_info!("daemon", "explorer_started", port => self.cfg.explorer_port);
+        }
+
+        // ── Wallet Web UI ─────────────────────────────────────────
+        if self.cfg.enable_wallet_ui {
+            let wallet_state = rpc.shared_state();
+            let wallet_ui = WalletUiServer::new(self.cfg.wallet_ui_port, wallet_state);
+            wallet_ui
+                .start()
+                .map_err(|e| NodeError::Init(format!("Wallet UI start failed: {}", e)))?;
+            slog_info!("daemon", "wallet_ui_started", port => self.cfg.wallet_ui_port);
         }
 
         // ── Contract IDE ──────────────────────────────────────────

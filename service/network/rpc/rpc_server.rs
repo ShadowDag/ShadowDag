@@ -608,8 +608,10 @@ impl RpcServer {
 
                 match stream {
                     Ok(mut s) => {
-                        let current = active_connections.load(std::sync::atomic::Ordering::Relaxed);
-                        if current >= MAX_RPC_CONNECTIONS {
+                        let prev = active_connections.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        let current = prev + 1;
+                        if current > MAX_RPC_CONNECTIONS {
+                            active_connections.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                             // Send a proper HTTP 503 so the client knows why
                             // the connection was refused, instead of a bare RST.
                             let resp = RpcResponse::err(
@@ -626,7 +628,6 @@ impl RpcServer {
                         let sc = Arc::clone(&state);
                         let rt = Arc::clone(&rate_table);
                         let conn_count = Arc::clone(&active_connections);
-                        conn_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let mrs = max_req_size;
                         thread::spawn(move || {
                             let _result = Self::handle_connection(s, sc, rt, mrs);
@@ -692,6 +693,15 @@ impl RpcServer {
         reader
             .read_line(&mut request_line)
             .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+        const MAX_REQUEST_LINE_BYTES: usize = 4096;
+        if request_line.len() > MAX_REQUEST_LINE_BYTES {
+            Self::write_http_response(
+                &mut stream,
+                414,
+                json!({"error": "Request URI too long"}),
+            )?;
+            return Ok(());
+        }
 
         let req = request_line.trim();
         if !(req.starts_with("POST /") || req.starts_with("POST / ")) {
@@ -701,6 +711,9 @@ impl RpcServer {
 
         let mut content_length: usize = 0;
         let mut auth_token: Option<String> = None;
+        let mut auth_header_seen = false;
+        let mut malformed_auth_header = false;
+        let mut has_forwarded_header = false;
         let mut line = String::new();
         let mut header_lines = 0usize;
         let mut total_header_bytes = 0usize;
@@ -741,16 +754,44 @@ impl RpcServer {
                     }
                 };
             }
+            if lower.starts_with("x-forwarded-for:")
+                || lower.starts_with("forwarded:")
+                || lower.starts_with("x-real-ip:")
+            {
+                has_forwarded_header = true;
+            }
             // Extract auth token from Authorization header (case-insensitive)
             if lower.starts_with("authorization:") {
+                if auth_header_seen {
+                    malformed_auth_header = true;
+                    continue;
+                }
+                auth_header_seen = true;
                 let v = &trimmed["Authorization:".len()..];
-                let token = v
-                    .trim()
+                let auth_value = v.trim();
+                if let Some(token) = auth_value
                     .strip_prefix("Bearer ")
-                    .or_else(|| v.trim().strip_prefix("bearer "))
-                    .unwrap_or(v.trim());
-                auth_token = Some(token.to_string());
+                    .or_else(|| auth_value.strip_prefix("bearer "))
+                {
+                    let token = token.trim();
+                    if token.is_empty() {
+                        malformed_auth_header = true;
+                    } else {
+                        auth_token = Some(token.to_string());
+                    }
+                } else {
+                    malformed_auth_header = true;
+                }
             }
+        }
+
+        if malformed_auth_header {
+            Self::write_http_response(
+                &mut stream,
+                400,
+                json!({"error": "Malformed Authorization header. Use: Authorization: Bearer <token>"}),
+            )?;
+            return Ok(());
         }
 
         if content_length > max_request_size {
@@ -794,8 +835,15 @@ impl RpcServer {
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
                 let is_localhost = peer_ip.is_some_and(|ip| ip.is_loopback());
+                let allow_submitblock_noauth =
+                    allow_local_noauth && is_localhost && !has_forwarded_header;
+                if allow_local_noauth && is_localhost && has_forwarded_header {
+                    slog_warn!("rpc", "local_noauth_disabled_forwarded_header",
+                        note => "Ignoring SHADOWDAG_RPC_LOCAL_NOAUTH because forwarded headers were present",
+                        method => &req.method);
+                }
                 if requires_auth(&req.method)
-                    && !(allow_local_noauth && is_localhost && matches!(req.method.as_str(),
+                    && !(allow_submitblock_noauth && matches!(req.method.as_str(),
                         "submitblock"))
                 {
                     match &auth_token {
@@ -888,7 +936,8 @@ impl RpcServer {
             .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))
     }
 
-    pub fn handle(&self, input: &str) -> String {
+    #[cfg(test)]
+    pub(crate) fn handle(&self, input: &str) -> String {
         match serde_json::from_str::<RpcRequest>(input) {
             Ok(req) => {
                 let id = req.id.clone();

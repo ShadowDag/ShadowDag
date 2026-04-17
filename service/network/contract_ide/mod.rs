@@ -13,7 +13,8 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use serde_json::{json, Value};
 
@@ -25,6 +26,10 @@ pub mod html;
 
 const IDE_READ_TIMEOUT_SECS: u64 = 10;
 const MAX_POST_BODY: usize = 512 * 1024;
+const MAX_IDE_CONNECTIONS: usize = 200;
+const MAX_REQUEST_LINE_BYTES: usize = 4096;
+const MAX_HEADER_LINES: usize = 64;
+const MAX_HEADER_BYTES: usize = 16 * 1024;
 
 pub struct ContractIdeServer {
     port: u16,
@@ -42,18 +47,32 @@ impl ContractIdeServer {
     }
 
     pub fn start(&self) -> Result<(), String> {
-        let addr = format!("0.0.0.0:{}", self.port);
+        let bind_host = std::env::var("SHADOWDAG_IDE_BIND")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let addr = format!("{}:{}", bind_host, self.port);
         let listener = TcpListener::bind(&addr)
             .map_err(|e| format!("IDE bind failed on {}: {}", addr, e))?;
         self.running.store(true, Ordering::SeqCst);
         slog_info!("ide", "listening", addr => &addr);
 
         let rpc_port = self.rpc_port;
+        let active_connections = Arc::new(AtomicUsize::new(0));
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 if let Ok(stream) = stream {
+                    let prev = active_connections.fetch_add(1, Ordering::AcqRel);
+                    if prev >= MAX_IDE_CONNECTIONS {
+                        active_connections.fetch_sub(1, Ordering::Relaxed);
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        continue;
+                    }
+                    let active_connections = Arc::clone(&active_connections);
                     std::thread::spawn(move || {
                         Self::handle_connection(stream, rpc_port);
+                        active_connections.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
             }
@@ -119,29 +138,54 @@ impl ContractIdeServer {
         let mut reader = BufReader::new(clone);
 
         let mut request_line = String::new();
-        if reader.read_line(&mut request_line).is_err() {
+        let req_read = {
+            let mut limited = (&mut reader).take(MAX_REQUEST_LINE_BYTES as u64);
+            limited.read_line(&mut request_line)
+        };
+        if req_read.is_err() {
+            return;
+        }
+        if request_line.len() >= MAX_REQUEST_LINE_BYTES && !request_line.ends_with('\n') {
+            Self::send_response(&mut stream, 414, "text/plain", b"Request line too long");
             return;
         }
 
         // Parse headers
         let mut content_length: usize = 0;
+        let mut malformed_content_length = false;
         let mut header_line = String::new();
+        let mut header_lines = 0usize;
+        let mut header_bytes = 0usize;
         loop {
             header_line.clear();
             match reader.read_line(&mut header_line) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
+                    header_lines += 1;
+                    header_bytes += header_line.len();
+                    if header_lines > MAX_HEADER_LINES || header_bytes > MAX_HEADER_BYTES {
+                        Self::send_response(&mut stream, 431, "text/plain", b"Request headers too large");
+                        return;
+                    }
                     if header_line.trim().is_empty() {
                         break;
                     }
                     let lower = header_line.to_lowercase();
                     if lower.starts_with("content-length:") {
                         if let Some(len) = lower.split(':').nth(1) {
-                            content_length = len.trim().parse().unwrap_or(0);
+                            match len.trim().parse::<usize>() {
+                                Ok(v) => content_length = v,
+                                Err(_) => malformed_content_length = true,
+                            }
                         }
                     }
                 }
             }
+        }
+
+        if malformed_content_length {
+            Self::send_response(&mut stream, 400, "text/plain", b"Malformed Content-Length");
+            return;
         }
 
         let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
@@ -159,7 +203,11 @@ impl ContractIdeServer {
 
         // Read POST body
         let body = if method == "POST" && content_length > 0 {
-            let len = content_length.min(MAX_POST_BODY);
+            if content_length > MAX_POST_BODY {
+                Self::send_response(&mut stream, 413, "text/plain", b"Request body too large");
+                return;
+            }
+            let len = content_length;
             let mut buf = vec![0u8; len];
             if reader.read_exact(&mut buf).is_err() {
                 return;
@@ -260,6 +308,12 @@ impl ContractIdeServer {
                 return;
             }
         };
+
+        // Input sanitization: limit source code size to 64 KB
+        if source.len() > 64 * 1024 {
+            Self::send_json(stream, &json!({"success": false, "error": "source code exceeds 64 KB limit"}));
+            return;
+        }
 
         // Step 1: Transpile ShadowLang → ShadowASM
         let asm = match shadowlang::compile(source) {
@@ -384,9 +438,6 @@ impl ContractIdeServer {
             "HTTP/1.1 {} {}\r\n\
              Content-Type: {}\r\n\
              Content-Length: {}\r\n\
-             Access-Control-Allow-Origin: *\r\n\
-             Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-             Access-Control-Allow-Headers: Content-Type\r\n\
              Connection: close\r\n\
              \r\n",
             status, status_text, content_type, body.len()

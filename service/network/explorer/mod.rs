@@ -16,9 +16,9 @@
 // PeerManager, etc. without any HTTP proxying.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::json;
@@ -33,6 +33,9 @@ type SharedState = Arc<Mutex<RpcState>>;
 
 const MAX_EXPLORER_CONNECTIONS: usize = 100;
 const EXPLORER_READ_TIMEOUT_SECS: u64 = 5;
+const MAX_REQUEST_LINE_BYTES: usize = 4096;
+const MAX_HEADER_LINES: usize = 64;
+const MAX_HEADER_BYTES: usize = 16 * 1024;
 
 pub struct ExplorerServer {
     port: u16,
@@ -50,7 +53,12 @@ impl ExplorerServer {
     }
 
     pub fn start(&self) -> Result<(), String> {
-        let addr = format!("0.0.0.0:{}", self.port);
+        let bind_host = std::env::var("SHADOWDAG_EXPLORER_BIND")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let addr = format!("{}:{}", bind_host, self.port);
         let listener = TcpListener::bind(&addr)
             .map_err(|e| format!("Explorer bind failed on {}: {}", addr, e))?;
         self.running.store(true, Ordering::SeqCst);
@@ -58,28 +66,27 @@ impl ExplorerServer {
 
         let state = Arc::clone(&self.state);
         let running = Arc::clone(&self.running);
+        let active_connections = Arc::new(AtomicUsize::new(0));
 
         std::thread::spawn(move || {
-            let mut active_connections = 0usize;
             for stream in listener.incoming() {
                 if !running.load(Ordering::SeqCst) {
                     break;
                 }
                 match stream {
                     Ok(stream) => {
-                        if active_connections >= MAX_EXPLORER_CONNECTIONS {
+                        let prev = active_connections.fetch_add(1, Ordering::AcqRel);
+                        if prev >= MAX_EXPLORER_CONNECTIONS {
+                            active_connections.fetch_sub(1, Ordering::Relaxed);
                             let _ = stream.shutdown(std::net::Shutdown::Both);
                             continue;
                         }
-                        active_connections += 1;
                         let state = Arc::clone(&state);
+                        let active_connections = Arc::clone(&active_connections);
                         std::thread::spawn(move || {
                             Self::handle_connection(stream, &state);
+                            active_connections.fetch_sub(1, Ordering::Relaxed);
                         });
-                        // Approximate: we don't decrement on completion (lightweight)
-                        if active_connections > 10 {
-                            active_connections -= 1;
-                        }
                     }
                     Err(e) => {
                         slog_error!("explorer", "accept_error", error => e);
@@ -102,17 +109,33 @@ impl ExplorerServer {
         };
         let mut reader = BufReader::new(clone);
         let mut request_line = String::new();
-        if reader.read_line(&mut request_line).is_err() {
+        let req_read = {
+            let mut limited = (&mut reader).take(MAX_REQUEST_LINE_BYTES as u64);
+            limited.read_line(&mut request_line)
+        };
+        if req_read.is_err() {
+            return;
+        }
+        if request_line.len() >= MAX_REQUEST_LINE_BYTES && !request_line.ends_with('\n') {
+            Self::send_response(&mut stream, 414, "text/plain", b"Request line too long");
             return;
         }
 
         // Consume remaining headers (we only need the first line)
         let mut header_line = String::new();
+        let mut header_lines = 0usize;
+        let mut header_bytes = 0usize;
         loop {
             header_line.clear();
             match reader.read_line(&mut header_line) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
+                    header_lines += 1;
+                    header_bytes += header_line.len();
+                    if header_lines > MAX_HEADER_LINES || header_bytes > MAX_HEADER_BYTES {
+                        Self::send_response(&mut stream, 431, "text/plain", b"Request headers too large");
+                        return;
+                    }
                     if header_line.trim().is_empty() {
                         break;
                     }
@@ -150,13 +173,25 @@ impl ExplorerServer {
             "/api/stats" => Self::api_stats(&mut stream, state),
             "/api/blocks" => Self::api_blocks(&mut stream, state),
             "/api/pool" => Self::api_pool(&mut stream),
+            "/api/mempool" => Self::api_mempool(&mut stream, state),
+            "/api/dag" => Self::api_dag(&mut stream, state),
+            "/api/network" => Self::api_network(&mut stream, state),
+            "/api/richlist" => Self::api_richlist(&mut stream, state),
             p if p.starts_with("/api/block/") => {
                 let id = &p["/api/block/".len()..];
                 Self::api_block_detail(&mut stream, state, id);
             }
+            p if p.starts_with("/api/tx/") => {
+                let hash = &p["/api/tx/".len()..];
+                Self::api_tx_detail(&mut stream, state, hash);
+            }
             p if p.starts_with("/api/address/") => {
                 let addr = &p["/api/address/".len()..];
                 Self::api_address(&mut stream, state, addr);
+            }
+            p if p.starts_with("/api/search/") => {
+                let query = &p["/api/search/".len()..];
+                Self::api_search(&mut stream, state, query);
             }
             _ => {
                 Self::send_response(&mut stream, 404, "text/plain", b"Not Found");
@@ -296,6 +331,209 @@ impl ExplorerServer {
         Self::send_json(stream, &data);
     }
 
+    fn api_tx_detail(stream: &mut TcpStream, state: &SharedState, hash: &str) {
+        let data = match state.lock() {
+            Ok(s) => {
+                // Search through recent blocks for the transaction
+                let height = s.best_height;
+                let start = if height > 200 { height - 200 } else { 0 };
+                let mut found = None;
+                'outer: for h in (start..=height).rev() {
+                    let hashes = s.block_store.get_block_hashes_at_height(h);
+                    for bh in hashes {
+                        if let Some(block) = s.block_store.get_block(&bh) {
+                            for tx in &block.body.transactions {
+                                if tx.hash == hash {
+                                    found = Some((tx.clone(), block.header.hash.clone(), block.header.height));
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Also check mempool
+                if found.is_none() {
+                    for tx in s.mempool.get_all_transactions() {
+                        if tx.hash == hash {
+                            found = Some((tx, String::new(), 0));
+                            break;
+                        }
+                    }
+                }
+                match found {
+                    Some((tx, block_hash, block_height)) => json!({
+                        "hash": tx.hash,
+                        "block_hash": block_hash,
+                        "block_height": block_height,
+                        "is_coinbase": tx.is_coinbase,
+                        "fee": tx.fee,
+                        "timestamp": tx.timestamp,
+                        "tx_type": format!("{:?}", tx.tx_type),
+                        "inputs": tx.inputs.iter().map(|i| json!({
+                            "txid": i.txid,
+                            "index": i.index,
+                            "owner": i.owner,
+                        })).collect::<Vec<_>>(),
+                        "outputs": tx.outputs.iter().map(|o| json!({
+                            "address": o.address,
+                            "amount": o.amount,
+                        })).collect::<Vec<_>>(),
+                        "total_output": tx.outputs.iter().map(|o| o.amount).sum::<u64>(),
+                        "confirmed": !block_hash.is_empty(),
+                    }),
+                    None => json!({"error": "transaction not found"}),
+                }
+            }
+            Err(_) => json!({"error": "state locked"}),
+        };
+        Self::send_json(stream, &data);
+    }
+
+    fn api_mempool(stream: &mut TcpStream, state: &SharedState) {
+        let data = match state.lock() {
+            Ok(s) => {
+                let txs = s.mempool.get_all_transactions();
+                let count = txs.len();
+                let total_fees: u64 = txs.iter().map(|t| t.fee).sum();
+                let items: Vec<_> = txs.iter().take(50).map(|tx| {
+                    json!({
+                        "hash": tx.hash,
+                        "fee": tx.fee,
+                        "timestamp": tx.timestamp,
+                        "tx_type": format!("{:?}", tx.tx_type),
+                        "inputs": tx.inputs.len(),
+                        "outputs": tx.outputs.len(),
+                        "total_output": tx.outputs.iter().map(|o| o.amount).sum::<u64>(),
+                    })
+                }).collect();
+                json!({
+                    "count": count,
+                    "total_fees": total_fees,
+                    "transactions": items,
+                })
+            }
+            Err(_) => json!({"error": "state locked"}),
+        };
+        Self::send_json(stream, &data);
+    }
+
+    fn api_dag(stream: &mut TcpStream, state: &SharedState) {
+        let data = match state.lock() {
+            Ok(s) => {
+                let height = s.best_height;
+                let start = if height > 30 { height - 30 } else { 0 };
+                let mut nodes = Vec::new();
+                let mut edges = Vec::new();
+                for h in start..=height {
+                    let hashes = s.block_store.get_block_hashes_at_height(h);
+                    for hash in &hashes {
+                        if let Some(block) = s.block_store.get_block(hash) {
+                            nodes.push(json!({
+                                "id": &block.header.hash[..12],
+                                "hash": block.header.hash,
+                                "height": block.header.height,
+                                "tx_count": block.body.transactions.len(),
+                                "timestamp": block.header.timestamp,
+                            }));
+                            for parent in &block.header.parents {
+                                edges.push(json!({
+                                    "from": &parent[..std::cmp::min(12, parent.len())],
+                                    "to": &block.header.hash[..12],
+                                }));
+                            }
+                        }
+                    }
+                }
+                json!({
+                    "nodes": nodes,
+                    "edges": edges,
+                    "best_height": height,
+                    "depth": height.saturating_sub(start),
+                })
+            }
+            Err(_) => json!({"error": "state locked"}),
+        };
+        Self::send_json(stream, &data);
+    }
+
+    fn api_network(stream: &mut TcpStream, state: &SharedState) {
+        let data = match state.lock() {
+            Ok(s) => {
+                let peer_count = s.peer_manager.count();
+                json!({
+                    "peer_count": peer_count,
+                    "node_version": s.node_version,
+                    "network": s.network_name,
+                    "p2p_port": s.p2p_port,
+                    "rpc_port": s.rpc_port,
+                    "best_height": s.best_height,
+                    "best_hash": s.best_hash,
+                })
+            }
+            Err(_) => json!({"error": "state locked"}),
+        };
+        Self::send_json(stream, &data);
+    }
+
+    fn api_richlist(stream: &mut TcpStream, state: &SharedState) {
+        let data = match state.lock() {
+            Ok(_s) => {
+                // Rich-list requires a dedicated indexed view of address balances.
+                // Full UTXO scans are intentionally not exposed by UtxoSet to avoid
+                // expensive unbounded RPC work and accidental data-layer coupling.
+                json!({
+                    "total_addresses": 0,
+                    "richlist": [],
+                    "note": "Richlist index is not enabled on this node build",
+                })
+            }
+            Err(_) => json!({"error": "state locked"}),
+        };
+        Self::send_json(stream, &data);
+    }
+
+    fn api_search(stream: &mut TcpStream, state: &SharedState, query: &str) {
+        let data = match state.lock() {
+            Ok(s) => {
+                // Determine query type and search accordingly
+                let q = query.trim();
+                // Check if it's a number (height)
+                if let Ok(height) = q.parse::<u64>() {
+                    let hashes = s.block_store.get_block_hashes_at_height(height);
+                    if !hashes.is_empty() {
+                        return Self::send_json(stream, &json!({"type": "block", "id": hashes[0]}));
+                    }
+                }
+                // Check if it's an address (starts with S)
+                if q.starts_with('S') || q.starts_with('s') {
+                    let balance = s.utxo_store.get_balance(q);
+                    return Self::send_json(stream, &json!({"type": "address", "id": q, "balance": balance}));
+                }
+                // Try as block hash
+                if s.block_store.get_block(q).is_some() {
+                    return Self::send_json(stream, &json!({"type": "block", "id": q}));
+                }
+                // Try as transaction hash (search recent blocks)
+                let height = s.best_height;
+                let start = if height > 100 { height - 100 } else { 0 };
+                for h in (start..=height).rev() {
+                    for bh in s.block_store.get_block_hashes_at_height(h) {
+                        if let Some(block) = s.block_store.get_block(&bh) {
+                            for tx in &block.body.transactions {
+                                if tx.hash == q {
+                                    return Self::send_json(stream, &json!({"type": "tx", "id": q}));
+                                }
+                            }
+                        }
+                    }
+                }
+                json!({"type": "not_found", "query": q})
+            }
+            Err(_) => json!({"error": "state locked"}),
+        };
+        Self::send_json(stream, &data);
+    }
+
     fn send_json(stream: &mut TcpStream, data: &serde_json::Value) {
         let body = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string());
         Self::send_response(stream, 200, "application/json", body.as_bytes());
@@ -306,6 +544,8 @@ impl ExplorerServer {
             200 => "OK",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            414 => "URI Too Long",
+            431 => "Request Header Fields Too Large",
             500 => "Internal Server Error",
             _ => "Unknown",
         };
@@ -313,7 +553,6 @@ impl ExplorerServer {
             "HTTP/1.1 {} {}\r\n\
              Content-Type: {}\r\n\
              Content-Length: {}\r\n\
-             Access-Control-Allow-Origin: *\r\n\
              Connection: close\r\n\
              \r\n",
             status, status_text, content_type, body.len()
