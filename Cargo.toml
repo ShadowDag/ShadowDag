@@ -62,11 +62,6 @@ name = "shadowdag-wallet-ui"
 path = "bin/wallet_ui.rs"
 
 [[bin]]
-name = "shadowdag-wallet-desktop"
-path = "bin/wallet_desktop.rs"
-required-features = ["desktop"]
-
-[[bin]]
 name = "shadowdag-rotate-rpc-password"
 path = "bin/rotate_rpc_password.rs"
 
