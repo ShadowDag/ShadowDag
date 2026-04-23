@@ -3,7 +3,7 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -427,7 +427,7 @@ pub type SharedState = Arc<Mutex<RpcState>>;
 
 /// Returns true for RPC methods that modify state and require authentication.
 /// Read-only methods (getblock, getinfo, getbalance, etc.) are open.
-/// Write methods (sendrawtransaction, submitblock, stop) require a valid token.
+/// Write methods and contract-heavy methods require a valid token.
 fn requires_auth(method: &str) -> bool {
     matches!(
         method,
@@ -437,7 +437,19 @@ fn requires_auth(method: &str) -> bool {
             | "deploy_contract"
             | "call_contract"
             | "verify_contract"
+            | "estimate_gas"
+            | "get_logs"
+            | "get_storage_at"
+            | "get_contract_code"
+            | "get_transaction_receipt"
+            | "get_contract_info"
     )
+}
+
+/// Methods that must only be callable by admin role.
+/// Miner/read-only tokens are insufficient even if authenticated.
+fn requires_admin(method: &str) -> bool {
+    matches!(method, "stop")
 }
 
 pub struct RpcServer {
@@ -451,6 +463,20 @@ pub struct RpcServer {
 }
 
 impl RpcServer {
+    #[inline]
+    fn configured_min_dag_parents_for_height(height: u64) -> usize {
+        let max = ConsensusParams::MAX_PARENTS;
+        match height {
+            0 => 0,
+            1 => 1,
+            _ => std::env::var("SHADOWDAG_MIN_DAG_PARENTS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(crate::engine::dag::security::selfish_mining_guard::MIN_DAG_PARENTS)
+                .clamp(1, max),
+        }
+    }
+
     pub fn new(db: Arc<DB>) -> Result<Self, NetworkError> {
         Ok(Self {
             state: Arc::new(Mutex::new(RpcState::new(db)?)),
@@ -557,9 +583,10 @@ impl RpcServer {
     /// `"shadowdag-testnet"`). Falls back to `"mainnet"` when the suffix
     /// is unrecognised.
     fn network_short_from_name(network_name: &str) -> String {
-        if network_name.contains("testnet") {
+        let name = network_name.to_ascii_lowercase();
+        if name.contains("testnet") {
             "testnet".to_string()
-        } else if network_name.contains("regtest") {
+        } else if name.contains("regtest") {
             "regtest".to_string()
         } else {
             "mainnet".to_string()
@@ -674,18 +701,27 @@ impl RpcServer {
 
         let peer_ip: Option<IpAddr> = stream.peer_addr().ok().map(|a| a.ip());
 
-        if let Some(ip) = peer_ip {
-            if !Self::check_rate_limit(&rate_table, ip) {
-                let resp = RpcResponse::err(
-                    Value::Null,
-                    ERR_RATE_LIMITED,
-                    format!("Rate limit exceeded: max {} requests/min", RATE_LIMIT_RPM),
-                );
-                let body = serde_json::to_value(&resp)
-                    .unwrap_or_else(|_| json!({"error": "rate limited"}));
-                Self::write_http_response(&mut stream, 429, body)?;
+        let ip = match peer_ip {
+            Some(ip) => ip,
+            None => {
+                Self::write_http_response(
+                    &mut stream,
+                    400,
+                    json!({"error": "Unable to determine client address"}),
+                )?;
                 return Ok(());
             }
+        };
+        if !Self::check_rate_limit(&rate_table, ip) {
+            let resp = RpcResponse::err(
+                Value::Null,
+                ERR_RATE_LIMITED,
+                format!("Rate limit exceeded: max {} requests/min", RATE_LIMIT_RPM),
+            );
+            let body =
+                serde_json::to_value(&resp).unwrap_or_else(|_| json!({"error": "rate limited"}));
+            Self::write_http_response(&mut stream, 429, body)?;
+            return Ok(());
         }
 
         let mut reader = BufReader::new(&stream);
@@ -704,16 +740,22 @@ impl RpcServer {
         }
 
         let req = request_line.trim();
-        if !(req.starts_with("POST /") || req.starts_with("POST / ")) {
+        let mut parts = req.split_whitespace();
+        let method = parts.next().unwrap_or_default();
+        let path = parts.next().unwrap_or_default();
+        let _version = parts.next().unwrap_or_default();
+        if method != "POST" || path != "/" {
             Self::write_http_response(&mut stream, 405, json!({"error": "Only POST is allowed"}))?;
             return Ok(());
         }
 
         let mut content_length: usize = 0;
+        let mut content_length_seen = false;
         let mut auth_token: Option<String> = None;
         let mut auth_header_seen = false;
         let mut malformed_auth_header = false;
         let mut has_forwarded_header = false;
+        let mut unsupported_transfer_encoding = false;
         let mut line = String::new();
         let mut header_lines = 0usize;
         let mut total_header_bytes = 0usize;
@@ -741,6 +783,15 @@ impl RpcServer {
             // HTTP headers are case-insensitive per RFC 7230
             let lower = trimmed.to_ascii_lowercase();
             if lower.starts_with("content-length:") {
+                if content_length_seen {
+                    Self::write_http_response(
+                        &mut stream,
+                        400,
+                        json!({"error": "duplicate Content-Length headers are not allowed"}),
+                    )?;
+                    return Ok(());
+                }
+                content_length_seen = true;
                 let v = &trimmed["Content-Length:".len()..];
                 content_length = match v.trim().parse::<usize>() {
                     Ok(n) => n,
@@ -753,6 +804,9 @@ impl RpcServer {
                         return Ok(());
                     }
                 };
+            }
+            if lower.starts_with("transfer-encoding:") {
+                unsupported_transfer_encoding = true;
             }
             if lower.starts_with("x-forwarded-for:")
                 || lower.starts_with("forwarded:")
@@ -793,6 +847,22 @@ impl RpcServer {
             )?;
             return Ok(());
         }
+        if !content_length_seen {
+            Self::write_http_response(
+                &mut stream,
+                411,
+                json!({"error": "Content-Length header is required"}),
+            )?;
+            return Ok(());
+        }
+        if unsupported_transfer_encoding {
+            Self::write_http_response(
+                &mut stream,
+                400,
+                json!({"error": "Transfer-Encoding is not supported; use Content-Length"}),
+            )?;
+            return Ok(());
+        }
 
         if content_length > max_request_size {
             Self::write_http_response(
@@ -822,43 +892,44 @@ impl RpcServer {
 
                 // AUTH CHECK: write methods require valid Bearer token
                 // verified via RpcAuthManager. Read-only methods are open.
-                // EXCEPTION: localhost (127.0.0.1) MAY be trusted for submitblock
-                // but ONLY when SHADOWDAG_RPC_LOCAL_NOAUTH=1|true is set.
-                // SECURITY WARNING: SHADOWDAG_RPC_LOCAL_NOAUTH trusts loopback
-                // (127.0.0.1 / ::1). If the RPC server is behind a reverse proxy
-                // (nginx, traefik, etc.), ALL requests appear to come from loopback,
-                // effectively disabling auth for submitblock. In production:
-                //   - Do NOT set this env var behind a reverse proxy
-                //   - Use proper Bearer token authentication instead
-                //   - If you must use it, keep it restricted to submitblock only
-                let allow_local_noauth = std::env::var("SHADOWDAG_RPC_LOCAL_NOAUTH")
+                //
+                // SECURITY: local unauthenticated submitblock bypass is disabled.
+                // If SHADOWDAG_RPC_LOCAL_NOAUTH is set, we only log and ignore it.
+                let env_local_noauth = std::env::var("SHADOWDAG_RPC_LOCAL_NOAUTH")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
-                let is_localhost = peer_ip.is_some_and(|ip| ip.is_loopback());
-                let allow_submitblock_noauth =
-                    allow_local_noauth && is_localhost && !has_forwarded_header;
-                if allow_local_noauth && is_localhost && has_forwarded_header {
-                    slog_warn!("rpc", "local_noauth_disabled_forwarded_header",
-                        note => "Ignoring SHADOWDAG_RPC_LOCAL_NOAUTH because forwarded headers were present",
-                        method => &req.method);
+                if env_local_noauth {
+                    let is_localhost = peer_ip.is_some_and(|ip| ip.is_loopback());
+                    slog_warn!("rpc", "local_noauth_ignored",
+                        method => &req.method,
+                        localhost => &is_localhost.to_string(),
+                        has_forwarded_header => &has_forwarded_header.to_string(),
+                        note => "SHADOWDAG_RPC_LOCAL_NOAUTH is disabled; bearer auth is always required for write RPC");
                 }
-                if requires_auth(&req.method)
-                    && !(allow_submitblock_noauth && matches!(req.method.as_str(),
-                        "submitblock"))
-                {
+                if requires_auth(&req.method) {
                     match &auth_token {
                         Some(token) => {
                             let mut s = state
                                 .lock()
                                 .map_err(|_| NetworkError::Other("State lock error".to_string()))?;
-                            if s.auth_manager.verify(token).is_some() {
+                            let allowed = if requires_admin(&req.method) {
+                                s.auth_manager.is_admin(token)
+                            } else {
+                                s.auth_manager.can_write(token)
+                            };
+                            if allowed {
                                 drop(s);
                                 Self::dispatch(&req.method, req.params, id, &state)
                             } else {
+                                let msg = if requires_admin(&req.method) {
+                                    "Admin role required for this method"
+                                } else {
+                                    "Invalid, expired, or insufficient-permission auth token"
+                                };
                                 RpcResponse::err(
                                     id,
                                     ERR_UNAUTHORIZED,
-                                    "Invalid or expired auth token",
+                                    msg,
                                 )
                             }
                         }
@@ -1602,6 +1673,23 @@ impl RpcServer {
                 if parent_hashes.is_empty() {
                     return RpcResponse::err(id, ERR_INTERNAL, "No valid parent hashes available");
                 }
+                let min_parents = Self::configured_min_dag_parents_for_height(next_height);
+                if parent_hashes.len() < min_parents {
+                    let mut seen: HashSet<String> = parent_hashes.iter().cloned().collect();
+                    let mut cursor = s.best_hash.clone();
+                    while parent_hashes.len() < min_parents && !cursor.is_empty() {
+                        if seen.insert(cursor.clone()) {
+                            parent_hashes.push(cursor.clone());
+                        }
+                        cursor = s
+                            .block_store
+                            .get_block(&cursor)
+                            .and_then(|b| b.header.selected_parent.clone())
+                            .unwrap_or_default();
+                    }
+                }
+                parent_hashes.sort();
+                parent_hashes.dedup();
                 // Limit to MAX_PARENTS
                 parent_hashes.truncate(ConsensusParams::MAX_PARENTS);
 
@@ -1625,10 +1713,11 @@ impl RpcServer {
         }
     }
 
-    fn cmd_submitblock(params: Vec<Value>, id: Value, _state: &SharedState) -> RpcResponse {
+    fn cmd_submitblock(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
         use crate::domain::block::block::Block;
         use crate::domain::block::block_body::BlockBody;
         use crate::domain::block::block_header::BlockHeader;
+        use crate::service::network::nodes::full_node::{get_dag_tips, get_next_difficulty};
 
         let block_json = match params.first() {
             Some(v) => {
@@ -1645,41 +1734,75 @@ impl RpcServer {
             None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "Expected block data"),
         };
 
-        // Parse block from JSON
-        let hash = block_json
-            .get("hash")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let height = block_json
-            .get("height")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let timestamp = block_json
-            .get("timestamp")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let nonce = block_json
-            .get("nonce")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let extra_nonce = block_json
-            .get("extra_nonce")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let difficulty = block_json
-            .get("difficulty")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1);
-        let merkle_root = block_json
-            .get("merkle_root")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let version = block_json
-            .get("version")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1) as u32;
+        // Parse block from JSON (fail-closed: reject malformed or missing fields).
+        let req_str = |key: &str| -> Result<String, RpcResponse> {
+            block_json
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    RpcResponse::err(
+                        id.clone(),
+                        ERR_INVALID_PARAMS,
+                        format!("Invalid block: missing or non-string '{}'", key),
+                    )
+                })
+        };
+        let req_u64 = |key: &str| -> Result<u64, RpcResponse> {
+            block_json
+                .get(key)
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| {
+                    RpcResponse::err(
+                        id.clone(),
+                        ERR_INVALID_PARAMS,
+                        format!("Invalid block: missing or non-u64 '{}'", key),
+                    )
+                })
+        };
+
+        let hash = match req_str("hash") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let height = match req_u64("height") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let timestamp = match req_u64("timestamp") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let nonce = match req_u64("nonce") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let extra_nonce = match req_u64("extra_nonce") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let difficulty = match req_u64("difficulty") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let merkle_root = match req_str("merkle_root") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let version_u64 = match req_u64("version") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let version = match u32::try_from(version_u64) {
+            Ok(v) => v,
+            Err(_) => {
+                return RpcResponse::err(
+                    id,
+                    ERR_INVALID_PARAMS,
+                    format!("Invalid block: version out of range for u32 ({})", version_u64),
+                )
+            }
+        };
 
         let parents: Vec<String> = block_json
             .get("parents")
@@ -1713,11 +1836,70 @@ impl RpcServer {
                 None => Vec::new(),
             };
 
-        if hash.is_empty() || height == 0 {
+        if hash.is_empty() || merkle_root.is_empty() || height == 0 || difficulty == 0 {
             return RpcResponse::err(
                 id,
                 ERR_INVALID_PARAMS,
-                "Invalid block: missing hash or height",
+                "Invalid block: empty hash/merkle_root or zero height/difficulty",
+            );
+        }
+
+        let (expected_height, expected_difficulty, current_tips) = match state.lock() {
+            Ok(mut s) => {
+                s.update_from_chain();
+                let expected_height = s.best_height + 1;
+                let expected_difficulty = match &s.mining_state {
+                    Some(ms) => ms.next_difficulty(),
+                    None => get_next_difficulty(),
+                };
+                let tips = match &s.mining_state {
+                    Some(ms) => ms.dag_tips(),
+                    None => get_dag_tips(),
+                };
+                (expected_height, expected_difficulty.max(1), tips)
+            }
+            Err(_) => return RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        };
+
+        if height != expected_height {
+            return RpcResponse::err(
+                id,
+                ERR_INVALID_PARAMS,
+                format!(
+                    "stale template: height mismatch (claimed {} expected {})",
+                    height, expected_height
+                ),
+            );
+        }
+        if difficulty != expected_difficulty {
+            return RpcResponse::err(
+                id,
+                ERR_INVALID_PARAMS,
+                format!(
+                    "stale template: difficulty mismatch (claimed {} expected {})",
+                    difficulty, expected_difficulty
+                ),
+            );
+        }
+        let min_parents = Self::configured_min_dag_parents_for_height(height);
+        if parents.len() < min_parents {
+            return RpcResponse::err(
+                id,
+                ERR_INVALID_PARAMS,
+                format!(
+                    "stale template: too few parents (got {} need at least {})",
+                    parents.len(),
+                    min_parents
+                ),
+            );
+        }
+        if !current_tips.is_empty()
+            && !parents.iter().any(|p| current_tips.iter().any(|tip| tip == p))
+        {
+            return RpcResponse::err(
+                id,
+                ERR_INVALID_PARAMS,
+                "stale template: parent set does not intersect current DAG tips",
             );
         }
 
@@ -4730,5 +4912,65 @@ mod tests {
         let s = make_server();
         let r = call_params(&s, "validateaddress", json!(["invalid"]));
         assert_eq!(r["result"]["isvalid"], json!(false));
+    }
+
+    #[test]
+    fn auth_policy_write_methods_require_auth() {
+        assert!(requires_auth("sendrawtransaction"));
+        assert!(requires_auth("submitblock"));
+        assert!(requires_auth("deploy_contract"));
+        assert!(!requires_auth("getblockcount"));
+    }
+
+    #[test]
+    fn auth_policy_stop_requires_admin() {
+        assert!(requires_auth("stop"));
+        assert!(requires_admin("stop"));
+        assert!(!requires_admin("submitblock"));
+        assert!(!requires_admin("sendrawtransaction"));
+    }
+
+    #[test]
+    fn submitblock_rejects_stale_difficulty_early() {
+        let s = make_server();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let block = json!({
+            "hash": "a".repeat(64),
+            "height": 1,
+            "timestamp": now.saturating_sub(1),
+            "nonce": 1u64,
+            "extra_nonce": 0u64,
+            "difficulty": u64::MAX,
+            "merkle_root": "b".repeat(64),
+            "version": 1u64,
+            "parents": ["c".repeat(64)],
+            "transactions": [{
+                "hash": "d".repeat(64),
+                "inputs": [],
+                "outputs": [{
+                    "address": "ST1testmineraddress",
+                    "amount": 1000,
+                    "commitment": null,
+                    "range_proof": null,
+                    "ephemeral_pubkey": null
+                }],
+                "fee": 0,
+                "timestamp": now.saturating_sub(1),
+                "is_coinbase": true,
+                "tx_type": "Transfer",
+                "payload_hash": null
+            }]
+        });
+        let r = call_params(&s, "submitblock", json!([block]));
+        let msg = r["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("stale template: difficulty")
+                && msg.contains("mismatch"),
+            "unexpected message: {}",
+            msg
+        );
     }
 }

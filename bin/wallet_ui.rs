@@ -53,8 +53,10 @@ fn rpc_call(rpc_addr: &str, method: &str, params: &[serde_json::Value]) -> serde
     });
     let body_str = body.to_string();
 
+    let fallback_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 9332));
+    let rpc_socket = rpc_addr.parse::<std::net::SocketAddr>().unwrap_or(fallback_addr);
     let stream = match TcpStream::connect_timeout(
-        &rpc_addr.parse().unwrap_or_else(|_| "127.0.0.1:9332".parse().unwrap()),
+        &rpc_socket,
         Duration::from_secs(RPC_TIMEOUT_SECS),
     ) {
         Ok(s) => s,

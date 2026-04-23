@@ -373,27 +373,49 @@ impl BlockValidator {
         expected_difficulty: Option<u64>,
         network: &NetworkMode,
     ) -> Result<(), ConsensusError> {
+        if block.header.height > 0 && expected_difficulty.is_none() {
+            return Err(ConsensusError::BlockValidation(
+                "missing expected_difficulty for non-genesis block".into(),
+            ));
+        }
+
         if let Some(expected) = expected_difficulty {
             // Allow a small tolerance around the expected difficulty to account
             // for the window between getblocktemplate and submitblock. During
             // that window the retarget engine may have adjusted difficulty by
-            // one or more EMA steps. A ±5% tolerance covers normal retarget
-            // drift without opening the door to difficulty gaming.
+            // one or more EMA steps. A ±10% tolerance on non-mainnet covers
+            // normal retarget drift on fast testnet DAG growth without opening
+            // the door to large difficulty gaming.
             //
             // Why not strict equality: in a DAG with 10 BPS, the EMA retarget
             // can move substantially between getblocktemplate and submitblock.
             // Each node sees blocks arrive in different order, so their EMA
-            // states diverge. A ±50% tolerance covers normal EMA drift across
-            // the network while still rejecting difficulty gaming (>2x or <0.5x).
+            // states diverge. We keep non-mainnet tolerance modest (10%)
+            // and keep mainnet strict (0%) for consensus safety.
             //
             // On mainnet with stable hashrate this can be tightened, but for
             // testnet bootstrap and early chain growth, wide tolerance is needed.
-            let min_allowed = expected / 2;
-            let max_allowed = expected.saturating_mul(2);
+            let tolerance_pct: u64 = if matches!(network, NetworkMode::Mainnet) {
+                0
+            } else {
+                10
+            };
+            let delta = if tolerance_pct == 0 {
+                0
+            } else {
+                expected.saturating_mul(tolerance_pct).saturating_div(100).max(1)
+            };
+            let min_allowed = expected.saturating_sub(delta).max(1);
+            let max_allowed = expected.saturating_add(delta);
             if block.header.difficulty < min_allowed || block.header.difficulty > max_allowed {
                 return Err(ConsensusError::BlockValidation(format!(
-                    "difficulty {} outside allowed range [{}, {}] (expected ~{})",
-                    block.header.difficulty, min_allowed, max_allowed, expected
+                    "difficulty {} outside allowed range [{}, {}] (expected {} on {:?}, tolerance={}%)",
+                    block.header.difficulty,
+                    min_allowed,
+                    max_allowed,
+                    expected,
+                    network,
+                    tolerance_pct
                 )));
             }
         }
@@ -1119,16 +1141,11 @@ impl BlockValidator {
     /// funds to the correct HTLC address derived from the secret hash and
     /// participants' public keys.
     fn validate_swap_tx(tx: &Transaction) -> Result<(), ConsensusError> {
+        TxValidator::validate_swap_payload(tx)?;
         // 1. Must have payload_hash (HTLC secret hash)
-        let secret_hash = tx.payload_hash.as_ref().ok_or_else(|| {
+        let _secret_hash = tx.payload_hash.as_ref().ok_or_else(|| {
             ConsensusError::BlockValidation("SwapTx missing payload_hash (HTLC secret hash)".into())
         })?;
-        // 2. payload_hash must be 64 hex chars (32 bytes SHA256)
-        if secret_hash.len() != 64 || !secret_hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(ConsensusError::BlockValidation(
-                "SwapTx payload_hash must be 64 hex chars".into(),
-            ));
-        }
         // 3. Must have at least one output (the HTLC lock)
         if tx.outputs.is_empty() {
             return Err(ConsensusError::BlockValidation(
@@ -1164,16 +1181,11 @@ impl BlockValidator {
     /// whether the decoded data represents a well-formed order that the DEX
     /// engine can match.
     fn validate_dex_order_tx(tx: &Transaction) -> Result<(), ConsensusError> {
+        TxValidator::validate_dex_order_payload(tx)?;
         // 1. Must have payload_hash (order data)
-        let order_data = tx.payload_hash.as_ref().ok_or_else(|| {
+        let _order_data = tx.payload_hash.as_ref().ok_or_else(|| {
             ConsensusError::BlockValidation("DexOrder missing payload_hash (order data)".into())
         })?;
-        // 2. payload_hash must be non-empty hex
-        if order_data.is_empty() || !order_data.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(ConsensusError::BlockValidation(
-                "DexOrder payload_hash must be valid hex".into(),
-            ));
-        }
         // 3. Must not be coinbase
         if tx.is_coinbase {
             return Err(ConsensusError::BlockValidation(
@@ -1199,6 +1211,7 @@ mod tests {
     use super::*;
     use crate::config::consensus::consensus_params::ConsensusParams;
     use crate::config::consensus::emission_schedule::EmissionSchedule;
+    use crate::config::genesis::genesis::TESTNET_DEV_ADDRESS;
     use crate::domain::block::block_body::BlockBody;
     use crate::domain::block::block_header::BlockHeader;
     use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput};
@@ -1750,6 +1763,37 @@ mod tests {
             BlockValidator::validate_transactions_atomic(&block, &utxo_set, &NetworkMode::Mainnet);
         // First tx fails on missing UTXO or second tx fails on double spend
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn consensus_difficulty_mainnet_requires_exact() {
+        let mut block = make_valid_block(1);
+        block.header.difficulty = 1_001;
+        let result =
+            BlockValidator::validate_consensus_layer(&block, Some(1_000), &NetworkMode::Mainnet);
+        assert!(result.is_err(), "mainnet must reject non-exact difficulty");
+    }
+
+    #[test]
+    fn consensus_difficulty_testnet_allows_small_drift_only() {
+        let mut near = make_valid_block(1);
+        // make_coinbase() uses mainnet owner address by default.
+        near.body.transactions[0].outputs[1].address = TESTNET_DEV_ADDRESS.to_string();
+        near.header.difficulty = 1_099; // within +10%
+        let ok = BlockValidator::validate_consensus_layer(&near, Some(1_000), &NetworkMode::Testnet);
+        assert!(ok.is_ok(), "testnet should allow <=10% drift");
+
+        let mut far = near.clone();
+        far.header.difficulty = 1_111; // beyond +10%
+        let bad = BlockValidator::validate_consensus_layer(&far, Some(1_000), &NetworkMode::Testnet);
+        assert!(bad.is_err(), "testnet must reject >10% drift");
+    }
+
+    #[test]
+    fn consensus_rejects_missing_expected_difficulty_non_genesis() {
+        let block = make_valid_block(1);
+        let result = BlockValidator::validate_consensus_layer(&block, None, &NetworkMode::Mainnet);
+        assert!(result.is_err(), "non-genesis must fail closed without expected difficulty");
     }
 
     // ─────────────────────────────────────────

@@ -849,6 +849,11 @@ impl TxValidator {
                     "payload_hash contains non-hex characters".into(),
                 ));
             }
+            if ph.chars().any(|c| c.is_ascii_uppercase()) {
+                return Err(ConsensusError::BlockValidation(
+                    "payload_hash must use lowercase hex".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -918,6 +923,11 @@ impl TxValidator {
                 "SwapTx payload_hash contains non-hex chars".into(),
             ));
         }
+        if hash.chars().any(|c| c.is_ascii_uppercase()) {
+            return Err(ConsensusError::BlockValidation(
+                "SwapTx payload_hash must use lowercase hex".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -942,6 +952,11 @@ impl TxValidator {
         if !data.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(ConsensusError::BlockValidation(
                 "DexOrder payload_hash contains non-hex chars".into(),
+            ));
+        }
+        if data.chars().any(|c| c.is_ascii_uppercase()) {
+            return Err(ConsensusError::BlockValidation(
+                "DexOrder payload_hash must use lowercase hex".into(),
             ));
         }
         Ok(())

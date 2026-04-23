@@ -191,6 +191,23 @@ pub struct FullNode {
 }
 
 impl FullNode {
+    #[inline]
+    fn should_keep_current_tip_on_tie(
+        current_best: &str,
+        best_tip: &str,
+        current_is_tip: bool,
+        current_score: u64,
+        best_score: u64,
+        current_height: u64,
+        best_height: u64,
+    ) -> bool {
+        !current_best.is_empty()
+            && best_tip != current_best
+            && current_is_tip
+            && current_score == best_score
+            && current_height == best_height
+    }
+
     pub fn new(
         block_store: Arc<BlockStore>,
         utxo_set: Arc<UtxoSet>,
@@ -296,6 +313,13 @@ impl FullNode {
     /// Everything else can be rebuilt from BlockStore on recovery.
     /// Process a block received from a specific peer (with rate limiting).
     pub fn process_block_from_peer(&self, block: &Block, peer_id: &str) -> Result<(), NodeError> {
+        // Known block relay is idempotent; do not spend DoS/rate budget on it.
+        if self.dag_manager.block_exists(&block.header.hash)
+            || self.block_store.get_block(&block.header.hash).is_some()
+        {
+            return Err(NodeError::BlockRejected("already exists".to_string()));
+        }
+
         // ── L0: Per-peer DoS guard (cheapest — no deserialization) ────
         // canonical_size_estimate is an approximation (header + tx_count * avg_tx_size).
         // The exact check_block_size (below) uses the real serialized size limit.
@@ -321,6 +345,20 @@ impl FullNode {
             }
         }
 
+        // ── L0.5: Per-peer rate limiting ─────────────────────────────
+        // Keep this before full serialization so high-rate spam is rejected
+        // with minimal CPU cost.
+
+        if self.is_peer_rate_limited(peer_id) {
+            return Err(NodeError::PeerBanned {
+                peer: peer_id.to_string(),
+                reason: format!(
+                    "RATE_LIMITED: exceeds {} blocks/min",
+                    MAX_BLOCKS_PER_PEER_PER_MIN
+                ),
+            });
+        }
+
         // ── L0.25: Exact serialized size check ────────────────────────
         // DosGuard::check uses canonical_size_estimate which under-counts.
         // Serialize once and enforce the exact byte-size limit.
@@ -333,17 +371,6 @@ impl FullNode {
             return Err(NodeError::PeerBanned {
                 peer: peer_id.to_string(),
                 reason: format!("BLOCK_TOO_LARGE: {}", e),
-            });
-        }
-
-        // ── L0.5: Per-peer rate limiting ─────────────────────────────
-        if self.is_peer_rate_limited(peer_id) {
-            return Err(NodeError::PeerBanned {
-                peer: peer_id.to_string(),
-                reason: format!(
-                    "RATE_LIMITED: exceeds {} blocks/min",
-                    MAX_BLOCKS_PER_PEER_PER_MIN
-                ),
             });
         }
 
@@ -432,14 +459,31 @@ impl FullNode {
         // For same/older heights, anchor to already-known blocks at that height.
         if block.header.height <= best_height {
             let hashes = self.block_store.get_block_hashes_at_height(block.header.height);
+            let mut fallback_anchor: Option<u64> = None;
             for h in hashes {
                 if let Some(existing) = self.block_store.get_block(&h) {
-                    return Ok(existing.header.difficulty.max(1));
+                    let anchored = existing.header.difficulty.max(1);
+                    // DAG may contain parallel blocks at the same height.
+                    // Accept when the claimed difficulty matches ANY anchored
+                    // difficulty at that height (not just the first entry).
+                    if anchored == block.header.difficulty.max(1) {
+                        return Ok(anchored);
+                    }
+                    if fallback_anchor.is_none() {
+                        fallback_anchor = Some(anchored);
+                    }
                 }
             }
-            // Historical/side branch with no body available at this height (e.g. pruning):
-            // avoid false-negative rejects by falling back to the claimed header value.
-            return Ok(block.header.difficulty.max(1));
+            if let Some(anchor) = fallback_anchor {
+                return Ok(anchor);
+            }
+            // Fail closed: if we cannot anchor expected difficulty to known chain
+            // data at this height, reject instead of trusting attacker-supplied
+            // header difficulty.
+            return Err(NodeError::BlockRejected(format!(
+                "difficulty anchor missing at height {}",
+                block.header.height
+            )));
         }
 
         // For tip extension (height = best + 1), use the current retarget EMA.
@@ -451,6 +495,13 @@ impl FullNode {
     }
 
     fn process_block_inner(&self, block: &Block, peer_id: &str) -> Result<(), NodeError> {
+        // Fast duplicate guard before dynamic difficulty checks.
+        if self.dag_manager.block_exists(&block.header.hash)
+            || self.block_store.get_block(&block.header.hash).is_some()
+        {
+            return Err(NodeError::BlockRejected("already exists".to_string()));
+        }
+
         // ═══════════════════════════════════════════════════════════════
         // CONSENSUS-CRITICAL VALIDATION PIPELINE
         //
@@ -505,13 +556,6 @@ impl FullNode {
         // ─── PHASE 1 END ─── (above: stateless only, no DB reads) ───
 
         // ─── PHASE 2 START ─── (stateful: reads block_store, dag_manager) ───
-        if self.dag_manager.block_exists(&block.header.hash) {
-            return Err(NodeError::BlockRejected(format!(
-                "Block {} already exists in DAG",
-                &block.header.hash
-            )));
-        }
-
         match BlockValidator::validate_parents_exist(block, &self.block_store, &self.dag_manager) {
             Ok(()) => {}
             Err(e) if e.to_string().contains("not found") => {
@@ -600,6 +644,13 @@ impl FullNode {
     /// Same as process_block_inner but WITHOUT triggering orphan processing.
     /// Used by the iterative orphan resolver to avoid recursion.
     fn process_block_without_orphans(&self, block: &Block) -> Result<(), NodeError> {
+        // Keep duplicate handling consistent with process_block_inner().
+        if self.dag_manager.block_exists(&block.header.hash)
+            || self.block_store.get_block(&block.header.hash).is_some()
+        {
+            return Err(NodeError::BlockRejected("already exists".to_string()));
+        }
+
         // NOTE: ema_difficulty() returns the tip-chain's difficulty
         // estimate. For side-chain blocks this may differ from the
         // difficulty their parents imply, but ShadowDAG's GHOSTDAG
@@ -623,10 +674,6 @@ impl FullNode {
             return Err(NodeError::BlockRejected(
                 result.reason.unwrap_or_else(|| "unknown".to_string()),
             ));
-        }
-
-        if self.dag_manager.block_exists(&block.header.hash) {
-            return Err(NodeError::BlockRejected("Already exists".to_string()));
         }
 
         BlockValidator::validate_parents_exist(block, &self.block_store, &self.dag_manager)
@@ -711,12 +758,34 @@ impl FullNode {
         }
 
         // Use canonical tip selection: blue_score -> height -> hash
-        let best_tip = match Self::select_best_tip(&tips, &self.ghostdag) {
+        let mut best_tip = match Self::select_best_tip(&tips, &self.ghostdag) {
             Some(tip) => tip,
             None => return Ok(()),
         };
 
         let current_best = self.block_store.get_best_hash().unwrap_or_default();
+
+        // Reorg stability guard:
+        // If the current best is still a DAG tip and has the same
+        // (blue_score, chain_height) quality as the newly selected tip,
+        // keep the current best to avoid tie-flip oscillation and needless
+        // rollback/apply churn.
+        let current_is_tip = tips.iter().any(|t| t == &current_best);
+        let best_score = self.ghostdag.get_blue_score(&best_tip);
+        let best_height = self.ghostdag.get_chain_height(&best_tip);
+        let current_score = self.ghostdag.get_blue_score(&current_best);
+        let current_height = self.ghostdag.get_chain_height(&current_best);
+        if Self::should_keep_current_tip_on_tie(
+            &current_best,
+            &best_tip,
+            current_is_tip,
+            current_score,
+            best_score,
+            current_height,
+            best_height,
+        ) {
+            best_tip = current_best.clone();
+        }
 
         if best_tip == current_best {
             return Ok(()); // No chain change
@@ -782,6 +851,27 @@ impl FullNode {
                 MAX_REORG_DEPTH
             )));
         }
+        // Preflight old-chain rollback depth BEFORE any rollback writes.
+        // Without this pre-check, a deep reorg can trigger partial rollback
+        // and then fail mid-way, leaving state inconsistent.
+        if !current_best.is_empty() && !new_chain.contains(&current_best) {
+            let mut cursor = current_best.clone();
+            let mut projected_rollback_depth = 0u64;
+            while !cursor.is_empty() && cursor != fork_point {
+                projected_rollback_depth = projected_rollback_depth.saturating_add(1);
+                if projected_rollback_depth > MAX_REORG_DEPTH {
+                    return Err(NodeError::BlockRejected(format!(
+                        "reorg rollback depth {} exceeds MAX_REORG_DEPTH {}",
+                        projected_rollback_depth, MAX_REORG_DEPTH
+                    )));
+                }
+                cursor = self
+                    .block_store
+                    .get_block(&cursor)
+                    .and_then(|b| b.header.selected_parent.clone())
+                    .unwrap_or_default();
+            }
+        }
 
         // Rollback entire old chain from current_best back to fork point
         let mut rolled_back_old: Vec<String> = Vec::new();
@@ -789,18 +879,12 @@ impl FullNode {
             let mut cursor = current_best.clone();
             let mut rollback_count = 0u64;
             while !cursor.is_empty() && cursor != fork_point {
-                if rollback_count >= MAX_REORG_DEPTH {
-                    return Err(NodeError::BlockRejected(format!(
-                        "reorg rollback depth {} exceeds MAX_REORG_DEPTH",
-                        rollback_count
-                    )));
-                }
                 self.utxo_set.rollback_block_undo(&cursor).map_err(|e| {
                     slog_error!("node", "rollback_failed", block => &cursor, error => &format!("{}", e));
                     NodeError::BlockRejected(format!("rollback failed for {}: {}", cursor, e))
                 })?;
                 // Contract state rollback + receipt purge.
-                self.rollback_contract_block(&cursor);
+                self.rollback_contract_block(&cursor)?;
                 rolled_back_old.push(cursor.clone());
                 rollback_count += 1;
                 // Walk to parent via selected_parent
@@ -866,7 +950,7 @@ impl FullNode {
                                 block => block_hash, error => &format!("{}", e));
                             for hash in applied_new.iter().rev() {
                                 let _ = self.utxo_set.rollback_block_undo(hash);
-                                self.rollback_contract_block(hash);
+                                self.rollback_contract_block_best_effort(hash);
                             }
                             // Best-effort: re-apply the old chain to restore the
                             // previous consistent state. If this also fails, the
@@ -976,7 +1060,7 @@ impl FullNode {
                                     // Roll back this block and reject it.
                                     for hash in applied_new.iter().rev() {
                                         let _ = self.utxo_set.rollback_block_undo(hash);
-                                        self.rollback_contract_block(hash);
+                                        self.rollback_contract_block_best_effort(hash);
                                     }
                                     // Re-apply old chain
                                     for hash in rolled_back_old.iter().rev() {
@@ -1021,7 +1105,7 @@ impl FullNode {
                                 // Rollback partially-applied new chain (UTXO + contract)
                                 for hash in applied_new.iter().rev() {
                                     let _ = self.utxo_set.rollback_block_undo(hash);
-                                    self.rollback_contract_block(hash);
+                                    self.rollback_contract_block_best_effort(hash);
                                 }
                                 // Best-effort: re-apply the old chain to restore the
                                 // previous consistent state. If this also fails, the
@@ -1068,7 +1152,7 @@ impl FullNode {
                                         // Rollback partially-applied new chain (UTXO + contract)
                                         for hash in applied_new.iter().rev() {
                                             let _ = self.utxo_set.rollback_block_undo(hash);
-                                            self.rollback_contract_block(hash);
+                                            self.rollback_contract_block_best_effort(hash);
                                         }
                                         // Best-effort: re-apply the old chain to restore the
                                         // previous consistent state. If this also fails, the
@@ -1111,7 +1195,7 @@ impl FullNode {
                                     // Rollback partially-applied new chain (UTXO + contract)
                                     for hash in applied_new.iter().rev() {
                                         let _ = self.utxo_set.rollback_block_undo(hash);
-                                        self.rollback_contract_block(hash);
+                                        self.rollback_contract_block_best_effort(hash);
                                     }
                                     // Best-effort: re-apply the old chain to restore the
                                     // previous consistent state. If this also fails, the
@@ -1156,7 +1240,7 @@ impl FullNode {
                         // Rollback partially-applied new chain (UTXO + contract)
                         for hash in applied_new.iter().rev() {
                             let _ = self.utxo_set.rollback_block_undo(hash);
-                            self.rollback_contract_block(hash);
+                            self.rollback_contract_block_best_effort(hash);
                         }
                         // Best-effort: re-apply the old chain to restore the
                         // previous consistent state. If this also fails, the
@@ -1192,7 +1276,7 @@ impl FullNode {
                 // Missing block in store — rollback partially-applied new chain (UTXO + contract)
                 for hash in applied_new.iter().rev() {
                     let _ = self.utxo_set.rollback_block_undo(hash);
-                    self.rollback_contract_block(hash);
+                    self.rollback_contract_block_best_effort(hash);
                 }
                 // Best-effort: re-apply the old chain to restore the
                 // previous consistent state. If this also fails, the
@@ -1229,7 +1313,7 @@ impl FullNode {
             // authoritative without a persisted best_hash pointer.
             for hash in applied_new.iter().rev() {
                 let _ = self.utxo_set.rollback_block_undo(hash);
-                self.rollback_contract_block(hash);
+                self.rollback_contract_block_best_effort(hash);
             }
             // Best-effort: re-apply the old chain to restore the
             // previous consistent state. If this also fails, the
@@ -1371,13 +1455,25 @@ impl FullNode {
     /// TX from the orphaned block and get back a receipt marked as
     /// "included in block X" where block X is no longer part of the
     /// canonical chain — a stale read that confuses every indexer.
-    fn rollback_contract_block(&self, block_hash: &str) {
-        // Contract state rollback — best-effort, a missing undo is
-        // non-fatal because some blocks may not have had any
-        // contract TXs and therefore carry no undo record.
-        if let Err(e) = self.contract_storage.rollback_block(block_hash) {
-            crate::slog_warn!("node", "contract_rollback_skipped",
-                block => block_hash, error => &format!("{}", e));
+    fn rollback_contract_block(&self, block_hash: &str) -> Result<(), NodeError> {
+        // Distinguish "no undo data" from "corrupt/read-failed undo data".
+        // Corruption here is consensus-critical and must not be silently skipped.
+        let has_undo = self
+            .contract_storage
+            .has_undo_data_strict(block_hash)
+            .map_err(|e| {
+                NodeError::Consensus(ConsensusError::BlockValidation(format!(
+                    "contract undo probe failed for {}: {}",
+                    block_hash, e
+                )))
+            })?;
+        if has_undo {
+            self.contract_storage.rollback_block(block_hash).map_err(|e| {
+                NodeError::Consensus(ConsensusError::BlockValidation(format!(
+                    "contract rollback failed for {}: {}",
+                    block_hash, e
+                )))
+            })?;
         }
 
         // Remove receipts for every TX in the block.
@@ -1393,6 +1489,14 @@ impl FullNode {
                 delete_receipts_for_block(self.contract_storage.shared_db().as_ref(), &tx_hashes);
                 self.receipt_store.remove_tx_hashes(&tx_hashes);
             }
+        }
+        Ok(())
+    }
+
+    fn rollback_contract_block_best_effort(&self, block_hash: &str) {
+        if let Err(e) = self.rollback_contract_block(block_hash) {
+            slog_error!("node", "CRITICAL_contract_rollback_failed",
+                block => block_hash, error => &format!("{}", e));
         }
     }
 
@@ -2419,7 +2523,7 @@ impl FullNode {
         // Genesis is always best
         if !self.block_store.update_best_hash(&block.header.hash) {
             let _ = self.utxo_set.rollback_block_undo(&block.header.hash);
-            self.rollback_contract_block(&block.header.hash);
+            self.rollback_contract_block_best_effort(&block.header.hash);
             self.ghostdag.clear_all();
             let _ = self.dag_manager.remove_block_topology(&block.header.hash);
             let _ = self.block_store.delete_block(&block.header.hash);
@@ -2448,3 +2552,66 @@ impl crate::domain::traits::block_processor::BlockProcessor for FullNode {
         self.get_tips()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::FullNode;
+
+    #[test]
+    fn keep_current_tip_on_exact_tie_when_current_is_still_tip() {
+        assert!(FullNode::should_keep_current_tip_on_tie(
+            "curr",
+            "new",
+            true,
+            100,
+            100,
+            42,
+            42,
+        ));
+    }
+
+    #[test]
+    fn do_not_keep_current_tip_when_new_tip_is_stronger() {
+        assert!(!FullNode::should_keep_current_tip_on_tie(
+            "curr",
+            "new",
+            true,
+            100,
+            101,
+            42,
+            42,
+        ));
+        assert!(!FullNode::should_keep_current_tip_on_tie(
+            "curr",
+            "new",
+            true,
+            100,
+            100,
+            42,
+            43,
+        ));
+    }
+
+    #[test]
+    fn do_not_keep_when_current_best_not_in_tip_set_or_same_tip() {
+        assert!(!FullNode::should_keep_current_tip_on_tie(
+            "curr",
+            "new",
+            false,
+            100,
+            100,
+            42,
+            42,
+        ));
+        assert!(!FullNode::should_keep_current_tip_on_tie(
+            "curr",
+            "curr",
+            true,
+            100,
+            100,
+            42,
+            42,
+        ));
+    }
+}
+

@@ -21,6 +21,29 @@ const TAG_ADDRESS: &[u8] = b"ShadowDAG_DeriveAddr_v1";
 pub struct KeyDerivation;
 
 impl KeyDerivation {
+    #[inline]
+    fn hmac_sha256_or_fallback(key: &[u8; 32], domain_tag: &[u8], extra: &[u8]) -> [u8; 32] {
+        // HMAC init should succeed for any key length, but never panic in
+        // runtime crypto paths: fall back to deterministic SHA256 derivation.
+        if let Ok(mut mac) = HmacSha256::new_from_slice(key) {
+            mac.update(domain_tag);
+            mac.update(extra);
+            let out = mac.finalize().into_bytes();
+            let mut raw = [0u8; 32];
+            raw.copy_from_slice(&out);
+            raw
+        } else {
+            let mut h = Sha256::new();
+            h.update(domain_tag);
+            h.update(key);
+            h.update(extra);
+            let out = h.finalize();
+            let mut raw = [0u8; 32];
+            raw.copy_from_slice(&out);
+            raw
+        }
+    }
+
     /// Derive a shared key from a view key and transaction public key
     /// Used in stealth address scanning
     pub fn derive(view_key: &str, tx_public_key: &str) -> String {
@@ -39,13 +62,7 @@ impl KeyDerivation {
         // Scalar encoding.  This avoids the skip-ahead loop that caused
         // derive_child(k, 0) == derive_child(k, 1) when index 0 happened
         // to produce a non-canonical result and wrapped to index 1.
-        let mut mac = HmacSha256::new_from_slice(parent_key).expect("HMAC key length");
-        mac.update(TAG_CHILD_KEY);
-        mac.update(&index.to_be_bytes());
-        let result = mac.finalize().into_bytes();
-
-        let mut raw = [0u8; 32];
-        raw.copy_from_slice(&result);
+        let raw = Self::hmac_sha256_or_fallback(parent_key, TAG_CHILD_KEY, &index.to_be_bytes());
         Scalar::from_bytes_mod_order(raw).to_bytes()
     }
 
@@ -61,22 +78,14 @@ impl KeyDerivation {
     /// Derive a view key from a master private key.
     /// Returns bytes guaranteed to be a canonical Scalar encoding.
     pub fn derive_view_key(master_key: &[u8; 32]) -> [u8; 32] {
-        let mut mac = HmacSha256::new_from_slice(master_key).expect("HMAC key length");
-        mac.update(b"shadowdag_view_key_v2");
-        let result = mac.finalize().into_bytes();
-        let mut raw = [0u8; 32];
-        raw.copy_from_slice(&result);
+        let raw = Self::hmac_sha256_or_fallback(master_key, b"shadowdag_view_key_v2", b"");
         Scalar::from_bytes_mod_order(raw).to_bytes()
     }
 
     /// Derive a spend key from a master private key.
     /// Returns bytes guaranteed to be a canonical Scalar encoding.
     pub fn derive_spend_key(master_key: &[u8; 32]) -> [u8; 32] {
-        let mut mac = HmacSha256::new_from_slice(master_key).expect("HMAC key length");
-        mac.update(b"shadowdag_spend_key_v2");
-        let result = mac.finalize().into_bytes();
-        let mut raw = [0u8; 32];
-        raw.copy_from_slice(&result);
+        let raw = Self::hmac_sha256_or_fallback(master_key, b"shadowdag_spend_key_v2", b"");
         Scalar::from_bytes_mod_order(raw).to_bytes()
     }
 

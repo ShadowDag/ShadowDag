@@ -791,8 +791,13 @@ impl VM {
                         pending.discard();
                         return Self::err(gas.gas_used(), "Stack overflow");
                     }
-                    // Safe: emptiness checked above
-                    let top = *stack.last().unwrap();
+                    let top = match stack.last() {
+                        Some(v) => *v,
+                        None => {
+                            pending.discard();
+                            return Self::err(gas.gas_used(), "Stack underflow");
+                        }
+                    };
                     stack.push(top);
                 }
 
@@ -1416,9 +1421,26 @@ impl VM {
                 message: "Stack underflow".to_string(),
             });
         }
-        // Safe: length checked above
-        let b = stack.pop().unwrap();
-        let a = stack.pop().unwrap();
+        let b = match stack.pop() {
+            Some(v) => v,
+            None => {
+                pending.discard();
+                return Err(ExecutionResult::Error {
+                    gas_used: gas.gas_used(),
+                    message: "Stack underflow".to_string(),
+                });
+            }
+        };
+        let a = match stack.pop() {
+            Some(v) => v,
+            None => {
+                pending.discard();
+                return Err(ExecutionResult::Error {
+                    gas_used: gas.gas_used(),
+                    message: "Stack underflow".to_string(),
+                });
+            }
+        };
         Ok((a, b))
     }
 
@@ -1434,10 +1456,36 @@ impl VM {
                 message: "Stack underflow".to_string(),
             });
         }
-        // Safe: length checked above
-        let a = stack.pop().unwrap();
-        let b = stack.pop().unwrap();
-        let c = stack.pop().unwrap();
+        let a = match stack.pop() {
+            Some(v) => v,
+            None => {
+                pending.discard();
+                return Err(ExecutionResult::Error {
+                    gas_used: gas.gas_used(),
+                    message: "Stack underflow".to_string(),
+                });
+            }
+        };
+        let b = match stack.pop() {
+            Some(v) => v,
+            None => {
+                pending.discard();
+                return Err(ExecutionResult::Error {
+                    gas_used: gas.gas_used(),
+                    message: "Stack underflow".to_string(),
+                });
+            }
+        };
+        let c = match stack.pop() {
+            Some(v) => v,
+            None => {
+                pending.discard();
+                return Err(ExecutionResult::Error {
+                    gas_used: gas.gas_used(),
+                    message: "Stack underflow".to_string(),
+                });
+            }
+        };
         Ok((a, b, c))
     }
 

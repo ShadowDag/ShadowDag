@@ -493,11 +493,16 @@ impl Mempool {
 
             // If still over count limit, batch-evict lowest-fee TXs
             if self.count() >= MAX_MEMPOOL_SIZE {
-                self.evict_to_fit(MAX_MEMPOOL_SIZE - EVICT_BATCH_SIZE);
+                let _ = self.evict_to_fit(MAX_MEMPOOL_SIZE - EVICT_BATCH_SIZE);
             }
             // If still over byte limit, evict until we fit
             while self.total_bytes() + tx_bytes > MAX_MEMPOOL_BYTES as u64 && self.count() > 0 {
-                self.evict_to_fit(self.count().saturating_sub(EVICT_BATCH_SIZE));
+                let removed = self.evict_to_fit(self.count().saturating_sub(EVICT_BATCH_SIZE));
+                if removed == 0 {
+                    // No forward progress means we cannot free more space with current
+                    // policy. Stop the loop to avoid a potential infinite eviction spin.
+                    return false;
+                }
             }
 
             // Min-fee-rate admission: if pool is still full, reject if new TX's
@@ -512,7 +517,10 @@ impl Mempool {
                     return false; // TX fee rate too low to displace any package
                 }
                 // Evict one more to make room
-                self.evict_to_fit(MAX_MEMPOOL_SIZE - 1);
+                let removed = self.evict_to_fit(MAX_MEMPOOL_SIZE - 1);
+                if removed == 0 {
+                    return false;
+                }
             }
         }
 
@@ -859,7 +867,7 @@ impl Mempool {
     /// package valuable overall.
     ///
     /// Collects up to EVICT_BATCH_SIZE candidates per iteration to avoid O(n²).
-    pub fn evict_to_fit(&self, target_count: usize) {
+    pub fn evict_to_fit(&self, target_count: usize) -> usize {
         let mut total_evicted = 0usize;
         loop {
             let cur = self.count();
@@ -900,12 +908,23 @@ impl Mempool {
                 break;
             }
 
+            let before_round = self.count();
             for hash in &evict_list {
                 self.remove_transaction(hash);
-                total_evicted += 1;
+            }
+            let after_round = self.count();
+            let removed_this_round = before_round.saturating_sub(after_round);
+            total_evicted = total_evicted.saturating_add(removed_this_round);
+            if removed_this_round == 0 {
+                // No forward progress (e.g., persistent storage failures).
+                // Break to avoid an infinite eviction loop.
+                slog_warn!("mempool", "evict_to_fit_stalled",
+                    before_count => before_round,
+                    target_count => target_count);
+                break;
             }
         }
-        let _ = total_evicted; // suppress unused warning
+        total_evicted
     }
 
     pub fn select_transactions_for_block(

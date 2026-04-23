@@ -73,6 +73,7 @@ static PEER_PENDING: Lazy<Arc<PlMutex<HashMap<String, (u32, u32)>>>> =
 const MAX_PENDING_TXS_PER_PEER: u32 = 500;
 /// Max pending blocks allowed from a single peer before dropping.
 const MAX_PENDING_BLOCKS_PER_PEER: u32 = 50;
+const MAX_OUTBOUND_LAG_SEQS: u64 = 5_000;
 /// Bytes per peer per minute — disconnect abusive peers (100MB/min).
 const MAX_BYTES_PER_PEER_PER_MIN: u64 = 100 * 1024 * 1024;
 /// Interval for bandwidth check (seconds)
@@ -93,6 +94,12 @@ static OUTBOUND_MSGS: Lazy<Arc<PlMutex<(u64, Vec<(u64, P2PMessage)>)>>> =
 #[allow(clippy::type_complexity)]
 static TARGETED_MSGS: Lazy<Arc<PlMutex<Vec<(String, P2PMessage)>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(64))));
+
+/// Per-peer last acknowledged outbound broadcast sequence.
+/// Used to safely prune only messages that all currently connected peers
+/// have already consumed.
+static PEER_LAST_OUTBOUND: Lazy<Arc<PlMutex<HashMap<String, u64>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(HashMap::new())));
 
 /// Received peer addresses from Addr messages — drained by daemon event loop
 /// and fed to PeerManager.
@@ -143,6 +150,10 @@ pub fn cleanup_peer_state(peer_id: &str) {
     {
         let mut p = PEER_PENDING.lock();
         p.remove(peer_id);
+    }
+    {
+        let mut acks = PEER_LAST_OUTBOUND.lock();
+        acks.remove(peer_id);
     }
 }
 
@@ -348,27 +359,29 @@ fn drain_outbound_since(since: u64) -> (Vec<(u64, P2PMessage)>, u64) {
             .map(|(seq, msg)| (*seq, msg.clone()))
             .collect();
     let max_seq = q.0;
-    // WARNING: This truncation does not consider the slowest peer's
-    // last_outbound_seq. Slow peers whose last_outbound_seq falls within
-    // the truncated range will permanently miss those broadcast messages.
-    // A proper fix would track all active sessions' last_outbound_seq and
-    // only trim messages that ALL peers have acknowledged.
-    if q.1.len() > 2000 {
-        let drain_to = q.1.len() - 1000;
-        // Log which sequence range is being discarded so operators can
-        // identify peers that may have missed messages.
-        let oldest_discarded = q.1.first().map(|(s, _)| *s).unwrap_or(0);
-        let newest_discarded =
-            q.1.get(drain_to.saturating_sub(1))
-                .map(|(s, _)| *s)
-                .unwrap_or(0);
-        slog_warn!("p2p", "outbound_queue_truncation",
-            discarded_count => drain_to,
-            oldest_seq => oldest_discarded,
-            newest_seq => newest_discarded,
-            note => "slow peers with last_outbound_seq in this range will miss messages"
-        );
+    // Safe pruning: remove only messages with seq <= global minimum ack
+    // across currently connected peers.
+    let min_ack = {
+        let acks = PEER_LAST_OUTBOUND.lock();
+        acks.values().copied().min()
+    };
+    if let Some(min_seq) = min_ack {
+        if min_seq > 0 {
+            let before = q.1.len();
+            q.1.retain(|(seq, _)| *seq > min_seq);
+            let dropped = before.saturating_sub(q.1.len());
+            if dropped > 0 {
+                slog_debug!("p2p", "outbound_queue_pruned",
+                    dropped => dropped,
+                    min_ack_seq => min_seq);
+            }
+        }
+    } else if q.1.len() > 10_000 {
+        // No connected peers are tracking acks. In this case dropping old
+        // backlog is safe because no live receiver exists.
+        let drain_to = q.1.len() - 1_000;
         q.1.drain(..drain_to);
+        slog_warn!("p2p", "outbound_queue_pruned_no_peers", dropped => drain_to);
     }
     (new_msgs, max_seq)
 }
@@ -488,6 +501,9 @@ struct ConnectionSession {
     /// Whether this peer connected without solving the connection puzzle.
     /// Legacy peers are monitored more aggressively.
     legacy_peer: bool,
+    /// Count of unsupported-message violations (unimplemented protocol commands).
+    /// Repeated abuse is treated as malformed/malicious behavior and disconnects.
+    unsupported_msg_violations: u32,
     /// Last outbound broadcast sequence number sent to this peer.
     /// Used to ensure every peer gets every broadcast message.
     last_outbound_seq: u64,
@@ -511,6 +527,7 @@ impl ConnectionSession {
             last_message_at: now,
             lifecycle_violations: 0,
             legacy_peer: false,
+            unsupported_msg_violations: 0,
             last_outbound_seq: 0,
         }
     }
@@ -751,6 +768,10 @@ impl P2P {
         let peer_str = peer_addr.to_string();
         // IP-only key for ban scoring — ephemeral port changes on reconnect
         let peer_ip = peer_addr.ip().to_string();
+        {
+            let mut acks = PEER_LAST_OUTBOUND.lock();
+            acks.entry(peer_str.clone()).or_insert(0);
+        }
 
         let mut reader = BufReader::new(&stream);
         let mut writer = BufWriter::new(&stream);
@@ -1042,7 +1063,17 @@ impl P2P {
                     }
 
                     // Flush broadcast + targeted outbound messages
-                    Self::flush_outbound(&mut writer, &peer_str, &mut session, magic);
+                    if !Self::flush_outbound(&mut writer, &peer_str, &mut session, magic) {
+                        let _ = Self::write_message(
+                            &mut writer,
+                            &P2PMessage::Reject {
+                                reason: "peer too slow for outbound stream".to_string(),
+                            },
+                            magic,
+                        );
+                        session.protocol.begin_disconnect();
+                        break;
+                    }
                 }
                 Err(e) => {
                     let msg = e.to_string().to_lowercase();
@@ -1109,7 +1140,17 @@ impl P2P {
                             break;
                         }
 
-                        Self::flush_outbound(&mut writer, &peer_str, &mut session, magic);
+                        if !Self::flush_outbound(&mut writer, &peer_str, &mut session, magic) {
+                            let _ = Self::write_message(
+                                &mut writer,
+                                &P2PMessage::Reject {
+                                    reason: "peer too slow for outbound stream".to_string(),
+                                },
+                                magic,
+                            );
+                            session.protocol.begin_disconnect();
+                            break;
+                        }
                         continue;
                     }
 
@@ -1139,8 +1180,33 @@ impl P2P {
         peer_str: &str,
         session: &mut ConnectionSession,
         magic: [u8; 4],
-    ) {
+    ) -> bool {
         let (outbound, _new_seq) = drain_outbound_since(session.last_outbound_seq);
+        if let Some((last_seq, _)) = outbound.last() {
+            let lag = last_seq.saturating_sub(session.last_outbound_seq);
+            if lag > MAX_OUTBOUND_LAG_SEQS {
+                let ip_key = extract_ban_ip(peer_str);
+                DOS_GUARD.add_ban_score_cat(
+                    peer_str,
+                    25,
+                    "excessive outbound lag; disconnecting slow peer",
+                    BanCategory::Resource,
+                );
+                if ip_key != peer_str {
+                    DOS_GUARD.add_ban_score_cat(
+                        &ip_key,
+                        25,
+                        "excessive outbound lag; disconnecting slow peer",
+                        BanCategory::Resource,
+                    );
+                }
+                slog_warn!("p2p", "disconnecting_lagging_peer",
+                    peer => peer_str,
+                    lag_seqs => lag,
+                    threshold => MAX_OUTBOUND_LAG_SEQS);
+                return false;
+            }
+        }
         // Track the last successfully sent sequence number.
         // If a write fails mid-way, we only advance to the last message
         // that was actually delivered, so unsent messages will be retried
@@ -1168,6 +1234,10 @@ impl P2P {
         }
         // Only update to the last sequence that was actually sent successfully.
         session.last_outbound_seq = last_successful_seq;
+        {
+            let mut acks = PEER_LAST_OUTBOUND.lock();
+            acks.insert(peer_str.to_string(), last_successful_seq);
+        }
 
         let targeted = drain_targeted_for(peer_str);
         for t_msg in targeted {
@@ -1181,10 +1251,11 @@ impl P2P {
                         let mut q = TARGETED_MSGS.lock();
                         q.push((peer_str.to_string(), t_msg));
                     }
-                    return;
+                    return false;
                 }
             }
         }
+        true
     }
 
     /// Write a framed message with 13-byte wire header (magic + cmd + len + checksum).
@@ -1279,8 +1350,14 @@ impl P2P {
         let cmd = validate_header(&header, magic)
             .map_err(|pe| NetworkError::Serialization(format!("[Protocol] {}", pe)))?;
 
-        // 5. Read payload
+        // 5. Validate per-command payload size bounds BEFORE allocation/read.
+        // This prevents adversaries from forcing large allocations for commands
+        // that should have tiny payloads (e.g. Ping/Pong).
         let payload_len = header.payload_len as usize;
+        validate_payload_size(cmd, payload_len)
+            .map_err(|pe| NetworkError::Serialization(format!("[Protocol] {}", pe)))?;
+
+        // 6. Read payload
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
             reader
@@ -1288,12 +1365,8 @@ impl P2P {
                 .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
         }
 
-        // 6. Validate checksum (BEFORE deserialization — blocks tampered data)
+        // 7. Validate checksum (BEFORE deserialization — blocks tampered data)
         validate_payload_checksum(&payload, header.checksum)
-            .map_err(|pe| NetworkError::Serialization(format!("[Protocol] {}", pe)))?;
-
-        // 7. Validate per-command payload size bounds
-        validate_payload_size(cmd, payload_len)
             .map_err(|pe| NetworkError::Serialization(format!("[Protocol] {}", pe)))?;
 
         // 8. Deserialize payload (bincode)
@@ -1899,14 +1972,28 @@ impl P2P {
 
             // ── ShadowTx / OnionTx / GetMempool: not yet implemented ───
             P2PMessage::ShadowTx { .. } | P2PMessage::OnionTx { .. } | P2PMessage::GetMempool => {
-                // Unsupported message type — add ban score to discourage DoS via Unknown messages
-                DOS_GUARD.add_ban_score_cat(
-                    peer,
-                    5,
-                    "unsupported message type",
-                    BanCategory::Resource,
+                session.unsupported_msg_violations =
+                    session.unsupported_msg_violations.saturating_add(1);
+                let (score, cat) = if session.unsupported_msg_violations >= 5 {
+                    (50u64, BanCategory::Malformed)
+                } else {
+                    (10u64, BanCategory::Resource)
+                };
+                let reason = format!(
+                    "unsupported message type (count={})",
+                    session.unsupported_msg_violations
                 );
-                slog_warn!("p2p", "unsupported_message", addr => peer, cmd => &format!("{:?}", Self::msg_to_command_id(&msg)));
+                report_bad_peer_cat(peer, score, &reason, cat);
+                slog_warn!("p2p", "unsupported_message",
+                    addr => peer,
+                    cmd => &format!("{:?}", Self::msg_to_command_id(&msg)),
+                    violation_count => session.unsupported_msg_violations);
+                if session.unsupported_msg_violations >= 3 {
+                    return Err(NetworkError::ConnectionFailed(format!(
+                        "disconnecting {} for repeated unsupported messages",
+                        peer
+                    )));
+                }
             }
         }
         Ok(())

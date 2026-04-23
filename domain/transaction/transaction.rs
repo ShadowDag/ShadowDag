@@ -160,10 +160,10 @@ impl Transaction {
         Some(total)
     }
 
-    /// Sum of all output amounts. Panics on overflow — prefer total_output_checked().
+    /// Sum of all output amounts.
+    /// On overflow, returns 0 (fail-safe) instead of panicking.
     pub fn total_output(&self) -> u64 {
-        self.total_output_checked()
-            .expect("output sum overflow — malformed transaction")
+        self.total_output_checked().unwrap_or(0)
     }
 
     /// Canonical serialization for transaction hashing (txid computation).

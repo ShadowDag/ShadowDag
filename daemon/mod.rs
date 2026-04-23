@@ -62,6 +62,26 @@ use crate::indexes::utxo_index::UtxoIndex;
 /// so they MUST be lowercase to ensure case-insensitive matching.
 const ERR_ALREADY_EXISTS: &str = "already exists";
 const ERR_ORPHAN: &str = "orphan";
+const ERR_DIFFICULTY_RANGE: &str = "outside allowed range";
+const ERR_DIFFICULTY_MISMATCH: &str = "difficulty mismatch";
+const ERR_STALE_TEMPLATE: &str = "stale template";
+
+#[inline]
+fn is_transient_block_rejection(err_msg_lc: &str) -> bool {
+    err_msg_lc.contains(ERR_DIFFICULTY_RANGE)
+        || err_msg_lc.contains(ERR_DIFFICULTY_MISMATCH)
+        || err_msg_lc.contains(ERR_STALE_TEMPLATE)
+}
+
+#[inline]
+fn is_non_penalized_block_rejection(err_msg_lc: &str) -> bool {
+    err_msg_lc.contains(ERR_ALREADY_EXISTS)
+        || err_msg_lc.contains(ERR_ORPHAN)
+        || is_transient_block_rejection(err_msg_lc)
+        || err_msg_lc.contains("peer is banned")
+        || err_msg_lc.contains("rate_limited")
+        || err_msg_lc.contains("dos_rejected")
+}
 
 /// Ban score for peers that send invalid blocks rejected by consensus.
 const BAN_SCORE_INVALID_BLOCK: u64 = 20;
@@ -404,7 +424,17 @@ impl DaemonNode {
                 did_work = true;
                 let batch_start = std::time::Instant::now();
                 let mut processed_count = 0usize;
+                let mut seen_hashes: std::collections::HashSet<String> =
+                    std::collections::HashSet::with_capacity(blocks.len());
                 for (peer_id, block) in blocks.iter() {
+                    // Skip duplicate hashes within the same drained batch.
+                    // Multiple peers may relay the same block nearly simultaneously.
+                    // Processing it once is sufficient; extra attempts only create
+                    // noisy "already exists"/stale errors and unnecessary CPU load.
+                    if !seen_hashes.insert(block.header.hash.clone()) {
+                        processed_count += 1;
+                        continue;
+                    }
                     let hash_prefix = if block.header.hash.len() >= 16 {
                         &block.header.hash[..16]
                     } else {
@@ -468,12 +498,9 @@ impl DaemonNode {
                             total_blocks_rejected += 1;
                             let err_msg = e.to_string().to_lowercase();
                             // "already exists" is normal during sync — don't penalize
-                            if !err_msg.contains(ERR_ALREADY_EXISTS)
-                                && !err_msg.contains(ERR_ORPHAN)
-                                && !err_msg.contains("peer is banned")
-                                && !err_msg.contains("rate_limited")
-                                && !err_msg.contains("dos_rejected")
-                            {
+                            // Difficulty/stale-template rejects are often transient races
+                            // between peers mining on nearby tips; treat as non-malicious.
+                            if !is_non_penalized_block_rejection(&err_msg) {
                                 // Ban feedback: penalize peer that sent the bad block
                                 report_bad_peer_cat(
                                     peer_id,
@@ -482,6 +509,8 @@ impl DaemonNode {
                                     BanCategory::Malformed,
                                 );
                                 slog_error!("daemon", "block_rejected_consensus", hash => hash_prefix, peer => peer_id, error => err_msg);
+                            } else {
+                                slog_warn!("daemon", "block_rejected_transient", hash => hash_prefix, peer => peer_id, error => err_msg);
                             }
                         }
                     }
@@ -512,7 +541,15 @@ impl DaemonNode {
                 did_work = true;
                 {
                     let mut mempool = self.mempool.lock();
+                    let mut seen_tx_hashes: std::collections::HashSet<String> =
+                        std::collections::HashSet::with_capacity(txs.len());
                     for (peer_id, tx) in txs.into_iter() {
+                        // Skip duplicate TX hashes within the same drained batch.
+                        // During relay races multiple peers can submit the same TX
+                        // in the same tick; processing once is enough.
+                        if !seen_tx_hashes.insert(tx.hash.clone()) {
+                            continue;
+                        }
                         // ── TX size check (defense-in-depth) ────────
                         // Reject oversized transactions before expensive
                         // validation. Uses the canonical serialization
@@ -581,15 +618,10 @@ impl DaemonNode {
                 use crate::service::network::p2p::p2p::drain_received_addrs;
                 let addrs = drain_received_addrs();
                 if !addrs.is_empty() {
-                    // Use a temporary PeerManager to add discovered addresses.
-                    // The daemon's PeerManager is inside the P2P instance which
-                    // may not be accessible here, so we use the global singleton.
-                    if let Ok(pm) =
-                        crate::service::network::p2p::peer_manager::PeerManager::new_default()
-                    {
-                        for addr in &addrs {
-                            let _ = pm.add_peer(addr);
-                        }
+                    // Persist discovered peers into the daemon's active peer manager.
+                    // Using a temporary manager here drops discoveries on the floor.
+                    for addr in &addrs {
+                        let _ = self.peer_manager.add_peer(addr);
                     }
                     slog_info!("daemon", "peer_addrs_ingested", count => addrs.len());
                 }
@@ -1058,5 +1090,28 @@ mod tests {
         let fn1 = d.full_node();
         let fn2 = d.full_node();
         assert!(Arc::ptr_eq(&fn1, &fn2));
+    }
+
+    #[test]
+    fn transient_block_rejections_are_classified_non_penalized() {
+        assert!(is_non_penalized_block_rejection(
+            "stale template: difficulty mismatch (claimed 4096 expected 3994)"
+        ));
+        assert!(is_non_penalized_block_rejection(
+            "difficulty 3994 outside allowed range [3897, 4091] (expected 3994, tolerance=5%)"
+        ));
+        assert!(is_non_penalized_block_rejection(
+            "stale template: parent set does not intersect current DAG tips"
+        ));
+    }
+
+    #[test]
+    fn hard_invalid_block_rejections_remain_penalized() {
+        assert!(!is_non_penalized_block_rejection(
+            "block validation failed: merkle root mismatch"
+        ));
+        assert!(!is_non_penalized_block_rejection(
+            "block validation failed: invalid coinbase"
+        ));
     }
 }
