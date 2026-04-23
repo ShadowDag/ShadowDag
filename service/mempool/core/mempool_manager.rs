@@ -82,7 +82,7 @@ impl MempoolManager {
             return TxPoolResult::Rejected;
         }
 
-        let result = self.tx_pool.add_transaction(&tx, &self.utxo_set);
+        let mut result = self.tx_pool.add_transaction(&tx, &self.utxo_set);
 
         match &result {
             TxPoolResult::Accepted => {
@@ -112,7 +112,11 @@ impl MempoolManager {
                 self.promote_orphans(&tx.hash);
             }
             TxPoolResult::Orphan => {
-                self.orphan_pool.add(tx.clone(), self.current_height);
+                // Hard fail when orphan pool is full: avoids endless orphan spam
+                // being treated as a soft Orphan outcome.
+                if !self.orphan_pool.add(tx.clone(), self.current_height) {
+                    result = TxPoolResult::Rejected;
+                }
             }
             TxPoolResult::Duplicate => {}
             TxPoolResult::DoubleSpend => {}

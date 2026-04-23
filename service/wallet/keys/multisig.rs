@@ -17,6 +17,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::errors::WalletError;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -156,12 +157,6 @@ impl PendingMultisig {
     }
 
     /// Add a partial signature from a signer.
-    ///
-    /// TODO: This is a placeholder. Real Ed25519 signature verification is needed
-    /// before production. Currently only validates that the signer is authorized,
-    /// the signature is not a duplicate, and the signature has the expected length
-    /// (64 bytes = 128 hex chars). Cryptographic verification of the signature
-    /// against the signer's public key and the transaction hash is NOT performed.
     pub fn add_signature(&mut self, pubkey: &str, signature: &str) -> Result<(), WalletError> {
         // Verify signer is authorized
         if !self.config.is_signer(pubkey) {
@@ -190,6 +185,7 @@ impl PendingMultisig {
                     .to_string(),
             ));
         }
+        verify_ed25519_signature(pubkey, &self.tx_hash, signature)?;
 
         self.signatures.push(PartialSignature {
             signer_pubkey: pubkey.to_string(),
@@ -217,27 +213,16 @@ impl PendingMultisig {
 
     /// Get aggregated signature (when complete).
     ///
-    /// TODO: This is a placeholder that hashes partial signatures together.
-    /// Real Ed25519 multi-signature aggregation (e.g., MuSig2 or similar)
-    /// must be implemented before production use. The current approach does
-    /// NOT provide cryptographic security.
+    /// Disabled in production until a real threshold aggregation scheme
+    /// (for example MuSig2/FROST) is implemented.
     #[deprecated(
-        note = "Placeholder: uses SHA-256 hash, not real Ed25519 signature aggregation. Needs real crypto before production."
+        note = "Disabled: real threshold signature aggregation is not implemented yet."
     )]
     pub fn aggregate_signatures(&self) -> Option<String> {
         if !self.is_complete() {
             return None;
         }
-
-        // Combine all signatures deterministically
-        let mut h = Sha256::new();
-        h.update(b"ShadowDAG_AggSig_v1");
-        h.update(self.tx_hash.as_bytes());
-        for sig in &self.signatures {
-            h.update(sig.signer_pubkey.as_bytes());
-            h.update(sig.signature.as_bytes());
-        }
-        Some(hex::encode(h.finalize()))
+        None
     }
 
     /// Who has signed so far
@@ -362,22 +347,77 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+fn verify_ed25519_signature(
+    signer_pubkey_hex: &str,
+    tx_hash: &str,
+    signature_hex: &str,
+) -> Result<(), WalletError> {
+    if tx_hash.len() != 64 || !tx_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(WalletError::Other(
+            "tx_hash must be 64 hex characters".to_string(),
+        ));
+    }
+    let tx_hash_bytes = hex::decode(tx_hash)
+        .map_err(|_| WalletError::Other("tx_hash must be valid hex".to_string()))?;
+
+    let pubkey_bytes = hex::decode(signer_pubkey_hex)
+        .map_err(|_| WalletError::Other("Signer public key must be hex".to_string()))?;
+    if pubkey_bytes.len() != 32 {
+        return Err(WalletError::Other(
+            "Signer public key must be 32 bytes (64 hex chars)".to_string(),
+        ));
+    }
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&pubkey_bytes);
+    let vk = VerifyingKey::from_bytes(&pk)
+        .map_err(|_| WalletError::Other("Invalid Ed25519 public key".to_string()))?;
+
+    let sig_bytes = hex::decode(signature_hex)
+        .map_err(|_| WalletError::Other("Signature must be hex".to_string()))?;
+    if sig_bytes.len() != 64 {
+        return Err(WalletError::Other(
+            "Signature must be 64 bytes (128 hex chars)".to_string(),
+        ));
+    }
+    let mut sig_arr = [0u8; 64];
+    sig_arr.copy_from_slice(&sig_bytes);
+    let sig = Signature::from_bytes(&sig_arr);
+
+    vk.verify(&tx_hash_bytes, &sig)
+        .map_err(|_| WalletError::Other("Invalid Ed25519 signature".to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
 
-    fn make_keys(n: usize) -> Vec<String> {
-        (0..n).map(|i| format!("pubkey_{:02}", i)).collect()
+    fn make_signing_keys(n: usize) -> Vec<SigningKey> {
+        (0..n)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed.fill((i as u8).saturating_add(1));
+                SigningKey::from_bytes(&seed)
+            })
+            .collect()
     }
 
-    /// Generate a valid 128-hex-char fake signature for testing
-    fn fake_sig(id: u8) -> String {
-        format!("{:0>128}", format!("{:02x}", id))
+    fn pubkeys_hex(keys: &[SigningKey]) -> Vec<String> {
+        keys.iter()
+            .map(|sk| hex::encode(sk.verifying_key().as_bytes()))
+            .collect()
+    }
+
+    fn sign_tx_hash(sk: &SigningKey, tx_hash: &str) -> String {
+        let tx_hash_bytes = hex::decode(tx_hash).expect("test tx_hash must be valid hex");
+        let sig = sk.sign(&tx_hash_bytes);
+        hex::encode(sig.to_bytes())
     }
 
     #[test]
     fn create_2_of_3() {
-        let config = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap();
+        let keys = make_signing_keys(3);
+        let config = MultisigConfig::new(2, pubkeys_hex(&keys), "mainnet").unwrap();
         assert_eq!(config.threshold, 2);
         assert_eq!(config.total, 3);
         assert!(config.address.starts_with("SD1m"));
@@ -386,7 +426,8 @@ mod tests {
 
     #[test]
     fn threshold_exceeds_total_fails() {
-        assert!(MultisigConfig::new(4, make_keys(3), "mainnet").is_err());
+        let keys = make_signing_keys(3);
+        assert!(MultisigConfig::new(4, pubkeys_hex(&keys), "mainnet").is_err());
     }
 
     #[test]
@@ -397,70 +438,109 @@ mod tests {
 
     #[test]
     fn add_signatures_until_complete() {
-        let config = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap();
-        let mut pending = PendingMultisig::new("tx1".into(), config, vec![]);
+        let tx_hash = "1111111111111111111111111111111111111111111111111111111111111111";
+        let keys = make_signing_keys(3);
+        let config = MultisigConfig::new(2, pubkeys_hex(&keys), "mainnet").unwrap();
+        let mut pending = PendingMultisig::new(tx_hash.into(), config, vec![]);
 
         assert!(!pending.is_complete());
         assert_eq!(pending.remaining(), 2);
 
-        pending.add_signature("pubkey_00", &fake_sig(0)).unwrap();
+        let p0 = hex::encode(keys[0].verifying_key().as_bytes());
+        let p1 = hex::encode(keys[1].verifying_key().as_bytes());
+        pending
+            .add_signature(&p0, &sign_tx_hash(&keys[0], tx_hash))
+            .unwrap();
         assert_eq!(pending.remaining(), 1);
 
-        pending.add_signature("pubkey_01", &fake_sig(1)).unwrap();
+        pending
+            .add_signature(&p1, &sign_tx_hash(&keys[1], tx_hash))
+            .unwrap();
         assert!(pending.is_complete());
         #[allow(deprecated)]
         let agg = pending.aggregate_signatures();
-        assert!(agg.is_some());
+        assert!(agg.is_none());
     }
 
     #[test]
     fn duplicate_signature_rejected() {
-        let config = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap();
-        let mut pending = PendingMultisig::new("tx1".into(), config, vec![]);
-        pending.add_signature("pubkey_00", &fake_sig(0)).unwrap();
-        assert!(pending.add_signature("pubkey_00", &fake_sig(99)).is_err());
+        let tx_hash = "2222222222222222222222222222222222222222222222222222222222222222";
+        let keys = make_signing_keys(3);
+        let config = MultisigConfig::new(2, pubkeys_hex(&keys), "mainnet").unwrap();
+        let mut pending = PendingMultisig::new(tx_hash.into(), config, vec![]);
+        let p0 = hex::encode(keys[0].verifying_key().as_bytes());
+        pending
+            .add_signature(&p0, &sign_tx_hash(&keys[0], tx_hash))
+            .unwrap();
+        assert!(
+            pending
+                .add_signature(&p0, &sign_tx_hash(&keys[0], tx_hash))
+                .is_err()
+        );
     }
 
     #[test]
     fn unauthorized_signer_rejected() {
-        let config = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap();
-        let mut pending = PendingMultisig::new("tx1".into(), config, vec![]);
-        assert!(pending.add_signature("unknown_key", &fake_sig(0)).is_err());
+        let tx_hash = "3333333333333333333333333333333333333333333333333333333333333333";
+        let keys = make_signing_keys(3);
+        let config = MultisigConfig::new(2, pubkeys_hex(&keys), "mainnet").unwrap();
+        let mut pending = PendingMultisig::new(tx_hash.into(), config, vec![]);
+        let unknown = SigningKey::from_bytes(&[9u8; 32]);
+        let unknown_pub = hex::encode(unknown.verifying_key().as_bytes());
+        assert!(
+            pending
+                .add_signature(&unknown_pub, &sign_tx_hash(&unknown, tx_hash))
+                .is_err()
+        );
     }
 
     #[test]
     fn pending_signers_tracked() {
-        let config = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap();
-        let mut pending = PendingMultisig::new("tx1".into(), config, vec![]);
-        pending.add_signature("pubkey_00", &fake_sig(0)).unwrap();
+        let tx_hash = "4444444444444444444444444444444444444444444444444444444444444444";
+        let keys = make_signing_keys(3);
+        let config = MultisigConfig::new(2, pubkeys_hex(&keys), "mainnet").unwrap();
+        let mut pending = PendingMultisig::new(tx_hash.into(), config, vec![]);
+        let p0 = hex::encode(keys[0].verifying_key().as_bytes());
+        pending
+            .add_signature(&p0, &sign_tx_hash(&keys[0], tx_hash))
+            .unwrap();
 
         let remaining = pending.pending_signers();
         assert_eq!(remaining.len(), 2);
-        assert!(!remaining.contains(&"pubkey_00".to_string()));
+        assert!(!remaining.contains(&p0));
     }
 
     #[test]
     fn manager_full_flow() {
+        let tx_hash = "5555555555555555555555555555555555555555555555555555555555555555";
+        let keys = make_signing_keys(3);
         let mut mgr = MultisigManager::new();
-        let config = MultisigConfig::new(2, make_keys(3), "mainnet").unwrap();
+        let config = MultisigConfig::new(2, pubkeys_hex(&keys), "mainnet").unwrap();
         let addr = mgr.register(config);
 
-        mgr.initiate("tx1".into(), &addr, vec![1, 2, 3]).unwrap();
-        assert!(!mgr.sign("tx1", "pubkey_00", &fake_sig(0)).unwrap());
-        assert!(mgr.sign("tx1", "pubkey_01", &fake_sig(1)).unwrap()); // Complete!
+        mgr.initiate(tx_hash.into(), &addr, vec![1, 2, 3]).unwrap();
+        let p0 = hex::encode(keys[0].verifying_key().as_bytes());
+        let p1 = hex::encode(keys[1].verifying_key().as_bytes());
+        assert!(
+            !mgr.sign(tx_hash, &p0, &sign_tx_hash(&keys[0], tx_hash))
+                .unwrap()
+        );
+        assert!(mgr.sign(tx_hash, &p1, &sign_tx_hash(&keys[1], tx_hash)).unwrap()); // Complete!
 
-        let completed = mgr.get_completed("tx1").unwrap();
+        let completed = mgr.get_completed(tx_hash).unwrap();
         #[allow(deprecated)]
         let agg = completed.aggregate_signatures();
-        assert!(agg.is_some());
+        assert!(agg.is_none());
     }
 
     #[test]
     fn address_is_deterministic() {
-        let a1 = MultisigConfig::new(2, make_keys(3), "mainnet")
+        let keys = make_signing_keys(3);
+        let pubs = pubkeys_hex(&keys);
+        let a1 = MultisigConfig::new(2, pubs.clone(), "mainnet")
             .unwrap()
             .address;
-        let a2 = MultisigConfig::new(2, make_keys(3), "mainnet")
+        let a2 = MultisigConfig::new(2, pubs, "mainnet")
             .unwrap()
             .address;
         assert_eq!(a1, a2);
@@ -468,10 +548,12 @@ mod tests {
 
     #[test]
     fn different_threshold_different_address() {
-        let a2 = MultisigConfig::new(2, make_keys(3), "mainnet")
+        let keys = make_signing_keys(3);
+        let pubs = pubkeys_hex(&keys);
+        let a2 = MultisigConfig::new(2, pubs.clone(), "mainnet")
             .unwrap()
             .address;
-        let a3 = MultisigConfig::new(3, make_keys(3), "mainnet")
+        let a3 = MultisigConfig::new(3, pubs, "mainnet")
             .unwrap()
             .address;
         assert_ne!(a2, a3);

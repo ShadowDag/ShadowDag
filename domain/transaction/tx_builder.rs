@@ -189,10 +189,11 @@ pub fn build_coinbase_at_height(
     timestamp: u64,
     height: u64,
 ) -> Transaction {
-    let miner_reward = ((block_reward as u128 * miner_pct as u128) / 100) as u64;
-    let dev_reward = block_reward
-        .checked_sub(miner_reward)
-        .expect("miner_reward <= block_reward");
+    // Clamp misconfigured percentages to keep reward split safe and
+    // non-panicking even if caller passes miner_pct > 100.
+    let effective_miner_pct = miner_pct.min(100);
+    let miner_reward = ((block_reward as u128 * effective_miner_pct as u128) / 100) as u64;
+    let dev_reward = block_reward.saturating_sub(miner_reward);
     debug_assert_eq!(miner_reward + dev_reward, block_reward);
 
     let mut h = Sha256::new();

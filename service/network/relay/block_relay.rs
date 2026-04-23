@@ -15,7 +15,7 @@ use crate::service::network::p2p::p2p::{push_outbound, P2PMessage};
 use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::{slog_error, slog_warn};
 
-pub const MAX_ORPHANS: usize = 1_024;
+pub const MAX_ORPHANS: usize = 256;
 
 pub const ORPHAN_TTL_SECS: u64 = 3_600;
 
@@ -25,10 +25,13 @@ pub const ORPHAN_TTL_SECS: u64 = 3_600;
 /// column family or scheduling periodic compaction instead.
 pub const RELAY_KEY_TTL_SECS: u64 = 86_400;
 
-/// Maximum serialized size of a single orphan entry (4 MB).
+/// Maximum serialized size of a single orphan entry (512 KB).
 /// Entries exceeding this are skipped during deserialization to prevent
 /// memory exhaustion from maliciously large or corrupted DB values.
-pub const MAX_ORPHAN_ENTRY_SIZE: usize = 4 * 1024 * 1024;
+pub const MAX_ORPHAN_ENTRY_SIZE: usize = 512 * 1024;
+/// Total on-disk serialized bytes allowed for orphan entries.
+/// Caps memory/disk amplification from parent-missing spam.
+pub const MAX_ORPHAN_POOL_BYTES: usize = 64 * 1024 * 1024;
 
 const PFX_ORPHAN: &[u8] = b"orphan:block:";
 const PFX_RELAY_BLOCK: &[u8] = b"relay:block:";
@@ -213,12 +216,6 @@ impl BlockRelay {
             return;
         }
 
-        self.prune_orphans();
-
-        if self.orphan_count() >= MAX_ORPHANS {
-            self.evict_oldest_orphan();
-        }
-
         let entry = OrphanEntry {
             block,
             received_at: Self::now(),
@@ -230,6 +227,24 @@ impl BlockRelay {
                 slog_warn!("relay", "orphan_entry_too_large",
                     size => data.len(), max => MAX_ORPHAN_ENTRY_SIZE);
                 return;
+            }
+            self.prune_orphans();
+
+            // Keep count bound.
+            while self.orphan_count() >= MAX_ORPHANS {
+                if !self.evict_oldest_orphan() {
+                    return;
+                }
+            }
+            // Keep total-byte budget bound.
+            let mut used = self.orphan_bytes_used();
+            while used.saturating_add(data.len()) > MAX_ORPHAN_POOL_BYTES {
+                if !self.evict_oldest_orphan() {
+                    slog_warn!("relay", "orphan_pool_budget_stalled",
+                        used => used, incoming => data.len(), max => MAX_ORPHAN_POOL_BYTES);
+                    return;
+                }
+                used = self.orphan_bytes_used();
             }
             let key = format!("orphan:block:{}", entry.block.header.hash);
             if let Err(e) = self.db.put(key.as_bytes(), &data) {
@@ -460,7 +475,7 @@ impl BlockRelay {
         }
     }
 
-    fn evict_oldest_orphan(&self) {
+    fn evict_oldest_orphan(&self) -> bool {
         let oldest: Option<(u64, Vec<u8>)> = self
             .db
             .prefix_iterator(PFX_ORPHAN)
@@ -487,8 +502,30 @@ impl BlockRelay {
         if let Some((_, k)) = oldest {
             if let Err(e) = self.db.delete(&k) {
                 slog_warn!("relay", "evict_oldest_orphan_delete_error", error => e);
+                return false;
             }
+            return true;
         }
+        false
+    }
+
+    fn orphan_bytes_used(&self) -> usize {
+        self.db
+            .prefix_iterator(PFX_ORPHAN)
+            .filter_map(|r| match r {
+                Ok((k, v)) => {
+                    if Self::key_has_prefix(k.as_ref(), PFX_ORPHAN) {
+                        Some(v.len())
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => {
+                    slog_warn!("relay", "orphan_bytes_iter_error", error => e);
+                    None
+                }
+            })
+            .sum()
     }
 
     /// Prune stale relay:block:* and relay:pending:* dedup keys older

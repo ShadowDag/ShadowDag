@@ -1,22 +1,15 @@
-// ═══════════════════════════════════════════════════════════════════════════
-//                           S H A D O W D A G
-//                     © ShadowDAG Project — All Rights Reserved
-// ═══════════════════════════════════════════════════════════════════════════
-
 use crate::domain::transaction::transaction::Transaction;
 use crate::domain::transaction::tx_validator::TxValidator;
 use crate::domain::utxo::utxo_key::UtxoKey;
 use crate::domain::utxo::utxo_set::UtxoSet;
 use crate::domain::utxo::utxo_validator::UtxoValidator;
 use crate::service::mempool::core::mempool::Mempool;
-use crate::slog_warn;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 pub struct TxPool {
     pub mempool: Mempool,
     pub spent_inputs: HashSet<UtxoKey>,
     pub seen_hashes: HashSet<String>,
-    pub orphan_parents: HashMap<String, Vec<Transaction>>,
 }
 
 impl TxPool {
@@ -25,7 +18,6 @@ impl TxPool {
             mempool,
             spent_inputs: HashSet::new(),
             seen_hashes: HashSet::new(),
-            orphan_parents: HashMap::new(),
         }
     }
 
@@ -34,8 +26,9 @@ impl TxPool {
             return TxPoolResult::Duplicate;
         }
 
+        // Orphan management is centralized in MempoolManager::orphan_pool.
+        // TxPool must not keep a second unbounded orphan cache.
         if !UtxoValidator::validate(tx, utxo_set) {
-            self.add_to_orphan_pool(tx);
             return TxPoolResult::Orphan;
         }
 
@@ -58,8 +51,6 @@ impl TxPool {
         self.mark_spent(tx);
         self.seen_hashes.insert(tx.hash.clone());
 
-        self.promote_orphans(&tx.hash, utxo_set);
-
         TxPoolResult::Accepted
     }
 
@@ -67,7 +58,8 @@ impl TxPool {
         // Clean up spent_inputs for this transaction's inputs
         if let Some(tx) = self.mempool.get_transaction(txid) {
             for input in &tx.inputs {
-                if let Ok(key) = crate::domain::utxo::utxo_set::utxo_key(&input.txid, input.index) {
+                if let Ok(key) = crate::domain::utxo::utxo_set::utxo_key(&input.txid, input.index)
+                {
                     self.spent_inputs.remove(&key);
                 }
             }
@@ -76,11 +68,11 @@ impl TxPool {
         self.seen_hashes.remove(txid);
     }
 
-    /// Remove a transaction and all its dependents, cleaning up TxPool caches
-    /// (spent_inputs, seen_hashes) for each one.
-    /// mempool.remove_transaction cascades to dependents internally, but only
-    /// cleans up the top-level tx's TxPool caches.  This method ensures every
-    /// recursively removed dependent also has its caches cleaned.
+    // Remove a transaction and all its dependents, cleaning up TxPool caches
+    // (spent_inputs, seen_hashes) for each one.
+    // mempool.remove_transaction cascades to dependents internally, but only
+    // cleans up the top-level tx's TxPool caches. This method ensures every
+    // recursively removed dependent also has its caches cleaned.
     pub fn remove_with_dependents(&mut self, txid: &str) {
         // First collect dependents before removing anything
         let deps = self.mempool.get_dependents(txid);
@@ -121,36 +113,6 @@ impl TxPool {
         for input in &tx.inputs {
             if let Ok(key) = crate::domain::utxo::utxo_set::utxo_key(&input.txid, input.index) {
                 self.spent_inputs.insert(key);
-            }
-        }
-    }
-
-    fn add_to_orphan_pool(&mut self, tx: &Transaction) {
-        for input in &tx.inputs {
-            let bucket = self.orphan_parents.entry(input.txid.clone()).or_default();
-            // BUG FIX: Dedup check — skip if this tx hash is already in the
-            // bucket. Without this, re-submitting the same orphan TX appends
-            // duplicates, causing double-promotion and inflated orphan counts.
-            if !bucket.iter().any(|t| t.hash == tx.hash) {
-                bucket.push(tx.clone());
-            }
-        }
-    }
-
-    fn promote_orphans(&mut self, parent_txid: &str, utxo_set: &UtxoSet) {
-        if let Some(orphans) = self.orphan_parents.remove(parent_txid) {
-            for orphan in orphans {
-                if UtxoValidator::validate(&orphan, utxo_set)
-                    && TxValidator::validate_tx(&orphan, utxo_set)
-                {
-                    if self.mempool.add_transaction(&orphan) {
-                        self.mark_spent(&orphan);
-                        self.seen_hashes.insert(orphan.hash.clone());
-                    } else {
-                        slog_warn!("mempool", "orphan_promotion_failed",
-                            txid => &orphan.hash);
-                    }
-                }
             }
         }
     }

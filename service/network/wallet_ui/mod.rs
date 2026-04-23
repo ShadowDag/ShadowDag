@@ -39,6 +39,7 @@ const MAX_REQUEST_LINE_BYTES: usize = 4096;
 const MAX_HEADER_LINES: usize = 64;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024;
+const MAX_HOST_HEADER_BYTES: usize = 256;
 
 pub struct WalletUiServer {
     port: u16,
@@ -123,6 +124,10 @@ impl WalletUiServer {
 
         // ── Read headers ──
         let mut content_length: usize = 0;
+        let mut content_length_seen = false;
+        let mut bad_content_length = false;
+        let mut host_header: Option<String> = None;
+        let mut origin_header: Option<String> = None;
         let mut header_line = String::new();
         let mut header_lines = 0usize;
         let mut header_bytes = 0usize;
@@ -137,10 +142,34 @@ impl WalletUiServer {
                         Self::send_response(&mut stream, 431, "text/plain", b"Headers too large");
                         return;
                     }
-                    let trimmed = header_line.trim().to_lowercase();
-                    if trimmed.starts_with("content-length:") {
-                        if let Some(val) = trimmed.strip_prefix("content-length:") {
-                            content_length = val.trim().parse().unwrap_or(0);
+                    let trimmed = header_line.trim();
+                    let lower = trimmed.to_ascii_lowercase();
+                    if lower.starts_with("content-length:") {
+                        if content_length_seen {
+                            bad_content_length = true;
+                        }
+                        content_length_seen = true;
+                        if let Some((_, val)) = trimmed.split_once(':') {
+                            match val.trim().parse::<usize>() {
+                                Ok(n) => content_length = n,
+                                Err(_) => bad_content_length = true,
+                            }
+                        } else {
+                            bad_content_length = true;
+                        }
+                    } else if lower.starts_with("host:") {
+                        if let Some((_, val)) = trimmed.split_once(':') {
+                            let host = val.trim();
+                            if host.len() <= MAX_HOST_HEADER_BYTES {
+                                host_header = Some(host.to_string());
+                            }
+                        }
+                    } else if lower.starts_with("origin:") {
+                        if let Some((_, val)) = trimmed.split_once(':') {
+                            let origin = val.trim();
+                            if origin.len() <= MAX_HOST_HEADER_BYTES {
+                                origin_header = Some(origin.to_string());
+                            }
                         }
                     }
                     if header_line.trim().is_empty() {
@@ -157,8 +186,23 @@ impl WalletUiServer {
         let method = parts[0];
         let path = parts[1];
 
+        if method != "GET" && method != "POST" {
+            Self::send_response(&mut stream, 405, "text/plain", b"Method Not Allowed");
+            return;
+        }
+
+        if bad_content_length {
+            Self::send_response(&mut stream, 400, "text/plain", b"Malformed Content-Length");
+            return;
+        }
+
         if path.len() > 512 {
             Self::send_response(&mut stream, 414, "text/plain", b"URI Too Long");
+            return;
+        }
+
+        if !Self::is_safe_local_request(host_header.as_deref(), origin_header.as_deref()) {
+            Self::send_response(&mut stream, 403, "text/plain", b"Forbidden");
             return;
         }
 
@@ -292,6 +336,8 @@ impl WalletUiServer {
             200 => "OK",
             400 => "Bad Request",
             404 => "Not Found",
+            405 => "Method Not Allowed",
+            403 => "Forbidden",
             413 => "Payload Too Large",
             414 => "URI Too Long",
             431 => "Request Header Fields Too Large",
@@ -309,5 +355,27 @@ impl WalletUiServer {
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.write_all(body);
         let _ = stream.flush();
+    }
+
+    fn is_safe_local_request(host: Option<&str>, origin: Option<&str>) -> bool {
+        // Mitigate DNS-rebinding and browser CSRF against localhost wallet UI.
+        // Accept only localhost loopback hostnames for browser-facing requests.
+        if let Some(h) = host {
+            let h = h.to_ascii_lowercase();
+            let host_only = h.split(':').next().unwrap_or("").trim();
+            if host_only != "127.0.0.1" && host_only != "localhost" && host_only != "[::1]" {
+                return false;
+            }
+        }
+        if let Some(o) = origin {
+            let o = o.to_ascii_lowercase();
+            if !(o.starts_with("http://127.0.0.1")
+                || o.starts_with("http://localhost")
+                || o.starts_with("http://[::1]"))
+            {
+                return false;
+            }
+        }
+        true
     }
 }

@@ -187,6 +187,9 @@ impl RpcAuthManager {
     pub fn add_user(&mut self, username: &str, password: &str, role: AuthRole) {
         let salt = generate_salt();
         let hash = salted_hash(password, &salt);
+        // Role/password rotation for an existing user must invalidate all
+        // previously-issued tokens to avoid stale-privilege sessions.
+        self.revoke_user_tokens(username);
         let user = AuthUser {
             username: username.to_string(),
             password_hash: hash,
@@ -198,6 +201,7 @@ impl RpcAuthManager {
     }
 
     pub fn remove_user(&mut self, username: &str) -> bool {
+        self.revoke_user_tokens(username);
         if let Some(db) = &self.db {
             let key = format!("rpc:user:{}", username);
             if let Err(e) = db.delete(key.as_bytes()) {
@@ -213,12 +217,24 @@ impl RpcAuthManager {
     }
 
     pub fn login(&mut self, username: &str, password: &str) -> Result<String, NetworkError> {
-        // Check user exists BEFORE creating an attempts entry (avoids memory leak from nonexistent usernames)
-        let user = self
-            .users
-            .get(username)
-            .ok_or_else(|| NetworkError::Other("Invalid credentials".to_string()))?;
-        let user = user.clone();
+        // Resolve user once without creating attempts entries for unknown names.
+        // Unknown-username path still performs one password verification with a
+        // decoy hash to reduce username-enumeration timing side channels.
+        let user = match self.users.get(username).cloned() {
+            Some(u) => u,
+            None => {
+                let decoy_hash = self
+                    .users
+                    .values()
+                    .next()
+                    .map(|u| u.password_hash.as_str())
+                    .unwrap_or(
+                        "pbkdf2-sha256$210000$00000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000",
+                    );
+                let _ = verify_password(password, decoy_hash);
+                return Err(NetworkError::Other("Invalid credentials".to_string()));
+            }
+        };
 
         let attempts = self.attempts.entry(username.to_string()).or_default();
         if attempts.locked_until > now_secs() {
@@ -288,7 +304,22 @@ impl RpcAuthManager {
         if self.tokens.len() > 1_000 {
             self.prune_expired_tokens();
         }
-        self.tokens.get(token).filter(|t| !t.is_expired())
+        let invalid = match self.tokens.get(token) {
+            Some(t) => {
+                t.is_expired()
+                    // Token must still map to an existing user with the same role.
+                    || !self
+                        .users
+                        .get(&t.username)
+                        .is_some_and(|u| u.role == t.role)
+            }
+            None => return None,
+        };
+        if invalid {
+            let _ = self.tokens.remove(token);
+            return None;
+        }
+        self.tokens.get(token)
     }
 
     pub fn is_authorized(&mut self, token: &str) -> bool {
@@ -317,6 +348,10 @@ impl RpcAuthManager {
 
     pub fn active_token_count(&self) -> usize {
         self.tokens.values().filter(|t| !t.is_expired()).count()
+    }
+
+    fn revoke_user_tokens(&mut self, username: &str) {
+        self.tokens.retain(|_, t| t.username != username);
     }
 }
 
@@ -538,5 +573,35 @@ mod tests {
         assert!(!token.is_empty());
         let upgraded = &auth.users.get("admin").unwrap().password_hash;
         assert!(upgraded.starts_with("pbkdf2-sha256$"));
+    }
+
+    #[test]
+    fn unknown_user_does_not_create_attempt_record() {
+        let mut auth = RpcAuthManager::with_default_admin("secret");
+        let before = auth.attempts.len();
+        let _ = auth.login("not_a_real_user", "whatever");
+        assert_eq!(auth.attempts.len(), before);
+    }
+
+    #[test]
+    fn remove_user_revokes_existing_tokens() {
+        let mut auth = RpcAuthManager::new();
+        auth.add_user("alice", "pw", AuthRole::Admin);
+        let token = auth.login("alice", "pw").expect("login must succeed");
+        assert!(auth.is_authorized(&token));
+        assert!(auth.remove_user("alice"));
+        assert!(!auth.is_authorized(&token));
+    }
+
+    #[test]
+    fn role_change_revokes_existing_tokens() {
+        let mut auth = RpcAuthManager::new();
+        auth.add_user("bob", "pw", AuthRole::ReadOnly);
+        let token = auth.login("bob", "pw").expect("login must succeed");
+        assert!(!auth.can_write(&token));
+
+        // Rotate role to admin; old token must be revoked.
+        auth.add_user("bob", "pw", AuthRole::Admin);
+        assert!(!auth.is_authorized(&token));
     }
 }

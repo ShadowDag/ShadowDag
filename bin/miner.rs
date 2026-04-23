@@ -31,7 +31,7 @@ use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Default)]
 struct RpcAuthConfig {
@@ -136,6 +136,9 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
     let mut total_mined: u64 = 0;
     let mut total_accepted: u64 = 0;
     let mut last_submitted_hash = String::new();
+    let mut last_submitted_template: Option<TemplateKey> = None;
+    let mut last_submit_attempt_at: Option<Instant> = None;
+    let mut stale_reject_streak: u32 = 0;
     let session_start = Instant::now();
 
     slog_info!("miner", "mining_loop_started");
@@ -153,6 +156,13 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
                 continue;
             }
         };
+        let template_key = TemplateKey::from_template(&template);
+
+        // Avoid spamming the node by reminting on an unchanged template.
+        if last_submitted_template.as_ref() == Some(&template_key) {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            continue;
+        }
 
         let height = template.height;
         let prev_hash = template.prev_hash;
@@ -237,17 +247,19 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         let t_hash_count = hash_count.clone();
         let t_difficulty = difficulty;
 
-        // Divide nonce space among threads
-        let nonces_per_thread = (u64::MAX as u128 / threads as u128) as u64;
+        // Divide nonce space among threads.
+        // Reserve u64::MAX because consensus treats it as a sentinel and rejects it.
+        let max_mine_nonce = u64::MAX - 1;
+        let nonces_per_thread = (max_mine_nonce as u128 / threads as u128) as u64;
 
         let result: Option<(u64, String)> = {
             use rayon::prelude::*;
             (0..threads).into_par_iter().find_map_any(|thread_id| {
                 let start_nonce = thread_id as u64 * nonces_per_thread;
                 let end_nonce = if thread_id == threads - 1 {
-                    u64::MAX
+                    max_mine_nonce
                 } else {
-                    start_nonce + nonces_per_thread
+                    start_nonce.saturating_add(nonces_per_thread).min(max_mine_nonce)
                 };
 
                 let mut nonce = start_nonce;
@@ -357,18 +369,106 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
             continue;
         }
 
+        // Re-check template freshness before submit. If tip/difficulty/parents
+        // moved while we were hashing, drop this stale block instead of
+        // flooding the node with guaranteed rejections.
+        if let Some(fresh) = rpc_get_template(&rpc_addr, rpc_auth.bearer_token.as_deref()) {
+            let fresh_key = TemplateKey::from_template(&fresh);
+            if fresh_key != template_key {
+                last_submitted_template = Some(template_key.clone());
+                slog_warn!("miner", "stale_template_drop",
+                    mined_height => height,
+                    mined_diff => difficulty,
+                    fresh_height => fresh.height,
+                    fresh_diff => fresh.difficulty);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+        }
+
+        if let Some(last) = last_submit_attempt_at {
+            let min_gap = Duration::from_millis(MIN_SUBMIT_INTERVAL_MS);
+            let elapsed_since_last = last.elapsed();
+            if elapsed_since_last < min_gap {
+                std::thread::sleep(min_gap - elapsed_since_last);
+            }
+        }
+        last_submit_attempt_at = Some(Instant::now());
+
         match rpc_submit_block(&rpc_addr, &block, rpc_auth.bearer_token.as_deref()) {
             SubmitResult::Accepted => {
                 last_submitted_hash = hash.clone();
+                last_submitted_template = Some(template_key.clone());
+                stale_reject_streak = 0;
                 total_accepted += 1;
                 println!("    âœ… Accepted by node (queued for consensus)");
             }
-            SubmitResult::Unauthorized(reason) | SubmitResult::Rejected(reason) => {
+            SubmitResult::Unauthorized(reason) => {
+                let reason_lc = reason.to_ascii_lowercase();
+                last_submitted_hash.clear();
+                last_submitted_template = None;
+                slog_error!("miner", "block_rejected", reason => &reason);
+                // Auto-recover from token expiry/missing auth without requiring
+                // manual miner restart. If login succeeds, clear template guard
+                // so we can immediately retry on fresh auth.
+                if (reason_lc.contains("authentication required")
+                    || reason_lc.contains("authorization: bearer"))
+                    && rpc_auth.password.as_deref().is_some()
+                {
+                    if let Some(token) =
+                        rpc_login(&rpc_addr, &rpc_auth.username, rpc_auth.password.as_deref())
+                    {
+                        rpc_auth.bearer_token = Some(token);
+                        last_submitted_hash.clear();
+                        last_submitted_template = None;
+                        slog_info!("miner", "rpc_relogin_ok", user => &rpc_auth.username);
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                    } else {
+                        slog_warn!("miner", "rpc_relogin_failed", user => &rpc_auth.username);
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    }
+                } else {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            }
+            SubmitResult::Rejected(reason) => {
+                let reason_lc = reason.to_ascii_lowercase();
+                if reason_lc.contains("rate limit exceeded") {
+                    slog_warn!("miner", "rpc_rate_limited", reason => &reason);
+                    // Keep this template pinned to avoid reminting the same
+                    // stale work in a tight loop.
+                    last_submitted_hash = hash.clone();
+                    last_submitted_template = Some(template_key.clone());
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    continue;
+                }
+                // Template moved while we were hashing (height/difficulty/parents).
+                // Keep guards pinned so we don't re-mine doomed work until the
+                // node template actually advances.
+                if reason_lc.contains("stale template")
+                    || reason_lc.contains("difficulty mismatch")
+                    || reason_lc.contains("too few parents")
+                    || reason_lc.contains("parent set does not intersect")
+                {
+                    stale_reject_streak = stale_reject_streak.saturating_add(1);
+                    last_submitted_hash = hash.clone();
+                    last_submitted_template = Some(template_key.clone());
+                    let backoff_ms = (150u64).saturating_mul(stale_reject_streak.min(10) as u64);
+                    slog_warn!("miner", "stale_or_parent_reject",
+                        reason => &reason,
+                        streak => stale_reject_streak,
+                        backoff_ms => backoff_ms);
+                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                    continue;
+                }
+                stale_reject_streak = 0;
                 last_submitted_hash = hash.clone();
+                last_submitted_template = Some(template_key.clone());
                 slog_error!("miner", "block_rejected", reason => &reason);
             }
             SubmitResult::ConnError => {
                 slog_warn!("miner", "block_submit_conn_error");
+                std::thread::sleep(std::time::Duration::from_millis(250));
             }
         }
 
@@ -401,6 +501,31 @@ struct BlockTemplate {
     total_fees: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TemplateKey {
+    height: u64,
+    difficulty: u64,
+    prev_hash: String,
+    parents: Vec<String>,
+}
+
+impl TemplateKey {
+    fn from_template(template: &BlockTemplate) -> Self {
+        let mut parents = template.parent_hashes.clone();
+        if parents.is_empty() {
+            parents.push(template.prev_hash.clone());
+        }
+        parents.sort();
+        parents.dedup();
+        Self {
+            height: template.height,
+            difficulty: template.difficulty,
+            prev_hash: template.prev_hash.clone(),
+            parents,
+        }
+    }
+}
+
 enum SubmitResult {
     Accepted,
     Unauthorized(String),
@@ -409,6 +534,7 @@ enum SubmitResult {
 }
 
 const MAX_RESPONSE: usize = 1_000_000; // 1 MB
+const MIN_SUBMIT_INTERVAL_MS: u64 = 700; // keep below write rate-limit (100 req/min)
 
 fn rpc_call(addr: &str, method: &str, params: &str, bearer_token: Option<&str>) -> Option<String> {
     let body = format!(
