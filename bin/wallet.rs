@@ -39,6 +39,7 @@ use std::path::PathBuf;
 
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use zeroize::Zeroizing;
 
 static UNLOCK_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -169,25 +170,42 @@ fn load_encrypted_seed() -> Result<EncryptedSeed, WalletError> {
     bincode::deserialize(&data).map_err(|e| WalletError::Other(format!("Deserialize error: {}", e)))
 }
 
-fn prompt_password(prompt_msg: &str) -> String {
+/// Read a password from the terminal with echo disabled (hidden input).
+///
+/// Uses rpassword which disables terminal echo via platform-specific APIs
+/// (termios on Unix, GetConsoleMode on Windows). Falls back to plain read
+/// when stdin is not a TTY (e.g. pipes, CI) — this is required for
+/// non-interactive use but does NOT hide input in that case.
+///
+/// Returns a Zeroizing<String> so the buffer is wiped on drop.
+fn prompt_password(prompt_msg: &str) -> Zeroizing<String> {
     eprint!("{}", prompt_msg);
     io::stderr().flush().ok();
-    let mut password = String::new();
-    match io::stdin().read_line(&mut password) {
-        Ok(0) => {
-            slog_error!("wallet", "stdin_closed_eof", hint => "pipe password via stdin for non-interactive use");
-            std::process::exit(1);
-        }
+
+    // rpassword::read_password reads without echoing when stdin is a TTY.
+    // When stdin is redirected (pipe, file), it falls back to a line read.
+    let input = match rpassword::read_password() {
+        Ok(s) => s,
         Err(e) => {
-            slog_error!("wallet", "password_read_failed", error => &e.to_string());
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                slog_error!("wallet", "stdin_closed_eof", hint => "pipe password via stdin for non-interactive use");
+            } else {
+                slog_error!("wallet", "password_read_failed", error => &e.to_string());
+            }
             std::process::exit(1);
         }
-        Ok(_) => {}
-    }
-    let trimmed = password.trim().to_string();
-    // Zeroize the original buffer before dropping it
-    password.replace_range(.., &"\0".repeat(password.len()));
-    password.clear();
+    };
+
+    // Wrap in Zeroizing so the allocation is wiped on drop.
+    let mut wrapped = Zeroizing::new(input);
+
+    // Normalise by trimming trailing CR/LF/whitespace. Since trim() returns a
+    // borrowed slice, we copy into a new Zeroizing and drop the original.
+    let trimmed = Zeroizing::new(wrapped.trim().to_string());
+    // Explicitly clear the original before it drops (defence in depth —
+    // Zeroizing will also do this, but being explicit documents intent).
+    wrapped.clear();
+    drop(wrapped);
 
     if trimmed.is_empty() {
         slog_error!("wallet", "empty_password_rejected");
@@ -200,26 +218,16 @@ fn prompt_password(prompt_msg: &str) -> String {
     trimmed
 }
 
-/// Zeroize a password string in memory after use.
-fn zeroize_password(mut password: String) {
-    password.replace_range(.., &"\0".repeat(password.len()));
-    password.clear();
-    drop(password);
-}
-
 /// Load an existing wallet from the DB and unlock it with a password.
+///
+/// The password is held in `Zeroizing<String>`, so its backing allocation is
+/// wiped automatically on drop regardless of which code path exits the fn.
 fn load_and_unlock_wallet() -> Result<Wallet, WalletError> {
     // Collect password and encrypted seed BEFORE acquiring the mutex so that
     // blocking I/O (the password prompt) never holds the lock. This eliminates
     // the deadlock risk when another thread also needs UNLOCK_MUTEX.
     let password = prompt_password("Enter wallet password: ");
-    let enc_seed = match load_encrypted_seed() {
-        Ok(s) => s,
-        Err(e) => {
-            zeroize_password(password);
-            return Err(e);
-        }
-    };
+    let enc_seed = load_encrypted_seed()?;
 
     // Now acquire the mutex only for the DB-touching critical section.
     let _guard = UNLOCK_MUTEX.lock();
@@ -235,23 +243,18 @@ fn load_and_unlock_wallet() -> Result<Wallet, WalletError> {
     if let Err(e) = temp.unlock(&enc_seed, &password) {
         // Rate limit after failed password attempt
         std::thread::sleep(std::time::Duration::from_secs(1));
-        zeroize_password(password);
         return Err(e);
     }
     // After unlocking, derive account 0 to get the address
-    if let Err(e) = temp.add_account(0, "Default Account") {
-        zeroize_password(password);
-        return Err(e);
-    }
+    temp.add_account(0, "Default Account")?;
     let addr = temp.address();
 
     // Try to load persisted wallet state (UTXOs, history, etc.)
-    let result = match db.get_wallet(&addr) {
+    match db.get_wallet(&addr) {
         Ok(Some(mut persisted)) => {
             if let Err(e) = persisted.unlock(&enc_seed, &password) {
                 // Rate limit after failed password attempt
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                zeroize_password(password);
                 return Err(e);
             }
             Ok(persisted)
@@ -269,11 +272,7 @@ fn load_and_unlock_wallet() -> Result<Wallet, WalletError> {
             ))
         }
         Err(e) => Err(e),
-    };
-
-    // Zeroize password from memory after use
-    zeroize_password(password);
-    result
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -388,22 +387,17 @@ fn cmd_new(args: &[String]) {
         return;
     }
     let confirm = prompt_password("Confirm password: ");
-    if password != confirm {
-        zeroize_password(password);
-        zeroize_password(confirm);
+    if *password != *confirm {
+        // Both are Zeroizing<String> — auto-wiped on drop at fn exit
         eprintln!("Error: passwords do not match.");
         return;
     }
-    zeroize_password(confirm);
+    drop(confirm); // release the duplicate early
 
     let mut wallet = Wallet::new(network);
     let (mnemonic, enc_seed) = match wallet.create(&password) {
-        Ok(r) => {
-            zeroize_password(password);
-            r
-        }
+        Ok(r) => r,
         Err(e) => {
-            zeroize_password(password);
             eprintln!("Error creating wallet: {}", e);
             return;
         }
@@ -1056,9 +1050,10 @@ fn print_help() {
 #[cfg(feature = "desktop")]
 mod gui {
     use std::io::{BufRead, BufReader, Read as _, Write as _};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use tao::dpi::LogicalSize;
     use tao::event::{Event, WindowEvent};
@@ -1072,39 +1067,82 @@ mod gui {
 
     const MAX_CONNECTIONS: usize = 16;
     const READ_TIMEOUT_SECS: u64 = 5;
+    const REQUEST_DEADLINE_SECS: u64 = 15; // overall deadline per request
     const MAX_REQUEST_LINE: usize = 4096;
     const MAX_HEADER_LINES: usize = 64;
     const MAX_HEADER_BYTES: usize = 16 * 1024;
     const MAX_BODY_BYTES: usize = 64 * 1024;
+    const MAX_HOST_HEADER_BYTES: usize = 256;
+    const MAX_PATH_BYTES: usize = 512;
+    const MAX_ADDR_BYTES: usize = 128; // longest plausible SDAG address
     const RPC_TIMEOUT_SECS: u64 = 5;
 
+    /// Parsed + validated RPC target. Using the SocketAddr's own
+    /// fmt avoids any user-controlled characters (CRLF etc.) in the
+    /// outbound HTTP Host header.
+    #[derive(Clone)]
+    struct RpcTarget {
+        socket: SocketAddr,
+        display: String, // canonical "ip:port" form from the parsed addr
+    }
+
     pub fn run(args: &[String]) {
-        let rpc_addr =
+        let raw_rpc =
             parse_flag(args, "--rpc").unwrap_or_else(|| "127.0.0.1:9332".to_string());
+
+        let rpc_target = match parse_rpc_target(&raw_rpc) {
+            Some(t) => t,
+            None => {
+                eprintln!("[wallet] invalid --rpc address: {}", raw_rpc);
+                return;
+            }
+        };
+
+        // Warn if RPC target is NOT loopback (user may have been tricked).
+        if !is_loopback_ip(&rpc_target.socket) {
+            eprintln!("╔════════════════════════════════════════════════════╗");
+            eprintln!("║  WARNING: Connecting to a non-localhost RPC.      ║");
+            eprintln!("║  Target: {:<38} ║", rpc_target.display);
+            eprintln!("║  Data you see may be controlled by a third party. ║");
+            eprintln!("║  Transactions are NOT sent via this channel —      ║");
+            eprintln!("║  signing happens only in the CLI wallet.           ║");
+            eprintln!("╚════════════════════════════════════════════════════╝");
+        }
+
         let network = parse_flag(args, "--network").unwrap_or_else(|| {
-            if rpc_addr.contains("19332") {
-                "testnet".to_string()
-            } else if rpc_addr.contains("29332") {
-                "regtest".to_string()
-            } else {
-                "mainnet".to_string()
+            // Auto-detect from the RPC port (no substring matching on raw input).
+            match rpc_target.socket.port() {
+                19332 => "testnet".to_string(),
+                29332 => "regtest".to_string(),
+                _ => "mainnet".to_string(),
             }
         });
 
-        // Start local server (HTML + API on same origin)
-        let server_port = start_server(rpc_addr, network.clone());
+        // Start local server (HTML + API on same origin, localhost-only).
+        let server_port = match start_server(rpc_target, network.clone()) {
+            Some(p) => p,
+            None => {
+                eprintln!("[wallet] failed to start local HTTP server");
+                return;
+            }
+        };
         let url = format!("http://127.0.0.1:{}", server_port);
 
-        // Create native window
+        // Create native window (no panics on failure).
         let event_loop = EventLoop::new();
-        let window = WindowBuilder::new()
+        let window = match WindowBuilder::new()
             .with_title(format!("ShadowDAG Wallet — {}", network))
             .with_inner_size(LogicalSize::new(1280.0, 860.0))
             .with_min_inner_size(LogicalSize::new(800.0, 600.0))
             .build(&event_loop)
-            .expect("Failed to create window");
+        {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("[wallet] failed to create window: {}", e);
+                return;
+            }
+        };
 
-        // Create webview with explicit bounds
         let size = window.inner_size();
         let builder = WebViewBuilder::new_as_child(&window)
             .with_bounds(Rect {
@@ -1116,7 +1154,15 @@ mod gui {
         #[cfg(debug_assertions)]
         let builder = builder.with_devtools(true);
 
-        let webview = builder.build().expect("Failed to create webview");
+        let webview = match builder.build() {
+            Ok(wv) => wv,
+            Err(e) => {
+                eprintln!("[wallet] failed to create webview: {}", e);
+                eprintln!("        On Windows, ensure WebView2 Runtime is installed:");
+                eprintln!("        https://developer.microsoft.com/microsoft-edge/webview2/");
+                return;
+            }
+        };
 
         event_loop.run(move |event, _, control_flow| {
             *control_flow = ControlFlow::Wait;
@@ -1148,9 +1194,65 @@ mod gui {
         None
     }
 
+    fn parse_rpc_target(raw: &str) -> Option<RpcTarget> {
+        // Reject obvious control characters up-front (defence in depth —
+        // SocketAddr's own parser also rejects these, but being explicit
+        // makes the guarantee visible at the call site).
+        if raw.chars().any(|c| c.is_control()) {
+            return None;
+        }
+        let socket: SocketAddr = raw.parse().ok()?;
+        // Use the SocketAddr's own Display impl — canonical, no CRLF.
+        let display = socket.to_string();
+        Some(RpcTarget { socket, display })
+    }
+
+    fn is_loopback_ip(addr: &SocketAddr) -> bool {
+        addr.ip().is_loopback()
+    }
+
+    /// Strip characters that could break out of a JSON string into HTML when
+    /// the result is rendered by `innerHTML`. JSON escaping alone is not
+    /// enough because `innerHTML` parses HTML, not JSON. We replace the
+    /// dangerous chars entirely rather than HTML-encoding them, because the
+    /// RPC strings that reach the UI (version, network name, block hash) are
+    /// not expected to contain them in honest operation.
+    fn sanitize_display(s: &str) -> String {
+        s.chars()
+            .map(|c| match c {
+                '<' | '>' | '&' | '\'' | '"' | '`' | '\u{0000}'..='\u{001F}' => '?',
+                other => other,
+            })
+            .take(256)
+            .collect()
+    }
+
+    /// Host / Origin validation — mitigate DNS rebinding and browser CSRF
+    /// against the localhost wallet UI. Accept ONLY loopback hostnames.
+    fn is_safe_local_request(host: Option<&str>, origin: Option<&str>) -> bool {
+        if let Some(h) = host {
+            let h = h.to_ascii_lowercase();
+            let host_only = h.split(':').next().unwrap_or("").trim();
+            if host_only != "127.0.0.1" && host_only != "localhost" && host_only != "[::1]"
+            {
+                return false;
+            }
+        }
+        if let Some(o) = origin {
+            let o = o.to_ascii_lowercase();
+            if !(o.starts_with("http://127.0.0.1")
+                || o.starts_with("http://localhost")
+                || o.starts_with("http://[::1]"))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     // ── RPC Client ──
     fn rpc_call(
-        rpc_addr: &str,
+        target: &RpcTarget,
         method: &str,
         params: &[serde_json::Value],
     ) -> serde_json::Value {
@@ -1162,38 +1264,35 @@ mod gui {
         });
         let body_str = body.to_string();
 
-        let addr = match rpc_addr.parse() {
-            Ok(a) => a,
-            Err(_) => return serde_json::json!({"error": "Invalid RPC address"}),
-        };
         let stream = match TcpStream::connect_timeout(
-            &addr,
-            std::time::Duration::from_secs(RPC_TIMEOUT_SECS),
+            &target.socket,
+            Duration::from_secs(RPC_TIMEOUT_SECS),
         ) {
             Ok(s) => s,
-            Err(e) => {
-                return serde_json::json!({"error": format!("Cannot connect to node: {}", e)})
-            }
+            // Generic error — don't leak OS error details to the webview.
+            Err(_) => return serde_json::json!({"error": "rpc unreachable"}),
         };
-        let _ = stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(RPC_TIMEOUT_SECS)));
-        let _ = stream
-            .set_write_timeout(Some(std::time::Duration::from_secs(RPC_TIMEOUT_SECS)));
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(RPC_TIMEOUT_SECS)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(RPC_TIMEOUT_SECS)));
 
         let mut stream = stream;
+        // Use the PARSED address's Display for the Host header, not the raw
+        // user input — guarantees no CRLF injection into request headers.
         let request = format!(
             "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            rpc_addr, body_str.len(), body_str
+            target.display,
+            body_str.len(),
+            body_str
         );
 
         if stream.write_all(request.as_bytes()).is_err() {
-            return serde_json::json!({"error": "RPC write failed"});
+            return serde_json::json!({"error": "rpc write failed"});
         }
         let _ = stream.flush();
 
         let mut response = String::new();
         if stream.read_to_string(&mut response).is_err() {
-            return serde_json::json!({"error": "RPC read failed"});
+            return serde_json::json!({"error": "rpc read failed"});
         }
 
         if let Some(idx) = response.find("\r\n\r\n") {
@@ -1203,53 +1302,73 @@ mod gui {
                     if let Some(result) = val.get("result") {
                         return result.clone();
                     }
-                    if let Some(error) = val.get("error") {
-                        return serde_json::json!({"error": error});
+                    if val.get("error").is_some() {
+                        // Don't echo node error back — just say it failed.
+                        return serde_json::json!({"error": "rpc returned error"});
                     }
                     val
                 }
-                Err(_) => serde_json::json!({"error": "Invalid RPC JSON"}),
+                Err(_) => serde_json::json!({"error": "invalid rpc response"}),
             }
         } else {
-            serde_json::json!({"error": "Bad RPC response"})
+            serde_json::json!({"error": "malformed rpc response"})
         }
     }
 
     // ── HTTP Server ──
-    fn start_server(rpc_addr: String, network: String) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind server");
-        let port = listener.local_addr().unwrap().port();
+    fn start_server(target: RpcTarget, network: String) -> Option<u16> {
+        // Bind to loopback ONLY. Never listen on 0.0.0.0.
+        let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+        let port = listener.local_addr().ok()?.port();
         let active = Arc::new(AtomicUsize::new(0));
 
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
-                        let prev = active.fetch_add(1, Ordering::AcqRel);
-                        if prev >= MAX_CONNECTIONS {
-                            active.fetch_sub(1, Ordering::Relaxed);
-                            let _ = stream.shutdown(std::net::Shutdown::Both);
-                            continue;
+                        // CAS-based admission: reject before spawning thread
+                        // if at capacity. Eliminates the fetch_add race.
+                        let mut current = active.load(Ordering::Acquire);
+                        loop {
+                            if current >= MAX_CONNECTIONS {
+                                let _ = stream.shutdown(std::net::Shutdown::Both);
+                                break;
+                            }
+                            match active.compare_exchange_weak(
+                                current,
+                                current + 1,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            ) {
+                                Ok(_) => {
+                                    let rpc = target.clone();
+                                    let net = network.clone();
+                                    let active = Arc::clone(&active);
+                                    std::thread::spawn(move || {
+                                        handle_request(stream, &rpc, &net);
+                                        active.fetch_sub(1, Ordering::Release);
+                                    });
+                                    break;
+                                }
+                                Err(actual) => {
+                                    current = actual;
+                                    // retry
+                                }
+                            }
                         }
-                        let rpc = rpc_addr.clone();
-                        let net = network.clone();
-                        let active = Arc::clone(&active);
-                        std::thread::spawn(move || {
-                            handle_request(stream, &rpc, &net);
-                            active.fetch_sub(1, Ordering::Relaxed);
-                        });
                     }
                     Err(_) => continue,
                 }
             }
         });
 
-        port
+        Some(port)
     }
 
-    fn handle_request(mut stream: TcpStream, rpc_addr: &str, network: &str) {
-        let _ = stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(READ_TIMEOUT_SECS)));
+    fn handle_request(mut stream: TcpStream, target: &RpcTarget, network: &str) {
+        let deadline = Instant::now() + Duration::from_secs(REQUEST_DEADLINE_SECS);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
 
         let clone = match stream.try_clone() {
             Ok(c) => c,
@@ -1257,6 +1376,7 @@ mod gui {
         };
         let mut reader = BufReader::new(clone);
 
+        // ── Request line ──
         let mut request_line = String::new();
         {
             let mut limited = (&mut reader).take(MAX_REQUEST_LINE as u64);
@@ -1264,29 +1384,57 @@ mod gui {
                 return;
             }
         }
+        if Instant::now() > deadline {
+            return;
+        }
+        if request_line.len() >= MAX_REQUEST_LINE && !request_line.ends_with('\n') {
+            send_response(&mut stream, 414, "text/plain", b"URI Too Long");
+            return;
+        }
 
+        // ── Headers (with Host/Origin extraction for DNS-rebinding guard) ──
         let mut content_length: usize = 0;
+        let mut host_header: Option<String> = None;
+        let mut origin_header: Option<String> = None;
         let mut header_line = String::new();
         let mut header_lines = 0usize;
         let mut header_bytes = 0usize;
         loop {
+            if Instant::now() > deadline {
+                return;
+            }
             header_line.clear();
             match reader.read_line(&mut header_line) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
                     header_lines += 1;
                     header_bytes += header_line.len();
-                    if header_lines > MAX_HEADER_LINES || header_bytes > MAX_HEADER_BYTES
-                    {
+                    if header_lines > MAX_HEADER_LINES || header_bytes > MAX_HEADER_BYTES {
+                        send_response(&mut stream, 431, "text/plain", b"Headers Too Large");
                         return;
                     }
-                    let lower = header_line.trim().to_ascii_lowercase();
+                    let trimmed = header_line.trim();
+                    let lower = trimmed.to_ascii_lowercase();
                     if lower.starts_with("content-length:") {
-                        if let Some((_, val)) = header_line.trim().split_once(':') {
+                        if let Some((_, val)) = trimmed.split_once(':') {
                             content_length = val.trim().parse().unwrap_or(0);
                         }
+                    } else if lower.starts_with("host:") {
+                        if let Some((_, val)) = trimmed.split_once(':') {
+                            let h = val.trim();
+                            if h.len() <= MAX_HOST_HEADER_BYTES {
+                                host_header = Some(h.to_string());
+                            }
+                        }
+                    } else if lower.starts_with("origin:") {
+                        if let Some((_, val)) = trimmed.split_once(':') {
+                            let o = val.trim();
+                            if o.len() <= MAX_HOST_HEADER_BYTES {
+                                origin_header = Some(o.to_string());
+                            }
+                        }
                     }
-                    if header_line.trim().is_empty() {
+                    if trimmed.is_empty() {
                         break;
                     }
                 }
@@ -1300,35 +1448,80 @@ mod gui {
         let method = parts[0];
         let path = parts[1];
 
+        if path.len() > MAX_PATH_BYTES {
+            send_response(&mut stream, 414, "text/plain", b"URI Too Long");
+            return;
+        }
+
+        if method != "GET" && method != "POST" {
+            send_response(&mut stream, 405, "text/plain", b"Method Not Allowed");
+            return;
+        }
+
+        // DNS-rebinding / CSRF guard.
+        if !is_safe_local_request(host_header.as_deref(), origin_header.as_deref()) {
+            send_response(&mut stream, 403, "text/plain", b"Forbidden");
+            return;
+        }
+
+        // ── Body (POST) — strict UTF-8, no lossy conversion ──
         let body = if method == "POST"
             && content_length > 0
             && content_length <= MAX_BODY_BYTES
         {
+            if Instant::now() > deadline {
+                return;
+            }
             let mut buf = vec![0u8; content_length];
             if reader.read_exact(&mut buf).is_err() {
                 return;
             }
-            String::from_utf8_lossy(&buf).to_string()
+            match String::from_utf8(buf) {
+                Ok(s) => s,
+                Err(_) => {
+                    send_response(&mut stream, 400, "text/plain", b"Invalid UTF-8 body");
+                    return;
+                }
+            }
         } else {
             String::new()
         };
 
         match (method, path) {
             ("GET", "/" | "/index.html") => {
-                send_response(&mut stream, 200, "text/html; charset=utf-8", WALLET_HTML.as_bytes());
+                send_response(
+                    &mut stream,
+                    200,
+                    "text/html; charset=utf-8",
+                    WALLET_HTML.as_bytes(),
+                );
             }
             ("GET", "/api/wallet/overview") => {
-                send_json(&mut stream, &api_overview(rpc_addr, network));
+                send_json(&mut stream, &api_overview(target, network));
             }
             ("GET", "/api/wallet/network") => {
-                send_json(&mut stream, &api_network(rpc_addr));
+                send_json(&mut stream, &api_network(target));
             }
             ("GET", p) if p.starts_with("/api/wallet/balance/") => {
                 let addr = &p["/api/wallet/balance/".len()..];
-                send_json(&mut stream, &api_balance(rpc_addr, addr));
+                if addr.is_empty() || addr.len() > MAX_ADDR_BYTES {
+                    send_response(&mut stream, 400, "text/plain", b"Invalid address");
+                    return;
+                }
+                // Only ASCII alphanumerics + a few separators allowed in
+                // SDAG addresses — reject anything that could be a path or
+                // payload injection vector.
+                if !addr
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    send_response(&mut stream, 400, "text/plain", b"Invalid address");
+                    return;
+                }
+                send_json(&mut stream, &api_balance(target, addr));
             }
             ("POST", "/api/wallet/send") => {
-                send_json(&mut stream, &api_send(rpc_addr, &body));
+                send_json(&mut stream, &api_send(target, &body));
             }
             ("GET", "/favicon.ico") => {
                 send_response(&mut stream, 204, "text/plain", b"");
@@ -1340,10 +1533,10 @@ mod gui {
     }
 
     // ── API Handlers ──
-    fn api_overview(rpc_addr: &str, network: &str) -> serde_json::Value {
-        let info = rpc_call(rpc_addr, "getnetworkinfo", &[]);
-        let height_val = rpc_call(rpc_addr, "getblockcount", &[]);
-        let mempool = rpc_call(rpc_addr, "getmempoolinfo", &[]);
+    fn api_overview(target: &RpcTarget, network: &str) -> serde_json::Value {
+        let info = rpc_call(target, "getnetworkinfo", &[]);
+        let height_val = rpc_call(target, "getblockcount", &[]);
+        let mempool = rpc_call(target, "getmempoolinfo", &[]);
 
         let height = if height_val.is_number() {
             height_val.as_u64().unwrap_or(0)
@@ -1357,21 +1550,28 @@ mod gui {
             .get("peer_count")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        let version = info
-            .get("version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("1.0.0");
+        // Sanitize any display strings coming from RPC — a malicious or
+        // compromised RPC could otherwise inject HTML into innerHTML.
+        let version = sanitize_display(
+            info.get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("1.0.0"),
+        );
         let mempool_size = mempool.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
-        let net_name = info
-            .get("network")
-            .and_then(|v| v.as_str())
-            .unwrap_or(network);
+        let net_name = sanitize_display(
+            info.get("network")
+                .and_then(|v| v.as_str())
+                .unwrap_or(network),
+        );
+        let best_hash = sanitize_display(
+            info.get("best_hash").and_then(|v| v.as_str()).unwrap_or(""),
+        );
 
         serde_json::json!({
             "node_version": version,
             "network": net_name,
             "best_height": height,
-            "best_hash": info.get("best_hash").and_then(|v| v.as_str()).unwrap_or(""),
+            "best_hash": best_hash,
             "peer_count": peer_count,
             "mempool_size": mempool_size,
             "chain_name": "ShadowDAG",
@@ -1379,26 +1579,32 @@ mod gui {
         })
     }
 
-    fn api_network(rpc_addr: &str) -> serde_json::Value {
-        let info = rpc_call(rpc_addr, "getnetworkinfo", &[]);
+    fn api_network(target: &RpcTarget) -> serde_json::Value {
+        let info = rpc_call(target, "getnetworkinfo", &[]);
         let height = info
             .get("best_height")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
 
+        let network = sanitize_display(
+            info.get("network")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+        );
+
         serde_json::json!({
-            "network": info.get("network").and_then(|v| v.as_str()).unwrap_or("unknown"),
+            "network": network,
             "p2p_port": info.get("p2p_port").and_then(|v| v.as_u64()).unwrap_or(0),
             "rpc_port": info.get("rpc_port").and_then(|v| v.as_u64()).unwrap_or(0),
             "peer_count": info.get("peer_count").and_then(|v| v.as_u64()).unwrap_or(0),
             "best_height": height,
-            "rpc_endpoint": rpc_addr,
+            "rpc_endpoint": target.display,
         })
     }
 
-    fn api_balance(rpc_addr: &str, addr: &str) -> serde_json::Value {
+    fn api_balance(target: &RpcTarget, addr: &str) -> serde_json::Value {
         let result = rpc_call(
-            rpc_addr,
+            target,
             "getbalancebyaddress",
             &[serde_json::Value::String(addr.to_string())],
         );
@@ -1408,31 +1614,50 @@ mod gui {
             result.get("balance").and_then(|v| v.as_u64()).unwrap_or(0)
         };
         serde_json::json!({
+            // `addr` is already validated against [A-Za-z0-9_-] in the router.
             "address": addr,
             "balance": balance,
             "balance_sdag": balance as f64 / 100_000_000.0,
         })
     }
 
-    fn api_send(rpc_addr: &str, body: &str) -> serde_json::Value {
-        match serde_json::from_str::<serde_json::Value>(body) {
-            Ok(req) => {
-                let to = req.get("to").and_then(|v| v.as_str()).unwrap_or("");
-                let amount = req.get("amount").and_then(|v| v.as_str()).unwrap_or("0");
-                if to.is_empty() || amount == "0" {
-                    serde_json::json!({"error": "Missing 'to' or 'amount'"})
-                } else {
-                    serde_json::json!({
-                        "status": "prepared",
-                        "to": to,
-                        "amount": amount,
-                        "message": format!("Sign via CLI:\n  shadowdag-wallet send {} {}", to, amount),
-                        "rpc_endpoint": rpc_addr,
-                    })
-                }
-            }
-            Err(e) => serde_json::json!({"error": format!("Invalid JSON: {}", e)}),
+    fn api_send(target: &RpcTarget, body: &str) -> serde_json::Value {
+        let req: serde_json::Value = match serde_json::from_str(body) {
+            Ok(v) => v,
+            Err(_) => return serde_json::json!({"error": "invalid json"}),
+        };
+        let to_raw = req.get("to").and_then(|v| v.as_str()).unwrap_or("");
+        let amount_raw = req.get("amount").and_then(|v| v.as_str()).unwrap_or("0");
+
+        // Validate both fields — the UI should already do this but never
+        // trust the client. Sanitize before echoing back.
+        if to_raw.is_empty() || to_raw.len() > MAX_ADDR_BYTES {
+            return serde_json::json!({"error": "invalid 'to' address"});
         }
+        if !to_raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return serde_json::json!({"error": "invalid 'to' address"});
+        }
+        if amount_raw.is_empty() || amount_raw.len() > 32 {
+            return serde_json::json!({"error": "invalid 'amount'"});
+        }
+        if !amount_raw
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == ',')
+        {
+            return serde_json::json!({"error": "invalid 'amount'"});
+        }
+
+        // Echo back — these are sanitized.
+        serde_json::json!({
+            "status": "prepared",
+            "to": to_raw,
+            "amount": amount_raw,
+            "message": format!("Sign via CLI:\n  shadowdag-wallet send {} {}", to_raw, amount_raw),
+            "rpc_endpoint": target.display,
+        })
     }
 
     // ── HTTP helpers ──
@@ -1446,15 +1671,31 @@ mod gui {
             200 => "OK",
             204 => "No Content",
             400 => "Bad Request",
+            403 => "Forbidden",
             404 => "Not Found",
+            405 => "Method Not Allowed",
+            413 => "Payload Too Large",
+            414 => "URI Too Long",
+            431 => "Request Header Fields Too Large",
             _ => "OK",
         };
+        // Security response headers: deny framing, no sniffing, no referrer.
+        // CSP restricts scripts/forms to the same origin, mitigating XSS if
+        // anything slips past sanitize_display.
         let response = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            status,
-            status_text,
-            content_type,
-            body.len()
+            "HTTP/1.1 {status} {status_text}\r\n\
+             Content-Type: {content_type}\r\n\
+             Content-Length: {len}\r\n\
+             X-Content-Type-Options: nosniff\r\n\
+             X-Frame-Options: DENY\r\n\
+             Referrer-Policy: no-referrer\r\n\
+             Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'\r\n\
+             Connection: close\r\n\
+             \r\n",
+            status = status,
+            status_text = status_text,
+            content_type = content_type,
+            len = body.len()
         );
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.write_all(body);

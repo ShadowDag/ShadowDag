@@ -156,6 +156,9 @@ anyhow             = "1"
 byteorder          = "1"
 bytes              = "1"
 
+# ─── Terminal / Password Input ────────────────────────────────────────────────
+rpassword          = "7"
+
 # ─── Desktop GUI (optional — for shadowdag-wallet-desktop) ────────────────
 tao                = { version = "0.30", optional = true }
 wry                = { version = "0.44", optional = true }
