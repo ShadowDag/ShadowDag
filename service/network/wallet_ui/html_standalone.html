@@ -148,9 +148,125 @@ tr:last-child td{border-bottom:none}
 }
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+
+/* ── Setup / Unlock Overlay ─────────────────── */
+.setup-overlay{position:fixed;inset:0;background:var(--bg);z-index:200;display:none;align-items:center;justify-content:center;padding:24px;overflow:auto}
+.setup-overlay.visible{display:flex}
+.setup-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:32px;max-width:520px;width:100%;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+.setup-card h1{color:#fff;font-size:22px;margin-bottom:4px;text-align:center}
+.setup-card h1 span{background:linear-gradient(135deg,var(--accent),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.setup-card .sub{color:var(--dim);text-align:center;font-size:13px;margin-bottom:24px}
+.setup-btn{display:flex;align-items:center;gap:12px;padding:16px 18px;background:var(--bg2);border:1px solid var(--border);border-radius:10px;cursor:pointer;width:100%;transition:all .15s;margin-bottom:10px;color:var(--text);text-align:left}
+.setup-btn:hover{border-color:var(--accent);background:var(--card2)}
+.setup-btn .icon{width:40px;height:40px;border-radius:10px;background:rgba(88,166,255,.12);display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.setup-btn .icon svg{width:22px;height:22px;fill:var(--accent)}
+.setup-btn .info{flex:1}
+.setup-btn .info h3{color:#fff;font-size:14px;margin-bottom:2px}
+.setup-btn .info p{color:var(--dim);font-size:12px}
+.setup-back{display:inline-flex;align-items:center;gap:6px;color:var(--dim);font-size:13px;cursor:pointer;margin-bottom:16px;user-select:none}
+.setup-back:hover{color:var(--accent)}
+.mnemonic-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin:16px 0;padding:14px;background:var(--bg);border:1px solid var(--border);border-radius:8px;font-family:'SF Mono',monospace}
+.mnemonic-word{font-size:13px;color:var(--text2);padding:4px 8px;background:var(--card2);border-radius:4px;display:flex;align-items:center;gap:6px}
+.mnemonic-word .num{color:var(--dim);font-size:10px;min-width:16px}
+.warn-box{background:rgba(210,153,34,.08);border:1px solid rgba(210,153,34,.3);border-radius:8px;padding:12px 14px;color:var(--orange);font-size:12px;margin:14px 0}
+.warn-box strong{color:#fff}
+
+/* ── Addresses table (accounts view) ────────── */
+.acct-card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:18px;margin-bottom:12px}
+.acct-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.acct-head .name{font-size:15px;color:#fff;font-weight:600}
+.acct-head .idx{font-size:11px;color:var(--dim);background:var(--card2);padding:2px 8px;border-radius:10px}
+.acct-addr{font-family:'SF Mono',monospace;font-size:12px;color:var(--text2);padding:8px 10px;background:var(--bg);border-radius:6px;margin:4px 0;word-break:break-all;display:flex;align-items:center;gap:8px}
+.acct-addr .label{color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.5px;flex-shrink:0;font-family:inherit}
 </style>
 </head>
 <body>
+
+<!-- ═══ Setup / Unlock Overlay ═══ -->
+<div id="setupOverlay" class="setup-overlay">
+  <div class="setup-card">
+    <!-- Welcome: Create or Import -->
+    <div id="setupWelcome">
+      <h1><span>Shadow</span>DAG Wallet</h1>
+      <div class="sub">Get started — no wallet detected on this device.</div>
+      <div class="setup-btn" onclick="setupShow('create')">
+        <div class="icon"><svg viewBox="0 0 16 16"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zm.75 4.75v2.5h2.5a.75.75 0 010 1.5h-2.5v2.5a.75.75 0 01-1.5 0v-2.5h-2.5a.75.75 0 010-1.5h2.5v-2.5a.75.75 0 011.5 0z"/></svg></div>
+        <div class="info"><h3>Create New Wallet</h3><p>Generate a fresh mnemonic + encrypted seed</p></div>
+      </div>
+      <div class="setup-btn" onclick="showCliImport()">
+        <div class="icon" style="background:rgba(188,140,255,.12)"><svg viewBox="0 0 16 16" style="fill:var(--purple)"><path d="M2 2.5A2.5 2.5 0 014.5 0h8.75a.75.75 0 01.75.75v12.5a.75.75 0 01-.75.75h-2.5a.75.75 0 010-1.5h1.75v-2h-8a1 1 0 00-.714 1.7.75.75 0 01-1.072 1.05A2.495 2.495 0 012 11.5v-9z"/></svg></div>
+        <div class="info"><h3>Import from Mnemonic</h3><p>Restore an existing wallet via CLI</p></div>
+      </div>
+    </div>
+
+    <!-- Unlock existing -->
+    <div id="setupUnlock" style="display:none">
+      <h1>Unlock Wallet</h1>
+      <div class="sub">Enter your password to unlock this device's wallet.</div>
+      <div class="form-group">
+        <label>Password</label>
+        <input id="unlockPwd" type="password" placeholder="••••••••" autofocus>
+      </div>
+      <button class="btn-primary" onclick="doUnlock()" style="width:100%">Unlock</button>
+      <div id="unlockErr" style="margin-top:10px;color:var(--red);font-size:12px;text-align:center"></div>
+    </div>
+
+    <!-- Create: password entry -->
+    <div id="setupCreate" style="display:none">
+      <div class="setup-back" onclick="setupShow('welcome')">← Back</div>
+      <h1>Create New Wallet</h1>
+      <div class="sub">Choose a strong password to encrypt your seed on disk.</div>
+      <div class="form-group">
+        <label>Network</label>
+        <select id="createNetwork" style="width:100%;padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:14px">
+          <option value="mainnet">Mainnet</option>
+          <option value="testnet">Testnet</option>
+          <option value="regtest">Regtest (local)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Password</label>
+        <input id="createPwd" type="password" placeholder="At least 8 characters">
+      </div>
+      <div class="form-group">
+        <label>Confirm Password</label>
+        <input id="createConfirm" type="password" placeholder="Re-enter password">
+      </div>
+      <button class="btn-primary" onclick="doCreate()" style="width:100%">Create Wallet</button>
+      <div id="createErr" style="margin-top:10px;color:var(--red);font-size:12px;text-align:center"></div>
+    </div>
+
+    <!-- Create: mnemonic display -->
+    <div id="setupMnemonic" style="display:none">
+      <h1>✓ Wallet Created</h1>
+      <div class="sub">Write down these 24 words in order.</div>
+      <div class="warn-box">
+        <strong>This is the ONLY way to recover your wallet.</strong><br>
+        Never share it, never type it into a website, and keep it offline.
+      </div>
+      <div class="mnemonic-grid" id="mnemonicGrid"></div>
+      <div style="margin:14px 0;padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:8px;font-family:monospace;font-size:12px;word-break:break-all">
+        <div style="color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Your Address</div>
+        <span id="mnemonicAddr"></span>
+      </div>
+      <button class="btn-primary" onclick="doMnemonicConfirm()" style="width:100%">I've written it down — Open Wallet</button>
+    </div>
+
+    <!-- Import notice -->
+    <div id="setupImport" style="display:none">
+      <div class="setup-back" onclick="setupShow('welcome')">← Back</div>
+      <h1>Import via CLI</h1>
+      <div class="sub">Use the command-line wallet to restore from mnemonic.</div>
+      <div style="padding:14px;background:var(--bg);border:1px solid var(--border);border-radius:8px;font-family:monospace;font-size:12px;color:var(--cyan);margin:14px 0">
+        shadowdag-wallet new [network]<br>
+        <span style="color:var(--dim)">(follow prompts to paste mnemonic)</span>
+      </div>
+      <p style="font-size:12px;color:var(--dim);line-height:1.6">
+        After importing via CLI, close and reopen the desktop wallet — it will detect the restored seed file and prompt you to unlock.
+      </p>
+    </div>
+  </div>
+</div>
 
 <!-- ═══ Sidebar ═══ -->
 <aside class="sidebar">
@@ -299,14 +415,18 @@ tr:last-child td{border-bottom:none}
 
 <!-- ═══ Addresses Panel ═══ -->
 <div id="p-addresses" class="panel">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-    <h3 style="color:#fff">Address Book</h3>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:8px;flex-wrap:wrap">
+    <h3 style="color:#fff">My Accounts &amp; Addresses</h3>
+    <div style="display:flex;gap:8px">
+      <button class="btn-secondary" onclick="doNewAccount()">+ New Account</button>
+      <button class="btn-secondary" onclick="doNewStealth()">+ Stealth Address</button>
+      <button class="btn-secondary" onclick="doLock()" style="color:var(--red);border-color:rgba(248,81,73,.3)">Lock</button>
+    </div>
   </div>
   <div class="addr-list" id="addrList">
     <div class="empty-state">
       <svg width="36" height="36" viewBox="0 0 16 16"><path d="M2 2.5A2.5 2.5 0 014.5 0h8.75a.75.75 0 01.75.75v12.5a.75.75 0 01-.75.75h-2.5a.75.75 0 010-1.5h1.75v-2h-8a1 1 0 00-.714 1.7.75.75 0 01-1.072 1.05A2.495 2.495 0 012 11.5v-9z"/></svg>
-      <h3>No Saved Addresses</h3>
-      <p>Use the CLI wallet to manage addresses:<br><code style="color:var(--cyan)">shadowdag-wallet info</code></p>
+      <h3>Loading accounts...</h3>
     </div>
   </div>
   <div style="margin-top:20px">
@@ -502,6 +622,153 @@ function copyAddr(){
 }
 
 /* ── Init ───────────────────────────────────── */
+/* ── Wallet Setup / Create / Unlock ──────────── */
+function setupShow(panel){
+  ['Welcome','Unlock','Create','Mnemonic','Import'].forEach(p=>{
+    document.getElementById('setup'+p).style.display='none';
+  });
+  const cap=panel.charAt(0).toUpperCase()+panel.slice(1);
+  document.getElementById('setup'+cap).style.display='block';
+}
+function showOverlay(show){
+  document.getElementById('setupOverlay').classList.toggle('visible',show);
+}
+function showCliImport(){ setupShow('import'); }
+
+async function doCreate(){
+  const pwd=document.getElementById('createPwd').value;
+  const confirm=document.getElementById('createConfirm').value;
+  const network=document.getElementById('createNetwork').value;
+  const err=document.getElementById('createErr');
+  err.textContent='';
+
+  if(!pwd||pwd.length<8){err.textContent='Password must be at least 8 characters';return}
+  if(pwd!==confirm){err.textContent='Passwords do not match';return}
+
+  const r=await fetch('/api/wallet/create',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({password:pwd,confirm,network})
+  }).then(x=>x.json()).catch(e=>({error:e.message}));
+
+  if(r.error){err.textContent=r.error;return}
+
+  // Show mnemonic screen
+  const words=(r.mnemonic||[]).map((w,i)=>{
+    return `<div class="mnemonic-word"><span class="num">${i+1}</span> ${w}</div>`;
+  }).join('');
+  document.getElementById('mnemonicGrid').innerHTML=words;
+  document.getElementById('mnemonicAddr').textContent=r.address||'';
+  setupShow('mnemonic');
+}
+
+function doMnemonicConfirm(){
+  showOverlay(false);
+  init(); // kick off the main wallet load
+}
+
+async function doUnlock(){
+  const pwd=document.getElementById('unlockPwd').value;
+  const err=document.getElementById('unlockErr');
+  err.textContent='';
+  if(!pwd){err.textContent='Enter your password';return}
+
+  const r=await fetch('/api/wallet/unlock',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({password:pwd})
+  }).then(x=>x.json()).catch(e=>({error:e.message}));
+
+  if(r.error){err.textContent=r.error;return}
+  document.getElementById('unlockPwd').value='';
+  showOverlay(false);
+  // Save the unlocked address for balance queries
+  if(r.address){
+    localStorage.setItem('sdag_wallet_addr',r.address);
+    walletAddress=r.address;
+  }
+  init();
+}
+
+async function checkWalletState(){
+  try{
+    const s=await fetch('/api/wallet/state').then(r=>r.json());
+    if(!s.has_seed){
+      showOverlay(true);
+      setupShow('welcome');
+      return false;
+    }
+    if(!s.unlocked){
+      showOverlay(true);
+      setupShow('unlock');
+      return false;
+    }
+    // Unlocked → seed the saved address if the wallet knows one
+    if(s.primary_address){
+      localStorage.setItem('sdag_wallet_addr',s.primary_address);
+      walletAddress=s.primary_address;
+    }
+    return true;
+  }catch(e){
+    // If wallet endpoints are unreachable, fall back to read-only mode.
+    return true;
+  }
+}
+
+async function loadAccounts(){
+  try{
+    const r=await fetch('/api/wallet/accounts').then(x=>x.json());
+    if(r.error)return;
+    const el=document.getElementById('addrList');
+    if(!el)return;
+    const html=(r.accounts||[]).map(a=>`
+      <div class="acct-card">
+        <div class="acct-head">
+          <div class="name">${a.label||('Account #'+a.index)}</div>
+          <div class="idx">#${a.index} &middot; ${(a.addresses||[]).length} addr</div>
+        </div>
+        ${(a.addresses||[]).map(ad=>`
+          <div class="acct-addr">
+            <span class="label">${ad.is_change?'CHANGE':'MAIN'}</span>
+            <span style="flex:1">${ad.address}</span>
+          </div>
+        `).join('')}
+      </div>
+    `).join('');
+    el.innerHTML=html || '<div class="empty-state">No accounts yet</div>';
+  }catch(e){}
+}
+
+async function doNewAccount(){
+  const label=prompt('Account label (e.g. "Savings"):','');
+  if(label===null)return;
+  const r=await fetch('/api/wallet/new-account',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({label:label||'Account'})
+  }).then(x=>x.json());
+  if(r.error){alert('Error: '+r.error);return}
+  await loadAccounts();
+}
+
+async function doNewStealth(){
+  const r=await fetch('/api/wallet/new-stealth',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:'{}'
+  }).then(x=>x.json());
+  if(r.error){alert('Error: '+r.error);return}
+  alert('One-time stealth address generated:\n\n'+r.stealth_address+'\n\nShare this instead of your real address for enhanced privacy.');
+}
+
+async function doLock(){
+  await fetch('/api/wallet/lock',{method:'POST'}).catch(()=>{});
+  localStorage.removeItem('sdag_wallet_addr');
+  walletAddress='';
+  showOverlay(true);
+  setupShow('unlock');
+}
+
 async function init(){
   await loadOverview();
   await loadNetworkSettings();
@@ -512,9 +779,13 @@ async function init(){
     await loadBalance(saved);
     drawQR(saved);
   }
+  await loadAccounts();
 }
 
-init();
+(async()=>{
+  const proceed=await checkWalletState();
+  if(proceed) init();
+})();
 setInterval(()=>{
   loadOverview();
   if(walletAddress)loadBalance(walletAddress);
