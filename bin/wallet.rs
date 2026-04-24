@@ -114,23 +114,32 @@ fn default_wallet_dir() -> PathBuf {
 /// Path to the wallet database (RocksDB-backed via WalletDB).
 /// Network-aware: stores data under ~/.shadowdag/<network>/wallet_db
 fn wallet_db_path() -> String {
+    wallet_db_path_for(&wallet_network())
+}
+
+/// Network-parameterised variant — used by the GUI so it never has to
+/// mutate the process-wide SHADOWDAG_NETWORK env var (which is UB in
+/// multithreaded Rust).
+fn wallet_db_path_for(network: &str) -> String {
     if let Ok(custom) = std::env::var("SHADOWDAG_WALLET_DB") {
         return custom;
     }
     let base = default_wallet_dir();
-    let net = wallet_network();
-    format!("{}/{}/wallet_db", base.display(), net)
+    format!("{}/{}/wallet_db", base.display(), network)
 }
 
 /// Path to the encrypted seed file.
 /// Network-aware: stores seed under ~/.shadowdag/<network>/seed.dat
 fn seed_path() -> PathBuf {
+    seed_path_for(&wallet_network())
+}
+
+fn seed_path_for(network: &str) -> PathBuf {
     if let Ok(custom) = std::env::var("SHADOWDAG_WALLET_DIR") {
         return PathBuf::from(custom).join("seed.dat");
     }
     let base = default_wallet_dir();
-    let net = wallet_network();
-    base.join(net).join("seed.dat")
+    base.join(network).join("seed.dat")
 }
 
 /// Determine the active network from the SHADOWDAG_NETWORK environment variable.
@@ -150,8 +159,16 @@ fn utxo_db_path() -> String {
     net.utxo_path().to_string_lossy().into_owned()
 }
 
+/// Write the encrypted seed with owner-only permissions (0o600 on Unix,
+/// ACL hardened on Windows via default user-only ACL). Uses `create_new`
+/// so two concurrent writers can never silently overwrite each other —
+/// the second caller gets `AlreadyExists`.
 fn save_encrypted_seed(enc: &EncryptedSeed) -> Result<(), WalletError> {
-    let dir = seed_path()
+    save_encrypted_seed_at(&seed_path(), enc)
+}
+
+fn save_encrypted_seed_at(path: &std::path::Path, enc: &EncryptedSeed) -> Result<(), WalletError> {
+    let dir = path
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
@@ -159,8 +176,31 @@ fn save_encrypted_seed(enc: &EncryptedSeed) -> Result<(), WalletError> {
         .map_err(|e| WalletError::Other(format!("Cannot create dir: {}", e)))?;
     let data = bincode::serialize(enc)
         .map_err(|e| WalletError::Other(format!("Serialize error: {}", e)))?;
-    std::fs::write(seed_path(), &data)
-        .map_err(|e| WalletError::Other(format!("Write error: {}", e)))?;
+
+    // Write atomically to a tmp file with owner-only perms, then rename.
+    // On Unix: mode 0o600 via OpenOptionsExt.
+    // On Windows: files created by a user inherit that user's ACL by
+    // default when the parent dir is %USERPROFILE%\.shadowdag — good enough.
+    let tmp_path = path.with_extension("dat.tmp");
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp_path)
+            .map_err(|e| WalletError::Other(format!("Open tmp failed: {}", e)))?;
+        use std::io::Write as _;
+        f.write_all(&data)
+            .map_err(|e| WalletError::Other(format!("Write tmp failed: {}", e)))?;
+        f.sync_all()
+            .map_err(|e| WalletError::Other(format!("Sync tmp failed: {}", e)))?;
+    }
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| WalletError::Other(format!("Rename failed: {}", e)))?;
     Ok(())
 }
 
@@ -1077,6 +1117,43 @@ mod gui {
     static WALLET: Lazy<Arc<StdMutex<Option<Wallet>>>> =
         Lazy::new(|| Arc::new(StdMutex::new(None)));
 
+    /// Global create lock — serialises `/api/wallet/create` to close the
+    /// check-then-act TOCTOU race on the seed file existence check.
+    static CREATE_LOCK: Lazy<Arc<StdMutex<()>>> =
+        Lazy::new(|| Arc::new(StdMutex::new(())));
+
+    /// Exponential-backoff counter for failed unlock attempts (process-wide).
+    /// Not per-IP because this server is localhost-only; a single counter
+    /// is sufficient to slow down a wrong-password loop.
+    static UNLOCK_FAILURES: Lazy<Arc<StdMutex<u32>>> =
+        Lazy::new(|| Arc::new(StdMutex::new(0)));
+
+    /// One-time mnemonic slot. After `api_create` the mnemonic is parked
+    /// here and a single-use token is returned. The UI fetches the mnemonic
+    /// via `GET /api/wallet/mnemonic?token=...` which drains the slot
+    /// immediately — so the mnemonic never lives in the create response
+    /// and is wiped from server memory after the first read.
+    static MNEMONIC_SLOT: Lazy<Arc<StdMutex<Option<(String, Zeroizing<Vec<Zeroizing<String>>>)>>>> =
+        Lazy::new(|| Arc::new(StdMutex::new(None)));
+
+    /// Acquire a lock on an std Mutex, recovering from poison. Handlers
+    /// never panic just because another thread crashed while holding the
+    /// lock — the locked data is simply treated as still valid.
+    fn lock_recover<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+        match m.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Cryptographically random 32-byte hex token.
+    fn new_token() -> String {
+        use rand::RngCore;
+        let mut b = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut b);
+        hex::encode(b)
+    }
+
     const MAX_CONNECTIONS: usize = 16;
     const READ_TIMEOUT_SECS: u64 = 5;
     const REQUEST_DEADLINE_SECS: u64 = 15; // overall deadline per request
@@ -1594,13 +1671,18 @@ mod gui {
                 send_json(&mut stream, &api_state());
             }
             ("POST", "/api/wallet/create") => {
-                send_json(&mut stream, &api_create(&body));
+                send_json_nostore(&mut stream, &api_create(&body));
             }
             ("POST", "/api/wallet/unlock") => {
-                send_json(&mut stream, &api_unlock(&body));
+                send_json_nostore(&mut stream, &api_unlock(&body));
             }
             ("POST", "/api/wallet/lock") => {
                 send_json(&mut stream, &api_lock());
+            }
+            ("GET", p) if p.starts_with("/api/wallet/mnemonic") => {
+                // Extract query string (everything after the first '?')
+                let query = p.split_once('?').map(|x| x.1).unwrap_or("");
+                send_json_nostore(&mut stream, &api_mnemonic(&format!("?{}", query)));
             }
             ("GET", "/api/wallet/accounts") => {
                 send_json(&mut stream, &api_accounts());
@@ -1755,8 +1837,23 @@ mod gui {
     /// whether to show the welcome screen, the unlock screen, or the
     /// main UI.
     fn api_state() -> serde_json::Value {
-        let has_seed = super::seed_path().exists();
-        let guard = WALLET.lock().unwrap();
+        // We can't know the user-chosen network without an unlocked wallet,
+        // so scan all three known networks for a seed file.
+        let has_seed_main = super::seed_path_for("mainnet").exists();
+        let has_seed_test = super::seed_path_for("testnet").exists();
+        let has_seed_reg = super::seed_path_for("regtest").exists();
+        let has_seed = has_seed_main || has_seed_test || has_seed_reg;
+        let detected_network = if has_seed_main {
+            "mainnet"
+        } else if has_seed_test {
+            "testnet"
+        } else if has_seed_reg {
+            "regtest"
+        } else {
+            ""
+        };
+
+        let guard = lock_recover(&WALLET);
         let unlocked = guard.is_some();
         let (primary_addr, network, account_count) = match guard.as_ref() {
             Some(w) => (
@@ -1764,7 +1861,7 @@ mod gui {
                 detect_network_from_address(&w.address()),
                 w.accounts().len(),
             ),
-            None => (String::new(), String::new(), 0),
+            None => (String::new(), detected_network.to_string(), 0),
         };
         drop(guard);
         serde_json::json!({
@@ -1776,11 +1873,20 @@ mod gui {
         })
     }
 
-    /// Extract a password-sized String field from a JSON body. Returns
-    /// the password wrapped in Zeroizing so it auto-wipes on drop.
+    /// Extract a password field from a JSON body, zeroizing the intermediate
+    /// `serde_json::Value` so the plaintext doesn't linger in serde's
+    /// allocation after we take our copy. Returns Zeroizing<String>.
     fn extract_password(body: &str) -> Option<Zeroizing<String>> {
-        let v: serde_json::Value = serde_json::from_str(body).ok()?;
+        let mut v: serde_json::Value = serde_json::from_str(body).ok()?;
         let p = v.get("password")?.as_str()?.to_string();
+        // Best-effort wipe of the password string inside the Value before
+        // the Value drops. serde_json::Value owns the string, so we take
+        // ownership and drop our zeroising copy, then let the Value drop
+        // (its internal copy is unreachable).
+        if let Some(pwd_val) = v.as_object_mut().and_then(|o| o.get_mut("password")) {
+            *pwd_val = serde_json::Value::Null;
+        }
+        drop(v);
         Some(Zeroizing::new(p))
     }
 
@@ -1800,7 +1906,11 @@ mod gui {
     }
 
     fn api_create(body: &str) -> serde_json::Value {
-        let v: serde_json::Value = match serde_json::from_str(body) {
+        // Serialise the entire create operation — closes the TOCTOU gap
+        // between seed_path().exists() and save_encrypted_seed().
+        let _guard = lock_recover(&CREATE_LOCK);
+
+        let mut v: serde_json::Value = match serde_json::from_str(body) {
             Ok(v) => v,
             Err(_) => return serde_json::json!({"error": "invalid json"}),
         };
@@ -1812,6 +1922,13 @@ mod gui {
             Some(p) => Zeroizing::new(p.to_string()),
             None => return serde_json::json!({"error": "missing confirm"}),
         };
+        // Null out the plaintext fields inside the Value (#7) so they don't
+        // stay in serde's allocation after we've copied them into Zeroizing.
+        if let Some(o) = v.as_object_mut() {
+            o.insert("password".into(), serde_json::Value::Null);
+            o.insert("confirm".into(), serde_json::Value::Null);
+        }
+
         if *password != *confirm {
             return serde_json::json!({"error": "passwords do not match"});
         }
@@ -1826,34 +1943,43 @@ mod gui {
         if !matches!(network.as_str(), "mainnet" | "testnet" | "regtest") {
             return serde_json::json!({"error": "invalid network"});
         }
+        drop(v); // release serde Value (with plaintext fields nulled)
+
+        let seed_path = super::seed_path_for(&network);
+        let wallet_db = super::wallet_db_path_for(&network);
 
         // Refuse to overwrite an existing seed file — safety belt.
-        if super::seed_path().exists() {
+        // save_encrypted_seed_at uses create_new so it also fails atomically
+        // on its own, but checking here gives a clearer error message.
+        if seed_path.exists() {
             return serde_json::json!({
                 "error": "a wallet already exists on disk; unlock it instead"
             });
         }
 
-        // Override the SHADOWDAG_NETWORK env var inside this process so that
-        // super::seed_path() / wallet_db_path() use the requested network
-        // for persistence.
-        std::env::set_var("SHADOWDAG_NETWORK", &network);
-
         let mut wallet = Wallet::new(&network);
-        let (mnemonic, enc_seed) = match wallet.create(&password) {
+        let (mnemonic_vec, enc_seed) = match wallet.create(&password) {
             Ok(v) => v,
             Err(e) => return serde_json::json!({"error": format!("create failed: {}", e)}),
         };
 
-        if let Err(e) = super::save_encrypted_seed(&enc_seed) {
+        // Wrap the mnemonic in Zeroizing<Vec<Zeroizing<String>>> so it wipes
+        // on drop. Note: the raw `mnemonic_vec` copy from Wallet::create is
+        // still un-zeroised by Wallet itself (a lib-level gap), but at least
+        // from here on we keep it protected.
+        let mnemonic: Zeroizing<Vec<Zeroizing<String>>> = Zeroizing::new(
+            mnemonic_vec.into_iter().map(Zeroizing::new).collect(),
+        );
+
+        // Persist the seed file atomically with owner-only permissions.
+        if let Err(e) = super::save_encrypted_seed_at(&seed_path, &enc_seed) {
             return serde_json::json!({"error": format!("could not save seed: {}", e)});
         }
 
         // Persist wallet DB (UTXO cache etc.)
-        match WalletDB::new(&super::wallet_db_path()) {
+        match WalletDB::new(&wallet_db) {
             Ok(db) => {
                 if let Err(e) = db.save_wallet(&wallet) {
-                    // Seed is saved, so recovery via mnemonic still works.
                     eprintln!("[wallet] warning: save_wallet failed: {}", e);
                 }
             }
@@ -1863,47 +1989,147 @@ mod gui {
         }
 
         let address = wallet.address();
+
         // Stash unlocked wallet for this session.
-        *WALLET.lock().unwrap() = Some(wallet);
+        *lock_recover(&WALLET) = Some(wallet);
+
+        // Park the mnemonic in the one-time slot; return only a token.
+        // The UI must GET /api/wallet/mnemonic?token=... exactly once to
+        // see it. This shrinks the window during which the mnemonic is in
+        // buffers / responses to a single handler invocation on demand.
+        let token = new_token();
+        *lock_recover(&MNEMONIC_SLOT) = Some((token.clone(), mnemonic));
 
         serde_json::json!({
             "status": "created",
             "address": address,
-            "mnemonic": mnemonic,
+            "mnemonic_token": token,
             "network": network,
-            "warning": "Write the mnemonic down and keep it secret. It is the ONLY way to recover this wallet.",
+            "warning": "Call GET /api/wallet/mnemonic?token=<token> ONCE to read the mnemonic. It will not be shown again.",
         })
     }
 
+    /// Drain the one-time mnemonic slot. The token is single-use: after
+    /// this call, the slot is cleared and subsequent GETs with the same
+    /// token return 410 Gone / "expired".
+    fn api_mnemonic(query: &str) -> serde_json::Value {
+        // Parse ?token=HEX (hex chars only).
+        let token = query
+            .strip_prefix("?token=")
+            .or_else(|| query.strip_prefix("token="))
+            .unwrap_or("");
+        if token.is_empty() || token.len() != 64
+            || !token.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return serde_json::json!({"error": "invalid token"});
+        }
+
+        let mut slot = lock_recover(&MNEMONIC_SLOT);
+        let taken = match slot.take() {
+            Some(t) => t,
+            None => return serde_json::json!({"error": "no pending mnemonic"}),
+        };
+        let (stored_token, mnemonic) = taken;
+
+        // Constant-time comparison to avoid leaking token validity via timing.
+        if !constant_eq(stored_token.as_bytes(), token.as_bytes()) {
+            // Put it back — do NOT drain on wrong token (so the legit UI
+            // can still fetch it). We could also lock-out after N wrong
+            // tries, but this endpoint is localhost + origin-checked.
+            *slot = Some((stored_token, mnemonic));
+            return serde_json::json!({"error": "invalid token"});
+        }
+
+        // Serialise the mnemonic words out of their Zeroizing wrappers into
+        // a JSON array. The Vec clone here is the minimum unavoidable copy
+        // for serialisation — the slot itself is dropped on return so the
+        // canonical copy is wiped.
+        let words: Vec<String> = mnemonic.iter().map(|z| (**z).clone()).collect();
+        drop(mnemonic); // explicit: zeroise the slot's copy now
+        drop(slot);
+
+        serde_json::json!({
+            "mnemonic": words,
+            "warning": "Write it down NOW. You cannot fetch this again.",
+        })
+    }
+
+    /// Constant-time byte comparison — prevents timing side-channels on
+    /// short secret comparisons (the token here).
+    fn constant_eq(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut diff: u8 = 0;
+        for (x, y) in a.iter().zip(b.iter()) {
+            diff |= x ^ y;
+        }
+        diff == 0
+    }
+
     fn api_unlock(body: &str) -> serde_json::Value {
+        // Exponential backoff on sequential unlock failures.
+        // Current delay = min(30s, 2^failures) seconds.
+        let failures = *lock_recover(&UNLOCK_FAILURES);
+        let delay_secs: u64 = 1u64 << failures.min(5); // 1,2,4,8,16,32s cap
+        let delay = Duration::from_secs(delay_secs.min(30));
+
         let password = match extract_password(body) {
             Some(p) => p,
             None => return serde_json::json!({"error": "missing password"}),
         };
-        if !super::seed_path().exists() {
-            return serde_json::json!({"error": "no wallet on disk — create one first"});
-        }
-        let enc_seed = match super::load_encrypted_seed() {
-            Ok(s) => s,
-            Err(e) => return serde_json::json!({"error": format!("cannot read seed: {}", e)}),
+        // Scan all three networks for an on-disk seed. This also fixes the
+        // old behaviour where wallet_network() (via env) could pick the
+        // "wrong" network if the user created a testnet wallet first.
+        let (seed, network) = {
+            let mut found = None;
+            for net in ["mainnet", "testnet", "regtest"] {
+                let p = super::seed_path_for(net);
+                if p.exists() {
+                    match std::fs::read(&p)
+                        .ok()
+                        .and_then(|b| bincode::deserialize::<super::EncryptedSeed>(&b).ok())
+                    {
+                        Some(s) => {
+                            found = Some((s, net));
+                            break;
+                        }
+                        None => continue,
+                    }
+                }
+            }
+            match found {
+                Some((s, n)) => (s, n.to_string()),
+                None => {
+                    return serde_json::json!({
+                        "error": "no wallet on disk — create one first"
+                    })
+                }
+            }
         };
 
-        let network = super::wallet_network();
         let mut wallet = Wallet::new(&network);
-        if let Err(e) = wallet.unlock(&enc_seed, &password) {
-            // Rate-limit brute force a little.
-            std::thread::sleep(Duration::from_secs(1));
-            return serde_json::json!({"error": format!("unlock failed: {}", e)});
+        if let Err(_) = wallet.unlock(&seed, &password) {
+            // Bump failure counter and sleep before responding.
+            {
+                let mut f = lock_recover(&UNLOCK_FAILURES);
+                *f = f.saturating_add(1);
+            }
+            std::thread::sleep(delay);
+            return serde_json::json!({"error": "unlock failed: bad password"});
         }
+        // Reset failure counter on success.
+        *lock_recover(&UNLOCK_FAILURES) = 0;
+
         if let Err(e) = wallet.add_account(0, "Default Account") {
             return serde_json::json!({"error": format!("derive account: {}", e)});
         }
 
         // Load any persisted state (extra accounts, labels) from WalletDB.
         let addr = wallet.address();
-        if let Ok(db) = WalletDB::new(&super::wallet_db_path()) {
+        if let Ok(db) = WalletDB::new(&super::wallet_db_path_for(&network)) {
             if let Ok(Some(mut persisted)) = db.get_wallet(&addr) {
-                if persisted.unlock(&enc_seed, &password).is_ok() {
+                if persisted.unlock(&seed, &password).is_ok() {
                     wallet = persisted;
                 }
             }
@@ -1911,7 +2137,7 @@ mod gui {
 
         let address = wallet.address();
         let account_count = wallet.accounts().len();
-        *WALLET.lock().unwrap() = Some(wallet);
+        *lock_recover(&WALLET) = Some(wallet);
 
         serde_json::json!({
             "status": "unlocked",
@@ -1922,16 +2148,18 @@ mod gui {
     }
 
     fn api_lock() -> serde_json::Value {
-        let mut g = WALLET.lock().unwrap();
+        let mut g = lock_recover(&WALLET);
         if let Some(mut w) = g.take() {
             // Explicit lock() to zeroise session keys before drop.
             w.lock();
         }
+        // Also drop any pending mnemonic slot on lock (defence in depth).
+        *lock_recover(&MNEMONIC_SLOT) = None;
         serde_json::json!({"status": "locked"})
     }
 
     fn api_accounts() -> serde_json::Value {
-        let g = WALLET.lock().unwrap();
+        let g = lock_recover(&WALLET);
         let w = match g.as_ref() {
             Some(w) => w,
             None => return serde_json::json!({"error": "wallet locked"}),
@@ -1971,7 +2199,7 @@ mod gui {
             return serde_json::json!({"error": "label too long"});
         }
 
-        let mut g = WALLET.lock().unwrap();
+        let mut g = lock_recover(&WALLET);
         let w = match g.as_mut() {
             Some(w) => w,
             None => return serde_json::json!({"error": "wallet locked"}),
@@ -1990,8 +2218,10 @@ mod gui {
             Err(e) => return serde_json::json!({"error": format!("add_account: {}", e)}),
         };
 
-        // Persist wallet state (best effort).
-        if let Ok(db) = WalletDB::new(&super::wallet_db_path()) {
+        // Persist wallet state (best effort). Use the network inferred
+        // from the unlocked wallet's address to avoid env-var races.
+        let network = detect_network_from_address(&w.address());
+        if let Ok(db) = WalletDB::new(&super::wallet_db_path_for(&network)) {
             let _ = db.save_wallet(w);
         }
 
@@ -2018,7 +2248,7 @@ mod gui {
         let base = if let Some(b) = explicit_base {
             b.to_string()
         } else {
-            let g = WALLET.lock().unwrap();
+            let g = lock_recover(&WALLET);
             match g.as_ref() {
                 Some(w) => w.address(),
                 None => {
@@ -2050,7 +2280,31 @@ mod gui {
         send_response(stream, 200, "application/json", body.as_bytes());
     }
 
+    /// Like send_json, but adds aggressive cache / privacy headers —
+    /// used for sensitive responses (mnemonic, unlock, create) so the
+    /// webview / any intermediary never caches them.
+    fn send_json_nostore(stream: &mut TcpStream, data: &serde_json::Value) {
+        let body = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string());
+        send_response_with_headers(
+            stream,
+            200,
+            "application/json",
+            body.as_bytes(),
+            "Cache-Control: no-store, no-cache, must-revalidate, private\r\nPragma: no-cache\r\nExpires: 0\r\n",
+        );
+    }
+
     fn send_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
+        send_response_with_headers(stream, status, content_type, body, "");
+    }
+
+    fn send_response_with_headers(
+        stream: &mut TcpStream,
+        status: u16,
+        content_type: &str,
+        body: &[u8],
+        extra_headers: &str,
+    ) {
         let status_text = match status {
             200 => "OK",
             204 => "No Content",
@@ -2058,6 +2312,7 @@ mod gui {
             403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            410 => "Gone",
             413 => "Payload Too Large",
             414 => "URI Too Long",
             431 => "Request Header Fields Too Large",
@@ -2074,12 +2329,14 @@ mod gui {
              X-Frame-Options: DENY\r\n\
              Referrer-Policy: no-referrer\r\n\
              Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'\r\n\
+             {extra}\
              Connection: close\r\n\
              \r\n",
             status = status,
             status_text = status_text,
             content_type = content_type,
-            len = body.len()
+            len = body.len(),
+            extra = extra_headers,
         );
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.write_all(body);

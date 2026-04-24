@@ -635,9 +635,25 @@ function showOverlay(show){
 }
 function showCliImport(){ setupShow('import'); }
 
+/* Safely wipe a string / input field in the DOM — best effort, since JS
+   strings are immutable. We overwrite with the same length of zeros to
+   nudge the GC, then clear references. */
+function wipe(el){
+  if(!el)return;
+  if(el.tagName==='INPUT'){
+    try{el.value='0'.repeat(el.value.length||1);}catch(e){}
+    el.value='';
+  }else{
+    el.innerHTML='';
+    el.textContent='';
+  }
+}
+
 async function doCreate(){
-  const pwd=document.getElementById('createPwd').value;
-  const confirm=document.getElementById('createConfirm').value;
+  const pwdEl=document.getElementById('createPwd');
+  const confirmEl=document.getElementById('createConfirm');
+  const pwd=pwdEl.value;
+  const confirm=confirmEl.value;
   const network=document.getElementById('createNetwork').value;
   const err=document.getElementById('createErr');
   err.textContent='';
@@ -645,45 +661,83 @@ async function doCreate(){
   if(!pwd||pwd.length<8){err.textContent='Password must be at least 8 characters';return}
   if(pwd!==confirm){err.textContent='Passwords do not match';return}
 
-  const r=await fetch('/api/wallet/create',{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({password:pwd,confirm,network})
-  }).then(x=>x.json()).catch(e=>({error:e.message}));
+  let r;
+  try{
+    r=await fetch('/api/wallet/create',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({password:pwd,confirm,network})
+    }).then(x=>x.json());
+  }catch(e){r={error:e.message};}
 
-  if(r.error){err.textContent=r.error;return}
+  // Immediately wipe password fields (they hold the plaintext in the DOM).
+  wipe(pwdEl);
+  wipe(confirmEl);
 
-  // Show mnemonic screen
-  const words=(r.mnemonic||[]).map((w,i)=>{
-    return `<div class="mnemonic-word"><span class="num">${i+1}</span> ${w}</div>`;
-  }).join('');
-  document.getElementById('mnemonicGrid').innerHTML=words;
+  if(r&&r.error){err.textContent=r.error;return}
+  if(!r||!r.mnemonic_token){err.textContent='unexpected response';return}
+
+  // Fetch the mnemonic via the one-time token. This endpoint drains the
+  // server-side slot on first read, so the mnemonic lives in Rust memory
+  // for a single response and then is wiped.
+  let m;
+  try{
+    m=await fetch('/api/wallet/mnemonic?token='+encodeURIComponent(r.mnemonic_token),{
+      headers:{'Cache-Control':'no-store'}
+    }).then(x=>x.json());
+  }catch(e){m={error:e.message};}
+
+  if(m&&m.error){err.textContent='Could not fetch mnemonic: '+m.error;return}
+  const words=(m&&m.mnemonic)||[];
+
+  const html=words.map((w,i)=>(
+    '<div class="mnemonic-word"><span class="num">'+(i+1)+'</span> '+w+'</div>'
+  )).join('');
+  document.getElementById('mnemonicGrid').innerHTML=html;
   document.getElementById('mnemonicAddr').textContent=r.address||'';
+
+  // Drop our local reference to the mnemonic array so the GC can reclaim it
+  // once the DOM is torn down on confirm.
+  setTimeout(()=>{ words.length=0; },0);
   setupShow('mnemonic');
 }
 
 function doMnemonicConfirm(){
+  // Wipe the mnemonic DOM + any address reference before moving on.
+  wipe(document.getElementById('mnemonicGrid'));
+  wipe(document.getElementById('mnemonicAddr'));
   showOverlay(false);
   init(); // kick off the main wallet load
 }
 
 async function doUnlock(){
-  const pwd=document.getElementById('unlockPwd').value;
+  const pwdEl=document.getElementById('unlockPwd');
+  const pwd=pwdEl.value;
   const err=document.getElementById('unlockErr');
   err.textContent='';
   if(!pwd){err.textContent='Enter your password';return}
 
-  const r=await fetch('/api/wallet/unlock',{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({password:pwd})
-  }).then(x=>x.json()).catch(e=>({error:e.message}));
+  // Disable the button during the request (exponential backoff can make
+  // unlock take up to ~30 seconds on repeated failure).
+  const btns=document.querySelectorAll('#setupUnlock button');
+  btns.forEach(b=>b.disabled=true);
 
-  if(r.error){err.textContent=r.error;return}
-  document.getElementById('unlockPwd').value='';
+  let r;
+  try{
+    r=await fetch('/api/wallet/unlock',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Cache-Control':'no-store'},
+      body:JSON.stringify({password:pwd})
+    }).then(x=>x.json());
+  }catch(e){r={error:e.message};}
+
+  // Wipe the password field regardless of outcome (success OR failure).
+  wipe(pwdEl);
+  btns.forEach(b=>b.disabled=false);
+
+  if(r&&r.error){err.textContent=r.error;return}
   showOverlay(false);
-  // Save the unlocked address for balance queries
-  if(r.address){
+  if(r&&r.address){
     localStorage.setItem('sdag_wallet_addr',r.address);
     walletAddress=r.address;
   }
