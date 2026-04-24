@@ -605,7 +605,15 @@ impl RpcServer {
         // Sync with actual chain state before accepting RPC requests
         self.sync_chain_state();
 
-        let addr = format!("127.0.0.1:{}", self.port);
+        // RPC bind host is 127.0.0.1 by default (safe). Operators who run a
+        // public seed node can set SHADOWDAG_RPC_BIND=0.0.0.0 to expose RPC
+        // to the network. Any non-empty value is accepted as a bind host.
+        let bind_host = std::env::var("SHADOWDAG_RPC_BIND")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let addr = format!("{}:{}", bind_host, self.port);
 
         // Bind BEFORE spawning thread — fail fast if port unavailable
         let listener = TcpListener::bind(&addr).map_err(|e| {
@@ -1841,6 +1849,30 @@ impl RpcServer {
                 id,
                 ERR_INVALID_PARAMS,
                 "Invalid block: empty hash/merkle_root or zero height/difficulty",
+            );
+        }
+        let is_hex_64 = |s: &str| -> bool {
+            s.len() == 64 && s.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
+        };
+        if !is_hex_64(&hash) {
+            return RpcResponse::err(
+                id,
+                ERR_INVALID_PARAMS,
+                "Invalid block: hash must be 64 hex chars",
+            );
+        }
+        if !is_hex_64(&merkle_root) {
+            return RpcResponse::err(
+                id,
+                ERR_INVALID_PARAMS,
+                "Invalid block: merkle_root must be 64 hex chars",
+            );
+        }
+        if !parents.iter().all(|p| is_hex_64(p)) {
+            return RpcResponse::err(
+                id,
+                ERR_INVALID_PARAMS,
+                "Invalid block: each parent must be 64 hex chars",
             );
         }
 
@@ -4758,25 +4790,34 @@ impl RpcServer {
 mod tests {
     use super::*;
     use crate::infrastructure::storage::rocksdb::core::db::NodeDB;
+    use std::fs;
     use std::net::IpAddr;
+    use std::path::PathBuf;
     use std::str::FromStr;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_db_path() -> String {
-        format!(
-            "/tmp/test_rpc_server_{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        )
+    fn temp_db_dir() -> PathBuf {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("shadowdag_rpc_test_{}", uniq));
+        let _ = fs::create_dir_all(&p);
+        p
     }
 
     fn make_server() -> RpcServer {
-        let path = temp_db_path();
-        let node_db = NodeDB::new(&path).unwrap();
-        let peers_path = format!("{}_peers", path);
-        RpcServer::new_for_network(0, &peers_path, node_db.shared(), None).unwrap()
+        let db_dir = temp_db_dir();
+        let db_path = db_dir.join("db");
+        let peers_path = db_dir.join("peers");
+        let node_db = NodeDB::new(db_path.to_string_lossy().as_ref()).unwrap();
+        RpcServer::new_for_network(
+            0,
+            peers_path.to_string_lossy().as_ref(),
+            node_db.shared(),
+            Some(&db_dir),
+        )
+        .unwrap()
     }
 
     fn call(server: &RpcServer, method: &str) -> Value {
@@ -4969,6 +5010,49 @@ mod tests {
         assert!(
             msg.contains("stale template: difficulty")
                 && msg.contains("mismatch"),
+            "unexpected message: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn submitblock_rejects_invalid_hash_shape_early() {
+        let s = make_server();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let block = json!({
+            "hash": "not_hex_or_64",
+            "height": 1,
+            "timestamp": now.saturating_sub(1),
+            "nonce": 1u64,
+            "extra_nonce": 0u64,
+            "difficulty": 1u64,
+            "merkle_root": "b".repeat(64),
+            "version": 1u64,
+            "parents": ["c".repeat(64)],
+            "transactions": [{
+                "hash": "d".repeat(64),
+                "inputs": [],
+                "outputs": [{
+                    "address": "ST1testmineraddress",
+                    "amount": 1000,
+                    "commitment": null,
+                    "range_proof": null,
+                    "ephemeral_pubkey": null
+                }],
+                "fee": 0,
+                "timestamp": now.saturating_sub(1),
+                "is_coinbase": true,
+                "tx_type": "Transfer",
+                "payload_hash": null
+            }]
+        });
+        let r = call_params(&s, "submitblock", json!([block]));
+        let msg = r["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("hash must be 64 hex chars"),
             "unexpected message: {}",
             msg
         );
