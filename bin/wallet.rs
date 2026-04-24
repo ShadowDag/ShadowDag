@@ -1076,6 +1076,18 @@ mod gui {
     const MAX_PATH_BYTES: usize = 512;
     const MAX_ADDR_BYTES: usize = 128; // longest plausible SDAG address
     const RPC_TIMEOUT_SECS: u64 = 5;
+    const SEED_PROBE_TIMEOUT_SECS: u64 = 3;
+
+    /// Official ShadowDAG seed RPC endpoints. The wallet picks the first one
+    /// that responds on startup, so users don't need to configure anything.
+    ///
+    /// Override with `--rpc=HOST:PORT` to use a custom node (e.g. a local
+    /// one for full trustlessness).
+    const DEFAULT_SEED_ENDPOINTS: &[&str] = &[
+        "144.172.105.147:9332",
+        "45.61.151.206:9332",
+        "172.86.90.70:9332",
+    ];
 
     /// Parsed + validated RPC target. Using the SocketAddr's own
     /// fmt avoids any user-controlled characters (CRLF etc.) in the
@@ -1087,26 +1099,38 @@ mod gui {
     }
 
     pub fn run(args: &[String]) {
-        let raw_rpc =
-            parse_flag(args, "--rpc").unwrap_or_else(|| "127.0.0.1:9332".to_string());
+        // Explicit --rpc=HOST:PORT overrides the seed list.
+        let user_rpc = parse_flag(args, "--rpc");
 
-        let rpc_target = match parse_rpc_target(&raw_rpc) {
-            Some(t) => t,
-            None => {
-                eprintln!("[wallet] invalid --rpc address: {}", raw_rpc);
-                return;
-            }
+        let rpc_target = match user_rpc {
+            Some(raw) => match parse_rpc_target(&raw) {
+                Some(t) => t,
+                None => {
+                    eprintln!("[wallet] invalid --rpc address: {}", raw);
+                    return;
+                }
+            },
+            None => match pick_first_live_seed() {
+                Some(t) => {
+                    eprintln!("[wallet] connected to seed node {}", t.display);
+                    t
+                }
+                None => {
+                    eprintln!(
+                        "[wallet] no seed nodes reachable — falling back to 127.0.0.1:9332"
+                    );
+                    eprintln!("         (check internet; or run a local node)");
+                    parse_rpc_target("127.0.0.1:9332")
+                        .expect("hardcoded loopback should always parse")
+                }
+            },
         };
 
-        // Warn if RPC target is NOT loopback (user may have been tricked).
+        // Info banner (not a warning) when using a remote seed node.
         if !is_loopback_ip(&rpc_target.socket) {
-            eprintln!("╔════════════════════════════════════════════════════╗");
-            eprintln!("║  WARNING: Connecting to a non-localhost RPC.      ║");
-            eprintln!("║  Target: {:<38} ║", rpc_target.display);
-            eprintln!("║  Data you see may be controlled by a third party. ║");
-            eprintln!("║  Transactions are NOT sent via this channel —      ║");
-            eprintln!("║  signing happens only in the CLI wallet.           ║");
-            eprintln!("╚════════════════════════════════════════════════════╝");
+            eprintln!("[wallet] using remote RPC: {}", rpc_target.display);
+            eprintln!("         - Balance / height data comes from this server.");
+            eprintln!("         - To send transactions, use the CLI wallet (signing is local).");
         }
 
         let network = parse_flag(args, "--network").unwrap_or_else(|| {
@@ -1209,6 +1233,36 @@ mod gui {
 
     fn is_loopback_ip(addr: &SocketAddr) -> bool {
         addr.ip().is_loopback()
+    }
+
+    /// Probe each seed endpoint and return the first one that accepts a TCP
+    /// connection within SEED_PROBE_TIMEOUT_SECS. Preserves the order from
+    /// DEFAULT_SEED_ENDPOINTS so users get deterministic failover behaviour.
+    ///
+    /// Probes run serially (not in parallel) to keep the wallet startup
+    /// predictable and avoid a burst of connections when all seeds are up.
+    fn pick_first_live_seed() -> Option<RpcTarget> {
+        for ep in DEFAULT_SEED_ENDPOINTS {
+            let target = match parse_rpc_target(ep) {
+                Some(t) => t,
+                None => {
+                    eprintln!("[wallet] skipping invalid seed: {}", ep);
+                    continue;
+                }
+            };
+            match TcpStream::connect_timeout(
+                &target.socket,
+                Duration::from_secs(SEED_PROBE_TIMEOUT_SECS),
+            ) {
+                Ok(s) => {
+                    // Close immediately — we only wanted to know it's up.
+                    drop(s);
+                    return Some(target);
+                }
+                Err(_) => continue,
+            }
+        }
+        None
     }
 
     /// Strip characters that could break out of a JSON string into HTML when
