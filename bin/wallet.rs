@@ -1052,18 +1052,30 @@ mod gui {
     use std::io::{BufRead, BufReader, Read as _, Write as _};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
     use std::time::{Duration, Instant};
 
+    use once_cell::sync::Lazy;
     use tao::dpi::LogicalSize;
     use tao::event::{Event, WindowEvent};
     use tao::event_loop::{ControlFlow, EventLoop};
     use tao::window::WindowBuilder;
     use wry::dpi::{LogicalPosition, LogicalSize as WryLogicalSize};
     use wry::{Rect, WebViewBuilder};
+    use zeroize::Zeroizing;
+
+    use shadowdag::domain::address::stealth_address::StealthAddress;
+    use shadowdag::service::wallet::core::wallet::Wallet;
+    use shadowdag::service::wallet::storage::wallet_db::WalletDB;
 
     const WALLET_HTML: &str =
         include_str!("../service/network/wallet_ui/html_standalone.html");
+
+    /// In-memory unlocked wallet. Held under a Mutex so handlers can
+    /// mutate it (add accounts, etc.). Seed material is zeroized when the
+    /// Wallet is dropped (via its internal `lock()` in Drop).
+    static WALLET: Lazy<Arc<StdMutex<Option<Wallet>>>> =
+        Lazy::new(|| Arc::new(StdMutex::new(None)));
 
     const MAX_CONNECTIONS: usize = 16;
     const READ_TIMEOUT_SECS: u64 = 5;
@@ -1577,6 +1589,28 @@ mod gui {
             ("POST", "/api/wallet/send") => {
                 send_json(&mut stream, &api_send(target, &body));
             }
+            // ── Wallet management (create / unlock / lock / accounts) ──
+            ("GET", "/api/wallet/state") => {
+                send_json(&mut stream, &api_state());
+            }
+            ("POST", "/api/wallet/create") => {
+                send_json(&mut stream, &api_create(&body));
+            }
+            ("POST", "/api/wallet/unlock") => {
+                send_json(&mut stream, &api_unlock(&body));
+            }
+            ("POST", "/api/wallet/lock") => {
+                send_json(&mut stream, &api_lock());
+            }
+            ("GET", "/api/wallet/accounts") => {
+                send_json(&mut stream, &api_accounts());
+            }
+            ("POST", "/api/wallet/new-account") => {
+                send_json(&mut stream, &api_new_account(&body));
+            }
+            ("POST", "/api/wallet/new-stealth") => {
+                send_json(&mut stream, &api_new_stealth(&body));
+            }
             ("GET", "/favicon.ico") => {
                 send_response(&mut stream, 204, "text/plain", b"");
             }
@@ -1711,6 +1745,302 @@ mod gui {
             "amount": amount_raw,
             "message": format!("Sign via CLI:\n  shadowdag-wallet send {} {}", to_raw, amount_raw),
             "rpc_endpoint": target.display,
+        })
+    }
+
+    // ── Wallet Management Handlers ────────────────────────────────────
+
+    /// Status of the wallet: whether a seed file exists on disk, and whether
+    /// it is currently unlocked in memory. Used by the HTML to decide
+    /// whether to show the welcome screen, the unlock screen, or the
+    /// main UI.
+    fn api_state() -> serde_json::Value {
+        let has_seed = super::seed_path().exists();
+        let guard = WALLET.lock().unwrap();
+        let unlocked = guard.is_some();
+        let (primary_addr, network, account_count) = match guard.as_ref() {
+            Some(w) => (
+                w.address(),
+                detect_network_from_address(&w.address()),
+                w.accounts().len(),
+            ),
+            None => (String::new(), String::new(), 0),
+        };
+        drop(guard);
+        serde_json::json!({
+            "has_seed": has_seed,
+            "unlocked": unlocked,
+            "primary_address": primary_addr,
+            "account_count": account_count,
+            "network": network,
+        })
+    }
+
+    /// Extract a password-sized String field from a JSON body. Returns
+    /// the password wrapped in Zeroizing so it auto-wipes on drop.
+    fn extract_password(body: &str) -> Option<Zeroizing<String>> {
+        let v: serde_json::Value = serde_json::from_str(body).ok()?;
+        let p = v.get("password")?.as_str()?.to_string();
+        Some(Zeroizing::new(p))
+    }
+
+    fn extract_str<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+        v.get(key)?.as_str()
+    }
+
+    /// Classify an address by prefix to pick the right network label.
+    fn detect_network_from_address(addr: &str) -> String {
+        if addr.starts_with("ST") {
+            "testnet".to_string()
+        } else if addr.starts_with("SR") {
+            "regtest".to_string()
+        } else {
+            "mainnet".to_string()
+        }
+    }
+
+    fn api_create(body: &str) -> serde_json::Value {
+        let v: serde_json::Value = match serde_json::from_str(body) {
+            Ok(v) => v,
+            Err(_) => return serde_json::json!({"error": "invalid json"}),
+        };
+        let password = match v.get("password").and_then(|p| p.as_str()) {
+            Some(p) => Zeroizing::new(p.to_string()),
+            None => return serde_json::json!({"error": "missing password"}),
+        };
+        let confirm = match v.get("confirm").and_then(|p| p.as_str()) {
+            Some(p) => Zeroizing::new(p.to_string()),
+            None => return serde_json::json!({"error": "missing confirm"}),
+        };
+        if *password != *confirm {
+            return serde_json::json!({"error": "passwords do not match"});
+        }
+        if password.len() < 8 {
+            return serde_json::json!({"error": "password too short (min 8)"});
+        }
+        let network = v
+            .get("network")
+            .and_then(|n| n.as_str())
+            .unwrap_or("mainnet")
+            .to_string();
+        if !matches!(network.as_str(), "mainnet" | "testnet" | "regtest") {
+            return serde_json::json!({"error": "invalid network"});
+        }
+
+        // Refuse to overwrite an existing seed file — safety belt.
+        if super::seed_path().exists() {
+            return serde_json::json!({
+                "error": "a wallet already exists on disk; unlock it instead"
+            });
+        }
+
+        // Override the SHADOWDAG_NETWORK env var inside this process so that
+        // super::seed_path() / wallet_db_path() use the requested network
+        // for persistence.
+        std::env::set_var("SHADOWDAG_NETWORK", &network);
+
+        let mut wallet = Wallet::new(&network);
+        let (mnemonic, enc_seed) = match wallet.create(&password) {
+            Ok(v) => v,
+            Err(e) => return serde_json::json!({"error": format!("create failed: {}", e)}),
+        };
+
+        if let Err(e) = super::save_encrypted_seed(&enc_seed) {
+            return serde_json::json!({"error": format!("could not save seed: {}", e)});
+        }
+
+        // Persist wallet DB (UTXO cache etc.)
+        match WalletDB::new(&super::wallet_db_path()) {
+            Ok(db) => {
+                if let Err(e) = db.save_wallet(&wallet) {
+                    // Seed is saved, so recovery via mnemonic still works.
+                    eprintln!("[wallet] warning: save_wallet failed: {}", e);
+                }
+            }
+            Err(e) => {
+                eprintln!("[wallet] warning: wallet_db open failed: {}", e);
+            }
+        }
+
+        let address = wallet.address();
+        // Stash unlocked wallet for this session.
+        *WALLET.lock().unwrap() = Some(wallet);
+
+        serde_json::json!({
+            "status": "created",
+            "address": address,
+            "mnemonic": mnemonic,
+            "network": network,
+            "warning": "Write the mnemonic down and keep it secret. It is the ONLY way to recover this wallet.",
+        })
+    }
+
+    fn api_unlock(body: &str) -> serde_json::Value {
+        let password = match extract_password(body) {
+            Some(p) => p,
+            None => return serde_json::json!({"error": "missing password"}),
+        };
+        if !super::seed_path().exists() {
+            return serde_json::json!({"error": "no wallet on disk — create one first"});
+        }
+        let enc_seed = match super::load_encrypted_seed() {
+            Ok(s) => s,
+            Err(e) => return serde_json::json!({"error": format!("cannot read seed: {}", e)}),
+        };
+
+        let network = super::wallet_network();
+        let mut wallet = Wallet::new(&network);
+        if let Err(e) = wallet.unlock(&enc_seed, &password) {
+            // Rate-limit brute force a little.
+            std::thread::sleep(Duration::from_secs(1));
+            return serde_json::json!({"error": format!("unlock failed: {}", e)});
+        }
+        if let Err(e) = wallet.add_account(0, "Default Account") {
+            return serde_json::json!({"error": format!("derive account: {}", e)});
+        }
+
+        // Load any persisted state (extra accounts, labels) from WalletDB.
+        let addr = wallet.address();
+        if let Ok(db) = WalletDB::new(&super::wallet_db_path()) {
+            if let Ok(Some(mut persisted)) = db.get_wallet(&addr) {
+                if persisted.unlock(&enc_seed, &password).is_ok() {
+                    wallet = persisted;
+                }
+            }
+        }
+
+        let address = wallet.address();
+        let account_count = wallet.accounts().len();
+        *WALLET.lock().unwrap() = Some(wallet);
+
+        serde_json::json!({
+            "status": "unlocked",
+            "address": address,
+            "account_count": account_count,
+            "network": network,
+        })
+    }
+
+    fn api_lock() -> serde_json::Value {
+        let mut g = WALLET.lock().unwrap();
+        if let Some(mut w) = g.take() {
+            // Explicit lock() to zeroise session keys before drop.
+            w.lock();
+        }
+        serde_json::json!({"status": "locked"})
+    }
+
+    fn api_accounts() -> serde_json::Value {
+        let g = WALLET.lock().unwrap();
+        let w = match g.as_ref() {
+            Some(w) => w,
+            None => return serde_json::json!({"error": "wallet locked"}),
+        };
+        let accounts: Vec<serde_json::Value> = w
+            .accounts()
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "index": a.index,
+                    "label": a.label,
+                    "balance": a.balance,
+                    "tx_count": a.tx_count,
+                    "addresses": a.addresses.iter().map(|ad| serde_json::json!({
+                        "address": ad.address,
+                        "public_key": ad.public_key,
+                        "is_change": ad.is_change,
+                        "label": ad.label,
+                        "index": ad.index,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "primary_address": w.address(),
+            "accounts": accounts,
+        })
+    }
+
+    fn api_new_account(body: &str) -> serde_json::Value {
+        let v: serde_json::Value = match serde_json::from_str(body) {
+            Ok(v) => v,
+            Err(_) => return serde_json::json!({"error": "invalid json"}),
+        };
+        let label = extract_str(&v, "label").unwrap_or("Account").to_string();
+        if label.len() > 64 {
+            return serde_json::json!({"error": "label too long"});
+        }
+
+        let mut g = WALLET.lock().unwrap();
+        let w = match g.as_mut() {
+            Some(w) => w,
+            None => return serde_json::json!({"error": "wallet locked"}),
+        };
+
+        // Pick the next unused account index.
+        let next_idx = w
+            .accounts()
+            .iter()
+            .map(|a| a.index)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        let account = match w.add_account(next_idx, &label) {
+            Ok(a) => a,
+            Err(e) => return serde_json::json!({"error": format!("add_account: {}", e)}),
+        };
+
+        // Persist wallet state (best effort).
+        if let Ok(db) = WalletDB::new(&super::wallet_db_path()) {
+            let _ = db.save_wallet(w);
+        }
+
+        let address = account
+            .addresses
+            .first()
+            .map(|a| a.address.clone())
+            .unwrap_or_default();
+        serde_json::json!({
+            "status": "created",
+            "index": account.index,
+            "label": account.label,
+            "address": address,
+        })
+    }
+
+    fn api_new_stealth(body: &str) -> serde_json::Value {
+        // Stealth addresses are derived from a base address (the user's
+        // primary). They're one-time, never stored — each call produces a
+        // fresh one.
+        let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+        let explicit_base = extract_str(&v, "base_address");
+
+        let base = if let Some(b) = explicit_base {
+            b.to_string()
+        } else {
+            let g = WALLET.lock().unwrap();
+            match g.as_ref() {
+                Some(w) => w.address(),
+                None => {
+                    return serde_json::json!({
+                        "error": "wallet locked and no base_address provided"
+                    })
+                }
+            }
+        };
+
+        if base.is_empty() || base.len() > MAX_ADDR_BYTES {
+            return serde_json::json!({"error": "invalid base address"});
+        }
+
+        let network = detect_network_from_address(&base);
+        let stealth = StealthAddress::generate_for_network(&base, &network);
+
+        serde_json::json!({
+            "status": "generated",
+            "base_address": base,
+            "stealth_address": stealth,
+            "note": "Each call produces a new one-time address; share this instead of your real one.",
         })
     }
 
