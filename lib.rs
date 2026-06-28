@@ -7,6 +7,11 @@
 #![allow(clippy::module_inception)]
 #![warn(unused_variables, unused_imports, unused_mut)]
 
+#[cfg(all(feature = "ringct_bypass", not(any(test, debug_assertions))))]
+compile_error!(
+    "feature 'ringct_bypass' is testing-only and must not be enabled in non-test builds"
+);
+
 pub mod errors;
 
 pub mod daemon;
@@ -135,6 +140,7 @@ pub mod engine {
             pub mod entropy;
         }
         pub mod signatures {
+            #[cfg(feature = "pq-dilithium")]
             pub mod dilithium;
             pub mod ed25519;
             pub mod falcon;
@@ -436,7 +442,9 @@ pub mod service {
             pub mod hardware_wallet;
             pub mod hd_wallet;
             pub mod key_manager;
+            pub mod mnemonic;
             pub mod multisig;
+            pub mod slip10;
         }
         pub mod storage {
             pub mod address_book;
