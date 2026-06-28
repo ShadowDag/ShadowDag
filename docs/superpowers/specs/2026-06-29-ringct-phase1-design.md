@@ -3,8 +3,20 @@
 **Date:** 2026-06-29
 **Track:** C (of 3 parallel tracks: docs / HD wallet / RingCT phase 1)
 **Status:** Approved (design), pending spec review
-**Scope:** Phase 1 only. Phases 2 (wallet build/scan) and 3 (UTXO/mempool
-integration polish) get their own specs later.
+**Scope:** Phase 1 = **sender privacy only** (ring signatures + key images +
+on-chain ring-member authenticity). **Amounts stay in plaintext** in Phase 1.
+
+> **Soundness decision (2026-06-29):** Hiding amounts safely requires binding a
+> per-input *pseudo-output commitment* to the real input's amount. The existing
+> `clsag.rs` is a single-key ring signature (proves knowledge of one spend key
+> only); it does NOT bind a commitment. A homomorphic balance over the *real*
+> input commitment is impossible without either (a) revealing which ring member
+> is real (breaks privacy) or (b) a dual-key CLSAG over (spend key, commitment
+> offset). Therefore amount-hiding (dual-key CLSAG + pseudo-commitments + range
+> proofs + homomorphic balance) is **deferred to a later phase with dedicated
+> cryptographic review**. Phase 1 keeps the existing plaintext balance check
+> unchanged, so there is no money-printing risk. Phases for wallet build/scan and
+> UTXO/mempool polish get their own specs later.
 
 ## Problem
 
@@ -28,12 +40,13 @@ Two reasons it isn't wired:
 
 ## Goal (Phase 1)
 
-Make consensus **correctly verify** a fully-formed confidential transaction:
-ring signatures cryptographically valid, amounts conserved homomorphically, range
-proofs valid, key images unique and unseen, and ring members proven to be real
-on-chain outputs. After Phase 1, a confidential TX constructed by a test harness
-(real wallet construction is Phase 2) is accepted iff it is cryptographically and
-economically valid; remove the blanket rejection gate.
+Make consensus **correctly verify** the *sender-privacy* aspects of a confidential
+transaction: ring signatures cryptographically valid, key images unique and
+unseen (double-spend prevention), and ring members proven to be real on-chain
+output keys. **Amounts remain plaintext and the existing balance check is
+unchanged.** After Phase 1, a confidential TX constructed by a test harness (real
+wallet construction is a later phase) is accepted iff its ring signatures and key
+images are valid; the blanket rejection gate for sender-privacy TXs is removed.
 
 ## Threat model / what Phase 1 must prevent
 
@@ -41,12 +54,26 @@ economically valid; remove the blanket rejection gate.
 |--------|--------------------|
 | Forge a ring signature | `clsag::verify(message, ring, sig)` over canonical message |
 | Spend with fake/non-existent decoy keys | Ring members must exist in on-chain **output-key index**; reject otherwise |
-| Inflate supply via hidden amounts | Homomorphic balance: `Σ C_in == Σ C_out + fee·H` |
-| Negative / overflow output amounts | Range proof per output (value ∈ [0, 2^64)) |
 | Double spend | Global **key-image store**; reject seen/duplicate key images |
 | Replay across chains/reorgs | Confidential signing message binds chain id + payload_hash |
+| Inflate supply | Plaintext balance check unchanged (amounts visible); amount-hiding deferred |
+
+> **Deferred to amount-hiding phase (NOT Phase 1):** hidden amounts via Pedersen
+> commitments, range proofs per output, homomorphic balance, and dual-key CLSAG.
 
 ## Architecture
+
+> **Phase-1 applicability:** The subsections below were drafted for full RingCT.
+> Per the soundness decision, **Phase 1 implements only**: §1 (CLSAG serialization;
+> RangeProof/commitment serialization deferred), §2 (`ring_signature` field +
+> one-time output pubkey, see note), §3 (confidential signing message — binding
+> key images + ring members + outputs, NOT commitments), §4 (output-key index),
+> §5 (key-image store), and §6 steps 1–3 + 6 (structural + CLSAG verify + okey
+> membership + key-image checks; remove gate). **Deferred to the amount-hiding
+> phase:** §6.4 (homomorphic balance), §6.5 (range proofs), §7 (UTXO commitment
+> storage). Confidential outputs in Phase 1 carry a one-time Ristretto pubkey
+> (for ring membership) but a **plaintext `amount`**; the existing balance check
+> applies unchanged.
 
 ### 1. Serialization layer (foundation)
 New module `engine/privacy/ringct/serialization.rs` (and/or per-type

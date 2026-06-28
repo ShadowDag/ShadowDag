@@ -158,6 +158,10 @@ Smooth exponential decay (no hard halvings):
 - Target: `MAX_TARGET / difficulty` (256-bit division)
 - NOT leading zeros — proper numeric comparison
 
+> **GPU status:** `engine/mining/gpu/cuda_miner.rs` and `opencl_miner.rs`
+> currently parallelize on CPU via Rayon. There are no CUDA/OpenCL kernels or
+> device bindings yet, so they provide no GPU speedup.
+
 ---
 
 ## 5. ShadowVM (`runtime/vm/`)
@@ -165,7 +169,9 @@ Smooth exponential decay (no hard halvings):
 ### Architecture
 
 - Stack-based (256-bit U256 elements)
-- 90+ opcodes in 16 categories
+- 52 opcodes in 16 categories (v1 consensus set; `runtime/vm/core/opcodes.rs`
+  contains a larger 119-entry reference enum that is explicitly NOT the consensus
+  set — see its file header)
 - Deterministic execution (10 invariants enforced)
 - Gas-first: every opcode checked BEFORE execution
 - Atomic state: WriteBatch commits only on STOP/RETURN
@@ -320,6 +326,12 @@ Multiplier = 2^(utilization x 6), capped at 64x
 | Stealth Addresses | `stealth/stealth_address.rs` | One-time receive addresses |
 | Shadow Pool | `shadow_pool/` | Privacy-first TX aggregation |
 | Dandelion++ | `service/network/propagation/` | Network-layer anonymity |
+
+> **Status:** The privacy primitives above are implemented and unit-tested, but
+> confidential transactions are **not yet accepted by consensus** —
+> `engine/privacy/ringct/ring_validator.rs` performs structural checks only and
+> rejects confidential TXs. End-to-end RingCT wiring is in progress (sender
+> privacy first; amount-hiding deferred pending a dual-key CLSAG extension).
 
 ---
 

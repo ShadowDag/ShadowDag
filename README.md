@@ -14,11 +14,11 @@ A next-generation cryptocurrency combining DAG-based high throughput, Monero-lev
 | **Blocks Per Second** | 10 (default), configurable 1/10/32 |
 | **Max TPS** | 100,000+ (10 BPS x 10,000 txs/block) |
 | **Finality** | 200 blocks (~20s), dynamic 100-2,000 |
-| **Privacy** | CLSAG Ring Signatures + Pedersen Commitments + Stealth Addresses + Dandelion++ |
-| **Smart Contracts** | ShadowVM (90+ opcodes, deterministic, gas-metered) |
+| **Privacy** | CLSAG Ring Signatures + Pedersen Commitments + Stealth Addresses + Dandelion++ (primitives implemented; end-to-end RingCT not yet enabled in consensus — see Implementation Status) |
+| **Smart Contracts** | ShadowVM (52 opcodes, v1 consensus set, deterministic, gas-metered) |
 | **Block Explorer** | Built-in web UI (DAG viz, mempool, TX viewer, rich list) |
 | **Desktop Wallet** | Browser-based wallet UI (send/receive, balance, address book) |
-| **Mining** | ShadowHash (ASIC-resistant, 256KB scratchpad) |
+| **Mining** | ShadowHash (ASIC-resistant, 256KB scratchpad). GPU miners currently run on CPU via Rayon — see Implementation Status |
 | **Post-Quantum** | Falcon + Dilithium signature support |
 | **Emission** | Smooth decay (0.38%/month, ~5.5yr halving) |
 | **Fee Market** | EIP-1559 style with exponential surge pricing |
@@ -106,7 +106,7 @@ shadowdag/                    130,415 lines of Rust across 328 files
 |   +-- storage/rocksdb/      Blocks, DAG, UTXO, transactions, peers, state
 |
 +-- runtime/                  Execution environment
-|   +-- vm/                   ShadowVM (90+ opcodes, U256, gas, precompiles)
+|   +-- vm/                   ShadowVM (52 opcodes v1, U256, gas, precompiles)
 |   +-- wasm/                 WASM SDK (browser-compatible wallet functions)
 |   +-- event_bus/            Pub-sub event system
 |   +-- scheduler/            Async task scheduling
@@ -240,7 +240,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed technical documentation.
 +---------------------------------------------------+
 | Engine: Consensus, GHOSTDAG, Mining, Privacy        |
 +---------------------------------------------------+
-| Runtime: ShadowVM (90+ opcodes), Event Bus          |
+| Runtime: ShadowVM (52 opcodes v1), Event Bus        |
 +---------------------------------------------------+
 | Domain: Blocks, Transactions, UTXO, Addresses       |
 +---------------------------------------------------+
@@ -280,6 +280,23 @@ Message:  "ShadowDAG/Genesis/2026-01-01/Privacy-is-a-right-not-a-privilege"
 | VM Contract Tests | `cargo test --lib -- execution_env v1_spec contract_e2e ...` |
 | Clippy | `cargo clippy --all-targets -- -D warnings` |
 | shadowasm Check | `shadowasm build --check` on sample |
+
+## Implementation Status / Known Limitations
+
+Honest snapshot of what is wired vs. in progress (as of 2026-06-29):
+
+| Area | Status |
+|------|--------|
+| Consensus / GHOSTDAG / DAG | Implemented, tested |
+| Storage (RocksDB, WAL, atomic) | Implemented |
+| Mempool (RBF / CPFP / surge pricing) | Implemented |
+| P2P networking | Implemented (thread-per-peer; no TLS; ~1k peer ceiling) |
+| ShadowVM (52 opcodes, v1) | Implemented |
+| Mining (ShadowHash + Stratum pool) | Implemented |
+| GPU mining | CPU fallback only — no CUDA/OpenCL kernels |
+| Privacy primitives (CLSAG / Pedersen / range proofs / stealth) | Implemented (unit-tested) |
+| Privacy in consensus (RingCT end-to-end) | Not yet enabled — confidential TXs rejected |
+| HD wallet (BIP39 + SLIP-0010) | In progress |
 
 ## License
 
