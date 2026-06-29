@@ -14,6 +14,7 @@ use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, Tx
 use crate::domain::transaction::tx_hash::TxHash;
 use crate::engine::privacy::confidential::pedersen::generator_h;
 use crate::engine::privacy::confidential::range_proof;
+use crate::engine::privacy::ringct::amount_encoding;
 use crate::engine::privacy::ringct::dual_clsag::{self, RingMember};
 use crate::engine::privacy::ringct::serialization::range_proof_to_hex;
 use crate::errors::CryptoError;
@@ -85,29 +86,25 @@ pub fn build_confidential_transaction(
         }
     }
 
-    // 2. Pseudo-output blindings (random per input) and output blindings
-    //    (random except the last, which absorbs the difference so the
-    //    commitments balance: Σ r'_in == Σ r_out).
-    let mut pseudo_blindings: Vec<Scalar> =
-        (0..inputs.len()).map(|_| Scalar::random(&mut OsRng)).collect();
-    let sum_pseudo: Scalar = pseudo_blindings.iter().sum();
-
+    // 2. Outputs: stealth one-time address + derived blinding + commitment +
+    //    range proof + encrypted amount. The blinding is derived from the ECDH
+    //    shared secret so the recipient can recompute it (so it is NOT free to
+    //    choose for balancing — the input side absorbs instead, step 3).
     let n_out = recipients.len();
-    let mut out_blindings: Vec<Scalar> =
-        (0..n_out).map(|_| Scalar::random(&mut OsRng)).collect();
-    let sum_other: Scalar = out_blindings[..n_out - 1].iter().sum();
-    out_blindings[n_out - 1] = sum_pseudo - sum_other;
-
-    // 3. Outputs: stealth one-time address + commitment + range proof.
+    let mut out_blinding_sum = Scalar::ZERO;
     let mut tx_outputs = Vec::with_capacity(n_out);
     for (i, r) in recipients.iter().enumerate() {
-        let stealth = StealthAddress::generate_full_for_network(
+        let (stealth, ss) = StealthAddress::generate_full_for_network_with_secret(
             &r.view_pub,
             &r.spend_pub,
             network.short_name(),
         )?;
-        let c_out = Scalar::from(r.amount) * h + out_blindings[i] * g;
-        let proof = range_proof::prove(r.amount, &out_blindings[i]);
+        let blinding = amount_encoding::derive_blinding(&ss, i as u32);
+        out_blinding_sum += blinding;
+        let c_out = Scalar::from(r.amount) * h + blinding * g;
+        let proof = range_proof::prove(r.amount, &blinding);
+        let mask = amount_encoding::amount_mask(&ss, i as u32);
+        let enc = amount_encoding::encrypt_amount(r.amount, &mask);
         tx_outputs.push(TxOutput {
             address: stealth.one_time_address,
             amount: 0,
@@ -115,9 +112,18 @@ pub fn build_confidential_transaction(
             range_proof: Some(range_proof_to_hex(&proof)),
             ephemeral_pubkey: Some(stealth.ephemeral_pubkey),
             one_time_pubkey: Some(stealth.one_time_pubkey),
-            encrypted_amount: None, // set by sub-project 4b (derived from ss)
+            encrypted_amount: Some(amount_encoding::enc_to_hex(&enc)),
         });
     }
+
+    // 3. Pseudo-output blindings: random per input EXCEPT the last input, which
+    //    absorbs the difference so Σ r'_in == Σ derived_out_blindings (the H
+    //    terms already match because the amounts balance). Requires ≥ 1 input.
+    let mut pseudo_blindings: Vec<Scalar> =
+        (0..inputs.len()).map(|_| Scalar::random(&mut OsRng)).collect();
+    let last = inputs.len() - 1;
+    let sum_other_pseudo: Scalar = pseudo_blindings[..last].iter().sum();
+    pseudo_blindings[last] = out_blinding_sum - sum_other_pseudo;
 
     // 4. Inputs: pseudo-output + ring + key image (no signature yet).
     let mut tx_inputs = Vec::with_capacity(inputs.len());
@@ -175,9 +181,6 @@ pub fn build_confidential_transaction(
     tx.hash = TxHash::hash_for_network(&tx, network);
 
     for b in pseudo_blindings.iter_mut() {
-        b.zeroize();
-    }
-    for b in out_blindings.iter_mut() {
         b.zeroize();
     }
     Ok(tx)
