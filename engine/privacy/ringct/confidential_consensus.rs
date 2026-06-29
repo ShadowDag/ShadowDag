@@ -337,4 +337,19 @@ mod tests {
             "key image already spent must be rejected"
         );
     }
+
+    #[test]
+    fn apply_advances_confidential_output_index() {
+        let set = UtxoSet::new_empty();
+        let tx = valid_conf_tx(&set, 100); // one confidential output
+        let before = set.confidential_output_count();
+        set.apply_block_dag_ordered(std::slice::from_ref(&tx), 1, "blk")
+            .unwrap();
+        assert_eq!(set.confidential_output_count(), before + 1);
+        let last = set.confidential_output_count() - 1;
+        assert_eq!(
+            set.confidential_output_at(last),
+            tx.outputs[0].one_time_pubkey.clone()
+        );
+    }
 }

@@ -166,6 +166,57 @@ impl UtxoSet {
             .and_then(|v| String::from_utf8(v).ok())
     }
 
+    // ── Sequential confidential-output index (for decoy selection) ──────
+    //
+    // `okeyidx:count` -> u64 LE, `okeyidx:{N}` -> one-time pubkey hex. Lets a
+    // wallet sample random real outputs to form privacy rings (Monero-style
+    // global output index).
+
+    fn okeyidx_count_key() -> Vec<u8> {
+        b"okeyidx:count".to_vec()
+    }
+    fn okeyidx_at_key(n: u64) -> Vec<u8> {
+        let mut v = Vec::with_capacity(8 + 20);
+        v.extend_from_slice(b"okeyidx:");
+        v.extend_from_slice(n.to_string().as_bytes());
+        v
+    }
+
+    /// Number of confidential outputs recorded in the global index.
+    pub fn confidential_output_count(&self) -> u64 {
+        match self.store.get_raw(&Self::okeyidx_count_key()) {
+            Some(v) if v.len() == 8 => {
+                let mut a = [0u8; 8];
+                a.copy_from_slice(&v);
+                u64::from_le_bytes(a)
+            }
+            _ => 0,
+        }
+    }
+
+    /// One-time pubkey (hex) at global index `n`, if present.
+    pub fn confidential_output_at(&self, n: u64) -> Option<String> {
+        self.store
+            .get_raw(&Self::okeyidx_at_key(n))
+            .and_then(|v| String::from_utf8(v).ok())
+    }
+
+    /// Record a confidential output into BOTH the okey P->C map and the global
+    /// sequential index. Non-atomic convenience used by tests; the live apply
+    /// path inlines the equivalent writes into its WriteBatch.
+    pub fn record_confidential_output_indexed(
+        &self,
+        pk_hex: &str,
+        commitment_hex: &str,
+    ) -> Result<(), StorageError> {
+        self.record_output_key(pk_hex, commitment_hex)?;
+        let n = self.confidential_output_count();
+        self.store
+            .put_raw(&Self::okeyidx_at_key(n), pk_hex.as_bytes())?;
+        self.store
+            .put_raw(&Self::okeyidx_count_key(), &(n + 1).to_le_bytes())
+    }
+
     pub fn add_utxo(&self, key: &UtxoKey, owner: String, amount: u64, address: String) {
         let utxo = Utxo {
             owner,
@@ -695,6 +746,11 @@ impl UtxoSet {
         let mut staged_outputs: HashMap<UtxoKey, crate::domain::utxo::utxo::Utxo> = HashMap::new();
         let mut staged_spent: std::collections::HashSet<UtxoKey> = std::collections::HashSet::new();
 
+        // RingCT global confidential-output index: read the counter once, advance
+        // it locally per confidential output, and flush it once into this batch.
+        let conf_out_index_start = self.confidential_output_count();
+        let mut conf_out_index = conf_out_index_start;
+
         for tx in transactions {
             // ───────────────────────────────────────────────────────────
             // TX UNIQUENESS CHECK (consensus rule)
@@ -737,6 +793,12 @@ impl UtxoSet {
                             key: Self::okey_key(otk),
                             value: c.as_bytes().to_vec(),
                         });
+                        // Append to the global confidential-output index.
+                        ops.push(BatchWrite::Put {
+                            key: Self::okeyidx_at_key(conf_out_index),
+                            value: otk.as_bytes().to_vec(),
+                        });
+                        conf_out_index += 1;
                     }
                 }
                 let seen_key = format!("tx_seen:{}", tx.hash);
@@ -1066,6 +1128,15 @@ impl UtxoSet {
             key: undo_key.as_bytes().to_vec(),
             value: undo_data,
         });
+
+        // Flush the advanced confidential-output index counter (once), in this
+        // same atomic batch, only if any confidential output was recorded.
+        if conf_out_index != conf_out_index_start {
+            ops.push(BatchWrite::Put {
+                key: Self::okeyidx_count_key(),
+                value: conf_out_index.to_le_bytes().to_vec(),
+            });
+        }
 
         // ATOMIC COMMIT
         self.store.write_batch(ops).map_err(|e| {
@@ -1604,5 +1675,23 @@ mod ringct_phase1_store_tests {
         set.record_output_key(&pk, &c).unwrap();
         assert_eq!(set.output_key_commitment(&pk), Some(c.clone()));
         assert!(set.output_key_exists(&pk));
+    }
+
+    #[test]
+    fn confidential_output_index_counts_and_indexes() {
+        let set = UtxoSet::new_empty();
+        assert_eq!(set.confidential_output_count(), 0);
+        assert!(set.confidential_output_at(0).is_none());
+
+        set.record_confidential_output_indexed(&"aa".repeat(32), &"11".repeat(32))
+            .unwrap();
+        set.record_confidential_output_indexed(&"bb".repeat(32), &"22".repeat(32))
+            .unwrap();
+
+        assert_eq!(set.confidential_output_count(), 2);
+        assert_eq!(set.confidential_output_at(0), Some("aa".repeat(32)));
+        assert_eq!(set.confidential_output_at(1), Some("bb".repeat(32)));
+        assert!(set.confidential_output_at(2).is_none());
+        assert_eq!(set.output_key_commitment(&"aa".repeat(32)), Some("11".repeat(32)));
     }
 }
