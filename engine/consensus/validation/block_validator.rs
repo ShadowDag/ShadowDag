@@ -203,6 +203,35 @@ impl BlockValidator {
                 MAX_TXS_PER_BLOCK_VALIDATION
             )));
         }
+        // Block gas budget: sum of declared tx gas_limits must not exceed
+        // MAX_BLOCK_GAS. Enforced HERE (not just in block_builder) so a peer
+        // cannot pack a block with unbounded contract execution and force every
+        // node to burn CPU far beyond the intended per-block bound (DoS).
+        // checked_add: a gas_limit near u64::MAX must not wrap past the cap.
+        {
+            let mut block_gas: u64 = 0;
+            for tx in &block.body.transactions {
+                let g = tx.gas_limit.unwrap_or(0);
+                if g == 0 {
+                    continue;
+                }
+                block_gas = match block_gas.checked_add(g) {
+                    Some(v) => v,
+                    None => {
+                        return Err(ConsensusError::BlockValidation(
+                            "block gas_limit sum overflow".into(),
+                        ))
+                    }
+                };
+                if block_gas > ConsensusParams::MAX_BLOCK_GAS {
+                    return Err(ConsensusError::BlockValidation(format!(
+                        "block gas {} exceeds MAX_BLOCK_GAS {}",
+                        block_gas,
+                        ConsensusParams::MAX_BLOCK_GAS
+                    )));
+                }
+            }
+        }
         if block.header.version == 0 {
             return Err(ConsensusError::BlockValidation("version=0".into()));
         }
@@ -1326,6 +1355,37 @@ mod tests {
     #[test]
     fn network_layer_valid_block_passes() {
         let block = make_valid_block(5);
+        assert!(BlockValidator::validate_network_layer(&block).is_ok());
+    }
+
+    #[test]
+    fn network_layer_rejects_block_over_gas_limit() {
+        // Regression: a peer block whose tx gas_limits sum beyond MAX_BLOCK_GAS
+        // must be rejected (otherwise unbounded contract execution = CPU DoS).
+        let cb = make_coinbase(5);
+        let mut t1 = make_regular_tx("gas_tx_1");
+        t1.gas_limit = Some(ConsensusParams::MAX_BLOCK_GAS);
+        t1.hash = TxHash::hash_for_network(&t1, &NetworkMode::Mainnet);
+        let mut t2 = make_regular_tx("gas_tx_2");
+        t2.gas_limit = Some(1);
+        t2.hash = TxHash::hash_for_network(&t2, &NetworkMode::Mainnet);
+        let block = make_block(5, vec![cb, t1, t2]);
+        let r = BlockValidator::validate_network_layer(&block);
+        assert!(r.is_err(), "block exceeding MAX_BLOCK_GAS must be rejected");
+        assert!(
+            format!("{:?}", r).to_lowercase().contains("gas"),
+            "rejection reason should mention gas: {:?}",
+            r
+        );
+    }
+
+    #[test]
+    fn network_layer_accepts_block_within_gas_limit() {
+        let cb = make_coinbase(5);
+        let mut t1 = make_regular_tx("gas_ok_1");
+        t1.gas_limit = Some(ConsensusParams::MAX_BLOCK_GAS / 2);
+        t1.hash = TxHash::hash_for_network(&t1, &NetworkMode::Mainnet);
+        let block = make_block(5, vec![cb, t1]);
         assert!(BlockValidator::validate_network_layer(&block).is_ok());
     }
 
