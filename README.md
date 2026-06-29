@@ -14,7 +14,7 @@ A next-generation cryptocurrency combining DAG-based high throughput, Monero-lev
 | **Blocks Per Second** | 10 (default), configurable 1/10/32 |
 | **Max TPS** | 100,000+ (10 BPS x 10,000 txs/block) |
 | **Finality** | 200 blocks (~20s), dynamic 100-2,000 |
-| **Privacy** | CLSAG Ring Signatures + Pedersen Commitments + Stealth Addresses + Dandelion++ (primitives implemented; end-to-end RingCT not yet enabled in consensus — see Implementation Status) |
+| **Privacy** | CLSAG Ring Signatures + Pedersen Commitments + Stealth Addresses + Dandelion++ (sender privacy enabled in consensus; confidential amounts pending — see Implementation Status) |
 | **Smart Contracts** | ShadowVM (52 opcodes, v1 consensus set, deterministic, gas-metered) |
 | **Block Explorer** | Built-in web UI (DAG viz, mempool, TX viewer, rich list) |
 | **Desktop Wallet** | Browser-based wallet UI (send/receive, balance, address book) |
@@ -295,8 +295,9 @@ Honest snapshot of what is wired vs. in progress (as of 2026-06-29):
 | Mining (ShadowHash + Stratum pool) | Implemented |
 | GPU mining | CPU fallback only — no CUDA/OpenCL kernels |
 | Privacy primitives (CLSAG / Pedersen / range proofs / stealth) | Implemented (unit-tested) |
-| Privacy in consensus (RingCT end-to-end) | Not yet enabled — confidential TXs rejected |
-| HD wallet (BIP39 + SLIP-0010) | In progress |
+| Sender privacy in consensus (CLSAG ring sigs + key images, RingCT phase 1) | Enabled — confidential TXs verified (ring signatures, key-image double-spend, on-chain ring-member authenticity) |
+| Confidential amounts (hidden amounts) | Not yet — requires dual-key CLSAG; amounts currently plaintext |
+| HD wallet (BIP39 + SLIP-0010) | Implemented |
 
 ## License
 

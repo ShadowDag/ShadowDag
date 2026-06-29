@@ -327,11 +327,13 @@ Multiplier = 2^(utilization x 6), capped at 64x
 | Shadow Pool | `shadow_pool/` | Privacy-first TX aggregation |
 | Dandelion++ | `service/network/propagation/` | Network-layer anonymity |
 
-> **Status:** The privacy primitives above are implemented and unit-tested, but
-> confidential transactions are **not yet accepted by consensus** —
-> `engine/privacy/ringct/ring_validator.rs` performs structural checks only and
-> rejects confidential TXs. End-to-end RingCT wiring is in progress (sender
-> privacy first; amount-hiding deferred pending a dual-key CLSAG extension).
+> **Status (RingCT phase 1 — sender privacy):** Confidential transactions are
+> now **verified by consensus** for sender privacy: `TxValidator::validate_confidential`
+> checks CLSAG ring signatures (`verify_clsag`), enforces key-image uniqueness
+> (a `ki:` store prevents double-spends), and requires every ring member to be a
+> real on-chain output key (an `okey:` index). **Amounts remain plaintext** in
+> this phase — hiding amounts needs a dual-key CLSAG + pseudo-commitments and is
+> deferred to a later phase with dedicated cryptographic review.
 
 ---
 
