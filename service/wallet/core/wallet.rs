@@ -351,8 +351,9 @@ impl Wallet {
                 .output_key_commitment(&u.one_time_pubkey)
                 .and_then(|c| point_from_hex(&c))
                 .ok_or_else(|| WalletError::Other("real output not on-chain yet".into()))?;
-            let mut ring = select_decoys(utxo_set, CONF_RING_SIZE - 1, &[u.one_time_pubkey.clone()])
-                .ok_or_else(|| WalletError::Other("not enough decoys on-chain yet".into()))?;
+            let mut ring =
+                select_decoys(utxo_set, CONF_RING_SIZE - 1, std::slice::from_ref(&u.one_time_pubkey))
+                    .ok_or_else(|| WalletError::Other("not enough decoys on-chain yet".into()))?;
             ring.push(RingMember {
                 public_key: real_pk,
                 commitment: real_c,
