@@ -3,11 +3,20 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::config::node::node_config::NetworkMode;
 use crate::domain::address::invisible_wallet::InvisibleWallet;
 use crate::domain::block::block::Block;
 use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
+use crate::domain::utxo::utxo_set::UtxoSet;
+use crate::engine::privacy::ringct::builder::{
+    build_confidential_transaction, ConfRecipient, OwnedInput,
+};
+use crate::engine::privacy::ringct::decoy::select_decoys;
+use crate::engine::privacy::ringct::dual_clsag::RingMember;
 use crate::engine::privacy::ringct::scan::scan_confidential_output;
+use crate::engine::privacy::ringct::serialization::point_from_hex;
 use crate::errors::WalletError;
+use curve25519_dalek::scalar::Scalar;
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hex;
@@ -25,6 +34,9 @@ const SALT_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
 const CHECKSUM_BYTES: usize = 4;
 const DUST_LIMIT: u64 = 546;
+/// Ring size for confidential sends: 1 real + (CONF_RING_SIZE-1) decoys.
+/// Must be ≥ the consensus minimum ring size (4) enforced by RingValidator.
+const CONF_RING_SIZE: usize = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct WalletAddress {
@@ -284,6 +296,102 @@ impl Wallet {
             }
         }
         n
+    }
+
+    /// Network as a `NetworkMode` (defaults to Mainnet if the string is unknown).
+    fn network_mode(&self) -> NetworkMode {
+        self.network.parse().unwrap_or(NetworkMode::Mainnet)
+    }
+
+    /// Build a confidential (RingCT) transaction sending `amount` to a confidential
+    /// payment address (`…1p`), with any change returned to this wallet. The
+    /// returned tx is unsigned-broadcast-ready (CLSAG-signed) — the caller submits
+    /// it via RPC `sendrawtransaction`. `utxo_set` is the node's confidential output
+    /// index (read-only), used for decoy selection + real-commitment lookup.
+    pub fn build_confidential_send(
+        &self,
+        recipient_addr: &str,
+        amount: u64,
+        fee: u64,
+        utxo_set: &UtxoSet,
+    ) -> Result<Transaction, WalletError> {
+        let ck = self.confidential_keys().ok_or(WalletError::Locked)?;
+        let net = self.network_mode();
+        let (view_pub, spend_pub) =
+            InvisibleWallet::parse_confidential_address(recipient_addr, &self.network)
+                .map_err(|e| WalletError::Other(format!("bad recipient address: {}", e)))?;
+
+        let need = amount
+            .checked_add(fee)
+            .ok_or_else(|| WalletError::Other("amount+fee overflow".into()))?;
+
+        // Select unspent confidential UTXOs, largest-first, until they cover need.
+        let mut chosen: Vec<&ConfidentialUtxo> =
+            self.confidential_utxos.iter().filter(|u| !u.spent).collect();
+        chosen.sort_by(|a, b| b.amount.cmp(&a.amount));
+        let mut inputs_total = 0u64;
+        let mut picked: Vec<&ConfidentialUtxo> = Vec::new();
+        for u in chosen {
+            if inputs_total >= need {
+                break;
+            }
+            inputs_total += u.amount;
+            picked.push(u);
+        }
+        if inputs_total < need {
+            return Err(WalletError::Other("insufficient confidential funds".into()));
+        }
+
+        // Build one OwnedInput per picked UTXO (ring + recovered spend secret).
+        let mut owned = Vec::with_capacity(picked.len());
+        for u in &picked {
+            let real_pk = point_from_hex(&u.one_time_pubkey)
+                .ok_or_else(|| WalletError::Other("bad one-time pubkey".into()))?;
+            let real_c = utxo_set
+                .output_key_commitment(&u.one_time_pubkey)
+                .and_then(|c| point_from_hex(&c))
+                .ok_or_else(|| WalletError::Other("real output not on-chain yet".into()))?;
+            let mut ring = select_decoys(utxo_set, CONF_RING_SIZE - 1, &[u.one_time_pubkey.clone()])
+                .ok_or_else(|| WalletError::Other("not enough decoys on-chain yet".into()))?;
+            ring.push(RingMember {
+                public_key: real_pk,
+                commitment: real_c,
+            });
+            let real_index = ring.len() - 1;
+            // Recover the one-time spend secret from the stored ephemeral pubkey.
+            let eph = point_from_hex(&u.ephemeral_pubkey)
+                .ok_or_else(|| WalletError::Other("bad ephemeral pubkey".into()))?;
+            let spend_secret = ck
+                .derive_spend_key_for(&eph)
+                .map_err(|e| WalletError::Other(format!("spend-secret recovery failed: {}", e)))?;
+            let blinding = scalar_from_hex(&u.blinding_hex)
+                .ok_or_else(|| WalletError::Other("bad blinding".into()))?;
+            owned.push(OwnedInput {
+                spend_secret,
+                amount: u.amount,
+                blinding,
+                ring,
+                real_index,
+            });
+        }
+
+        // Recipients: the target + change back to self (rescannable + spendable).
+        let mut recipients = vec![ConfRecipient {
+            view_pub,
+            spend_pub,
+            amount,
+        }];
+        let change = inputs_total - need;
+        if change > 0 {
+            recipients.push(ConfRecipient {
+                view_pub: ck.view_public(),
+                spend_pub: ck.spend_public(),
+                amount: change,
+            });
+        }
+
+        build_confidential_transaction(owned, recipients, fee, &net)
+            .map_err(|e| WalletError::Other(format!("build confidential tx failed: {}", e)))
     }
 
     pub fn is_locked(&self) -> bool {
@@ -1076,9 +1184,119 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+/// Decode a hex-encoded canonical Ristretto scalar (32 bytes).
+fn scalar_from_hex(s: &str) -> Option<Scalar> {
+    let b = hex::decode(s).ok()?;
+    let arr: [u8; 32] = b.try_into().ok()?;
+    Option::from(Scalar::from_canonical_bytes(arr))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_confidential_roundtrip_a_to_b_then_b_spends() {
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::utxo::utxo_set::UtxoSet;
+        use crate::engine::privacy::ringct::builder::{
+            build_confidential_transaction, ConfRecipient, OwnedInput,
+        };
+        use crate::engine::privacy::ringct::confidential_consensus::verify_confidential_tx;
+        use crate::engine::privacy::ringct::dual_clsag::RingMember;
+        use curve25519_dalek::ristretto::RistrettoPoint;
+        use curve25519_dalek::{constants::RISTRETTO_BASEPOINT_POINT as G, scalar::Scalar};
+        use rand::rngs::OsRng;
+        use std::collections::HashSet;
+
+        let net = NetworkMode::Mainnet;
+        let h = crate::engine::privacy::confidential::pedersen::generator_h();
+        let set = UtxoSet::new_empty();
+        let rec = |set: &UtxoSet, pk: RistrettoPoint, c: RistrettoPoint| {
+            set.record_confidential_output_indexed(
+                &hex::encode(pk.compress().as_bytes()),
+                &hex::encode(c.compress().as_bytes()),
+            )
+            .unwrap();
+        };
+        // Seed decoys.
+        for _ in 0..8 {
+            rec(&set, Scalar::random(&mut OsRng) * G, Scalar::from(9u64) * h + Scalar::random(&mut OsRng) * G);
+        }
+
+        let mut a = Wallet::new("mainnet");
+        a.restore_from_seed(vec![10u8; 32]).unwrap();
+        let ack = a.confidential_keys().unwrap();
+        let mut b = Wallet::new("mainnet");
+        b.restore_from_seed(vec![20u8; 32]).unwrap();
+
+        // Seed A's own 100-output by building a tx to A and scanning it.
+        let spend = Scalar::random(&mut OsRng);
+        let bl = Scalar::random(&mut OsRng);
+        let real_pk = spend * G;
+        let real_c = Scalar::from(100u64) * h + bl * G;
+        rec(&set, real_pk, real_c);
+        let mut ring = crate::engine::privacy::ringct::decoy::select_decoys(
+            &set,
+            4,
+            &[hex::encode(real_pk.compress().as_bytes())],
+        )
+        .unwrap();
+        ring.push(RingMember { public_key: real_pk, commitment: real_c });
+        let ri = ring.len() - 1;
+        let seed_tx = build_confidential_transaction(
+            vec![OwnedInput { spend_secret: spend, amount: 100, blinding: bl, ring, real_index: ri }],
+            vec![ConfRecipient {
+                view_pub: ack.view_public(),
+                spend_pub: ack.spend_public(),
+                amount: 100,
+            }],
+            0,
+            &net,
+        )
+        .unwrap();
+        for out in &seed_tx.outputs {
+            rec(
+                &set,
+                point_from_hex(out.one_time_pubkey.as_ref().unwrap()).unwrap(),
+                point_from_hex(out.commitment.as_ref().unwrap()).unwrap(),
+            );
+        }
+        assert_eq!(a.scan_confidential(&seed_tx).len(), 1);
+
+        // A sends 60 to B, 40 change back to A (fee 0).
+        let tx = a
+            .build_confidential_send(&b.confidential_receive_address().unwrap(), 60, 0, &set)
+            .unwrap();
+        let mut seen = HashSet::new();
+        assert!(
+            verify_confidential_tx(&tx, &set, &net, &mut seen).is_ok(),
+            "A->B confidential tx must be consensus-valid"
+        );
+
+        // B scans and finds 60.
+        assert_eq!(
+            b.scan_confidential(&tx).iter().map(|u| u.amount).sum::<u64>(),
+            60
+        );
+
+        // Record tx outputs on-chain; B spends its 60 back to A.
+        for out in &tx.outputs {
+            rec(
+                &set,
+                point_from_hex(out.one_time_pubkey.as_ref().unwrap()).unwrap(),
+                point_from_hex(out.commitment.as_ref().unwrap()).unwrap(),
+            );
+        }
+        let tx2 = b
+            .build_confidential_send(&a.confidential_receive_address().unwrap(), 60, 0, &set)
+            .unwrap();
+        let mut seen2 = HashSet::new();
+        assert!(
+            verify_confidential_tx(&tx2, &set, &net, &mut seen2).is_ok(),
+            "B respend must be consensus-valid"
+        );
+    }
 
     #[test]
     fn scan_confidential_recovers_self_output() {
