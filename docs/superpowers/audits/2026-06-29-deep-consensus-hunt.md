@@ -257,6 +257,37 @@ hash/target math (verified clean), auth-token generation+verification. Math
 soundness of CLSAG/Pedersen/range-proofs remains the external cryptographer's
 scope (not attempted here).
 
+## Eighth pass (ShadowVM / smart-contract audit) — arithmetic, CALL/value, gas, storage, deploy
+
+Verified by me against real code. 4 confirmed FIXED; 3 candidate findings REFUTED
+by adversarial verify (guards exist). All 4 real ones are tx-bounded: no node
+abort, no money creation/theft, no honest-node consensus split. Live VM =
+`execution_env.rs` (via `executor.rs` → `execute_frame_guarded`); `vm.rs` engine
+has no live caller (fuzz/tests + shared types only).
+
+- **VM1 (MED) — FIXED:** SHL/SHR truncated the shift operand via `as_u64() as u32`,
+  so shifts ≥ 2³² (2⁶⁴, 2³², 2³²+5) wrapped to small/zero instead of EVM's "≥256 ⇒ 0".
+  Added `U256::shift_count()` (clamps to 256); used in both `execution_env.rs` and
+  legacy `vm.rs` to prevent drift. Tests added.
+- **VM2 (LOW) — FIXED:** MLOAD/MSTORE/MSTORE8/CALLDATALOAD truncated offsets via
+  `as_u64() as usize` — offsets ≥ 2⁶⁴ wrapped to a small in-bounds address where EVM
+  faults. Added `U256::to_mem_offset()`; MLOAD/MSTORE/MSTORE8 fail the frame (EVM
+  OOG), CALLDATALOAD zero-pads. Test added.
+- **VM3 (MED) — FIXED:** CALLDATACOPY/CODECOPY/RETURNDATACOPY charged no per-word
+  copy cost → tight copy loop over warm memory = CPU/bandwidth DoS replayed by every
+  validator. Added `charge_copy_words` (3 gas/word) before each copy.
+- **VM4 (LOW) — FIXED:** `StateManager::set_code` bumped nonce 0→1 without journaling
+  it → rollback left a stale nonce. Now journals a `NonceChange`. Test added.
+- **REFUTED (not bugs):** gas-budget-bypass via `gas_limit=None` (guarded on the
+  peer-accept path), block-apply ContractCreate-without-validation (every dangerous
+  outcome guarded elsewhere), `resolve_address` subtype-probing misroute (no real
+  cross-subtype collision).
+
+8th-pass coverage: opcode arithmetic/stack/memory, CALL/CREATE/value/balance
+conservation, gas metering, contract storage/state isolation/rollback,
+deploy/dispatch determinism. No money-creation/theft, no node-abort/panic, no
+honest-node consensus divergence found.
+
 ## Final deferred set (all confirmed real, all MEDIUM, all mitigated — consensus/storage REDESIGNS)
 These share: real but NOT turnkey-exploitable, and their correct fix is an
 architecture change where a rushed patch is itself a serious risk. They are the
