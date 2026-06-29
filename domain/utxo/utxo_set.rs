@@ -745,6 +745,12 @@ impl UtxoSet {
         // This ensures tx3 can see tx1's output even though it's only in the batch.
         let mut staged_outputs: HashMap<UtxoKey, crate::domain::utxo::utxo::Utxo> = HashMap::new();
         let mut staged_spent: std::collections::HashSet<UtxoKey> = std::collections::HashSet::new();
+        // Coinbase outputs created earlier in THIS block. They CANNOT be spent in
+        // the same block (need COINBASE_MATURITY confirmations). The maturity
+        // check (D, below) only sees committed `cb_height:` markers via get_raw,
+        // so an intra-block coinbase would otherwise slip through — diverging from
+        // validate_block_utxos (which rejects it) and bypassing maturity.
+        let mut staged_coinbase: std::collections::HashSet<UtxoKey> = std::collections::HashSet::new();
 
         // RingCT global confidential-output index: read the counter once, advance
         // it locally per confidential output, and flush it once into this batch.
@@ -850,6 +856,7 @@ impl UtxoSet {
                     undo.created_cb_heights.push(meta_key_string);
 
                     staged_outputs.insert(key, utxo);
+                    staged_coinbase.insert(key);
 
                     commitment_hasher.update(b"C");
                     commitment_hasher.update(key.as_ref());
@@ -890,6 +897,15 @@ impl UtxoSet {
 
                 // 2. Created by earlier tx in this block? (intra-block spend)
                 if let Some(utxo) = staged_outputs.get(&key) {
+                    // A coinbase output created in THIS block is immature
+                    // (needs COINBASE_MATURITY confirmations) — spending it in
+                    // the same block is a conflict. Mirrors validate_block_utxos
+                    // (utxo_validator.rs is_cb rejection) so both validation
+                    // paths agree and the maturity invariant holds.
+                    if staged_coinbase.contains(&key) {
+                        conflict = true;
+                        break;
+                    }
                     tx_inputs.push((key, utxo.clone()));
                     continue;
                 }
@@ -1696,5 +1712,53 @@ mod ringct_phase1_store_tests {
         assert_eq!(set.confidential_output_at(1), Some("bb".repeat(32)));
         assert!(set.confidential_output_at(2).is_none());
         assert_eq!(set.output_key_commitment(&"aa".repeat(32)), Some("11".repeat(32)));
+    }
+
+    #[test]
+    fn same_block_coinbase_spend_is_skipped() {
+        // Regression: a tx that spends a coinbase output created in the SAME
+        // block must NOT be applied by apply_block_dag_ordered (coinbase needs
+        // COINBASE_MATURITY confirmations). Previously the maturity check read
+        // cb_height only from committed DB, so an intra-block coinbase slipped
+        // through — bypassing maturity and diverging from validate_block_utxos.
+        use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput};
+        let set = UtxoSet::new_empty();
+        let cb_hash = "cb".repeat(32);
+        let mut coinbase = Transaction::new_coinbase(
+            cb_hash.clone(),
+            vec![TxOutput::new("miner_addr".into(), 5000)],
+            0,
+            1000,
+        );
+        coinbase.hash = cb_hash.clone();
+        let mut spend = Transaction::new(
+            "ee".repeat(32),
+            vec![TxInput::new(
+                cb_hash.clone(),
+                0,
+                "miner_addr".into(),
+                "sig".into(),
+                "pk".into(),
+            )],
+            vec![TxOutput::new("dest_addr".into(), 4000)],
+            1,
+            1000,
+        );
+        spend.hash = "ee".repeat(32);
+
+        let (applied, skipped, _fees) = set
+            .apply_block_dag_ordered(&[coinbase, spend], 1, &"bb".repeat(32))
+            .unwrap();
+        assert_eq!(applied, 1, "only the coinbase should apply");
+        assert!(skipped >= 1, "same-block coinbase spend must be skipped");
+
+        // The coinbase output must remain UNSPENT.
+        let key = utxo_key(&cb_hash, 0).unwrap();
+        let raw = set
+            .store
+            .get_raw(key.as_ref())
+            .expect("coinbase utxo must exist");
+        let utxo: crate::domain::utxo::utxo::Utxo = bincode::deserialize(&raw).unwrap();
+        assert!(!utxo.spent, "coinbase output must remain unspent");
     }
 }
