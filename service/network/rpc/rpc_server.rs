@@ -4321,6 +4321,12 @@ impl RpcServer {
         // the JSON-RPC handler thread — a remotely-triggerable
         // crash.
         let network_short = Self::network_short_from_name(&s.network_name);
+        // Release the global state lock BEFORE the VM simulation: simulate runs
+        // against a fresh ContractStorage built from the shared DB handle (cloned
+        // above) and does not need the lock. Holding it across simulate would let
+        // one client freeze every other RPC (including reads and login) for the
+        // duration of an expensive contract execution.
+        drop(s);
         let ctx = match ContractStorage::new(cs.shared_db()) {
             Ok(cs_clone) => VMContext::new(cs_clone),
             Err(e) => {
@@ -4406,6 +4412,8 @@ impl RpcServer {
         // the JSON-RPC handler thread — a remotely-triggerable
         // crash.
         let network_short = Self::network_short_from_name(&s.network_name);
+        // Release the global state lock before the VM simulation (see cmd_deploy_contract).
+        drop(s);
         let ctx = match ContractStorage::new(cs.shared_db()) {
             Ok(cs_clone) => VMContext::new(cs_clone),
             Err(e) => {
@@ -4493,6 +4501,10 @@ impl RpcServer {
                                                    // the JSON-RPC handler thread — a remotely-triggerable
                                                    // crash.
         let network_short = Self::network_short_from_name(&s.network_name);
+        // Release the global state lock before the VM simulation (see cmd_deploy_contract).
+        // estimate_gas runs with a 100M gas ceiling, so holding the lock here would
+        // freeze all other RPC traffic for the entire estimation.
+        drop(s);
         let ctx = match ContractStorage::new(cs.shared_db()) {
             Ok(cs_clone) => VMContext::new(cs_clone),
             Err(e) => {
