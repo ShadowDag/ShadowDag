@@ -115,6 +115,7 @@ pub fn build_confidential_transaction(
             range_proof: Some(range_proof_to_hex(&proof)),
             ephemeral_pubkey: Some(stealth.ephemeral_pubkey),
             one_time_pubkey: Some(stealth.one_time_pubkey),
+            encrypted_amount: None, // set by sub-project 4b (derived from ss)
         });
     }
 

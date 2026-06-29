@@ -98,6 +98,7 @@ pub fn build_transaction_with_anchor(
             range_proof: None,
             ephemeral_pubkey: None,
             one_time_pubkey: None,
+            encrypted_amount: None,
         })
         .collect();
 
@@ -269,6 +270,7 @@ pub fn build_coinbase_at_height(
                 range_proof: None,
                 ephemeral_pubkey: None,
                 one_time_pubkey: None,
+                encrypted_amount: None,
             },
             TxOutput {
                 address: dev_address,
@@ -277,6 +279,7 @@ pub fn build_coinbase_at_height(
                 range_proof: None,
                 ephemeral_pubkey: None,
                 one_time_pubkey: None,
+                encrypted_amount: None,
             },
         ],
         0,

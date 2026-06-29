@@ -600,6 +600,7 @@ impl Wallet {
             range_proof: None,
             ephemeral_pubkey: None,
             one_time_pubkey: None,
+            encrypted_amount: None,
         }];
 
         // Change output if needed
@@ -612,6 +613,7 @@ impl Wallet {
                 range_proof: None,
                 ephemeral_pubkey: None,
                 one_time_pubkey: None,
+                encrypted_amount: None,
             });
         }
 
@@ -688,6 +690,7 @@ impl Wallet {
             range_proof: None,
             ephemeral_pubkey: None,
             one_time_pubkey: None,
+            encrypted_amount: None,
         }];
 
         let change = total_in.saturating_sub(total_needed);
@@ -699,6 +702,7 @@ impl Wallet {
                 range_proof: None,
                 ephemeral_pubkey: None,
                 one_time_pubkey: None,
+                encrypted_amount: None,
             });
         }
 

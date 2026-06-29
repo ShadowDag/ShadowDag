@@ -81,6 +81,11 @@ pub struct TxOutput {
     /// the on-chain output-key index. None for transparent outputs.
     #[serde(default)]
     pub one_time_pubkey: Option<String>,
+    /// RingCT: amount masked with a one-time pad derived from the ECDH shared
+    /// secret (hex, 8 bytes). Lets the recipient recover the amount. None for
+    /// transparent outputs.
+    #[serde(default)]
+    pub encrypted_amount: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -355,6 +360,14 @@ impl Transaction {
             } else {
                 buf.push(0x00);
             }
+            // RingCT: encrypted amount (masked).
+            if let Some(ref ea) = out.encrypted_amount {
+                buf.push(0x01);
+                buf.extend_from_slice(&(ea.len() as u32).to_le_bytes());
+                buf.extend_from_slice(ea.as_bytes());
+            } else {
+                buf.push(0x00);
+            }
         }
 
         // 5. payload_hash — chain-state binding (replay protection)
@@ -491,6 +504,7 @@ impl TxOutput {
             range_proof: None,
             ephemeral_pubkey: None,
             one_time_pubkey: None,
+            encrypted_amount: None,
         }
     }
 
@@ -503,6 +517,7 @@ impl TxOutput {
             range_proof: Some(range_proof),
             ephemeral_pubkey: None,
             one_time_pubkey: None,
+            encrypted_amount: None,
         }
     }
 
@@ -579,6 +594,14 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_amount_changes_canonical_bytes() {
+        let mut tx = Transaction::new(String::new(), vec![], vec![TxOutput::new("SD1x".into(), 10)], 1, 0);
+        let base = tx.canonical_bytes();
+        tx.outputs[0].encrypted_amount = Some("0011223344556677".into());
+        assert_ne!(base, tx.canonical_bytes());
+    }
+
+    #[test]
     fn confidential_tx_serde_round_trips() {
         let mut tx = Transaction::new(
             String::new(),
@@ -601,6 +624,7 @@ mod tests {
                 range_proof: Some("88".repeat(10)),
                 ephemeral_pubkey: Some("99".repeat(32)),
                 one_time_pubkey: Some("aa".repeat(32)),
+                encrypted_amount: Some("0011223344556677".into()),
             }],
             5,
             1_700_000_000,

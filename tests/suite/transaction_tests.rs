@@ -23,6 +23,7 @@ mod tests {
                 range_proof: None,
                 ephemeral_pubkey: None,
                 one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee,
             timestamp: 1_735_689_600,
@@ -45,6 +46,7 @@ mod tests {
                 range_proof: None,
                 ephemeral_pubkey: None,
                 one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee,
             timestamp: 1_735_689_600,
@@ -176,6 +178,7 @@ mod tests {
                 range_proof: None,
                 ephemeral_pubkey: None,
                 one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee: MIN_TX_FEE,
             timestamp: 1_735_689_600,
@@ -202,6 +205,7 @@ mod tests {
                 range_proof: None,
                 ephemeral_pubkey: None,
                 one_time_pubkey: None,
+                encrypted_amount: None,
             })
             .collect();
         let mut tx = Transaction {
@@ -252,6 +256,7 @@ mod tests {
                 range_proof: None,
                 ephemeral_pubkey: None,
                 one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee: MIN_TX_FEE,
             timestamp: 1_735_689_600,
@@ -277,6 +282,7 @@ mod tests {
                     range_proof: None,
                     ephemeral_pubkey: None,
                     one_time_pubkey: None,
+                    encrypted_amount: None,
                 },
                 TxOutput {
                     address: "a2".into(),
@@ -285,6 +291,7 @@ mod tests {
                     range_proof: None,
                     ephemeral_pubkey: None,
                     one_time_pubkey: None,
+                    encrypted_amount: None,
                 },
             ],
             fee: 0,
@@ -324,6 +331,7 @@ mod tests {
                 range_proof: None,
                 ephemeral_pubkey: None,
                 one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee: MIN_TX_FEE,
             timestamp: 1_735_689_600,
@@ -412,6 +420,7 @@ mod tests {
                 range_proof: None,
                 ephemeral_pubkey: None,
                 one_time_pubkey: None,
+                encrypted_amount: None,
             })
             .collect();
         let tx = Transaction {

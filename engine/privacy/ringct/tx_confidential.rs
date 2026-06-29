@@ -168,6 +168,7 @@ mod tests {
             range_proof: Some(range_proof_to_hex(&proof)),
             ephemeral_pubkey: Some(hexp(&eph)),
             one_time_pubkey: Some(hexp(&otk)),
+            encrypted_amount: None,
         };
         let view = parse_confidential_output(&output).expect("parse");
         assert_eq!(view.commitment, commitment);

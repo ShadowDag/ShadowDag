@@ -209,6 +209,7 @@ mod tests {
                 range_proof: Some(range_proof_to_hex(&proof)),
                 ephemeral_pubkey: Some(hexp(&eph)),
                 one_time_pubkey: Some(hexp(&one_time)),
+                encrypted_amount: None,
             }],
             fee: 0,
             timestamp: 1_735_689_600,

@@ -134,6 +134,7 @@ mod tests {
                 range_proof: None,
                 ephemeral_pubkey: None,
                 one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee: 1,
             timestamp: 1735689600,

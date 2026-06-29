@@ -141,7 +141,7 @@ impl TxHash {
     ) -> Vec<u8> {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
-        h.update(b"SHADOW_TX_CONF_SIGN_V2");
+        h.update(b"SHADOW_TX_CONF_SIGN_V3");
         h.update(Self::chain_id_for(network).to_le_bytes());
         h.update(tx.timestamp.to_le_bytes());
         h.update(tx.fee.to_le_bytes());
@@ -153,7 +153,12 @@ impl TxHash {
             h.update(a);
             h.update(o.amount.to_le_bytes());
             // commitment, ephemeral_pubkey, one_time_pubkey (RingCT).
-            for opt in [&o.commitment, &o.ephemeral_pubkey, &o.one_time_pubkey] {
+            for opt in [
+                &o.commitment,
+                &o.ephemeral_pubkey,
+                &o.one_time_pubkey,
+                &o.encrypted_amount,
+            ] {
                 match opt {
                     Some(s) => {
                         h.update([1u8]);
@@ -257,6 +262,7 @@ mod tests {
                 range_proof: None,
                 ephemeral_pubkey: None,
                 one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee: 1,
             timestamp: 1_735_689_600,
@@ -296,6 +302,7 @@ mod tests {
                 range_proof: None,
                 ephemeral_pubkey: None,
                 one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee: 1,
             timestamp: tx1.timestamp,
@@ -437,6 +444,7 @@ mod tests {
             range_proof: None,
             ephemeral_pubkey: None,
             one_time_pubkey: None,
+            encrypted_amount: None,
         }];
         let tx_a = Transaction {
             hash: String::new(),
