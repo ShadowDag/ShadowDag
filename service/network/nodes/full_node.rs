@@ -2715,7 +2715,19 @@ mod tests {
 
         static CTR: AtomicU64 = AtomicU64::new(0);
         let id = CTR.fetch_add(1, Ordering::Relaxed);
-        let path = format!("{}/rt_canon_{}", std::env::temp_dir().display(), id);
+        // Unique per RUN (not just per process) so a leftover temp dir from a
+        // prior run can't make save_block reject "g" as a duplicate.
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = format!(
+            "{}/rt_canon_{}_{}_{}",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            uniq,
+            id
+        );
         let store = BlockStore::new(NodeDB::new(&path).unwrap().shared()).unwrap();
 
         let mk = |hash: &str, height: u64, parent: Option<&str>, ts: u64| Block {
