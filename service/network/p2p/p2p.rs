@@ -109,6 +109,43 @@ static PEER_LAST_OUTBOUND: Lazy<Arc<PlMutex<HashMap<String, u64>>>> =
 static RECEIVED_ADDRS: Lazy<Arc<PlMutex<Vec<String>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(Vec::new())));
 
+/// Live inbound connection count per remote IP (anti-eclipse).
+///
+/// `PeerManager::conn_count_for_ip` only counts *stored* peer records, so it
+/// does not bound how many live inbound sockets a single host may open — a
+/// single IP/subnet could otherwise monopolize all inbound slots and eclipse
+/// the node. This map tracks currently-open inbound connections per IP and is
+/// enforced in `accept_loop` (reject over the cap) + released when the
+/// connection ends.
+static INBOUND_CONN_PER_IP: Lazy<Arc<PlMutex<HashMap<String, u32>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(HashMap::new())));
+
+/// Try to register one more live inbound connection for `ip`. Returns `false`
+/// (without incrementing) if `ip` already has `MAX_PEERS_PER_IP` live inbound
+/// connections.
+fn try_register_inbound_ip(ip: &str) -> bool {
+    use crate::service::network::p2p::peer_manager::MAX_PEERS_PER_IP;
+    let mut map = INBOUND_CONN_PER_IP.lock();
+    let entry = map.entry(ip.to_string()).or_insert(0);
+    if *entry >= MAX_PEERS_PER_IP {
+        return false;
+    }
+    *entry += 1;
+    true
+}
+
+/// Release one live inbound connection for `ip` (call exactly once per
+/// successful `try_register_inbound_ip`).
+fn release_inbound_ip(ip: &str) {
+    let mut map = INBOUND_CONN_PER_IP.lock();
+    if let Some(c) = map.get_mut(ip) {
+        *c = c.saturating_sub(1);
+        if *c == 0 {
+            map.remove(ip);
+        }
+    }
+}
+
 /// Drain all pending transactions received by P2P (call from node main loop).
 /// Returns (peer_id, transaction) tuples for ban attribution.
 /// Thread-safe: works from ANY thread, not just the one that pushed.
@@ -789,14 +826,25 @@ impl P2P {
                         continue;
                     }
 
+                    // ── Anti-eclipse: cap live inbound connections per IP ──
+                    // Prevents a single host from monopolizing inbound slots.
+                    if !try_register_inbound_ip(&ban_key) {
+                        pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        slog_warn!("p2p", "rejected_too_many_per_ip", addr => &peer_addr);
+                        drop(s);
+                        continue;
+                    }
+
                     slog_info!("p2p", "inbound_connection", addr => &peer_addr);
                     // Query fresh peer list on each connection (fix stale snapshot)
                     let peers_snapshot = peer_manager.get_addr_list_limited(100);
                     let pending_clone = Arc::clone(&pending);
+                    let ip_key = ban_key.clone();
 
                     thread::spawn(move || {
                         let result = Self::handle_peer_connection(s, false, magic, peers_snapshot);
                         pending_clone.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        release_inbound_ip(&ip_key);
                         if let Err(e) = result {
                             slog_error!("p2p", "peer_connection_error", addr => &peer_addr, error => &e.to_string());
                         }
@@ -2161,5 +2209,32 @@ impl P2P {
     }
     pub fn fast_sync_blocks(&self) {
         slog_debug!("p2p", "fast_sync_blocks_deprecated");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::network::p2p::peer_manager::MAX_PEERS_PER_IP;
+
+    #[test]
+    fn inbound_per_ip_cap_enforced_and_released() {
+        // Unique IP so this test does not race the global map with others.
+        let ip = "203.0.113.77";
+        // Up to the cap succeeds...
+        for _ in 0..MAX_PEERS_PER_IP {
+            assert!(try_register_inbound_ip(ip), "within cap must register");
+        }
+        // ...the next is rejected (anti-eclipse).
+        assert!(!try_register_inbound_ip(ip), "over cap must be rejected");
+        // Releasing one frees a slot.
+        release_inbound_ip(ip);
+        assert!(try_register_inbound_ip(ip), "slot freed after release");
+        // Clean up so the map does not leak this IP across the suite.
+        for _ in 0..MAX_PEERS_PER_IP {
+            release_inbound_ip(ip);
+        }
+        // Over-release must not underflow/panic.
+        release_inbound_ip(ip);
     }
 }
