@@ -21,6 +21,13 @@ pub const MAX_ADDR_CACHE_SIZE: usize = 4_096;
 pub const MAX_GETADDR_RESPONSE: usize = 200;
 pub const MAX_PEERS_PER_IP: u32 = 3;
 pub const PEER_HEALTH_TIMEOUT_SECS: u64 = 300;
+/// Hard cap on persisted peer records (anti-DoS: bounds the `peer:` keyspace so
+/// an attacker flooding valid-but-distinct addresses cannot grow the DB without
+/// bound). Counted via the `meta:peer_count` key (NOT under `peer:`).
+pub const MAX_STORED_PEERS: u64 = 16_384;
+/// Meta key holding the live count of `peer:` records. Deliberately outside the
+/// `peer:` prefix so it is never counted/iterated as a peer.
+const PEER_COUNT_KEY: &[u8] = b"meta:peer_count";
 
 const PFX_BAN: &str = "ban:";
 const PFX_PENALTY: &str = "penalty:";
@@ -246,6 +253,26 @@ impl PeerManager {
         self.add_peer_record(PeerRecord::new(addr, port))
     }
 
+    /// Live count of persisted `peer:` records, via the `meta:peer_count` key.
+    /// Lazily initialised (once) by iterating the `peer:` prefix if the key is
+    /// absent. Takes the held DB guard to avoid re-locking.
+    fn stored_peer_count_inner(db: &DB) -> u64 {
+        if let Ok(Some(v)) = db.get(PEER_COUNT_KEY) {
+            if v.len() == 8 {
+                return u64::from_le_bytes(v[..8].try_into().unwrap_or([0u8; 8]));
+            }
+        }
+        // Lazy init: count existing peer records once, then persist the count.
+        let prefix = PFX_PEER.as_bytes();
+        let n = db
+            .iterator(IteratorMode::Start)
+            .filter_map(|r| r.ok())
+            .filter(|(k, _)| k.starts_with(prefix))
+            .count() as u64;
+        let _ = db.put(PEER_COUNT_KEY, n.to_le_bytes());
+        n
+    }
+
     pub fn add_peer_record(&self, record: PeerRecord) -> Result<(), NetworkError> {
         if self.is_banned(&record.addr) {
             return Err(NetworkError::PeerBanned(record.addr.clone()));
@@ -267,6 +294,17 @@ impl PeerManager {
             .get(format!("{}{}", PFX_PEER, record.addr).as_bytes())
             .map(|v| v.is_some())
             .unwrap_or(false);
+
+        // Anti-DoS: bound the total number of persisted peer records. Only NEW
+        // peers grow the store, so the cap is checked for those only.
+        let stored = Self::stored_peer_count_inner(&db);
+        if !already_exists && stored >= MAX_STORED_PEERS {
+            return Err(NetworkError::ConnectionFailed(format!(
+                "peer store at capacity ({} records)",
+                MAX_STORED_PEERS
+            )));
+        }
+
         let mut batch = WriteBatch::default();
         let key = format!("{}{}", PFX_PEER, record.addr);
         batch.put(key.as_bytes(), &data);
@@ -274,12 +312,13 @@ impl PeerManager {
             format!("{}{}", PFX_LAST_SEEN, record.addr).as_bytes(),
             unix_now().to_le_bytes(),
         );
-        // Only increment conn_count if this is a NEW peer
+        // Only increment conn_count + the global peer count if this is a NEW peer
         if !already_exists {
             batch.put(
                 format!("{}{}", PFX_CONN_COUNT, ip).as_bytes(),
                 (count + 1).to_le_bytes(),
             );
+            batch.put(PEER_COUNT_KEY, stored.saturating_add(1).to_le_bytes());
         }
         db.write(batch).map_err(|e| {
             NetworkError::Storage(crate::errors::StorageError::WriteFailed(e.to_string()))
@@ -304,6 +343,10 @@ impl PeerManager {
                 (count - 1).to_le_bytes(),
             );
         }
+        // Keep the global peer count in step (peer_exists was true above, so a
+        // record is actually being removed).
+        let stored = Self::stored_peer_count_inner(&db);
+        batch.put(PEER_COUNT_KEY, stored.saturating_sub(1).to_le_bytes());
         db.write(batch).map_err(|e| {
             NetworkError::Storage(crate::errors::StorageError::WriteFailed(e.to_string()))
         })
@@ -427,6 +470,13 @@ impl PeerManager {
 
     pub fn count(&self) -> usize {
         self.get_peers().len()
+    }
+
+    /// Live persisted-peer count from the `meta:peer_count` key (O(1) after lazy
+    /// init). Used by the `MAX_STORED_PEERS` anti-DoS cap.
+    pub fn stored_peer_count(&self) -> u64 {
+        let db = self.lock_db();
+        Self::stored_peer_count_inner(&db)
     }
 
     pub fn ban_peer(&self, addr: &str, duration_secs: u64, _reason: &str) {
@@ -857,6 +907,27 @@ mod tests {
         assert!(pm.peer_exists("1.2.3.4:9333"));
         assert!(pm.remove_peer("1.2.3.4:9333").is_ok());
         assert!(!pm.peer_exists("1.2.3.4:9333"));
+    }
+
+    #[test]
+    fn peer_count_meta_tracks_add_and_remove() {
+        let path = tmp("peer_count");
+        let _ = fs::remove_dir_all(&path);
+        let pm = PeerManager::open(&path).unwrap();
+        // Distinct IPs so the per-IP cap (3) doesn't interfere.
+        assert!(pm.add_peer("1.0.0.1:9333").is_ok());
+        assert!(pm.add_peer("1.0.0.2:9333").is_ok());
+        assert!(pm.add_peer("1.0.0.3:9333").is_ok());
+        assert_eq!(pm.count(), 3);
+        // The meta counter (which enforces MAX_STORED_PEERS) matches ground truth.
+        assert_eq!(pm.stored_peer_count(), 3);
+        // Re-adding an existing peer must NOT double-count.
+        assert!(pm.add_peer("1.0.0.1:9333").is_ok());
+        assert_eq!(pm.stored_peer_count(), 3);
+        // Removal decrements.
+        pm.remove_peer("1.0.0.2:9333").unwrap();
+        assert_eq!(pm.count(), 2);
+        assert_eq!(pm.stored_peer_count(), 2);
     }
 
     #[test]
