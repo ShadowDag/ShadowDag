@@ -43,8 +43,33 @@ with a regression test where meaningful, committed per-cluster. Final gate:
 | XC1 | deleted dead insecure crypto (bulletproofs/pedersen_commitment/confidential_tx) |
 | DAN1 | dandelion clock math uses saturating_sub |
 
-The **[DOC]** items below remain open for follow-up (larger refactors / product
-decisions / lower blast radius). Verified-correct confirmations are unchanged.
+### Second remediation pass (security DOC items)
+
+After the 18 above, additional documented security items were verified and fixed:
+
+| ID | Fix summary |
+|----|-------------|
+| NET1 | live inbound-connection-per-IP cap enforced in accept_loop (anti-eclipse); regression test |
+| MEM1 | cheap fee/quota checks moved before signature verification; `remove_transaction` cascade made iterative (no stack-overflow DoS); 1500-deep-chain regression test |
+| RBF1 | RBF replacement must cover REAL transitive dependent fees (`dependent_fees`), not a MIN_FEE_BUMP lower bound; regression test |
+| bincode | allocation-bounded wire deserialization on P2PMessage/Tx/Block (anti-OOM); wire-compat round-trip test |
+| MUH | RE-CLASSIFIED: **not a live issue** — the live UTXO commitment uses SHA-256 (`compute_commitment_hash`); `muhash.rs` is dead code (only its own tests reference it). No fix needed. |
+
+Final gate after both passes: clippy `--all-targets -D warnings` clean, full lib
+suite **2185 passed, 0 failed**.
+
+### Still open — honestly NOT fixed (need larger refactor / product decision)
+- **ST1** cross-store write atomicity (DSP/confirmed-tx/UTXO, add_utxo, ban_peer):
+  needs a storage refactor to a shared WriteBatch / column families. Existing
+  per-stage rollback mitigates partial-failure on the block path; full atomicity
+  is a multi-file change deferred intentionally.
+- **GEN1** genesis date/difficulty: needs a re-mine + product decision.
+- **misc (loopback-only, LOW):** explorer JS XSS (HTML-escape chain fields),
+  gRPC no-auth (loopback bind + write handlers are stubs), address-prefix
+  substring classification. Low blast radius; deferred.
+
+The **[DOC]** items above remain open for follow-up. Verified-correct
+confirmations are unchanged.
 
 ## CRITICAL / HIGH — consensus, money, live panics
 
