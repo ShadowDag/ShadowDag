@@ -71,6 +71,78 @@ fn scalar_from(b: &[u8]) -> Option<Scalar> {
     Option::<Scalar>::from(Scalar::from_canonical_bytes(arr))
 }
 
+// ── Borromean RangeProof serialization ──────────────────────────────────────
+
+use crate::engine::privacy::confidential::range_proof::{RangeProof, RANGE_BITS};
+
+/// Wire: `nbits(u32 LE) || bit_commitments[nbits]·32 || challenges[nbits]·32
+/// || responses[nbits]·64` (two scalars each).
+pub fn range_proof_to_bytes(p: &RangeProof) -> Vec<u8> {
+    let n = p.bit_commitments.len();
+    let mut out = Vec::with_capacity(4 + n * (32 + 32 + 64));
+    out.extend_from_slice(&(n as u32).to_le_bytes());
+    for c in &p.bit_commitments {
+        out.extend_from_slice(c.compress().as_bytes());
+    }
+    for e in &p.challenges {
+        out.extend_from_slice(e.as_bytes());
+    }
+    for [s0, s1] in &p.responses {
+        out.extend_from_slice(s0.as_bytes());
+        out.extend_from_slice(s1.as_bytes());
+    }
+    out
+}
+
+/// Parse a range proof, rejecting wrong length / nbits, non-canonical scalars,
+/// and undecompressable points.
+pub fn range_proof_from_bytes(b: &[u8]) -> Option<RangeProof> {
+    if b.len() < 4 {
+        return None;
+    }
+    let n = u32::from_le_bytes(b[0..4].try_into().ok()?) as usize;
+    if n != RANGE_BITS {
+        return None;
+    }
+    let need = 4 + n * (32 + 32 + 64);
+    if b.len() != need {
+        return None;
+    }
+    let mut off = 4;
+    let mut bit_commitments = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&b[off..off + 32]);
+        bit_commitments.push(CompressedRistretto(arr).decompress()?);
+        off += 32;
+    }
+    let mut challenges = Vec::with_capacity(n);
+    for _ in 0..n {
+        challenges.push(scalar_from(&b[off..off + 32])?);
+        off += 32;
+    }
+    let mut responses = Vec::with_capacity(n);
+    for _ in 0..n {
+        let s0 = scalar_from(&b[off..off + 32])?;
+        let s1 = scalar_from(&b[off + 32..off + 64])?;
+        responses.push([s0, s1]);
+        off += 64;
+    }
+    Some(RangeProof {
+        bit_commitments,
+        challenges,
+        responses,
+    })
+}
+
+pub fn range_proof_to_hex(p: &RangeProof) -> String {
+    hex::encode(range_proof_to_bytes(p))
+}
+
+pub fn range_proof_from_hex(h: &str) -> Option<RangeProof> {
+    range_proof_from_bytes(&hex::decode(h).ok()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +187,21 @@ mod tests {
         let h = hex::encode(p.compress().as_bytes());
         assert_eq!(point_from_hex(&h), Some(p));
         assert!(point_from_hex("00").is_none());
+    }
+
+    #[test]
+    fn range_proof_round_trips_and_rejects_malformed() {
+        use crate::engine::privacy::confidential::pedersen::generator_h;
+        use crate::engine::privacy::confidential::range_proof::{prove, verify};
+
+        let blind = Scalar::random(&mut OsRng);
+        let proof = prove(42u64, &blind);
+        let bytes = range_proof_to_bytes(&proof);
+        let back = range_proof_from_bytes(&bytes).expect("decode");
+        let commitment =
+            Scalar::from(42u64) * generator_h() + blind * RISTRETTO_BASEPOINT_POINT;
+        assert!(verify(&commitment, &back));
+        assert!(range_proof_from_bytes(&bytes[..bytes.len() - 1]).is_none());
+        assert!(range_proof_from_hex("zz").is_none());
     }
 }
