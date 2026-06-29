@@ -122,6 +122,27 @@ They are flagged for dedicated, tested work + the mandatory external review.
 - **O (LOW):** dead selfish-mining reward penalty — NOT a vuln (emission hard-capped
   per block); cleanup only.
 
+## Fourth pass + remaining-deferred remediation
+
+FIXED (verified + regression-tested; full suite 2207 green, clippy clean):
+
+| # | Sev | Fix |
+|---|-----|-----|
+| M | HIGH | Contract-state crash hole healed: `persist_with_undo` writes a `contract:applied:{block_hash}` marker in the SAME atomic batch as contract state; `recompute_virtual_chain` skips a block only if BOTH the UTXO commitment AND the contract marker are present (else re-executes the crash-interrupted block); rollback clears the marker. Regression test. |
+| P2P-Addr | HIGH | (4th hunt) `Addr` entries are now validated as routable `host:port` SocketAddrs before being persisted (reject garbage/loopback/unspecified/multicast + ban-score). Previously unvalidated strings bloated the peer DB without bound (each a unique "ip" bypassing the per-IP cap) → disk exhaustion + peer-store poisoning. Regression test. |
+
+4th hunt coverage: shadow_pool/mixer, P2P, serialization, pruning/snapshot, key-mgmt —
+**only the Addr finding** surfaced; the other four surfaces verified clean (shadow_pool
+confirmed non-consensus/decorative; serialization tx-hash binding sound; pruning respects
+MAX_REORG_DEPTH; key-mgmt KDF/sig/multisig sound).
+
+### STILL deferred — genuine redesigns (need dedicated work + external review)
+- **G (MED):** no contract state-root consensus (roots post-execution, not in PoW). Architectural.
+- **ST1 (HIGH):** broad cross-store write atomicity (UTXO/block/DAG/DSP separate stores). M closed the
+  contract-vs-UTXO case; the general multi-store atomicity needs a shared WriteBatch/CF refactor.
+- **Sized addrman (follow-up):** bound even valid-but-distinct addresses with eviction (P2P design pattern).
+- **O (LOW):** dead reward-penalty code — not a vuln.
+
 ## Overarching recommendation
 The recurring root cause is **two divergent block-application paths**: the lenient
 `apply_block_dag_ordered` (live; skips conflicts) vs the strict
