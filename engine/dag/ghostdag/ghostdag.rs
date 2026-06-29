@@ -151,9 +151,15 @@ impl GhostDag {
         // For persistence, we store the diff. For computation, we use it directly.
         let blue_set = blue_set_diff.clone();
 
-        let blue_score = self.get_blue_score(&selected_parent) + merge_blues.len() as u64 + 1;
+        // saturating_add: a corrupt/forged stored score near u64::MAX must not
+        // wrap to a small value (which would break the monotonic-blue-score
+        // invariant that fork choice / reorg rely on) nor panic in debug.
+        let blue_score = self
+            .get_blue_score(&selected_parent)
+            .saturating_add(merge_blues.len() as u64)
+            .saturating_add(1);
 
-        let chain_height = self.get_chain_height(&selected_parent) + 1;
+        let chain_height = self.get_chain_height(&selected_parent).saturating_add(1);
 
         let order_index = self.next_order_index();
 

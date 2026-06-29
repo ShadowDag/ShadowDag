@@ -983,7 +983,10 @@ impl BlockValidator {
         // emission must be split correctly.
         {
             use crate::config::genesis::genesis::{DEV_REWARD_PCT, MINER_REWARD_PCT};
-            let expected_miner_base = (expected_reward * MINER_REWARD_PCT) / 100;
+            // u128 intermediate: avoid overflow on the multiply (consensus check
+            // on attacker-influenced height), matching rewards/reward.rs.
+            let expected_miner_base =
+                ((expected_reward as u128 * MINER_REWARD_PCT as u128) / 100) as u64;
             let expected_dev_base = expected_reward - expected_miner_base;
             // Dev share must be at least the expected amount
             if cb.outputs[1].amount < expected_dev_base {
