@@ -940,6 +940,58 @@ impl FullNode {
             }
 
             if let Some(block) = self.block_store.get_block(block_hash) {
+                // ── CONFIDENTIAL (RingCT) CONSENSUS GATE ───────────────────
+                // CRITICAL: block_validator only runs the STRUCTURAL
+                // RingValidator check, and apply_block_dag_ordered records
+                // confidential key-images/outputs WITHOUT validating. So the
+                // full gate (CLSAG crypto + homomorphic balance + on-chain
+                // ring-member authenticity + range proofs + cross-block
+                // key-image uniqueness) MUST run here, against the state with
+                // all earlier new-chain blocks already applied, or a peer block
+                // could mint/double-spend confidential value. A block-wide
+                // seen-key-image set also catches duplicates within the block.
+                {
+                    if let Err(msg) =
+                        verify_block_confidential_txs(&block, &self.utxo_set, &self.network)
+                    {
+                        slog_error!("node", "confidential_block_rejected",
+                            block => block_hash, reason => &msg);
+                        // Roll back everything applied during this reorg, then
+                        // best-effort restore the previous chain (mirrors the
+                        // contract-persist-failure path below).
+                        for hash in applied_new.iter().rev() {
+                            let _ = self.utxo_set.rollback_block_undo(hash);
+                            self.rollback_contract_block_best_effort(hash);
+                        }
+                        for hash in rolled_back_old.iter().rev() {
+                            if let Some(old_block) = self.block_store.get_block(hash) {
+                                let _ = self.utxo_set.apply_block_dag_ordered(
+                                    &old_block.body.transactions,
+                                    old_block.header.height,
+                                    hash,
+                                );
+                                let (_, _, _, env) = self.execute_contract_transactions(
+                                    &old_block,
+                                    &self.contract_storage,
+                                );
+                                let _ = env.persist_with_undo(
+                                    &self.contract_storage,
+                                    hash,
+                                    None,
+                                    None,
+                                );
+                            }
+                        }
+                        // Best-effort: drop the offending block from the DAG +
+                        // store so it is not endlessly re-selected as a tip.
+                        // (ghostdag in-memory tip removal is a follow-up; the
+                        // safety guarantee — never APPLYING it — already holds.)
+                        let _ = self.dag_manager.remove_block_topology(block_hash);
+                        let _ = self.block_store.delete_block(block_hash);
+                        return Err(NodeError::BlockRejected(msg));
+                    }
+                }
+
                 // ── CONTRACT EXECUTION (before UTXO processing) ─────────
                 // Uses the persistent contract storage (not temp_dir).
                 // State is persisted with undo data after UTXO succeeds.
@@ -2583,9 +2635,119 @@ impl crate::domain::traits::block_processor::BlockProcessor for FullNode {
     }
 }
 
+/// Run the confidential (RingCT) consensus gate over every confidential tx in a
+/// block, against `utxo_set` (which MUST already reflect all earlier blocks in
+/// the chain being applied). Returns `Err(reason)` on the first failure. A
+/// block-wide seen-key-image set also catches duplicate key images within the
+/// same block. This is the gate that `apply_block_dag_ordered` relies on having
+/// run (it records confidential state without validating).
+fn verify_block_confidential_txs(
+    block: &Block,
+    utxo_set: &UtxoSet,
+    network: &NetworkMode,
+) -> Result<(), String> {
+    use std::collections::HashSet;
+    let mut seen_ki: HashSet<String> = HashSet::new();
+    for tx in &block.body.transactions {
+        if tx.is_confidential() {
+            crate::engine::privacy::ringct::confidential_consensus::verify_confidential_tx(
+                tx, utxo_set, network, &mut seen_ki,
+            )
+            .map_err(|e| format!("confidential tx {} failed consensus gate: {}", tx.hash, e))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::FullNode;
+    use super::{verify_block_confidential_txs, FullNode};
+
+    #[test]
+    fn confidential_gate_accepts_valid_and_rejects_tampered_block() {
+        // Regression for the CRITICAL apply-path gap: recompute_virtual_chain
+        // must run the full confidential gate before applying a block. This
+        // tests the extracted gate function directly (no full-node harness):
+        // a valid confidential tx in a block passes; a tampered one is rejected.
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::block::block::Block;
+        use crate::domain::block::block_body::BlockBody;
+        use crate::domain::block::block_header::BlockHeader;
+        use crate::domain::utxo::utxo_set::UtxoSet;
+        use crate::engine::privacy::ringct::builder::{
+            build_confidential_transaction, ConfRecipient, OwnedInput,
+        };
+        use crate::engine::privacy::ringct::dual_clsag::RingMember;
+        use curve25519_dalek::{constants::RISTRETTO_BASEPOINT_POINT as G, scalar::Scalar};
+        use rand::rngs::OsRng;
+
+        let net = NetworkMode::Mainnet;
+        let h = crate::engine::privacy::confidential::pedersen::generator_h();
+        let set = UtxoSet::new_empty();
+        let recput = |pk: curve25519_dalek::ristretto::RistrettoPoint,
+                      c: curve25519_dalek::ristretto::RistrettoPoint| {
+            set.record_confidential_output_indexed(
+                &hex::encode(pk.compress().as_bytes()),
+                &hex::encode(c.compress().as_bytes()),
+            )
+            .unwrap();
+        };
+        for _ in 0..4 {
+            recput(Scalar::random(&mut OsRng) * G, Scalar::from(9u64) * h + Scalar::random(&mut OsRng) * G);
+        }
+        let spend = Scalar::random(&mut OsRng);
+        let bl = Scalar::random(&mut OsRng);
+        let real_pk = spend * G;
+        let real_c = Scalar::from(50u64) * h + bl * G;
+        recput(real_pk, real_c);
+        let mut ring = crate::engine::privacy::ringct::decoy::select_decoys(
+            &set,
+            4,
+            &[hex::encode(real_pk.compress().as_bytes())],
+        )
+        .unwrap();
+        ring.push(RingMember { public_key: real_pk, commitment: real_c });
+        let real_index = ring.len() - 1;
+        let vp = Scalar::random(&mut OsRng) * G;
+        let sp = Scalar::random(&mut OsRng) * G;
+        let tx = build_confidential_transaction(
+            vec![OwnedInput { spend_secret: spend, amount: 50, blinding: bl, ring, real_index }],
+            vec![ConfRecipient { view_pub: vp, spend_pub: sp, amount: 50 }],
+            0,
+            &net,
+        )
+        .unwrap();
+
+        let mk_block = |txs: Vec<_>| Block {
+            header: BlockHeader {
+                version: 1,
+                hash: "00".repeat(32),
+                parents: vec![],
+                merkle_root: String::new(),
+                timestamp: 1,
+                nonce: 0,
+                difficulty: 1,
+                height: 1,
+                blue_score: 0,
+                selected_parent: None,
+                utxo_commitment: None,
+                extra_nonce: 0,
+                receipt_root: None,
+                state_root: None,
+            },
+            body: BlockBody { transactions: txs },
+        };
+
+        // Valid confidential tx → gate passes.
+        let good = mk_block(vec![tx.clone()]);
+        assert!(verify_block_confidential_txs(&good, &set, &net).is_ok());
+
+        // Tamper the ring signature → gate must reject the block.
+        let mut bad_tx = tx.clone();
+        bad_tx.inputs[0].ring_signature = Some("00".repeat(160));
+        let bad = mk_block(vec![bad_tx]);
+        assert!(verify_block_confidential_txs(&bad, &set, &net).is_err());
+    }
 
     #[test]
     fn keep_current_tip_on_exact_tie_when_current_is_still_tip() {

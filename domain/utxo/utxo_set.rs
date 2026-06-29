@@ -777,7 +777,10 @@ impl UtxoSet {
             // RingCT confidential tx: record key images (double-spend) and
             // one-time output pubkeys → commitment (ring-member authenticity)
             // in the SAME atomic batch. No transparent UTXO spend/create.
-            // (Validation already ran in validate_block_utxos.)
+            // SECURITY: this records WITHOUT validating — every caller MUST run
+            // the confidential gate (verify_confidential_tx) first. Callers:
+            // validate_block_utxos (apply_block_full / genesis) and
+            // FullNode::recompute_virtual_chain (peer-block / reorg path).
             if tx.is_confidential() {
                 for input in &tx.inputs {
                     if let Some(ki) = &input.key_image {
