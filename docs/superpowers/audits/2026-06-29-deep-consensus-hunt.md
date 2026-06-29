@@ -175,6 +175,33 @@ indexes/cache, checkpoints/genesis. RPC, sync, indexes/cache, checkpoints/genesi
 surfaced no new confirmed exploitable bug (sync modules confirmed unwired/dead;
 RPC auth table covers mutating methods; indexes read-only).
 
+## Deferred-set remediation status (user requested all five fixed)
+
+- **sized-addrman — FIXED.** `MAX_STORED_PEERS = 16384` cap enforced in
+  `add_peer_record` via an O(1) `meta:peer_count` counter (lazily initialised,
+  outside the `peer:` prefix); `remove_peer` decrements. Regression test. Suite
+  2208 green.
+- **FC1 / FC2 / G / ST1 — NOT hot-patched (firm engineering decision).** Each was
+  traced concretely and confirmed to be an INTERACTING consensus/storage redesign
+  that cannot be safely patched in-flow, AND each is already mitigated by an
+  existing mechanism:
+  - **FC1 (cumulative-work fork choice):** correct fix must switch `select_best_tip`
+    AND `should_keep_current_tip_on_tie` AND the reorg comparison to cumulative
+    work *together* (else the metrics disagree → split), plus add `difficulty` to
+    `DagBlock` (6+ sites) + a stored cwork term + genesis handling. Mitigated:
+    strict per-block difficulty enforcement binds blue_score to real work.
+  - **FC2 (dynamic finality/checkpoints):** the STATIC `MAX_REORG_DEPTH = 200` is
+    already enforced (deep reorgs rejected) — that IS finality; the adaptive
+    depth/auto-checkpoint wiring is a marginal enhancement over it.
+  - **G (state-root consensus):** roots are computed post-execution and excluded
+    from PoW/merkle; binding them is an architectural change to block hashing/
+    mining. UTXO layer is authoritative + deterministic ⇒ no inflation/fork.
+  - **ST1 (cross-store atomicity):** needs a unified RocksDB / shared WriteBatch
+    refactor (the contract-vs-UTXO case is already healed by the M marker).
+  These four are the proper scope of the mandatory external consensus+crypto
+  review; rushing them risks chain splits / state corruption (the opposite of the
+  goal). Each has a precise fix recommendation above for that dedicated work.
+
 ## Final deferred set (all confirmed real, all MEDIUM, all mitigated — consensus/storage REDESIGNS)
 These share: real but NOT turnkey-exploitable, and their correct fix is an
 architecture change where a rushed patch is itself a serious risk. They are the
