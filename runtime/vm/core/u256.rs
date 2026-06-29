@@ -190,6 +190,50 @@ impl U256 {
         result
     }
 
+    /// `(self + rhs) mod n`, carry-correct over the full 257-bit sum.
+    ///
+    /// `wrapping_add` alone drops the 2^256 carry, giving the wrong result when
+    /// `self + rhs >= 2^256` (EVM ADDMOD requires the true sum first). We reduce
+    /// both operands mod `n` (so each is < n) and fold the carry back in.
+    pub fn add_mod(self, rhs: U256, n: U256) -> U256 {
+        if n.is_zero() {
+            return U256::ZERO;
+        }
+        let a = self.checked_mod(n); // a in [0, n)
+        let b = rhs.checked_mod(n); // b in [0, n)
+        let sum = a.wrapping_add(b);
+        // Carry iff a+b overflowed 2^256 (then sum < a). True sum is in [0, 2n).
+        let carried = sum < a;
+        if carried || sum >= n {
+            sum.wrapping_sub(n)
+        } else {
+            sum
+        }
+    }
+
+    /// `(self * rhs) mod n` without truncating the 512-bit product.
+    ///
+    /// `wrapping_mul` keeps only the low 256 bits, so `wrapping_mul.mod n` is
+    /// wrong once the true product reaches 2^256 (EVM MULMOD requires the full
+    /// product first). Computed via double-and-add using the carry-correct
+    /// `add_mod`, so every intermediate stays reduced mod `n` (O(256) steps).
+    pub fn mul_mod(self, rhs: U256, n: U256) -> U256 {
+        if n.is_zero() {
+            return U256::ZERO;
+        }
+        let mut a = self.checked_mod(n);
+        let mut b = rhs.checked_mod(n);
+        let mut result = U256::ZERO;
+        while !b.is_zero() {
+            if b.0[0] & 1 == 1 {
+                result = result.add_mod(a, n);
+            }
+            a = a.add_mod(a, n); // a = 2a mod n
+            b = b.shr1();
+        }
+        result
+    }
+
     // ── Bitwise ─────────────────────────────────────────────────
 
     #[allow(clippy::should_implement_trait)]
@@ -516,6 +560,45 @@ mod tests {
         let r = a.wrapping_mul(b);
         assert_eq!(r.0[0], u64::MAX - 1); // lower 64 bits
         assert_eq!(r.0[1], 1); // carry
+    }
+
+    #[test]
+    fn add_mod_small_and_carry() {
+        // (100 + 200) mod 7 = 6
+        assert_eq!(
+            U256::from_u64(100).add_mod(U256::from_u64(200), U256::from_u64(7)),
+            U256::from_u64(6)
+        );
+        // Carry case: 2^255 + 2^255 = 2^256; 2^256 mod 3 == 1 (since 2 ≡ -1 mod 3).
+        let p = U256::ONE.shl(255);
+        assert_eq!(p.add_mod(p, U256::from_u64(3)), U256::ONE);
+        // mod 0 → 0
+        assert_eq!(p.add_mod(p, U256::ZERO), U256::ZERO);
+    }
+
+    #[test]
+    fn mul_mod_small_and_fullwidth() {
+        // (100 * 200) mod 7 = 1
+        assert_eq!(
+            U256::from_u64(100).mul_mod(U256::from_u64(200), U256::from_u64(7)),
+            U256::ONE
+        );
+        // Full-width: 2^200 * 2^200 = 2^400; 2^400 mod 7 == 2 (2^3 ≡ 1 mod 7, 400 mod 3 = 1).
+        let x = U256::ONE.shl(200);
+        assert_eq!(x.mul_mod(x, U256::from_u64(7)), U256::from_u64(2));
+        // Truncating (wrong) impl would give wrapping_mul(2^200,2^200)=0 (2^400 mod 2^256=0) mod 7 = 0.
+        assert_ne!(x.mul_mod(x, U256::from_u64(7)), U256::ZERO);
+        assert_eq!(x.mul_mod(x, U256::ZERO), U256::ZERO);
+    }
+
+    #[test]
+    fn exp_full_exponent() {
+        assert_eq!(U256::from_u64(3).wrapping_pow(U256::from_u64(4)), U256::from_u64(81));
+        // 2^256 wraps to 0 mod 2^256 — the old capped-at-255 code returned 2^255.
+        assert_eq!(U256::from_u64(2).wrapping_pow(U256::from_u64(256)), U256::ZERO);
+        // 2^255 is the high bit set.
+        assert_eq!(U256::from_u64(2).wrapping_pow(U256::from_u64(255)), U256::ONE.shl(255));
+        assert_eq!(U256::from_u64(7).wrapping_pow(U256::ZERO), U256::ONE);
     }
 
     #[test]

@@ -1518,12 +1518,10 @@ impl ExecutionEnvironment {
                 }
                 OpCode::EXP => {
                     let (base, exp) = pop2!(stack, gas, snapshot, self);
-                    let exp_val = exp.as_u64().min(255);
-                    let mut result = U256::ONE;
-                    for _ in 0..exp_val {
-                        result = result.wrapping_mul(base);
-                    }
-                    stack.push(result);
+                    // Full 256-bit exponent via square-and-multiply (mod 2^256).
+                    // The old code capped the exponent at 255 and read only its
+                    // low 64 bits, giving wrong results (e.g. EXP(2,256) != 0).
+                    stack.push(base.wrapping_pow(exp));
                 }
                 OpCode::ADDMOD => {
                     if stack.len() < 3 {
@@ -1535,11 +1533,8 @@ impl ExecutionEnvironment {
                     let a = pop1!(stack, gas, snapshot, self);
                     let b = pop1!(stack, gas, snapshot, self);
                     let n = pop1!(stack, gas, snapshot, self);
-                    stack.push(if n.is_zero() {
-                        U256::ZERO
-                    } else {
-                        a.wrapping_add(b).checked_mod(n)
-                    });
+                    // Carry-correct: (a+b) mod n computed over the full 257-bit sum.
+                    stack.push(a.add_mod(b, n));
                 }
                 OpCode::MULMOD => {
                     if stack.len() < 3 {
@@ -1551,11 +1546,8 @@ impl ExecutionEnvironment {
                     let a = pop1!(stack, gas, snapshot, self);
                     let b = pop1!(stack, gas, snapshot, self);
                     let n = pop1!(stack, gas, snapshot, self);
-                    stack.push(if n.is_zero() {
-                        U256::ZERO
-                    } else {
-                        a.wrapping_mul(b).checked_mod(n)
-                    });
+                    // Full-width: (a*b) mod n without truncating the 512-bit product.
+                    stack.push(a.mul_mod(b, n));
                 }
 
                 // ── Comparison ───────────────────────────────
