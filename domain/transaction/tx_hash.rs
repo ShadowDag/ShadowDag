@@ -141,7 +141,7 @@ impl TxHash {
     ) -> Vec<u8> {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
-        h.update(b"SHADOW_TX_CONF_SIGN_V1");
+        h.update(b"SHADOW_TX_CONF_SIGN_V2");
         h.update(Self::chain_id_for(network).to_le_bytes());
         h.update(tx.timestamp.to_le_bytes());
         h.update(tx.fee.to_le_bytes());
@@ -152,7 +152,8 @@ impl TxHash {
             h.update((a.len() as u32).to_le_bytes());
             h.update(a);
             h.update(o.amount.to_le_bytes());
-            for opt in [&o.commitment, &o.ephemeral_pubkey] {
+            // commitment, ephemeral_pubkey, one_time_pubkey (RingCT).
+            for opt in [&o.commitment, &o.ephemeral_pubkey, &o.one_time_pubkey] {
                 match opt {
                     Some(s) => {
                         h.update([1u8]);
@@ -193,6 +194,26 @@ impl TxHash {
                         h.update((m.len() as u32).to_le_bytes());
                         h.update(m.as_bytes());
                     }
+                }
+                None => h.update([0u8]),
+            }
+            // RingCT: ring_commitments (parallel C_i) and pseudo-output C'.
+            match &inp.ring_commitments {
+                Some(cs) => {
+                    h.update([1u8]);
+                    h.update((cs.len() as u32).to_le_bytes());
+                    for c in cs {
+                        h.update((c.len() as u32).to_le_bytes());
+                        h.update(c.as_bytes());
+                    }
+                }
+                None => h.update([0u8]),
+            }
+            match &inp.pseudo_commitment {
+                Some(pc) => {
+                    h.update([1u8]);
+                    h.update((pc.len() as u32).to_le_bytes());
+                    h.update(pc.as_bytes());
                 }
                 None => h.update([0u8]),
             }
@@ -503,5 +524,26 @@ mod tests {
         tx.inputs[0].key_image = Some("ff".repeat(32));
         let after = TxHash::confidential_signing_message_for_network(&tx, &net);
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn conf_message_binds_one_time_pubkey_and_ring_commitments() {
+        let net = NetworkMode::Mainnet;
+        let mut tx = make_confidential_tx();
+        let base = TxHash::confidential_signing_message_for_network(&tx, &net);
+
+        tx.outputs[0].one_time_pubkey = Some("ab".repeat(32));
+        let after_otk = TxHash::confidential_signing_message_for_network(&tx, &net);
+        assert_ne!(base, after_otk);
+
+        tx.inputs[0].ring_commitments = Some(vec!["cd".repeat(32)]);
+        let after_rc = TxHash::confidential_signing_message_for_network(&tx, &net);
+        assert_ne!(after_otk, after_rc);
+
+        tx.inputs[0].pseudo_commitment = Some("ef".repeat(32));
+        assert_ne!(
+            after_rc,
+            TxHash::confidential_signing_message_for_network(&tx, &net)
+        );
     }
 }
