@@ -312,6 +312,7 @@ fn generate_test_tx_invalid(from: &str, to: &str, seq: u64) -> Transaction {
             pub_key: "loadtest_pk".to_string(),
             key_image: None,
             ring_members: None,
+            ring_signature: None,
         }],
         outputs: vec![TxOutput {
             address: to.to_string(),
@@ -357,6 +358,7 @@ fn generate_valid_transfer_tx(n: u64, from_addr: &str, to_addr: &str) -> Transac
             pub_key: hex::encode(vec![0u8; 32]),   // placeholder 32-byte pubkey
             key_image: None,
             ring_members: None,
+            ring_signature: None,
         }],
         outputs: vec![TxOutput {
             address: to_addr.to_string(),
