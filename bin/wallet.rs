@@ -780,11 +780,127 @@ fn cmd_stealth(_args: &[String]) {
     }
 }
 
+/// Build a JSON-RPC 2.0 request body (pure; unit-tested).
+fn cli_rpc_request_body(method: &str, params: &serde_json::Value) -> String {
+    serde_json::json!({"jsonrpc": "2.0", "method": method, "params": params, "id": 1}).to_string()
+}
+
+/// Extract the `result` value from a JSON-RPC response string (pure; unit-tested).
+/// Returns None on parse error or if the response carries an `error`.
+fn cli_rpc_extract_result(response_json: &str) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(response_json).ok()?;
+    match v.get("error") {
+        Some(e) if !e.is_null() => return None,
+        _ => {}
+    }
+    v.get("result").cloned()
+}
+
+/// Resolve the RPC endpoint: `SHADOWDAG_RPC=host:port`, else loopback + the
+/// network's default RPC port.
+fn cli_rpc_target() -> std::net::SocketAddr {
+    if let Ok(s) = std::env::var("SHADOWDAG_RPC") {
+        if let Ok(sa) = s.trim().parse::<std::net::SocketAddr>() {
+            return sa;
+        }
+    }
+    let port: u16 = match wallet_network().as_str() {
+        "testnet" => 19332,
+        "regtest" => 29332,
+        _ => 9332,
+    };
+    std::net::SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+/// Minimal JSON-RPC-over-HTTP client for the CLI (the hardened client in the
+/// desktop-gated `mod gui` is unavailable here). Returns the `result` value, or
+/// None on any failure. NETWORK PATH: exercised only against a running node; the
+/// pure request/parse helpers above are unit-tested.
+fn cli_rpc_call(
+    socket: std::net::SocketAddr,
+    method: &str,
+    params: serde_json::Value,
+) -> Option<serde_json::Value> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let body = cli_rpc_request_body(method, &params);
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&socket, std::time::Duration::from_secs(5)).ok()?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(20)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(20)));
+    let req = format!(
+        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        socket, body.len(), body
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let _ = stream.flush();
+
+    let mut reader = BufReader::new(stream);
+    let mut content_length: usize = 0;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 {
+            break;
+        }
+        let t = line.trim();
+        if t.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = t.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().ok()?;
+            }
+        }
+    }
+    if content_length == 0 || content_length > 32 * 1024 * 1024 {
+        return None;
+    }
+    let mut buf = vec![0u8; content_length];
+    reader.read_exact(&mut buf).ok()?;
+    let s = String::from_utf8(buf).ok()?;
+    cli_rpc_extract_result(&s)
+}
+
+/// Fetch all chain blocks from a running node via RPC (getblockcount → getblocks
+/// → getblockfull). Returns None if the node is unreachable (caller falls back
+/// to the local DB). NETWORK PATH: live-node only.
+fn scan_fetch_blocks_via_rpc(
+) -> Option<Vec<shadowdag::domain::block::block::Block>> {
+    use shadowdag::domain::block::block::Block;
+    let socket = cli_rpc_target();
+    let count_v = cli_rpc_call(socket, "getblockcount", serde_json::json!([]))?;
+    let height = count_v
+        .as_u64()
+        .or_else(|| count_v.get("best_height").and_then(|v| v.as_u64()))?;
+
+    let mut blocks: Vec<Block> = Vec::new();
+    let page = 500u64;
+    let mut start = 0u64;
+    while start <= height {
+        let resp = cli_rpc_call(socket, "getblocks", serde_json::json!([start, page]))?;
+        let arr = match resp.get("blocks").and_then(|b| b.as_array()) {
+            Some(a) if !a.is_empty() => a.clone(),
+            _ => break,
+        };
+        for item in &arr {
+            if let Some(hash) = item.get("hash").and_then(|h| h.as_str()) {
+                if let Some(full) = cli_rpc_call(socket, "getblockfull", serde_json::json!([hash])) {
+                    if let Ok(block) = serde_json::from_value::<Block>(full) {
+                        blocks.push(block);
+                    }
+                }
+            }
+        }
+        start += page;
+    }
+    Some(blocks)
+}
+
 fn cmd_scan(_args: &[String]) {
-    // Scan the local node block DB for confidential outputs owned by this wallet,
-    // record them, persist, and report the confidential balance. NOTE: this opens
-    // the node DB directly (same pattern as `balance`); run it while the node is
-    // stopped. Against a running node, scanning via RPC is a follow-up.
+    // Scan for confidential outputs owned by this wallet, record them, persist,
+    // and report the confidential balance. Prefers a RUNNING node over RPC
+    // (getblockfull); if the node is unreachable, falls back to opening the local
+    // block DB directly (run that variant with the node stopped — same DB-access
+    // pattern as `balance`).
     let mut wallet = match load_and_unlock_wallet() {
         Ok(w) => w,
         Err(e) => {
@@ -793,32 +909,41 @@ fn cmd_scan(_args: &[String]) {
         }
     };
     let addr = wallet.address();
-    let db_path = utxo_db_path();
-    let store = match shadowdag::infrastructure::storage::rocksdb::blocks::block_store::BlockStore::new(
-        db_path.as_str(),
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Cannot open block DB ({}): {}", db_path, e);
-            return;
+
+    // 1) Try a running node over RPC.
+    let (blocks, source) = match scan_fetch_blocks_via_rpc() {
+        Some(b) => (b, "node RPC"),
+        None => {
+            // 2) Fall back to the local block DB (node must be stopped).
+            let db_path = utxo_db_path();
+            let store = match shadowdag::infrastructure::storage::rocksdb::blocks::block_store::BlockStore::new(
+                db_path.as_str(),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Node not reachable over RPC and cannot open local block DB ({}): {}", db_path, e);
+                    eprintln!("Start the node, or run this while the node is stopped.");
+                    return;
+                }
+            };
+            let mut blocks = Vec::new();
+            let mut h = 0u64;
+            loop {
+                let hashes = store.get_block_hashes_at_height(h);
+                if hashes.is_empty() {
+                    break;
+                }
+                for hash in hashes {
+                    if let Some(b) = store.get_block(&hash) {
+                        blocks.push(b);
+                    }
+                }
+                h += 1;
+            }
+            (blocks, "local DB")
         }
     };
-
-    // Walk the DAG by height until a height with no blocks is reached.
-    let mut blocks = Vec::new();
-    let mut h = 0u64;
-    loop {
-        let hashes = store.get_block_hashes_at_height(h);
-        if hashes.is_empty() {
-            break;
-        }
-        for hash in hashes {
-            if let Some(b) = store.get_block(&hash) {
-                blocks.push(b);
-            }
-        }
-        h += 1;
-    }
+    println!("Scanning via {} ...", source);
     let found = wallet.scan_blocks(&blocks);
 
     // Persist updated wallet state (confidential UTXOs) back to the wallet DB.
@@ -2542,7 +2667,34 @@ mod gui {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::{is_confidential_addr, validate_address};
+    use super::{
+        cli_rpc_extract_result, cli_rpc_request_body, is_confidential_addr, validate_address,
+    };
+
+    #[test]
+    fn rpc_request_body_is_jsonrpc2() {
+        let body = cli_rpc_request_body("getblockcount", &serde_json::json!([]));
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["method"], "getblockcount");
+        assert_eq!(v["params"], serde_json::json!([]));
+        assert_eq!(v["id"], 1);
+    }
+
+    #[test]
+    fn rpc_extract_result_handles_ok_and_error() {
+        assert_eq!(
+            cli_rpc_extract_result(r#"{"jsonrpc":"2.0","result":42,"id":1}"#),
+            Some(serde_json::json!(42))
+        );
+        // Error response → None.
+        assert_eq!(
+            cli_rpc_extract_result(r#"{"jsonrpc":"2.0","error":{"code":-1,"message":"x"},"id":1}"#),
+            None
+        );
+        // Malformed → None.
+        assert_eq!(cli_rpc_extract_result("not json"), None);
+    }
 
     #[test]
     fn confidential_addr_routing_predicate() {
