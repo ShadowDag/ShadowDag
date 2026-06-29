@@ -462,6 +462,7 @@ mod tests {
                 pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
             }],
             outputs: vec![TxOutput {
                 address: "bob".into(),

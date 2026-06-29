@@ -610,7 +610,7 @@ pub fn payload_size_bounds(cmd: CommandId) -> (usize, usize) {
         CommandId::Inv => (BINCODE_TAG + 1, BINCODE_TAG + 512 * 1024),
         CommandId::GetData => (BINCODE_TAG + 1, BINCODE_TAG + 512 * 1024),
         // Block: up to 2 MiB (MAX_BLOCK_SIZE is 2 MB per consensus)
-        CommandId::Block => (BINCODE_TAG + 60, 2 * 1024 * 1024),
+        CommandId::Block => (BINCODE_TAG + 60, MAX_MESSAGE_SIZE),
         // Tx: max 256 KiB (prevents single giant TXs with millions of inputs)
         CommandId::Tx => (BINCODE_TAG + 12, 256 * 1024),
         CommandId::GetHeaders => (BINCODE_TAG + 1, BINCODE_TAG + 1024),

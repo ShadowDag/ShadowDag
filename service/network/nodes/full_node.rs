@@ -192,6 +192,25 @@ pub struct FullNode {
 
 impl FullNode {
     #[inline]
+    fn decode_revert_reason(return_data: &[u8]) -> String {
+        const MAX_REVERT_REASON_BYTES: usize = 1024;
+        let limited = &return_data[..return_data.len().min(MAX_REVERT_REASON_BYTES)];
+        match std::str::from_utf8(limited) {
+            Ok(s) => s
+                .chars()
+                .map(|c| {
+                    if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
+                        '?'
+                    } else {
+                        c
+                    }
+                })
+                .collect(),
+            Err(_) => format!("0x{}", hex::encode(limited)),
+        }
+    }
+
+    #[inline]
     fn should_keep_current_tip_on_tie(
         current_best: &str,
         best_tip: &str,
@@ -460,6 +479,7 @@ impl FullNode {
         if block.header.height <= best_height {
             let hashes = self.block_store.get_block_hashes_at_height(block.header.height);
             let mut fallback_anchor: Option<u64> = None;
+            let mut saw_different_anchor = false;
             for h in hashes {
                 if let Some(existing) = self.block_store.get_block(&h) {
                     let anchored = existing.header.difficulty.max(1);
@@ -469,10 +489,20 @@ impl FullNode {
                     if anchored == block.header.difficulty.max(1) {
                         return Ok(anchored);
                     }
-                    if fallback_anchor.is_none() {
+                    if let Some(a) = fallback_anchor {
+                        if a != anchored {
+                            saw_different_anchor = true;
+                        }
+                    } else {
                         fallback_anchor = Some(anchored);
                     }
                 }
+            }
+            if saw_different_anchor {
+                return Err(NodeError::BlockRejected(format!(
+                    "ambiguous difficulty anchors at height {}",
+                    block.header.height
+                )));
             }
             if let Some(anchor) = fallback_anchor {
                 return Ok(anchor);
@@ -1945,7 +1975,7 @@ impl FullNode {
                             env.state.rollback(deploy_snapshot).ok();
                             ExecutionResult::Revert {
                                 gas_used,
-                                reason: String::from_utf8_lossy(&return_data).to_string(),
+                                reason: Self::decode_revert_reason(&return_data),
                             }
                         }
                         CallOutcome::Failure { gas_used } => {
@@ -2149,7 +2179,7 @@ impl FullNode {
                             return_data,
                         } => ExecutionResult::Revert {
                             gas_used,
-                            reason: String::from_utf8_lossy(&return_data).to_string(),
+                            reason: Self::decode_revert_reason(&return_data),
                         },
                         CallOutcome::Failure { gas_used } => {
                             // See the ContractCreate branch above

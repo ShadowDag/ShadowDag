@@ -26,6 +26,7 @@ mod tests {
                 pub_key: "pk".to_string(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
             }],
             outputs: vec![TxOutput {
                 address: "addr1".into(),

@@ -95,7 +95,11 @@ impl MempoolManager {
                         if let Ok(tx_bytes) = bincode::serialize(&tx) {
                             push_outbound_to_peer(&stem_peer, P2PMessage::Tx { data: tx_bytes });
                         }
-                        log::debug!("[Dandelion] TX {} stem → {}", &tx.hash[..8], stem_peer);
+                        log::debug!(
+                            "[Dandelion] TX {} stem → {}",
+                            tx.hash.get(..8).unwrap_or(&tx.hash),
+                            stem_peer
+                        );
                     }
                     RelayAction::Fluff => {
                         // Fluff phase: broadcast to all peers

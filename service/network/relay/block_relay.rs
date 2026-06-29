@@ -53,6 +53,17 @@ pub struct BlockRelay {
 
 impl BlockRelay {
     #[inline]
+    fn key_log_hint(key: &[u8]) -> String {
+        const MAX_KEY_LOG_BYTES: usize = 32;
+        let clipped = &key[..key.len().min(MAX_KEY_LOG_BYTES)];
+        let mut out = hex::encode(clipped);
+        if key.len() > MAX_KEY_LOG_BYTES {
+            out.push_str("...");
+        }
+        out
+    }
+
+    #[inline]
     fn key_has_prefix(k: &[u8], p: &[u8]) -> bool {
         k.starts_with(p)
     }
@@ -293,7 +304,7 @@ impl BlockRelay {
                             // Fix #7: Delete corrupt/undeserializable orphan entries
                             // instead of silently skipping them forever.
                             slog_warn!("relay", "orphan_corrupt_entry_deleted",
-                                key => String::from_utf8_lossy(&k), error => e);
+                                key => &Self::key_log_hint(k.as_ref()), error => e);
                             corrupt_keys.push(k.to_vec());
                         }
                     }
@@ -426,7 +437,7 @@ impl BlockRelay {
                             // Fix #7: corrupt entry — delete it instead of
                             // leaving it to accumulate forever.
                             slog_warn!("relay", "prune_orphan_corrupt_entry_deleted",
-                                key => String::from_utf8_lossy(&k), error => e);
+                                key => &Self::key_log_hint(k.as_ref()), error => e);
                             stale_keys.push(k.to_vec());
                         }
                     }

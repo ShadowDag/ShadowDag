@@ -206,7 +206,11 @@ impl Miner {
 
             if PowValidator::hash_meets_target(&hash, block.header.difficulty) {
                 block.header.hash = hash.clone();
-                slog_info!("mining", "block_found", nonce => nonce, hash_prefix => &hash[..8], height => block.header.height, parents => block.header.parents.len());
+                slog_info!("mining", "block_found",
+                    nonce => nonce,
+                    hash_prefix => hash.get(..8).unwrap_or(&hash),
+                    height => block.header.height,
+                    parents => block.header.parents.len());
                 return block;
             }
 
@@ -242,7 +246,9 @@ impl Miner {
     pub fn verify_pow(block: &Block) -> bool {
         let computed = shadow_hash(block);
         if computed != block.header.hash {
-            slog_warn!("mining", "pow_mismatch", computed => &computed[..8], stored => block.header.hash.get(..8).unwrap_or("?"));
+            slog_warn!("mining", "pow_mismatch",
+                computed => computed.get(..8).unwrap_or(&computed),
+                stored => block.header.hash.get(..8).unwrap_or("?"));
             return false;
         }
         PowValidator::hash_meets_target(&computed, block.header.difficulty)

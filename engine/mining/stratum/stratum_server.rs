@@ -55,6 +55,123 @@ const MAX_CONNECTIONS: usize = 1_024;
 
 /// Maximum JSON-RPC line length in bytes (DoS protection)
 const MAX_LINE_LENGTH: usize = 8_192;
+const MAX_RPC_HEADER_LINES: usize = 64;
+const MAX_RPC_HEADER_BYTES: usize = 16 * 1024;
+const MAX_RPC_BODY_BYTES: usize = 1_000_000;
+
+fn submit_block_to_local_rpc(rpc_port: u16, rpc_body: &str) -> Result<(), String> {
+    let addr = format!("127.0.0.1:{}", rpc_port);
+    let socket: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| format!("bad rpc socket address {}: {}", addr, e))?;
+    let mut stream = std::net::TcpStream::connect_timeout(&socket, Duration::from_secs(5))
+        .map_err(|e| format!("rpc connect {} failed: {}", addr, e))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| format!("rpc set_read_timeout: {}", e))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| format!("rpc set_write_timeout: {}", e))?;
+
+    let auth_header = std::env::var("SHADOWDAG_STRATUM_RPC_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(|token| format!("Authorization: Bearer {}\r\n", token))
+        .unwrap_or_default();
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        auth_header,
+        rpc_body.len(),
+        rpc_body
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("rpc write failed: {}", e))?;
+    stream
+        .flush()
+        .map_err(|e| format!("rpc flush failed: {}", e))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .map_err(|e| format!("rpc read status failed: {}", e))?;
+    if status_line.trim().is_empty() {
+        return Err("rpc empty status line".to_string());
+    }
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| format!("rpc malformed status line: {}", status_line.trim()))?;
+
+    let mut content_length: usize = 0;
+    let mut content_length_seen = false;
+    let mut transfer_encoding_seen = false;
+    let mut header_lines = 0usize;
+    let mut header_bytes = 0usize;
+    loop {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .map_err(|e| format!("rpc read header failed: {}", e))?;
+        header_lines += 1;
+        header_bytes += line.len();
+        if header_lines > MAX_RPC_HEADER_LINES || header_bytes > MAX_RPC_HEADER_BYTES {
+            return Err("rpc response headers too large".to_string());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("content-length:") {
+            if content_length_seen {
+                return Err("rpc duplicate Content-Length".to_string());
+            }
+            content_length_seen = true;
+            let (_, value) = trimmed
+                .split_once(':')
+                .ok_or_else(|| "rpc malformed Content-Length".to_string())?;
+            content_length = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| "rpc malformed Content-Length".to_string())?;
+        } else if lower.starts_with("transfer-encoding:") {
+            transfer_encoding_seen = true;
+        }
+    }
+    if transfer_encoding_seen || !content_length_seen {
+        return Err("rpc unsupported response framing".to_string());
+    }
+    if content_length > MAX_RPC_BODY_BYTES {
+        return Err(format!(
+            "rpc response too large: {} > {}",
+            content_length, MAX_RPC_BODY_BYTES
+        ));
+    }
+
+    let mut body = vec![0u8; content_length];
+    reader
+        .read_exact(&mut body)
+        .map_err(|e| format!("rpc read body failed: {}", e))?;
+    let body_str =
+        String::from_utf8(body).map_err(|e| format!("rpc non-utf8 response body: {}", e))?;
+
+    if !(200..300).contains(&status) {
+        return Err(format!("rpc HTTP {}: {}", status, body_str));
+    }
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body_str).map_err(|e| format!("rpc invalid json: {}", e))?;
+    if let Some(err) = parsed.get("error") {
+        if !err.is_null() {
+            return Err(format!("submitblock rejected: {}", err));
+        }
+    }
+    Ok(())
+}
 
 /// Stratum method types
 #[derive(Debug, Clone, PartialEq)]
@@ -631,13 +748,8 @@ impl StratumServer {
                     // delay the stratum response to the miner.
                     let rpc_port = self.rpc_port;
                     std::thread::spawn(move || {
-                        let addr = format!("127.0.0.1:{}", rpc_port);
-                        if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
-                            let request = format!(
-                                "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                rpc_body.len(), rpc_body
-                            );
-                            let _ = std::io::Write::write_all(&mut stream, request.as_bytes());
+                        if let Err(e) = submit_block_to_local_rpc(rpc_port, &rpc_body) {
+                            slog_warn!("stratum", "submitblock_rpc_failed", error => e);
                         }
                     });
                 }

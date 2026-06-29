@@ -29,6 +29,7 @@ use crate::domain::block::block::Block;
 use crate::errors::{DagError, StorageError};
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
 use crate::slog_info;
+use crate::slog_warn;
 use rocksdb::{IteratorMode, Options, WriteBatch, DB};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -84,6 +85,20 @@ fn key_tip(hash: &str) -> Vec<u8> {
 
 const META_GENESIS: &[u8] = b"bg:meta:genesis";
 const META_TOTAL_ADDED: &[u8] = b"bg:meta:total_added";
+
+#[inline]
+fn decode_hash_key_suffix(bytes: &[u8]) -> Option<String> {
+    // Accept canonical 64-hex hashes, but remain backward-compatible with
+    // older/test keys that used arbitrary ASCII IDs.
+    if bytes.is_empty() || bytes.len() > 256 {
+        return None;
+    }
+    let s = std::str::from_utf8(bytes).ok()?;
+    if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(s.to_ascii_lowercase());
+    }
+    Some(s.to_string())
+}
 
 // ── Orphan persistence keys ──────────────────────────────────────────
 // Orphan blocks are persisted to RocksDB so they survive restarts.
@@ -196,8 +211,11 @@ impl BlockGraph {
             if !k.starts_with(prefix) {
                 break;
             }
-            let hash = String::from_utf8_lossy(&k[prefix.len()..]).into_owned();
-            self.cache_tips.insert(hash);
+            if let Some(hash) = decode_hash_key_suffix(&k[prefix.len()..]) {
+                self.cache_tips.insert(hash);
+            } else {
+                slog_warn!("dag", "block_graph_recover_skip_invalid_tip_key");
+            }
         }
 
         // Recover the most recent blocks into the LRU cache.
@@ -272,7 +290,10 @@ impl BlockGraph {
             if !k.starts_with(orphan_prefix) {
                 break;
             }
-            let hash = String::from_utf8_lossy(&k[orphan_prefix.len()..]).into_owned();
+            let Some(hash) = decode_hash_key_suffix(&k[orphan_prefix.len()..]) else {
+                slog_warn!("dag", "block_graph_recover_skip_invalid_orphan_key");
+                continue;
+            };
             if let Ok(block) = bincode::deserialize::<Block>(&v) {
                 for parent in &block.header.parents {
                     self.orphan_index
@@ -331,7 +352,11 @@ impl BlockGraph {
             if !k.starts_with(prefix) {
                 break;
             }
-            result.push(String::from_utf8_lossy(&k[prefix.len()..]).into_owned());
+            if let Some(hash) = decode_hash_key_suffix(&k[prefix.len()..]) {
+                result.push(hash);
+            } else {
+                slog_warn!("dag", "block_graph_scan_skip_invalid_hash_key");
+            }
         }
         result
     }

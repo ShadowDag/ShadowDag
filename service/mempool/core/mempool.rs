@@ -54,6 +54,28 @@ pub struct Mempool {
 // Internal metadata helpers (atomic counters via RocksDB)
 // ─────────────────────────────────────────────────────────
 impl Mempool {
+    #[inline]
+    fn key_log_hint(key: &[u8]) -> String {
+        const MAX_KEY_LOG_BYTES: usize = 32;
+        let clipped = &key[..key.len().min(MAX_KEY_LOG_BYTES)];
+        match std::str::from_utf8(clipped) {
+            Ok(s) => {
+                if key.len() > MAX_KEY_LOG_BYTES {
+                    format!("{}...", s)
+                } else {
+                    s.to_string()
+                }
+            }
+            Err(_) => {
+                let mut out = hex::encode(clipped);
+                if key.len() > MAX_KEY_LOG_BYTES {
+                    out.push_str("...");
+                }
+                out
+            }
+        }
+    }
+
     /// Iterate the fee index backward (lowest fee_rate first) and return up to
     /// `limit` tx hashes. Uses RocksDB's reverse seek so only `limit` entries
     /// are read — O(limit) instead of O(n) for the full prefix scan + reverse.
@@ -82,9 +104,9 @@ impl Mempool {
             }
             Ok(_) => 0,
             Err(e) => {
-                let key_str = String::from_utf8_lossy(key);
+                let key_str = Self::key_log_hint(key);
                 slog_error!("mempool", "meta_get_u64_read_failed",
-                    key => &key_str.to_string(), error => &e.to_string());
+                    key => &key_str, error => &e.to_string());
                 0
             }
         }
@@ -93,9 +115,9 @@ impl Mempool {
     #[inline]
     fn meta_set_u64(&self, key: &[u8], val: u64) {
         if let Err(e) = self.db.put(key, val.to_le_bytes()) {
-            let key_str = String::from_utf8_lossy(key);
+            let key_str = Self::key_log_hint(key);
             slog_error!("mempool", "meta_set_u64_write_failed",
-                key => &key_str.to_string(), error => &e.to_string());
+                key => &key_str, error => &e.to_string());
         }
     }
 
@@ -310,6 +332,11 @@ impl Mempool {
         let mut m = Self::new(source)?;
         m.network = network;
         Ok(m)
+    }
+
+    #[inline]
+    pub fn network_mode(&self) -> &NetworkMode {
+        &self.network
     }
 
     /// Storage-only insertion. Does NOT validate UTXO/signatures.
@@ -1353,8 +1380,11 @@ impl Mempool {
             }
         }
 
-        // Full UTXO + signature validation before accepting into mempool
-        if !tx.is_coinbase() && !TxValidator::validate_tx(tx, utxo_set) {
+        // Full UTXO + signature validation before accepting into mempool.
+        // Must be network-aware so address/payload/signing rules match
+        // the active chain (mainnet/testnet/regtest).
+        if !tx.is_coinbase() && !TxValidator::validate_tx_for_network(tx, utxo_set, &self.network)
+        {
             return Err(MempoolError::ValidationFailed(
                 "transaction failed UTXO/signature validation".to_string(),
             ));
@@ -1574,6 +1604,7 @@ mod tests {
                 pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
             }],
             outputs: vec![TxOutput {
                 address: "bob".into(),
@@ -1771,6 +1802,7 @@ mod cpfp_tests {
                 pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
             }],
             outputs: vec![TxOutput {
                 address: "bob".into(),
@@ -2163,9 +2195,9 @@ impl Mempool {
             .collect();
 
         for k in &stale_keys {
-            let label = String::from_utf8_lossy(k);
+            let label = Self::key_log_hint(k);
             if let Err(e) = self.db.delete(k) {
-                slog_warn!("mempool", "orphan_db_delete_failed", key => &label.to_string(), error => &e.to_string());
+                slog_warn!("mempool", "orphan_db_delete_failed", key => &label, error => &e.to_string());
             }
             // Clean up the receive-time metadata key
             if let Ok(key_str) = String::from_utf8(k.to_vec()) {
@@ -2220,6 +2252,7 @@ mod orphan_tests {
                 pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
             }],
             outputs: vec![TxOutput {
                 address: "bob".into(),

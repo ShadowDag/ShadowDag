@@ -21,6 +21,23 @@ pub const DEFAULT_GAS_LIMIT: u64 = 10_000_000;
 
 /// Maximum contract bytecode size
 pub const MAX_CONTRACT_SIZE: usize = 24 * 1024; // 24 KB
+const MAX_REVERT_REASON_BYTES: usize = 512;
+
+#[inline]
+fn decode_revert_reason(return_data: &[u8]) -> String {
+    let clipped = if return_data.len() > MAX_REVERT_REASON_BYTES {
+        &return_data[..MAX_REVERT_REASON_BYTES]
+    } else {
+        return_data
+    };
+    match std::str::from_utf8(clipped) {
+        Ok(s) => s
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect(),
+        Err(_) => format!("0x{}", hex::encode(clipped)),
+    }
+}
 
 pub struct Executor {
     context: VMContext,
@@ -271,7 +288,7 @@ impl Executor {
                 return_data,
             } => ExecutionResult::Revert {
                 gas_used,
-                reason: String::from_utf8_lossy(&return_data).to_string(),
+                reason: decode_revert_reason(&return_data),
             },
             CallOutcome::Failure { gas_used } => ExecutionResult::OutOfGas { gas_used },
         };
@@ -475,7 +492,7 @@ impl Executor {
                 return_data,
             } => ExecutionResult::Revert {
                 gas_used,
-                reason: String::from_utf8_lossy(&return_data).to_string(),
+                reason: decode_revert_reason(&return_data),
             },
             CallOutcome::Failure { gas_used } => ExecutionResult::OutOfGas { gas_used },
         }

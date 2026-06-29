@@ -207,6 +207,7 @@ impl PeerManager {
     /// Create a PeerManager with a unique temp path (for tests).
     /// Create a temporary PeerManager for testing.
     /// Returns a fallback in-memory default if DB creation fails.
+    #[cfg(test)]
     pub fn new_temp() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);

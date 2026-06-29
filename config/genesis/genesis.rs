@@ -59,13 +59,13 @@ pub const DEV_REWARD_PCT: u64 = 5;
 // ── HARDCODED PoW RESULTS (mined with ShadowHash algorithm) ──────────────
 // These were mined by running `mine-genesis` binary.
 // Every node verifies these on startup. If they don't match, the node panics.
-pub const MAINNET_GENESIS_NONCE: u64 = 8888;
+pub const MAINNET_GENESIS_NONCE: u64 = 4034;
 pub const MAINNET_GENESIS_HASH: &str =
-    "0003402066a8335bd50d10054a36a5b82c2a6e5690cf80449a02fa8867e82851";
+    "00008c3137892f3b3081ee4a8b35fdd3c3a36b3b19d44e779db6c0e34ca26f38";
 pub const MAINNET_MERKLE_ROOT: &str =
-    "647b7531e64ef4511202ca43c87729d1bdb1594933325c8f79b3cf172febba7e";
+    "7dd883946da1f206fed84f21c0daa77304ffe7876f2bffae5cd05fc904602e8a";
 pub const MAINNET_COINBASE_HASH: &str =
-    "647b7531e64ef4511202ca43c87729d1bdb1594933325c8f79b3cf172febba7e";
+    "7dd883946da1f206fed84f21c0daa77304ffe7876f2bffae5cd05fc904602e8a";
 
 pub const TESTNET_GENESIS_NONCE: u64 = 11242;
 pub const TESTNET_GENESIS_HASH: &str =
@@ -288,12 +288,10 @@ fn mine_genesis(p: &GenesisParams, merkle_root: &str) -> (u64, String) {
 
         nonce += 1;
 
-        // Safety: prevent infinite loop in case of misconfiguration
-        if nonce > 100_000_000 {
-            panic!(
-                "FATAL: Genesis mining failed after 100,000,000 attempts. \
-                 This indicates a misconfigured difficulty target."
-            );
+        // Keep searching; if parameters are unusual this may take a long
+        // time, so emit periodic progress instead of aborting.
+        if nonce.is_multiple_of(10_000_000) {
+            slog_warn!("genesis", "mining_still_in_progress", nonce => nonce, difficulty => p.difficulty);
         }
     }
 }
@@ -303,7 +301,13 @@ fn mine_genesis(p: &GenesisParams, merkle_root: &str) -> (u64, String) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Build a complete genesis block.
-/// Uses hardcoded PoW results for fast startup. Falls back to mining if needed.
+/// Uses hardcoded PoW results for fast startup.
+///
+/// Mainnet safety rule:
+/// - If hardcoded mainnet genesis constants do not reproduce the expected hash,
+///   abort startup immediately.
+/// - Never "re-mine" mainnet genesis at runtime, because that can create a
+///   different network root across nodes.
 fn build_block(p: GenesisParams) -> Block {
     let coinbase = build_coinbase(&p);
     let merkle_root = compute_merkle_root(std::slice::from_ref(&coinbase.hash));
@@ -326,8 +330,17 @@ fn build_block(p: GenesisParams) -> Block {
             if hash == MAINNET_GENESIS_HASH {
                 (MAINNET_GENESIS_NONCE, hash)
             } else {
-                slog_warn!("genesis", "mainnet_hash_mismatch_remining");
-                mine_genesis(&p, &merkle_root)
+                // Consensus-critical invariant:
+                // mainnet genesis must be deterministic and fixed.
+                // Runtime re-mining on mainnet can split the network.
+                slog_error!("genesis", "mainnet_hash_mismatch_abort",
+                    expected => MAINNET_GENESIS_HASH,
+                    got => &hash);
+                panic!(
+                    "FATAL: mainnet genesis constants mismatch (expected {}, got {}). \
+                     Refusing to re-mine mainnet genesis at runtime.",
+                    MAINNET_GENESIS_HASH, hash
+                );
             }
         }
         0xDA0C_0002 => {

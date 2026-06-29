@@ -5,6 +5,7 @@
 
 use crate::config::consensus::consensus_params::ConsensusParams;
 use crate::config::consensus::emission_schedule::EmissionSchedule;
+use crate::config::node::node_config::NetworkMode;
 use crate::domain::block::block::Block;
 use crate::domain::block::block_body::BlockBody;
 use crate::domain::block::block_header::BlockHeader;
@@ -114,7 +115,8 @@ impl BlockTemplateBuilder {
             MAX_BLOCK_TX_COUNT - 1, // reserve slot for coinbase
         );
 
-        let template = Self::select_valid_transactions(candidates, utxo_set);
+        let network = Self::network_from_miner_address(miner_address);
+        let template = Self::select_valid_transactions(candidates, utxo_set, &network);
 
         // Coinbase reward = emission + transaction fees (must match validator expectation)
         let emission = EmissionSchedule::block_reward(height);
@@ -228,7 +230,8 @@ impl BlockTemplateBuilder {
         // Select transactions BEFORE building coinbase so we know total fees
         let candidates = mempool.get_transactions_for_block(utxo_set, MAX_BLOCK_TX_COUNT - 1);
 
-        let template = Self::select_valid_transactions(candidates, utxo_set);
+        let network = Self::network_from_miner_address(miner_address);
+        let template = Self::select_valid_transactions(candidates, utxo_set, &network);
 
         // Coinbase reward = emission + transaction fees.
         // Legacy method returns Block (not Result), so avoid panics here.
@@ -288,6 +291,7 @@ impl BlockTemplateBuilder {
     fn select_valid_transactions(
         candidates: Vec<Transaction>,
         utxo_set: &UtxoSet,
+        network: &NetworkMode,
     ) -> BlockTemplate {
         let mut staged_utxos: HashMap<UtxoKey, (String, u64)> = HashMap::new();
 
@@ -340,7 +344,7 @@ impl BlockTemplateBuilder {
                 continue;
             }
 
-            if !tx.is_coinbase() && !TxValidator::validate_tx(&tx, utxo_set) {
+            if !tx.is_coinbase() && !TxValidator::validate_tx_for_network(&tx, utxo_set, network) {
                 // TX failed full validation — reject it regardless of staged UTXO status.
                 // Previously, TXs whose inputs were all in staged_utxos were accepted
                 // even when signature/fee/ring checks failed. This bypassed consensus.
@@ -402,6 +406,18 @@ impl BlockTemplateBuilder {
             tx_count: accepted.len(),
             total_fees,
             transactions: accepted,
+        }
+    }
+
+    #[inline]
+    fn network_from_miner_address(miner_address: &str) -> NetworkMode {
+        if miner_address.starts_with("ST1") {
+            NetworkMode::Testnet
+        } else if miner_address.starts_with("SR1") {
+            NetworkMode::Regtest
+        } else {
+            // Default to mainnet for unknown/legacy prefixes.
+            NetworkMode::Mainnet
         }
     }
 

@@ -36,7 +36,7 @@ impl TxPool {
             return TxPoolResult::DoubleSpend;
         }
 
-        if !TxValidator::validate_tx(tx, utxo_set) {
+        if !TxValidator::validate_tx_for_network(tx, utxo_set, self.mempool.network_mode()) {
             return TxPoolResult::Invalid;
         }
 

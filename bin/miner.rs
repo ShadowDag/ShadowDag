@@ -329,7 +329,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         println!(
             "â›ڈ  Block #{} mined! hash={}... nonce={} time={:.1}s rate={:.0} H/s fees={:.8} SDAG",
             height,
-            &hash[..16],
+            hash.get(..16).unwrap_or(&hash),
             nonce,
             elapsed,
             hashrate,
@@ -534,6 +534,7 @@ enum SubmitResult {
 }
 
 const MAX_RESPONSE: usize = 1_000_000; // 1 MB
+const MAX_HEADER_LINES: usize = 100;
 const MIN_SUBMIT_INTERVAL_MS: u64 = 700; // keep below write rate-limit (100 req/min)
 
 fn rpc_call(addr: &str, method: &str, params: &str, bearer_token: Option<&str>) -> Option<String> {
@@ -567,9 +568,11 @@ fn rpc_call(addr: &str, method: &str, params: &str, bearer_token: Option<&str>) 
     // EAGAIN (os error 11) which .ok()? silently swallows as None.
     let mut reader = std::io::BufReader::new(&stream);
     let mut content_length: usize = 0;
+    let mut content_length_seen = false;
+    let mut unsupported_transfer_encoding = false;
 
     // Read headers line by line until empty line
-    let mut header_count = 0;
+    let mut header_count = 0usize;
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
@@ -580,41 +583,60 @@ fn rpc_call(addr: &str, method: &str, params: &str, bearer_token: Option<&str>) 
                     break;
                 } // End of headers
                 header_count += 1;
-                if header_count > 100 {
-                    break;
+                if header_count > MAX_HEADER_LINES {
+                    slog_error!("miner", "rpc_header_overflow", max_headers => MAX_HEADER_LINES);
+                    return None;
                 }
                 // Case-insensitive Content-Length matching
-                if trimmed.len() > 15 && trimmed[..15].eq_ignore_ascii_case("content-length:") {
-                    content_length = trimmed[15..].trim().parse().unwrap_or(0);
+                if let Some((name, value)) = trimmed.split_once(':') {
+                    if name.trim().eq_ignore_ascii_case("content-length") {
+                        if content_length_seen {
+                            slog_error!("miner", "rpc_duplicate_content_length");
+                            return None;
+                        }
+                        content_length_seen = true;
+                        content_length = match value.trim().parse::<usize>() {
+                            Ok(n) => n,
+                            Err(_) => {
+                                slog_error!("miner", "rpc_invalid_content_length", raw => value.trim());
+                                return None;
+                            }
+                        };
+                    } else if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+                        unsupported_transfer_encoding = true;
+                    }
                 }
             }
-            Err(_) => break,
-        }
-    }
-
-    // Read exactly content_length bytes for the body
-    if content_length > 0 {
-        if content_length > MAX_RESPONSE {
-            slog_error!("miner", "rpc_response_too_large", bytes => content_length, max => MAX_RESPONSE);
-            return None;
-        }
-        let mut body_buf = vec![0u8; content_length];
-        match reader.read_exact(&mut body_buf) {
-            Ok(()) => {}
             Err(e) => {
-                slog_error!("miner", "rpc_read_failed", bytes => content_length, error => e);
+                slog_error!("miner", "rpc_header_read_failed", error => e);
                 return None;
             }
         }
-        String::from_utf8(body_buf).ok()
-    } else {
-        // Fallback: read whatever is available
-        let mut buf = vec![0u8; 65536];
-        match reader.read(&mut buf) {
-            Ok(n) if n > 0 => String::from_utf8(buf[..n].to_vec()).ok(),
-            _ => None,
+    }
+    if unsupported_transfer_encoding || !content_length_seen {
+        slog_error!("miner", "rpc_invalid_response_headers",
+            transfer_encoding => unsupported_transfer_encoding,
+            content_length_seen => content_length_seen);
+        return None;
+    }
+
+    // Read exactly content_length bytes for the body
+    if content_length == 0 {
+        return None;
+    }
+    if content_length > MAX_RESPONSE {
+        slog_error!("miner", "rpc_response_too_large", bytes => content_length, max => MAX_RESPONSE);
+        return None;
+    }
+    let mut body_buf = vec![0u8; content_length];
+    match reader.read_exact(&mut body_buf) {
+        Ok(()) => {}
+        Err(e) => {
+            slog_error!("miner", "rpc_read_failed", bytes => content_length, error => e);
+            return None;
         }
     }
+    String::from_utf8(body_buf).ok()
 }
 
 fn rpc_get_template(addr: &str, bearer_token: Option<&str>) -> Option<BlockTemplate> {

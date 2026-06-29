@@ -103,7 +103,7 @@ impl OpenClMiner {
                 let mut final_block = block.clone();
                 final_block.header.nonce = nonce;
                 final_block.header.hash = shadow_hash(&final_block);
-                slog_info!("gpu", "opencl_block_found", nonce => nonce, hash_prefix => &final_block.header.hash[..16]);
+                slog_info!("gpu", "opencl_block_found", nonce => nonce, hash_prefix => final_block.header.hash.get(..16).unwrap_or(&final_block.header.hash));
                 return Some(final_block);
             }
         }

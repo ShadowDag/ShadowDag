@@ -291,7 +291,8 @@ impl DagSync {
         let iter = self.db.iterator_cf(cf, IteratorMode::Start);
 
         for (key, _) in iter.flatten() {
-            slog_debug!("dag", "sync_seen_block", hash => String::from_utf8_lossy(&key));
+            let hint = hex::encode(&key);
+            slog_debug!("dag", "sync_seen_block", hash => &hint);
         }
     }
 }

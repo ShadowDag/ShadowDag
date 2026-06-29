@@ -118,7 +118,7 @@ struct Lexer;
 impl Lexer {
     fn tokenize(source: &str) -> Result<Vec<(Token, usize)>, CompileError> {
         let mut tokens = Vec::new();
-        let mut chars: Vec<char> = source.chars().collect();
+        let chars: Vec<char> = source.chars().collect();
         let mut pos = 0;
         let mut line = 1;
 
@@ -275,14 +275,17 @@ struct Contract {
     name: String,
     storage_vars: Vec<StorageVar>,
     functions: Vec<Function>,
+    #[allow(dead_code)]
     events: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 struct StorageVar {
     name: String,
+    #[allow(dead_code)]
     ty: String,
     slot: usize,
+    #[allow(dead_code)]
     initial: Option<u64>,
 }
 
@@ -315,6 +318,7 @@ enum Statement {
     },
     Return(Expr),
     Require(Expr),
+    #[allow(dead_code)]
     Emit {
         event: String,
         args: Vec<Expr>,

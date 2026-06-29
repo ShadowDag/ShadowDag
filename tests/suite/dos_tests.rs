@@ -46,6 +46,7 @@ mod tests {
                     pub_key: String::new(),
                     key_image: None,
                     ring_members: None,
+                    ring_signature: None,
                 })
                 .collect(),
             outputs: vec![TxOutput {

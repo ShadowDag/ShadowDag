@@ -8,8 +8,9 @@ use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config::node::node_config::NetworkMode;
 use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
-use crate::domain::transaction::tx_validator::TxValidator;
+use crate::domain::transaction::tx_hash::TxHash;
 use crate::errors::CryptoError;
 
 pub struct KeyPairHex {
@@ -99,8 +100,6 @@ pub fn build_transaction_with_anchor(
         })
         .collect();
 
-    let temp_hash = build_tx_hash_from_refs(&inputs_refs, &tx_outputs, fee, timestamp);
-
     let mut tx_inputs: Vec<TxInput> = inputs_refs
         .iter()
         .map(|(txid, index, owner)| TxInput {
@@ -111,11 +110,14 @@ pub fn build_transaction_with_anchor(
             pub_key: public_key_hex.to_string(),
             key_image: None,
             ring_members: None,
+            ring_signature: None,
         })
         .collect();
 
-    let temp_tx = Transaction {
-        hash: temp_hash.clone(),
+    let network = infer_network_from_refs_and_outputs(&inputs_refs, &tx_outputs)?;
+
+    let mut temp_tx = Transaction {
+        hash: String::new(),
         inputs: tx_inputs.clone(),
         outputs: tx_outputs.clone(),
         fee,
@@ -130,7 +132,9 @@ pub fn build_transaction_with_anchor(
         vm_version: None,
     };
 
-    let signing_msg = TxValidator::build_signing_message(&temp_tx);
+    let temp_hash = TxHash::hash_for_network(&temp_tx, &network);
+    temp_tx.hash = temp_hash.clone();
+    let signing_msg = TxHash::signing_message_for_network(&temp_tx, &network);
 
     let sk_bytes: Vec<u8> = hex::decode(private_key_hex)
         .map_err(|e| CryptoError::InvalidKey(format!("invalid private key hex: {}", e)))?;
@@ -162,6 +166,52 @@ pub fn build_transaction_with_anchor(
     };
 
     Ok(final_tx)
+}
+
+#[inline]
+fn infer_network_from_address(addr: &str) -> Option<NetworkMode> {
+    if addr.starts_with("ST1") {
+        Some(NetworkMode::Testnet)
+    } else if addr.starts_with("SR1") {
+        Some(NetworkMode::Regtest)
+    } else if addr.starts_with("SD1") {
+        Some(NetworkMode::Mainnet)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn infer_network_from_refs_and_outputs(
+    inputs_refs: &[(String, u32, String)],
+    outputs: &[TxOutput],
+) -> Result<NetworkMode, CryptoError> {
+    let mut selected: Option<NetworkMode> = None;
+    let mut observe = |candidate: NetworkMode| -> Result<(), CryptoError> {
+        if let Some(existing) = &selected {
+            if existing != &candidate {
+                return Err(CryptoError::Other(
+                    "transaction contains mixed network address prefixes".into(),
+                ));
+            }
+        } else {
+            selected = Some(candidate);
+        }
+        Ok(())
+    };
+
+    for out in outputs {
+        if let Some(n) = infer_network_from_address(&out.address) {
+            observe(n)?;
+        }
+    }
+    for (_, _, owner) in inputs_refs {
+        if let Some(n) = infer_network_from_address(owner) {
+            observe(n)?;
+        }
+    }
+
+    Ok(selected.unwrap_or(NetworkMode::Mainnet))
 }
 
 pub fn build_coinbase(
@@ -304,6 +354,7 @@ pub const MAX_CONSOLIDATION_INPUTS: usize = 500;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::errors::CryptoError;
 
     #[test]
     fn coinbase_hash_is_deterministic() {
@@ -382,5 +433,24 @@ mod tests {
             kp.address.starts_with("SR1"),
             "Regtest address must start with 'SR1'"
         );
+    }
+
+    #[test]
+    fn build_transaction_rejects_mixed_network_prefixes() {
+        let kp = generate_keypair();
+        let res = build_transaction(
+            vec![("ab".repeat(32), 0, "SD1owner000000000000000000000000000000000001".to_string())],
+            vec![("ST1dest000000000000000000000000000000000002".to_string(), 1_000)],
+            1,
+            &kp.private_key_hex,
+            &kp.public_key_hex,
+        );
+
+        match res {
+            Err(CryptoError::Other(msg)) => {
+                assert!(msg.contains("mixed network address prefixes"), "{}", msg)
+            }
+            other => panic!("expected mixed-network rejection, got {:?}", other),
+        }
     }
 }

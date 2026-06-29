@@ -46,6 +46,60 @@ const ED25519_L: [u8; 32] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
 ];
 
+#[inline]
+fn infer_network_from_tx_free(tx: &Transaction) -> NetworkMode {
+    for output in &tx.outputs {
+        if output.address.starts_with("ST1") {
+            return NetworkMode::Testnet;
+        }
+        if output.address.starts_with("SR1") {
+            return NetworkMode::Regtest;
+        }
+        if output.address.starts_with("SD1") {
+            return NetworkMode::Mainnet;
+        }
+    }
+    for input in &tx.inputs {
+        if input.owner.starts_with("ST1") {
+            return NetworkMode::Testnet;
+        }
+        if input.owner.starts_with("SR1") {
+            return NetworkMode::Regtest;
+        }
+        if input.owner.starts_with("SD1") {
+            return NetworkMode::Mainnet;
+        }
+    }
+    NetworkMode::Mainnet
+}
+
+#[inline]
+fn tx_addresses_match_network_free(tx: &Transaction, network: &NetworkMode) -> bool {
+    for output in &tx.outputs {
+        if output.address.starts_with("ST1") && !matches!(network, NetworkMode::Testnet) {
+            return false;
+        }
+        if output.address.starts_with("SR1") && !matches!(network, NetworkMode::Regtest) {
+            return false;
+        }
+        if output.address.starts_with("SD1") && !matches!(network, NetworkMode::Mainnet) {
+            return false;
+        }
+    }
+    for input in &tx.inputs {
+        if input.owner.starts_with("ST1") && !matches!(network, NetworkMode::Testnet) {
+            return false;
+        }
+        if input.owner.starts_with("SR1") && !matches!(network, NetworkMode::Regtest) {
+            return false;
+        }
+        if input.owner.starts_with("SD1") && !matches!(network, NetworkMode::Mainnet) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Structural validation only (no utxo set required).
 /// Checks: non-empty outputs, non-empty hash, size limits, hash integrity, output amounts.
 /// Also enforces: non-coinbase tx must have >= 1 input, coinbase tx must have 0 inputs.
@@ -54,6 +108,14 @@ pub fn validate_tx(tx: &Transaction) -> bool {
         return false;
     }
     if tx.hash.is_empty() {
+        return false;
+    }
+    let network = infer_network_from_tx_free(tx);
+    if !tx_addresses_match_network_free(tx, &network) {
+        return false;
+    }
+
+    if !tx.is_coinbase() && !TxHash::verify_for_network(tx, &network) {
         return false;
     }
 
@@ -84,6 +146,97 @@ pub fn validate_tx(tx: &Transaction) -> bool {
 pub struct TxValidator;
 
 impl TxValidator {
+    #[inline]
+    fn contract_prefix_for_network(network: &NetworkMode) -> &'static str {
+        match network {
+            NetworkMode::Mainnet => "SD1c",
+            NetworkMode::Testnet => "ST1c",
+            NetworkMode::Regtest => "SR1c",
+        }
+    }
+
+    #[inline]
+    fn infer_network_from_address(addr: &str) -> Option<NetworkMode> {
+        if addr.starts_with("ST1") {
+            Some(NetworkMode::Testnet)
+        } else if addr.starts_with("SR1") {
+            Some(NetworkMode::Regtest)
+        } else if addr.starts_with("SD1") {
+            Some(NetworkMode::Mainnet)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn infer_network_from_tx(tx: &Transaction, utxo_set: Option<&UtxoSet>) -> NetworkMode {
+        for output in &tx.outputs {
+            if let Some(n) = Self::infer_network_from_address(&output.address) {
+                return n;
+            }
+        }
+        if let Some(set) = utxo_set {
+            for input in &tx.inputs {
+                if let Ok(key) = utxo_key(&input.txid, input.index) {
+                    if let Some(utxo) = set.get_utxo(&key) {
+                        if let Some(n) = Self::infer_network_from_address(&utxo.address) {
+                            return n;
+                        }
+                    }
+                }
+                if let Some(n) = Self::infer_network_from_address(&input.owner) {
+                    return n;
+                }
+            }
+        }
+        NetworkMode::Mainnet
+    }
+
+    #[inline]
+    fn tx_addresses_match_network(
+        tx: &Transaction,
+        network: &NetworkMode,
+        utxo_set: Option<&UtxoSet>,
+    ) -> bool {
+        for output in &tx.outputs {
+            if let Some(n) = Self::infer_network_from_address(&output.address) {
+                if &n != network {
+                    return false;
+                }
+            }
+        }
+
+        for input in &tx.inputs {
+            if let Some(n) = Self::infer_network_from_address(&input.owner) {
+                if &n != network {
+                    return false;
+                }
+            }
+        }
+
+        if let Some(set) = utxo_set {
+            for input in &tx.inputs {
+                let key = match utxo_key(&input.txid, input.index) {
+                    Ok(k) => k,
+                    Err(_) => return false,
+                };
+                if let Some(utxo) = set.get_utxo(&key) {
+                    if let Some(n) = Self::infer_network_from_address(&utxo.address) {
+                        if &n != network {
+                            return false;
+                        }
+                    }
+                    if let Some(n) = Self::infer_network_from_address(&utxo.owner) {
+                        if &n != network {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        true
+    }
     pub fn validate_tx(tx: &Transaction, utxo_set: &UtxoSet) -> bool {
         // 🔥 FAST FAIL قبل serialize
         if tx.outputs.is_empty() {
@@ -98,7 +251,12 @@ impl TxValidator {
             return false;
         }
 
-        if !TxHash::verify(tx) {
+        let network = Self::infer_network_from_tx(tx, Some(utxo_set));
+        if !Self::tx_addresses_match_network(tx, &network, Some(utxo_set)) {
+            return false;
+        }
+
+        if !TxHash::verify_for_network(tx, &network) {
             return false;
         }
 
@@ -123,6 +281,7 @@ impl TxValidator {
 
         let mut seen_inputs: HashSet<UtxoKey> = HashSet::with_capacity(tx.inputs.len());
         let mut input_sum: u64 = 0;
+        let signing_msg = TxHash::signing_message_for_network(tx, &network);
 
         for input in &tx.inputs {
             let key = match utxo_key(&input.txid, input.index) {
@@ -147,7 +306,7 @@ impl TxValidator {
             }
 
             // Verify that the signer owns this UTXO
-            if !Self::verify_input_ownership(input, &utxo, &TxHash::signing_message(tx)) {
+            if !Self::verify_input_ownership(input, &utxo, &signing_msg) {
                 return false;
             }
 
@@ -207,6 +366,9 @@ impl TxValidator {
         if !TxHash::verify_for_network(tx, network) {
             return false;
         }
+        if !Self::tx_addresses_match_network(tx, network, None) {
+            return false;
+        }
         if tx.inputs.len() > MAX_TX_INPUTS {
             return false;
         }
@@ -227,10 +389,10 @@ impl TxValidator {
         }
 
         // Contract-specific payload validation
-        if Self::validate_contract_create_payload(tx).is_err() {
+        if Self::validate_contract_create_payload_for_network(tx, network).is_err() {
             return false;
         }
-        if Self::validate_contract_call_payload(tx).is_err() {
+        if Self::validate_contract_call_payload_for_network(tx, network).is_err() {
             return false;
         }
 
@@ -271,6 +433,9 @@ impl TxValidator {
         if !TxHash::verify_for_network(tx, network) {
             return false;
         }
+        if !Self::tx_addresses_match_network(tx, network, Some(utxo_set)) {
+            return false;
+        }
 
         if tx.inputs.len() > MAX_TX_INPUTS {
             return false;
@@ -298,10 +463,10 @@ impl TxValidator {
             return false;
         }
         // Contract-specific payload validation
-        if Self::validate_contract_create_payload(tx).is_err() {
+        if Self::validate_contract_create_payload_for_network(tx, network).is_err() {
             return false;
         }
-        if Self::validate_contract_call_payload(tx).is_err() {
+        if Self::validate_contract_call_payload_for_network(tx, network).is_err() {
             return false;
         }
         // Ring signature for confidential TXs
@@ -371,7 +536,8 @@ impl TxValidator {
     }
 
     pub fn validate(tx: &Transaction, utxo_set: &UtxoSet) -> bool {
-        Self::validate_tx(tx, utxo_set)
+        let network = Self::infer_network_from_tx(tx, Some(utxo_set));
+        Self::validate_tx_for_network(tx, utxo_set, &network)
     }
 
     /// Full UTXO-aware validation with descriptive error messages.
@@ -386,6 +552,12 @@ impl TxValidator {
     ///   8. TX timestamp within acceptable range (anti-replay)
     ///   9. payload_hash format validation (anti-replay)
     pub fn validate_transaction(tx: &Transaction, utxo_set: &UtxoSet) -> Result<(), StorageError> {
+        let network = Self::infer_network_from_tx(tx, Some(utxo_set));
+        if !Self::tx_addresses_match_network(tx, &network, Some(utxo_set)) {
+            return Err(StorageError::Other(
+                "transaction mixes addresses from different networks".into(),
+            ));
+        }
         // ── structural checks ───────────────────────────────────────────
         if tx.hash.is_empty() {
             return Err(StorageError::Other("transaction hash is empty".into()));
@@ -405,10 +577,10 @@ impl TxValidator {
         }
 
         // [10] Contract-specific payload validation
-        if let Err(reason) = Self::validate_contract_create_payload(tx) {
+        if let Err(reason) = Self::validate_contract_create_payload_for_network(tx, &network) {
             return Err(StorageError::Other(format!("tx {}: {}", tx.hash, reason)));
         }
-        if let Err(reason) = Self::validate_contract_call_payload(tx) {
+        if let Err(reason) = Self::validate_contract_call_payload_for_network(tx, &network) {
             return Err(StorageError::Other(format!("tx {}: {}", tx.hash, reason)));
         }
 
@@ -418,6 +590,13 @@ impl TxValidator {
             return Err(StorageError::Other(format!(
                 "transaction exceeds max size ({} > {})",
                 canonical_size, MAX_TX_BYTES
+            )));
+        }
+
+        if !TxHash::verify_for_network(tx, &network) {
+            return Err(StorageError::Other(format!(
+                "transaction hash verification failed for {}",
+                tx.hash
             )));
         }
 
@@ -461,6 +640,7 @@ impl TxValidator {
         // ── [1][2][3][5] input validation ───────────────────────────────
         let mut seen_inputs: HashSet<UtxoKey> = HashSet::with_capacity(tx.inputs.len());
         let mut input_sum: u64 = 0;
+        let signing_msg = TxHash::signing_message_for_network(tx, &network);
 
         for input in &tx.inputs {
             let key = utxo_key(&input.txid, input.index)?;
@@ -487,7 +667,6 @@ impl TxValidator {
             }
 
             // [NEW] Verify signature matches UTXO owner
-            let signing_msg = TxHash::signing_message(tx);
             if !Self::verify_input_ownership(input, &utxo, &signing_msg) {
                 return Err(StorageError::Other(format!(
                     "input {} signature does not match UTXO owner (tx {})",
@@ -779,7 +958,7 @@ impl TxValidator {
              0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
              0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
         ];
-        if LOW_ORDER_POINTS.iter().any(|p| *p == pk_arr) {
+        if LOW_ORDER_POINTS.contains(&pk_arr) {
             return false;
         }
 
@@ -795,6 +974,10 @@ impl TxValidator {
 
     pub fn build_signing_message(tx: &Transaction) -> Vec<u8> {
         TxHash::signing_message(tx)
+    }
+
+    pub fn build_signing_message_for_network(tx: &Transaction, network: &NetworkMode) -> Vec<u8> {
+        TxHash::signing_message_for_network(tx, network)
     }
 
     /// Validate TX timestamp is within acceptable range of current time.
@@ -928,6 +1111,11 @@ impl TxValidator {
                 "SwapTx payload_hash must use lowercase hex".into(),
             ));
         }
+        if hash == &"0".repeat(64) {
+            return Err(ConsensusError::BlockValidation(
+                "SwapTx payload_hash must be non-zero".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -949,6 +1137,12 @@ impl TxValidator {
                 "DexOrder payload_hash is empty".into(),
             ));
         }
+        if data.len() != 64 {
+            return Err(ConsensusError::BlockValidation(format!(
+                "DexOrder payload_hash length {} != 64",
+                data.len()
+            )));
+        }
         if !data.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(ConsensusError::BlockValidation(
                 "DexOrder payload_hash contains non-hex chars".into(),
@@ -959,13 +1153,20 @@ impl TxValidator {
                 "DexOrder payload_hash must use lowercase hex".into(),
             ));
         }
+        if data == &"0".repeat(64) {
+            return Err(ConsensusError::BlockValidation(
+                "DexOrder payload_hash must be non-zero".into(),
+            ));
+        }
         Ok(())
     }
 
-    /// Validate ContractCreate transaction payload fields.
-    /// Requires deploy_code, gas_limit, and vm_version.
-    /// Falls back to payload_hash for legacy support.
-    pub fn validate_contract_create_payload(tx: &Transaction) -> Result<(), ConsensusError> {
+    /// Validate ContractCreate transaction payload fields using network-specific
+    /// contract address prefixes.
+    pub fn validate_contract_create_payload_for_network(
+        tx: &Transaction,
+        network: &NetworkMode,
+    ) -> Result<(), ConsensusError> {
         if tx.tx_type != TxType::ContractCreate {
             return Ok(()); // Not a contract create, skip
         }
@@ -1027,13 +1228,33 @@ impl TxValidator {
             }
         }
 
+        // If contract address is precomputed/off-chain supplied, enforce network prefix.
+        if let Some(addr) = &tx.contract_address {
+            let expected = Self::contract_prefix_for_network(network);
+            if !addr.starts_with(expected) {
+                return Err(ConsensusError::BlockValidation(format!(
+                    "contract create address {} must start with {}",
+                    addr, expected
+                )));
+            }
+        }
+
         Ok(())
     }
 
-    /// Validate ContractCall transaction payload fields.
-    /// Requires contract_address (SD1c prefix), gas_limit, and vm_version.
-    /// Falls back to payload_hash and first output for legacy support.
-    pub fn validate_contract_call_payload(tx: &Transaction) -> Result<(), ConsensusError> {
+    /// Validate ContractCreate transaction payload fields.
+    /// Requires deploy_code, gas_limit, and vm_version.
+    /// Falls back to payload_hash for legacy support.
+    pub fn validate_contract_create_payload(tx: &Transaction) -> Result<(), ConsensusError> {
+        Self::validate_contract_create_payload_for_network(tx, &NetworkMode::Mainnet)
+    }
+
+    /// Validate ContractCall transaction payload fields using network-specific
+    /// contract address prefixes.
+    pub fn validate_contract_call_payload_for_network(
+        tx: &Transaction,
+        network: &NetworkMode,
+    ) -> Result<(), ConsensusError> {
         if tx.tx_type != TxType::ContractCall {
             return Ok(()); // Not a contract call, skip
         }
@@ -1069,22 +1290,25 @@ impl TxValidator {
             }
         }
 
-        // contract_address is required and must start with SD1c
+        let expected_prefix = Self::contract_prefix_for_network(network);
+
+        // contract_address is required and must have network-correct contract prefix
         match &tx.contract_address {
-            Some(addr) if addr.starts_with("SD1c") => {}
+            Some(addr) if addr.starts_with(expected_prefix) => {}
             Some(addr) => {
                 return Err(ConsensusError::BlockValidation(format!(
-                    "contract call target {} must start with SD1c",
-                    addr
+                    "contract call target {} must start with {}",
+                    addr, expected_prefix
                 )))
             }
             None => {
                 // Fall back to legacy first-output check
                 if let Some(output) = tx.outputs.first() {
-                    if !output.address.starts_with("SD1c") {
-                        return Err(ConsensusError::BlockValidation(
-                            "contract call target must be SD1c address".into(),
-                        ));
+                    if !output.address.starts_with(expected_prefix) {
+                        return Err(ConsensusError::BlockValidation(format!(
+                            "contract call target must be {} address",
+                            expected_prefix
+                        )));
                     }
                 }
                 // Also require legacy payload_hash
@@ -1105,5 +1329,163 @@ impl TxValidator {
         }
 
         Ok(())
+    }
+
+    /// Validate ContractCall transaction payload fields.
+    /// Requires contract_address (SD1c prefix), gas_limit, and vm_version.
+    /// Falls back to payload_hash and first output for legacy support.
+pub fn validate_contract_call_payload(tx: &Transaction) -> Result<(), ConsensusError> {
+        Self::validate_contract_call_payload_for_network(tx, &NetworkMode::Mainnet)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
+    use crate::domain::transaction::tx_hash::TxHash;
+
+    fn make_contract_call(addr: &str) -> Transaction {
+        let mut tx = Transaction::new(
+            "ab".repeat(32),
+            vec![],
+            vec![TxOutput::new("SD1dest".into(), 1_000)],
+            1,
+            1_700_000_000,
+        );
+        tx.tx_type = TxType::ContractCall;
+        tx.contract_address = Some(addr.to_string());
+        tx.gas_limit = Some(21_000);
+        tx.vm_version = Some(1);
+        tx
+    }
+
+    #[test]
+    fn contract_call_prefix_rejects_mainnet_addr_on_testnet() {
+        let tx = make_contract_call("SD1c1234567890abcdef1234567890abcdef123456");
+        let err = TxValidator::validate_contract_call_payload_for_network(
+            &tx,
+            &NetworkMode::Testnet,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ST1c"), "{}", err);
+    }
+
+    #[test]
+    fn contract_call_prefix_accepts_testnet_addr_on_testnet() {
+        let tx = make_contract_call("ST1c1234567890abcdef1234567890abcdef123456");
+        assert!(TxValidator::validate_contract_call_payload_for_network(&tx, &NetworkMode::Testnet)
+            .is_ok());
+    }
+
+    #[test]
+    fn structure_validation_rejects_mixed_network_output_prefixes() {
+        let mut tx = Transaction::new_coinbase(
+            "placeholder".into(),
+            vec![
+                TxOutput::new("SD1mine0000000000000000000000000000000001".into(), 1_000),
+                TxOutput::new("ST1mine0000000000000000000000000000000002".into(), 1_000),
+            ],
+            0,
+            1_700_000_000,
+        );
+        tx.hash = TxHash::hash_for_network(&tx, &NetworkMode::Mainnet);
+        assert!(!TxValidator::validate_structure_for_network(
+            &tx,
+            &NetworkMode::Mainnet
+        ));
+    }
+
+    #[test]
+    fn structure_validation_accepts_consistent_network_output_prefixes() {
+        let mut tx = Transaction::new_coinbase(
+            "placeholder".into(),
+            vec![
+                TxOutput::new("SD1mine0000000000000000000000000000000001".into(), 1_000),
+                TxOutput::new("SD1mine0000000000000000000000000000000002".into(), 1_000),
+            ],
+            0,
+            1_700_000_001,
+        );
+        tx.hash = TxHash::hash_for_network(&tx, &NetworkMode::Mainnet);
+        assert!(TxValidator::validate_structure_for_network(
+            &tx,
+            &NetworkMode::Mainnet
+        ));
+    }
+
+    #[test]
+    fn dex_order_payload_rejects_non_64_len_hash() {
+        let mut tx = Transaction::new(
+            "ab".repeat(32),
+            vec![],
+            vec![TxOutput::new("SD1dest".into(), 1_000)],
+            1,
+            1_700_000_000,
+        );
+        tx.tx_type = TxType::DexOrder;
+        tx.payload_hash = Some("a".repeat(63));
+
+        let err = TxValidator::validate_dex_order_payload(&tx).unwrap_err();
+        assert!(
+            err.to_string().contains("length 63 != 64"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn dex_order_payload_accepts_64_len_lower_hex_hash() {
+        let mut tx = Transaction::new(
+            "ab".repeat(32),
+            vec![],
+            vec![TxOutput::new("SD1dest".into(), 1_000)],
+            1,
+            1_700_000_001,
+        );
+        tx.tx_type = TxType::DexOrder;
+        tx.payload_hash = Some("a".repeat(64));
+
+        assert!(TxValidator::validate_dex_order_payload(&tx).is_ok());
+    }
+
+    #[test]
+    fn swap_payload_rejects_zero_hash() {
+        let mut tx = Transaction::new(
+            "ab".repeat(32),
+            vec![],
+            vec![TxOutput::new("SD1hdeadbeef".into(), 1_000)],
+            1,
+            1_700_000_002,
+        );
+        tx.tx_type = TxType::SwapTx;
+        tx.payload_hash = Some("0".repeat(64));
+
+        let err = TxValidator::validate_swap_payload(&tx).unwrap_err();
+        assert!(
+            err.to_string().contains("must be non-zero"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn dex_order_payload_rejects_zero_hash() {
+        let mut tx = Transaction::new(
+            "ab".repeat(32),
+            vec![],
+            vec![TxOutput::new("SD1dest".into(), 1_000)],
+            1,
+            1_700_000_003,
+        );
+        tx.tx_type = TxType::DexOrder;
+        tx.payload_hash = Some("0".repeat(64));
+
+        let err = TxValidator::validate_dex_order_payload(&tx).unwrap_err();
+        assert!(
+            err.to_string().contains("must be non-zero"),
+            "unexpected error: {}",
+            err
+        );
     }
 }

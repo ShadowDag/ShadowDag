@@ -144,6 +144,7 @@ mod tests {
                 pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
             }],
             outputs: vec![TxOutput {
                 address: "bob".to_string(),
@@ -280,6 +281,7 @@ mod tests {
                 pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
             },
             TxInput {
                 txid: "tx_bbb".into(),
@@ -289,6 +291,7 @@ mod tests {
                 pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
             },
         ];
         let inputs_b = vec![
@@ -300,6 +303,7 @@ mod tests {
                 pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
             },
             TxInput {
                 txid: "tx_aaa".into(),
@@ -309,6 +313,7 @@ mod tests {
                 pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
             },
         ];
         let outputs = vec![TxOutput {

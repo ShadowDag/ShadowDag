@@ -60,7 +60,11 @@ impl PedersenCommitment {
             return false; // Non-canonical scalar rejected
         }
 
-        let r = Scalar::from_canonical_bytes(r_arr).unwrap();
+        let r: Scalar = match Scalar::from_canonical_bytes(r_arr).into() {
+            Some(v) => v,
+            // Defensive: avoid panics even if canonical check logic changes.
+            None => return false,
+        };
 
         // Standard Pedersen: C = v*H + r*G (must match commit_with_blinding)
         let h_point = Self::_h_point();

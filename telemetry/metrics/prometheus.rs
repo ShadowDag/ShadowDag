@@ -32,7 +32,9 @@ pub(crate) fn is_valid_metric_name(name: &str) -> bool {
         return false;
     }
     let mut chars = name.chars();
-    let first = chars.next().unwrap();
+    let Some(first) = chars.next() else {
+        return false;
+    };
     if !(first.is_ascii_alphabetic() || first == '_' || first == ':') {
         return false;
     }

@@ -43,6 +43,10 @@ pub struct TxInput {
     /// None for transparent TXs.
     #[serde(default)]
     pub ring_members: Option<Vec<String>>,
+    /// Serialized CLSAG signature (hex) for confidential inputs. None for
+    /// transparent inputs (which use `signature` = Ed25519 hex).
+    #[serde(default)]
+    pub ring_signature: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -260,6 +264,17 @@ impl Transaction {
             } else {
                 buf.push(0x00);
             }
+
+            // ring_signature: bind the CLSAG signature into the txid so it
+            // cannot be swapped without changing the transaction identity.
+            if let Some(ref rs) = inp.ring_signature {
+                buf.push(0x01);
+                let rs_bytes = rs.as_bytes();
+                buf.extend_from_slice(&(rs_bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(rs_bytes);
+            } else {
+                buf.push(0x00);
+            }
         }
 
         // 4. outputs — in original order (order matters for output indices)
@@ -389,6 +404,7 @@ impl TxInput {
             pub_key,
             key_image: None,
             ring_members: None,
+            ring_signature: None,
         }
     }
 
@@ -410,6 +426,7 @@ impl TxInput {
             pub_key,
             key_image: Some(key_image),
             ring_members: Some(ring_members),
+            ring_signature: None,
         }
     }
 }
@@ -440,5 +457,34 @@ impl TxOutput {
     /// Returns true if this output uses a Pedersen commitment
     pub fn is_confidential(&self) -> bool {
         self.commitment.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ring_signature_changes_canonical_bytes() {
+        let mut tx = Transaction::new(
+            String::new(),
+            vec![TxInput {
+                txid: "b".repeat(64),
+                index: 0,
+                owner: "SD1o".into(),
+                signature: String::new(),
+                pub_key: String::new(),
+                key_image: Some("11".repeat(32)),
+                ring_members: Some(vec!["22".repeat(32)]),
+                ring_signature: None,
+            }],
+            vec![TxOutput::new("SD1x".into(), 10)],
+            1,
+            0,
+        );
+        let before = tx.canonical_bytes();
+        tx.inputs[0].ring_signature = Some("abcd".into());
+        let after = tx.canonical_bytes();
+        assert_ne!(before, after);
     }
 }

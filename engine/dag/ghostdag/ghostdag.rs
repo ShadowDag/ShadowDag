@@ -444,7 +444,9 @@ impl GhostDag {
         match self.db.get(format!("{}{}", PFX_BLUE_SCORE, hash)) {
             Ok(Some(d)) => {
                 if d.len() >= 8 {
-                    u64::from_le_bytes(d[..8].try_into().unwrap())
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&d[..8]);
+                    u64::from_le_bytes(bytes)
                 } else {
                     slog_error!("ghostdag", "blue_score_corrupt_length",
                         hash => hash, len => d.len());
@@ -464,7 +466,9 @@ impl GhostDag {
         match self.db.get(format!("{}{}", PFX_CHAIN_HEIGHT, hash)) {
             Ok(Some(d)) => {
                 if d.len() >= 8 {
-                    u64::from_le_bytes(d[..8].try_into().unwrap())
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&d[..8]);
+                    u64::from_le_bytes(bytes)
                 } else {
                     slog_error!("ghostdag", "chain_height_corrupt_length",
                         hash => hash, len => d.len());

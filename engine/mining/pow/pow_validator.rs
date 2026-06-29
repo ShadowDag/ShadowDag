@@ -77,7 +77,7 @@ impl PowValidator {
         {
             return PowResult::fail(format!(
                 "hash {} does not meet difficulty {} target",
-                &computed_hash[..16],
+                computed_hash.get(..16).unwrap_or(&computed_hash),
                 block.header.difficulty
             ));
         }

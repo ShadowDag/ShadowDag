@@ -5,6 +5,7 @@
 
 use rocksdb::{Options, DB};
 use std::path::Path;
+use std::sync::Mutex;
 
 use crate::errors::StorageError;
 use crate::slog_error;
@@ -13,14 +14,20 @@ use serde_json;
 
 pub struct DagIndex {
     db: DB,
+    write_lock: Mutex<()>,
 }
+
+const MAX_INDEXED_HASH_LEN: usize = 128;
 
 impl DagIndex {
     pub fn new(path: &str) -> Result<Self, StorageError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         let db = DB::open(&opts, Path::new(path))?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            write_lock: Mutex::new(()),
+        })
     }
 
     /// Index a block hash at a given height.
@@ -31,9 +38,27 @@ impl DagIndex {
     /// same height may lose an insertion. A dedup check prevents
     /// duplicates when the same block is re-indexed.
     pub fn index_block(&self, hash: &str, height: u64) {
+        let _guard = match self.write_lock.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                slog_error!("storage", "dag_index_lock_poisoned", error => e.to_string());
+                return;
+            }
+        };
+
+        if hash.is_empty() || hash.len() > MAX_INDEXED_HASH_LEN {
+            slog_error!(
+                "storage",
+                "dag_index_invalid_hash",
+                height => height,
+                hash_len => hash.len()
+            );
+            return;
+        }
+
         let key = format!("height:{}", height);
         let mut hashes = self.get_hashes_at_height(height);
-        if !hashes.contains(&hash.to_string()) {
+        if !hashes.iter().any(|h| h == hash) {
             hashes.push(hash.to_string());
         }
         let serialized = match serde_json::to_vec(&hashes) {

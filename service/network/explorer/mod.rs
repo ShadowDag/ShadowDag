@@ -36,6 +36,8 @@ const EXPLORER_READ_TIMEOUT_SECS: u64 = 5;
 const MAX_REQUEST_LINE_BYTES: usize = 4096;
 const MAX_HEADER_LINES: usize = 64;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
+const MAX_ID_BYTES: usize = 128;
+const MAX_SEARCH_BYTES: usize = 128;
 
 pub struct ExplorerServer {
     port: u16,
@@ -44,6 +46,71 @@ pub struct ExplorerServer {
 }
 
 impl ExplorerServer {
+    fn host_name_only(host: &str) -> String {
+        let h = host.trim().to_ascii_lowercase();
+        if h.starts_with('[') {
+            if let Some(end) = h.find(']') {
+                return h[..=end].to_string();
+            }
+            return h;
+        }
+        h.split(':').next().unwrap_or("").trim().to_string()
+    }
+
+    fn origin_host_only(origin: &str) -> Option<String> {
+        let o = origin.trim().to_ascii_lowercase();
+        let rest = if let Some(s) = o.strip_prefix("http://") {
+            s
+        } else if let Some(s) = o.strip_prefix("https://") {
+            s
+        } else {
+            return None;
+        };
+        let authority = rest.split('/').next().unwrap_or("");
+        if authority.is_empty() {
+            return None;
+        }
+        Some(Self::host_name_only(authority))
+    }
+
+    fn is_safe_local_request(host: Option<&str>, origin: Option<&str>) -> bool {
+        let Some(h) = host else {
+            return false;
+        };
+        let host_only = Self::host_name_only(h);
+        if host_only != "127.0.0.1" && host_only != "localhost" && host_only != "[::1]" {
+            return false;
+        }
+        if let Some(o) = origin {
+            let Some(origin_host) = Self::origin_host_only(o) else {
+                return false;
+            };
+            if origin_host != "127.0.0.1" && origin_host != "localhost" && origin_host != "[::1]"
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[inline]
+    fn short_id(s: &str) -> &str {
+        s.get(..12).unwrap_or(s)
+    }
+
+    #[inline]
+    fn is_reasonable_id(s: &str) -> bool {
+        !s.is_empty() && s.len() <= MAX_ID_BYTES && s.chars().all(|c| c.is_ascii_alphanumeric())
+    }
+
+    #[inline]
+    fn is_reasonable_query(s: &str) -> bool {
+        !s.is_empty()
+            && s.len() <= MAX_SEARCH_BYTES
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
+    }
+
     pub fn new(port: u16, state: SharedState) -> Self {
         Self {
             port,
@@ -58,6 +125,19 @@ impl ExplorerServer {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "127.0.0.1".to_string());
+        // Security hardening: Explorer exposes chain/query surfaces without RPC auth,
+        // so it must remain loopback-only by default.
+        let bind_lower = bind_host.to_ascii_lowercase();
+        let is_loopback = matches!(
+            bind_lower.as_str(),
+            "127.0.0.1" | "localhost" | "::1" | "[::1]"
+        );
+        if !is_loopback {
+            return Err(format!(
+                "Refusing to bind Explorer to non-loopback host '{}'. Use 127.0.0.1/localhost only.",
+                bind_host
+            ));
+        }
         let addr = format!("{}:{}", bind_host, self.port);
         let listener = TcpListener::bind(&addr)
             .map_err(|e| format!("Explorer bind failed on {}: {}", addr, e))?;
@@ -125,6 +205,8 @@ impl ExplorerServer {
         let mut header_line = String::new();
         let mut header_lines = 0usize;
         let mut header_bytes = 0usize;
+        let mut host_header: Option<String> = None;
+        let mut origin_header: Option<String> = None;
         loop {
             header_line.clear();
             match reader.read_line(&mut header_line) {
@@ -136,6 +218,16 @@ impl ExplorerServer {
                         Self::send_response(&mut stream, 431, "text/plain", b"Request headers too large");
                         return;
                     }
+                    let lower = header_line.to_ascii_lowercase();
+                    if lower.starts_with("host:") {
+                        if let Some((_, v)) = header_line.trim().split_once(':') {
+                            host_header = Some(v.trim().to_string());
+                        }
+                    } else if lower.starts_with("origin:") {
+                        if let Some((_, v)) = header_line.trim().split_once(':') {
+                            origin_header = Some(v.trim().to_string());
+                        }
+                    }
                     if header_line.trim().is_empty() {
                         break;
                     }
@@ -143,12 +235,16 @@ impl ExplorerServer {
             }
         }
 
-        let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
+        let parts: Vec<&str> = request_line.split_whitespace().collect();
         if parts.len() < 2 {
             return;
         }
         let method = parts[0];
         let path = parts[1];
+        if !Self::is_safe_local_request(host_header.as_deref(), origin_header.as_deref()) {
+            Self::send_response(&mut stream, 403, "text/plain", b"Forbidden");
+            return;
+        }
 
         // Input sanitization: reject oversized paths (DoS prevention)
         if path.len() > 512 {
@@ -179,18 +275,34 @@ impl ExplorerServer {
             "/api/richlist" => Self::api_richlist(&mut stream, state),
             p if p.starts_with("/api/block/") => {
                 let id = &p["/api/block/".len()..];
+                if !Self::is_reasonable_id(id) {
+                    Self::send_response(&mut stream, 400, "text/plain", b"Invalid block id");
+                    return;
+                }
                 Self::api_block_detail(&mut stream, state, id);
             }
             p if p.starts_with("/api/tx/") => {
                 let hash = &p["/api/tx/".len()..];
+                if !Self::is_reasonable_id(hash) {
+                    Self::send_response(&mut stream, 400, "text/plain", b"Invalid tx hash");
+                    return;
+                }
                 Self::api_tx_detail(&mut stream, state, hash);
             }
             p if p.starts_with("/api/address/") => {
                 let addr = &p["/api/address/".len()..];
+                if !Self::is_reasonable_id(addr) {
+                    Self::send_response(&mut stream, 400, "text/plain", b"Invalid address");
+                    return;
+                }
                 Self::api_address(&mut stream, state, addr);
             }
             p if p.starts_with("/api/search/") => {
                 let query = &p["/api/search/".len()..];
+                if !Self::is_reasonable_query(query) {
+                    Self::send_response(&mut stream, 400, "text/plain", b"Invalid search query");
+                    return;
+                }
                 Self::api_search(&mut stream, state, query);
             }
             _ => {
@@ -228,7 +340,7 @@ impl ExplorerServer {
             Ok(s) => {
                 let height = s.best_height;
                 let mut blocks = Vec::new();
-                let start = if height > 20 { height - 20 } else { 0 };
+                let start = height.saturating_sub(20);
                 for h in (start..=height).rev() {
                     let hashes = s.block_store.get_block_hashes_at_height(h);
                     for hash in hashes {
@@ -336,7 +448,7 @@ impl ExplorerServer {
             Ok(s) => {
                 // Search through recent blocks for the transaction
                 let height = s.best_height;
-                let start = if height > 200 { height - 200 } else { 0 };
+                let start = height.saturating_sub(200);
                 let mut found = None;
                 'outer: for h in (start..=height).rev() {
                     let hashes = s.block_store.get_block_hashes_at_height(h);
@@ -421,7 +533,7 @@ impl ExplorerServer {
         let data = match state.lock() {
             Ok(s) => {
                 let height = s.best_height;
-                let start = if height > 30 { height - 30 } else { 0 };
+                let start = height.saturating_sub(30);
                 let mut nodes = Vec::new();
                 let mut edges = Vec::new();
                 for h in start..=height {
@@ -429,7 +541,7 @@ impl ExplorerServer {
                     for hash in &hashes {
                         if let Some(block) = s.block_store.get_block(hash) {
                             nodes.push(json!({
-                                "id": &block.header.hash[..12],
+                                "id": Self::short_id(&block.header.hash),
                                 "hash": block.header.hash,
                                 "height": block.header.height,
                                 "tx_count": block.body.transactions.len(),
@@ -438,7 +550,7 @@ impl ExplorerServer {
                             for parent in &block.header.parents {
                                 edges.push(json!({
                                     "from": &parent[..std::cmp::min(12, parent.len())],
-                                    "to": &block.header.hash[..12],
+                                    "to": Self::short_id(&block.header.hash),
                                 }));
                             }
                         }
@@ -515,7 +627,7 @@ impl ExplorerServer {
                 }
                 // Try as transaction hash (search recent blocks)
                 let height = s.best_height;
-                let start = if height > 100 { height - 100 } else { 0 };
+                let start = height.saturating_sub(100);
                 for h in (start..=height).rev() {
                     for bh in s.block_store.get_block_hashes_at_height(h) {
                         if let Some(block) = s.block_store.get_block(&bh) {

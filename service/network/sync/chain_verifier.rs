@@ -17,11 +17,13 @@
 
 use crate::domain::block::block_header::BlockHeader;
 
-/// Minimum cumulative difficulty to accept a chain as valid
-pub const MIN_CUMULATIVE_WORK: u64 = 1_000;
+/// Minimum cumulative difficulty to accept a chain as valid.
+/// Keep this in the same unit as `block_work` (difficulty units).
+pub const MIN_CUMULATIVE_WORK: u128 = 1_000;
 
-/// Maximum allowed timestamp gap between consecutive headers (1 hour)
-pub const MAX_HEADER_TIME_GAP_SECS: u64 = 3_600;
+/// Maximum allowed timestamp gap between consecutive headers.
+/// Keep aligned with consensus future-drift policy to reduce timewarp surface.
+pub const MAX_HEADER_TIME_GAP_SECS: u64 = 120;
 
 /// Verification result
 #[derive(Debug, Clone)]
@@ -50,8 +52,8 @@ pub enum ChainVerifyResult {
         got: String,
     },
     InsufficientWork {
-        cumulative: u64,
-        required: u64,
+        cumulative: u128,
+        required: u128,
     },
     EmptyChain,
 }
@@ -122,7 +124,7 @@ impl ChainVerifier {
             }
         }
 
-        let mut cumulative_work: u64 = 0;
+        let mut cumulative_work: u128 = 0;
         let mut prev_timestamp: u64 = 0;
         let mut prev_hash: Option<&str> = None;
         let mut prev_height: u64 = headers[0].height.saturating_sub(1);
@@ -226,9 +228,10 @@ impl ChainVerifier {
                 }
             }
 
-            // 3. Timestamp check — must be strictly increasing and within max gap
+            // 3. Timestamp check — must be monotonic (non-decreasing) and within max gap.
+            // Equal timestamps are valid in 1-second resolution networks.
             if prev_timestamp > 0 {
-                if header.timestamp <= prev_timestamp {
+                if header.timestamp < prev_timestamp {
                     return ChainVerifyResult::TimestampBackward {
                         height: header.height,
                         timestamp: header.timestamp,
@@ -256,18 +259,10 @@ impl ChainVerifier {
                 }
             }
 
-            // 5. Accumulate work: use exponential metric (2^difficulty) not
-            // linear difficulty. A chain at difficulty 20 has ~1M times
-            // more work than difficulty 0, not 20 times more.
-            let block_work = if header.difficulty <= 63 {
-                1u64 << header.difficulty
-            } else {
-                // Cap at 2^63 (not u64::MAX) to preserve meaningful
-                // comparison between high-difficulty chains. u64::MAX
-                // saturates all chains above difficulty 63 to the same
-                // value, making cumulative work comparison useless.
-                1u64 << 63
-            };
+            // 5. Accumulate work in the same unit used by consensus retarget/PoW checks:
+            // difficulty units (target = MAX_TARGET / difficulty).
+            // This avoids unrealistic bit-shift work that collapses at high difficulties.
+            let block_work = u128::from(header.difficulty.max(1));
             cumulative_work = cumulative_work.saturating_add(block_work);
 
             prev_hash = Some(&header.hash);
@@ -362,10 +357,10 @@ mod tests {
     fn valid_chain() {
         let genesis = make_header(0, 1, 1000, vec![]);
         let cv = ChainVerifier::new(&genesis.hash);
-        // MIN_CUMULATIVE_WORK = 1000; difficulty 1 => work = 2 per block.
-        // Need ~500 blocks minimum.
+        // MIN_CUMULATIVE_WORK = 1000; difficulty 1 => work = 1 per block.
+        // Need ~1000 blocks minimum.
         let mut headers = vec![genesis];
-        for i in 1..550u64 {
+        for i in 1..1100u64 {
             let prev_hash = headers.last().unwrap().hash.clone();
             headers.push(make_header(i, 1, 1000 + i * 100, vec![prev_hash]));
         }
@@ -406,7 +401,7 @@ mod tests {
         let genesis = make_header(0, 1, 1000, vec![]);
         let mut cv = ChainVerifier::new(&genesis.hash);
         // Set a checkpoint that the real hash won't match
-        let block1 = make_header(1, 1, 2000, vec![genesis.hash.clone()]);
+        let block1 = make_header(1, 1, 1100, vec![genesis.hash.clone()]);
         cv.add_checkpoint(1, "0000wrong_checkpoint_hash");
         let headers = vec![genesis, block1];
         assert!(matches!(
@@ -444,10 +439,12 @@ mod tests {
         let cv = ChainVerifier::new(&genesis.hash);
         let block1 = make_header(1, 1, 5000, vec![genesis.hash.clone()]);
         let headers = vec![genesis, block1];
-        assert!(matches!(
-            cv.verify_header_chain(&headers),
-            ChainVerifyResult::TimestampBackward { height: 1, .. }
-        ));
+        let res = cv.verify_header_chain(&headers);
+        assert!(
+            !matches!(res, ChainVerifyResult::TimestampBackward { height: 1, .. }),
+            "equal timestamps should be accepted as monotonic; got {:?}",
+            res
+        );
     }
 
     #[test]

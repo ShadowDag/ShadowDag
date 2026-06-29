@@ -4,6 +4,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::domain::block::block::Block;
+use crate::config::node::node_config::NetworkMode;
 use crate::domain::transaction::transaction::Transaction;
 use crate::domain::transaction::tx_hash::TxHash;
 use crate::domain::transaction::tx_validator::TxValidator;
@@ -15,6 +16,18 @@ use std::collections::{HashMap, HashSet};
 pub struct UtxoValidator;
 
 impl UtxoValidator {
+    #[inline]
+    fn network_from_owner_address(owner_address: &str) -> NetworkMode {
+        if owner_address.starts_with("ST1") {
+            NetworkMode::Testnet
+        } else if owner_address.starts_with("SR1") {
+            NetworkMode::Regtest
+        } else {
+            // Keep backward compatibility for legacy/plain owners used in tests.
+            NetworkMode::Mainnet
+        }
+    }
+
     pub fn validate(tx: &Transaction, utxo_set: &UtxoSet) -> bool {
         // Non-coinbase tx MUST have inputs. Empty inputs = reject.
         // Coinbase tx are validated separately (they have no inputs by design).
@@ -156,6 +169,8 @@ impl UtxoValidator {
             // Duplicate inputs within same tx + UTXO checks
             let mut seen_in_tx: HashSet<UtxoKey> = HashSet::with_capacity(tx.inputs.len());
             let mut input_sum: u64 = 0;
+            let mut tx_network: Option<NetworkMode> = None;
+            let mut signing_msg: Option<Vec<u8>> = None;
 
             for input in &tx.inputs {
                 let key = utxo_key(&input.txid, input.index)?;
@@ -219,9 +234,28 @@ impl UtxoValidator {
                         )));
                 };
 
-                // Verify signature matches UTXO owner
-                let signing_msg = TxHash::signing_message(tx);
-                if !TxValidator::verify_input_ownership_by_address(input, &owner, &signing_msg) {
+                // Determine tx network from input owners and enforce consistency
+                // across all inputs in the same transaction.
+                let input_network = Self::network_from_owner_address(&owner);
+                match tx_network {
+                    None => {
+                        tx_network = Some(input_network.clone());
+                        signing_msg = Some(TxHash::signing_message_for_network(tx, &input_network));
+                    }
+                    Some(ref net) if *net != input_network => {
+                        return Err(StorageError::Other(format!(
+                            "validate_block_utxos: mixed input networks in tx {}",
+                            tx.hash
+                        )));
+                    }
+                    _ => {}
+                }
+
+                // Verify signature matches UTXO owner.
+                let msg = signing_msg
+                    .as_ref()
+                    .ok_or_else(|| StorageError::Other("missing signing message".into()))?;
+                if !TxValidator::verify_input_ownership_by_address(input, &owner, msg) {
                     return Err(StorageError::Other(format!(
                         "validate_block_utxos: input {} signature does not match UTXO owner (tx {})",
                         key, tx.hash

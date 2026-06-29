@@ -96,7 +96,7 @@ impl CudaMiner {
                     b.header.nonce = nonce;
                     shadow_hash(&b)
                 };
-                slog_info!("gpu", "cuda_block_found", nonce => nonce, hash_prefix => &block.header.hash[..16]);
+                slog_info!("gpu", "cuda_block_found", nonce => nonce, hash_prefix => block.header.hash.get(..16).unwrap_or(&block.header.hash));
                 return Some(block);
             }
         }

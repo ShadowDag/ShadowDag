@@ -134,16 +134,9 @@ impl UtxoKey {
     /// Extract the 32-byte hash portion.
     #[inline]
     pub fn hash_bytes(&self) -> &[u8; 32] {
-        // self.bytes is [u8; 36], so [..32] is always exactly 32 bytes.
-        // Use arrayref-style split: first() on a split_at is infallible.
-        // SAFETY: This is a pure compile-time guarantee — no unsafe needed.
-        let (hash, _rest) = self.bytes.split_at(32);
-        // hash is &[u8] of len 32; try_into cannot fail but we avoid expect().
-        // The compiler can see the length is fixed from split_at on [u8; 36].
-        match <&[u8; 32]>::try_from(hash) {
-            Ok(arr) => arr,
-            Err(_) => unreachable!(), // [u8; 36].split_at(32).0 is always 32 bytes
-        }
+        self.bytes[..]
+            .first_chunk::<32>()
+            .expect("UtxoKey must always contain 36 bytes")
     }
 
     /// Hex-encode the hash portion (for logging/display only, NOT for storage).

@@ -25,6 +25,20 @@ pub const MAX_ANCESTOR_WALK: usize = 50_000;
 
 const META_BLOCK_COUNT: &[u8] = b"meta:block_count";
 
+#[inline]
+fn decode_hash_key_suffix(bytes: &[u8]) -> Option<String> {
+    // Accept canonical 64-hex hashes, but remain backward-compatible with
+    // older/test keys that used arbitrary ASCII IDs.
+    if bytes.is_empty() || bytes.len() > 256 {
+        return None;
+    }
+    let s = std::str::from_utf8(bytes).ok()?;
+    if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(s.to_ascii_lowercase());
+    }
+    Some(s.to_string())
+}
+
 // KEY BUILDERS (NO format!)
 #[inline]
 fn key_exists(hash: &str) -> Vec<u8> {
@@ -476,8 +490,11 @@ impl DagManager {
 
         for (k, _) in self.db.iterator(IteratorMode::Start).flatten() {
             if k.starts_with(b"exists:") {
-                let hash = String::from_utf8_lossy(&k[7..]).into_owned();
-                map.insert(hash.clone(), self.get_parents(&hash));
+                if let Some(hash) = decode_hash_key_suffix(&k[7..]) {
+                    map.insert(hash.clone(), self.get_parents(&hash));
+                } else {
+                    slog_warn!("dag", "dag_map_skip_invalid_exists_key");
+                }
             }
         }
 
@@ -522,8 +539,11 @@ impl DagManager {
             if !k.starts_with(prefix_bytes) {
                 break;
             }
-
-            result.push(String::from_utf8_lossy(&k[prefix_bytes.len()..]).into_owned());
+            if let Some(hash) = decode_hash_key_suffix(&k[prefix_bytes.len()..]) {
+                result.push(hash);
+            } else {
+                slog_warn!("dag", "dag_scan_skip_invalid_hash_key");
+            }
         }
 
         result

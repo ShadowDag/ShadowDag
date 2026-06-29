@@ -68,6 +68,9 @@ pub const RATE_LIMIT_RPM: u64 = 100;
 pub const RATE_BURST: u64 = 20;
 
 pub const RATE_CLEANUP_INTERVAL_SECS: u64 = 300;
+/// Hard cap for per-IP rate buckets to prevent unbounded memory growth
+/// under high-cardinality source-IP floods.
+pub const MAX_RATE_TABLE_ENTRIES: usize = 20_000;
 
 pub const ERR_INVALID_PARAMS: i32 = -32602;
 pub const ERR_METHOD_NOT_FOUND: i32 = -32601;
@@ -203,7 +206,7 @@ impl RpcState {
     /// This ensures the password survives restarts.
     ///
     /// `data_dir` — directory to write the `rpc_password` file into.
-    /// When `None`, falls back to the current working directory (legacy behaviour).
+    /// When `None`, no plaintext password file is written.
     fn load_or_create_admin_password(
         db: &Arc<DB>,
         data_dir: Option<&std::path::Path>,
@@ -246,9 +249,7 @@ impl RpcState {
         // restricted file instead, and print only a masked hint to console.
         // Use the node's data_dir so the file lives next to the DB, not in
         // whichever directory the process happened to start from.
-        let base_dir = data_dir
-            .map(|p| p.to_path_buf())
-            .or_else(|| std::env::current_dir().ok());
+        let base_dir = data_dir.map(|p| p.to_path_buf());
         if let Some(base) = base_dir {
             let pw_path = base.join("rpc_password");
             match std::fs::write(&pw_path, password.as_bytes()) {
@@ -305,15 +306,13 @@ impl RpcState {
     pub fn new(db: Arc<DB>) -> Result<Self, NetworkError> {
         // Persistent admin password: stored in RocksDB under "rpc:admin_password"
         // First run: generate + store. Subsequent runs: load from DB.
-        // NOTE: no data_dir available here — falls back to cwd for password file.
-        // SECURITY: CWD password-file fallback is disabled by default.
-        // Callers that truly need this legacy behavior must opt in explicitly.
-        if std::env::var("SHADOWDAG_ALLOW_CWD_PASSWORDS").is_err() {
-            return Err(NetworkError::Other(
-                "RpcState::new() refuses CWD password fallback by default; use new_for_network with explicit data_dir, or set SHADOWDAG_ALLOW_CWD_PASSWORDS=1 for legacy behavior".into()
-            ));
-        }
-        slog_warn!("rpc", "rpc_new_without_data_dir", note => "legacy mode enabled: admin password may use cwd");
+        // No data_dir here, so the generated admin password is persisted only in DB.
+        // We intentionally avoid writing credentials to the current working directory.
+        slog_warn!(
+            "rpc",
+            "rpc_new_without_data_dir",
+            note => "no data_dir provided; rpc_password file will not be written"
+        );
         let admin_password = Self::load_or_create_admin_password(&db, None)?;
         let block_store = BlockStore::new(db.clone()).map_err(NetworkError::Storage)?;
         // NO fallback — RPC MUST use the same UTXO state as the node.
@@ -433,6 +432,8 @@ fn requires_auth(method: &str) -> bool {
         method,
         "sendrawtransaction"
             | "submitblock"
+            | "getblocktemplate"
+            | "getwork"
             | "stop"
             | "deploy_contract"
             | "call_contract"
@@ -465,16 +466,7 @@ pub struct RpcServer {
 impl RpcServer {
     #[inline]
     fn configured_min_dag_parents_for_height(height: u64) -> usize {
-        let max = ConsensusParams::MAX_PARENTS;
-        match height {
-            0 => 0,
-            1 => 1,
-            _ => std::env::var("SHADOWDAG_MIN_DAG_PARENTS")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(crate::engine::dag::security::selfish_mining_guard::MIN_DAG_PARENTS)
-                .clamp(1, max),
-        }
+        crate::engine::dag::security::selfish_mining_guard::SelfishMiningGuard::configured_min_dag_parents_for_height(height)
     }
 
     pub fn new(db: Arc<DB>) -> Result<Self, NetworkError> {
@@ -800,7 +792,17 @@ impl RpcServer {
                     return Ok(());
                 }
                 content_length_seen = true;
-                let v = &trimmed["Content-Length:".len()..];
+                let v = match trimmed.split_once(':') {
+                    Some((_, rest)) => rest,
+                    None => {
+                        Self::write_http_response(
+                            &mut stream,
+                            400,
+                            json!({"error": "malformed Content-Length header"}),
+                        )?;
+                        return Ok(());
+                    }
+                };
                 content_length = match v.trim().parse::<usize>() {
                     Ok(n) => n,
                     Err(_) => {
@@ -829,18 +831,20 @@ impl RpcServer {
                     continue;
                 }
                 auth_header_seen = true;
-                let v = &trimmed["Authorization:".len()..];
-                let auth_value = v.trim();
-                if let Some(token) = auth_value
-                    .strip_prefix("Bearer ")
-                    .or_else(|| auth_value.strip_prefix("bearer "))
-                {
-                    let token = token.trim();
-                    if token.is_empty() {
+                let v = match trimmed.split_once(':') {
+                    Some((_, rest)) => rest,
+                    None => {
                         malformed_auth_header = true;
-                    } else {
-                        auth_token = Some(token.to_string());
+                        continue;
                     }
+                };
+                let auth_value = v.trim();
+                let mut parts = auth_value.split_whitespace();
+                let scheme = parts.next().unwrap_or_default();
+                let token = parts.next().unwrap_or_default();
+                let extra = parts.next().is_some();
+                if scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() && !extra {
+                    auth_token = Some(token.to_string());
                 } else {
                     malformed_auth_header = true;
                 }
@@ -962,23 +966,33 @@ impl RpcServer {
     }
 
     fn check_rate_limit(rate_table: &RateTable, ip: IpAddr) -> bool {
-        match rate_table.lock() {
-            Ok(mut table) => {
-                if table.len() > 10_000 {
-                    let cutoff = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                        .saturating_sub(RATE_CLEANUP_INTERVAL_SECS);
-                    table.retain(|_, b| b.last_refill >= cutoff);
-                }
-
-                let bucket = table.entry(ip).or_insert_with(RateBucket::new);
-                bucket.try_consume()
+        fn consume_token(table: &mut HashMap<IpAddr, RateBucket>, ip: IpAddr) -> bool {
+            if table.len() >= MAX_RATE_TABLE_ENTRIES {
+                let cutoff = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .saturating_sub(RATE_CLEANUP_INTERVAL_SECS);
+                table.retain(|_, b| b.last_refill >= cutoff);
             }
+
+            // New-IP flood guard: if table is still at capacity, reject unseen
+            // IPs rather than allowing unbounded growth.
+            if !table.contains_key(&ip) && table.len() >= MAX_RATE_TABLE_ENTRIES {
+                return false;
+            }
+
+            let bucket = table.entry(ip).or_insert_with(RateBucket::new);
+            bucket.try_consume()
+        }
+
+        match rate_table.lock() {
+            Ok(mut table) => consume_token(&mut table, ip),
             Err(e) => {
-                slog_error!("rpc", "rate_limit_lock_poisoned", error => e);
-                false // fail-closed: deny on lock failure
+                slog_error!("rpc", "rate_limit_lock_poisoned_recovering", error => &e.to_string());
+                // Recover from poisoning to avoid permanent self-DoS.
+                let mut table = e.into_inner();
+                consume_token(&mut table, ip)
             }
         }
     }
@@ -1313,6 +1327,8 @@ impl RpcServer {
                 std::thread::spawn(|| {
                     std::thread::sleep(Duration::from_millis(500));
                     slog_info!("rpc", "sending_sigterm_for_graceful_shutdown");
+                    // SAFETY: raising SIGTERM targets the current process and
+                    // does not dereference raw pointers.
                     unsafe {
                         libc::raise(libc::SIGTERM);
                     }
@@ -2615,7 +2631,7 @@ impl RpcServer {
                     id,
                     json!({
                         "difficulty":   difficulty,
-                        "target":       &target[..16],
+                        "target":       target.get(..16).unwrap_or(&target),
                         "height":       height,
                     }),
                 )
@@ -4867,6 +4883,52 @@ mod tests {
     }
 
     #[test]
+    fn rate_limiter_recovers_from_poisoned_lock() {
+        let rate_table: RateTable = Arc::new(Mutex::new(HashMap::new()));
+        let ip = IpAddr::from_str("127.0.0.2").unwrap();
+
+        let poisoned = Arc::clone(&rate_table);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison test mutex");
+        });
+
+        assert!(
+            RpcServer::check_rate_limit(&rate_table, ip),
+            "Rate limiter should recover from lock poisoning instead of denying all requests"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_caps_new_ip_cardinality() {
+        use std::net::Ipv4Addr;
+
+        let rate_table: RateTable = Arc::new(Mutex::new(HashMap::new()));
+
+        // Fill up the table with unique IPs (all should be admitted initially).
+        for i in 0..MAX_RATE_TABLE_ENTRIES {
+            let ip = IpAddr::V4(Ipv4Addr::new(
+                ((i / 256 / 256) % 256) as u8,
+                ((i / 256) % 256) as u8,
+                (i % 256) as u8,
+                1,
+            ));
+            assert!(
+                RpcServer::check_rate_limit(&rate_table, ip),
+                "existing capacity should accept new entry {}",
+                i
+            );
+        }
+
+        // Next unseen IP should be rejected by hard-cap guard.
+        let overflow_ip = IpAddr::V4(Ipv4Addr::new(250, 250, 250, 250));
+        assert!(
+            !RpcServer::check_rate_limit(&rate_table, overflow_ip),
+            "unseen IP beyond MAX_RATE_TABLE_ENTRIES must be rejected"
+        );
+    }
+
+    #[test]
     fn getblockcount_returns_zero() {
         let s = make_server();
         let r = call(&s, "getblockcount");
@@ -4959,6 +5021,8 @@ mod tests {
     fn auth_policy_write_methods_require_auth() {
         assert!(requires_auth("sendrawtransaction"));
         assert!(requires_auth("submitblock"));
+        assert!(requires_auth("getblocktemplate"));
+        assert!(requires_auth("getwork"));
         assert!(requires_auth("deploy_contract"));
         assert!(!requires_auth("getblockcount"));
     }

@@ -435,11 +435,7 @@ impl DaemonNode {
                         processed_count += 1;
                         continue;
                     }
-                    let hash_prefix = if block.header.hash.len() >= 16 {
-                        &block.header.hash[..16]
-                    } else {
-                        &block.header.hash
-                    };
+                    let hash_prefix = block.header.hash.get(..16).unwrap_or(&block.header.hash);
 
                     // ── DagShield safety net (defense-in-depth) ──
                     // P2P dispatch already calls pre_validate_block, but the event

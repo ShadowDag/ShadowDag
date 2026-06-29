@@ -7,6 +7,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap; // 🔥 ADD
 use std::sync::Arc; // 🔥 ADD
 
+use crate::config::node::node_config::NetworkMode;
 use crate::domain::block::block::Block;
 use crate::domain::traits::utxo_backend::{BatchWrite, UtxoBackend};
 use crate::domain::transaction::transaction::Transaction;
@@ -101,6 +102,17 @@ pub struct UtxoSet {
 }
 
 impl UtxoSet {
+    #[inline]
+    fn network_from_address_prefix(address: &str) -> NetworkMode {
+        if address.starts_with("ST1") {
+            NetworkMode::Testnet
+        } else if address.starts_with("SR1") {
+            NetworkMode::Regtest
+        } else {
+            NetworkMode::Mainnet
+        }
+    }
+
     pub fn new(store: Arc<dyn UtxoBackend>) -> Self {
         Self {
             store,
@@ -752,8 +764,14 @@ impl UtxoSet {
             // or wrong ownership could be applied to the UTXO set.
             // ───────────────────────────────────────────────────────
 
-            // A) Signature verification — every input must have a valid Ed25519 signature
-            if !TxValidator::verify_signatures(tx) {
+            // A) Signature verification — every input must have a valid Ed25519 signature.
+            // Use the UTXO address prefix as network anchor to avoid cross-network
+            // signature-message mismatches (mainnet/testnet/regtest).
+            let tx_network = tx_inputs
+                .first()
+                .map(|(_, utxo)| Self::network_from_address_prefix(&utxo.address))
+                .unwrap_or(NetworkMode::Mainnet);
+            if !TxValidator::verify_signatures_for_network(tx, &tx_network) {
                 skipped += 1;
                 commitment_hasher.update(b"SKIP");
                 commitment_hasher.update(tx.hash.as_bytes());
@@ -762,7 +780,7 @@ impl UtxoSet {
 
             // B) Ownership verification — input.owner must match UTXO address
             {
-                let signing_msg = TxHash::signing_message(tx);
+                let signing_msg = TxHash::signing_message_for_network(tx, &tx_network);
                 let mut ownership_ok = true;
                 for (i, input) in tx.inputs.iter().enumerate() {
                     let (ref _key, ref utxo) = tx_inputs[i];

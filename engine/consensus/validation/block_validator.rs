@@ -356,7 +356,7 @@ impl BlockValidator {
             }
             // Validate swap/dex transaction payloads
             if tx.tx_type == TxType::SwapTx {
-                Self::validate_swap_tx(tx)?;
+                Self::validate_swap_tx(tx, network)?;
             }
             if tx.tx_type == TxType::DexOrder {
                 Self::validate_dex_order_tx(tx)?;
@@ -380,42 +380,14 @@ impl BlockValidator {
         }
 
         if let Some(expected) = expected_difficulty {
-            // Allow a small tolerance around the expected difficulty to account
-            // for the window between getblocktemplate and submitblock. During
-            // that window the retarget engine may have adjusted difficulty by
-            // one or more EMA steps. A ±10% tolerance on non-mainnet covers
-            // normal retarget drift on fast testnet DAG growth without opening
-            // the door to large difficulty gaming.
-            //
-            // Why not strict equality: in a DAG with 10 BPS, the EMA retarget
-            // can move substantially between getblocktemplate and submitblock.
-            // Each node sees blocks arrive in different order, so their EMA
-            // states diverge. We keep non-mainnet tolerance modest (10%)
-            // and keep mainnet strict (0%) for consensus safety.
-            //
-            // On mainnet with stable hashrate this can be tightened, but for
-            // testnet bootstrap and early chain growth, wide tolerance is needed.
-            let tolerance_pct: u64 = if matches!(network, NetworkMode::Mainnet) {
-                0
-            } else {
-                10
-            };
-            let delta = if tolerance_pct == 0 {
-                0
-            } else {
-                expected.saturating_mul(tolerance_pct).saturating_div(100).max(1)
-            };
-            let min_allowed = expected.saturating_sub(delta).max(1);
-            let max_allowed = expected.saturating_add(delta);
-            if block.header.difficulty < min_allowed || block.header.difficulty > max_allowed {
+            // Consensus safety: difficulty must match exactly on all networks.
+            // Any tolerance can admit invalid work and cause fork divergence.
+            if block.header.difficulty != expected {
                 return Err(ConsensusError::BlockValidation(format!(
-                    "difficulty {} outside allowed range [{}, {}] (expected {} on {:?}, tolerance={}%)",
+                    "difficulty mismatch: claimed {} expected {} on {:?}",
                     block.header.difficulty,
-                    min_allowed,
-                    max_allowed,
                     expected,
                     network,
-                    tolerance_pct
                 )));
             }
         }
@@ -1102,7 +1074,7 @@ impl BlockValidator {
                         i
                     ));
                 }
-                if !TxValidator::verify_signatures(tx) {
+                if !TxValidator::verify_signatures_for_network(tx, network) {
                     return BlockValidationResult::fail(&format!(
                         "genesis tx {} signature verification failed",
                         i
@@ -1140,7 +1112,7 @@ impl BlockValidator {
     /// secret hash format is checked, not whether the output actually locks
     /// funds to the correct HTLC address derived from the secret hash and
     /// participants' public keys.
-    fn validate_swap_tx(tx: &Transaction) -> Result<(), ConsensusError> {
+    fn validate_swap_tx(tx: &Transaction, network: &NetworkMode) -> Result<(), ConsensusError> {
         TxValidator::validate_swap_payload(tx)?;
         // 1. Must have payload_hash (HTLC secret hash)
         let _secret_hash = tx.payload_hash.as_ref().ok_or_else(|| {
@@ -1152,14 +1124,20 @@ impl BlockValidator {
                 "SwapTx must have at least one output".into(),
             ));
         }
-        // 3b. First output must lock funds to an HTLC address (P2SH prefix "SD1h")
+        // 3b. First output must lock funds to an HTLC address for this network.
+        let required_prefix = match network {
+            NetworkMode::Mainnet => "SD1h",
+            NetworkMode::Testnet => "ST1h",
+            NetworkMode::Regtest => "SR1h",
+        };
         if let Some(first_output) = tx.outputs.first() {
-            if !first_output
-                .address
-                .starts_with(crate::domain::address::address::P2SH_PREFIX)
-            {
+            let addr = crate::domain::address::address::Address::new(first_output.address.clone());
+            if !addr.is_valid() || !first_output.address.starts_with(required_prefix) {
                 return Err(ConsensusError::BlockValidation(
-                    "SwapTx first output must lock funds to HTLC address (SD1h prefix)".into(),
+                    format!(
+                        "SwapTx first output must lock funds to HTLC address ({} prefix)",
+                        required_prefix
+                    ),
                 ));
             }
         }
@@ -1214,7 +1192,7 @@ mod tests {
     use crate::config::genesis::genesis::TESTNET_DEV_ADDRESS;
     use crate::domain::block::block_body::BlockBody;
     use crate::domain::block::block_header::BlockHeader;
-    use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput};
+    use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
     use crate::domain::transaction::tx_hash::TxHash;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1330,6 +1308,14 @@ mod tests {
         make_block(height, vec![cb, tx])
     }
 
+    fn make_swap_tx_with_prefix(prefix: &str) -> Transaction {
+        let mut tx = make_regular_tx("swap_seed");
+        tx.tx_type = TxType::SwapTx;
+        tx.payload_hash = Some("ab".repeat(32));
+        tx.outputs[0].address = format!("{}{}", prefix, "11".repeat(20));
+        tx
+    }
+
     // ─────────────────────────────────────────
     //  L1 Network Layer
     // ─────────────────────────────────────────
@@ -1402,6 +1388,23 @@ mod tests {
 
         let result = BlockValidator::validate_network_layer(&block);
         assert!(result.is_err(), "single non-coinbase tx block must fail");
+    }
+
+    #[test]
+    fn swap_tx_requires_network_specific_htlc_prefix_testnet() {
+        let tx = make_swap_tx_with_prefix("SD1h");
+        let err = BlockValidator::validate_swap_tx(&tx, &NetworkMode::Testnet).unwrap_err();
+        assert!(
+            err.to_string().contains("ST1h"),
+            "expected testnet HTLC prefix enforcement, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn swap_tx_accepts_network_specific_htlc_prefix_testnet() {
+        let tx = make_swap_tx_with_prefix("ST1h");
+        assert!(BlockValidator::validate_swap_tx(&tx, &NetworkMode::Testnet).is_ok());
     }
 
     // ─────────────────────────────────────────
@@ -1775,18 +1778,13 @@ mod tests {
     }
 
     #[test]
-    fn consensus_difficulty_testnet_allows_small_drift_only() {
+    fn consensus_difficulty_testnet_requires_exact() {
         let mut near = make_valid_block(1);
         // make_coinbase() uses mainnet owner address by default.
         near.body.transactions[0].outputs[1].address = TESTNET_DEV_ADDRESS.to_string();
-        near.header.difficulty = 1_099; // within +10%
+        near.header.difficulty = 1_099;
         let ok = BlockValidator::validate_consensus_layer(&near, Some(1_000), &NetworkMode::Testnet);
-        assert!(ok.is_ok(), "testnet should allow <=10% drift");
-
-        let mut far = near.clone();
-        far.header.difficulty = 1_111; // beyond +10%
-        let bad = BlockValidator::validate_consensus_layer(&far, Some(1_000), &NetworkMode::Testnet);
-        assert!(bad.is_err(), "testnet must reject >10% drift");
+        assert!(ok.is_err(), "testnet must reject non-exact difficulty");
     }
 
     #[test]

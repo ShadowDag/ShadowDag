@@ -125,6 +125,8 @@ impl DiskMonitor {
             let mut free_available: u64 = 0;
             let mut total: u64 = 0;
             let mut total_free: u64 = 0;
+            // SAFETY: `wide` is NUL-terminated and lives for the call; all output
+            // pointers refer to valid writable `u64` locals.
             let ret = unsafe {
                 GetDiskFreeSpaceExW(
                     wide.as_ptr(),

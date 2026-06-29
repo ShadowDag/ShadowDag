@@ -182,7 +182,7 @@ fn run(args: &[String]) -> Result<(), BootError> {
         p2p_port => cfg.p2p_port,
         rpc_port => cfg.rpc_port,
         data_dir => cfg.data_dir.display(),
-        genesis => &genesis.header.hash[..16],
+        genesis => genesis.header.hash.get(..16).unwrap_or(&genesis.header.hash),
         emission => EmissionSchedule::info(0));
     println!();
 

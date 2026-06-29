@@ -966,7 +966,10 @@ fn cmd_deploy_package(args: &[String]) {
     println!(
         "  Bytecode:    {} bytes (hash: {}...)",
         package.code_size(),
-        &package.bytecode_hash[..16]
+        package
+            .bytecode_hash
+            .get(..16)
+            .unwrap_or(&package.bytecode_hash)
     );
     println!("  VM version:  {}", package.vm_version);
     println!(
@@ -1029,7 +1032,13 @@ fn cmd_verify(args: &[String]) {
 
     println!("Verifying contract {} against {}...", address, package_path);
     println!("  Package name:     {}", package.name);
-    println!("  Package hash:     {}...", &package.bytecode_hash[..16]);
+    println!(
+        "  Package hash:     {}...",
+        package
+            .bytecode_hash
+            .get(..16)
+            .unwrap_or(&package.bytecode_hash)
+    );
     println!("  VM version:       {}", package.vm_version);
     println!(
         "\n  Use RPC: verify_contract {} '{}'",
@@ -1165,6 +1174,7 @@ mod gui {
     const MAX_PATH_BYTES: usize = 512;
     const MAX_ADDR_BYTES: usize = 128; // longest plausible SDAG address
     const RPC_TIMEOUT_SECS: u64 = 5;
+    const MAX_RPC_RESPONSE_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
     const SEED_PROBE_TIMEOUT_SECS: u64 = 3;
 
     /// Official ShadowDAG seed RPC endpoints. The wallet picks the first one
@@ -1209,8 +1219,15 @@ mod gui {
                         "[wallet] no seed nodes reachable — falling back to 127.0.0.1:9332"
                     );
                     eprintln!("         (check internet; or run a local node)");
-                    parse_rpc_target("127.0.0.1:9332")
-                        .expect("hardcoded loopback should always parse")
+                    match parse_rpc_target("127.0.0.1:9332") {
+                        Some(target) => target,
+                        None => {
+                            eprintln!(
+                                "[wallet] internal error: failed to parse hardcoded fallback RPC"
+                            );
+                            return;
+                        }
+                    }
                 }
             },
         };
@@ -1373,13 +1390,13 @@ mod gui {
     /// Host / Origin validation — mitigate DNS rebinding and browser CSRF
     /// against the localhost wallet UI. Accept ONLY loopback hostnames.
     fn is_safe_local_request(host: Option<&str>, origin: Option<&str>) -> bool {
-        if let Some(h) = host {
-            let h = h.to_ascii_lowercase();
-            let host_only = h.split(':').next().unwrap_or("").trim();
-            if host_only != "127.0.0.1" && host_only != "localhost" && host_only != "[::1]"
-            {
-                return false;
-            }
+        let Some(h) = host else {
+            return false;
+        };
+        let h = h.to_ascii_lowercase();
+        let host_only = h.split(':').next().unwrap_or("").trim();
+        if host_only != "127.0.0.1" && host_only != "localhost" && host_only != "[::1]" {
+            return false;
         }
         if let Some(o) = origin {
             let o = o.to_ascii_lowercase();
@@ -1433,28 +1450,74 @@ mod gui {
         }
         let _ = stream.flush();
 
-        let mut response = String::new();
-        if stream.read_to_string(&mut response).is_err() {
-            return serde_json::json!({"error": "rpc read failed"});
+        let mut reader = BufReader::new(&stream);
+        let mut content_length: usize = 0;
+        let mut content_length_seen = false;
+        let mut unsupported_transfer_encoding = false;
+        let mut header_lines = 0usize;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    header_lines += 1;
+                    if header_lines > MAX_HEADER_LINES {
+                        return serde_json::json!({"error": "rpc headers too large"});
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = trimmed.split_once(':') {
+                        if name.trim().eq_ignore_ascii_case("content-length") {
+                            if content_length_seen {
+                                return serde_json::json!({"error": "invalid rpc response"});
+                            }
+                            content_length_seen = true;
+                            content_length = match value.trim().parse::<usize>() {
+                                Ok(n) => n,
+                                Err(_) => return serde_json::json!({"error": "invalid rpc response"}),
+                            };
+                        } else if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+                            unsupported_transfer_encoding = true;
+                        }
+                    }
+                }
+                Err(_) => return serde_json::json!({"error": "rpc read failed"}),
+            }
+        }
+        if unsupported_transfer_encoding || !content_length_seen {
+            return serde_json::json!({"error": "invalid rpc response"});
         }
 
-        if let Some(idx) = response.find("\r\n\r\n") {
-            let json_str = &response[idx + 4..];
-            match serde_json::from_str::<serde_json::Value>(json_str) {
-                Ok(val) => {
-                    if let Some(result) = val.get("result") {
-                        return result.clone();
-                    }
-                    if val.get("error").is_some() {
-                        // Don't echo node error back — just say it failed.
-                        return serde_json::json!({"error": "rpc returned error"});
-                    }
-                    val
-                }
-                Err(_) => serde_json::json!({"error": "invalid rpc response"}),
+        let response_body = if content_length > 0 {
+            if content_length > MAX_RPC_RESPONSE_BYTES {
+                return serde_json::json!({"error": "rpc response too large"});
+            }
+            let mut body = vec![0u8; content_length];
+            if reader.read_exact(&mut body).is_err() {
+                return serde_json::json!({"error": "rpc read failed"});
+            }
+            match String::from_utf8(body) {
+                Ok(s) => s,
+                Err(_) => return serde_json::json!({"error": "invalid rpc response"}),
             }
         } else {
-            serde_json::json!({"error": "malformed rpc response"})
+            String::new()
+        };
+
+        match serde_json::from_str::<serde_json::Value>(&response_body) {
+            Ok(val) => {
+                if let Some(result) = val.get("result") {
+                    return result.clone();
+                }
+                if val.get("error").is_some() {
+                    // Don't echo node error back - just say it failed.
+                    return serde_json::json!({"error": "rpc returned error"});
+                }
+                val
+            }
+            Err(_) => serde_json::json!({"error": "invalid rpc response"}),
         }
     }
 
@@ -1539,6 +1602,7 @@ mod gui {
         let mut content_length: usize = 0;
         let mut host_header: Option<String> = None;
         let mut origin_header: Option<String> = None;
+        let mut malformed_content_length = false;
         let mut header_line = String::new();
         let mut header_lines = 0usize;
         let mut header_bytes = 0usize;
@@ -1560,7 +1624,10 @@ mod gui {
                     let lower = trimmed.to_ascii_lowercase();
                     if lower.starts_with("content-length:") {
                         if let Some((_, val)) = trimmed.split_once(':') {
-                            content_length = val.trim().parse().unwrap_or(0);
+                            match val.trim().parse::<usize>() {
+                                Ok(v) => content_length = v,
+                                Err(_) => malformed_content_length = true,
+                            }
                         }
                     } else if lower.starts_with("host:") {
                         if let Some((_, val)) = trimmed.split_once(':') {
@@ -1582,6 +1649,10 @@ mod gui {
                     }
                 }
             }
+        }
+        if malformed_content_length {
+            send_response(&mut stream, 400, "text/plain", b"Malformed Content-Length");
+            return;
         }
 
         let parts: Vec<&str> = request_line.trim().split_whitespace().collect();

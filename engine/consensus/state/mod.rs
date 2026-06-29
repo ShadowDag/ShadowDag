@@ -76,10 +76,10 @@ impl ConsensusState {
     /// to call `recover_from_db()` separately. This prevents the bug where
     /// someone forgets to call recovery and the node runs with empty state.
     ///
-    /// Panics if recovery encounters corruption (iterator errors, unreadable
-    /// chain state). A node with partially recovered consensus state is
-    /// dangerous — it's safer to crash than to run with gaps.
-    pub fn new_with_db(db: Arc<rocksdb::DB>) -> Self {
+    /// Returns `Err` if recovery encounters corruption (iterator errors,
+    /// unreadable chain state). A node with partially recovered consensus
+    /// state is dangerous, so callers should treat this as fatal.
+    pub fn new_with_db(db: Arc<rocksdb::DB>) -> Result<Self, ConsensusError> {
         let mut s = Self {
             block_data: HashMap::new(),
             blue_blocks: HashSet::new(),
@@ -88,19 +88,15 @@ impl ConsensusState {
             db: Some(db),
         };
         if let Err(e) = s.recover_from_db() {
-            slog_error!("consensus", "fatal_recovery_failure", error => e);
-            panic!(
-                "ConsensusState recovery failed: {}. \
-                 Node cannot start with corrupt or partial consensus state.",
-                e
-            );
+            slog_error!("consensus", "fatal_recovery_failure", error => &e.to_string());
+            return Err(e);
         }
         slog_info!("consensus", "state_recovered", blocks => s.block_data.len(), tip => s.chain.selected_tip, blue_score => s.chain.best_blue_score);
         let issues = s.verify_consistency();
         if !issues.is_empty() {
             slog_warn!("consensus", "consistency_issues_after_recovery", count => issues.len());
         }
-        s
+        Ok(s)
     }
 
     pub fn init_with_genesis(&mut self, genesis_hash: &str) {

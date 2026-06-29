@@ -587,6 +587,7 @@ impl Wallet {
                 pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
             })
             .collect();
 
@@ -670,6 +671,7 @@ impl Wallet {
                 pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
             })
             .collect();
 
@@ -765,9 +767,10 @@ fn derive_key(
         .map_err(|e| WalletError::KeyDerivation(e.to_string()))?;
     mac.update(path.as_bytes());
     let res = mac.finalize().into_bytes();
-    let key: [u8; 32] = res[..32]
-        .try_into()
-        .map_err(|_| WalletError::KeyDerivation("Key slice error".to_string()))?;
+    let key: [u8; 32] = res
+        .get(..32)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| WalletError::KeyDerivation("Key slice error".to_string()))?;
     Ok(SigningKey::from_bytes(&key))
 }
 

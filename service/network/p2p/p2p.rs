@@ -73,6 +73,9 @@ static PEER_PENDING: Lazy<Arc<PlMutex<HashMap<String, (u32, u32)>>>> =
 const MAX_PENDING_TXS_PER_PEER: u32 = 500;
 /// Max pending blocks allowed from a single peer before dropping.
 const MAX_PENDING_BLOCKS_PER_PEER: u32 = 50;
+/// Global hard caps for pending inbound queues (all peers combined).
+const MAX_PENDING_TX_QUEUE: usize = 10_000;
+const MAX_PENDING_BLOCK_QUEUE: usize = 1_000;
 const MAX_OUTBOUND_LAG_SEQS: u64 = 5_000;
 /// Bytes per peer per minute — disconnect abusive peers (100MB/min).
 const MAX_BYTES_PER_PEER_PER_MIN: u64 = 100 * 1024 * 1024;
@@ -143,6 +146,26 @@ pub fn drain_pending_blocks() -> Vec<(String, Block)> {
 /// Clean up global state for a disconnected peer.
 /// Removes targeted messages and pending counts to prevent resource leaks.
 pub fn cleanup_peer_state(peer_id: &str) {
+    // Remove pending inbound work attributed to this peer so disconnected
+    // peers cannot keep stale queue pressure.
+    {
+        let mut q = PENDING_TXS.lock();
+        let before = q.len();
+        q.retain(|(peer, _)| peer != peer_id);
+        let dropped = before.saturating_sub(q.len());
+        if dropped > 0 {
+            slog_warn!("p2p", "cleanup_dropped_pending_txs", peer => peer_id, dropped => dropped);
+        }
+    }
+    {
+        let mut q = PENDING_BLOCKS.lock();
+        let before = q.len();
+        q.retain(|(peer, _)| peer != peer_id);
+        let dropped = before.saturating_sub(q.len());
+        if dropped > 0 {
+            slog_warn!("p2p", "cleanup_dropped_pending_blocks", peer => peer_id, dropped => dropped);
+        }
+    }
     {
         let mut q = TARGETED_MSGS.lock();
         q.retain(|(target, _)| target != peer_id);
@@ -174,12 +197,31 @@ pub fn requeue_pending_blocks(items: Vec<(String, Block)>) {
     }
     let mut q = PENDING_BLOCKS.lock();
     let mut counts = PEER_PENDING.lock();
-    // Restore per-peer pending counts that were decremented during drain
-    for (peer_id, _) in &items {
+
+    // Keep queue bounded even during requeue. Under load, new incoming items
+    // can arrive between drain and requeue; without this cap, requeue could
+    // temporarily exceed the global queue limit.
+    let available = MAX_PENDING_BLOCK_QUEUE.saturating_sub(q.len());
+    let mut dropped = 0usize;
+    let mut requeued: Vec<(String, Block)> = Vec::with_capacity(items.len().min(available));
+    for (peer_id, block) in items {
+        if requeued.len() >= available {
+            dropped = dropped.saturating_add(1);
+            continue;
+        }
         let entry = counts.entry(peer_id.clone()).or_insert((0, 0));
+        if entry.1 >= MAX_PENDING_BLOCKS_PER_PEER {
+            dropped = dropped.saturating_add(1);
+            continue;
+        }
         entry.1 = entry.1.saturating_add(1);
+        requeued.push((peer_id, block));
     }
-    let mut combined = items;
+    if dropped > 0 {
+        slog_warn!("p2p", "pending_block_requeue_dropped", dropped => dropped);
+    }
+
+    let mut combined = requeued;
     combined.extend(q.drain(..));
     *q = combined;
 }
@@ -194,12 +236,29 @@ pub fn requeue_pending_txs(items: Vec<(String, Transaction)>) {
     }
     let mut q = PENDING_TXS.lock();
     let mut counts = PEER_PENDING.lock();
-    // Restore per-peer pending counts that were decremented during drain
-    for (peer_id, _) in &items {
+
+    // Keep queue bounded even during requeue.
+    let available = MAX_PENDING_TX_QUEUE.saturating_sub(q.len());
+    let mut dropped = 0usize;
+    let mut requeued: Vec<(String, Transaction)> = Vec::with_capacity(items.len().min(available));
+    for (peer_id, tx) in items {
+        if requeued.len() >= available {
+            dropped = dropped.saturating_add(1);
+            continue;
+        }
         let entry = counts.entry(peer_id.clone()).or_insert((0, 0));
+        if entry.0 >= MAX_PENDING_TXS_PER_PEER {
+            dropped = dropped.saturating_add(1);
+            continue;
+        }
         entry.0 = entry.0.saturating_add(1);
+        requeued.push((peer_id, tx));
     }
-    let mut combined = items;
+    if dropped > 0 {
+        slog_warn!("p2p", "pending_tx_requeue_dropped", dropped => dropped);
+    }
+
+    let mut combined = requeued;
     combined.extend(q.drain(..));
     *q = combined;
 }
@@ -215,7 +274,7 @@ pub fn push_pending_block(peer_id: &str, block: Block) -> bool {
     // Lock queue FIRST to match lock order in dispatch_message
     // (queue → PEER_PENDING), preventing deadlocks.
     let mut q = PENDING_BLOCKS.lock();
-    if q.len() >= 1_000 {
+    if q.len() >= MAX_PENDING_BLOCK_QUEUE {
         slog_warn!("p2p", "pending_block_queue_full");
         return false;
     }
@@ -244,7 +303,7 @@ pub fn push_pending_tx(peer_id: &str, tx: Transaction) -> bool {
     // Lock queue FIRST to match lock order in dispatch_message
     // (queue → PEER_PENDING), preventing deadlocks.
     let mut q = PENDING_TXS.lock();
-    if q.len() >= 10_000 {
+    if q.len() >= MAX_PENDING_TX_QUEUE {
         slog_warn!("p2p", "pending_tx_queue_full");
         return false;
     }

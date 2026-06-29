@@ -121,7 +121,7 @@ impl GpuMiner {
             block.header.nonce = nonce;
             block.header.hash = hash.clone();
 
-            slog_info!("gpu", "gpu_block_found", nonce => nonce, hash_prefix => &hash[..16], time_ms => elapsed_ms, hashrate_mhs => format!("{:.2}", self.hashrate));
+            slog_info!("gpu", "gpu_block_found", nonce => nonce, hash_prefix => hash.get(..16).unwrap_or(&hash), time_ms => elapsed_ms, hashrate_mhs => format!("{:.2}", self.hashrate));
             Some(block)
         } else {
             slog_warn!("gpu", "gpu_no_valid_nonce_found");

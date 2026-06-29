@@ -25,14 +25,47 @@ pub struct SelfishMiningGuard;
 
 impl SelfishMiningGuard {
     #[inline]
+    fn is_mainnet_runtime() -> bool {
+        std::env::var("NETWORK")
+            .or_else(|_| std::env::var("SHADOWDAG_NETWORK"))
+            .map(|v| {
+                let v = v.trim();
+                v.eq_ignore_ascii_case("mainnet") || v.eq_ignore_ascii_case("shadowdag-mainnet")
+            })
+            .unwrap_or(false)
+    }
+
+    #[inline]
     fn configured_min_dag_parents() -> usize {
         // Optional override for small/dev networks where only one DAG tip may exist.
-        // Mainnet keeps the secure default (2) unless explicitly overridden.
-        std::env::var("SHADOWDAG_MIN_DAG_PARENTS")
+        // Mainnet is locked to the secure minimum (2+) to prevent accidental
+        // consensus weakening from environment overrides.
+        let configured = std::env::var("SHADOWDAG_MIN_DAG_PARENTS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(MIN_DAG_PARENTS)
-            .clamp(1, MAX_DAG_PARENTS)
+            .clamp(1, MAX_DAG_PARENTS);
+
+        if Self::is_mainnet_runtime() && configured < MIN_DAG_PARENTS {
+            log::warn!(
+                target: "dag",
+                "unsafe_min_dag_parents_ignored_on_mainnet configured={} enforced={}",
+                configured,
+                MIN_DAG_PARENTS
+            );
+            MIN_DAG_PARENTS
+        } else {
+            configured
+        }
+    }
+
+    #[inline]
+    pub fn configured_min_dag_parents_for_height(height: u64) -> usize {
+        match height {
+            0 => 0,
+            1 => 1,
+            _ => Self::configured_min_dag_parents(),
+        }
     }
 
     #[inline(always)]
@@ -42,11 +75,7 @@ impl SelfishMiningGuard {
 
         // Genesis has no parents. Height 1 can only point to genesis.
         // For height >= 2, enforce the configured minimum parent count.
-        let min_parents = match block.header.height {
-            0 => 0,
-            1 => 1,
-            _ => Self::configured_min_dag_parents(),
-        };
+        let min_parents = Self::configured_min_dag_parents_for_height(block.header.height);
 
         // 1️⃣ Range
         if len < min_parents || len > MAX_DAG_PARENTS {
@@ -192,5 +221,15 @@ mod tests {
     fn whitespace_only_parent_rejected() {
         let b = make_block("ws", vec!["   ", "valid"], 2);
         assert!(!SelfishMiningGuard::validate(&b));
+    }
+
+    #[test]
+    fn mainnet_env_clamps_unsafe_override() {
+        std::env::set_var("NETWORK", "mainnet");
+        std::env::set_var("SHADOWDAG_MIN_DAG_PARENTS", "1");
+        let min = SelfishMiningGuard::configured_min_dag_parents_for_height(2);
+        std::env::remove_var("SHADOWDAG_MIN_DAG_PARENTS");
+        std::env::remove_var("NETWORK");
+        assert_eq!(min, MIN_DAG_PARENTS);
     }
 }

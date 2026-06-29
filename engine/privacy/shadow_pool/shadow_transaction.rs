@@ -11,6 +11,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use rand::rngs::OsRng;
+use rand::Rng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
@@ -85,22 +86,23 @@ impl ShadowTransaction {
     /// indistinguishable in size from real shadow transactions.
     pub fn new_decoy(timestamp: u64) -> Self {
         use crate::domain::transaction::transaction::{TxOutput, TxType};
-        use rand::Rng;
 
         // Add random jitter (0-60s in ms) so decoys don't share identical timestamps
-        let jitter: u64 = rand::thread_rng().gen_range(0..60_000);
+        let mut rng = OsRng;
+        let jitter: u64 = rng.gen_range(0..60_000);
         let decoy_ts = timestamp.wrapping_add(jitter);
 
         let mut entropy = [0u8; 32];
         OsRng.fill_bytes(&mut entropy);
         let decoy_hash = hex::encode(entropy);
 
+        let decoy_suffix = decoy_hash.get(..40).unwrap_or(&decoy_hash);
         let tx = Transaction {
             hash: decoy_hash.clone(),
             inputs: vec![],
             outputs: vec![TxOutput {
                 // Decoy addresses use network-neutral format (filtered before relay)
-                address: format!("DECOY{:0>40}", &decoy_hash[..40]),
+                address: format!("DECOY{:0>40}", decoy_suffix),
                 amount: 0,
                 commitment: None,
                 range_proof: None,

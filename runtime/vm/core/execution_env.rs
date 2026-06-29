@@ -14,13 +14,14 @@
 
 macro_rules! pop1 {
     ($stack:expr, $gas:expr, $snapshot:expr, $self:expr) => {
-        if $stack.is_empty() {
-            $self.state.rollback($snapshot).ok();
-            return CallOutcome::Failure {
-                gas_used: $gas.gas_used(),
-            };
-        } else {
-            $stack.pop().unwrap()
+        match $stack.pop() {
+            Some(v) => v,
+            None => {
+                $self.state.rollback($snapshot).ok();
+                return CallOutcome::Failure {
+                    gas_used: $gas.gas_used(),
+                };
+            }
         }
     };
 }
@@ -33,7 +34,15 @@ macro_rules! pop2 {
                 gas_used: $gas.gas_used(),
             };
         } else {
-            ($stack.pop().unwrap(), $stack.pop().unwrap())
+            match ($stack.pop(), $stack.pop()) {
+                (Some(a), Some(b)) => (a, b),
+                _ => {
+                    $self.state.rollback($snapshot).ok();
+                    return CallOutcome::Failure {
+                        gas_used: $gas.gas_used(),
+                    };
+                }
+            }
         }
     };
 }
@@ -1459,7 +1468,12 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let top = *stack.last().unwrap();
+                    let Some(&top) = stack.last() else {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    };
                     stack.push(top);
                 }
                 OpCode::SWAP => {
@@ -1518,9 +1532,9 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let a = stack.pop().unwrap();
-                    let b = stack.pop().unwrap();
-                    let n = stack.pop().unwrap();
+                    let a = pop1!(stack, gas, snapshot, self);
+                    let b = pop1!(stack, gas, snapshot, self);
+                    let n = pop1!(stack, gas, snapshot, self);
                     stack.push(if n.is_zero() {
                         U256::ZERO
                     } else {
@@ -1534,9 +1548,9 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let a = stack.pop().unwrap();
-                    let b = stack.pop().unwrap();
-                    let n = stack.pop().unwrap();
+                    let a = pop1!(stack, gas, snapshot, self);
+                    let b = pop1!(stack, gas, snapshot, self);
+                    let n = pop1!(stack, gas, snapshot, self);
                     stack.push(if n.is_zero() {
                         U256::ZERO
                     } else {
@@ -1768,7 +1782,7 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let requested = stack.pop().unwrap();
+                    let requested = pop1!(stack, gas, snapshot, self);
                     let mut hasher = <Sha256 as Digest>::new();
                     Digest::update(&mut hasher, b"ShadowDAG_BLOCKHASH_v2");
                     Digest::update(&mut hasher, self.block_ctx.block_hash.as_bytes());
@@ -1901,8 +1915,8 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let offset = stack.pop().unwrap().as_u64() as usize;
-                    let size = stack.pop().unwrap().as_u64() as usize;
+                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let size = pop1!(stack, gas, snapshot, self).as_u64() as usize;
                     // EVM semantics: RETURN's memory window is
                     // virtual — bytes past the end of the current
                     // memory buffer are zero, not "truncated to
@@ -1950,8 +1964,8 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let offset = stack.pop().unwrap().as_u64() as usize;
-                    let size = stack.pop().unwrap().as_u64() as usize;
+                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let size = pop1!(stack, gas, snapshot, self).as_u64() as usize;
                     // Same zero-padding / checked-add fix as RETURN.
                     // REVERT must still produce the exact `size`
                     // bytes the contract asked for, zero-filling any
@@ -1983,13 +1997,13 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let req_gas = stack.pop().unwrap().as_u64();
-                    let addr = stack.pop().unwrap();
-                    let call_value = stack.pop().unwrap().as_u64();
-                    let args_offset = stack.pop().unwrap().as_u64() as usize;
-                    let args_len = stack.pop().unwrap().as_u64() as usize;
-                    let ret_offset = stack.pop().unwrap().as_u64() as usize;
-                    let ret_len = stack.pop().unwrap().as_u64() as usize;
+                    let req_gas = pop1!(stack, gas, snapshot, self).as_u64();
+                    let addr = pop1!(stack, gas, snapshot, self);
+                    let call_value = pop1!(stack, gas, snapshot, self).as_u64();
+                    let args_offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let args_len = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let ret_offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let ret_len = pop1!(stack, gas, snapshot, self).as_u64() as usize;
 
                     // Static check: CALL with value > 0 inside STATICCALL is forbidden.
                     //
@@ -2253,12 +2267,12 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let req_gas = stack.pop().unwrap().as_u64();
-                    let addr = stack.pop().unwrap();
-                    let args_offset = stack.pop().unwrap().as_u64() as usize;
-                    let args_len = stack.pop().unwrap().as_u64() as usize;
-                    let ret_offset = stack.pop().unwrap().as_u64() as usize;
-                    let ret_len = stack.pop().unwrap().as_u64() as usize;
+                    let req_gas = pop1!(stack, gas, snapshot, self).as_u64();
+                    let addr = pop1!(stack, gas, snapshot, self);
+                    let args_offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let args_len = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let ret_offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let ret_len = pop1!(stack, gas, snapshot, self).as_u64() as usize;
 
                     let remaining = gas.gas_remaining();
                     let max_allowed = remaining - remaining / 64;
@@ -2400,12 +2414,12 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let req_gas = stack.pop().unwrap().as_u64();
-                    let code_addr = stack.pop().unwrap();
-                    let args_offset = stack.pop().unwrap().as_u64() as usize;
-                    let args_len = stack.pop().unwrap().as_u64() as usize;
-                    let ret_offset = stack.pop().unwrap().as_u64() as usize;
-                    let ret_len = stack.pop().unwrap().as_u64() as usize;
+                    let req_gas = pop1!(stack, gas, snapshot, self).as_u64();
+                    let code_addr = pop1!(stack, gas, snapshot, self);
+                    let args_offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let args_len = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let ret_offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let ret_len = pop1!(stack, gas, snapshot, self).as_u64() as usize;
 
                     let remaining = gas.gas_remaining();
                     let max_allowed = remaining - remaining / 64;
@@ -2523,13 +2537,13 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let req_gas = stack.pop().unwrap().as_u64();
-                    let code_addr = stack.pop().unwrap();
-                    let call_value = stack.pop().unwrap().as_u64();
-                    let args_offset = stack.pop().unwrap().as_u64() as usize;
-                    let args_len = stack.pop().unwrap().as_u64() as usize;
-                    let ret_offset = stack.pop().unwrap().as_u64() as usize;
-                    let ret_len = stack.pop().unwrap().as_u64() as usize;
+                    let req_gas = pop1!(stack, gas, snapshot, self).as_u64();
+                    let code_addr = pop1!(stack, gas, snapshot, self);
+                    let call_value = pop1!(stack, gas, snapshot, self).as_u64();
+                    let args_offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let args_len = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let ret_offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let ret_len = pop1!(stack, gas, snapshot, self).as_u64() as usize;
 
                     // Static check: CALLCODE with value > 0 is
                     // forbidden inside a static frame. Clear the
@@ -2691,9 +2705,9 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let create_value = stack.pop().unwrap().as_u64();
-                    let offset = stack.pop().unwrap().as_u64() as usize;
-                    let length = stack.pop().unwrap().as_u64() as usize;
+                    let create_value = pop1!(stack, gas, snapshot, self).as_u64();
+                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let length = pop1!(stack, gas, snapshot, self).as_u64() as usize;
 
                     // Read init code from memory with the
                     // zero-padding / checked-add helper. A window
@@ -2928,10 +2942,10 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let create_value = stack.pop().unwrap().as_u64();
-                    let offset = stack.pop().unwrap().as_u64() as usize;
-                    let length = stack.pop().unwrap().as_u64() as usize;
-                    let salt = stack.pop().unwrap();
+                    let create_value = pop1!(stack, gas, snapshot, self).as_u64();
+                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let length = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let salt = pop1!(stack, gas, snapshot, self);
 
                     let init_code = if length > 0 && offset + length <= memory.len() {
                         memory[offset..offset + length].to_vec()
@@ -3088,7 +3102,7 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let beneficiary_val = stack.pop().unwrap();
+                    let beneficiary_val = pop1!(stack, gas, snapshot, self);
                     // Resolve the beneficiary body back to its
                     // ShadowDAG string via the runtime registry. This
                     // is the same fix as BALANCE / CALL / etc. — a
@@ -3244,7 +3258,12 @@ impl ExecutionEnvironment {
                         OpCode::LOG2 => 2,
                         OpCode::LOG3 => 3,
                         OpCode::LOG4 => 4,
-                        _ => unreachable!(),
+                        _ => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
                     };
                     // Need offset + length + num_topics items on stack
                     if stack.len() < 2 + num_topics {
@@ -3253,11 +3272,11 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let offset = stack.pop().unwrap().as_u64() as usize;
-                    let length = stack.pop().unwrap().as_u64() as usize;
+                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let length = pop1!(stack, gas, snapshot, self).as_u64() as usize;
                     let mut topics = Vec::with_capacity(num_topics);
                     for _ in 0..num_topics {
-                        topics.push(stack.pop().unwrap());
+                        topics.push(pop1!(stack, gas, snapshot, self));
                     }
                     // Read data from memory, charging for any expansion.
                     let data = if length == 0 {
@@ -3311,9 +3330,9 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let dest = stack.pop().unwrap().as_u64() as usize;
-                    let offset = stack.pop().unwrap().as_u64() as usize;
-                    let length = stack.pop().unwrap().as_u64() as usize;
+                    let dest = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let length = pop1!(stack, gas, snapshot, self).as_u64() as usize;
                     if length > 0 {
                         let dest_end = match dest.checked_add(length) {
                             Some(end) => end,
@@ -3366,9 +3385,9 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let dest = stack.pop().unwrap().as_u64() as usize;
-                    let offset = stack.pop().unwrap().as_u64() as usize;
-                    let length = stack.pop().unwrap().as_u64() as usize;
+                    let dest = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let length = pop1!(stack, gas, snapshot, self).as_u64() as usize;
                     if length > 0 {
                         let dest_end = match dest.checked_add(length) {
                             Some(end) => end,
@@ -3432,9 +3451,9 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let dest = stack.pop().unwrap().as_u64() as usize;
-                    let offset = stack.pop().unwrap().as_u64() as usize;
-                    let length = stack.pop().unwrap().as_u64() as usize;
+                    let dest = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let length = pop1!(stack, gas, snapshot, self).as_u64() as usize;
                     if length > 0 {
                         // Bounds check against return data (EIP-211).
                         // Use checked_add on both the source and
@@ -3500,7 +3519,12 @@ impl ExecutionEnvironment {
                         OpCode::DUP6 => 6,
                         OpCode::DUP7 => 7,
                         OpCode::DUP8 => 8,
-                        _ => unreachable!(),
+                        _ => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
                     };
                     if stack.len() < n {
                         self.state.rollback(snapshot).ok();
@@ -3523,7 +3547,12 @@ impl ExecutionEnvironment {
                         OpCode::SWAP2 => 3usize, // swap top with 3rd from top
                         OpCode::SWAP3 => 4,      // swap top with 4th from top
                         OpCode::SWAP4 => 5,      // swap top with 5th from top
-                        _ => unreachable!(),
+                        _ => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
                     };
                     if stack.len() < n {
                         self.state.rollback(snapshot).ok();

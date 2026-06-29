@@ -40,6 +40,7 @@ const MAX_HEADER_LINES: usize = 64;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_HOST_HEADER_BYTES: usize = 256;
+const MAX_ADDR_PATH_BYTES: usize = 128;
 
 pub struct WalletUiServer {
     port: u16,
@@ -48,6 +49,35 @@ pub struct WalletUiServer {
 }
 
 impl WalletUiServer {
+    #[inline]
+    fn looks_like_address(addr: &str) -> bool {
+        if addr.len() > MAX_ADDR_PATH_BYTES {
+            return false;
+        }
+        let prefix_ok = addr.starts_with("SD") || addr.starts_with("ST") || addr.starts_with("SR");
+        prefix_ok && addr.chars().all(|c| c.is_ascii_alphanumeric())
+    }
+
+    #[inline]
+    fn looks_like_amount_text(amount: &str) -> bool {
+        if amount.is_empty() || amount.len() > 32 || amount.starts_with('-') {
+            return false;
+        }
+        let (whole, frac) = match amount.split_once('.') {
+            Some((w, f)) => (w, Some(f)),
+            None => (amount, None),
+        };
+        if whole.is_empty() || !whole.chars().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
+        if let Some(f) = frac {
+            if f.is_empty() || f.len() > 8 || !f.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn new(port: u16, state: SharedState) -> Self {
         Self {
             port,
@@ -179,7 +209,7 @@ impl WalletUiServer {
             }
         }
 
-        let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
+        let parts: Vec<&str> = request_line.split_whitespace().collect();
         if parts.len() < 2 {
             return;
         }
@@ -217,7 +247,13 @@ impl WalletUiServer {
                 Self::send_response(&mut stream, 400, "text/plain", b"Bad request body");
                 return;
             }
-            String::from_utf8_lossy(&buf).to_string()
+            match String::from_utf8(buf) {
+                Ok(s) => s,
+                Err(_) => {
+                    Self::send_response(&mut stream, 400, "text/plain", b"Invalid UTF-8 body");
+                    return;
+                }
+            }
         } else {
             String::new()
         };
@@ -236,6 +272,10 @@ impl WalletUiServer {
             ("GET", "/api/wallet/network") => Self::api_network_info(&mut stream, state),
             ("GET", p) if p.starts_with("/api/wallet/balance/") => {
                 let addr = &p["/api/wallet/balance/".len()..];
+                if !Self::looks_like_address(addr) {
+                    Self::send_response(&mut stream, 400, "text/plain", b"Invalid address");
+                    return;
+                }
                 Self::api_balance(&mut stream, state, addr);
             }
             ("POST", "/api/wallet/send") => Self::api_send(&mut stream, state, &body),
@@ -305,8 +345,11 @@ impl WalletUiServer {
                 let to = req.get("to").and_then(|v| v.as_str()).unwrap_or("");
                 let amount = req.get("amount").and_then(|v| v.as_str()).unwrap_or("0");
 
-                if to.is_empty() || amount == "0" {
-                    json!({"error": "Missing 'to' address or 'amount'"})
+                if !Self::looks_like_address(to)
+                    || !Self::looks_like_amount_text(amount)
+                    || amount == "0"
+                {
+                    json!({"error": "Invalid 'to' address or 'amount'"})
                 } else {
                     // The actual send is done via CLI wallet or RPC.
                     // The web UI shows the user what to do.
@@ -360,12 +403,13 @@ impl WalletUiServer {
     fn is_safe_local_request(host: Option<&str>, origin: Option<&str>) -> bool {
         // Mitigate DNS-rebinding and browser CSRF against localhost wallet UI.
         // Accept only localhost loopback hostnames for browser-facing requests.
-        if let Some(h) = host {
-            let h = h.to_ascii_lowercase();
-            let host_only = h.split(':').next().unwrap_or("").trim();
-            if host_only != "127.0.0.1" && host_only != "localhost" && host_only != "[::1]" {
-                return false;
-            }
+        let Some(h) = host else {
+            return false;
+        };
+        let h = h.to_ascii_lowercase();
+        let host_only = h.split(':').next().unwrap_or("").trim();
+        if host_only != "127.0.0.1" && host_only != "localhost" && host_only != "[::1]" {
+            return false;
         }
         if let Some(o) = origin {
             let o = o.to_ascii_lowercase();

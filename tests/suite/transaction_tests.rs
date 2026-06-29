@@ -159,6 +159,7 @@ mod tests {
                 pub_key: "aabbcc".repeat(5),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
             })
             .collect();
         let mut tx = Transaction {
@@ -234,6 +235,7 @@ mod tests {
                 pub_key: "pk".into(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
             }],
             outputs: vec![TxOutput {
                 address: "addr".into(),
@@ -297,6 +299,7 @@ mod tests {
             pub_key: "b".repeat(64),
             key_image: None,
             ring_members: None,
+            ring_signature: None,
         };
         let tx = Transaction {
             hash: "dup_input_tx".to_string(),

@@ -5,6 +5,8 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::config::node::node_config::NetworkMode;
+    use crate::domain::transaction::tx_hash::TxHash;
     use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
     use crate::domain::transaction::tx_validator::{validate_tx, TxValidator, MAX_TX_OUTPUTS};
     use crate::domain::utxo::utxo_set::UtxoSet;
@@ -42,6 +44,7 @@ mod tests {
             pub_key: pk.to_string(),
             key_image: None,
             ring_members: None,
+            ring_signature: None,
         }
     }
 
@@ -76,17 +79,77 @@ mod tests {
     #[test]
     fn free_validate_basic_valid_tx() {
         let mut tx = make_tx(
-            "abc123",
+            "placeholder",
             vec![],
             vec![make_output("addr1", 546)], // at least DUST_LIMIT (546)
         );
         // Mark as coinbase so it passes the "non-coinbase must have inputs" rule
         tx.is_coinbase = true;
-        // validate_tx structural check does not verify hash integrity
-        // so a coinbase with valid outputs should pass structural checks
+        // Coinbase uses a dedicated hash construction path outside TxHash::hash().
+        // Free validation intentionally accepts valid coinbase structure here.
+        tx.hash = "coinbase_hash_like_value".to_string();
         assert!(
             validate_tx(&tx),
             "valid coinbase TX should pass free validation"
+        );
+    }
+
+    #[test]
+    fn free_validate_non_coinbase_tampered_hash_fails() {
+        let mut tx = make_tx(
+            "placeholder",
+            vec![make_input("prev_tx", 0, "", "")],
+            vec![make_output("addr1", 546)],
+        );
+        tx.is_coinbase = false;
+        tx.hash = TxHash::hash(&tx);
+        assert!(validate_tx(&tx), "baseline tx should pass free validation");
+
+        // Tamper with hash after computing it.
+        tx.hash = "0".repeat(64);
+        assert!(
+            !validate_tx(&tx),
+            "non-coinbase tx with tampered hash must be rejected"
+        );
+    }
+
+    #[test]
+    fn free_validate_non_coinbase_testnet_hash_passes() {
+        let mut tx = make_tx(
+            "placeholder",
+            vec![make_input(
+                "prev_tx",
+                0,
+                "",
+                "",
+            )],
+            vec![make_output("ST1addr100000000000000000000000000000000001", 546)],
+        );
+        tx.is_coinbase = false;
+        tx.inputs[0].owner = "ST1owner0000000000000000000000000000000002".to_string();
+        tx.hash = TxHash::hash_for_network(&tx, &NetworkMode::Testnet);
+        assert!(
+            validate_tx(&tx),
+            "non-coinbase testnet tx with correct network hash should pass"
+        );
+    }
+
+    #[test]
+    fn free_validate_mixed_network_prefixes_fail() {
+        let mut tx = make_tx(
+            "placeholder",
+            vec![make_input("prev_tx", 0, "", "")],
+            vec![
+                make_output("SD1dest000000000000000000000000000000000001", 546),
+                make_output("ST1dest000000000000000000000000000000000002", 546),
+            ],
+        );
+        tx.is_coinbase = false;
+        tx.inputs[0].owner = "SD1owner0000000000000000000000000000000003".to_string();
+        tx.hash = TxHash::hash_for_network(&tx, &NetworkMode::Mainnet);
+        assert!(
+            !validate_tx(&tx),
+            "mixed network address prefixes must be rejected"
         );
     }
 
