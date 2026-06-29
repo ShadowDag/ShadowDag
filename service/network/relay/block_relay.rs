@@ -215,9 +215,32 @@ impl BlockRelay {
     }
 
     pub fn add_to_orphan_pool(&self, block: Block) {
-        // Basic PoW check before storing — prevents filling the orphan pool
-        // with blocks that can never pass consensus validation.
+        // Recompute the block hash from the header fields and require it to match
+        // the claimed hash BEFORE the PoW check. Otherwise an attacker could set
+        // header.hash to any low value that "meets target" without doing real
+        // work, defeating this admission gate and cheaply churning/evicting
+        // honest orphans (the pool is bounded + evicts oldest).
+        use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
         use crate::engine::mining::pow::pow_validator::PowValidator;
+        let computed = shadow_hash_raw_full(
+            block.header.version,
+            block.header.height,
+            block.header.timestamp,
+            block.header.nonce,
+            block.header.extra_nonce,
+            block.header.difficulty,
+            &block.header.merkle_root,
+            &block.header.parents,
+        );
+        if computed != block.header.hash {
+            slog_warn!("relay", "orphan_rejected_hash_mismatch",
+                claimed => &block.header.hash[..block.header.hash.len().min(16)],
+                computed => &computed[..computed.len().min(16)]);
+            return;
+        }
+        // Basic PoW check before storing — prevents filling the orphan pool
+        // with blocks that can never pass consensus validation. Now that the
+        // hash is verified to bind the header content, this requires real work.
         if block.header.difficulty > 0
             && !PowValidator::hash_meets_target(&block.header.hash, block.header.difficulty)
         {
@@ -648,17 +671,81 @@ mod tests {
         }
     }
 
+    /// Build a block whose `hash` actually binds its header content (computed via
+    /// `shadow_hash_raw_full`), so it passes the orphan-pool hash-recompute gate.
+    /// `parents` are arbitrary reference strings (need not be valid hashes).
+    fn make_valid_block(parents: Vec<&str>, height: u64) -> Block {
+        use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
+        let parents: Vec<String> = parents.into_iter().map(|s| s.to_string()).collect();
+        let version: u32 = 1;
+        let timestamp: u64 = 1_735_689_600;
+        let nonce: u64 = 0;
+        let extra_nonce: u64 = 0;
+        let difficulty: u64 = 0;
+        let merkle_root = "root".to_string();
+        let hash = shadow_hash_raw_full(
+            version,
+            height,
+            timestamp,
+            nonce,
+            extra_nonce,
+            difficulty,
+            &merkle_root,
+            &parents,
+        );
+        Block {
+            header: BlockHeader {
+                version,
+                hash,
+                parents,
+                merkle_root,
+                timestamp,
+                nonce,
+                difficulty,
+                height,
+                blue_score: 0,
+                selected_parent: None,
+                utxo_commitment: None,
+                extra_nonce,
+                receipt_root: None,
+                state_root: None,
+            },
+            body: BlockBody {
+                transactions: vec![],
+            },
+        }
+    }
+
     #[test]
     fn orphan_queued_when_parent_missing() {
         let relay = make_relay();
         relay.clear_orphan_pool();
 
-        let orphan = make_block("child_hash", vec!["unknown_parent"], 1);
+        let orphan = make_valid_block(vec!["unknown_parent"], 1);
+        let h = orphan.header.hash.clone();
         let result = relay.receive_block(orphan);
         assert!(!result, "Block with unknown parent must go to orphan pool");
+        assert!(relay.is_orphan(&h), "Block must be in orphan pool");
+    }
+
+    #[test]
+    fn orphan_rejected_when_hash_does_not_match_content() {
+        let relay = make_relay();
+        relay.clear_orphan_pool();
+        // A content-valid orphan is admitted...
+        let good = make_valid_block(vec!["unknown_p"], 1);
+        let hg = good.header.hash.clone();
+        relay.add_to_orphan_pool(good);
+        assert!(relay.is_orphan(&hg), "valid-hash orphan must be admitted");
+        // ...but a block whose claimed hash does NOT bind its header content
+        // (a forged low hash) must be rejected by the recompute gate.
+        let mut bad = make_valid_block(vec!["unknown_p2"], 1);
+        bad.header.hash = "00".repeat(32);
+        let hb = bad.header.hash.clone();
+        relay.add_to_orphan_pool(bad);
         assert!(
-            relay.is_orphan("child_hash"),
-            "Block must be in orphan pool"
+            !relay.is_orphan(&hb),
+            "forged-hash orphan must be rejected (hash does not bind content)"
         );
     }
 
@@ -670,14 +757,15 @@ mod tests {
         let parent_key = "relay:block:parent_a";
         let _ = relay.db.put(parent_key.as_bytes(), b"1");
 
-        let orphan = make_block("orphan_b", vec!["parent_a"], 1);
+        let orphan = make_valid_block(vec!["parent_a"], 1);
+        let h = orphan.header.hash.clone();
         relay.add_to_orphan_pool(orphan);
 
         let resolved = relay.resolve_orphans("parent_a");
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].header.hash, "orphan_b");
+        assert_eq!(resolved[0].header.hash, h);
         assert!(
-            !relay.is_orphan("orphan_b"),
+            !relay.is_orphan(&h),
             "Resolved block must be removed from pool"
         );
     }
@@ -692,23 +780,26 @@ mod tests {
 
         // child_a depends on root (known)
         // child_b depends on child_a (orphan until child_a resolves)
-        let child_a = make_block("child_a", vec!["root"], 1);
-        let child_b = make_block("child_b", vec!["child_a"], 2);
+        let child_a = make_valid_block(vec!["root"], 1);
+        let ha = child_a.header.hash.clone();
+        // child_b's parent is child_a's REAL hash, so the cascade resolves it.
+        let child_b = make_valid_block(vec![&ha], 2);
+        let hb = child_b.header.hash.clone();
         relay.add_to_orphan_pool(child_a);
         relay.add_to_orphan_pool(child_b);
 
         let resolved = relay.resolve_orphans("root");
-        let hashes: Vec<&str> = resolved.iter().map(|b| b.header.hash.as_str()).collect();
+        let hashes: Vec<String> = resolved.iter().map(|b| b.header.hash.clone()).collect();
         assert!(
-            hashes.contains(&"child_a"),
+            hashes.contains(&ha),
             "child_a should resolve (parent root is known)"
         );
         assert!(
-            hashes.contains(&"child_b"),
+            hashes.contains(&hb),
             "child_b should cascade-resolve (child_a now known)"
         );
-        assert!(!relay.is_orphan("child_a"));
-        assert!(!relay.is_orphan("child_b"));
+        assert!(!relay.is_orphan(&ha));
+        assert!(!relay.is_orphan(&hb));
     }
 
     #[test]
@@ -720,7 +811,8 @@ mod tests {
         let _ = relay.db.put(b"relay:block:parent_x", b"1");
 
         // Block requires both parents
-        let block = make_block("needs_both", vec!["parent_x", "parent_y"], 1);
+        let block = make_valid_block(vec!["parent_x", "parent_y"], 1);
+        let h = block.header.hash.clone();
         relay.add_to_orphan_pool(block);
 
         let resolved = relay.resolve_orphans("parent_x");
@@ -728,7 +820,7 @@ mod tests {
             resolved.is_empty(),
             "Block with a missing parent must stay orphaned"
         );
-        assert!(relay.is_orphan("needs_both"));
+        assert!(relay.is_orphan(&h));
     }
 
     #[test]

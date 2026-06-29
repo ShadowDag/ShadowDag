@@ -18,6 +18,7 @@ use crate::errors::CryptoError;
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::traits::IsIdentity;
 use sha2::{Digest, Sha512};
 
 /// A ring member: its one-time spend public key and its output commitment.
@@ -183,6 +184,14 @@ pub fn verify(
         Some(p) => p,
         None => return false,
     };
+    // Reject the identity point for the key image and the auxiliary point D.
+    // Ristretto encodings are already prime-order (no cofactor/torsion), but the
+    // identity point is a degenerate value that must never be accepted as a key
+    // image (it would correspond to a zero secret and weakens the double-spend
+    // uniqueness guarantee).
+    if i_img.is_identity() || d_img.is_identity() {
+        return false;
+    }
     let mu_p = agg_coeff(b"CLSAG2_agg_P_v1", ring, pseudo_out, &i_img, &d_img);
     let mu_c = agg_coeff(b"CLSAG2_agg_C_v1", ring, pseudo_out, &i_img, &d_img);
     let w_image = mu_p * i_img + mu_c * d_img;
@@ -299,6 +308,24 @@ mod tests {
         let pseudo_out = amount * h_gen + r_prime * g;
         let z = r_pi - r_prime; // C_pi - pseudo_out = z·G
         (ring, pseudo_out, spend, z)
+    }
+
+    #[test]
+    fn identity_key_image_or_d_is_rejected() {
+        use curve25519_dalek::traits::Identity;
+        let (ring, pseudo, spend, z) = build_case(5, 2);
+        let sig = sign(b"m", &ring, &pseudo, 2, &spend, &z).unwrap();
+        assert!(verify(b"m", &ring, &pseudo, &sig));
+
+        // Forcing the key image to the identity point must be rejected.
+        let mut tampered = sign(b"m", &ring, &pseudo, 2, &spend, &z).unwrap();
+        tampered.key_image = RistrettoPoint::identity().compress();
+        assert!(!verify(b"m", &ring, &pseudo, &tampered));
+
+        // Same for the auxiliary D point.
+        let mut tampered_d = sign(b"m", &ring, &pseudo, 2, &spend, &z).unwrap();
+        tampered_d.d = RistrettoPoint::identity().compress();
+        assert!(!verify(b"m", &ring, &pseudo, &tampered_d));
     }
 
     #[test]
