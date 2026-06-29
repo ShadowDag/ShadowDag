@@ -1164,12 +1164,13 @@ impl ExecutionEnvironment {
             };
         }
 
-        // NOTE: Reentrancy guard is NOT checked here. It is checked and
-        // managed at each CALL/STATICCALL/CREATE site within the opcode
-        // handlers below. This ensures proper insert-before + remove-after
-        // semantics without modifying 121 return points in execute_frame.
-        // See the `reentrant_guard` insert/remove pairs at CALL, CALLCODE,
-        // DELEGATECALL, STATICCALL, CREATE, and CREATE2 handlers.
+        // NOTE: the reentrancy guard is NOT managed inside execute_frame. Both
+        // child frames (CALL/STATICCALL/CALLCODE/CREATE/CREATE2 opcode handlers)
+        // AND top-level entries (executor::deploy/call, FullNode Contract*) invoke
+        // `execute_frame_guarded`, which performs the single insert-before /
+        // remove-after of `ctx.address` for non-delegate frames. Routing the
+        // top-level entry through the guard is what protects the entry-point
+        // contract itself from A->B->A reentrancy.
 
         // Register the frame's caller, storage address, and code address
         // in the runtime address registry so that every later CALLER /
@@ -5893,6 +5894,42 @@ mod tests {
             }
             other => panic!("expected Success, got {:?}", other),
         }
+    }
+
+    // Reentrancy guard must protect the ENTRY-POINT contract, not just child
+    // frames. Top-level entries now run via execute_frame_guarded, which
+    // registers the address; a re-entry into a registered address is rejected.
+    #[test]
+    fn reentrancy_guard_blocks_reentry_to_registered_address() {
+        let mut env = make_env();
+        // Trivial program: PUSH1 0 (size), PUSH1 0 (offset), RETURN → Success.
+        env.state
+            .set_code("victim", vec![0x10, 0, 0x10, 0, 0xB6])
+            .unwrap();
+        let ctx = CallContext {
+            address: "victim".into(),
+            code_address: "victim".into(),
+            caller: "user".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
+        };
+        // Fresh guarded entry succeeds and leaves the guard clean on exit.
+        assert!(matches!(
+            env.execute_frame_guarded(&ctx),
+            CallOutcome::Success { .. }
+        ));
+        assert!(!env.reentrant_guard.contains("victim"));
+        // With the entry address already registered (as a top-level entry now
+        // does for the duration of its frame), a re-entry MUST be rejected.
+        env.reentrant_guard.insert("victim".to_string());
+        assert!(matches!(
+            env.execute_frame_guarded(&ctx),
+            CallOutcome::Failure { .. }
+        ));
     }
 
     // M-P0-9 — DELEGATECALL to an empty-code target must NOT issue

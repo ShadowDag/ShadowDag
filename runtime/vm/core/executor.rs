@@ -234,7 +234,10 @@ impl Executor {
         };
 
         // Phase 2: Run the constructor.
-        let outcome = env.execute_frame(&ctx);
+        // Route the top-level entry through the reentrancy guard so the entry
+        // contract itself is registered — otherwise an A->B->A re-entry into the
+        // entry-point contract is NOT caught (the guard only covered child frames).
+        let outcome = env.execute_frame_guarded(&ctx);
 
         // Phase 3: On success, replace the init code with the returned
         // runtime code (if any) and — if `persist` is set — commit the
@@ -462,7 +465,10 @@ impl Executor {
             is_delegate: false,
         };
 
-        let outcome = env.execute_frame(&ctx);
+        // Route the top-level entry through the reentrancy guard so the entry
+        // contract itself is registered — otherwise an A->B->A re-entry into the
+        // entry-point contract is NOT caught (the guard only covered child frames).
+        let outcome = env.execute_frame_guarded(&ctx);
 
         // Convert CallOutcome to ExecutionResult and persist on success
         // (only when `persist` is set — simulate_call skips this step

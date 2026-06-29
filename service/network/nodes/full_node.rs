@@ -1910,7 +1910,10 @@ impl FullNode {
                     };
 
                     // Phase 2: Run the constructor.
-                    let outcome = env.execute_frame(&call_ctx);
+                    // Route the top-level entry through the reentrancy guard so the
+                    // entry contract is registered (closes the A->B->A entry-point
+                    // reentrancy gap; child frames already use the guarded path).
+                    let outcome = env.execute_frame_guarded(&call_ctx);
                     let exec_result = match outcome {
                         CallOutcome::Success {
                             gas_used,
@@ -2215,7 +2218,10 @@ impl FullNode {
                         is_delegate: false,
                     };
 
-                    let outcome = env.execute_frame(&call_ctx);
+                    // Route the top-level entry through the reentrancy guard so the
+                    // entry contract is registered (closes the A->B->A entry-point
+                    // reentrancy gap; child frames already use the guarded path).
+                    let outcome = env.execute_frame_guarded(&call_ctx);
                     let exec_result = match outcome {
                         CallOutcome::Success {
                             gas_used,
