@@ -283,6 +283,25 @@ impl Wallet {
                 }
             }
         }
+
+        // Mark any of our confidential UTXOs spent if their key image appears in
+        // this tx's inputs (handles our own sends + sends from another device
+        // sharing the seed). The key image is deterministic from (spend_secret,
+        // one_time_pubkey), matching what the builder/consensus uses.
+        let input_kis: std::collections::HashSet<&str> = tx
+            .inputs
+            .iter()
+            .filter_map(|i| i.key_image.as_deref())
+            .collect();
+        if !input_kis.is_empty() {
+            for u in self.confidential_utxos.iter_mut().filter(|u| !u.spent) {
+                if let Some(ki) = confidential_key_image_hex(&ck, u) {
+                    if input_kis.contains(ki.as_str()) {
+                        u.spent = true;
+                    }
+                }
+            }
+        }
         found
     }
 
@@ -1192,9 +1211,93 @@ fn scalar_from_hex(s: &str) -> Option<Scalar> {
     Option::from(Scalar::from_canonical_bytes(arr))
 }
 
+/// Compute the on-chain key image (hex) for one of our confidential UTXOs, using
+/// the SAME derivation the builder/consensus use:
+/// `key_image(spend_secret, one_time_pubkey)`. The spend secret is recovered
+/// from the stored ephemeral pubkey. Returns None if any decode/recovery fails.
+fn confidential_key_image_hex(ck: &InvisibleWallet, u: &ConfidentialUtxo) -> Option<String> {
+    let otk = point_from_hex(&u.one_time_pubkey)?;
+    let eph = point_from_hex(&u.ephemeral_pubkey)?;
+    let spend_secret = ck.derive_spend_key_for(&eph).ok()?;
+    let ki = crate::engine::privacy::ringct::dual_clsag::key_image(&spend_secret, &otk);
+    Some(hex::encode(ki.compress().as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scanning_own_spend_marks_utxo_spent() {
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::utxo::utxo_set::UtxoSet;
+        use crate::engine::privacy::ringct::builder::{
+            build_confidential_transaction, ConfRecipient, OwnedInput,
+        };
+        use crate::engine::privacy::ringct::dual_clsag::RingMember;
+        use curve25519_dalek::ristretto::RistrettoPoint;
+        use curve25519_dalek::{constants::RISTRETTO_BASEPOINT_POINT as G, scalar::Scalar};
+        use rand::rngs::OsRng;
+
+        let net = NetworkMode::Mainnet;
+        let h = crate::engine::privacy::confidential::pedersen::generator_h();
+        let set = UtxoSet::new_empty();
+        let rec = |set: &UtxoSet, pk: RistrettoPoint, c: RistrettoPoint| {
+            set.record_confidential_output_indexed(
+                &hex::encode(pk.compress().as_bytes()),
+                &hex::encode(c.compress().as_bytes()),
+            )
+            .unwrap();
+        };
+        for _ in 0..8 {
+            rec(&set, Scalar::random(&mut OsRng) * G, Scalar::from(9u64) * h + Scalar::random(&mut OsRng) * G);
+        }
+
+        let mut a = Wallet::new("mainnet");
+        a.restore_from_seed(vec![44u8; 32]).unwrap();
+        let ack = a.confidential_keys().unwrap();
+        let mut b = Wallet::new("mainnet");
+        b.restore_from_seed(vec![55u8; 32]).unwrap();
+
+        // Seed A's 100-output and scan it in.
+        let spend = Scalar::random(&mut OsRng);
+        let bl = Scalar::random(&mut OsRng);
+        let real_pk = spend * G;
+        let real_c = Scalar::from(100u64) * h + bl * G;
+        rec(&set, real_pk, real_c);
+        let mut ring = crate::engine::privacy::ringct::decoy::select_decoys(
+            &set,
+            4,
+            &[hex::encode(real_pk.compress().as_bytes())],
+        )
+        .unwrap();
+        ring.push(RingMember { public_key: real_pk, commitment: real_c });
+        let ri = ring.len() - 1;
+        let seed_tx = build_confidential_transaction(
+            vec![OwnedInput { spend_secret: spend, amount: 100, blinding: bl, ring, real_index: ri }],
+            vec![ConfRecipient { view_pub: ack.view_public(), spend_pub: ack.spend_public(), amount: 100 }],
+            0,
+            &net,
+        )
+        .unwrap();
+        for out in &seed_tx.outputs {
+            rec(
+                &set,
+                point_from_hex(out.one_time_pubkey.as_ref().unwrap()).unwrap(),
+                point_from_hex(out.commitment.as_ref().unwrap()).unwrap(),
+            );
+        }
+        assert_eq!(a.scan_confidential(&seed_tx).len(), 1);
+        assert_eq!(a.confidential_balance(), 100);
+
+        // A spends 100 to B (no change). Scanning that tx must mark A's UTXO spent.
+        let tx = a
+            .build_confidential_send(&b.confidential_receive_address().unwrap(), 100, 0, &set)
+            .unwrap();
+        a.scan_confidential(&tx);
+        assert_eq!(a.confidential_balance(), 0, "spent UTXO must drop from balance");
+        assert!(a.confidential_utxos().iter().all(|u| u.spent));
+    }
 
     #[test]
     fn full_confidential_roundtrip_a_to_b_then_b_spends() {
