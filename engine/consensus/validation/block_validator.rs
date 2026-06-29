@@ -1144,42 +1144,24 @@ impl BlockValidator {
     /// secret hash format is checked, not whether the output actually locks
     /// funds to the correct HTLC address derived from the secret hash and
     /// participants' public keys.
-    fn validate_swap_tx(tx: &Transaction, network: &NetworkMode) -> Result<(), ConsensusError> {
-        TxValidator::validate_swap_payload(tx)?;
-        // 1. Must have payload_hash (HTLC secret hash)
-        let _secret_hash = tx.payload_hash.as_ref().ok_or_else(|| {
-            ConsensusError::BlockValidation("SwapTx missing payload_hash (HTLC secret hash)".into())
-        })?;
-        // 3. Must have at least one output (the HTLC lock)
-        if tx.outputs.is_empty() {
-            return Err(ConsensusError::BlockValidation(
-                "SwapTx must have at least one output".into(),
-            ));
-        }
-        // 3b. First output must lock funds to an HTLC address for this network.
-        let required_prefix = match network {
-            NetworkMode::Mainnet => "SD1h",
-            NetworkMode::Testnet => "ST1h",
-            NetworkMode::Regtest => "SR1h",
-        };
-        if let Some(first_output) = tx.outputs.first() {
-            let addr = crate::domain::address::address::Address::new(first_output.address.clone());
-            if !addr.is_valid() || !first_output.address.starts_with(required_prefix) {
-                return Err(ConsensusError::BlockValidation(
-                    format!(
-                        "SwapTx first output must lock funds to HTLC address ({} prefix)",
-                        required_prefix
-                    ),
-                ));
-            }
-        }
-        // 4. Must not be coinbase
-        if tx.is_coinbase {
-            return Err(ConsensusError::BlockValidation(
-                "SwapTx cannot be coinbase".into(),
-            ));
-        }
-        Ok(())
+    fn validate_swap_tx(_tx: &Transaction, _network: &NetworkMode) -> Result<(), ConsensusError> {
+        // DISABLED AT CONSENSUS (security): an atomic-swap (SwapTx) locks its
+        // first output to a P2SH/HTLC address (SD1h/ST1h/SR1h), but the spend-time
+        // ownership check (verify_input_ownership_by_address) only matches standard
+        // Ed25519 addresses — a 44-char SD1h address can never equal a derived
+        // 43-char SD1 address — so HTLC outputs are PERMANENTLY UNSPENDABLE.
+        // Moreover the HTLC engine (engine/swap/atomic_swap.rs) is in-memory only
+        // and never consulted by consensus (no secret-reveal / timeout enforcement).
+        // Accepting a SwapTx would therefore BURN the locked funds with a false
+        // "trustless swap" guarantee. Reject it until a real HTLC redeem/refund
+        // spend path exists, enforced in BOTH apply_block_dag_ordered AND
+        // validate_block_utxos (preimage+recipient-sig before timeout, or
+        // sender-sig after).
+        Err(ConsensusError::BlockValidation(
+            "atomic-swap (SwapTx) is disabled: HTLC outputs are unspendable; \
+             rejected to prevent fund loss until an HTLC spend path is implemented"
+                .into(),
+        ))
     }
 
     /// Validate a DEX order transaction's payload.
@@ -1454,20 +1436,13 @@ mod tests {
     }
 
     #[test]
-    fn swap_tx_requires_network_specific_htlc_prefix_testnet() {
-        let tx = make_swap_tx_with_prefix("SD1h");
-        let err = BlockValidator::validate_swap_tx(&tx, &NetworkMode::Testnet).unwrap_err();
-        assert!(
-            err.to_string().contains("ST1h"),
-            "expected testnet HTLC prefix enforcement, got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn swap_tx_accepts_network_specific_htlc_prefix_testnet() {
+    fn swap_tx_rejected_to_prevent_burn() {
+        // HTLC atomic swaps have no on-chain spend path; SD1h/ST1h outputs are
+        // unspendable, so SwapTx is rejected at consensus to prevent fund loss.
         let tx = make_swap_tx_with_prefix("ST1h");
-        assert!(BlockValidator::validate_swap_tx(&tx, &NetworkMode::Testnet).is_ok());
+        assert!(BlockValidator::validate_swap_tx(&tx, &NetworkMode::Testnet).is_err());
+        let tx2 = make_swap_tx_with_prefix("SD1h");
+        assert!(BlockValidator::validate_swap_tx(&tx2, &NetworkMode::Mainnet).is_err());
     }
 
     // ─────────────────────────────────────────
