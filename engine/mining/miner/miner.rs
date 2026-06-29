@@ -58,9 +58,11 @@ impl Miner {
                 u64::MAX
             }
         };
-        let miner_reward = (reward
-            * crate::config::consensus::consensus_params::ConsensusParams::MINER_PERCENT)
-            / 100;
+        // u128 intermediate: `reward` may be u64::MAX (capped above on overflow),
+        // so `reward * MINER_PERCENT` would itself overflow in u64.
+        let miner_reward = ((reward as u128
+            * crate::config::consensus::consensus_params::ConsensusParams::MINER_PERCENT as u128)
+            / 100) as u64;
         let owner_reward = reward - miner_reward;
 
         let hash = Self::coinbase_hash(
@@ -160,7 +162,7 @@ impl Miner {
             if !dag_manager.block_exists(parent_hash) {
                 return Err(ConsensusError::Other(format!(
                     "Parent block {} not found in DAG",
-                    &parent_hash[..parent_hash.len().min(16)]
+                    parent_hash.chars().take(16).collect::<String>()
                 )));
             }
         }

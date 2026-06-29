@@ -1186,8 +1186,11 @@ impl PayoutCalculator {
         block_reward: u64,
         pool_fee_pct: u64,
     ) -> HashMap<String, u64> {
-        let pool_fee = block_reward * pool_fee_pct / 100;
-        let distributable = block_reward - pool_fee;
+        // u128 + clamp + saturating: avoid overflow on the multiply and
+        // underflow if a misconfigured pool_fee_pct exceeds 100.
+        let pct = pool_fee_pct.min(100);
+        let pool_fee = ((block_reward as u128 * pct as u128) / 100) as u64;
+        let distributable = block_reward.saturating_sub(pool_fee);
         let total_shares: u64 = match workers
             .values()
             .try_fold(0u64, |acc, w| acc.checked_add(w.shares_accepted))
@@ -1223,8 +1226,11 @@ impl PayoutCalculator {
         pool_fee_pct: u64,
         window_size: u64,
     ) -> HashMap<String, u64> {
-        let pool_fee = block_reward * pool_fee_pct / 100;
-        let distributable = block_reward - pool_fee;
+        // u128 + clamp + saturating: avoid overflow on the multiply and
+        // underflow if a misconfigured pool_fee_pct exceeds 100.
+        let pct = pool_fee_pct.min(100);
+        let pool_fee = ((block_reward as u128 * pct as u128) / 100) as u64;
+        let distributable = block_reward.saturating_sub(pool_fee);
 
         let total_shares: u64 = match workers
             .values()
