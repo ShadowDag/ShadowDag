@@ -474,12 +474,10 @@ impl Mempool {
             }
         }
 
-        // ── L2 Structural: signature verification (prevents flood) ───
-        if !tx.is_coinbase() && !TxValidator::verify_signatures_for_network(tx, &self.network) {
-            return false;
-        }
-
-        // ── L4 Execution: fee + fee_rate check ──────────────────────
+        // ── L4 Execution: fee + fee_rate check (CHEAP — run before crypto) ──
+        // These run BEFORE signature verification so that flood traffic priced
+        // below the relay floor is rejected without spending CPU on an expensive
+        // signature check (DoS amplification otherwise).
         if tx.fee < MIN_RELAY_FEE {
             return false;
         }
@@ -491,7 +489,7 @@ impl Mempool {
             return false;
         }
 
-        // ── L5 Anti-spam: per-sender rate limit ─────────────────────
+        // ── L5 Anti-spam: per-sender rate limit (CHEAP — run before crypto) ──
         // Prevents a single wallet from monopolizing the pool with
         // cheap TXs. Legitimate batching (25 TXs) is still allowed.
         // Checks ALL unique owners across inputs to prevent bypass via
@@ -500,6 +498,13 @@ impl Mempool {
             if self.sender_tx_count(sender) >= MAX_TXS_PER_SENDER {
                 return false;
             }
+        }
+
+        // ── L2 Structural: signature verification (EXPENSIVE — last gate) ───
+        // Performed after the cheap fee/quota filters above so spam is dropped
+        // before any crypto work.
+        if !tx.is_coinbase() && !TxValidator::verify_signatures_for_network(tx, &self.network) {
+            return false;
         }
 
         // ── Serialize first to know exact byte size ────────────────
@@ -767,16 +772,36 @@ impl Mempool {
     }
 
     pub fn remove_transaction(&self, txid: &str) {
-        // BUG FIX: Cascade removal to dependent transactions (children that
-        // spend this TX's outputs). Without this, removing a parent leaves
-        // orphaned children in the pool whose inputs no longer exist,
-        // causing block template validation failures.
-        let dependents = self.get_dependents(txid);
-        for dep_txid in &dependents {
-            // Recursive call handles transitive dependents (grandchildren, etc.)
-            self.remove_transaction(dep_txid);
+        // Cascade removal to dependent transactions (children that spend this
+        // TX's outputs), transitively. Without this, removing a parent leaves
+        // orphaned children whose inputs no longer exist.
+        //
+        // DoS hardening: this was previously recursive, so a deep dependency
+        // chain (depth bounded only by pool capacity — tens of thousands) could
+        // overflow the stack. Collect the transitive closure ITERATIVELY with an
+        // explicit work stack, then delete each tx's own records.
+        let mut to_remove: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack: Vec<String> = vec![txid.to_string()];
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur.clone()) {
+                continue;
+            }
+            for dep in self.get_dependents(&cur) {
+                if !seen.contains(&dep) {
+                    stack.push(dep);
+                }
+            }
+            to_remove.push(cur);
         }
+        for id in &to_remove {
+            self.remove_single_tx(id);
+        }
+    }
 
+    /// Delete a single transaction's records from the pool (no cascade).
+    /// Callers that need cascade removal use `remove_transaction`.
+    fn remove_single_tx(&self, txid: &str) {
         if let Some(tx) = self.get_transaction(txid) {
             // Compute byte size for counter update
             let tx_bytes = bincode::serialize(&tx).map(|d| d.len() as u64).unwrap_or(0);
@@ -1846,6 +1871,29 @@ mod cpfp_tests {
         let id = CTR.fetch_add(1, Ordering::Relaxed);
         let path = format!("/tmp/test_cpfp_{}_{}_{}", label, ts(), id);
         Mempool::try_new(path.as_str()).expect("test pool")
+    }
+
+    #[test]
+    fn remove_transaction_handles_deep_dependency_chain_iteratively() {
+        // Regression: remove_transaction was recursive, so a deep dependency
+        // chain would overflow the stack. The iterative closure must remove the
+        // whole chain (and not crash) regardless of depth.
+        let mp = pool("deep_chain");
+        let depth = 1500;
+        let root = coinbase("chain_0", 500);
+        assert!(mp.add_transaction_test(&root));
+        for i in 1..depth {
+            let tx = child_tx(&format!("chain_{}", i), &format!("chain_{}", i - 1), 0, 500);
+            assert!(mp.add_transaction_test(&tx));
+        }
+        mp.remove_transaction("chain_0");
+        for i in 0..depth {
+            assert!(
+                mp.get_transaction(&format!("chain_{}", i)).is_none(),
+                "tx chain_{} must be removed by cascade",
+                i
+            );
+        }
     }
 
     #[test]
