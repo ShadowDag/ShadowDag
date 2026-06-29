@@ -134,6 +134,19 @@ fn try_register_inbound_ip(ip: &str) -> bool {
     true
 }
 
+/// True if `addr` is a routable `host:port` SocketAddr suitable for the peer
+/// store. Rejects unparseable/garbage strings (which would otherwise bloat the
+/// peer DB unbounded) and loopback/unspecified/multicast addresses.
+fn is_routable_peer_addr(addr: &str) -> bool {
+    match addr.parse::<std::net::SocketAddr>() {
+        Ok(sa) => {
+            let ip = sa.ip();
+            !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()
+        }
+        Err(_) => false,
+    }
+}
+
 /// Release one live inbound connection for `ip` (call exactly once per
 /// successful `try_register_inbound_ip`).
 fn release_inbound_ip(ip: &str) {
@@ -1762,13 +1775,34 @@ impl P2P {
                     );
                     return Ok(());
                 }
-                // Queue addresses for the daemon event loop to feed to PeerManager
+                // Queue addresses for the daemon event loop to feed to PeerManager.
+                // SECURITY: only enqueue entries that parse as a ROUTABLE
+                // SocketAddr. validate_addr_list checks list length only — without
+                // this per-entry check, arbitrary garbage strings get persisted as
+                // peer records (each distinct string is a unique "ip", so the
+                // per-IP cap never trips), letting a handshaked peer grow the peer
+                // DB without bound (disk exhaustion) and poison peer selection.
                 {
                     let mut q = RECEIVED_ADDRS.lock();
+                    let mut rejected = 0u32;
                     for addr in peers {
+                        if !is_routable_peer_addr(addr) {
+                            rejected = rejected.saturating_add(1);
+                            continue;
+                        }
                         if q.len() < 4096 {
                             q.push(addr.clone());
                         }
+                    }
+                    drop(q);
+                    if rejected > 0 {
+                        // Penalize peers that send invalid/garbage addresses.
+                        DOS_GUARD.add_ban_score_cat(
+                            peer,
+                            (rejected as u64).min(50),
+                            "invalid addr entries",
+                            BanCategory::Malformed,
+                        );
                     }
                 }
                 slog_debug!("p2p", "received_addresses", count => peers.len(), addr => peer);
@@ -2252,6 +2286,23 @@ mod tests {
         }
         // Over-release must not underflow/panic.
         release_inbound_ip(ip);
+    }
+
+    #[test]
+    fn addr_routability_filter_rejects_garbage_and_unroutable() {
+        // Valid routable addresses are accepted.
+        assert!(is_routable_peer_addr("203.0.113.9:9333"));
+        assert!(is_routable_peer_addr("[2001:db8::1]:9333"));
+        // Garbage / unparseable strings are rejected (they would otherwise bloat
+        // the peer DB unbounded — each distinct string a unique "ip").
+        assert!(!is_routable_peer_addr("not-an-address"));
+        assert!(!is_routable_peer_addr(""));
+        assert!(!is_routable_peer_addr("AAAA".repeat(50).as_str()));
+        assert!(!is_routable_peer_addr("1.2.3.4")); // no port
+        // Loopback / unspecified / multicast are rejected.
+        assert!(!is_routable_peer_addr("127.0.0.1:9333"));
+        assert!(!is_routable_peer_addr("0.0.0.0:9333"));
+        assert!(!is_routable_peer_addr("224.0.0.1:9333"));
     }
 
     #[test]
