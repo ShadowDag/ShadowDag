@@ -146,6 +146,22 @@ fn release_inbound_ip(ip: &str) {
     }
 }
 
+/// Deserialize untrusted wire bytes with a byte limit equal to the input
+/// length. Plain `bincode::deserialize` reads an inner collection's length
+/// prefix and may pre-allocate `Vec::with_capacity(len)` from it — a single
+/// (already size-capped) message could declare a huge inner length and trigger
+/// an OOM abort. Capping the limit at the buffer's own size makes any inner
+/// length larger than the buffer fail cleanly, and is wire-compatible with
+/// `bincode::serialize` (fixint encoding, reject trailing) — proven by the
+/// `bounded_deserialize_wire_compatible` test.
+fn bounded_deserialize<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::Error> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(bytes.len() as u64)
+        .deserialize(bytes)
+}
+
 /// Drain all pending transactions received by P2P (call from node main loop).
 /// Returns (peer_id, transaction) tuples for ban attribution.
 /// Thread-safe: works from ANY thread, not just the one that pushed.
@@ -1476,8 +1492,8 @@ impl P2P {
         validate_payload_checksum(&payload, header.checksum)
             .map_err(|pe| NetworkError::Serialization(format!("[Protocol] {}", pe)))?;
 
-        // 8. Deserialize payload (bincode)
-        let msg: P2PMessage = bincode::deserialize(&payload).map_err(|e| {
+        // 8. Deserialize payload (bincode, allocation-bounded)
+        let msg: P2PMessage = bounded_deserialize(&payload).map_err(|e| {
             NetworkError::Serialization(format!("[Protocol] {} deserialize failed: {}", cmd, e))
         })?;
 
@@ -1790,7 +1806,7 @@ impl P2P {
 
             // ── Tx: DagShield pre-validation + queue management ────��───
             P2PMessage::Tx { data } => {
-                match bincode::deserialize::<Transaction>(&data) {
+                match bounded_deserialize::<Transaction>(&data) {
                     Ok(tx) => {
                         match DagShield::pre_validate_tx(&tx) {
                             Ok(()) => {
@@ -1849,7 +1865,7 @@ impl P2P {
 
             // ── Block: DagShield pre-validation + queue management ──────
             P2PMessage::Block { data } => {
-                match bincode::deserialize::<Block>(&data) {
+                match bounded_deserialize::<Block>(&data) {
                     Ok(block) => {
                         match DagShield::pre_validate_block(&block) {
                             Ok(()) => {
@@ -2236,5 +2252,23 @@ mod tests {
         }
         // Over-release must not underflow/panic.
         release_inbound_ip(ip);
+    }
+
+    #[test]
+    fn bounded_deserialize_wire_compatible() {
+        // Proves bounded_deserialize round-trips data produced by the
+        // bincode::serialize used on the send side (same wire format).
+        let msg = P2PMessage::Ping { nonce: 0xdead_beef };
+        let bytes = bincode::serialize(&msg).expect("serialize");
+        let back: P2PMessage = bounded_deserialize(&bytes).expect("bounded deserialize");
+        assert!(matches!(back, P2PMessage::Ping { nonce } if nonce == 0xdead_beef));
+
+        // A buffer whose declared inner length exceeds the buffer must fail
+        // cleanly (not allocate). Vec<u8> with a fixint length prefix of
+        // u64::MAX followed by no data:
+        let mut evil = Vec::new();
+        evil.extend_from_slice(&u64::MAX.to_le_bytes()); // claimed length
+        let r: Result<Vec<u8>, _> = bounded_deserialize(&evil);
+        assert!(r.is_err(), "oversized inner length must be rejected, not allocated");
     }
 }
