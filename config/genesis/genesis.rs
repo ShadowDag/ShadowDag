@@ -194,6 +194,7 @@ fn build_coinbase(p: &GenesisParams) -> Transaction {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
             },
             // Output 1: Developer reward (5%)
             TxOutput {
@@ -202,6 +203,7 @@ fn build_coinbase(p: &GenesisParams) -> Transaction {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
             },
         ],
         fee: 0,

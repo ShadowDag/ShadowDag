@@ -82,6 +82,7 @@ impl Miner {
                     commitment: None,
                     range_proof: None,
                     ephemeral_pubkey: None,
+                    one_time_pubkey: None,
                 },
                 TxOutput {
                     address: self.owner_reward_address.clone(),
@@ -89,6 +90,7 @@ impl Miner {
                     commitment: None,
                     range_proof: None,
                     ephemeral_pubkey: None,
+                    one_time_pubkey: None,
                 },
             ],
             fee: 0,

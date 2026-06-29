@@ -97,6 +97,7 @@ pub fn build_transaction_with_anchor(
             commitment: None,
             range_proof: None,
             ephemeral_pubkey: None,
+            one_time_pubkey: None,
         })
         .collect();
 
@@ -111,6 +112,8 @@ pub fn build_transaction_with_anchor(
             key_image: None,
             ring_members: None,
             ring_signature: None,
+            ring_commitments: None,
+            pseudo_commitment: None,
         })
         .collect();
 
@@ -265,6 +268,7 @@ pub fn build_coinbase_at_height(
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
             },
             TxOutput {
                 address: dev_address,
@@ -272,6 +276,7 @@ pub fn build_coinbase_at_height(
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
             },
         ],
         0,

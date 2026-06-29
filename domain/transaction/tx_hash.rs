@@ -226,6 +226,8 @@ mod tests {
                 key_image: None,
                 ring_members: None,
                 ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
             }],
             outputs: vec![TxOutput {
                 address: "bob".to_string(),
@@ -233,6 +235,7 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
             }],
             fee: 1,
             timestamp: 1_735_689_600,
@@ -271,6 +274,7 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
             }],
             fee: 1,
             timestamp: tx1.timestamp,
@@ -363,6 +367,8 @@ mod tests {
                 key_image: None,
                 ring_members: None,
                 ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
             },
             TxInput {
                 txid: "tx_bbb".into(),
@@ -373,6 +379,8 @@ mod tests {
                 key_image: None,
                 ring_members: None,
                 ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
             },
         ];
         let inputs_b = vec![
@@ -385,6 +393,8 @@ mod tests {
                 key_image: None,
                 ring_members: None,
                 ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
             },
             TxInput {
                 txid: "tx_aaa".into(),
@@ -395,6 +405,8 @@ mod tests {
                 key_image: None,
                 ring_members: None,
                 ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
             },
         ];
         let outputs = vec![TxOutput {
@@ -403,6 +415,7 @@ mod tests {
             commitment: None,
             range_proof: None,
             ephemeral_pubkey: None,
+            one_time_pubkey: None,
         }];
         let tx_a = Transaction {
             hash: String::new(),
@@ -450,6 +463,8 @@ mod tests {
                     "55".repeat(32),
                 ]),
                 ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
             }],
             outputs: vec![TxOutput::new("SD1dest".into(), 1000)],
             fee: 100,

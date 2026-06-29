@@ -262,6 +262,7 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
             }],
             fee: 1,
             timestamp: 1735689600,
@@ -301,6 +302,7 @@ mod tests {
                     commitment: None,
                     range_proof: None,
                     ephemeral_pubkey: None,
+                    one_time_pubkey: None,
                 },
                 TxOutput {
                     address: "b".into(),
@@ -308,6 +310,7 @@ mod tests {
                     commitment: None,
                     range_proof: None,
                     ephemeral_pubkey: None,
+                    one_time_pubkey: None,
                 },
                 TxOutput {
                     address: "c".into(),
@@ -315,6 +318,7 @@ mod tests {
                     commitment: None,
                     range_proof: None,
                     ephemeral_pubkey: None,
+                    one_time_pubkey: None,
                 },
             ],
             fee: 1,
@@ -377,6 +381,7 @@ mod tests {
                     commitment: None,
                     range_proof: None,
                     ephemeral_pubkey: None,
+                    one_time_pubkey: None,
                 },
                 TxOutput {
                     address: "b".into(),
@@ -384,6 +389,7 @@ mod tests {
                     commitment: None,
                     range_proof: None,
                     ephemeral_pubkey: None,
+                    one_time_pubkey: None,
                 },
                 TxOutput {
                     address: "c".into(),
@@ -391,6 +397,7 @@ mod tests {
                     commitment: None,
                     range_proof: None,
                     ephemeral_pubkey: None,
+                    one_time_pubkey: None,
                 },
             ],
             fee: 1,

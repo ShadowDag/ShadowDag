@@ -538,6 +538,7 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
             }],
             fee: 1,
             timestamp: 1735689600,

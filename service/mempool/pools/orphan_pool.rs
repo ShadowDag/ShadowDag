@@ -151,6 +151,8 @@ mod tests {
                     key_image: None,
                     ring_members: None,
                     ring_signature: None,
+                    ring_commitments: None,
+                    pseudo_commitment: None,
                 })
                 .collect(),
             outputs: vec![TxOutput {
@@ -159,6 +161,7 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
             }],
             fee: 10,
             timestamp: 1000,

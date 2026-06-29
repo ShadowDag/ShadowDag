@@ -44,9 +44,19 @@ pub struct TxInput {
     #[serde(default)]
     pub ring_members: Option<Vec<String>>,
     /// Serialized CLSAG signature (hex) for confidential inputs. None for
-    /// transparent inputs (which use `signature` = Ed25519 hex).
+    /// transparent inputs (which use `signature` = Ed25519 hex). For RingCT
+    /// confidential inputs this holds a dual-key CLSAG (embeds key images I, D).
     #[serde(default)]
     pub ring_signature: Option<String>,
+    /// RingCT: commitment C_i for each ring member, parallel to `ring_members`
+    /// (same length). ring_members[i] = P_i, ring_commitments[i] = C_i. Hex
+    /// compressed Ristretto. None for transparent inputs.
+    #[serde(default)]
+    pub ring_commitments: Option<Vec<String>>,
+    /// RingCT: per-input pseudo-output commitment C' (hex compressed Ristretto).
+    /// None for transparent inputs.
+    #[serde(default)]
+    pub pseudo_commitment: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -65,6 +75,12 @@ pub struct TxOutput {
     /// Present on stealth outputs so the recipient can perform ECDH to detect ownership.
     #[serde(default)]
     pub ephemeral_pubkey: Option<String>,
+    /// RingCT: full one-time output public key P (hex compressed Ristretto).
+    /// The `address` is a truncated hash and cannot be a ring member; this
+    /// carries the full point so the output can be a decoy and be recorded in
+    /// the on-chain output-key index. None for transparent outputs.
+    #[serde(default)]
+    pub one_time_pubkey: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -275,6 +291,28 @@ impl Transaction {
             } else {
                 buf.push(0x00);
             }
+
+            // RingCT: ring_commitments (parallel C_i) bound to the txid.
+            if let Some(ref cs) = inp.ring_commitments {
+                buf.push(0x01);
+                buf.extend_from_slice(&(cs.len() as u32).to_le_bytes());
+                for c in cs {
+                    let cb = c.as_bytes();
+                    buf.extend_from_slice(&(cb.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(cb);
+                }
+            } else {
+                buf.push(0x00);
+            }
+            // RingCT: pseudo-output commitment C'.
+            if let Some(ref pc) = inp.pseudo_commitment {
+                buf.push(0x01);
+                let pb = pc.as_bytes();
+                buf.extend_from_slice(&(pb.len() as u32).to_le_bytes());
+                buf.extend_from_slice(pb);
+            } else {
+                buf.push(0x00);
+            }
         }
 
         // 4. outputs — in original order (order matters for output indices)
@@ -306,6 +344,14 @@ impl Transaction {
                 buf.push(0x01);
                 buf.extend_from_slice(&(epk.len() as u32).to_le_bytes());
                 buf.extend_from_slice(epk.as_bytes());
+            } else {
+                buf.push(0x00);
+            }
+            // RingCT: full one-time output pubkey P.
+            if let Some(ref otk) = out.one_time_pubkey {
+                buf.push(0x01);
+                buf.extend_from_slice(&(otk.len() as u32).to_le_bytes());
+                buf.extend_from_slice(otk.as_bytes());
             } else {
                 buf.push(0x00);
             }
@@ -405,6 +451,8 @@ impl TxInput {
             key_image: None,
             ring_members: None,
             ring_signature: None,
+            ring_commitments: None,
+            pseudo_commitment: None,
         }
     }
 
@@ -427,6 +475,8 @@ impl TxInput {
             key_image: Some(key_image),
             ring_members: Some(ring_members),
             ring_signature: None,
+            ring_commitments: None,
+            pseudo_commitment: None,
         }
     }
 }
@@ -440,6 +490,7 @@ impl TxOutput {
             commitment: None,
             range_proof: None,
             ephemeral_pubkey: None,
+            one_time_pubkey: None,
         }
     }
 
@@ -451,6 +502,7 @@ impl TxOutput {
             commitment: Some(commitment),
             range_proof: Some(range_proof),
             ephemeral_pubkey: None,
+            one_time_pubkey: None,
         }
     }
 
@@ -477,6 +529,8 @@ mod tests {
                 key_image: Some("11".repeat(32)),
                 ring_members: Some(vec!["22".repeat(32)]),
                 ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
             }],
             vec![TxOutput::new("SD1x".into(), 10)],
             1,
@@ -486,5 +540,41 @@ mod tests {
         tx.inputs[0].ring_signature = Some("abcd".into());
         let after = tx.canonical_bytes();
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn ringct_input_fields_change_canonical_bytes() {
+        let mut tx = Transaction::new(
+            String::new(),
+            vec![TxInput {
+                txid: "b".repeat(64),
+                index: 0,
+                owner: "SD1o".into(),
+                signature: String::new(),
+                pub_key: String::new(),
+                key_image: Some("11".repeat(32)),
+                ring_members: Some(vec!["22".repeat(32)]),
+                ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
+            }],
+            vec![TxOutput::new("SD1x".into(), 10)],
+            1,
+            0,
+        );
+        let base = tx.canonical_bytes();
+        tx.inputs[0].ring_commitments = Some(vec!["33".repeat(32)]);
+        let after_rc = tx.canonical_bytes();
+        assert_ne!(base, after_rc);
+        tx.inputs[0].pseudo_commitment = Some("44".repeat(32));
+        assert_ne!(after_rc, tx.canonical_bytes());
+    }
+
+    #[test]
+    fn ringct_output_one_time_pubkey_changes_canonical_bytes() {
+        let mut tx = Transaction::new(String::new(), vec![], vec![TxOutput::new("SD1x".into(), 10)], 1, 0);
+        let base = tx.canonical_bytes();
+        tx.outputs[0].one_time_pubkey = Some("55".repeat(32));
+        assert_ne!(base, tx.canonical_bytes());
     }
 }
