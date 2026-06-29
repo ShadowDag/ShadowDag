@@ -293,6 +293,25 @@ impl BlockValidator {
         Self::validate_parents(block)?;
         Self::validate_timestamp(block, ancestor_timestamps)?;
 
+        // Per-tx timestamp sanity, HEADER-RELATIVE (IBD-safe). The mempool
+        // rejects future-dated txs at entry; enforce the equivalent on the block
+        // path so a miner cannot include a tx timestamped meaningfully after the
+        // block that carries it. We bound against the BLOCK header timestamp (not
+        // wall clock) so legitimately-old historical txs are NOT rejected during
+        // IBD/replay. Coinbase is exempt (its timestamp is the block's own).
+        const MAX_TX_FUTURE_SECS: u64 = 15; // matches the mempool future bound
+        for tx in &block.body.transactions {
+            if tx.is_coinbase() {
+                continue;
+            }
+            if tx.timestamp > block.header.timestamp.saturating_add(MAX_TX_FUTURE_SECS) {
+                return Err(ConsensusError::BlockValidation(format!(
+                    "tx {} timestamp {} is after block timestamp {} (+{}s)",
+                    tx.hash, tx.timestamp, block.header.timestamp, MAX_TX_FUTURE_SECS
+                )));
+            }
+        }
+
         // Merkle root — header must commit to actual TX body
         let computed_merkle = MerkleTree::build(
             &block.body.transactions,
@@ -1587,6 +1606,26 @@ mod tests {
         // With empty ancestors, timestamp validation only checks R1+R2
         assert!(
             BlockValidator::validate_structural_layer(&block, &[], &NetworkMode::Mainnet,).is_ok()
+        );
+    }
+
+    #[test]
+    fn structural_layer_rejects_tx_timestamped_after_block() {
+        // Header-relative per-tx timestamp rule: a non-coinbase tx timestamped
+        // far after the block header must be rejected on the block path (mirrors
+        // the mempool future-timestamp rule, IBD-safe).
+        let cb = make_coinbase(5);
+        let mut tx = make_regular_tx("future_ts");
+        // Build a block first so we know the header timestamp, then push tx 1 day ahead.
+        let mut block = make_block(5, vec![cb.clone(), tx.clone()]);
+        tx.timestamp = block.header.timestamp + 86_400; // 1 day after the block
+        tx.hash = TxHash::hash_for_network(&tx, &NetworkMode::Mainnet);
+        block.body.transactions = vec![cb, tx];
+        block.header.merkle_root =
+            MerkleTree::build(&block.body.transactions, block.header.height, &block.header.parents);
+        assert!(
+            BlockValidator::validate_structural_layer(&block, &[], &NetworkMode::Mainnet).is_err(),
+            "a tx timestamped after the block header must be rejected"
         );
     }
 
