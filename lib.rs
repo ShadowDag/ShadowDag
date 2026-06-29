@@ -229,6 +229,7 @@ pub mod engine {
             pub mod key_image;
             pub mod ring_builder;
             pub mod ring_signature;
+            pub mod confidential_consensus;
             pub mod ring_validator;
             pub mod serialization;
             pub mod tx_confidential;
