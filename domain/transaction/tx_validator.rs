@@ -469,8 +469,9 @@ impl TxValidator {
         if Self::validate_contract_call_payload_for_network(tx, network).is_err() {
             return false;
         }
-        // Ring signature for confidential TXs
-        if tx.is_confidential() && !RingValidator::validate(tx) {
+        // Confidential TXs: full RingCT phase-1 gate (structural + CLSAG crypto
+        // + on-chain ring-member authenticity + key-image uniqueness).
+        if tx.is_confidential() && !Self::validate_confidential(tx, utxo_set, network) {
             return false;
         }
 
@@ -550,6 +551,55 @@ impl TxValidator {
     ///   6. Non-negative fee (inputs - outputs >= 0)
     ///   7. Empty inputs/outputs rejection (non-coinbase)
     ///   8. TX timestamp within acceptable range (anti-replay)
+    /// Full confidential (RingCT phase 1) validation for a confidential TX:
+    /// structural checks + cryptographic CLSAG verification + on-chain
+    /// ring-member authenticity (decoys must be real outputs) + key-image
+    /// uniqueness (unseen on-chain and not duplicated within the TX).
+    ///
+    /// Amounts are NOT hidden in phase 1 — the normal plaintext balance check
+    /// still applies. This function only covers sender privacy + double-spend.
+    pub fn validate_confidential(
+        tx: &Transaction,
+        utxo_set: &UtxoSet,
+        network: &NetworkMode,
+    ) -> bool {
+        // 1. Structural checks (ring sizes, key-image format/uniqueness, ...).
+        if !RingValidator::validate(tx) {
+            return false;
+        }
+        // 2. Cryptographic CLSAG verification over the canonical message.
+        if !RingValidator::verify_clsag(tx, network) {
+            return false;
+        }
+        // 3. DB-backed: ring members must be real on-chain output keys, and
+        //    key images must be unseen on-chain + unique within this TX.
+        let mut seen_in_tx = std::collections::HashSet::new();
+        for input in &tx.inputs {
+            match &input.ring_members {
+                Some(members) if !members.is_empty() => {
+                    for m in members {
+                        if !utxo_set.output_key_exists(m) {
+                            return false;
+                        }
+                    }
+                }
+                _ => return false,
+            }
+            match &input.key_image {
+                Some(ki) => {
+                    if utxo_set.key_image_seen(ki) {
+                        return false;
+                    }
+                    if !seen_in_tx.insert(ki.clone()) {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        true
+    }
+
     ///   9. payload_hash format validation (anti-replay)
     pub fn validate_transaction(tx: &Transaction, utxo_set: &UtxoSet) -> Result<(), StorageError> {
         let network = Self::infer_network_from_tx(tx, Some(utxo_set));
@@ -719,9 +769,9 @@ impl TxValidator {
         // Mandatory check: ring signatures must be valid in the consensus path.
         // block_validator already checks this, but tx_validator must also enforce
         // it so that mempool admission and standalone TX validation are safe.
-        if tx.is_confidential() && !RingValidator::validate(tx) {
+        if tx.is_confidential() && !Self::validate_confidential(tx, utxo_set, &network) {
             return Err(StorageError::Other(format!(
-                "ring signature verification failed for confidential tx {}",
+                "confidential (RingCT) verification failed for tx {}",
                 tx.hash
             )));
         }

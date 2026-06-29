@@ -6,7 +6,6 @@
 use crate::domain::transaction::transaction::Transaction;
 #[allow(deprecated)]
 use crate::engine::privacy::ringct::ring_signature::RingSignature;
-use crate::slog_error;
 
 /// Validates ring signature aspects of a transaction.
 ///
@@ -52,17 +51,13 @@ impl RingValidator {
             return false;
         }
 
-        // Log warning that we are using the legacy path (no real crypto verification).
-        // This ensures operators are aware during testnet that ring sigs are not
-        // cryptographically verified yet.
-        if tx.tx_type == crate::domain::transaction::transaction::TxType::Confidential {
-            eprintln!(
-                "[WARN] ring_validator: using LEGACY structural-only ring signature check \
-                 for confidential TX {}. CLSAG cryptographic verification is not yet wired. \
-                 See engine/privacy/ringct/clsag.rs for the real implementation.",
-                tx.hash,
-            );
-        }
+        // NOTE: This function performs STRUCTURAL checks only. Cryptographic
+        // CLSAG verification lives in `verify_clsag()`, and the full
+        // consensus gate (crypto + on-chain ring-member authenticity +
+        // key-image uniqueness) lives in `TxValidator::validate_confidential()`,
+        // which has UTXO-set access. Callers validating confidential TXs for
+        // consensus MUST use `validate_confidential`, not `validate` alone.
+
         // 2. Non-empty outputs
         if tx.outputs.is_empty() {
             return false;
@@ -115,23 +110,9 @@ impl RingValidator {
             }
         }
 
-        // CRITICAL: Real CLSAG ring signature verification is NOT YET
-        // wired. Until it is, privacy transactions MUST be rejected at
-        // the consensus layer to prevent forging ring signatures.
-        //
-        // When CLSAG verification is implemented:
-        //   1. Deserialize CLSAGSignature from each input
-        //   2. Call clsag::verify(message, ring, sig)
-        //   3. Remove this rejection gate
-        #[cfg(not(feature = "ringct_bypass"))]
-        {
-            slog_error!("privacy", "CLSAG_NOT_WIRED",
-                note => "Rejecting privacy TX: ring signature verification is structural-only. \
-                         Enable feature 'ringct_bypass' for testing only.");
-            return false;
-        }
-
-        #[allow(unreachable_code)]
+        // Structural checks passed. Cryptographic verification (CLSAG) and the
+        // DB-backed gate (ring-member authenticity + key-image uniqueness) are
+        // applied by TxValidator::validate_confidential().
         true
     }
 
@@ -261,28 +242,25 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ringct_bypass")]
-    fn accepts_matching_key_images_count() {
-        // 3 inputs, 3 key images -- should pass the count check.
-        // Requires 'ringct_bypass' feature because the CLSAG rejection
-        // gate blocks all privacy TXs when real verification isn't wired.
+    fn structural_validate_accepts_matching_key_images_count() {
+        // 3 inputs, 3 key images -- structural validate() passes (crypto is
+        // checked separately by verify_clsag / validate_confidential).
         let tx = make_confidential_tx(3);
         assert!(
             RingValidator::validate(&tx),
-            "TX with matching input/key_image counts should pass"
+            "TX with matching input/key_image counts should pass structural checks"
         );
     }
 
     #[test]
-    #[cfg(not(feature = "ringct_bypass"))]
-    fn rejects_privacy_tx_without_clsag() {
-        // Without the ringct_bypass feature, ALL privacy TXs must be
-        // rejected because CLSAG cryptographic verification is not wired.
-        let tx = make_confidential_tx(3);
-        assert!(
-            !RingValidator::validate(&tx),
-            "Privacy TX must be rejected when CLSAG is not wired"
-        );
+    fn structural_validate_rejects_garbage_ring_signature_via_crypto() {
+        use crate::config::node::node_config::NetworkMode;
+        // Structural validate() passes, but verify_clsag() rejects because the
+        // ring_signature is not a valid CLSAG over the message.
+        let mut tx = make_confidential_tx(1);
+        tx.inputs[0].ring_signature = Some("00".repeat(200));
+        assert!(RingValidator::validate(&tx));
+        assert!(!RingValidator::verify_clsag(&tx, &NetworkMode::Mainnet));
     }
 
     #[test]
