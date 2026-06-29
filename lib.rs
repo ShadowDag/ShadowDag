@@ -225,6 +225,7 @@ pub mod engine {
         }
         pub mod ringct {
             pub mod clsag;
+            pub mod dual_clsag;
             pub mod key_image;
             pub mod ring_builder;
             pub mod ring_signature;
