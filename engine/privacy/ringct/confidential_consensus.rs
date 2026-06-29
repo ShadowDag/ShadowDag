@@ -104,6 +104,17 @@ pub fn verify_confidential_tx(
     // ── Outputs: range proofs ──
     let mut output_commitments = Vec::with_capacity(tx.outputs.len());
     for output in &tx.outputs {
+        // PRIVACY INVARIANT: a confidential output's value lives ONLY in its
+        // Pedersen commitment. The plaintext `amount` field MUST be 0 — otherwise
+        // a sender could publish the true value in the clear (and downstream
+        // scanners trust it), defeating amount-hiding. Enforced in the shared
+        // gate so it holds identically on mempool, block, and reorg/apply paths.
+        if output.amount != 0 {
+            return Err(err(format!(
+                "confidential tx {}: plaintext output amount must be 0 (value is hidden in the commitment)",
+                tx.hash
+            )));
+        }
         let view = parse_confidential_output(output)
             .ok_or_else(|| err(format!("confidential tx {}: malformed output", tx.hash)))?;
         if !range_proof::verify(&view.commitment, &view.range_proof) {
@@ -233,6 +244,22 @@ mod tests {
         let tx = valid_conf_tx(&set, 100);
         let mut seen = HashSet::new();
         assert!(verify_confidential_tx(&tx, &set, &net(), &mut seen).is_ok());
+    }
+
+    #[test]
+    fn rejects_nonzero_plaintext_output_amount() {
+        // Privacy invariant: a confidential output must carry plaintext amount 0
+        // (value hidden in the commitment). A nonzero amount would leak the value.
+        let set = UtxoSet::new_empty();
+        let mut tx = valid_conf_tx(&set, 100);
+        let mut seen = HashSet::new();
+        assert!(verify_confidential_tx(&tx, &set, &net(), &mut seen).is_ok());
+        tx.outputs[0].amount = 100; // leak the real value in the clear
+        let mut seen2 = HashSet::new();
+        assert!(
+            verify_confidential_tx(&tx, &set, &net(), &mut seen2).is_err(),
+            "nonzero plaintext amount on a confidential output must be rejected"
+        );
     }
 
     #[test]

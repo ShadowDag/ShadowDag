@@ -188,11 +188,13 @@ impl DosProtection {
             }
         }
 
-        // Outputs
+        // Outputs. Confidential (RingCT) outputs carry amount=0 by design (value
+        // in the commitment); the zero-amount rejection is transparent-only.
+        let is_conf = tx.is_confidential();
         let mut total: u128 = 0;
 
         for output in &tx.outputs {
-            if output.amount == 0 {
+            if output.amount == 0 && !is_conf {
                 return DosCheckResult::fail("Zero output".to_string());
             }
 

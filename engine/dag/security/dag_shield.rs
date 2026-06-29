@@ -227,10 +227,13 @@ impl DagShield {
             return Err(ShieldRejection::minor("stale TX timestamp"));
         }
 
-        // Output amount sanity (cheap O(n))
+        // Output amount sanity (cheap O(n)). Confidential (RingCT) outputs carry
+        // amount=0 by design (value hidden in the commitment), so the zero-amount
+        // rejection applies to transparent outputs only.
+        let is_conf = tx.is_confidential();
         let mut total: u128 = 0;
         for output in &tx.outputs {
-            if output.amount == 0 {
+            if output.amount == 0 && !is_conf {
                 return Err(ShieldRejection::moderate("zero output amount"));
             }
             if output.amount > MAX_OUTPUT_AMOUNT {
