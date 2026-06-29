@@ -306,7 +306,7 @@ mod tests {
         let out = short_hash(&s);
         assert_eq!(out.chars().count(), 16);
         // A peer hash mixing ascii + multibyte around the 16-byte boundary.
-        let mixed = format!("{}{}", "ab".to_string(), "好".repeat(10));
+        let mixed = format!("ab{}", "好".repeat(10));
         let _ = short_hash(&mixed); // must not panic
     }
 

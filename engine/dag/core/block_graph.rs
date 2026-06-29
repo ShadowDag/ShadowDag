@@ -916,7 +916,7 @@ mod tests {
         let tip = format!("h{}", depth - 1);
         // Deep ancestor traversal: tip eventually reaches h0 (not the target),
         // so no cycle — but the walk is `depth` deep.
-        assert!(!g.has_cycle("not_in_chain", &[tip.clone()]));
+        assert!(!g.has_cycle("not_in_chain", std::slice::from_ref(&tip)));
         // And a real back-edge to h0 is detected across the full depth.
         assert!(g.has_cycle("h0", &[tip]));
     }
