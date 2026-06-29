@@ -69,6 +69,22 @@ seed). Contained but touches consensus difficulty — needs dedicated testing.
 callers (live path = `FullNode::process_block` → `recompute_virtual_chain` →
 `apply_block_dag_ordered`). Cleanup candidates.
 
+## Third hunt pass (fresh surfaces: tx-malleability, VM, emission, crash-atomicity, mempool-parity, privacy)
+
+### FIXED (verified + regression-tested; suite 2203 green)
+
+| # | Sev | Issue | Fix |
+|---|-----|-------|-----|
+| J | **CRIT** | **Crash-recovery bricks the node:** `verify_and_recover` compared the per-block CHAINED commitment (`utxo:commitment:{hash}`, a block-history hash) against `compute_commitment_hash()` (a set SNAPSHOT) — structurally incomparable → every restart past genesis wiped the UTXO set, replayed, still mismatched, and FATAL'd (node unbootable). | Drop the broken snapshot-vs-chained comparison; use the reorg-independent count-based integrity check (proper snapshot/Merkle UTXO commitment is future work). `daemon/mod.rs`. |
+| K | HIGH | Confidential output plaintext `amount` never forced to 0 → sender could leak the real value in the clear (scanner trusts it), defeating amount-hiding. Conversely the zero-amount spam filters had no confidential exemption, so honest amount=0 confidential outputs were rejected on the live path. | `verify_confidential_tx` rejects `amount != 0`; dag_shield/spam_filter/dos_protection make the zero-amount rejection transparent-only. |
+| L | HIGH | Reentrancy guard never covered the top-level (entry-point) contract — A→B→A drain of the entry contract was admitted (guard only registered child frames). | top-level entries (executor deploy/call, FullNode ContractCreate/ContractCall) now call `execute_frame_guarded`. |
+
+### DOCUMENTED — confirmed but NOT fixed (architecture / IBD-risk / cleanup)
+
+- **M — HIGH (crash-atomicity):** UTXO state and contract state live in SEPARATE RocksDBs committed in separate batches; a crash between the UTXO commit and the contract-persist commit leaves a contract-state hole, and recovery's idempotency skip (`get_commitment(block_hash).is_some()`) never re-executes contracts → divergent `state_root` on contract chains. Fix needs a contract-applied marker in the contract-DB batch + recovery re-execution, or unifying both DBs into one (column families) — a storage-architecture change with real risk; deferred. Documented in OPS_RUNBOOK as a manual incident today.
+- **N — MEDIUM→relay (mempool-block parity):** per-tx timestamp anti-replay/age (MAX_TX_FUTURE_SECS / MAX_TX_AGE_SECS) is enforced at mempool/P2P entry but not on the block-apply path. NOT a fork (all block validators apply the same rules) and tx.timestamp is signed, so no fund loss — relay/template inconsistency only. A naive wall-clock check on the block path would BREAK IBD (historical txs are >24h old); the safe fix is header-relative (`tx.timestamp <= block.header.timestamp + skew`) and is deferred.
+- **O — LOW (emission):** the selfish-mining / red-block reward penalty (`reward.rs` penalized_miner_reward etc.) is dead code — never wired into coinbase construction or validation. Per-block emission is still hard-capped on both validation paths, so NOT an inflation primitive; it is a missing economic deterrent. Either remove the dead module + its claims, or wire it in deterministically (on-chain blue/red + delay, not node-local timestamps).
+
 ## Overarching recommendation
 The recurring root cause is **two divergent block-application paths**: the lenient
 `apply_block_dag_ordered` (live; skips conflicts) vs the strict
