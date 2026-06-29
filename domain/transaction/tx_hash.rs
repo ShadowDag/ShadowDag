@@ -126,6 +126,87 @@ impl TxHash {
     pub fn is_correct_chain(tx: &Transaction) -> bool {
         Self::is_correct_chain_for(tx, &NetworkMode::Mainnet)
     }
+
+    /// Canonical signing message for confidential (ring-signed) inputs.
+    ///
+    /// Binds: domain tag + chain id + timestamp + fee + every output
+    /// (address/amount/commitment/ephemeral_pubkey) + every input
+    /// (outpoint/key_image/ring_members, inputs sorted by (txid,index)) +
+    /// payload_hash. EXCLUDES `ring_signature` and `signature` to avoid
+    /// circular dependence. Distinct domain tag from the transparent message,
+    /// so the two are never interchangeable.
+    pub fn confidential_signing_message_for_network(
+        tx: &Transaction,
+        network: &NetworkMode,
+    ) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"SHADOW_TX_CONF_SIGN_V1");
+        h.update(Self::chain_id_for(network).to_le_bytes());
+        h.update(tx.timestamp.to_le_bytes());
+        h.update(tx.fee.to_le_bytes());
+
+        h.update((tx.outputs.len() as u32).to_le_bytes());
+        for o in &tx.outputs {
+            let a = o.address.as_bytes();
+            h.update((a.len() as u32).to_le_bytes());
+            h.update(a);
+            h.update(o.amount.to_le_bytes());
+            for opt in [&o.commitment, &o.ephemeral_pubkey] {
+                match opt {
+                    Some(s) => {
+                        h.update([1u8]);
+                        h.update((s.len() as u32).to_le_bytes());
+                        h.update(s.as_bytes());
+                    }
+                    None => h.update([0u8]),
+                }
+            }
+        }
+
+        // Inputs sorted by (txid, index) for determinism.
+        let mut idx: Vec<usize> = (0..tx.inputs.len()).collect();
+        idx.sort_by(|&i, &j| {
+            (tx.inputs[i].txid.as_str(), tx.inputs[i].index)
+                .cmp(&(tx.inputs[j].txid.as_str(), tx.inputs[j].index))
+        });
+        h.update((tx.inputs.len() as u32).to_le_bytes());
+        for &i in &idx {
+            let inp = &tx.inputs[i];
+            let t = inp.txid.as_bytes();
+            h.update((t.len() as u32).to_le_bytes());
+            h.update(t);
+            h.update(inp.index.to_le_bytes());
+            match &inp.key_image {
+                Some(k) => {
+                    h.update([1u8]);
+                    h.update((k.len() as u32).to_le_bytes());
+                    h.update(k.as_bytes());
+                }
+                None => h.update([0u8]),
+            }
+            match &inp.ring_members {
+                Some(members) => {
+                    h.update([1u8]);
+                    h.update((members.len() as u32).to_le_bytes());
+                    for m in members {
+                        h.update((m.len() as u32).to_le_bytes());
+                        h.update(m.as_bytes());
+                    }
+                }
+                None => h.update([0u8]),
+            }
+        }
+        match &tx.payload_hash {
+            Some(p) => {
+                h.update([1u8]);
+                h.update((p.len() as u32).to_le_bytes());
+                h.update(p.as_bytes());
+            }
+            None => h.update([0u8]),
+        }
+        h.finalize().to_vec()
+    }
 }
 
 #[cfg(test)]
@@ -350,5 +431,62 @@ mod tests {
             TxHash::hash(&tx_b),
             "Input order must not affect transaction hash"
         );
+    }
+
+    fn make_confidential_tx() -> Transaction {
+        Transaction {
+            hash: "a".repeat(64),
+            inputs: vec![TxInput {
+                txid: "b".repeat(64),
+                index: 0,
+                owner: "SD1owner".into(),
+                signature: String::new(),
+                pub_key: String::new(),
+                key_image: Some("11".repeat(32)),
+                ring_members: Some(vec![
+                    "22".repeat(32),
+                    "33".repeat(32),
+                    "44".repeat(32),
+                    "55".repeat(32),
+                ]),
+                ring_signature: None,
+            }],
+            outputs: vec![TxOutput::new("SD1dest".into(), 1000)],
+            fee: 100,
+            timestamp: 1_735_689_600,
+            is_coinbase: false,
+            tx_type: TxType::Confidential,
+            payload_hash: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn confidential_message_is_deterministic() {
+        let tx = make_confidential_tx();
+        let net = NetworkMode::Mainnet;
+        let a = TxHash::confidential_signing_message_for_network(&tx, &net);
+        let b = TxHash::confidential_signing_message_for_network(&tx, &net);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 32);
+    }
+
+    #[test]
+    fn confidential_message_differs_from_transparent() {
+        let tx = make_confidential_tx();
+        let net = NetworkMode::Mainnet;
+        let conf = TxHash::confidential_signing_message_for_network(&tx, &net);
+        let transp = TxHash::signing_message_for_network(&tx, &net);
+        assert_ne!(conf, transp);
+    }
+
+    #[test]
+    fn confidential_message_binds_key_image() {
+        let mut tx = make_confidential_tx();
+        let net = NetworkMode::Mainnet;
+        let before = TxHash::confidential_signing_message_for_network(&tx, &net);
+        tx.inputs[0].key_image = Some("ff".repeat(32));
+        let after = TxHash::confidential_signing_message_for_network(&tx, &net);
+        assert_ne!(before, after);
     }
 }
