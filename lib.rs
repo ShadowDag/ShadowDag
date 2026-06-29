@@ -229,6 +229,7 @@ pub mod engine {
             pub mod ring_builder;
             pub mod ring_signature;
             pub mod ring_validator;
+            pub mod serialization;
         }
         pub mod shadow_pool {
             pub mod mixer;
