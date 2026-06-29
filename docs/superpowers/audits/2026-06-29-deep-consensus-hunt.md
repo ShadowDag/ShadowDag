@@ -288,6 +288,34 @@ conservation, gas metering, contract storage/state isolation/rollback,
 deploy/dispatch determinism. No money-creation/theft, no node-abort/panic, no
 honest-node consensus divergence found.
 
+## Deferred-set remediation (mainnet hardening) — progress
+
+- **FC1 (cumulative-work fork choice) — DONE.** Implemented heaviest-chain rule:
+  `cumulative_work(b) = cwork(selected_parent) + header.difficulty`, memoized
+  (pure function of immutable ancestry → reorg-safe, restart-stable). `select_best_tip`
+  ranks cumulative-work → blue_score → height → hash; `should_keep_current_tip_on_tie`
+  requires equal cumulative work; the daemon recovery path uses the SAME static
+  `select_best_tip_inner` so runtime + recovery agree. Tests added; suite 2218 green.
+  STILL requires external review + multi-node testnet before mainnet.
+- **FC2 (finality) — core already enforced; verified.** Deep-reorg finality IS
+  enforced: `recompute_virtual_chain` rejects any reorg whose new-chain segment OR
+  old-chain rollback depth exceeds `MAX_REORG_DEPTH = 200`, checked PRE-WRITE on both
+  directions (full_node.rs:1011, 1026). With FC1 this gives a sound "heaviest chain
+  within a 200-block finality window" rule. The `FinalityManager` auto-checkpoint
+  layer (absolute finality, dynamic depth) is owned by the daemon, fed post-accept,
+  and NOT consulted by the reorg path — it is a SUPPLEMENTARY enhancement (absolute
+  vs the existing relative bound) whose wiring needs daemon↔full_node plumbing for
+  marginal gain over the static bound. DEFERRED as low-value/higher-risk; the
+  security-relevant guarantee (no deep reorg) already holds.
+- **G (state-root in PoW) — DEFERRED (architectural).** Contract state_root is
+  computed post-execution, emitted as None, and not consensus-validated. Binding it
+  requires changing block hashing + the mining flow (roots filled post-execution
+  before broadcast). High-risk; UTXO layer is authoritative meanwhile. Needs a
+  dedicated, externally-reviewed change.
+- **ST1 (cross-store atomicity) — DEFERRED (architectural).** Needs unified RocksDB
+  column-families / shared WriteBatch so UTXO+block+DAG+contract commit atomically.
+  The contract↔UTXO crash case is already closed (M marker). High-risk refactor.
+
 ## Final deferred set (all confirmed real, all MEDIUM, all mitigated — consensus/storage REDESIGNS)
 These share: real but NOT turnkey-exploitable, and their correct fix is an
 architecture change where a rushed patch is itself a serious risk. They are the
