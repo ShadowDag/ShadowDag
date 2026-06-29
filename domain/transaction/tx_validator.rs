@@ -541,16 +541,6 @@ impl TxValidator {
         Self::validate_tx_for_network(tx, utxo_set, &network)
     }
 
-    /// Full UTXO-aware validation with descriptive error messages.
-    /// Checks ALL validation gaps from issue #3:
-    ///   1. Duplicate inputs within same tx
-    ///   2. Input UTXO must exist
-    ///   3. Input UTXO must be unspent
-    ///   4. sum(inputs) >= sum(outputs)
-    ///   5. Overflow protection via checked_add
-    ///   6. Non-negative fee (inputs - outputs >= 0)
-    ///   7. Empty inputs/outputs rejection (non-coinbase)
-    ///   8. TX timestamp within acceptable range (anti-replay)
     /// Full confidential (RingCT phase 1) validation for a confidential TX:
     /// structural checks + cryptographic CLSAG verification + on-chain
     /// ring-member authenticity (decoys must be real outputs) + key-image
@@ -600,6 +590,16 @@ impl TxValidator {
         true
     }
 
+    /// Full UTXO-aware validation with descriptive error messages.
+    /// Checks ALL validation gaps from issue #3:
+    ///   1. Duplicate inputs within same tx
+    ///   2. Input UTXO must exist
+    ///   3. Input UTXO must be unspent
+    ///   4. sum(inputs) >= sum(outputs)
+    ///   5. Overflow protection via checked_add
+    ///   6. Non-negative fee (inputs - outputs >= 0)
+    ///   7. Empty inputs/outputs rejection (non-coinbase)
+    ///   8. TX timestamp within acceptable range (anti-replay)
     ///   9. payload_hash format validation (anti-replay)
     pub fn validate_transaction(tx: &Transaction, utxo_set: &UtxoSet) -> Result<(), StorageError> {
         let network = Self::infer_network_from_tx(tx, Some(utxo_set));
