@@ -85,6 +85,43 @@ callers (live path = `FullNode::process_block` → `recompute_virtual_chain` →
 - **N — MEDIUM→relay (mempool-block parity):** per-tx timestamp anti-replay/age (MAX_TX_FUTURE_SECS / MAX_TX_AGE_SECS) is enforced at mempool/P2P entry but not on the block-apply path. NOT a fork (all block validators apply the same rules) and tx.timestamp is signed, so no fund loss — relay/template inconsistency only. A naive wall-clock check on the block path would BREAK IBD (historical txs are >24h old); the safe fix is header-relative (`tx.timestamp <= block.header.timestamp + skew`) and is deferred.
 - **O — LOW (emission):** the selfish-mining / red-block reward penalty (`reward.rs` penalized_miner_reward etc.) is dead code — never wired into coinbase construction or validation. Per-block emission is still hard-capped on both validation paths, so NOT an inflation primitive; it is a missing economic deterrent. Either remove the dead module + its claims, or wire it in deterministically (on-chain blue/red + delay, not node-local timestamps).
 
+## Remediation of the deferred items (user: "fix everything")
+
+After the user asked for ALL confirmed items fixed, the following were additionally
+FIXED (verified + regression-tested; full suite 2205 green, clippy clean):
+
+| # | Sev | Fix |
+|---|-----|-----|
+| H+I | MED | Difficulty is now a pure function of the CANONICAL selected-parent chain. `build_retarget_from_canonical` rebuilds the RetargetEngine from the tip's selected-parent window at BOTH startup seed and the reorg path (was: incremental feed + all-blocks-by-height seed → node-local, reorg/arrival-dependent → strict-equality split risk). Determinism regression test. |
+| N | MED/relay | `validate_structural_layer` now rejects any non-coinbase tx whose timestamp exceeds `block.header.timestamp + 15s` (header-relative ⇒ IBD-safe). Closes the mempool-vs-block timestamp divergence. Regression test. |
+
+### STILL deferred — genuine storage/consensus REDESIGNS (NOT safe to hot-patch)
+
+These are real but their correct fix is an architecture change; a rushed patch
+would risk corrupting UTXO/contract state on every block (worse than the bounded
+defect), and there is no crash/restart integration harness here to validate them.
+They are flagged for dedicated, tested work + the mandatory external review.
+
+- **M (HIGH) — contract-state crash hole:** UTXO (main DB) and contract state
+  (separate DB) commit in separate batches; a crash between them + the
+  UTXO-commitment idempotency skip leaves a permanent contract-state hole.
+  Correct fix: either (a) reorder to persist contracts BEFORE the UTXO commitment
+  (so the existing skip guard becomes a correct marker), or (b) write a
+  `contract:applied:{block_hash}` marker in the contract-DB batch + re-execute on
+  recovery, or (c) unify UTXO+contract into one RocksDB (column families) committed
+  in ONE WriteBatch. (c) is the robust end state. All require careful re-test of the
+  apply/rollback loop — deferred to avoid every-block corruption risk.
+- **G (MED) — no contract state-root consensus:** header `state_root`/`receipt_root`
+  are computed post-execution, not in PoW/merkle, and never compared to the peer's
+  claim. Binding them into consensus is an architectural change (parent-state model
+  / 2-phase commit). UTXO layer is authoritative + execution is deterministic, so no
+  inflation/fork follows; the gap is undetected VM-divergence. Deferred.
+- **ST1 (HIGH) — cross-store atomicity:** UTXO / block / DAG / DSP writes span
+  separate stores; a crash mid-sequence can desync consensus state. Fix = shared
+  WriteBatch / unified column families. Large storage refactor. Deferred.
+- **O (LOW):** dead selfish-mining reward penalty — NOT a vuln (emission hard-capped
+  per block); cleanup only.
+
 ## Overarching recommendation
 The recurring root cause is **two divergent block-application paths**: the lenient
 `apply_block_dag_ordered` (live; skips conflicts) vs the strict
