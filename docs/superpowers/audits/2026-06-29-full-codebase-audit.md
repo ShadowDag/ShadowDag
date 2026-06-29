@@ -17,6 +17,35 @@ Coverage (all read in full by the assigned auditor):
 Legend: **[FIX]** = fixing this session · **[DOC]** = documented for follow-up (larger
 refactor / needs product decision / lower blast radius).
 
+## RESOLUTION (this session)
+
+All 18 **[FIX]** items below were verified against the real code and fixed, each
+with a regression test where meaningful, committed per-cluster. Final gate:
+`cargo clippy --all-targets -- -D warnings` clean, full lib suite **2181 passed,
+0 failed** (net of 3 deleted dead fake-crypto modules + added KAT/regression tests).
+
+| ID | Fix summary |
+|----|-------------|
+| A1 | min-DAG-parents now a pure fn of height+constant (env reads removed) |
+| A2 | blue-set sorted before truncation (deterministic) |
+| A3 | blue_score/chain_height use saturating_add |
+| A4 | coinbase split uses u128 intermediate |
+| V1/V2/V3 | added `U256::add_mod`/`mul_mod` (carry/full-width correct); EXP uses `wrapping_pow`; KAT tests |
+| P1 | char-safe peer-identity truncation |
+| P2 | DagShield requires hash bytes be ascii-hex |
+| M1 | fee-rate scaled to milli-sat/byte |
+| R1 | confidential txs return from the confidential gate (no transparent fall-through); regression test |
+| S1 | pool payout u128 + clamp pct≤100 + saturating_sub |
+| S2 | coinbase reward u128; char-safe parent-hash slice |
+| K1 | derive_children range uses saturating_add |
+| MX1 | `/debug` served to loopback peers only |
+| RPC1 | global state lock dropped before VM simulation (deploy/call/estimate_gas) |
+| XC1 | deleted dead insecure crypto (bulletproofs/pedersen_commitment/confidential_tx) |
+| DAN1 | dandelion clock math uses saturating_sub |
+
+The **[DOC]** items below remain open for follow-up (larger refactors / product
+decisions / lower blast radius). Verified-correct confirmations are unchanged.
+
 ## CRITICAL / HIGH — consensus, money, live panics
 
 | ID | Sev | Where | Issue | Status |
