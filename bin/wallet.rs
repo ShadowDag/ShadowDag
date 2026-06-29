@@ -323,7 +323,7 @@ fn load_and_unlock_wallet() -> Result<Wallet, WalletError> {
 /// Anything else (no args, --gui, --rpc=, etc.) → GUI mode (if feature enabled).
 const CLI_COMMANDS: &[&str] = &[
     "new", "create", "balance", "bal", "send", "transfer",
-    "info", "stealth", "invisible", "export",
+    "info", "stealth", "scan", "invisible", "export",
     "deploy", "deploy-package", "call", "receipt", "logs", "verify",
     "help", "--help", "-h", "version", "--version", "-v",
     "--cli",
@@ -369,6 +369,7 @@ fn run_cli(args: &[String], command: &str) {
         "send" | "transfer" => cmd_send(args),
         "info" => cmd_info(),
         "stealth" => cmd_stealth(args),
+        "scan" => cmd_scan(args),
         "invisible" => cmd_invisible(args),
         "export" => cmd_export(),
         "deploy" => cmd_deploy(args),
@@ -557,6 +558,20 @@ fn validate_address(addr: &str) -> Result<(), String> {
 
     let after_net = &addr[2..];
 
+    // Confidential payment address: "1p" + 136 hex (view_pub‖spend_pub + checksum).
+    if let Some(hex_part) = after_net.strip_prefix("1p") {
+        if hex_part.len() != 136 {
+            return Err(format!(
+                "Confidential address hex part must be 136 characters, got {}",
+                hex_part.len()
+            ));
+        }
+        if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("Address contains invalid hex characters".into());
+        }
+        return Ok(());
+    }
+
     // Typed addresses: "1s", "1c", "1m" after network prefix => 4-char prefix + 40 hex
     if after_net.starts_with("1s") || after_net.starts_with("1c") || after_net.starts_with("1m") {
         let hex_part = &after_net[2..];
@@ -583,6 +598,12 @@ fn validate_address(addr: &str) -> Result<(), String> {
         return Err("Address contains invalid hex characters".into());
     }
     Ok(())
+}
+
+/// True if `addr` is a confidential payment address (`SD1p…`/`ST1p…`/`SR1p…`).
+fn is_confidential_addr(addr: &str) -> bool {
+    (addr.starts_with("SD1p") || addr.starts_with("ST1p") || addr.starts_with("SR1p"))
+        && addr.len() == 4 + 136
 }
 
 fn cmd_send(args: &[String]) {
@@ -628,6 +649,39 @@ fn cmd_send(args: &[String]) {
     let from_address = wallet.address();
     if from_address.is_empty() {
         eprintln!("Error: wallet has no accounts. Create a wallet first.");
+        return;
+    }
+
+    // Confidential (RingCT) send: recipient is a confidential payment address.
+    // Builds a hidden-amount tx using the wallet's scanned confidential UTXOs
+    // and the node's confidential output index (read-only) for decoy selection.
+    if is_confidential_addr(&to) {
+        let db_path = utxo_db_path();
+        let store = match UtxoStore::new(db_path.as_str()) {
+            Ok(s) => std::sync::Arc::new(s),
+            Err(e) => {
+                eprintln!("Cannot open UTXO DB ({}): {}", db_path, e);
+                return;
+            }
+        };
+        let utxo_set = shadowdag::domain::utxo::utxo_set::UtxoSet::new(
+            store as std::sync::Arc<dyn shadowdag::domain::traits::utxo_backend::UtxoBackend>,
+        );
+        match wallet.build_confidential_send(&to, amount, fee, &utxo_set) {
+            Ok(tx) => {
+                let raw = hex::encode(serde_json::to_vec(&tx).unwrap_or_default());
+                println!("Confidential transaction built and signed!");
+                println!("  TxID   : {}", tx.hash);
+                println!("  To     : {} (confidential)", to);
+                println!("  Amount : {} SDAG (hidden on-chain)", amount_str);
+                println!("  Fee    : {:.8} SDAG", fee as f64 / 100_000_000.0);
+                println!("  Raw    : {}", raw);
+                println!();
+                println!("Submit with: RPC sendrawtransaction to a running node.");
+                println!("(Run 'scan' first if you have not detected your confidential funds.)");
+            }
+            Err(e) => eprintln!("Error building confidential transaction: {}", e),
+        }
         return;
     }
 
@@ -704,15 +758,86 @@ fn cmd_info() {
     }
 }
 
-fn cmd_stealth(args: &[String]) {
-    let base = args.get(2).map(|s| s.as_str()).unwrap_or("SD1default");
-    use shadowdag::domain::address::stealth_address::StealthAddress;
+fn cmd_stealth(_args: &[String]) {
+    // Print this wallet's reusable confidential payment address (SD1p…).
+    // Share it with senders so they can send you hidden-amount (RingCT) funds.
+    let wallet = match load_and_unlock_wallet() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("Cannot load wallet: {}", e);
+            return;
+        }
+    };
+    match wallet.confidential_receive_address() {
+        Some(addr) => {
+            println!("Confidential receive address (share this to receive private funds):");
+            println!("  {}", addr);
+            println!();
+            println!("Senders use: shadowdag-wallet send {} <amount>", addr);
+            println!("Run 'shadowdag-wallet scan' to detect funds sent to you.");
+        }
+        None => eprintln!("Wallet is locked; cannot derive confidential address."),
+    }
+}
 
-    println!("Generating stealth address...");
-    let stealth = StealthAddress::generate(base);
-    println!("  Base Address    : {}", base);
-    println!("  Stealth Address : {}", stealth);
-    println!("  (One-time address -- never reused)");
+fn cmd_scan(_args: &[String]) {
+    // Scan the local node block DB for confidential outputs owned by this wallet,
+    // record them, persist, and report the confidential balance. NOTE: this opens
+    // the node DB directly (same pattern as `balance`); run it while the node is
+    // stopped. Against a running node, scanning via RPC is a follow-up.
+    let mut wallet = match load_and_unlock_wallet() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("Cannot load wallet: {}", e);
+            return;
+        }
+    };
+    let addr = wallet.address();
+    let db_path = utxo_db_path();
+    let store = match shadowdag::infrastructure::storage::rocksdb::blocks::block_store::BlockStore::new(
+        db_path.as_str(),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Cannot open block DB ({}): {}", db_path, e);
+            return;
+        }
+    };
+
+    // Walk the DAG by height until a height with no blocks is reached.
+    let mut blocks = Vec::new();
+    let mut h = 0u64;
+    loop {
+        let hashes = store.get_block_hashes_at_height(h);
+        if hashes.is_empty() {
+            break;
+        }
+        for hash in hashes {
+            if let Some(b) = store.get_block(&hash) {
+                blocks.push(b);
+            }
+        }
+        h += 1;
+    }
+    let found = wallet.scan_blocks(&blocks);
+
+    // Persist updated wallet state (confidential UTXOs) back to the wallet DB.
+    if !addr.is_empty() {
+        if let Ok(db) = WalletDB::new(&wallet_db_path()) {
+            if let Err(e) = db.save_wallet(&wallet) {
+                eprintln!("Warning: could not persist scan results: {}", e);
+            }
+        }
+    }
+
+    println!("Scanned {} block(s).", blocks.len());
+    println!("New confidential outputs found this scan: {}", found);
+    println!(
+        "Confidential balance: {:.8} SDAG ({} sats) across {} output(s).",
+        wallet.confidential_balance() as f64 / 100_000_000.0,
+        wallet.confidential_balance(),
+        wallet.confidential_utxos().iter().filter(|u| !u.spent).count()
+    );
 }
 
 fn cmd_invisible(args: &[String]) {
@@ -2412,5 +2537,22 @@ mod gui {
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.write_all(body);
         let _ = stream.flush();
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{is_confidential_addr, validate_address};
+
+    #[test]
+    fn confidential_addr_routing_predicate() {
+        let conf = format!("SD1p{}", "0".repeat(136));
+        assert!(is_confidential_addr(&conf), "SD1p + 136 hex is confidential");
+        // Standard and stealth/one-time addresses must NOT route as confidential.
+        assert!(!is_confidential_addr(&format!("SD{}", "0".repeat(74))));
+        assert!(!is_confidential_addr(&format!("SD1s{}", "0".repeat(40))));
+        assert!(!is_confidential_addr("SD1p00")); // wrong length
+        // The confidential address must also pass validate_address.
+        assert!(validate_address(&conf).is_ok());
     }
 }
