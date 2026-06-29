@@ -577,4 +577,40 @@ mod tests {
         tx.outputs[0].one_time_pubkey = Some("55".repeat(32));
         assert_ne!(base, tx.canonical_bytes());
     }
+
+    #[test]
+    fn confidential_tx_serde_round_trips() {
+        let mut tx = Transaction::new(
+            String::new(),
+            vec![TxInput {
+                txid: "b".repeat(64),
+                index: 0,
+                owner: "o".into(),
+                signature: String::new(),
+                pub_key: String::new(),
+                key_image: Some("11".repeat(32)),
+                ring_members: Some(vec!["22".repeat(32), "33".repeat(32)]),
+                ring_signature: Some("aa".repeat(40)),
+                ring_commitments: Some(vec!["44".repeat(32), "55".repeat(32)]),
+                pseudo_commitment: Some("66".repeat(32)),
+            }],
+            vec![TxOutput {
+                address: "SD1s".into(),
+                amount: 0,
+                commitment: Some("77".repeat(32)),
+                range_proof: Some("88".repeat(10)),
+                ephemeral_pubkey: Some("99".repeat(32)),
+                one_time_pubkey: Some("aa".repeat(32)),
+            }],
+            5,
+            1_700_000_000,
+        );
+        tx.tx_type = TxType::Confidential;
+        let bytes = bincode::serialize(&tx).unwrap();
+        let back: Transaction = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.inputs[0].ring_commitments, tx.inputs[0].ring_commitments);
+        assert_eq!(back.inputs[0].pseudo_commitment, tx.inputs[0].pseudo_commitment);
+        assert_eq!(back.outputs[0].one_time_pubkey, tx.outputs[0].one_time_pubkey);
+        assert_eq!(back.canonical_bytes(), tx.canonical_bytes());
+    }
 }

@@ -205,6 +205,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
                     commitment: None,
                     range_proof: None,
                     ephemeral_pubkey: None,
+                    one_time_pubkey: None,
                 },
                 TxOutput {
                     address: owner_address.clone(),
@@ -212,6 +213,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
                     commitment: None,
                     range_proof: None,
                     ephemeral_pubkey: None,
+                    one_time_pubkey: None,
                 },
             ],
             fee: 0,
