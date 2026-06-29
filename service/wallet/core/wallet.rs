@@ -3,6 +3,7 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::domain::address::invisible_wallet::InvisibleWallet;
 use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
 use crate::errors::WalletError;
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
@@ -167,6 +168,31 @@ impl Wallet {
             k.zeroize();
         }
         self.locked = true;
+    }
+
+    /// Stable 32-byte confidential master key derived from the unlocked seed.
+    /// The domain-separation tag is FIXED forever — changing it would make
+    /// previously-received confidential funds unrecoverable.
+    fn confidential_master_key(&self) -> Option<[u8; 32]> {
+        let seed = self.session_key.as_ref()?;
+        let mut h = Sha256::new();
+        h.update(b"ShadowDAG_conf_master_v1");
+        h.update(seed);
+        let out = h.finalize();
+        let mut mk = [0u8; 32];
+        mk.copy_from_slice(&out);
+        Some(mk)
+    }
+
+    /// Build the confidential (view/spend) key wallet from the seed. None if locked.
+    pub fn confidential_keys(&self) -> Option<InvisibleWallet> {
+        let mk = self.confidential_master_key()?;
+        InvisibleWallet::from_master_key(mk, &self.network).ok()
+    }
+
+    /// Reusable confidential receive address (`SD1p…`). None if locked.
+    pub fn confidential_receive_address(&self) -> Option<String> {
+        Some(self.confidential_keys()?.confidential_address())
     }
 
     pub fn is_locked(&self) -> bool {
@@ -962,6 +988,22 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confidential_address_is_deterministic_from_seed() {
+        let mut w1 = Wallet::new("mainnet");
+        w1.restore_from_seed(vec![9u8; 32]).unwrap();
+        let mut w2 = Wallet::new("mainnet");
+        w2.restore_from_seed(vec![9u8; 32]).unwrap();
+        let a1 = w1.confidential_receive_address().unwrap();
+        let a2 = w2.confidential_receive_address().unwrap();
+        assert_eq!(a1, a2, "same seed must yield same confidential address");
+        assert!(a1.starts_with("SD1p"));
+
+        let mut w3 = Wallet::new("mainnet");
+        w3.restore_from_seed(vec![1u8; 32]).unwrap();
+        assert_ne!(a1, w3.confidential_receive_address().unwrap());
+    }
 
     #[test]
     fn create_and_unlock() {
