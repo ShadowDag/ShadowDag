@@ -47,7 +47,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --test shadowdag
+      # The integration suite lives in tests/suite/*.rs, wired into the crate via
+      # `#[cfg(test)] pub mod tests` (root tests.rs), so it runs under --lib in
+      # the `crate::tests::` module path. There is no `--test shadowdag` target.
+      - run: cargo test --lib tests::
 
   test-vm:
     name: VM Contract Tests
@@ -77,4 +80,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --bin shadowasm
-      - run: echo "PUSH1 42\nSTOP" > /tmp/test.sasm && ./target/release/shadowasm build /tmp/test.sasm --check
+      # printf (not echo) so the newline is interpreted into a real two-line
+      # source; bash's builtin echo would write a literal "\n".
+      - run: printf 'PUSH1 42\nSTOP\n' > /tmp/test.sasm && ./target/release/shadowasm build /tmp/test.sasm --check
