@@ -239,35 +239,29 @@ impl FullNode {
         // NOT MIN_DIFFICULTY. This ensures the first blocks after genesis
         // are validated against a reasonable difficulty.
         let genesis_diff = crate::config::genesis::genesis::genesis_difficulty_for(&network);
-        let mut retarget = RetargetEngine::new_with_bps(
-            genesis_diff,
-            crate::config::consensus::consensus_params::ConsensusParams::BLOCKS_PER_SECOND,
-        );
 
-        // ── Seed retarget from chain history ──────────────────────
-        // On restart, load the last SHORT_WINDOW blocks from BlockStore
-        // and replay them through the retarget engine. This recovers
-        // the exact difficulty state without storing it separately.
-        let blocks = block_store.get_all_blocks_sorted_by_height();
-        let seed_count = blocks.len().min(SHORT_WINDOW);
-        if seed_count > 1 {
-            // Feed the last SHORT_WINDOW blocks (or all if fewer)
-            let start_idx = blocks.len().saturating_sub(SHORT_WINDOW);
-            for block in &blocks[start_idx..] {
-                retarget.on_new_block(BlockTimeRecord {
-                    height: block.header.height,
-                    timestamp: block.header.timestamp,
-                    difficulty: block.header.difficulty,
-                    dag_block_count: 1, // historical seed — no DAG width data
-                    blue_score: block.header.blue_score,
-                });
+        // ── Seed retarget from the CANONICAL selected-parent chain ──────────
+        // Rebuild deterministically from the best tip's selected-parent chain
+        // (the same method the runtime reorg path uses), so a freshly-restarted
+        // node and a long-running node compute the IDENTICAL difficulty target.
+        // (The previous seed replayed get_all_blocks_sorted_by_height — all DAG
+        // blocks by height, not the canonical chain — which could diverge.)
+        let retarget = match block_store.get_best_hash() {
+            Some(best) if !best.is_empty() => {
+                let (engine, seeded_diff) =
+                    Self::build_retarget_from_canonical(&block_store, &network, &best);
+                set_next_difficulty(seeded_diff);
+                slog_info!("node", "retarget_seeded", ema_difficulty => &seeded_diff.to_string());
+                engine
             }
-            let seeded_diff = retarget.ema_difficulty();
-            set_next_difficulty(seeded_diff);
-            slog_info!("node", "retarget_seeded", blocks => &seed_count.to_string(), ema_difficulty => &seeded_diff.to_string());
-        } else {
-            set_next_difficulty(genesis_diff);
-        }
+            _ => {
+                set_next_difficulty(genesis_diff);
+                RetargetEngine::new_with_bps(
+                    genesis_diff,
+                    crate::config::consensus::consensus_params::ConsensusParams::BLOCKS_PER_SECOND,
+                )
+            }
+        };
 
         // Initialize global DAG tips for getblocktemplate
         let initial_tips = dag_manager.get_tips();
@@ -291,11 +285,9 @@ impl FullNode {
         // caller that still uses the `get_next_difficulty` /
         // `get_dag_tips` free functions sees the same values.
         let mining_state = Arc::new(MiningTemplateState::new());
-        mining_state.set_next_difficulty(if seed_count > 1 {
-            retarget.ema_difficulty()
-        } else {
-            genesis_diff
-        });
+        // `retarget` is already seeded from the canonical chain (or fresh at
+        // genesis), so its EMA is the authoritative next difficulty.
+        mining_state.set_next_difficulty(retarget.ema_difficulty());
         if !initial_tips.is_empty() {
             mining_state.set_dag_tips(initial_tips.clone());
         }
@@ -776,6 +768,51 @@ impl FullNode {
     /// Recompute the virtual selected parent chain after DAG changes.
     ///
     /// Walks the GHOSTDAG ordering to determine which blocks should
+    /// Build a fresh `RetargetEngine` purely from the CANONICAL selected-parent
+    /// chain ending at `best_tip` (last `SHORT_WINDOW` blocks, oldest→newest),
+    /// returning it with the resulting next difficulty. Difficulty is thus a pure
+    /// function of the canonical chain — NOT of reorg/arrival history — so every
+    /// node computes the same value (eliminates cross-node difficulty divergence
+    /// after reorgs, which the strict-equality difficulty check would otherwise
+    /// turn into a chain split).
+    fn build_retarget_from_canonical(
+        block_store: &BlockStore,
+        network: &NetworkMode,
+        best_tip: &str,
+    ) -> (RetargetEngine, u64) {
+        let genesis_diff = crate::config::genesis::genesis::genesis_difficulty_for(network);
+        let mut engine = RetargetEngine::new_with_bps(
+            genesis_diff,
+            crate::config::consensus::consensus_params::ConsensusParams::BLOCKS_PER_SECOND,
+        );
+        // Walk the canonical selected-parent chain newest→oldest (≤ SHORT_WINDOW).
+        let mut chain: Vec<crate::domain::block::block::Block> = Vec::new();
+        let mut cursor = best_tip.to_string();
+        while chain.len() < SHORT_WINDOW && !cursor.is_empty() {
+            match block_store.get_block(&cursor) {
+                Some(b) => {
+                    let parent = b.header.selected_parent.clone().unwrap_or_default();
+                    chain.push(b);
+                    cursor = parent;
+                }
+                None => break,
+            }
+        }
+        chain.reverse(); // oldest → newest
+        let mut next_diff = genesis_diff;
+        for b in &chain {
+            let dag_width = (block_store.blocks_at_height(b.header.height) as u64).max(1);
+            next_diff = engine.on_new_block(BlockTimeRecord {
+                height: b.header.height,
+                timestamp: b.header.timestamp,
+                difficulty: b.header.difficulty,
+                dag_block_count: dag_width,
+                blue_score: b.header.blue_score,
+            });
+        }
+        (engine, next_diff)
+    }
+
     /// have their transactions executed, and in what order.
     ///
     /// If the selected chain changed (reorg), rolls back old blocks
@@ -1423,21 +1460,15 @@ impl FullNode {
             )));
         }
 
-        // Update retarget from selected chain and publish next difficulty
-        if let Some(best_block) = self.block_store.get_block(&best_tip) {
+        // Update retarget from the CANONICAL selected-parent chain and publish
+        // next difficulty. Rebuilt deterministically (not fed incrementally) so
+        // the difficulty target is a pure function of the canonical chain and
+        // cannot diverge across nodes after a reorg.
+        if self.block_store.get_block(&best_tip).is_some() {
             if let Ok(mut retarget) = self.retarget.lock() {
-                // Count total DAG blocks at this height for DAG-aware difficulty.
-                // This gives the retarget engine visibility into parallel blocks.
-                let dag_width =
-                    (self.block_store.blocks_at_height(best_block.header.height) as u64).max(1);
-
-                let next_diff = retarget.on_new_block(BlockTimeRecord {
-                    height: best_block.header.height,
-                    timestamp: best_block.header.timestamp,
-                    difficulty: best_block.header.difficulty,
-                    dag_block_count: dag_width,
-                    blue_score: best_block.header.blue_score,
-                });
+                let (fresh, next_diff) =
+                    Self::build_retarget_from_canonical(&self.block_store, &self.network, &best_tip);
+                *retarget = fresh;
                 // Publish for RPC getblocktemplate — write to both
                 // the per-instance cell (the canonical reader for
                 // RPC handlers that hold an `Arc<MiningTemplateState>`
@@ -2668,6 +2699,54 @@ fn verify_block_confidential_txs(
 #[cfg(test)]
 mod tests {
     use super::{verify_block_confidential_txs, FullNode};
+
+    #[test]
+    fn retarget_rebuild_deterministic_from_canonical_chain() {
+        // The retarget engine must be a pure function of the canonical
+        // selected-parent chain (so all nodes agree on the next difficulty and
+        // a reorg cannot leave a divergent target). Same chain → same result.
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::block::block::Block;
+        use crate::domain::block::block_body::BlockBody;
+        use crate::domain::block::block_header::BlockHeader;
+        use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
+        use crate::infrastructure::storage::rocksdb::core::db::NodeDB;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let id = CTR.fetch_add(1, Ordering::Relaxed);
+        let path = format!("{}/rt_canon_{}", std::env::temp_dir().display(), id);
+        let store = BlockStore::new(NodeDB::new(&path).unwrap().shared()).unwrap();
+
+        let mk = |hash: &str, height: u64, parent: Option<&str>, ts: u64| Block {
+            header: BlockHeader {
+                version: 1,
+                hash: hash.into(),
+                parents: parent.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                merkle_root: "m".into(),
+                timestamp: ts,
+                nonce: 0,
+                difficulty: 1000,
+                height,
+                blue_score: height,
+                selected_parent: parent.map(|p| p.to_string()),
+                utxo_commitment: None,
+                extra_nonce: 0,
+                receipt_root: None,
+                state_root: None,
+            },
+            body: BlockBody { transactions: vec![] },
+        };
+        assert!(store.save_block(&mk("g", 0, None, 1000)));
+        assert!(store.save_block(&mk("b1", 1, Some("g"), 1010)));
+        assert!(store.save_block(&mk("b2", 2, Some("b1"), 1020)));
+
+        let net = NetworkMode::Regtest;
+        let (_e1, d1) = FullNode::build_retarget_from_canonical(&store, &net, "b2");
+        let (_e2, d2) = FullNode::build_retarget_from_canonical(&store, &net, "b2");
+        assert_eq!(d1, d2, "rebuild must be deterministic for the same canonical chain");
+        assert!(d1 > 0, "difficulty must be positive");
+    }
 
     #[test]
     fn confidential_gate_accepts_valid_and_rejects_tampered_block() {
