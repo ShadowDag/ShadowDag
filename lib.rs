@@ -217,10 +217,11 @@ pub mod engine {
     }
     pub mod privacy {
         pub mod confidential {
-            pub mod bulletproofs;
-            pub mod confidential_tx;
+            // Real, consensus-wired primitives. The former `bulletproofs`,
+            // `confidential_tx`, and `pedersen_commitment` modules were
+            // placeholder/insecure implementations with no live consumers and
+            // were removed (audit XC1) so they can never be wired into consensus.
             pub mod pedersen;
-            pub mod pedersen_commitment;
             pub mod range_proof;
         }
         pub mod ringct {

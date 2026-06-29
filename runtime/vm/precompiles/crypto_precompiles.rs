@@ -133,7 +133,7 @@ pub fn ed25519_verify(input: &[u8], _gas_limit: u64) -> PrecompileResult {
 /// The function name `pedersen_commit` is retained for registry/ABI
 /// compatibility at address 0x09. For actual Pedersen commitments with
 /// homomorphic properties, use the privacy layer
-/// (`engine/privacy/confidential/pedersen_commitment.rs`).
+/// (`engine/privacy/confidential/pedersen.rs`, `RealPedersenCommitment`).
 ///
 /// Input format (40 bytes):
 ///   [0..8]   value (u64 LE)
