@@ -1538,4 +1538,149 @@ mod tests {
             err
         );
     }
+
+    // ── RingCT phase 1 end-to-end: accept valid + every defense fails closed ──
+    mod ringct_phase1 {
+        use super::*;
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::transaction::transaction::TxInput;
+        use crate::domain::utxo::utxo_set::UtxoSet;
+        use crate::engine::privacy::ringct::clsag;
+        use crate::engine::privacy::ringct::serialization::clsag_sig_to_hex;
+        use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+        use curve25519_dalek::ristretto::RistrettoPoint;
+        use curve25519_dalek::scalar::Scalar;
+        use rand::rngs::OsRng;
+
+        fn keypairs(n: usize) -> Vec<(Scalar, RistrettoPoint)> {
+            (0..n)
+                .map(|_| {
+                    let sk = Scalar::random(&mut OsRng);
+                    (sk, sk * RISTRETTO_BASEPOINT_POINT)
+                })
+                .collect()
+        }
+
+        /// Build a fully-signed confidential TX with `num_inputs` inputs (ring
+        /// size 4), recording every ring member into `set` as a valid on-chain
+        /// output key. Signer is always index 1 of each ring.
+        fn signed_conf_tx(set: &UtxoSet, num_inputs: usize, net: &NetworkMode) -> Transaction {
+            let mut inputs = Vec::new();
+            let mut rings: Vec<(Vec<(Scalar, RistrettoPoint)>, usize)> = Vec::new();
+
+            for i in 0..num_inputs {
+                let pairs = keypairs(4);
+                let ring_hex: Vec<String> = pairs
+                    .iter()
+                    .map(|(_, pk)| hex::encode(pk.compress().as_bytes()))
+                    .collect();
+                for h in &ring_hex {
+                    set.record_output_key(h).unwrap();
+                }
+                let signer_idx = 1usize;
+                let ki = clsag::key_image(&pairs[signer_idx].0, &pairs[signer_idx].1);
+                inputs.push(TxInput::new_confidential(
+                    format!("{:064x}", i + 1),
+                    i as u32,
+                    "owner".into(),
+                    String::new(),
+                    String::new(),
+                    hex::encode(ki.compress().as_bytes()),
+                    ring_hex,
+                ));
+                rings.push((pairs, signer_idx));
+            }
+
+            let mut tx = Transaction {
+                hash: "a".repeat(64),
+                inputs,
+                outputs: vec![TxOutput::new("SD1dest".into(), 1000)],
+                fee: 100,
+                timestamp: 1_735_689_600,
+                is_coinbase: false,
+                tx_type: TxType::Confidential,
+                payload_hash: None,
+                ..Default::default()
+            };
+
+            // Message binds key images + ring members (already set) → sign now.
+            let msg = TxHash::confidential_signing_message_for_network(&tx, net);
+            for (i, (pairs, idx)) in rings.iter().enumerate() {
+                let ring: Vec<_> = pairs.iter().map(|(_, p)| *p).collect();
+                let sig = clsag::sign(&msg, &ring, *idx, &pairs[*idx].0).unwrap();
+                tx.inputs[i].ring_signature = Some(clsag_sig_to_hex(&sig));
+            }
+            tx
+        }
+
+        #[test]
+        fn accepts_valid_confidential_tx() {
+            let set = UtxoSet::new_empty();
+            let net = NetworkMode::Mainnet;
+            let tx = signed_conf_tx(&set, 1, &net);
+            assert!(TxValidator::validate_confidential(&tx, &set, &net));
+        }
+
+        #[test]
+        fn rejects_ring_member_not_on_chain() {
+            let set = UtxoSet::new_empty();
+            let net = NetworkMode::Mainnet;
+            let mut tx = signed_conf_tx(&set, 1, &net);
+            // Swap one ring member to a freshly-generated key never recorded.
+            let stray = (Scalar::random(&mut OsRng) * RISTRETTO_BASEPOINT_POINT)
+                .compress();
+            tx.inputs[0].ring_members.as_mut().unwrap()[0] =
+                hex::encode(stray.as_bytes());
+            assert!(!TxValidator::validate_confidential(&tx, &set, &net));
+        }
+
+        #[test]
+        fn rejects_tampered_signature() {
+            let set = UtxoSet::new_empty();
+            let net = NetworkMode::Mainnet;
+            let mut tx = signed_conf_tx(&set, 1, &net);
+            tx.inputs[0].ring_signature = Some("00".repeat(164));
+            assert!(!TxValidator::validate_confidential(&tx, &set, &net));
+        }
+
+        #[test]
+        fn rejects_already_spent_key_image() {
+            let set = UtxoSet::new_empty();
+            let net = NetworkMode::Mainnet;
+            let tx = signed_conf_tx(&set, 1, &net);
+            // Pre-seed the key image as already spent on-chain.
+            let ki = tx.inputs[0].key_image.clone().unwrap();
+            set.record_key_image(&ki).unwrap();
+            assert!(!TxValidator::validate_confidential(&tx, &set, &net));
+        }
+
+        #[test]
+        fn rejects_duplicate_key_image_within_tx() {
+            let set = UtxoSet::new_empty();
+            let net = NetworkMode::Mainnet;
+            let mut tx = signed_conf_tx(&set, 1, &net);
+            // Duplicate the single input → same key image twice in one TX.
+            let dup = tx.inputs[0].clone();
+            tx.inputs.push(dup);
+            assert!(!TxValidator::validate_confidential(&tx, &set, &net));
+        }
+
+        #[test]
+        fn rejects_message_mismatch() {
+            let set = UtxoSet::new_empty();
+            let net = NetworkMode::Mainnet;
+            let mut tx = signed_conf_tx(&set, 1, &net);
+            // Change the fee AFTER signing → message no longer matches the sig.
+            tx.fee += 1;
+            assert!(!TxValidator::validate_confidential(&tx, &set, &net));
+        }
+
+        #[test]
+        fn accepts_two_input_confidential_tx() {
+            let set = UtxoSet::new_empty();
+            let net = NetworkMode::Mainnet;
+            let tx = signed_conf_tx(&set, 2, &net);
+            assert!(TxValidator::validate_confidential(&tx, &set, &net));
+        }
+    }
 }
