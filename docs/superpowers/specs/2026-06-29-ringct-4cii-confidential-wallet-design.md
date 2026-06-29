@@ -1,7 +1,10 @@
 # RingCT Sub-Project 4c-ii — Confidential Wallet Send/Receive
 
 **Date:** 2026-06-29
-**Status:** Design (approved for spec review)
+**Status:** Implemented (wallet/CLI wiring). Live-node manual verification + external
+crypto review pending. RPC `getconfidentialaddress` deferred (node has no user-wallet
+handle; the CLI `stealth` command exposes the address and `sendrawtransaction` accepts
+confidential txs). Plan: `docs/superpowers/plans/2026-06-29-ringct-4cii-confidential-wallet.md`.
 **Depends on:** RingCT 4a/4b/4c-i (crypto core complete: `build_confidential_transaction`,
 `scan_confidential_output`, `recover_spend_secret`, `select_decoys`, dual-CLSAG,
 `verify_confidential_tx`, `okeyidx:` global output index).
