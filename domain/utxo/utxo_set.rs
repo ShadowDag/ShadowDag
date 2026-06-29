@@ -120,6 +120,44 @@ impl UtxoSet {
         }
     }
 
+    // ── RingCT phase 1: key-image store + output-key index ──────────────
+    //
+    // `ki:`   = set of spent key images (double-spend prevention for
+    //           confidential inputs — replaces the `spent` flag, since the real
+    //           input is hidden in a ring).
+    // `okey:` = set of on-chain one-time output pubkeys (ring members must
+    //           reference real outputs, preventing forgery with fake keys).
+
+    fn ki_key(ki_hex: &str) -> Vec<u8> {
+        let mut v = Vec::with_capacity(3 + ki_hex.len());
+        v.extend_from_slice(b"ki:");
+        v.extend_from_slice(ki_hex.as_bytes());
+        v
+    }
+    fn okey_key(pk_hex: &str) -> Vec<u8> {
+        let mut v = Vec::with_capacity(5 + pk_hex.len());
+        v.extend_from_slice(b"okey:");
+        v.extend_from_slice(pk_hex.as_bytes());
+        v
+    }
+
+    /// Returns true if this key image has already been spent on-chain.
+    pub fn key_image_seen(&self, ki_hex: &str) -> bool {
+        self.store.get_raw(&Self::ki_key(ki_hex)).is_some()
+    }
+    /// Record a key image as spent (use within an atomic block apply).
+    pub fn record_key_image(&self, ki_hex: &str) -> Result<(), StorageError> {
+        self.store.put_raw(&Self::ki_key(ki_hex), &[1u8])
+    }
+    /// Returns true if this one-time output pubkey exists on-chain.
+    pub fn output_key_exists(&self, pk_hex: &str) -> bool {
+        self.store.get_raw(&Self::okey_key(pk_hex)).is_some()
+    }
+    /// Record a one-time output pubkey as a valid ring-member candidate.
+    pub fn record_output_key(&self, pk_hex: &str) -> Result<(), StorageError> {
+        self.store.put_raw(&Self::okey_key(pk_hex), &[1u8])
+    }
+
     pub fn add_utxo(&self, key: &UtxoKey, owner: String, amount: u64, address: String) {
         let utxo = Utxo {
             owner,
@@ -518,6 +556,26 @@ impl UtxoSet {
                     commitment_hasher.update(key.as_ref());
                     commitment_hasher.update(output.address.as_bytes());
                     commitment_hasher.update(output.amount.to_le_bytes());
+                }
+            }
+
+            // RingCT phase 1: record confidential key images (double-spend
+            // prevention) and one-time output pubkeys (ring-member authenticity)
+            // atomically with this block's UTXO writes.
+            for input in &tx.inputs {
+                if let Some(ki) = &input.key_image {
+                    ops.push(BatchWrite::Put {
+                        key: Self::ki_key(ki),
+                        value: vec![1u8],
+                    });
+                }
+            }
+            for output in &tx.outputs {
+                if let Some(pk) = &output.ephemeral_pubkey {
+                    ops.push(BatchWrite::Put {
+                        key: Self::okey_key(pk),
+                        value: vec![1u8],
+                    });
                 }
             }
         }
@@ -1470,5 +1528,28 @@ impl UtxoSet {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod ringct_phase1_store_tests {
+    use super::*;
+
+    #[test]
+    fn key_image_recorded_and_detected() {
+        let set = UtxoSet::new_empty();
+        let ki = "ab".repeat(32);
+        assert!(!set.key_image_seen(&ki));
+        set.record_key_image(&ki).unwrap();
+        assert!(set.key_image_seen(&ki));
+    }
+
+    #[test]
+    fn output_key_membership() {
+        let set = UtxoSet::new_empty();
+        let pk = "cd".repeat(32);
+        assert!(!set.output_key_exists(&pk));
+        set.record_output_key(&pk).unwrap();
+        assert!(set.output_key_exists(&pk));
     }
 }
