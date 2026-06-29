@@ -227,6 +227,29 @@ impl Mempool {
     // ── RBF helper ─────────────────────────────────────────────────────
     /// Build RBF info for a conflicting mempool TX.
     fn build_rbf_info(&self, tx: &Transaction) -> MempoolTxInfo {
+        // Transitive dependent closure + their REAL summed fees. RBF eviction
+        // (remove_transaction) cascades through the whole closure, so the
+        // replacement must cover all of those fees — using actual fees (not a
+        // MIN_FEE_BUMP lower bound) prevents a replacement from reducing the
+        // mempool's total fee.
+        let mut dependents: Vec<String> = Vec::new();
+        let mut dependent_fees: u64 = 0;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack: Vec<String> = self.get_dependents(&tx.hash);
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur.clone()) {
+                continue;
+            }
+            if let Some(dep_tx) = self.get_transaction(&cur) {
+                dependent_fees = dependent_fees.saturating_add(dep_tx.fee);
+            }
+            for next in self.get_dependents(&cur) {
+                if !seen.contains(&next) {
+                    stack.push(next);
+                }
+            }
+            dependents.push(cur);
+        }
         MempoolTxInfo {
             hash: tx.hash.clone(),
             fee: tx.fee,
@@ -241,7 +264,8 @@ impl Mempool {
                         .map(|k| k.to_string())
                 })
                 .collect(),
-            dependents: self.get_dependents(&tx.hash),
+            dependents,
+            dependent_fees,
             replacement_depth: 0,
         }
     }
