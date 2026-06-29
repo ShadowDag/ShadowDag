@@ -143,6 +143,46 @@ MAX_REORG_DEPTH; key-mgmt KDF/sig/multisig sound).
 - **Sized addrman (follow-up):** bound even valid-but-distinct addresses with eviction (P2P design pattern).
 - **O (LOW):** dead reward-penalty code — not a vuln.
 
+## Fifth pass (fork-choice / finality / RPC / sync / indexes / checkpoints)
+
+Confirmed (verified by me against real code) — both MEDIUM, both DEFERRED as
+consensus redesigns (mitigated; a rushed fork-choice change risks a network split):
+
+- **FC1 (MED) — fork choice is by block-count, not work:** `select_best_tip`
+  (full_node.rs:752-766) ranks tips by `blue_score → chain_height → hash`; there is
+  NO cumulative-PoW term. The implemented work machinery
+  (`Difficulty::accumulate_blue_work`, `reorg::CumulativeWork`) is DEAD (no live
+  callers). MITIGATED: every block enforces `header.difficulty == expected` (strict)
+  + PoW, and the retarget raises difficulty when parallel blocks arrive, so a
+  higher blue_score requires comparable real work → no cheap-takeover exploit; deep
+  reorgs are bounded by the static `MAX_REORG_DEPTH = 200`. Residual: two equal-count
+  competing sub-chains with unequal per-block difficulty rank EQUAL (deviation from
+  Nakamoto/Kaspa heaviest-chain). FIX (deferred, consensus-critical): maintain a
+  per-block cumulative-work index and compare by it FIRST in `select_best_tip` /
+  `recompute_virtual_chain`, blue_score as tie-break — wire the existing
+  `accumulate_blue_work`/`CumulativeWork`.
+- **FC2 (MED) — finality/auto-checkpoints inert:** `FinalityManager` computes a
+  dynamic finality depth + persists auto-checkpoints (`chkpt:` keys), but
+  `current_depth()`/`is_checkpointed()` and `Checkpoints::is_valid_with_dynamic` have
+  NO callers in fork choice / reorg / validation; only the genesis-only hardcoded
+  checkpoint list is enforced. So the adaptive deep-reorg backstop is not active
+  (the static 200-block bound IS active). FIX (deferred): feed
+  `FinalityManager::current_depth()` into the reorg-depth check and enforce
+  `is_valid_with_dynamic` in the validation/reorg path.
+
+5th-hunt coverage: fork-choice/finality, RPC handler surface, sync modules,
+indexes/cache, checkpoints/genesis. RPC, sync, indexes/cache, checkpoints/genesis
+surfaced no new confirmed exploitable bug (sync modules confirmed unwired/dead;
+RPC auth table covers mutating methods; indexes read-only).
+
+## Final deferred set (all confirmed real, all MEDIUM, all mitigated — consensus/storage REDESIGNS)
+These share: real but NOT turnkey-exploitable, and their correct fix is an
+architecture change where a rushed patch is itself a serious risk. They are the
+proper scope of the mandatory external consensus+crypto review:
+**G** (state-root not in PoW), **ST1** (broad cross-store atomicity),
+**FC1** (cumulative-work fork choice), **FC2** (dynamic finality/checkpoint
+enforcement), **sized-addrman** (eviction backstop). `O` (dead reward penalty) = not a vuln.
+
 ## Overarching recommendation
 The recurring root cause is **two divergent block-application paths**: the lenient
 `apply_block_dag_ordered` (live; skips conflicts) vs the strict
