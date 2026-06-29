@@ -327,13 +327,19 @@ Multiplier = 2^(utilization x 6), capped at 64x
 | Shadow Pool | `shadow_pool/` | Privacy-first TX aggregation |
 | Dandelion++ | `service/network/propagation/` | Network-layer anonymity |
 
-> **Status (RingCT phase 1 — sender privacy):** Confidential transactions are
-> now **verified by consensus** for sender privacy: `TxValidator::validate_confidential`
-> checks CLSAG ring signatures (`verify_clsag`), enforces key-image uniqueness
-> (a `ki:` store prevents double-spends), and requires every ring member to be a
-> real on-chain output key (an `okey:` index). **Amounts remain plaintext** in
-> this phase — hiding amounts needs a dual-key CLSAG + pseudo-commitments and is
-> deferred to a later phase with dedicated cryptographic review.
+> **Status (RingCT phase 1 — sender privacy): PARTIAL, NOT consensus-enforced.**
+> `TxValidator::validate_confidential` implements the CLSAG gate (verify_clsag +
+> `ki:` key-image uniqueness + `okey:` ring-member authenticity), and it is wired
+> into the **mempool** admission path only. It is **NOT** yet called by block
+> validation (`UtxoValidator::validate_block_utxos`) or the live apply path
+> (`UtxoSet::apply_block_dag_ordered`), and key-image/output-key recording is not
+> wired into the live apply path either. Net effect today: confidential TXs are
+> rejected at the mempool (the `okey:` set is empty) and treated as transparent
+> (Ed25519 ownership + balance) inside blocks — the ring signature is not enforced
+> in consensus. Known follow-ups: wire the gate + recording into the block path,
+> fix `okey:` to index one-time output keys, dedup ring members, bind key-image +
+> ring into the CLSAG challenge. **Amounts remain plaintext** (dual-key CLSAG
+> deferred). Do not rely on this for privacy yet.
 
 ---
 
