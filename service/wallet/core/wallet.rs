@@ -373,11 +373,21 @@ impl Wallet {
             let mut ring =
                 select_decoys(utxo_set, CONF_RING_SIZE - 1, std::slice::from_ref(&u.one_time_pubkey))
                     .ok_or_else(|| WalletError::Other("not enough decoys on-chain yet".into()))?;
-            ring.push(RingMember {
-                public_key: real_pk,
-                commitment: real_c,
-            });
-            let real_index = ring.len() - 1;
+            // PRIVACY: insert the real member at a UNIFORMLY RANDOM position.
+            // Appending it last would make the real spend positionally
+            // identifiable on-chain (the last ring member would always be the
+            // real one) — a full deanonymization of every confidential input.
+            let real_index = {
+                use rand::Rng;
+                rand::rngs::OsRng.gen_range(0..=ring.len())
+            };
+            ring.insert(
+                real_index,
+                RingMember {
+                    public_key: real_pk,
+                    commitment: real_c,
+                },
+            );
             // Recover the one-time spend secret from the stored ephemeral pubkey.
             let eph = point_from_hex(&u.ephemeral_pubkey)
                 .ok_or_else(|| WalletError::Other("bad ephemeral pubkey".into()))?;

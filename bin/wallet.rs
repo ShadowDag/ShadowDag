@@ -669,7 +669,13 @@ fn cmd_send(args: &[String]) {
         );
         match wallet.build_confidential_send(&to, amount, fee, &utxo_set) {
             Ok(tx) => {
-                let raw = hex::encode(serde_json::to_vec(&tx).unwrap_or_default());
+                let raw = match serde_json::to_vec(&tx) {
+                    Ok(b) => hex::encode(b),
+                    Err(e) => {
+                        eprintln!("Error serializing confidential transaction: {}", e);
+                        return;
+                    }
+                };
                 println!("Confidential transaction built and signed!");
                 println!("  TxID   : {}", tx.hash);
                 println!("  To     : {} (confidential)", to);
@@ -860,23 +866,29 @@ fn cli_rpc_call(
     cli_rpc_extract_result(&s)
 }
 
-/// Fetch all chain blocks from a running node via RPC (getblockcount → getblocks
-/// → getblockfull). Returns None if the node is unreachable (caller falls back
-/// to the local DB). NETWORK PATH: live-node only.
-fn scan_fetch_blocks_via_rpc(
-) -> Option<Vec<shadowdag::domain::block::block::Block>> {
+/// Scan a running node's chain for confidential outputs via RPC (getblockcount →
+/// getblocks → getblockfull), STREAMING one page at a time so blocks are scanned
+/// and dropped rather than buffered (bounded memory). Returns the count of newly
+/// recorded confidential outputs, or None if the node is unreachable (caller
+/// falls back to the local DB). NETWORK PATH: live-node only.
+fn scan_via_rpc(wallet: &mut Wallet) -> Option<usize> {
     use shadowdag::domain::block::block::Block;
+    // Sanity ceiling: the height comes from the node and could be hostile
+    // (SHADOWDAG_RPC). Bound the loop so a bogus huge height can't DoS the wallet.
+    const MAX_SCAN_HEIGHT: u64 = 100_000_000;
+    const PAGE: u64 = 500; // must be <= server MAX_GETBLOCKS_RANGE
+
     let socket = cli_rpc_target();
     let count_v = cli_rpc_call(socket, "getblockcount", serde_json::json!([]))?;
     let height = count_v
         .as_u64()
-        .or_else(|| count_v.get("best_height").and_then(|v| v.as_u64()))?;
+        .or_else(|| count_v.get("best_height").and_then(|v| v.as_u64()))?
+        .min(MAX_SCAN_HEIGHT);
 
-    let mut blocks: Vec<Block> = Vec::new();
-    let page = 500u64;
+    let mut found = 0usize;
     let mut start = 0u64;
     while start <= height {
-        let resp = cli_rpc_call(socket, "getblocks", serde_json::json!([start, page]))?;
+        let resp = cli_rpc_call(socket, "getblocks", serde_json::json!([start, PAGE]))?;
         let arr = match resp.get("blocks").and_then(|b| b.as_array()) {
             Some(a) if !a.is_empty() => a.clone(),
             _ => break,
@@ -885,14 +897,19 @@ fn scan_fetch_blocks_via_rpc(
             if let Some(hash) = item.get("hash").and_then(|h| h.as_str()) {
                 if let Some(full) = cli_rpc_call(socket, "getblockfull", serde_json::json!([hash])) {
                     if let Ok(block) = serde_json::from_value::<Block>(full) {
-                        blocks.push(block);
+                        // Scan and drop immediately — no whole-chain buffering.
+                        found += wallet.scan_blocks(std::slice::from_ref(&block));
                     }
                 }
             }
         }
-        start += page;
+        // checked_add: never overflow/wrap into an infinite loop.
+        start = match start.checked_add(PAGE) {
+            Some(s) => s,
+            None => break,
+        };
     }
-    Some(blocks)
+    Some(found)
 }
 
 fn cmd_scan(_args: &[String]) {
@@ -910,9 +927,9 @@ fn cmd_scan(_args: &[String]) {
     };
     let addr = wallet.address();
 
-    // 1) Try a running node over RPC.
-    let (blocks, source) = match scan_fetch_blocks_via_rpc() {
-        Some(b) => (b, "node RPC"),
+    // 1) Try a running node over RPC (streams blocks; bounded memory).
+    let (found, source) = match scan_via_rpc(&mut wallet) {
+        Some(n) => (n, "node RPC"),
         None => {
             // 2) Fall back to the local block DB (node must be stopped).
             let db_path = utxo_db_path();
@@ -926,8 +943,8 @@ fn cmd_scan(_args: &[String]) {
                     return;
                 }
             };
-            let mut blocks = Vec::new();
             let mut h = 0u64;
+            let mut found = 0usize;
             loop {
                 let hashes = store.get_block_hashes_at_height(h);
                 if hashes.is_empty() {
@@ -935,16 +952,18 @@ fn cmd_scan(_args: &[String]) {
                 }
                 for hash in hashes {
                     if let Some(b) = store.get_block(&hash) {
-                        blocks.push(b);
+                        found += wallet.scan_blocks(std::slice::from_ref(&b));
                     }
                 }
-                h += 1;
+                h = match h.checked_add(1) {
+                    Some(n) => n,
+                    None => break,
+                };
             }
-            (blocks, "local DB")
+            (found, "local DB")
         }
     };
-    println!("Scanning via {} ...", source);
-    let found = wallet.scan_blocks(&blocks);
+    println!("Scanned via {}.", source);
 
     // Persist updated wallet state (confidential UTXOs) back to the wallet DB.
     if !addr.is_empty() {
@@ -955,7 +974,6 @@ fn cmd_scan(_args: &[String]) {
         }
     }
 
-    println!("Scanned {} block(s).", blocks.len());
     println!("New confidential outputs found this scan: {}", found);
     println!(
         "Confidential balance: {:.8} SDAG ({} sats) across {} output(s).",
