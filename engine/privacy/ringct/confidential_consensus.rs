@@ -305,4 +305,35 @@ mod tests {
         let mut seen = HashSet::new();
         assert!(verify_confidential_tx(&tx, &set, &net(), &mut seen).is_err());
     }
+
+    #[test]
+    fn apply_records_ki_okey_then_double_spend_rejected() {
+        let set = UtxoSet::new_empty();
+        let tx = valid_conf_tx(&set, 100);
+
+        // Valid before applying.
+        let mut seen = HashSet::new();
+        assert!(verify_confidential_tx(&tx, &set, &net(), &mut seen).is_ok());
+
+        // Apply the block (single confidential tx) via the LIVE apply path.
+        set.apply_block_dag_ordered(std::slice::from_ref(&tx), 1, "blockhash0")
+            .unwrap();
+
+        // Key image recorded; one-time output key → commitment recorded.
+        let ki = tx.inputs[0].key_image.clone().unwrap();
+        assert!(set.key_image_seen(&ki), "key image must be recorded on apply");
+        let otk = tx.outputs[0].one_time_pubkey.clone().unwrap();
+        assert_eq!(
+            set.output_key_commitment(&otk),
+            tx.outputs[0].commitment.clone(),
+            "output one-time key must map to its commitment"
+        );
+
+        // Re-spending the same key image now fails (cross-block double-spend).
+        let mut seen2 = HashSet::new();
+        assert!(
+            verify_confidential_tx(&tx, &set, &net(), &mut seen2).is_err(),
+            "key image already spent must be rejected"
+        );
+    }
 }

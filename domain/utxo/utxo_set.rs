@@ -718,6 +718,40 @@ impl UtxoSet {
                 }
             }
 
+            // RingCT confidential tx: record key images (double-spend) and
+            // one-time output pubkeys → commitment (ring-member authenticity)
+            // in the SAME atomic batch. No transparent UTXO spend/create.
+            // (Validation already ran in validate_block_utxos.)
+            if tx.is_confidential() {
+                for input in &tx.inputs {
+                    if let Some(ki) = &input.key_image {
+                        ops.push(BatchWrite::Put {
+                            key: Self::ki_key(ki),
+                            value: vec![1u8],
+                        });
+                    }
+                }
+                for output in &tx.outputs {
+                    if let (Some(otk), Some(c)) = (&output.one_time_pubkey, &output.commitment) {
+                        ops.push(BatchWrite::Put {
+                            key: Self::okey_key(otk),
+                            value: c.as_bytes().to_vec(),
+                        });
+                    }
+                }
+                let seen_key = format!("tx_seen:{}", tx.hash);
+                ops.push(BatchWrite::Put {
+                    key: seen_key.as_bytes().to_vec(),
+                    value: block_hash.as_bytes().to_vec(),
+                });
+                undo.applied_tx_ids.push(tx.hash.clone());
+                commitment_hasher.update(b"CONF");
+                commitment_hasher.update(tx.hash.as_bytes());
+                applied += 1;
+                applied_fees = applied_fees.saturating_add(tx.fee);
+                continue;
+            }
+
             if tx.is_coinbase() {
                 for (idx, output) in tx.outputs.iter().enumerate() {
                     let key = utxo_key(&tx.hash, idx as u32)?;

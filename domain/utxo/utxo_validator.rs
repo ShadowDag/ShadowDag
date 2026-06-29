@@ -13,6 +13,27 @@ use crate::domain::utxo::utxo_set::{utxo_key, UtxoSet, COINBASE_MATURITY};
 use crate::errors::StorageError;
 use std::collections::{HashMap, HashSet};
 
+/// Best-effort network inference from a block's output address prefixes
+/// (ST1*=Testnet, SR1*=Regtest, else Mainnet). Used only to pick the chain_id
+/// for the confidential signing message. Proper threading of the node's network
+/// is audit follow-up H-net.
+fn infer_block_network(block: &Block) -> NetworkMode {
+    for tx in &block.body.transactions {
+        for o in &tx.outputs {
+            if o.address.starts_with("ST1") {
+                return NetworkMode::Testnet;
+            }
+            if o.address.starts_with("SR1") {
+                return NetworkMode::Regtest;
+            }
+            if o.address.starts_with("SD1") {
+                return NetworkMode::Mainnet;
+            }
+        }
+    }
+    NetworkMode::Mainnet
+}
+
 pub struct UtxoValidator;
 
 impl UtxoValidator {
@@ -124,6 +145,11 @@ impl UtxoValidator {
         let mut staged_outputs: HashMap<UtxoKey, (String, u64, bool)> =
             HashMap::with_capacity(transactions.len() * 2);
 
+        // RingCT: network for the confidential signing message + block-wide
+        // key-image set for intra-block double-spend detection.
+        let conf_network = infer_block_network(block);
+        let mut seen_key_images: HashSet<String> = HashSet::new();
+
         for tx in transactions {
             // Empty outputs check (applies to all tx including coinbase)
             if tx.outputs.is_empty() {
@@ -155,6 +181,20 @@ impl UtxoValidator {
                     let key = utxo_key(&tx.hash, idx as u32)?;
                     staged_outputs.insert(key, (output.address.clone(), output.amount, true));
                 }
+                continue;
+            }
+
+            // RingCT confidential tx: verified entirely by the confidential gate
+            // (CLSAG + ring authenticity + key images + range + homomorphic
+            // balance). Confidential inputs do NOT spend transparent UTXOs and
+            // confidential outputs are NOT staged into the transparent map.
+            if tx.is_confidential() {
+                crate::engine::privacy::ringct::confidential_consensus::verify_confidential_tx(
+                    tx,
+                    utxo_set,
+                    &conf_network,
+                    &mut seen_key_images,
+                )?;
                 continue;
             }
 
