@@ -153,9 +153,17 @@ impl UtxoSet {
     pub fn output_key_exists(&self, pk_hex: &str) -> bool {
         self.store.get_raw(&Self::okey_key(pk_hex)).is_some()
     }
-    /// Record a one-time output pubkey as a valid ring-member candidate.
-    pub fn record_output_key(&self, pk_hex: &str) -> Result<(), StorageError> {
-        self.store.put_raw(&Self::okey_key(pk_hex), &[1u8])
+    /// Record a confidential output's one-time pubkey → its commitment, so ring
+    /// members can be checked for both existence AND commitment authenticity.
+    pub fn record_output_key(&self, pk_hex: &str, commitment_hex: &str) -> Result<(), StorageError> {
+        self.store
+            .put_raw(&Self::okey_key(pk_hex), commitment_hex.as_bytes())
+    }
+    /// The recorded commitment for a one-time output pubkey, if it exists on-chain.
+    pub fn output_key_commitment(&self, pk_hex: &str) -> Option<String> {
+        self.store
+            .get_raw(&Self::okey_key(pk_hex))
+            .and_then(|v| String::from_utf8(v).ok())
     }
 
     pub fn add_utxo(&self, key: &UtxoKey, owner: String, amount: u64, address: String) {
@@ -1549,7 +1557,18 @@ mod ringct_phase1_store_tests {
         let set = UtxoSet::new_empty();
         let pk = "cd".repeat(32);
         assert!(!set.output_key_exists(&pk));
-        set.record_output_key(&pk).unwrap();
+        set.record_output_key(&pk, &"00".repeat(32)).unwrap();
+        assert!(set.output_key_exists(&pk));
+    }
+
+    #[test]
+    fn okey_binds_pubkey_to_commitment() {
+        let set = UtxoSet::new_empty();
+        let pk = "ab".repeat(32);
+        let c = "cd".repeat(32);
+        assert!(set.output_key_commitment(&pk).is_none());
+        set.record_output_key(&pk, &c).unwrap();
+        assert_eq!(set.output_key_commitment(&pk), Some(c.clone()));
         assert!(set.output_key_exists(&pk));
     }
 }
