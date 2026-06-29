@@ -19,6 +19,7 @@ use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 use rand::rngs::OsRng;
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 
 use crate::domain::address::key_derivation::KeyDerivation;
 use crate::domain::address::stealth_address::StealthAddress;
@@ -148,6 +149,78 @@ impl InvisibleWallet {
             &self.spend_scalar,
         )
     }
+
+    /// View secret scalar (needed for scanning confidential outputs).
+    pub fn view_scalar(&self) -> Scalar {
+        self.view_scalar
+    }
+
+    /// Spend secret scalar (needed to recover one-time spend keys).
+    pub fn spend_scalar(&self) -> Scalar {
+        self.spend_scalar
+    }
+
+    /// Network prefix for the reusable confidential payment address (`<p>1p`).
+    fn conf_prefix(network: &str) -> &'static str {
+        match network {
+            "testnet" => "ST1p",
+            "regtest" => "SR1p",
+            _ => "SD1p",
+        }
+    }
+
+    /// Reusable confidential payment address:
+    /// `prefix + hex(view_pub‖spend_pub) + hex(checksum[..4])`.
+    ///
+    /// Senders parse this to obtain (view_pub, spend_pub) for stealth output
+    /// generation. Unlike the one-time `…1s` output address, this is reusable
+    /// and published by the recipient.
+    pub fn confidential_address(&self) -> String {
+        let mut body = Vec::with_capacity(64);
+        body.extend_from_slice(self.view_public.compress().as_bytes());
+        body.extend_from_slice(self.spend_public.compress().as_bytes());
+        let checksum = &Sha256::digest(&body)[..4];
+        format!(
+            "{}{}{}",
+            Self::conf_prefix(&self.network),
+            hex::encode(&body),
+            hex::encode(checksum)
+        )
+    }
+
+    /// Parse a confidential payment address for `network` into (view_pub, spend_pub).
+    pub fn parse_confidential_address(
+        addr: &str,
+        network: &str,
+    ) -> Result<(RistrettoPoint, RistrettoPoint), CryptoError> {
+        let prefix = Self::conf_prefix(network);
+        let rest = addr
+            .strip_prefix(prefix)
+            .ok_or_else(|| CryptoError::InvalidKey("bad confidential address prefix".into()))?;
+        // 64 body bytes = 128 hex + 4 checksum bytes = 8 hex.
+        if rest.len() != 136 {
+            return Err(CryptoError::InvalidKey(
+                "bad confidential address length".into(),
+            ));
+        }
+        let raw =
+            hex::decode(rest).map_err(|_| CryptoError::InvalidKey("non-hex address".into()))?;
+        let (body, checksum) = raw.split_at(64);
+        if &Sha256::digest(body)[..4] != checksum {
+            return Err(CryptoError::InvalidKey(
+                "confidential address checksum mismatch".into(),
+            ));
+        }
+        let decode = |b: &[u8]| -> Result<RistrettoPoint, CryptoError> {
+            let arr: [u8; 32] = b
+                .try_into()
+                .map_err(|_| CryptoError::InvalidKey("bad point len".into()))?;
+            CompressedRistretto(arr)
+                .decompress()
+                .ok_or_else(|| CryptoError::InvalidKey("point not on curve".into()))
+        };
+        Ok((decode(&body[..32])?, decode(&body[32..])?))
+    }
 }
 
 impl Drop for InvisibleWallet {
@@ -166,6 +239,32 @@ impl Drop for InvisibleWallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confidential_address_round_trips() {
+        let w = InvisibleWallet::from_master_key([7u8; 32], "mainnet").unwrap();
+        let addr = w.confidential_address();
+        assert!(addr.starts_with("SD1p"));
+        let (v, s) = InvisibleWallet::parse_confidential_address(&addr, "mainnet").unwrap();
+        assert_eq!(v, w.view_public());
+        assert_eq!(s, w.spend_public());
+    }
+
+    #[test]
+    fn confidential_address_rejects_tampered_checksum() {
+        let w = InvisibleWallet::from_master_key([7u8; 32], "mainnet").unwrap();
+        let mut addr = w.confidential_address();
+        addr.pop();
+        addr.push(if addr.ends_with('0') { '1' } else { '0' });
+        assert!(InvisibleWallet::parse_confidential_address(&addr, "mainnet").is_err());
+    }
+
+    #[test]
+    fn confidential_address_rejects_wrong_network_prefix() {
+        let w = InvisibleWallet::from_master_key([7u8; 32], "mainnet").unwrap();
+        let addr = w.confidential_address();
+        assert!(InvisibleWallet::parse_confidential_address(&addr, "testnet").is_err());
+    }
 
     #[test]
     fn new_wallet_starts_at_index_zero() {
