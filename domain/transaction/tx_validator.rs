@@ -13,7 +13,6 @@ use crate::domain::transaction::tx_hash::TxHash;
 use crate::domain::utxo::utxo::Utxo;
 use crate::domain::utxo::utxo_key::UtxoKey;
 use crate::domain::utxo::utxo_set::{utxo_key, UtxoSet};
-use crate::engine::privacy::ringct::ring_validator::RingValidator;
 use crate::errors::{ConsensusError, StorageError};
 
 pub const MIN_TX_FEE: u64 = 1;
@@ -541,53 +540,22 @@ impl TxValidator {
         Self::validate_tx_for_network(tx, utxo_set, &network)
     }
 
-    /// Full confidential (RingCT phase 1) validation for a confidential TX:
-    /// structural checks + cryptographic CLSAG verification + on-chain
-    /// ring-member authenticity (decoys must be real outputs) + key-image
-    /// uniqueness (unseen on-chain and not duplicated within the TX).
-    ///
-    /// Amounts are NOT hidden in phase 1 — the normal plaintext balance check
-    /// still applies. This function only covers sender privacy + double-spend.
+    /// Full confidential (RingCT) validation for the mempool path. Delegates to
+    /// the SAME gate the block path uses (`verify_confidential_tx`): dual-key
+    /// CLSAG + on-chain ring-member authenticity (P AND C) + key-image
+    /// uniqueness + per-output range proofs + homomorphic balance
+    /// `Σ C'_in == Σ C_out + fee·H`. Mempool and block share one code path, so
+    /// they cannot diverge.
     pub fn validate_confidential(
         tx: &Transaction,
         utxo_set: &UtxoSet,
         network: &NetworkMode,
     ) -> bool {
-        // 1. Structural checks (ring sizes, key-image format/uniqueness, ...).
-        if !RingValidator::validate(tx) {
-            return false;
-        }
-        // 2. Cryptographic CLSAG verification over the canonical message.
-        if !RingValidator::verify_clsag(tx, network) {
-            return false;
-        }
-        // 3. DB-backed: ring members must be real on-chain output keys, and
-        //    key images must be unseen on-chain + unique within this TX.
-        let mut seen_in_tx = std::collections::HashSet::new();
-        for input in &tx.inputs {
-            match &input.ring_members {
-                Some(members) if !members.is_empty() => {
-                    for m in members {
-                        if !utxo_set.output_key_exists(m) {
-                            return false;
-                        }
-                    }
-                }
-                _ => return false,
-            }
-            match &input.key_image {
-                Some(ki) => {
-                    if utxo_set.key_image_seen(ki) {
-                        return false;
-                    }
-                    if !seen_in_tx.insert(ki.clone()) {
-                        return false;
-                    }
-                }
-                None => return false,
-            }
-        }
-        true
+        let mut seen = std::collections::HashSet::new();
+        crate::engine::privacy::ringct::confidential_consensus::verify_confidential_tx(
+            tx, utxo_set, network, &mut seen,
+        )
+        .is_ok()
     }
 
     /// Full UTXO-aware validation with descriptive error messages.
@@ -1539,4 +1507,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validate_confidential_rejects_malformed_via_shared_gate() {
+        // The mempool entry point delegates to verify_confidential_tx (same gate
+        // as the block path). A confidential tx with no ring data is malformed
+        // and must be rejected. (The valid-path battery lives in
+        // engine::privacy::ringct::confidential_consensus.)
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::utxo::utxo_set::UtxoSet;
+        let set = UtxoSet::new_empty();
+        let mut tx = Transaction::new(
+            "d".repeat(64),
+            vec![],
+            vec![TxOutput::new("SD1s".into(), 1)],
+            0,
+            1_700_000_000,
+        );
+        tx.tx_type = TxType::Confidential;
+        tx.inputs.push(crate::domain::transaction::transaction::TxInput::new(
+            "0".repeat(64),
+            0,
+            "owner".into(),
+            String::new(),
+            String::new(),
+        ));
+        assert!(!TxValidator::validate_confidential(
+            &tx,
+            &set,
+            &NetworkMode::Mainnet
+        ));
+    }
 }
