@@ -26,6 +26,21 @@
 
 use std::collections::HashMap;
 
+/// Max bracket nesting depth (parens + braces) the parser accepts. The
+/// recursive-descent parser descends one (or more) native stack frames per
+/// nesting level; a deeply nested source (e.g. `((((...))))` or nested
+/// if/while blocks) would otherwise overflow the thread stack — an UNCATCHABLE
+/// process abort, not a recoverable panic. Capping nesting up front turns that
+/// into a graceful compile error. Bounds both expression (paren/call) and block
+/// (nested if/while) recursion.
+const MAX_NESTING_DEPTH: usize = 128;
+
+/// Max expression-tree depth the code generator will recurse into. The parser
+/// builds long left-leaning binary chains (`a + a + a + ...`) ITERATIVELY, so
+/// they evade the bracket-nesting cap, but `generate_expr` walks them
+/// RECURSIVELY and would overflow the stack. This caps that walk.
+const MAX_EXPR_DEPTH: usize = 512;
+
 /// Compile ShadowLang source code to ShadowASM assembly.
 ///
 /// Returns the ShadowASM text that can be fed to `Assembler::assemble()`.
@@ -374,6 +389,32 @@ struct Parser;
 
 impl Parser {
     fn parse(tokens: &[(Token, usize)]) -> Result<Contract, CompileError> {
+        // Anti-DoS: reject pathologically deep bracket nesting BEFORE recursive
+        // descent. A native stack overflow aborts the whole process and is not
+        // catchable by catch_unwind, so this must fail closed up front. The max
+        // running balance of open brackets equals the max nesting depth.
+        let mut nesting: usize = 0;
+        for (tok, line) in tokens {
+            match tok {
+                Token::LParen | Token::LBrace => {
+                    nesting += 1;
+                    if nesting > MAX_NESTING_DEPTH {
+                        return Err(CompileError {
+                            message: format!(
+                                "nesting too deep (max {})",
+                                MAX_NESTING_DEPTH
+                            ),
+                            line: *line,
+                        });
+                    }
+                }
+                Token::RParen | Token::RBrace => {
+                    nesting = nesting.saturating_sub(1);
+                }
+                _ => {}
+            }
+        }
+
         let mut pos = 0;
 
         // Expect: contract Name {
@@ -1091,6 +1132,19 @@ impl CodeGen {
     }
 
     fn generate_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
+        self.generate_expr_d(expr, 0)
+    }
+
+    /// Depth-tracked expression codegen. `depth` bounds recursion so a deep
+    /// expression tree (notably a long left-leaning binary chain the parser
+    /// built iteratively) cannot overflow the native stack.
+    fn generate_expr_d(&mut self, expr: &Expr, depth: usize) -> Result<(), CompileError> {
+        if depth > MAX_EXPR_DEPTH {
+            return Err(CompileError {
+                message: format!("expression too deeply nested (max {})", MAX_EXPR_DEPTH),
+                line: 0,
+            });
+        }
         match expr {
             Expr::Number(n) => {
                 if *n <= 255 {
@@ -1122,8 +1176,8 @@ impl CodeGen {
                 }
             }
             Expr::BinaryOp { left, op, right } => {
-                self.generate_expr(left)?;
-                self.generate_expr(right)?;
+                self.generate_expr_d(left, depth + 1)?;
+                self.generate_expr_d(right, depth + 1)?;
                 match op {
                     BinOp::Add => self.emit("ADD"),
                     BinOp::Sub => self.emit("SUB"),
@@ -1142,7 +1196,7 @@ impl CodeGen {
                 }
             }
             Expr::UnaryOp { op, expr } => {
-                self.generate_expr(expr)?;
+                self.generate_expr_d(expr, depth + 1)?;
                 match op {
                     UnaryOp::Not => self.emit("ISZERO"),
                 }
@@ -1155,13 +1209,13 @@ impl CodeGen {
                     "timestamp" => self.emit("TIMESTAMP"),
                     "balance" => {
                         if let Some(arg) = args.first() {
-                            self.generate_expr(arg)?;
+                            self.generate_expr_d(arg, depth + 1)?;
                         }
                         self.emit("BALANCE");
                     }
                     "sha256" => {
                         if let Some(arg) = args.first() {
-                            self.generate_expr(arg)?;
+                            self.generate_expr_d(arg, depth + 1)?;
                         }
                         self.emit("SHA256");
                     }
@@ -1268,5 +1322,47 @@ mod tests {
         let bytecode = compile_to_bytecode(source);
         assert!(bytecode.is_ok());
         assert!(!bytecode.unwrap().is_empty());
+    }
+
+    #[test]
+    fn deeply_nested_parens_rejected_not_crash() {
+        // ~200 nested parens would overflow the recursive-descent parser's
+        // native stack (an uncatchable process abort). The pre-pass must reject
+        // it as a graceful compile error instead.
+        let depth = MAX_NESTING_DEPTH + 80;
+        let inner = "(".repeat(depth) + "1" + &")".repeat(depth);
+        let source = format!("contract C {{ fn f() {{ let x = {}; }} }}", inner);
+        let err = compile(&source).expect_err("deep nesting must be rejected");
+        assert!(
+            err.message.contains("nesting too deep"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn deep_binary_chain_rejected_by_codegen_guard() {
+        // A long left-leaning `1+1+1+...` chain uses NO brackets, so it passes
+        // the nesting pre-pass, but the parser builds it as a deep left-leaning
+        // tree that generate_expr walks recursively. The codegen depth guard
+        // must reject it rather than overflow the stack.
+        let chain = "1".to_string() + &"+1".repeat(MAX_EXPR_DEPTH + 50);
+        let source =
+            format!("contract C {{ fn f() -> uint64 {{ return {}; }} }}", chain);
+        let err = compile(&source).expect_err("deep binary chain must be rejected");
+        assert!(
+            err.message.contains("too deeply nested"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn moderate_nesting_still_compiles() {
+        // The caps must not reject legitimately-nested expressions.
+        let inner = "(".repeat(10) + "1 + 2" + &")".repeat(10);
+        let source =
+            format!("contract C {{ fn f() -> uint64 {{ return {}; }} }}", inner);
+        assert!(compile(&source).is_ok(), "moderate nesting must still compile");
     }
 }
