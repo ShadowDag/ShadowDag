@@ -202,6 +202,26 @@ RPC auth table covers mutating methods; indexes read-only).
   review; rushing them risks chain splits / state corruption (the opposite of the
   goal). Each has a precise fix recommendation above for that dedicated work.
 
+## Sixth pass (web UI / gRPC-WS / full RPC / VM lang / node lifecycle) — coverage-gap closure
+
+Confirmed (verified by me against real code) — 1 finding, FIXED:
+
+- **LANG1 (LOW) — FIXED:** ShadowLang parser + `generate_expr` had no recursion-
+  depth limit. Deeply nested source (`((((...))))` / nested if-while) or a long
+  left-leaning binary chain (`1+1+1+...`, built iteratively by the parser but
+  walked recursively by codegen) could overflow the native thread stack — an
+  UNCATCHABLE process abort that kills the whole node. Reachable via contract-IDE
+  `/api/compile-lang` (opt-in `--enable-ide`, loopback-only, Origin-guarded ⇒
+  LOW; local DoS only). FIX: bracket-nesting pre-pass in `Parser::parse`
+  (`MAX_NESTING_DEPTH=128`) + depth guard in `generate_expr` (`MAX_EXPR_DEPTH=512`);
+  both return a graceful `CompileError`. Regression tests added.
+
+6th-pass coverage: web UI HTTP servers, gRPC+WS+health, FULL RPC cmd_* surface +
+auth table, VM lang compiler, node lifecycle/boot/light+shadow nodes. No other
+confirmed exploitable bug: contract_ide bind/loopback + CSRF/DNS-rebind guard
+verified active; RPC auth table covers mutating methods; sync/light modules
+confirmed unwired or proof-gated.
+
 ## Final deferred set (all confirmed real, all MEDIUM, all mitigated — consensus/storage REDESIGNS)
 These share: real but NOT turnkey-exploitable, and their correct fix is an
 architecture change where a rushed patch is itself a serious risk. They are the
