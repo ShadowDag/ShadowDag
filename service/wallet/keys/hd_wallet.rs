@@ -35,8 +35,6 @@ pub struct HDWallet {
     /// Held in memory only; never persisted in plaintext.
     mnemonic: Zeroizing<String>,
     key_manager: KeyManager,
-    #[allow(dead_code)]
-    password: String,
 }
 
 impl HDWallet {
@@ -51,7 +49,6 @@ impl HDWallet {
         Ok(Self {
             mnemonic: Zeroizing::new(phrase),
             key_manager,
-            password: password.to_string(),
         })
     }
 
@@ -67,7 +64,6 @@ impl HDWallet {
         Ok(Self {
             mnemonic: Zeroizing::new(phrase.to_string()),
             key_manager,
-            password: password.to_string(),
         })
     }
 
@@ -77,7 +73,6 @@ impl HDWallet {
         Ok(Self {
             mnemonic: Zeroizing::new(phrase),
             key_manager,
-            password: password.to_string(),
         })
     }
 
