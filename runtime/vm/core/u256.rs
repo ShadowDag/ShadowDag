@@ -49,6 +49,30 @@ impl U256 {
         self.0[0] as usize
     }
 
+    /// Shift amount for SHL/SHR, clamped to 256. Any value >= 256 maps to 256,
+    /// for which `shl`/`shr` return ZERO — matching EVM semantics (a shift of
+    /// 256 or more yields 0). Must NOT be derived by truncating to u32/u64, or
+    /// large operands (e.g. 2^64, 2^32) would wrap to a small shift and produce
+    /// the wrong result.
+    pub fn shift_count(&self) -> u32 {
+        if self.0[1] != 0 || self.0[2] != 0 || self.0[3] != 0 || self.0[0] >= 256 {
+            256
+        } else {
+            self.0[0] as u32
+        }
+    }
+
+    /// Interpret the value as a memory/calldata byte offset. Returns `None` if it
+    /// does not fit the addressable range (any high limb set, i.e. value >= 2^64).
+    /// EVM faults (out-of-gas) on astronomically large offsets; ShadowVM callers
+    /// reject the frame on `None` instead of silently truncating the low bits.
+    pub fn to_mem_offset(&self) -> Option<usize> {
+        if self.0[1] != 0 || self.0[2] != 0 || self.0[3] != 0 {
+            return None;
+        }
+        usize::try_from(self.0[0]).ok()
+    }
+
     /// Check if zero
     pub fn is_zero(&self) -> bool {
         self.0[0] == 0 && self.0[1] == 0 && self.0[2] == 0 && self.0[3] == 0
@@ -754,5 +778,47 @@ mod tests {
         let n = U256::from_u64(10);
         let result = a.wrapping_mul(b).checked_mod(n);
         assert_eq!(result.as_u64(), 1); // (7*3) % 10 = 1
+    }
+
+    #[test]
+    fn shift_count_clamps_to_256_no_truncation() {
+        // Small shifts pass through.
+        assert_eq!(U256::from_u64(0).shift_count(), 0);
+        assert_eq!(U256::from_u64(5).shift_count(), 5);
+        assert_eq!(U256::from_u64(255).shift_count(), 255);
+        // Anything >= 256 clamps to 256 (so shl/shr return ZERO), NOT truncated.
+        assert_eq!(U256::from_u64(256).shift_count(), 256);
+        assert_eq!(U256::from_u64(1_000).shift_count(), 256);
+        // 2^32 — would truncate to 0 under `as u32`; must clamp to 256.
+        assert_eq!(U256::from_u64(1u64 << 32).shift_count(), 256);
+        // 2^32 + 5 — would shift by 5 under `as u32`; must clamp to 256.
+        assert_eq!(U256::from_u64((1u64 << 32) + 5).shift_count(), 256);
+        // 2^64 (limb[1]=1) — would be 0 under `as_u64() as u32`; must clamp.
+        assert_eq!(U256([0, 1, 0, 0]).shift_count(), 256);
+        // 2^192 (limb[3]=1) — must clamp.
+        assert_eq!(U256([0, 0, 0, 1]).shift_count(), 256);
+    }
+
+    #[test]
+    fn shl_shr_by_large_amount_yields_zero() {
+        let v = U256::from_u64(0xDEAD_BEEF);
+        // Shifts >= 256 (incl. the previously-truncating 2^64 / 2^32 cases)
+        // must yield ZERO, not the operand unchanged.
+        assert_eq!(v.shl(U256([0, 1, 0, 0]).shift_count()), U256::ZERO); // 2^64
+        assert_eq!(v.shr(U256([0, 1, 0, 0]).shift_count()), U256::ZERO);
+        assert_eq!(v.shl(U256::from_u64(1u64 << 32).shift_count()), U256::ZERO);
+        assert_eq!(v.shr(U256::from_u64(256).shift_count()), U256::ZERO);
+        // A genuine small shift still works.
+        assert_eq!(U256::from_u64(1).shl(U256::from_u64(4).shift_count()), U256::from_u64(16));
+    }
+
+    #[test]
+    fn to_mem_offset_rejects_huge_offsets() {
+        assert_eq!(U256::from_u64(0).to_mem_offset(), Some(0));
+        assert_eq!(U256::from_u64(1024).to_mem_offset(), Some(1024));
+        // >= 2^64 (any high limb set) is not addressable → None.
+        assert_eq!(U256([0, 1, 0, 0]).to_mem_offset(), None); // 2^64
+        assert_eq!(U256([5, 0, 1, 0]).to_mem_offset(), None); // 2^128 + 5
+        assert_eq!(U256([0, 0, 0, 1]).to_mem_offset(), None); // 2^192
     }
 }

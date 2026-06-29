@@ -1033,6 +1033,21 @@ impl ExecutionEnvironment {
         true
     }
 
+    /// Charge the per-word copy cost (EVM: 3 gas per 32-byte word) for the
+    /// *COPY opcodes, in ADDITION to the base + memory-expansion cost. Without
+    /// this, a tight loop copying into already-warm memory pays only the flat
+    /// base gas, letting an attacker amplify native copy work (hundreds of GB
+    /// per block-gas budget) far beyond what is charged — a CPU/bandwidth DoS
+    /// replayed by every validating node. Returns false on out-of-gas.
+    fn charge_copy_words(gas: &mut GasMeter, length: usize) -> bool {
+        let words = (length as u64).div_ceil(32);
+        let cost = words.saturating_mul(MEMORY_GAS_PER_WORD);
+        if cost == 0 {
+            return true;
+        }
+        !matches!(gas.consume(cost), GasResult::OutOfGas { .. })
+    }
+
     /// Read `len` bytes from `memory` starting at `offset`, zero-padded
     /// to exactly `len` bytes if the requested window extends past the
     /// current memory buffer.
@@ -1599,11 +1614,13 @@ impl ExecutionEnvironment {
                 }
                 OpCode::SHL => {
                     let (a, b) = pop2!(stack, gas, snapshot, self);
-                    stack.push(b.shl(a.as_u64() as u32));
+                    // Clamp the shift to 256 (a >= 256 yields ZERO); never
+                    // truncate the operand to u32 or large shifts wrap wrong.
+                    stack.push(b.shl(a.shift_count()));
                 }
                 OpCode::SHR => {
                     let (a, b) = pop2!(stack, gas, snapshot, self);
-                    stack.push(b.shr(a.as_u64() as u32));
+                    stack.push(b.shr(a.shift_count()));
                 }
 
                 // ── Storage ──────────────────────────────────
@@ -1847,7 +1864,18 @@ impl ExecutionEnvironment {
 
                 // ── Memory ───────────────────────────────────
                 OpCode::MLOAD => {
-                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    // to_mem_offset: reject offsets >= 2^64 BEFORE truncation.
+                    // `as_u64() as usize` would wrap such an offset to a small
+                    // in-bounds value (EVM faults instead), diverging from spec.
+                    let offset = match pop1!(stack, gas, snapshot, self).to_mem_offset() {
+                        Some(o) => o,
+                        None => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                    };
                     // checked_add: offset is attacker-controlled (up to u64::MAX);
                     // a raw `offset + 32` wraps in release and slips past the
                     // MAX_MEMORY_SIZE guard, then panics on the slice.
@@ -1872,7 +1900,15 @@ impl ExecutionEnvironment {
                 }
                 OpCode::MSTORE => {
                     let (offset_val, val) = pop2!(stack, gas, snapshot, self);
-                    let offset = offset_val.as_u64() as usize;
+                    let offset = match offset_val.to_mem_offset() {
+                        Some(o) => o,
+                        None => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                    };
                     let end = match offset.checked_add(32) {
                         Some(e) if e <= MAX_MEMORY_SIZE => e,
                         _ => {
@@ -3234,7 +3270,15 @@ impl ExecutionEnvironment {
                 // ── Memory (extended) ───────────────────────
                 OpCode::MSTORE8 => {
                     let (offset_val, val) = pop2!(stack, gas, snapshot, self);
-                    let offset = offset_val.as_u64() as usize;
+                    let offset = match offset_val.to_mem_offset() {
+                        Some(o) => o,
+                        None => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                    };
                     let end = match offset.checked_add(1) {
                         Some(e) if e <= MAX_MEMORY_SIZE => e,
                         _ => {
@@ -3327,7 +3371,9 @@ impl ExecutionEnvironment {
 
                 // ── Call data ───────────────────────────────
                 OpCode::CALLDATALOAD => {
-                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    // to_mem_offset is None for offsets >= 2^64, which are wholly
+                    // beyond calldata; EVM zero-pads (no fault), so leave buf zero.
+                    let offset_opt = pop1!(stack, gas, snapshot, self).to_mem_offset();
                     if stack.len() >= MAX_STACK_SIZE {
                         self.state.rollback(snapshot).ok();
                         return CallOutcome::Failure {
@@ -3335,12 +3381,14 @@ impl ExecutionEnvironment {
                         };
                     }
                     let mut buf = [0u8; 32];
-                    for (i, byte) in buf.iter_mut().enumerate() {
-                        // checked_add: offset is attacker-controlled; a raw
-                        // offset + i wraps in release and could index OOB.
-                        if let Some(idx) = offset.checked_add(i) {
-                            if idx < ctx.calldata.len() {
-                                *byte = ctx.calldata[idx];
+                    if let Some(offset) = offset_opt {
+                        for (i, byte) in buf.iter_mut().enumerate() {
+                            // checked_add: offset is attacker-controlled; a raw
+                            // offset + i wraps in release and could index OOB.
+                            if let Some(idx) = offset.checked_add(i) {
+                                if idx < ctx.calldata.len() {
+                                    *byte = ctx.calldata[idx];
+                                }
                             }
                         }
                     }
@@ -3382,6 +3430,14 @@ impl ExecutionEnvironment {
                             };
                         }
                         if !Self::charge_and_expand_memory(&mut gas, &mut memory, dest_end) {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                        // Per-word copy cost (anti-DoS): without it a warm-memory
+                        // copy loop costs only the flat base gas.
+                        if !Self::charge_copy_words(&mut gas, length) {
                             self.state.rollback(snapshot).ok();
                             return CallOutcome::Failure {
                                 gas_used: gas.gas_used(),
@@ -3437,6 +3493,13 @@ impl ExecutionEnvironment {
                             };
                         }
                         if !Self::charge_and_expand_memory(&mut gas, &mut memory, dest_end) {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                        // Per-word copy cost (anti-DoS), as for CALLDATACOPY.
+                        if !Self::charge_copy_words(&mut gas, length) {
                             self.state.rollback(snapshot).ok();
                             return CallOutcome::Failure {
                                 gas_used: gas.gas_used(),
@@ -3525,6 +3588,13 @@ impl ExecutionEnvironment {
                             };
                         }
                         if !Self::charge_and_expand_memory(&mut gas, &mut memory, dest_end) {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                        // Per-word copy cost (anti-DoS), as for CALLDATACOPY.
+                        if !Self::charge_copy_words(&mut gas, length) {
                             self.state.rollback(snapshot).ok();
                             return CallOutcome::Failure {
                                 gas_used: gas.gas_used(),
