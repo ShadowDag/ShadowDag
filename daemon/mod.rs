@@ -761,67 +761,32 @@ impl DaemonNode {
             slog_warn!("daemon", "utxo_empty_replaying");
             self.replay_blocks()?;
         } else if best_block.header.height > 0 {
-            // Level 2: full UTXO commitment verification
-            // Instead of just comparing counts, compute a commitment hash over
-            // ALL UTXO data (txid, index, amount, owner, maturity) and compare
-            // with the commitment stored in the best block header.
-            slog_info!("daemon", "utxo_commitment_check");
-
-            // Try UTXO store commitment first (atomic with UTXO apply),
-            // then BlockStore (legacy), then header field (oldest legacy).
-            let stored_commitment = self
-                .utxo_set
-                .get_commitment(&best_block.header.hash)
-                .or_else(|| {
-                    self.block_store
-                        .get_utxo_commitment(&best_block.header.hash)
-                })
-                .or_else(|| best_block.header.utxo_commitment.clone())
-                .unwrap_or_default();
-            let computed_commitment = self.utxo_set.compute_commitment_hash();
-
-            if stored_commitment.is_empty() {
-                // No commitment anywhere — fall back to count-based check
-                // (for blocks processed before commitment was added)
-                slog_info!("daemon", "utxo_no_commitment_fallback_count_check");
-                let expected = self.compute_expected_utxo_count();
-                let actual = utxo_count;
-                let tolerance = std::cmp::max(expected / 100, 10);
-                let diff = expected.abs_diff(actual);
-
-                if expected > 0 && diff > tolerance {
-                    slog_warn!("daemon", "utxo_count_mismatch_rebuilding", expected => expected, actual => actual);
-                    self.utxo_set.clear_all();
-                    self.replay_blocks()?;
-                    slog_info!("daemon", "utxo_rebuilt", entries => self.utxo_set.count_utxos());
-                } else {
-                    slog_info!("daemon", "utxo_ok_count_based", actual => actual, expected => expected);
-                }
-            } else if computed_commitment != stored_commitment {
-                // Commitment mismatch — UTXO state is corrupted (amounts, owners,
-                // spent flags, or maturity could be wrong even if count matches)
-                slog_error!("daemon", "utxo_commitment_mismatch_rebuilding",
-                    stored => &stored_commitment[..std::cmp::min(16, stored_commitment.len())],
-                    computed => &computed_commitment[..std::cmp::min(16, computed_commitment.len())]
-                );
+            // Level 2: UTXO integrity check on restart.
+            //
+            // NOTE: we intentionally do NOT compare the per-block stored
+            // commitment here. That stored value (`utxo:commitment:{hash}`) is an
+            // incremental CHAINED hash — a function of block-apply HISTORY
+            // (including reorg order), not of the current UTXO set — so it is
+            // structurally incomparable to a snapshot of the live set. The old
+            // code compared it against `compute_commitment_hash()` (a set
+            // snapshot); those two algorithms can never be equal, so EVERY
+            // restart past genesis wiped the UTXO set, replayed, still mismatched
+            // and FATAL'd — bricking the node. Until a proper snapshot/Merkle
+            // UTXO commitment exists, use the count-based consistency check
+            // (the previous pre-commitment behaviour), which is reorg-independent
+            // and never false-FATALs.
+            slog_info!("daemon", "utxo_count_integrity_check");
+            let expected = self.compute_expected_utxo_count();
+            let actual = utxo_count;
+            let tolerance = std::cmp::max(expected / 100, 10);
+            let diff = expected.abs_diff(actual);
+            if expected > 0 && diff > tolerance {
+                slog_warn!("daemon", "utxo_count_mismatch_rebuilding", expected => expected, actual => actual);
                 self.utxo_set.clear_all();
                 self.replay_blocks()?;
-
-                // Verify commitment after rebuild
-                let rebuilt_commitment = self.utxo_set.compute_commitment_hash();
-                if rebuilt_commitment != stored_commitment {
-                    return Err(NodeError::Init(format!(
-                        "UTXO commitment still mismatches after full replay! \
-                         This indicates BlockStore corruption. stored={}, rebuilt={}",
-                        &stored_commitment[..std::cmp::min(16, stored_commitment.len())],
-                        &rebuilt_commitment[..std::cmp::min(16, rebuilt_commitment.len())]
-                    )));
-                }
-                slog_info!("daemon", "utxo_rebuilt_and_verified", entries => self.utxo_set.count_utxos());
+                slog_info!("daemon", "utxo_rebuilt", entries => self.utxo_set.count_utxos());
             } else {
-                slog_info!("daemon", "utxo_ok_commitment_verified",
-                    entries => utxo_count,
-                    hash => &computed_commitment[..std::cmp::min(16, computed_commitment.len())]);
+                slog_info!("daemon", "utxo_ok_count_based", actual => actual, expected => expected);
             }
         } else {
             slog_info!("daemon", "utxo_ok", entries => utxo_count);
@@ -919,10 +884,18 @@ impl DaemonNode {
         }
 
         // Re-derive best tip using the canonical GHOSTDAG selection rule.
-        // Uses FullNode::select_best_tip to guarantee runtime and recovery
-        // always agree on fork-choice (blue_score -> height -> hash).
+        // Uses FullNode::select_best_tip_inner to guarantee runtime and recovery
+        // always agree on fork-choice (cumulative work -> blue_score -> height
+        // -> hash). A fresh local cache is fine — cumulative work is a pure
+        // function of the chain, so it yields identical results to the runtime.
         let tips = self.ghostdag.get_tips();
-        let best_tip = FullNode::select_best_tip(&tips, &self.ghostdag);
+        let mut cwork_cache = std::collections::HashMap::new();
+        let best_tip = FullNode::select_best_tip_inner(
+            &self.block_store,
+            &self.ghostdag,
+            &mut cwork_cache,
+            &tips,
+        );
         if let Some(ref best_tip) = best_tip {
             if !self.block_store.update_best_hash(best_tip) {
                 slog_error!("daemon", "rebuild_ghostdag_best_hash_failed",

@@ -188,6 +188,13 @@ pub struct FullNode {
     /// to after each accepted block — without going through a
     /// process-global that would leak between co-tenant nodes.
     pub mining_state: Arc<MiningTemplateState>,
+    /// Memoized cumulative proof-of-work per block hash, used for
+    /// heaviest-chain fork choice. `cwork(b) = cwork(selected_parent) +
+    /// b.header.difficulty`. This is a PURE function of the block's
+    /// (immutable) ancestry, so the cache never needs invalidation — a
+    /// block's cumulative work is fixed once it exists. Rebuilt lazily after
+    /// restart. See `cumulative_work`.
+    cwork_cache: Mutex<HashMap<String, u128>>,
 }
 
 impl FullNode {
@@ -211,10 +218,13 @@ impl FullNode {
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn should_keep_current_tip_on_tie(
         current_best: &str,
         best_tip: &str,
         current_is_tip: bool,
+        current_cwork: u128,
+        best_cwork: u128,
         current_score: u64,
         best_score: u64,
         current_height: u64,
@@ -223,6 +233,7 @@ impl FullNode {
         !current_best.is_empty()
             && best_tip != current_best
             && current_is_tip
+            && current_cwork == best_cwork
             && current_score == best_score
             && current_height == best_height
     }
@@ -307,6 +318,7 @@ impl FullNode {
             dos_guard: DosGuard::new(),
             receipt_store: ReceiptStore::new(100_000),
             mining_state,
+            cwork_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -749,12 +761,92 @@ impl FullNode {
     ///
     /// This MUST be used everywhere a "best tip" is chosen (runtime AND recovery)
     /// to guarantee consistent fork-choice across restarts.
-    pub fn select_best_tip(tips: &[String], ghostdag: &GhostDag) -> Option<String> {
+    /// Cumulative proof-of-work for `hash`: the sum of `header.difficulty` over
+    /// the selected-parent chain back to genesis. Memoized in `cwork_cache`.
+    ///
+    /// This is a deterministic pure function of the block's immutable ancestry
+    /// (selected_parent + the consensus-enforced per-block difficulty), so the
+    /// memo is always valid and identical on every node — no invalidation on
+    /// reorg, and a restarted node rebuilds the same values. The walk is
+    /// iterative (no recursion) to stay safe on very long chains, and stops at
+    /// the first already-cached ancestor for amortized O(1) cost.
+    pub fn cumulative_work(&self, hash: &str) -> u128 {
+        if hash.is_empty() {
+            return 0;
+        }
+        let mut cache = self.cwork_cache.lock().unwrap_or_else(|e| e.into_inner());
+        Self::cumulative_work_inner(&self.block_store, &mut cache, hash)
+    }
+
+    /// Core of [`cumulative_work`], parameterized over the store + memo cache so
+    /// it can be unit-tested without a full node. Walks the selected-parent
+    /// chain (iteratively) to genesis or the first cached ancestor, then
+    /// accumulates `header.difficulty` upward. Pure function of the chain.
+    fn cumulative_work_inner(
+        block_store: &BlockStore,
+        cache: &mut HashMap<String, u128>,
+        hash: &str,
+    ) -> u128 {
+        if hash.is_empty() {
+            return 0;
+        }
+        if let Some(&w) = cache.get(hash) {
+            return w;
+        }
+        // Walk down to genesis or the first cached ancestor, collecting
+        // (hash, difficulty) so we can accumulate upward afterwards.
+        let mut pending: Vec<(String, u128)> = Vec::new();
+        let mut cursor = hash.to_string();
+        let mut base: u128 = 0;
+        loop {
+            if cursor.is_empty() {
+                break;
+            }
+            if let Some(&w) = cache.get(&cursor) {
+                base = w;
+                break;
+            }
+            match block_store.get_block(&cursor) {
+                Some(b) => {
+                    pending.push((cursor.clone(), b.header.difficulty as u128));
+                    cursor = b.header.selected_parent.clone().unwrap_or_default();
+                }
+                None => break, // missing ancestor: treat as chain base
+            }
+        }
+        // Accumulate from the oldest pending block (last pushed) upward.
+        let mut acc = base;
+        while let Some((h, diff)) = pending.pop() {
+            acc = acc.saturating_add(diff);
+            cache.insert(h, acc);
+        }
+        cache.get(hash).copied().unwrap_or(base)
+    }
+
+    /// Select the best tip by HEAVIEST CUMULATIVE WORK (Nakamoto/Kaspa rule),
+    /// then blue_score, then chain_height, then lowest hash as deterministic
+    /// tie-breaks. Ranking by total work — not by blue block COUNT — prevents a
+    /// competing chain with more blocks but less proof-of-work from displacing
+    /// the honest heaviest chain.
+    pub fn select_best_tip(&self, tips: &[String]) -> Option<String> {
+        let mut cache = self.cwork_cache.lock().unwrap_or_else(|e| e.into_inner());
+        Self::select_best_tip_inner(&self.block_store, &self.ghostdag, &mut cache, tips)
+    }
+
+    /// Static core of [`select_best_tip`], shared by the runtime path and the
+    /// crash-recovery path (daemon) so BOTH agree on fork choice exactly — a
+    /// mismatch would let a node pick a different canonical tip after restart.
+    pub fn select_best_tip_inner(
+        block_store: &BlockStore,
+        ghostdag: &GhostDag,
+        cache: &mut HashMap<String, u128>,
+        tips: &[String],
+    ) -> Option<String> {
         tips.iter()
             .max_by(|a, b| {
-                ghostdag
-                    .get_blue_score(a)
-                    .cmp(&ghostdag.get_blue_score(b))
+                Self::cumulative_work_inner(block_store, cache, a)
+                    .cmp(&Self::cumulative_work_inner(block_store, cache, b))
+                    .then_with(|| ghostdag.get_blue_score(a).cmp(&ghostdag.get_blue_score(b)))
                     .then_with(|| {
                         ghostdag
                             .get_chain_height(a)
@@ -824,8 +916,8 @@ impl FullNode {
             return Ok(());
         }
 
-        // Use canonical tip selection: blue_score -> height -> hash
-        let mut best_tip = match Self::select_best_tip(&tips, &self.ghostdag) {
+        // Canonical tip selection: cumulative work -> blue_score -> height -> hash
+        let mut best_tip = match self.select_best_tip(&tips) {
             Some(tip) => tip,
             None => return Ok(()),
         };
@@ -833,11 +925,14 @@ impl FullNode {
         let current_best = self.block_store.get_best_hash().unwrap_or_default();
 
         // Reorg stability guard:
-        // If the current best is still a DAG tip and has the same
-        // (blue_score, chain_height) quality as the newly selected tip,
+        // If the current best is still a DAG tip and has the SAME quality as the
+        // newly selected tip (equal cumulative work, blue_score AND chain_height),
         // keep the current best to avoid tie-flip oscillation and needless
-        // rollback/apply churn.
+        // rollback/apply churn. Cumulative work must match too, or a heavier
+        // competing tip could be wrongly held off by an equal-score lighter one.
         let current_is_tip = tips.iter().any(|t| t == &current_best);
+        let best_cwork = self.cumulative_work(&best_tip);
+        let current_cwork = self.cumulative_work(&current_best);
         let best_score = self.ghostdag.get_blue_score(&best_tip);
         let best_height = self.ghostdag.get_chain_height(&best_tip);
         let current_score = self.ghostdag.get_blue_score(&current_best);
@@ -846,6 +941,8 @@ impl FullNode {
             &current_best,
             &best_tip,
             current_is_tip,
+            current_cwork,
+            best_cwork,
             current_score,
             best_score,
             current_height,
@@ -2770,6 +2867,73 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_work_sums_difficulty_and_prefers_heavier_equal_height_tip() {
+        use crate::domain::block::block::Block;
+        use crate::domain::block::block_body::BlockBody;
+        use crate::domain::block::block_header::BlockHeader;
+        use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
+        use crate::infrastructure::storage::rocksdb::core::db::NodeDB;
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let id = CTR.fetch_add(1, Ordering::Relaxed);
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = format!(
+            "{}/cwork_{}_{}_{}",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            uniq,
+            id
+        );
+        let store = BlockStore::new(NodeDB::new(&path).unwrap().shared()).unwrap();
+
+        let mk = |hash: &str, height: u64, parent: Option<&str>, diff: u64| Block {
+            header: BlockHeader {
+                version: 1,
+                hash: hash.into(),
+                parents: parent.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                merkle_root: "m".into(),
+                timestamp: 1000 + height,
+                nonce: 0,
+                difficulty: diff,
+                height,
+                blue_score: height,
+                selected_parent: parent.map(|p| p.to_string()),
+                utxo_commitment: None,
+                extra_nonce: 0,
+                receipt_root: None,
+                state_root: None,
+            },
+            body: BlockBody { transactions: vec![] },
+        };
+        // Main chain g(1000) -> b1(2000) -> b2(500); competing tip b1 -> c2(5000).
+        assert!(store.save_block(&mk("g", 0, None, 1000)));
+        assert!(store.save_block(&mk("b1", 1, Some("g"), 2000)));
+        assert!(store.save_block(&mk("b2", 2, Some("b1"), 500)));
+        assert!(store.save_block(&mk("c2", 2, Some("b1"), 5000)));
+
+        let mut cache: HashMap<String, u128> = HashMap::new();
+        assert_eq!(FullNode::cumulative_work_inner(&store, &mut cache, "g"), 1000);
+        assert_eq!(FullNode::cumulative_work_inner(&store, &mut cache, "b1"), 3000);
+        assert_eq!(FullNode::cumulative_work_inner(&store, &mut cache, "b2"), 3500);
+        assert_eq!(FullNode::cumulative_work_inner(&store, &mut cache, "c2"), 8000);
+        // Heaviest-chain rule: equal height (2) but c2 carries far more PoW.
+        assert!(
+            FullNode::cumulative_work_inner(&store, &mut cache, "c2")
+                > FullNode::cumulative_work_inner(&store, &mut cache, "b2"),
+            "equal-height competing tip with more PoW must have greater cumulative work"
+        );
+        // Memoized values are stable and consistent.
+        assert_eq!(FullNode::cumulative_work_inner(&store, &mut cache, "b2"), 3500);
+        assert_eq!(*cache.get("c2").unwrap(), 8000u128);
+        assert_eq!(FullNode::cumulative_work_inner(&store, &mut cache, ""), 0);
+    }
+
+    #[test]
     fn confidential_gate_accepts_valid_and_rejects_tampered_block() {
         // Regression for the CRITICAL apply-path gap: recompute_virtual_chain
         // must run the full confidential gate before applying a block. This
@@ -2855,60 +3019,40 @@ mod tests {
         assert!(verify_block_confidential_txs(&bad, &set, &net).is_err());
     }
 
+    // Signature: (current_best, best_tip, current_is_tip,
+    //             current_cwork, best_cwork, current_score, best_score,
+    //             current_height, best_height)
     #[test]
     fn keep_current_tip_on_exact_tie_when_current_is_still_tip() {
+        // Equal cumulative work, blue_score AND height → keep current (no churn).
         assert!(FullNode::should_keep_current_tip_on_tie(
-            "curr",
-            "new",
-            true,
-            100,
-            100,
-            42,
-            42,
+            "curr", "new", true, 500, 500, 100, 100, 42, 42,
         ));
     }
 
     #[test]
     fn do_not_keep_current_tip_when_new_tip_is_stronger() {
+        // Heavier cumulative work on the new tip → must reorg (do NOT keep).
         assert!(!FullNode::should_keep_current_tip_on_tie(
-            "curr",
-            "new",
-            true,
-            100,
-            101,
-            42,
-            42,
+            "curr", "new", true, 500, 501, 100, 100, 42, 42,
         ));
+        // Higher blue_score → do not keep.
         assert!(!FullNode::should_keep_current_tip_on_tie(
-            "curr",
-            "new",
-            true,
-            100,
-            100,
-            42,
-            43,
+            "curr", "new", true, 500, 500, 100, 101, 42, 42,
+        ));
+        // Higher chain_height → do not keep.
+        assert!(!FullNode::should_keep_current_tip_on_tie(
+            "curr", "new", true, 500, 500, 100, 100, 42, 43,
         ));
     }
 
     #[test]
     fn do_not_keep_when_current_best_not_in_tip_set_or_same_tip() {
         assert!(!FullNode::should_keep_current_tip_on_tie(
-            "curr",
-            "new",
-            false,
-            100,
-            100,
-            42,
-            42,
+            "curr", "new", false, 500, 500, 100, 100, 42, 42,
         ));
         assert!(!FullNode::should_keep_current_tip_on_tie(
-            "curr",
-            "curr",
-            true,
-            100,
-            100,
-            42,
-            42,
+            "curr", "curr", true, 500, 500, 100, 100, 42, 42,
         ));
     }
 }
