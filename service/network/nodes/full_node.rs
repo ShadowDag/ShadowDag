@@ -971,8 +971,17 @@ impl FullNode {
         let mut applied_new: Vec<String> = Vec::new();
 
         for block_hash in &new_chain {
-            // Skip if already applied
-            if self.utxo_set.get_commitment(block_hash).is_some() {
+            // Skip only if BOTH the UTXO state (utxo:commitment) AND the contract
+            // state (contract:applied marker) for this block are persisted. UTXO
+            // and contract state live in SEPARATE RocksDBs committed in separate
+            // batches; a crash between them leaves the UTXO commitment present but
+            // the contract state missing. Keying the skip off UTXO commitment
+            // alone would permanently skip such a block, leaving a contract-state
+            // hole (state_root divergence). Requiring the contract marker too
+            // forces re-execution of a crash-interrupted block.
+            if self.utxo_set.get_commitment(block_hash).is_some()
+                && self.contract_storage.contract_block_applied(block_hash)
+            {
                 continue;
             }
 

@@ -751,6 +751,17 @@ impl ExecutionEnvironment {
         })?;
         wb.put(undo_key.as_bytes(), &undo_bytes);
 
+        // Contract-applied marker, in the SAME atomic batch as the contract
+        // state. The block-apply path commits UTXO state (with its
+        // `utxo:commitment:` marker) to a SEPARATE RocksDB, then persists
+        // contracts here. A crash BETWEEN those two commits would leave the
+        // UTXO commitment present but contract state missing; recovery keys
+        // idempotency off this marker so such a block is RE-EXECUTED rather than
+        // skipped (otherwise the contract-state hole is permanent → state_root
+        // divergence on contract chains).
+        let applied_key = format!("contract:applied:{}", block_hash);
+        wb.put(applied_key.as_bytes(), [1u8]);
+
         // Commit state + undo atomically via the shared DB handle.
         storage.shared_db().write(wb).map_err(|e| {
             VmError::Other(format!(
