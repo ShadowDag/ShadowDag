@@ -1066,6 +1066,7 @@ impl RpcServer {
                 }
             }
             "getblock" => Self::cmd_getblock(params, id, state),
+            "getblockfull" => Self::cmd_getblockfull(params, id, state),
             "getblocks" => Self::cmd_getblocks(params, id, state),
             "getblockcount" => Self::cmd_getblockcount(id, state),
             "getbestblockhash" => Self::cmd_getbestblockhash(id, state),
@@ -1368,6 +1369,31 @@ impl RpcServer {
                 None => RpcResponse::err(id, ERR_NOT_FOUND, format!("Block {} not found", hash)),
             },
             Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        }
+    }
+
+    /// Return the FULL block (header + all transactions, including confidential
+    /// output fields) as JSON deserializable into `Block`. Unlike `getblock`
+    /// (header summary only), this exposes the data a wallet needs to scan for
+    /// confidential outputs. Read-only; the state lock is dropped before
+    /// serialization (a block can be large).
+    fn cmd_getblockfull(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
+        let hash = match params.first().and_then(|v| v.as_str()) {
+            Some(h) => h.to_string(),
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "Expected block hash"),
+        };
+        let block_opt = match state.lock() {
+            Ok(s) => s.block_store.get_block(&hash),
+            Err(_) => return RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        };
+        match block_opt {
+            Some(block) => match serde_json::to_value(&block) {
+                Ok(v) => RpcResponse::ok(id, v),
+                Err(e) => {
+                    RpcResponse::err(id, ERR_INTERNAL, format!("block serialize failed: {}", e))
+                }
+            },
+            None => RpcResponse::err(id, ERR_NOT_FOUND, format!("Block {} not found", hash)),
         }
     }
 
@@ -4967,6 +4993,54 @@ mod tests {
         let s = make_server();
         let r = call(&s, "getblock");
         assert_eq!(r["error"]["code"], json!(ERR_INVALID_PARAMS));
+    }
+
+    #[test]
+    fn getblockfull_without_params_returns_error() {
+        let s = make_server();
+        let r = call(&s, "getblockfull");
+        assert_eq!(r["error"]["code"], json!(ERR_INVALID_PARAMS));
+    }
+
+    #[test]
+    fn getblockfull_unknown_hash_returns_not_found() {
+        let s = make_server();
+        let r = call_params(&s, "getblockfull", json!(["deadbeef"]));
+        assert_eq!(r["error"]["code"], json!(ERR_NOT_FOUND));
+    }
+
+    #[test]
+    fn block_json_round_trips_for_wallet_scan() {
+        // The CLI scan deserializes getblockfull's JSON into `Block`. Prove the
+        // serde contract holds (Block -> serde_json::Value -> Block).
+        use crate::domain::block::block::Block;
+        use crate::domain::block::block_body::BlockBody;
+        use crate::domain::block::block_header::BlockHeader;
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                hash: "ab".repeat(32),
+                parents: vec!["cd".repeat(32)],
+                merkle_root: "mr".into(),
+                timestamp: 1000,
+                nonce: 7,
+                difficulty: 1,
+                height: 5,
+                blue_score: 0,
+                selected_parent: None,
+                utxo_commitment: None,
+                extra_nonce: 0,
+                receipt_root: None,
+                state_root: None,
+            },
+            body: BlockBody {
+                transactions: vec![],
+            },
+        };
+        let v = serde_json::to_value(&block).unwrap();
+        let back: Block = serde_json::from_value(v).unwrap();
+        assert_eq!(back.header.hash, block.header.hash);
+        assert_eq!(back.header.height, 5);
     }
 
     #[test]
