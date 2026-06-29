@@ -135,6 +135,52 @@ impl RingValidator {
         true
     }
 
+    /// Cryptographic CLSAG verification for every confidential input.
+    ///
+    /// Deserializes each input's `ring_members` (hex compressed Ristretto) and
+    /// `ring_signature` (hex CLSAG), then checks the ring closes over the
+    /// canonical confidential message. Also requires the input's `key_image`
+    /// field to equal the signature's key image. Pure crypto — NO DB access.
+    pub fn verify_clsag(
+        tx: &Transaction,
+        network: &crate::config::node::node_config::NetworkMode,
+    ) -> bool {
+        use crate::domain::transaction::tx_hash::TxHash;
+        use crate::engine::privacy::ringct::clsag;
+        use crate::engine::privacy::ringct::serialization::{clsag_sig_from_hex, point_from_hex};
+
+        let msg = TxHash::confidential_signing_message_for_network(tx, network);
+        for input in &tx.inputs {
+            let members = match &input.ring_members {
+                Some(m) if !m.is_empty() => m,
+                _ => return false,
+            };
+            let mut ring = Vec::with_capacity(members.len());
+            for m in members {
+                match point_from_hex(m) {
+                    Some(p) => ring.push(p),
+                    None => return false,
+                }
+            }
+            let sig = match &input.ring_signature {
+                Some(rs) => match clsag_sig_from_hex(rs) {
+                    Some(s) => s,
+                    None => return false,
+                },
+                None => return false,
+            };
+            // The advertised key image must match the signature's key image.
+            match &input.key_image {
+                Some(ki) if *ki == hex::encode(sig.key_image.as_bytes()) => {}
+                _ => return false,
+            }
+            if !clsag::verify(&msg, &ring, &sig) {
+                return false;
+            }
+        }
+        true
+    }
+
     #[deprecated(
         since = "1.0.0",
         note = "Use validate() instead. quick_validate skips ring signature verification!"
@@ -236,6 +282,53 @@ mod tests {
         assert!(
             !RingValidator::validate(&tx),
             "Privacy TX must be rejected when CLSAG is not wired"
+        );
+    }
+
+    #[test]
+    fn verify_clsag_accepts_valid_and_rejects_tamper() {
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::transaction::tx_hash::TxHash;
+        use crate::engine::privacy::ringct::clsag;
+        use crate::engine::privacy::ringct::serialization::clsag_sig_to_hex;
+        use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+        use curve25519_dalek::scalar::Scalar;
+        use rand::rngs::OsRng;
+
+        // Ring of 4 real keypairs; the real signer is index 2.
+        let pairs: Vec<(Scalar, _)> = (0..4)
+            .map(|_| {
+                let sk = Scalar::random(&mut OsRng);
+                (sk, sk * RISTRETTO_BASEPOINT_POINT)
+            })
+            .collect();
+        let ring_hex: Vec<String> = pairs
+            .iter()
+            .map(|(_, pk)| hex::encode(pk.compress().as_bytes()))
+            .collect();
+
+        let mut tx = make_confidential_tx(1);
+        tx.inputs[0].ring_members = Some(ring_hex);
+        let net = NetworkMode::Mainnet;
+        // Key image is deterministic from the signer's key — set it BEFORE
+        // computing the message (the message binds the key image).
+        let ki = clsag::key_image(&pairs[2].0, &pairs[2].1);
+        tx.inputs[0].key_image = Some(hex::encode(ki.compress().as_bytes()));
+        let msg = TxHash::confidential_signing_message_for_network(&tx, &net);
+        let ring: Vec<_> = pairs.iter().map(|(_, p)| *p).collect();
+        let sig = clsag::sign(&msg, &ring, 2, &pairs[2].0).unwrap();
+        tx.inputs[0].ring_signature = Some(clsag_sig_to_hex(&sig));
+
+        assert!(RingValidator::verify_clsag(&tx, &net), "valid CLSAG must pass");
+
+        // Tamper: replace the signature with garbage of the same shape.
+        let mut bad = tx.clone();
+        bad.inputs[0].ring_signature = Some(clsag_sig_to_hex(
+            &clsag::sign(b"different message", &ring, 2, &pairs[2].0).unwrap(),
+        ));
+        assert!(
+            !RingValidator::verify_clsag(&bad, &net),
+            "signature over a different message must fail"
         );
     }
 }
