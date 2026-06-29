@@ -360,7 +360,11 @@ impl Mempool {
             Err(_) => return false,
         }
         let tx_size = tx.canonical_bytes().len().max(1) as u64;
-        let fee_rate = tx.fee / tx_size;
+        // Scale before dividing: a plain `fee / size` is integer-truncated to 0
+        // for every normal tx (fee in sat < size in bytes), collapsing all txs
+        // into one priority bucket and breaking fee-based eviction/template
+        // ordering. Use milli-sat-per-byte so the ordering key has resolution.
+        let fee_rate = tx.fee.saturating_mul(1000) / tx_size;
         let fee_key = format!("fee:{:020}:{}", u64::MAX - fee_rate, tx.hash);
         batch.put(fee_key.as_bytes(), tx.hash.as_bytes());
         // Build conflict + dependency indexes (same as production)
@@ -605,7 +609,11 @@ impl Mempool {
         batch.put(tx_key.as_bytes(), &data);
 
         let tx_size = tx.canonical_bytes().len().max(1) as u64;
-        let fee_rate = tx.fee / tx_size;
+        // Scale before dividing: a plain `fee / size` is integer-truncated to 0
+        // for every normal tx (fee in sat < size in bytes), collapsing all txs
+        // into one priority bucket and breaking fee-based eviction/template
+        // ordering. Use milli-sat-per-byte so the ordering key has resolution.
+        let fee_rate = tx.fee.saturating_mul(1000) / tx_size;
         let fee_key = format!("fee:{:020}:{}", u64::MAX - fee_rate, tx.hash);
         batch.put(fee_key.as_bytes(), tx.hash.as_bytes());
 
@@ -1737,7 +1745,7 @@ mod tests {
             let _ = mp.db.put(format!("tx:{}", old_hash).as_bytes(), &data);
             // Also insert fee index entry (required by evict_expired scan)
             let tx_size = old_tx.canonical_bytes().len().max(1) as u64;
-            let fee_rate = old_tx.fee / tx_size;
+            let fee_rate = old_tx.fee.saturating_mul(1000) / tx_size; // milli-sat/byte (consistent with add)
             let fee_key = format!("fee:{:020}:{}", u64::MAX - fee_rate, old_hash);
             let _ = mp.db.put(fee_key.as_bytes(), old_hash.as_bytes());
         }
