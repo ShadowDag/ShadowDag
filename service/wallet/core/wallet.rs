@@ -100,6 +100,23 @@ pub struct WalletState {
     pub accounts: Vec<WalletAccount>,
 }
 
+/// A confidential (RingCT) output owned by this wallet, recovered by scanning.
+/// The raw one-time spend secret is NOT stored — it is recovered on demand at
+/// spend time from `ephemeral_pubkey` + the wallet's view/spend scalars.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConfidentialUtxo {
+    pub txid: String,
+    pub index: u32,
+    pub amount: u64,
+    /// hex(Scalar.to_bytes()) — the Pedersen blinding (needed to spend).
+    pub blinding_hex: String,
+    /// hex(compressed point) — the real ring member (this output's one-time key).
+    pub one_time_pubkey: String,
+    /// hex(R) — ephemeral pubkey, used to recover the spend secret at spend time.
+    pub ephemeral_pubkey: String,
+    pub spent: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Wallet {
     state: WalletState,
@@ -109,6 +126,8 @@ pub struct Wallet {
     session_key: Option<Vec<u8>>,
     locked: bool,
     network: String,
+    #[serde(default)]
+    confidential_utxos: Vec<ConfidentialUtxo>,
 }
 
 impl Wallet {
@@ -125,6 +144,7 @@ impl Wallet {
             session_key: None,
             locked: true,
             network: network.to_string(),
+            confidential_utxos: Vec::new(),
         }
     }
 
@@ -193,6 +213,31 @@ impl Wallet {
     /// Reusable confidential receive address (`SD1p…`). None if locked.
     pub fn confidential_receive_address(&self) -> Option<String> {
         Some(self.confidential_keys()?.confidential_address())
+    }
+
+    /// Record a confidential UTXO (deduplicated by one-time pubkey).
+    pub fn add_confidential_utxo(&mut self, u: ConfidentialUtxo) {
+        if !self
+            .confidential_utxos
+            .iter()
+            .any(|e| e.one_time_pubkey == u.one_time_pubkey)
+        {
+            self.confidential_utxos.push(u);
+        }
+    }
+
+    /// Total spendable (unspent) confidential balance.
+    pub fn confidential_balance(&self) -> u64 {
+        self.confidential_utxos
+            .iter()
+            .filter(|u| !u.spent)
+            .map(|u| u.amount)
+            .sum()
+    }
+
+    /// All tracked confidential UTXOs (spent + unspent).
+    pub fn confidential_utxos(&self) -> &[ConfidentialUtxo] {
+        &self.confidential_utxos
     }
 
     pub fn is_locked(&self) -> bool {
@@ -988,6 +1033,32 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confidential_balance_sums_unspent() {
+        let mut w = Wallet::new("mainnet");
+        w.restore_from_seed(vec![5u8; 32]).unwrap();
+        assert_eq!(w.confidential_balance(), 0);
+        w.add_confidential_utxo(ConfidentialUtxo {
+            txid: "a".into(),
+            index: 0,
+            amount: 100,
+            blinding_hex: "00".repeat(32),
+            one_time_pubkey: "11".repeat(32),
+            ephemeral_pubkey: "22".repeat(32),
+            spent: false,
+        });
+        w.add_confidential_utxo(ConfidentialUtxo {
+            txid: "b".into(),
+            index: 0,
+            amount: 50,
+            blinding_hex: "00".repeat(32),
+            one_time_pubkey: "33".repeat(32),
+            ephemeral_pubkey: "44".repeat(32),
+            spent: true,
+        });
+        assert_eq!(w.confidential_balance(), 100); // spent excluded
+    }
 
     #[test]
     fn confidential_address_is_deterministic_from_seed() {
