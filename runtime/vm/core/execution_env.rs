@@ -1844,39 +1844,48 @@ impl ExecutionEnvironment {
                 // ── Memory ───────────────────────────────────
                 OpCode::MLOAD => {
                     let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
-                    if offset + 32 > MAX_MEMORY_SIZE {
-                        self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure {
-                            gas_used: gas.gas_used(),
-                        };
-                    }
-                    if !Self::charge_and_expand_memory(&mut gas, &mut memory, offset + 32) {
+                    // checked_add: offset is attacker-controlled (up to u64::MAX);
+                    // a raw `offset + 32` wraps in release and slips past the
+                    // MAX_MEMORY_SIZE guard, then panics on the slice.
+                    let end = match offset.checked_add(32) {
+                        Some(e) if e <= MAX_MEMORY_SIZE => e,
+                        _ => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                    };
+                    if !Self::charge_and_expand_memory(&mut gas, &mut memory, end) {
                         self.state.rollback(snapshot).ok();
                         return CallOutcome::Failure {
                             gas_used: gas.gas_used(),
                         };
                     }
                     let mut buf = [0u8; 32];
-                    buf.copy_from_slice(&memory[offset..offset + 32]);
+                    buf.copy_from_slice(&memory[offset..end]);
                     stack.push(U256::from_be_bytes(&buf));
                 }
                 OpCode::MSTORE => {
                     let (offset_val, val) = pop2!(stack, gas, snapshot, self);
                     let offset = offset_val.as_u64() as usize;
-                    if offset + 32 > MAX_MEMORY_SIZE {
-                        self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure {
-                            gas_used: gas.gas_used(),
-                        };
-                    }
-                    if !Self::charge_and_expand_memory(&mut gas, &mut memory, offset + 32) {
+                    let end = match offset.checked_add(32) {
+                        Some(e) if e <= MAX_MEMORY_SIZE => e,
+                        _ => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                    };
+                    if !Self::charge_and_expand_memory(&mut gas, &mut memory, end) {
                         self.state.rollback(snapshot).ok();
                         return CallOutcome::Failure {
                             gas_used: gas.gas_used(),
                         };
                     }
                     let bytes = val.to_be_bytes();
-                    memory[offset..offset + 32].copy_from_slice(&bytes);
+                    memory[offset..end].copy_from_slice(&bytes);
                 }
 
                 // ── Logging ──────────────────────────────────
@@ -2947,8 +2956,11 @@ impl ExecutionEnvironment {
                     let length = pop1!(stack, gas, snapshot, self).as_u64() as usize;
                     let salt = pop1!(stack, gas, snapshot, self);
 
-                    let init_code = if length > 0 && offset + length <= memory.len() {
-                        memory[offset..offset + length].to_vec()
+                    let init_code = if length > 0
+                        && offset.checked_add(length).is_some_and(|e| e <= memory.len())
+                    {
+                        let end = offset + length; // safe: checked above
+                        memory[offset..end].to_vec()
                     } else {
                         stack.push(U256::ZERO);
                         pc += 1;
@@ -3219,13 +3231,16 @@ impl ExecutionEnvironment {
                 OpCode::MSTORE8 => {
                     let (offset_val, val) = pop2!(stack, gas, snapshot, self);
                     let offset = offset_val.as_u64() as usize;
-                    if offset + 1 > MAX_MEMORY_SIZE {
-                        self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure {
-                            gas_used: gas.gas_used(),
-                        };
-                    }
-                    if !Self::charge_and_expand_memory(&mut gas, &mut memory, offset + 1) {
+                    let end = match offset.checked_add(1) {
+                        Some(e) if e <= MAX_MEMORY_SIZE => e,
+                        _ => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                    };
+                    if !Self::charge_and_expand_memory(&mut gas, &mut memory, end) {
                         self.state.rollback(snapshot).ok();
                         return CallOutcome::Failure {
                             gas_used: gas.gas_used(),
@@ -3282,13 +3297,22 @@ impl ExecutionEnvironment {
                     let data = if length == 0 {
                         Vec::new()
                     } else {
-                        if !Self::charge_and_expand_memory(&mut gas, &mut memory, offset + length) {
+                        let end = match offset.checked_add(length) {
+                            Some(e) => e,
+                            None => {
+                                self.state.rollback(snapshot).ok();
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
+                            }
+                        };
+                        if !Self::charge_and_expand_memory(&mut gas, &mut memory, end) {
                             self.state.rollback(snapshot).ok();
                             return CallOutcome::Failure {
                                 gas_used: gas.gas_used(),
                             };
                         }
-                        memory[offset..offset + length].to_vec()
+                        memory[offset..end].to_vec()
                     };
                     logs.push(LogEntry {
                         contract: ctx.address.clone(),
@@ -3308,8 +3332,12 @@ impl ExecutionEnvironment {
                     }
                     let mut buf = [0u8; 32];
                     for (i, byte) in buf.iter_mut().enumerate() {
-                        if offset + i < ctx.calldata.len() {
-                            *byte = ctx.calldata[offset + i];
+                        // checked_add: offset is attacker-controlled; a raw
+                        // offset + i wraps in release and could index OOB.
+                        if let Some(idx) = offset.checked_add(i) {
+                            if idx < ctx.calldata.len() {
+                                *byte = ctx.calldata[idx];
+                            }
                         }
                     }
                     stack.push(U256::from_be_bytes(&buf));
@@ -3825,6 +3853,33 @@ mod tests {
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Success { .. }));
+    }
+
+    #[test]
+    fn mstore_huge_offset_fails_without_panic() {
+        // Regression (C1): a near-usize::MAX offset must NOT wrap past the
+        // MAX_MEMORY_SIZE guard and panic on the slice — it must fail cleanly.
+        let mut env = make_env();
+        // PUSH8 0xFFFF..FF (value), PUSH8 0xFFFF..FF (offset), MSTORE
+        let code: Vec<u8> = vec![
+            0x13, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // PUSH8 value
+            0x13, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // PUSH8 offset
+            0x91, // MSTORE
+        ];
+        env.state.set_code("c", code).unwrap();
+        let ctx = CallContext {
+            address: "c".into(),
+            code_address: "c".into(),
+            caller: "u".into(),
+            value: 0,
+            gas_limit: 1_000_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(matches!(result, CallOutcome::Failure { .. }));
     }
 
     #[test]
