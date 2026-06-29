@@ -179,8 +179,9 @@ impl DandelionRelay {
         let now = now_secs();
         let mut to_fluff = Vec::new();
 
-        // Check epoch rotation
-        if now - self.epoch_start >= EPOCH_DURATION_SECS {
+        // Check epoch rotation (saturating_sub: a backward clock step must not
+        // panic in debug nor wrap to a huge value in release).
+        if now.saturating_sub(self.epoch_start) >= EPOCH_DURATION_SECS {
             self.epoch_start = now;
             self.stem_peer_map.clear(); // Re-randomize stem peers
         }
@@ -192,7 +193,7 @@ impl DandelionRelay {
             .filter(|(_, dtx)| match dtx.phase {
                 RelayPhase::Stem {
                     entered_at, hops, ..
-                } => now - entered_at >= STEM_TIMEOUT_SECS || hops >= MAX_STEM_HOPS,
+                } => now.saturating_sub(entered_at) >= STEM_TIMEOUT_SECS || hops >= MAX_STEM_HOPS,
                 RelayPhase::Fluff => true,
             })
             .map(|(h, _)| h.clone())
@@ -264,7 +265,7 @@ impl DandelionRelay {
     fn flush_expired(&mut self) {
         let now = now_secs();
         self.stem_pool.retain(|_, dtx| match dtx.phase {
-            RelayPhase::Stem { entered_at, .. } => now - entered_at < STEM_TIMEOUT_SECS,
+            RelayPhase::Stem { entered_at, .. } => now.saturating_sub(entered_at) < STEM_TIMEOUT_SECS,
             RelayPhase::Fluff => false,
         });
     }
