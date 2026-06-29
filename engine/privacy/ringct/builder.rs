@@ -261,6 +261,22 @@ mod tests {
     }
 
     #[test]
+    fn confidential_tx_passes_mempool_validation_path() {
+        // Regression for the mempool fall-through bug: a confidential tx must be
+        // ACCEPTED by TxValidator::validate_tx_for_network (which previously fell
+        // through into the transparent UTXO loop and rejected it).
+        use crate::domain::transaction::tx_validator::TxValidator;
+        let set = UtxoSet::new_empty();
+        let net = NetworkMode::Mainnet;
+        let inp = owned_input(&set, 100, 4, 1);
+        let tx = build_confidential_transaction(vec![inp], vec![recipient(100)], 0, &net).unwrap();
+        assert!(
+            TxValidator::validate_tx_for_network(&tx, &set, &net),
+            "confidential tx must pass the mempool validation path"
+        );
+    }
+
+    #[test]
     fn builds_valid_1in_3out_with_fee() {
         let set = UtxoSet::new_empty();
         let net = NetworkMode::Mainnet;

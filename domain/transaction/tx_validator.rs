@@ -468,10 +468,14 @@ impl TxValidator {
         if Self::validate_contract_call_payload_for_network(tx, network).is_err() {
             return false;
         }
-        // Confidential TXs: full RingCT phase-1 gate (structural + CLSAG crypto
-        // + on-chain ring-member authenticity + key-image uniqueness).
-        if tx.is_confidential() && !Self::validate_confidential(tx, utxo_set, network) {
-            return false;
+        // Confidential (RingCT) TXs are validated ENTIRELY by the confidential
+        // gate (CLSAG + on-chain ring authenticity + key-image uniqueness +
+        // homomorphic balance + range proofs) and then RETURN — they must NOT
+        // fall through to the transparent UTXO loop below, which would look up
+        // a non-existent outpoint (confidential inputs carry a dummy txid) and
+        // reject the tx, diverging from the block path (validate_block_utxos).
+        if tx.is_confidential() {
+            return Self::validate_confidential(tx, utxo_set, network);
         }
 
         let mut seen_inputs: HashSet<UtxoKey> = HashSet::with_capacity(tx.inputs.len());
@@ -587,6 +591,21 @@ impl TxValidator {
         // [8] TX timestamp validation — reject stale/future TXs
         if let Err(reason) = Self::validate_tx_timestamp(tx) {
             return Err(StorageError::Other(format!("tx {}: {}", tx.hash, reason)));
+        }
+
+        // Confidential (RingCT) TXs: validated entirely by the confidential gate
+        // and RETURN — must not fall through to the transparent UTXO loop below
+        // (their inputs carry dummy outpoints). Mirrors validate_tx_for_network
+        // and the block path (validate_block_utxos).
+        if tx.is_confidential() {
+            return if Self::validate_confidential(tx, utxo_set, &network) {
+                Ok(())
+            } else {
+                Err(StorageError::Other(format!(
+                    "confidential (RingCT) verification failed for tx {}",
+                    tx.hash
+                )))
+            };
         }
 
         // [9] payload_hash format validation
@@ -733,17 +752,8 @@ impl TxValidator {
             )));
         }
 
-        // ── Ring signature verification for confidential transactions ───
-        // Mandatory check: ring signatures must be valid in the consensus path.
-        // block_validator already checks this, but tx_validator must also enforce
-        // it so that mempool admission and standalone TX validation are safe.
-        if tx.is_confidential() && !Self::validate_confidential(tx, utxo_set, &network) {
-            return Err(StorageError::Other(format!(
-                "confidential (RingCT) verification failed for tx {}",
-                tx.hash
-            )));
-        }
-
+        // (Confidential TXs returned earlier via the confidential gate; the
+        // transparent path above does not apply to them.)
         Ok(())
     }
 
