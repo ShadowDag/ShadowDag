@@ -233,6 +233,7 @@ pub mod engine {
             pub mod builder;
             pub mod confidential_consensus;
             pub mod ring_validator;
+            pub mod scan;
             pub mod serialization;
             pub mod tx_confidential;
         }
