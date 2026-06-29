@@ -222,6 +222,41 @@ confirmed exploitable bug: contract_ide bind/loopback + CSRF/DNS-rebind guard
 verified active; RPC auth table covers mutating methods; sync/light modules
 confirmed unwired or proof-gated.
 
+## Seventh pass (crypto implementation pitfalls) — RNG/nonce, point validation, constant-time, PoW, auth
+
+Verified by me against real code. 3 FIXED, 2 confirmed non-issues:
+
+- **CR1 (LOW) — FIXED:** `dual_clsag::verify` accepted the identity point as a key
+  image / auxiliary D. Ristretto is already prime-order (no torsion), but identity
+  is a degenerate (zero-secret) value that weakens double-spend uniqueness. Now
+  rejected via `IsIdentity`. Test added.
+- **CR2 (LOW) — FIXED:** `add_to_orphan_pool` ran its PoW admission against the
+  attacker-supplied `header.hash`, so a forged low hash "met target" without work,
+  defeating the gate and letting cheap junk churn/evict honest orphans (bounded
+  pool, evicts oldest). Now recomputes the hash via `shadow_hash_raw_full` and
+  requires it to bind the header before the PoW check. Test added; orphan tests
+  updated to content-valid hashes.
+- **CR3 (LOW) — FIXED:** `HDWallet` kept the wallet password in a dead, non-zeroizing
+  `String` field lingering in memory. Removed (encryption uses the password param
+  directly).
+- **CR4 (INFO) — NOT a bug, do NOT change:** the wallet's custom 12-word mnemonic
+  encodes ~132 bits (>128, standard 12-word strength); the seed is derived
+  deterministically FROM the mnemonic (`mnemonic_to_seed_simple` PBKDF2), so
+  backup/restore round-trips correctly. Altering `entropy_to_mnemonic_simple`/
+  `mnemonic_to_seed_simple` would change the seed derived from existing mnemonics
+  ⇒ LOST FUNDS. Left untouched by design.
+- **CR5 (INFO) — not exploitable:** RPC bearer-token lookup uses a `HashMap` (token
+  is the key). SipHash is randomly seeded per map, so there is no byte-position
+  timing correlation, and tokens are `OsRng` high-entropy. No classic timing
+  oracle; switching to a linear ct_eq scan would add an O(n) per-request cost for
+  no real gain. Left as-is.
+
+7th-pass coverage: RNG/nonce (OsRng throughout; random ring position confirmed),
+point/scalar validation on untrusted bytes, constant-time secret comparison, PoW
+hash/target math (verified clean), auth-token generation+verification. Math
+soundness of CLSAG/Pedersen/range-proofs remains the external cryptographer's
+scope (not attempted here).
+
 ## Final deferred set (all confirmed real, all MEDIUM, all mitigated — consensus/storage REDESIGNS)
 These share: real but NOT turnkey-exploitable, and their correct fix is an
 architecture change where a rushed patch is itself a serious risk. They are the
