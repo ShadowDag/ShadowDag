@@ -4,7 +4,9 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::domain::address::invisible_wallet::InvisibleWallet;
+use crate::domain::block::block::Block;
 use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
+use crate::engine::privacy::ringct::scan::scan_confidential_output;
 use crate::errors::WalletError;
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -238,6 +240,50 @@ impl Wallet {
     /// All tracked confidential UTXOs (spent + unspent).
     pub fn confidential_utxos(&self) -> &[ConfidentialUtxo] {
         &self.confidential_utxos
+    }
+
+    /// Scan a transaction for confidential outputs owned by this wallet, record
+    /// any new ones, and return them. Uses `scan_confidential_output` (the same
+    /// context-free derivation the builder used) — NOT the tx-context stealth
+    /// scanner — so detection + amount recovery match what was produced.
+    pub fn scan_confidential(&mut self, tx: &Transaction) -> Vec<ConfidentialUtxo> {
+        let ck = match self.confidential_keys() {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        let (vs, sp) = (ck.view_scalar(), ck.spend_public());
+        let mut found = Vec::new();
+        for (idx, out) in tx.outputs.iter().enumerate() {
+            if let Some(rec) = scan_confidential_output(out, idx as u32, &vs, &sp) {
+                let u = ConfidentialUtxo {
+                    txid: tx.hash.clone(),
+                    index: idx as u32,
+                    amount: rec.amount,
+                    blinding_hex: hex::encode(rec.blinding.to_bytes()),
+                    one_time_pubkey: hex::encode(rec.one_time_pubkey.compress().as_bytes()),
+                    ephemeral_pubkey: out.ephemeral_pubkey.clone().unwrap_or_default(),
+                    spent: false,
+                };
+                let before = self.confidential_utxos.len();
+                self.add_confidential_utxo(u.clone());
+                if self.confidential_utxos.len() > before {
+                    found.push(u);
+                }
+            }
+        }
+        found
+    }
+
+    /// Scan many blocks (e.g. from the node DB) and accumulate owned outputs.
+    /// Returns the count of newly-recorded confidential outputs.
+    pub fn scan_blocks(&mut self, blocks: &[Block]) -> usize {
+        let mut n = 0;
+        for b in blocks {
+            for tx in &b.body.transactions {
+                n += self.scan_confidential(tx).len();
+            }
+        }
+        n
     }
 
     pub fn is_locked(&self) -> bool {
@@ -1033,6 +1079,65 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_confidential_recovers_self_output() {
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::utxo::utxo_set::UtxoSet;
+        use crate::engine::privacy::ringct::builder::{
+            build_confidential_transaction, ConfRecipient, OwnedInput,
+        };
+        use crate::engine::privacy::ringct::dual_clsag::RingMember;
+        use curve25519_dalek::{constants::RISTRETTO_BASEPOINT_POINT as G, scalar::Scalar};
+        use rand::rngs::OsRng;
+
+        let mut w = Wallet::new("mainnet");
+        w.restore_from_seed(vec![3u8; 32]).unwrap();
+        let ck = w.confidential_keys().unwrap();
+
+        let set = UtxoSet::new_empty();
+        let h = crate::engine::privacy::confidential::pedersen::generator_h();
+        let rec = |set: &UtxoSet, pk: curve25519_dalek::ristretto::RistrettoPoint, c: curve25519_dalek::ristretto::RistrettoPoint| {
+            set.record_confidential_output_indexed(
+                &hex::encode(pk.compress().as_bytes()),
+                &hex::encode(c.compress().as_bytes()),
+            )
+            .unwrap();
+        };
+        for _ in 0..4 {
+            rec(&set, Scalar::random(&mut OsRng) * G, Scalar::from(7u64) * h + Scalar::random(&mut OsRng) * G);
+        }
+        let spend = Scalar::random(&mut OsRng);
+        let bl = Scalar::random(&mut OsRng);
+        let real_pk = spend * G;
+        let real_c = Scalar::from(100u64) * h + bl * G;
+        rec(&set, real_pk, real_c);
+        let mut ring = crate::engine::privacy::ringct::decoy::select_decoys(
+            &set,
+            4,
+            &[hex::encode(real_pk.compress().as_bytes())],
+        )
+        .unwrap();
+        ring.push(RingMember { public_key: real_pk, commitment: real_c });
+        let real_index = ring.len() - 1;
+
+        let tx = build_confidential_transaction(
+            vec![OwnedInput { spend_secret: spend, amount: 100, blinding: bl, ring, real_index }],
+            vec![ConfRecipient {
+                view_pub: ck.view_public(),
+                spend_pub: ck.spend_public(),
+                amount: 100,
+            }],
+            0,
+            &NetworkMode::Mainnet,
+        )
+        .unwrap();
+
+        let found = w.scan_confidential(&tx);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].amount, 100);
+        assert_eq!(w.confidential_balance(), 100);
+    }
 
     #[test]
     fn confidential_balance_sums_unspent() {
