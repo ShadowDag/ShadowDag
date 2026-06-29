@@ -81,6 +81,23 @@ pub struct BlockUndoData {
     /// by a different chain during reorg.
     #[serde(default)]
     pub applied_tx_ids: Vec<String>,
+    /// Confidential (RingCT) key images recorded by this block (`ki:` keys).
+    /// On rollback: delete them so the inputs are spendable on the new chain
+    /// (otherwise the key image is seen-forever → frozen funds + consensus split).
+    #[serde(default)]
+    pub created_key_images: Vec<String>,
+    /// Confidential one-time output pubkeys recorded by this block (`okey:` keys).
+    /// On rollback: delete them (otherwise orphaned outputs stay citable as ring
+    /// members and the global output index desyncs across nodes).
+    #[serde(default)]
+    pub created_output_keys: Vec<String>,
+    /// Confidential-output global-index span [start, end) appended by this block.
+    /// On rollback: delete `okeyidx:{n}` for n in the range and restore
+    /// `okeyidx:count` to `start`.
+    #[serde(default)]
+    pub conf_index_start: Option<u64>,
+    #[serde(default)]
+    pub conf_index_end: Option<u64>,
 }
 
 /// Maximum UTXO cache entries (prevents unbounded memory growth)
@@ -481,6 +498,10 @@ impl UtxoSet {
             deleted_addr_indexes: Vec::new(),
             created_cb_heights: Vec::new(),
             applied_tx_ids: Vec::new(),
+            created_key_images: Vec::new(),
+            created_output_keys: Vec::new(),
+            conf_index_start: None,
+            conf_index_end: None,
         };
 
         // Incremental commitment hash chain
@@ -722,6 +743,10 @@ impl UtxoSet {
             deleted_addr_indexes: Vec::new(),
             created_cb_heights: Vec::new(),
             applied_tx_ids: Vec::new(),
+            created_key_images: Vec::new(),
+            created_output_keys: Vec::new(),
+            conf_index_start: None,
+            conf_index_end: None,
         };
 
         let mut commitment_hasher = Sha256::new();
@@ -794,6 +819,9 @@ impl UtxoSet {
                             key: Self::ki_key(ki),
                             value: vec![1u8],
                         });
+                        // Record for rollback: a reorg MUST delete this ki marker,
+                        // else the input is frozen forever + nodes diverge.
+                        undo.created_key_images.push(ki.clone());
                     }
                 }
                 for output in &tx.outputs {
@@ -807,6 +835,8 @@ impl UtxoSet {
                             key: Self::okeyidx_at_key(conf_out_index),
                             value: otk.as_bytes().to_vec(),
                         });
+                        // Record for rollback (delete okey + okeyidx span on reorg).
+                        undo.created_output_keys.push(otk.clone());
                         conf_out_index += 1;
                     }
                 }
@@ -1140,6 +1170,11 @@ impl UtxoSet {
             value: commitment.as_bytes().to_vec(),
         });
 
+        // Record the confidential-output index span so rollback can delete the
+        // okeyidx:{n} entries and restore the counter.
+        undo.conf_index_start = Some(conf_out_index_start);
+        undo.conf_index_end = Some(conf_out_index);
+
         let undo_key = format!("utxo:undo:{}", block_hash);
         let undo_data = bincode::serialize(&undo)
             .map_err(|e| StorageError::Serialization(format!("undo data: {}", e)))?;
@@ -1268,6 +1303,35 @@ impl UtxoSet {
             ops.push(BatchWrite::Delete {
                 key: seen_key.as_bytes().to_vec(),
             });
+        }
+
+        // 6b. Reverse confidential (RingCT) mutations this block recorded.
+        //     CRITICAL: without this, key-image markers persist after a reorg —
+        //     freezing the input forever and splitting consensus — and the
+        //     global confidential-output index (okey:/okeyidx:) desyncs.
+        for ki in &undo.created_key_images {
+            ops.push(BatchWrite::Delete {
+                key: Self::ki_key(ki),
+            });
+        }
+        for otk in &undo.created_output_keys {
+            ops.push(BatchWrite::Delete {
+                key: Self::okey_key(otk),
+            });
+        }
+        if let (Some(start), Some(end)) = (undo.conf_index_start, undo.conf_index_end) {
+            for n in start..end {
+                ops.push(BatchWrite::Delete {
+                    key: Self::okeyidx_at_key(n),
+                });
+            }
+            if end != start {
+                // Restore the global confidential-output counter to its pre-block value.
+                ops.push(BatchWrite::Put {
+                    key: Self::okeyidx_count_key(),
+                    value: start.to_le_bytes().to_vec(),
+                });
+            }
         }
 
         // 7. Clean up undo data and commitment
@@ -1712,6 +1776,48 @@ mod ringct_phase1_store_tests {
         assert_eq!(set.confidential_output_at(1), Some("bb".repeat(32)));
         assert!(set.confidential_output_at(2).is_none());
         assert_eq!(set.output_key_commitment(&"aa".repeat(32)), Some("11".repeat(32)));
+    }
+
+    #[test]
+    fn reorg_rollback_reverses_confidential_state() {
+        // Regression for the CRITICAL: apply_block_dag_ordered records ki:/okey:/
+        // okeyidx: for confidential txs; rollback_block_undo MUST reverse them on
+        // reorg, else key images are seen-forever (frozen funds + consensus split)
+        // and the confidential output index desyncs.
+        use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
+        let set = UtxoSet::new_empty();
+        let ki = "11".repeat(32);
+        let otk = "22".repeat(32);
+        let commit = "33".repeat(32);
+
+        let mut inp = TxInput::new("00".repeat(32), 0, String::new(), String::new(), String::new());
+        inp.key_image = Some(ki.clone());
+        let mut out = TxOutput::new("conf".into(), 0);
+        out.one_time_pubkey = Some(otk.clone());
+        out.commitment = Some(commit.clone());
+        let mut tx = Transaction::new("cf".repeat(32), vec![inp], vec![out], 0, 1000);
+        tx.tx_type = TxType::Confidential;
+        tx.hash = "cf".repeat(32);
+        assert!(tx.is_confidential());
+
+        assert_eq!(set.confidential_output_count(), 0);
+        let block_hash = "bb".repeat(32);
+        set.apply_block_dag_ordered(std::slice::from_ref(&tx), 1, &block_hash)
+            .unwrap();
+        // Recorded by apply.
+        assert!(set.key_image_seen(&ki));
+        assert!(set.output_key_exists(&otk));
+        assert_eq!(set.confidential_output_count(), 1);
+
+        // Reorg rollback must reverse ALL confidential state.
+        set.rollback_block_undo(&block_hash).unwrap();
+        assert!(!set.key_image_seen(&ki), "ki: must be deleted on rollback");
+        assert!(!set.output_key_exists(&otk), "okey: must be deleted on rollback");
+        assert_eq!(
+            set.confidential_output_count(),
+            0,
+            "okeyidx:count must be restored to pre-block value"
+        );
     }
 
     #[test]
