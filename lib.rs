@@ -232,6 +232,7 @@ pub mod engine {
             pub mod amount_encoding;
             pub mod builder;
             pub mod confidential_consensus;
+            pub mod decoy;
             pub mod ring_validator;
             pub mod scan;
             pub mod serialization;
