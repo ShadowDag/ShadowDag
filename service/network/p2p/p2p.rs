@@ -1639,9 +1639,14 @@ impl P2P {
                     return Ok(());
                 }
 
-                // Log peer identity
+                // Log peer identity. Use char-safe truncation: `id` derives from
+                // the attacker-controlled Version user_agent, so byte-slicing
+                // `&id[..16]` could land mid-UTF-8 and panic the peer thread
+                // (and leak its PEER_LAST_OUTBOUND entry since cleanup runs after
+                // the loop).
                 if let Some(id) = session.protocol.peer_identity() {
-                    slog_debug!("p2p", "peer_identity", addr => peer, identity => &id[..id.len().min(16)]);
+                    let short: String = id.chars().take(16).collect();
+                    slog_debug!("p2p", "peer_identity", addr => peer, identity => &short);
                 }
 
                 let bytes = Self::write_message(writer, &P2PMessage::VerAck, magic)?;

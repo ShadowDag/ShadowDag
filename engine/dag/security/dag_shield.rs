@@ -139,8 +139,12 @@ impl DagShield {
         if block.header.hash.is_empty() {
             return Err(ShieldRejection::severe("empty block hash"));
         }
-        if block.header.hash.len() != 64 {
-            return Err(ShieldRejection::severe("invalid block hash length"));
+        // Length AND hex: a 64-char hash containing a multibyte UTF-8 char would
+        // otherwise pass and later panic any code that byte-slices it.
+        if block.header.hash.len() != 64
+            || !block.header.hash.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(ShieldRejection::severe("invalid block hash (len/hex)"));
         }
         if block.body.transactions.is_empty() && block.header.height > 0 {
             return Err(ShieldRejection::moderate("empty block body"));
@@ -188,8 +192,8 @@ impl DagShield {
         if tx.hash.is_empty() {
             return Err(ShieldRejection::severe("empty tx hash"));
         }
-        if tx.hash.len() != 64 {
-            return Err(ShieldRejection::moderate("invalid tx hash length"));
+        if tx.hash.len() != 64 || !tx.hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ShieldRejection::moderate("invalid tx hash (len/hex)"));
         }
 
         // Must have outputs
@@ -531,7 +535,18 @@ mod tests {
         tx.hash = "abc123".into();
         let r = DagShield::pre_validate_tx(&tx);
         assert!(r.is_err());
-        assert_eq!(r.unwrap_err().reason, "invalid tx hash length");
+        assert_eq!(r.unwrap_err().reason, "invalid tx hash (len/hex)");
+    }
+
+    #[test]
+    fn non_hex_64_char_hash_rejected() {
+        // A 64-char hash containing a non-hex (here, multibyte) char must be
+        // rejected so downstream byte-slicing can't panic.
+        let mut tx = make_tx("a".repeat(64).as_str(), 5);
+        tx.hash = format!("{}é", "a".repeat(62)); // 62 ascii + 'é' (2 bytes) = 64 bytes
+        assert_eq!(tx.hash.len(), 64);
+        let r = DagShield::pre_validate_tx(&tx);
+        assert!(r.is_err(), "non-hex 64-byte hash must be rejected");
     }
 
     #[test]
