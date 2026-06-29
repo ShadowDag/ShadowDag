@@ -25,6 +25,15 @@ pub const MIN_CUMULATIVE_WORK: u128 = 1_000;
 /// Keep aligned with consensus future-drift policy to reduce timewarp surface.
 pub const MAX_HEADER_TIME_GAP_SECS: u64 = 120;
 
+/// Char-safe truncation for log/error strings built from peer-supplied hashes.
+///
+/// `&s[..n]` byte-slices and PANICS if it lands inside a multibyte UTF-8
+/// codepoint. Peer headers carry an arbitrary `hash: String`, so a malicious
+/// header can crash the sync thread. Truncate by characters instead.
+fn short_hash(s: &str) -> String {
+    s.chars().take(16).collect()
+}
+
 /// Verification result
 #[derive(Debug, Clone)]
 pub enum ChainVerifyResult {
@@ -156,8 +165,8 @@ impl ChainVerifier {
                         height: header.height,
                         hash: format!(
                             "hash mismatch: claimed {} != computed {}",
-                            &header.hash[..header.hash.len().min(16)],
-                            &recomputed[..recomputed.len().min(16)]
+                            short_hash(&header.hash),
+                            short_hash(&recomputed)
                         ),
                     };
                 }
@@ -205,7 +214,7 @@ impl ChainVerifier {
                         height: header.height,
                         hash: format!(
                             "parent continuity: expected parent {}",
-                            &ph[..ph.len().min(16)]
+                            short_hash(ph)
                         ),
                     };
                 }
@@ -289,6 +298,27 @@ impl ChainVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_hash_is_char_safe_on_multibyte() {
+        // Byte-slicing &s[..16] would panic mid-codepoint; short_hash must not.
+        let s = "区".repeat(20); // each char is 3 bytes
+        let out = short_hash(&s);
+        assert_eq!(out.chars().count(), 16);
+        // A peer hash mixing ascii + multibyte around the 16-byte boundary.
+        let mixed = format!("{}{}", "ab".to_string(), "好".repeat(10));
+        let _ = short_hash(&mixed); // must not panic
+    }
+
+    #[test]
+    fn verify_header_chain_does_not_panic_on_multibyte_hash() {
+        // A header whose hash is non-ASCII will mismatch the recomputed PoW
+        // hash and hit the short_hash formatting path — must return, not panic.
+        let cv = ChainVerifier::new("genesis");
+        let mut h = make_header(1, 1, 1_000, vec!["好".repeat(30)]);
+        h.hash = "好".repeat(30);
+        let _ = cv.verify_header_chain(&[h]); // no panic = pass
+    }
 
     /// Build a header with a real shadow_hash_raw_full so the hash
     /// recomputation check passes during verify_header_chain.
