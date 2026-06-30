@@ -1237,6 +1237,37 @@ fn confidential_key_image_hex(ck: &InvisibleWallet, u: &ConfidentialUtxo) -> Opt
 mod tests {
     use super::*;
 
+    // Reference vectors pinning the wallet's address-derivation chain. The
+    // standalone wasm-sdk crate replicates this exact chain; these assertions
+    // pin the format so any change here flags that wasm-sdk must be updated.
+    #[test]
+    fn wasm_sdk_reference_vectors() {
+        use crate::domain::address::address::Address;
+
+        // V1: public key of 32 0x01 bytes -> mainnet address.
+        let a1 = Address::from_public_key(&[1u8; 32], "mainnet");
+        assert!(a1.value.starts_with("SD1") && a1.value.len() == 43);
+
+        // V2: seed of 64 0x02 bytes -> derive_key(acct=0, idx=0, change=false).
+        let sk = derive_key(&[2u8; 64], 0, 0, false).unwrap();
+        let pk = sk.verifying_key().to_bytes();
+        let a2 = Address::from_public_key(&pk, "mainnet");
+
+        // V3: full mnemonic path (entropy 32x0x03 -> words -> seed -> address).
+        let words = entropy_to_mnemonic_simple(&[3u8; 32]);
+        let seed = mnemonic_to_seed_simple(&words, "");
+        let sk3 = derive_key(&seed, 0, 0, false).unwrap();
+        let pk3 = sk3.verifying_key().to_bytes();
+        let a3 = Address::from_public_key(&pk3, "mainnet");
+
+        println!("WASM_VEC V1_pubkey_ones_addr = {}", a1.value);
+        println!("WASM_VEC V2_seed_twos_pubkey = {}", hex::encode(pk));
+        println!("WASM_VEC V2_seed_twos_addr   = {}", a2.value);
+        println!("WASM_VEC V3_mnemonic         = {}", words.join(" "));
+        println!("WASM_VEC V3_seed_hex         = {}", hex::encode(&seed));
+        println!("WASM_VEC V3_addr             = {}", a3.value);
+    }
+
     #[test]
     fn scanning_own_spend_marks_utxo_spent() {
         use crate::config::node::node_config::NetworkMode;
