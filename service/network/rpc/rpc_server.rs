@@ -744,6 +744,14 @@ impl RpcServer {
         let method = parts.next().unwrap_or_default();
         let path = parts.next().unwrap_or_default();
         let _version = parts.next().unwrap_or_default();
+        // Prometheus scrape endpoint: GET /metrics returns text exposition format.
+        // Unauthenticated by design (the metrics are non-sensitive chain stats,
+        // and operators keep the RPC port on a private network); still rate-limited.
+        if method == "GET" && path == "/metrics" {
+            let body = Self::prometheus_metrics(&state);
+            Self::write_http_text(&mut stream, 200, "text/plain; version=0.0.4", &body)?;
+            return Ok(());
+        }
         if method != "POST" || path != "/" {
             Self::write_http_response(&mut stream, 405, json!({"error": "Only POST is allowed"}))?;
             return Ok(());
@@ -1027,6 +1035,81 @@ impl RpcServer {
         stream
             .write_all(resp.as_bytes())
             .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))
+    }
+
+    /// Write a plain-text HTTP response (used by the Prometheus /metrics endpoint).
+    fn write_http_text(
+        stream: &mut TcpStream,
+        status: u16,
+        content_type: &str,
+        body: &str,
+    ) -> Result<(), NetworkError> {
+        let resp = format!(
+            "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status,
+            content_type,
+            body.len(),
+            body
+        );
+        stream
+            .write_all(resp.as_bytes())
+            .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))
+    }
+
+    /// Append one Prometheus gauge (HELP + TYPE + value lines).
+    fn prom_gauge(out: &mut String, name: &str, help: &str, value: u64) {
+        out.push_str("# HELP ");
+        out.push_str(name);
+        out.push(' ');
+        out.push_str(help);
+        out.push('\n');
+        out.push_str("# TYPE ");
+        out.push_str(name);
+        out.push_str(" gauge\n");
+        out.push_str(name);
+        out.push(' ');
+        out.push_str(&value.to_string());
+        out.push('\n');
+    }
+
+    /// Render node metrics in Prometheus text exposition format.
+    fn prometheus_metrics(state: &SharedState) -> String {
+        let s = match state.lock() {
+            Ok(s) => s,
+            Err(_) => return String::from("# shadowdag: state lock error\n"),
+        };
+        let mut out = String::with_capacity(512);
+        Self::prom_gauge(
+            &mut out,
+            "shadowdag_block_count",
+            "Total blocks stored",
+            s.block_store.count() as u64,
+        );
+        Self::prom_gauge(
+            &mut out,
+            "shadowdag_height",
+            "Current selected-chain height",
+            s.best_height,
+        );
+        Self::prom_gauge(
+            &mut out,
+            "shadowdag_mempool_size",
+            "Transactions currently in the mempool",
+            s.mempool.count() as u64,
+        );
+        Self::prom_gauge(
+            &mut out,
+            "shadowdag_peer_count",
+            "Known/connected peers",
+            s.peer_manager.get_peers().len() as u64,
+        );
+        Self::prom_gauge(
+            &mut out,
+            "shadowdag_utxo_count",
+            "Size of the UTXO set",
+            s.utxo_store.count_utxos() as u64,
+        );
+        out
     }
 
     #[cfg(test)]
@@ -4262,9 +4345,18 @@ impl RpcServer {
     }
 
     fn cmd_getprometheusurl(id: Value) -> RpcResponse {
+        // Metrics are served as GET /metrics on this node's own RPC port
+        // (text exposition format), so a Prometheus job can scrape the node
+        // directly. Substitute the node's host:rpc_port for <rpc_host:port>.
         RpcResponse::ok(
             id,
-            json!({"url": "http://localhost:9090/metrics", "format": "prometheus_text", "scrape_interval": "15s"}),
+            json!({
+                "path": "/metrics",
+                "method": "GET",
+                "url_template": "http://<rpc_host:port>/metrics",
+                "format": "prometheus_text",
+                "scrape_interval": "15s"
+            }),
         )
     }
 
@@ -5101,6 +5193,30 @@ mod tests {
         let s = make_server();
         let r = call_params(&s, "validateaddress", json!(["invalid"]));
         assert_eq!(r["result"]["isvalid"], json!(false));
+    }
+
+    #[test]
+    fn prometheus_gauge_exposition_format() {
+        let mut out = String::new();
+        RpcServer::prom_gauge(&mut out, "shadowdag_height", "Current height", 42);
+        assert!(out.contains("# HELP shadowdag_height Current height\n"));
+        assert!(out.contains("# TYPE shadowdag_height gauge\n"));
+        assert!(out.contains("shadowdag_height 42\n"));
+    }
+
+    #[test]
+    fn prometheus_metrics_endpoint_renders_all_gauges() {
+        let s = make_server();
+        let body = RpcServer::prometheus_metrics(&s.state);
+        for g in [
+            "shadowdag_block_count",
+            "shadowdag_height",
+            "shadowdag_mempool_size",
+            "shadowdag_peer_count",
+            "shadowdag_utxo_count",
+        ] {
+            assert!(body.contains(g), "metrics missing gauge {g}");
+        }
     }
 
     #[test]
