@@ -301,7 +301,7 @@ impl BlockValidator {
         network: &NetworkMode,
     ) -> Result<(), ConsensusError> {
         Self::validate_parents(block)?;
-        Self::validate_timestamp(block, ancestor_timestamps)?;
+        Self::validate_timestamp_for_network(block, ancestor_timestamps, network)?;
 
         // Per-tx timestamp sanity, HEADER-RELATIVE (IBD-safe). The mempool
         // rejects future-dated txs at entry; enforce the equivalent on the block
@@ -540,7 +540,21 @@ impl BlockValidator {
     /// reject valid blocks, but this is the node operator's responsibility
     /// (NTP is assumed). The DAG-based rules (R3–R6) provide secondary
     /// protection independent of wall-clock accuracy.
+    #[cfg(test)]
     fn validate_timestamp(block: &Block, ancestors: &[u64]) -> Result<(), ConsensusError> {
+        Self::validate_timestamp_for_network(block, ancestors, &NetworkMode::Mainnet)
+    }
+
+    /// Network-aware timestamp validation. On test networks the R5 "max forward
+    /// jump from parent" anti-timewarp cap is skipped so a chain that has been
+    /// IDLE longer than the cap can RESUME: a block mined now has ts≈now, which
+    /// is legitimately far ahead of an old parent but still within R1's
+    /// future bound and R4's monotonic rule. Mainnet keeps R5 unchanged.
+    fn validate_timestamp_for_network(
+        block: &Block,
+        ancestors: &[u64],
+        network: &NetworkMode,
+    ) -> Result<(), ConsensusError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -597,7 +611,11 @@ impl BlockValidator {
             // block took 120s when it really took 1s. The jump limit
             // is generous (30x target) to allow normal variance but
             // tight enough to prevent systematic manipulation.
-            if ts > max_parent_ts + MAX_TIMESTAMP_JUMP_SECS {
+            // Skipped on test networks so an idle chain can resume (R1 still
+            // bounds future-dated timestamps on all networks).
+            if matches!(network, NetworkMode::Mainnet)
+                && ts > max_parent_ts + MAX_TIMESTAMP_JUMP_SECS
+            {
                 return Err(ConsensusError::Timestamp(format!(
                     "timestamp jump {}s from parent (max {}s)",
                     ts.saturating_sub(max_parent_ts),
