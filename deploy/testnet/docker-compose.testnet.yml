@@ -1,0 +1,28 @@
+# ShadowDAG TESTNET node (Docker).
+#
+# Run from this directory:
+#   docker compose -f docker-compose.testnet.yml up -d --build
+#
+# Ports (testnet): RPC 19332, P2P 19333 (explorer 8080 if enabled).
+# P2P is published publicly so peers can reach this node; RPC is bound to
+# localhost only.
+
+services:
+  node-testnet:
+    build:
+      context: ../..          # repo root (where the Dockerfile lives)
+      dockerfile: Dockerfile
+    image: shadowdag:latest
+    container_name: shadowdag-testnet
+    restart: unless-stopped
+    environment:
+      - NETWORK=testnet
+    ports:
+      - "19333:19333"             # P2P — PUBLIC (peers connect here)
+      - "127.0.0.1:19332:19332"   # RPC  — localhost only (keep private)
+      - "8080:8080"               # Explorer (optional, read-only)
+    volumes:
+      - shadowdag-testnet-data:/data
+
+volumes:
+  shadowdag-testnet-data:
