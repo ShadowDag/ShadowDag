@@ -20,7 +20,10 @@ services:
     ports:
       - "19333:19333"             # P2P — PUBLIC (peers connect here)
       - "127.0.0.1:19332:19332"   # RPC  — localhost only (keep private)
-      - "8080:8080"               # Explorer (optional, read-only)
+      # Explorer is run inside the container but NOT published by default (it
+      # conflicts with anything already on host 8080, and a seed node doesn't
+      # need it). To expose it, add a free host port, e.g.:
+      #   - "127.0.0.1:18080:8080"
     volumes:
       - shadowdag-testnet-data:/data
 
