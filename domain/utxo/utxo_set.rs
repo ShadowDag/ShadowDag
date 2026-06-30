@@ -116,6 +116,10 @@ pub const UTXO_SET_WARNING_THRESHOLD: usize = 50_000_000;
 pub struct UtxoSet {
     store: Arc<dyn UtxoBackend>,
     cache: RwLock<HashMap<UtxoKey, Utxo>>,
+    /// Node network. Only affects the coinbase-maturity window: test networks
+    /// mature fast so transactions can be tested without a long wait; mainnet
+    /// uses the full `COINBASE_MATURITY`. Defaults to Mainnet (see `with_network`).
+    network: NetworkMode,
 }
 
 impl UtxoSet {
@@ -134,6 +138,25 @@ impl UtxoSet {
         Self {
             store,
             cache: RwLock::new(HashMap::with_capacity(MAX_CACHE_SIZE / 4)),
+            network: NetworkMode::Mainnet,
+        }
+    }
+
+    /// Builder: set the node network (the daemon passes `cfg.network`). Only the
+    /// coinbase-maturity window depends on it.
+    pub fn with_network(mut self, network: NetworkMode) -> Self {
+        self.network = network;
+        self
+    }
+
+    /// Coinbase maturity (blocks) for this node's network. Test networks mature
+    /// fast (so a freshly-mined reward is spendable quickly for testing); mainnet
+    /// uses the full window.
+    #[inline]
+    pub fn coinbase_maturity(&self) -> u64 {
+        match self.network {
+            NetworkMode::Mainnet => COINBASE_MATURITY,
+            NetworkMode::Testnet | NetworkMode::Regtest => 10,
         }
     }
 
@@ -353,10 +376,11 @@ impl UtxoSet {
 
         if let Some(created_height) = self.coinbase_created_height(key) {
             let confirmations = current_height.saturating_sub(created_height);
-            if confirmations < COINBASE_MATURITY {
+            let maturity = self.coinbase_maturity();
+            if confirmations < maturity {
                 return Err(StorageError::Other(format!(
                     "coinbase utxo {} immature: {} confirmations < required {}",
-                    key, confirmations, COINBASE_MATURITY
+                    key, confirmations, maturity
                 )));
             }
         }
@@ -368,7 +392,7 @@ impl UtxoSet {
         match self.get_utxo(key) {
             Some(utxo) if !utxo.spent => {
                 if let Some(created_height) = self.coinbase_created_height(key) {
-                    current_height.saturating_sub(created_height) >= COINBASE_MATURITY
+                    current_height.saturating_sub(created_height) >= self.coinbase_maturity()
                 } else {
                     true
                 }
@@ -1069,7 +1093,7 @@ impl UtxoSet {
                     if let Some(raw) = self.store.get_raw(&meta_key) {
                         if raw.len() >= 8 {
                             let cb_h = u64::from_le_bytes(raw[..8].try_into().unwrap_or([0; 8]));
-                            if block_height < cb_h + COINBASE_MATURITY {
+                            if block_height < cb_h + self.coinbase_maturity() {
                                 // consensus maturity check
                                 maturity_ok = false;
                                 break;
@@ -1587,6 +1611,7 @@ impl UtxoSet {
         Ok(Self {
             store: Arc::new(store) as Arc<dyn UtxoBackend>,
             cache: RwLock::new(HM::with_capacity(64)),
+            network: NetworkMode::Mainnet,
         })
     }
 
@@ -1730,6 +1755,25 @@ impl UtxoSet {
 #[cfg(test)]
 mod ringct_phase1_store_tests {
     use super::*;
+
+    #[test]
+    fn coinbase_maturity_is_network_aware() {
+        use crate::config::node::node_config::NetworkMode;
+        // Mainnet (default) keeps the full window; test networks mature fast.
+        assert_eq!(UtxoSet::new_empty().coinbase_maturity(), COINBASE_MATURITY);
+        assert_eq!(
+            UtxoSet::new_empty()
+                .with_network(NetworkMode::Testnet)
+                .coinbase_maturity(),
+            10
+        );
+        assert_eq!(
+            UtxoSet::new_empty()
+                .with_network(NetworkMode::Regtest)
+                .coinbase_maturity(),
+            10
+        );
+    }
 
     #[test]
     fn key_image_recorded_and_detected() {

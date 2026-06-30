@@ -9,7 +9,7 @@ use crate::domain::transaction::transaction::Transaction;
 use crate::domain::transaction::tx_hash::TxHash;
 use crate::domain::transaction::tx_validator::TxValidator;
 use crate::domain::utxo::utxo_key::UtxoKey;
-use crate::domain::utxo::utxo_set::{utxo_key, UtxoSet, COINBASE_MATURITY};
+use crate::domain::utxo::utxo_set::{utxo_key, UtxoSet};
 use crate::errors::StorageError;
 use std::collections::{HashMap, HashSet};
 
@@ -247,10 +247,11 @@ impl UtxoValidator {
                     // Coinbase maturity check (base UTXO set only)
                     if let Some(created_height) = utxo_set.coinbase_created_height(&key) {
                         let confirmations = block_height.saturating_sub(created_height);
-                        if confirmations < COINBASE_MATURITY {
+                        let maturity = utxo_set.coinbase_maturity();
+                        if confirmations < maturity {
                             return Err(StorageError::Other(format!(
                                     "validate_block_utxos: coinbase utxo {} immature: {} confirmations < required {} (tx {})",
-                                    key, confirmations, COINBASE_MATURITY, tx.hash
+                                    key, confirmations, maturity, tx.hash
                                 )));
                         }
                     }

@@ -137,9 +137,12 @@ impl DaemonNode {
         let utxo_store = Arc::new(UtxoStore::new(db.clone()).map_err(|e| {
             NodeError::Init(format!("[daemon] FATAL: cannot create UTXO store: {}", e))
         })?);
-        let utxo_set = Arc::new(UtxoSet::new(
-            utxo_store.clone() as Arc<dyn crate::domain::traits::utxo_backend::UtxoBackend>
-        ));
+        let utxo_set = Arc::new(
+            UtxoSet::new(
+                utxo_store.clone() as Arc<dyn crate::domain::traits::utxo_backend::UtxoBackend>,
+            )
+            .with_network(cfg.network.clone()),
+        );
 
         // GhostDag shares the node's single RocksDB instance.
         // All GhostDag keys are namespaced with "gd:" to avoid collisions.
