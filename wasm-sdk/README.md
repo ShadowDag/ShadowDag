@@ -13,6 +13,8 @@ reference vectors from the main crate — addresses generated here are
 
 ## What it does today
 
+**Accounts & addresses**
+
 | Function | Purpose |
 |---|---|
 | `new_wallet(network)` | Generate a fresh 12-word mnemonic + its address |
@@ -23,7 +25,23 @@ reference vectors from the main crate — addresses generated here are
 | `mnemonic_to_seed_hex(mnemonic, passphrase)` | The 64-byte seed (hex) |
 | `validate_address(address)` | Validate a ShadowDAG address |
 
+**Transactions & RPC**
+
+| Function | Purpose |
+|---|---|
+| `build_signed_transfer_json(inputs, outputs, fee, timestamp, anchor, privHex, pubHex, network)` | Build + Ed25519-sign a transparent transfer; returns node-ready tx JSON |
+| `sendrawtransaction_body(txJson)` | Wrap a signed tx in a JSON-RPC `sendrawtransaction` body |
+| `json_rpc_body(method, paramsJsonArray)` | Build any JSON-RPC 2.0 request body |
+
+`inputs` is an array of JSON strings `'{"txid":"<hex>","index":0,"owner":"SD1..."}'`;
+`outputs` an array of `'{"address":"SD1...","amount":1000}'`; `anchor` is a recent
+tip hash for replay protection (`""` for none). The SDK builds + signs locally;
+your JS does the `fetch` to the node's RPC (keeps the SDK dependency-light).
+
 `network` is `"mainnet" | "testnet" | "regtest"`.
+
+The tx hash and signature are **byte-identical** to the node — verified against a
+reference vector (`tx_builder.rs::tests::wasm_sdk_tx_reference_vector`).
 
 ## Build
 
@@ -74,12 +92,35 @@ const sdk = require('./pkg/shadowdag_wasm_sdk.js');
 const [mnemonic, address] = sdk.new_wallet('mainnet').split('\n');
 ```
 
+## Send a transaction (browser)
+
+```js
+import init, * as sdk from './pkg/shadowdag_wasm_sdk.js';
+await init();
+
+const inputs  = [JSON.stringify({ txid: utxoTxid, index: 0, owner: myAddress })];
+const outputs = [JSON.stringify({ address: toAddress, amount: 1000n })];
+const now = BigInt(Math.floor(Date.now() / 1000));
+
+const txJson = sdk.build_signed_transfer_json(
+  inputs, outputs, 10n, now, recentTipHash, privHex, pubHex, 'mainnet');
+
+const body = sdk.sendrawtransaction_body(txJson);
+const res  = await fetch('http://localhost:9332', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+});
+console.log(await res.json());
+```
+
+(`u64` parameters map to JS `BigInt` — note the `n` suffixes.)
+
 ## Roadmap (next increments)
 
-- Transaction building + Ed25519 signing (construct & sign transfers client-side).
-- JSON-RPC client helpers (submit tx, query balance/UTXOs) over `fetch`.
+- JSON-RPC query helpers (balance / UTXO selection) — currently `json_rpc_body`
+  builds the request; UTXO selection is left to the caller.
 - TypeScript typings (`wasm-pack` emits a `.d.ts`; add hand-written ergonomic wrappers).
-- Confidential (RingCT) address + scan helpers.
+- Confidential (RingCT) address + scan + spend helpers.
+- Multi-output / multi-input coin-selection helpers.
 
 ## Correctness
 

@@ -202,6 +202,378 @@ pub fn validate_address(address: &str) -> bool {
     is_valid_address(address)
 }
 
+// ── Transaction building + signing (transparent transfers) ──────────────────
+//
+// Replicates the node's exact wire format so the node accepts SDK-built txs:
+//   * txid hash  : SHA256("SHADOW_TX_ID_V1"  || chain_id || 2u32 || canonical)
+//   * sign msg   : SHA256("SHADOW_TX_SIGN_V1" || chain_id || ...fields...)
+//   * signature  : Ed25519 over sign msg (deterministic)
+// `canonical` and the field order mirror transaction.rs::canonical_bytes and
+// tx_hash.rs::signing_message_for_network. Verified against a reference vector
+// (tx_builder.rs::tests::wasm_sdk_tx_reference_vector).
+
+use ed25519_dalek::Signer;
+
+fn chain_id_for(network: &str) -> u32 {
+    match network {
+        "testnet" => 0xDA0C_0002,
+        "regtest" => 0xDA0C_0003,
+        _ => 0xDA0C_0001, // mainnet (also the fail-safe default)
+    }
+}
+
+const TX_HASH_VERSION: u32 = 2;
+
+struct InRef {
+    txid: String,
+    index: u32,
+    owner: String,
+}
+struct OutRef {
+    address: String,
+    amount: u64,
+}
+
+fn le32(v: u32) -> [u8; 4] {
+    v.to_le_bytes()
+}
+
+/// Sorted input order used by BOTH canonical_bytes and signing_message.
+fn sorted_input_order(inputs: &[InRef]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..inputs.len()).collect();
+    idx.sort_by(|&a, &b| {
+        inputs[a]
+            .txid
+            .cmp(&inputs[b].txid)
+            .then(inputs[a].index.cmp(&inputs[b].index))
+    });
+    idx
+}
+
+/// transaction.rs::canonical_bytes for a transparent transfer (all privacy /
+/// contract fields absent → 0x00 markers).
+fn canonical_bytes_transparent(
+    inputs: &[InRef],
+    pub_key_hex: &str,
+    outputs: &[OutRef],
+    fee: u64,
+    timestamp: u64,
+    payload_hash: &Option<String>,
+) -> Vec<u8> {
+    let mut b: Vec<u8> = Vec::new();
+    b.push(0x00); // tx_type = Transfer
+    b.push(0x00); // is_coinbase = false
+    b.extend_from_slice(&timestamp.to_le_bytes());
+    b.extend_from_slice(&fee.to_le_bytes());
+
+    let order = sorted_input_order(inputs);
+    b.extend_from_slice(&le32(inputs.len() as u32));
+    for &i in &order {
+        let inp = &inputs[i];
+        b.extend_from_slice(&le32(inp.txid.len() as u32));
+        b.extend_from_slice(inp.txid.as_bytes());
+        b.extend_from_slice(&inp.index.to_le_bytes());
+        b.extend_from_slice(&le32(inp.owner.len() as u32));
+        b.extend_from_slice(inp.owner.as_bytes());
+        b.extend_from_slice(&le32(pub_key_hex.len() as u32));
+        b.extend_from_slice(pub_key_hex.as_bytes());
+        b.push(0x00); // key_image
+        b.push(0x00); // ring_members
+        b.push(0x00); // ring_signature
+        b.push(0x00); // ring_commitments
+        b.push(0x00); // pseudo_commitment
+    }
+
+    b.extend_from_slice(&le32(outputs.len() as u32));
+    for out in outputs {
+        b.extend_from_slice(&le32(out.address.len() as u32));
+        b.extend_from_slice(out.address.as_bytes());
+        b.extend_from_slice(&out.amount.to_le_bytes());
+        b.push(0x00); // commitment
+        b.push(0x00); // range_proof
+        b.push(0x00); // ephemeral_pubkey
+        b.push(0x00); // one_time_pubkey
+        b.push(0x00); // encrypted_amount
+    }
+
+    match payload_hash {
+        Some(ph) => {
+            b.push(0x01);
+            b.extend_from_slice(&le32(ph.len() as u32));
+            b.extend_from_slice(ph.as_bytes());
+        }
+        None => b.push(0x00),
+    }
+    b.push(0x00); // gas_limit
+    b.push(0x00); // deploy_code
+    b.push(0x00); // calldata
+    b.push(0x00); // contract_address
+    b.push(0x00); // vm_version
+    b
+}
+
+fn tx_id_hash(canonical: &[u8], chain_id: u32) -> String {
+    let mut h = Sha256::new();
+    h.update(b"SHADOW_TX_ID_V1");
+    h.update(chain_id.to_le_bytes());
+    h.update(TX_HASH_VERSION.to_le_bytes());
+    h.update(canonical);
+    hex::encode(h.finalize())
+}
+
+fn signing_message(
+    hash_hex: &str,
+    inputs: &[InRef],
+    outputs: &[OutRef],
+    fee: u64,
+    timestamp: u64,
+    payload_hash: &Option<String>,
+    chain_id: u32,
+) -> Vec<u8> {
+    let mut h = Sha256::new();
+    h.update(b"SHADOW_TX_SIGN_V1");
+    h.update(chain_id.to_le_bytes());
+    h.update(le32(hash_hex.len() as u32));
+    h.update(hash_hex.as_bytes());
+    h.update(timestamp.to_le_bytes());
+    h.update(fee.to_le_bytes());
+    h.update(le32(outputs.len() as u32));
+    for out in outputs {
+        h.update(le32(out.address.len() as u32));
+        h.update(out.address.as_bytes());
+        h.update(out.amount.to_le_bytes());
+    }
+    let order = sorted_input_order(inputs);
+    h.update(le32(inputs.len() as u32));
+    for &i in &order {
+        let inp = &inputs[i];
+        h.update(le32(inp.txid.len() as u32));
+        h.update(inp.txid.as_bytes());
+        h.update(inp.index.to_le_bytes());
+    }
+    match payload_hash {
+        Some(ph) => {
+            h.update([0x01]);
+            h.update(le32(ph.len() as u32));
+            h.update(ph.as_bytes());
+        }
+        None => h.update([0x00]),
+    }
+    h.finalize().to_vec()
+}
+
+struct Signed {
+    hash: String,
+    signature: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_transfer(
+    inputs: &[InRef],
+    outputs: &[OutRef],
+    fee: u64,
+    timestamp: u64,
+    payload_hash: &Option<String>,
+    private_key_hex: &str,
+    public_key_hex: &str,
+    network: &str,
+) -> Result<Signed, String> {
+    let chain_id = chain_id_for(network);
+    let canonical =
+        canonical_bytes_transparent(inputs, public_key_hex, outputs, fee, timestamp, payload_hash);
+    let hash = tx_id_hash(&canonical, chain_id);
+    let msg = signing_message(&hash, inputs, outputs, fee, timestamp, payload_hash, chain_id);
+
+    let sk_bytes = hex::decode(private_key_hex).map_err(|e| e.to_string())?;
+    let sk_arr: [u8; 32] = sk_bytes
+        .try_into()
+        .map_err(|_| "private key must be 32 bytes".to_string())?;
+    let sk = SigningKey::from_bytes(&sk_arr);
+    let signature = hex::encode(sk.sign(&msg).to_bytes());
+    Ok(Signed { hash, signature })
+}
+
+fn json_str(s: &str) -> String {
+    // Addresses/hex/hashes contain no JSON-special chars, but escape defensively.
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Build + sign a transparent transfer, returning the transaction as JSON ready
+/// for the node's `sendrawtransaction` RPC.
+///
+/// `inputs` / `outputs` are JSON arrays:
+///   inputs:  [{"txid":"<hex>","index":0,"owner":"SD1..."}, ...]
+///   outputs: [{"address":"SD1...","amount":1000}, ...]
+/// `anchor` is an optional recent tip hash (replay protection); pass "" for none.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn build_signed_transfer_json(
+    inputs: Vec<JsValue>,
+    outputs: Vec<JsValue>,
+    fee: u64,
+    timestamp: u64,
+    anchor: &str,
+    private_key_hex: &str,
+    public_key_hex: &str,
+    network: &str,
+) -> Result<String, JsValue> {
+    let to_err = |e: String| JsValue::from_str(&e);
+    let parsed_in = parse_inputs(&inputs).map_err(to_err)?;
+    let parsed_out = parse_outputs(&outputs).map_err(to_err)?;
+    let payload_hash = if anchor.is_empty() {
+        None
+    } else {
+        Some(anchor.to_string())
+    };
+    let signed = sign_transfer(
+        &parsed_in,
+        &parsed_out,
+        fee,
+        timestamp,
+        &payload_hash,
+        private_key_hex,
+        public_key_hex,
+        network,
+    )
+    .map_err(to_err)?;
+
+    Ok(transfer_json(
+        &signed,
+        &parsed_in,
+        &parsed_out,
+        fee,
+        timestamp,
+        &payload_hash,
+        public_key_hex,
+    ))
+}
+
+// Parsing of the JS-provided input/output objects via web JS values would
+// require js-sys; to keep the crate dependency-light, inputs/outputs are passed
+// as already-stringified JSON entries (one JsValue string per entry).
+fn parse_inputs(items: &[JsValue]) -> Result<Vec<InRef>, String> {
+    items
+        .iter()
+        .map(|v| {
+            let s = v.as_string().ok_or("input entry must be a JSON string")?;
+            let txid = json_field(&s, "txid").ok_or("input missing txid")?;
+            let owner = json_field(&s, "owner").ok_or("input missing owner")?;
+            let index = json_num(&s, "index").ok_or("input missing index")? as u32;
+            Ok(InRef { txid, index, owner })
+        })
+        .collect()
+}
+
+fn parse_outputs(items: &[JsValue]) -> Result<Vec<OutRef>, String> {
+    items
+        .iter()
+        .map(|v| {
+            let s = v.as_string().ok_or("output entry must be a JSON string")?;
+            let address = json_field(&s, "address").ok_or("output missing address")?;
+            let amount = json_num(&s, "amount").ok_or("output missing amount")?;
+            Ok(OutRef { address, amount })
+        })
+        .collect()
+}
+
+// Minimal field extractors for flat `{"k":"v"}` / `{"k":123}` JSON entries.
+fn json_field(s: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{}\"", key);
+    let i = s.find(&pat)? + pat.len();
+    let rest = &s[i..];
+    let q1 = rest.find('"')?;
+    let after = &rest[q1 + 1..];
+    let q2 = after.find('"')?;
+    Some(after[..q2].to_string())
+}
+
+fn json_num(s: &str, key: &str) -> Option<u64> {
+    let pat = format!("\"{}\"", key);
+    let i = s.find(&pat)? + pat.len();
+    let rest = s[i..].trim_start_matches([':', ' ']);
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+fn transfer_json(
+    signed: &Signed,
+    inputs: &[InRef],
+    outputs: &[OutRef],
+    fee: u64,
+    timestamp: u64,
+    payload_hash: &Option<String>,
+    public_key_hex: &str,
+) -> String {
+    let mut s = String::from("{");
+    s.push_str(&format!("\"hash\":{},", json_str(&signed.hash)));
+    s.push_str("\"inputs\":[");
+    for (i, inp) in inputs.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!(
+            "{{\"txid\":{},\"index\":{},\"owner\":{},\"signature\":{},\"pub_key\":{}}}",
+            json_str(&inp.txid),
+            inp.index,
+            json_str(&inp.owner),
+            json_str(&signed.signature),
+            json_str(public_key_hex),
+        ));
+    }
+    s.push_str("],\"outputs\":[");
+    for (i, out) in outputs.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!(
+            "{{\"address\":{},\"amount\":{}}}",
+            json_str(&out.address),
+            out.amount,
+        ));
+    }
+    s.push_str(&format!(
+        "],\"fee\":{},\"timestamp\":{},\"is_coinbase\":false,\"tx_type\":\"Transfer\"",
+        fee, timestamp
+    ));
+    if let Some(ph) = payload_hash {
+        s.push_str(&format!(",\"payload_hash\":{}", json_str(ph)));
+    }
+    s.push('}');
+    s
+}
+
+/// Wrap a signed-tx JSON in a JSON-RPC 2.0 `sendrawtransaction` request body.
+/// POST the result to the node's RPC endpoint (the JS layer does the `fetch`).
+#[wasm_bindgen]
+pub fn sendrawtransaction_body(tx_json: &str) -> String {
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"sendrawtransaction\",\"params\":[{}]}}",
+        tx_json
+    )
+}
+
+/// Build a JSON-RPC 2.0 request body for any method (params is a JSON array string).
+#[wasm_bindgen]
+pub fn json_rpc_body(method: &str, params_json_array: &str) -> String {
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":{},\"params\":{}}}",
+        json_str(method),
+        params_json_array
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +641,70 @@ mod tests {
         assert!(validate_address(address));
         // Restoring the mnemonic reproduces the same address.
         assert_eq!(address_from_mnemonic(mnemonic, "", "mainnet"), address);
+    }
+
+    // Reference vector from tx_builder.rs::tests::wasm_sdk_tx_reference_vector.
+    const TX_PRIV: [u8; 32] = [7u8; 32];
+    const TX_PUBKEY: &str = "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c";
+    const TX_OWNER: &str = "SD15733ef1109c71b28d117680dde4417876ea6bca5";
+    const TX_HASH: &str = "4f7c71d635fcd3cedae89cf56baf4f8f85ff96104df1f6356b5b10c70fd46169";
+    const TX_SIG: &str = "6fd6fd09c2f64c8f6267f0467cff2757cb47fed22497ad05cef355b5878148b8575356ba2942c0ae8e24602f2331369b7b98979c7a38d4b67268d42290f6150c";
+
+    #[test]
+    fn tx_build_sign_matches_chain_reference_vector() {
+        // Address derivation reproduces the owner from the private key.
+        assert_eq!(address_from_public_key(TX_PUBKEY, "mainnet").unwrap(), TX_OWNER);
+
+        let sk_hex = hex::encode(TX_PRIV);
+        let inputs = vec![InRef {
+            txid: "aa".repeat(32),
+            index: 0,
+            owner: TX_OWNER.to_string(),
+        }];
+        let outputs = vec![OutRef {
+            address: format!("SD1{}", "11".repeat(20)),
+            amount: 1000,
+        }];
+        let signed = sign_transfer(
+            &inputs, &outputs, 10, 1_700_000_000, &None, &sk_hex, TX_PUBKEY, "mainnet",
+        )
+        .unwrap();
+
+        // Byte-identical hash + signature to the node.
+        assert_eq!(signed.hash, TX_HASH);
+        assert_eq!(signed.signature, TX_SIG);
+
+        // JSON has the right shape for sendrawtransaction.
+        let json = transfer_json(&signed, &inputs, &outputs, 10, 1_700_000_000, &None, TX_PUBKEY);
+        assert!(json.contains("\"tx_type\":\"Transfer\""));
+        assert!(json.contains("\"is_coinbase\":false"));
+        assert!(json.contains(TX_HASH));
+        assert!(json.contains(TX_SIG));
+        assert!(json.contains(TX_PUBKEY));
+
+        let body = sendrawtransaction_body(&json);
+        assert!(body.contains("\"method\":\"sendrawtransaction\""));
+        assert!(body.contains("\"jsonrpc\":\"2.0\""));
+    }
+
+    #[test]
+    fn anchor_changes_the_signature() {
+        let sk_hex = hex::encode(TX_PRIV);
+        let inputs = vec![InRef { txid: "aa".repeat(32), index: 0, owner: TX_OWNER.to_string() }];
+        let outputs = vec![OutRef { address: format!("SD1{}", "11".repeat(20)), amount: 1000 }];
+        let no_anchor = sign_transfer(&inputs, &outputs, 10, 1_700_000_000, &None, &sk_hex, TX_PUBKEY, "mainnet").unwrap();
+        let anchored = sign_transfer(&inputs, &outputs, 10, 1_700_000_000, &Some("bb".repeat(32)), &sk_hex, TX_PUBKEY, "mainnet").unwrap();
+        assert_ne!(no_anchor.hash, anchored.hash);
+        assert_ne!(no_anchor.signature, anchored.signature);
+    }
+
+    #[test]
+    fn json_extractors_work() {
+        let s = "{\"txid\":\"abc\",\"index\":5,\"owner\":\"SD1x\",\"amount\":1000}";
+        assert_eq!(json_field(s, "txid").as_deref(), Some("abc"));
+        assert_eq!(json_field(s, "owner").as_deref(), Some("SD1x"));
+        assert_eq!(json_num(s, "index"), Some(5));
+        assert_eq!(json_num(s, "amount"), Some(1000));
+        assert_eq!(json_field(s, "missing"), None);
     }
 }

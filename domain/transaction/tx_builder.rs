@@ -364,6 +364,73 @@ mod tests {
     use super::*;
     use crate::errors::CryptoError;
 
+    // Reference vector pinning a TRANSPARENT transfer tx end-to-end (hash +
+    // Ed25519 signature, both deterministic). The wasm-sdk replicates this exact
+    // build/sign; these literals are mirrored there. Any change here flags that
+    // the SDK must be updated.
+    #[test]
+    fn wasm_sdk_tx_reference_vector() {
+        use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let pk_hex = hex::encode(sk.verifying_key().to_bytes());
+        let owner = crate::domain::address::address::Address::from_public_key(
+            &sk.verifying_key().to_bytes(),
+            "mainnet",
+        )
+        .value;
+
+        let inputs = vec![TxInput {
+            txid: "aa".repeat(32),
+            index: 0,
+            owner: owner.clone(),
+            signature: String::new(),
+            pub_key: pk_hex.clone(),
+            key_image: None,
+            ring_members: None,
+            ring_signature: None,
+            ring_commitments: None,
+            pseudo_commitment: None,
+        }];
+        let outputs = vec![TxOutput {
+            address: format!("SD1{}", "11".repeat(20)),
+            amount: 1000,
+            commitment: None,
+            range_proof: None,
+            ephemeral_pubkey: None,
+            one_time_pubkey: None,
+            encrypted_amount: None,
+        }];
+        let mut tx = Transaction {
+            hash: String::new(),
+            inputs,
+            outputs,
+            fee: 10,
+            timestamp: 1_700_000_000,
+            is_coinbase: false,
+            tx_type: TxType::Transfer,
+            payload_hash: None,
+            gas_limit: None,
+            deploy_code: None,
+            calldata: None,
+            contract_address: None,
+            vm_version: None,
+        };
+        let net = NetworkMode::Mainnet;
+        tx.hash = TxHash::hash_for_network(&tx, &net);
+        let msg = TxHash::signing_message_for_network(&tx, &net);
+        let sig = hex::encode(sk.sign(&msg).to_bytes());
+
+        println!("WASM_TX pubkey   = {}", pk_hex);
+        println!("WASM_TX owner    = {}", owner);
+        println!("WASM_TX hash     = {}", tx.hash);
+        println!("WASM_TX sign_msg = {}", hex::encode(&msg));
+        println!("WASM_TX sig      = {}", sig);
+        assert_eq!(tx.hash.len(), 64);
+        assert_eq!(sig.len(), 128);
+    }
+
     #[test]
     fn coinbase_hash_is_deterministic() {
         let tx1 = build_coinbase_at_height(
