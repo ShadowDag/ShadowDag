@@ -1200,6 +1200,7 @@ impl RpcServer {
             // ── UTXO Methods ───────────────────────────────────────────
             "getutxobyaddress" => Self::cmd_getutxobyaddress(params, id, state),
             "getbalancebyaddress" => Self::cmd_getbalancebyaddress(params, id, state),
+            "listunspent" | "getutxos" => Self::cmd_listunspent(params, id, state),
 
             // ── Fee Methods ────────────────────────────────────────────
             "estimatefee" => Self::cmd_estimatefee(id, state),
@@ -2370,6 +2371,66 @@ impl RpcServer {
         }
     }
 
+    /// List unspent outputs for an address together with their outpoints —
+    /// the exact data an external signer (the SDK, an exchange backend) needs
+    /// to construct and sign a spend. Each entry is
+    /// `{txid, vout, amount, coinbase, mature}`; `mature` reflects the
+    /// network-specific coinbase maturity so callers can avoid building a
+    /// spend the node would reject.
+    fn cmd_listunspent(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
+        let address = match params.first().and_then(|v| v.as_str()) {
+            Some(a) => a.to_string(),
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "Expected address"),
+        };
+        match state.lock() {
+            Ok(mut s) => {
+                // Read a fresh tip height so maturity is computed correctly.
+                s.update_from_chain();
+                let height = s.best_height;
+                let maturity = s.utxo_store.coinbase_maturity();
+                let mut utxos = Vec::new();
+                let mut total: u64 = 0;
+                let mut spendable: u64 = 0;
+                for (key, utxo) in s.utxo_store.export_all() {
+                    if utxo.spent || utxo.address != address {
+                        continue;
+                    }
+                    // Coinbase outputs carry a recorded creation height; pure
+                    // transfers do not and are spendable immediately.
+                    let created = s.utxo_store.coinbase_created_height(&key);
+                    let is_coinbase = created.is_some();
+                    let mature = match created {
+                        Some(h) => height.saturating_sub(h) >= maturity,
+                        None => true,
+                    };
+                    total = total.saturating_add(utxo.amount);
+                    if mature {
+                        spendable = spendable.saturating_add(utxo.amount);
+                    }
+                    utxos.push(json!({
+                        "txid":     key.hash_hex(),
+                        "vout":     key.index(),
+                        "amount":   utxo.amount,
+                        "coinbase": is_coinbase,
+                        "mature":   mature,
+                    }));
+                }
+                RpcResponse::ok(
+                    id,
+                    json!({
+                        "address":   address,
+                        "height":    height,
+                        "count":     utxos.len(),
+                        "total":     total,
+                        "spendable": spendable,
+                        "utxos":     utxos,
+                    }),
+                )
+            }
+            Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        }
+    }
+
     fn cmd_estimatefee(id: Value, state: &SharedState) -> RpcResponse {
         match state.lock() {
             Ok(s) => {
@@ -2519,8 +2580,9 @@ impl RpcServer {
                     {"name": "gettips",            "params": "[]",        "description": "Get current DAG tips"},
                     {"name": "getblockheader",     "params": "[hash]",    "description": "Get block header only"},
                     {"name": "getblocksbyheight",  "params": "[height]",  "description": "Get all blocks at height"},
-                    {"name": "getutxobyaddress",   "params": "[address]", "description": "Get UTXOs for address"},
+                    {"name": "getutxobyaddress",   "params": "[address]", "description": "Get UTXO summary for address"},
                     {"name": "getbalancebyaddress","params": "[address]", "description": "Get detailed balance"},
+                    {"name": "listunspent",        "params": "[address]", "description": "List unspent outpoints (txid,vout,amount,mature) for an address"},
                     {"name": "estimatefee",        "params": "[]",        "description": "Estimate transaction fee"},
                     {"name": "getbpsinfo",         "params": "[]",        "description": "Get BPS engine profiles"},
                     {"name": "getemission",        "params": "[height]",  "description": "Get emission at height"},
@@ -5174,6 +5236,45 @@ mod tests {
         let s = make_server();
         let r = call(&s, "getbalance");
         assert!(r["error"].is_object());
+    }
+
+    #[test]
+    fn listunspent_without_params_returns_error() {
+        let s = make_server();
+        let r = call(&s, "listunspent");
+        assert_eq!(r["error"]["code"], json!(ERR_INVALID_PARAMS));
+    }
+
+    #[test]
+    fn listunspent_returns_outpoints_and_maturity() {
+        use crate::domain::utxo::utxo_key::UtxoKey;
+        let s = make_server();
+        let addr = "ST1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        // Inject one regular transfer output (immediately spendable) and one
+        // coinbase output created at height 0 (not yet mature at tip 0).
+        {
+            let st = s.state.lock().unwrap();
+            let k_regular = UtxoKey::new(&"ab".repeat(32), 0);
+            st.utxo_store
+                .add_utxo(&k_regular, "owner".into(), 500, addr.into());
+            let k_coinbase = UtxoKey::new(&"cd".repeat(32), 1);
+            st.utxo_store
+                .add_utxo_coinbase(&k_coinbase, "owner".into(), 1000, addr.into(), 0);
+        }
+        let r = call_params(&s, "listunspent", json!([addr]));
+        let res = &r["result"];
+        assert_eq!(res["count"], json!(2));
+        assert_eq!(res["total"], json!(1500));
+        // The height-0 coinbase is immature at tip 0, so only the 500 transfer
+        // is spendable.
+        assert_eq!(res["spendable"], json!(500));
+        // Every entry must carry the outpoint a signer needs to build a spend.
+        for u in res["utxos"].as_array().unwrap() {
+            assert!(u["txid"].as_str().is_some_and(|t| t.len() == 64));
+            assert!(u["vout"].is_u64());
+            assert!(u["amount"].is_u64());
+            assert!(u["mature"].is_boolean());
+        }
     }
 
     #[test]
