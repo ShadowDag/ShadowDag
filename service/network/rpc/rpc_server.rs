@@ -734,7 +734,11 @@ impl RpcServer {
                 return Ok(());
             }
         };
-        if !Self::check_rate_limit(&rate_table, ip) {
+        // Loopback (127.0.0.1 / ::1) is the operator's own traffic on a private
+        // RPC port — a co-located miner polls getblocktemplate faster than the
+        // per-IP cap and would otherwise be throttled (and exit). It is not a DoS
+        // vector, so exempt it; external IPs are still rate-limited.
+        if !ip.is_loopback() && !Self::check_rate_limit(&rate_table, ip) {
             let resp = RpcResponse::err(
                 Value::Null,
                 ERR_RATE_LIMITED,
