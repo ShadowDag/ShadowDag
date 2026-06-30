@@ -19,6 +19,9 @@
 FROM rust:1-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
+    build-essential \
+    clang \
+    cmake \
     libclang-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
