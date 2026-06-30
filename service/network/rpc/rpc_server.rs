@@ -464,9 +464,31 @@ pub struct RpcServer {
 }
 
 impl RpcServer {
+    /// Map the stored network_name string to a `NetworkMode`.
+    fn network_mode_from_name(
+        network_name: &str,
+    ) -> crate::config::node::node_config::NetworkMode {
+        use crate::config::node::node_config::NetworkMode;
+        let n = network_name.to_ascii_lowercase();
+        if n.contains("testnet") {
+            NetworkMode::Testnet
+        } else if n.contains("regtest") {
+            NetworkMode::Regtest
+        } else {
+            NetworkMode::Mainnet
+        }
+    }
+
+    /// Min DAG parents for `height` on the node's network. Testnet/regtest allow
+    /// linear (single-parent) chains so a fresh chain can bootstrap from one
+    /// genesis; mainnet keeps the 2-parent anti-selfish-mining rule. Used by
+    /// getblocktemplate so the template + the submitblock gate agree.
     #[inline]
-    fn configured_min_dag_parents_for_height(height: u64) -> usize {
-        crate::engine::dag::security::selfish_mining_guard::SelfishMiningGuard::configured_min_dag_parents_for_height(height)
+    fn min_dag_parents_for_height(height: u64, network_name: &str) -> usize {
+        crate::engine::dag::security::selfish_mining_guard::SelfishMiningGuard::min_dag_parents_for(
+            height,
+            Self::network_mode_from_name(network_name),
+        )
     }
 
     pub fn new(db: Arc<DB>) -> Result<Self, NetworkError> {
@@ -1806,7 +1828,7 @@ impl RpcServer {
                 if parent_hashes.is_empty() {
                     return RpcResponse::err(id, ERR_INTERNAL, "No valid parent hashes available");
                 }
-                let min_parents = Self::configured_min_dag_parents_for_height(next_height);
+                let min_parents = Self::min_dag_parents_for_height(next_height, &s.network_name);
                 if parent_hashes.len() < min_parents {
                     let mut seen: HashSet<String> = parent_hashes.iter().cloned().collect();
                     let mut cursor = s.best_hash.clone();
@@ -2001,7 +2023,8 @@ impl RpcServer {
             );
         }
 
-        let (expected_height, expected_difficulty, current_tips) = match state.lock() {
+        let (expected_height, expected_difficulty, current_tips, network_name) = match state.lock()
+        {
             Ok(mut s) => {
                 s.update_from_chain();
                 let expected_height = s.best_height + 1;
@@ -2013,7 +2036,12 @@ impl RpcServer {
                     Some(ms) => ms.dag_tips(),
                     None => get_dag_tips(),
                 };
-                (expected_height, expected_difficulty.max(1), tips)
+                (
+                    expected_height,
+                    expected_difficulty.max(1),
+                    tips,
+                    s.network_name.clone(),
+                )
             }
             Err(_) => return RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
         };
@@ -2038,7 +2066,7 @@ impl RpcServer {
                 ),
             );
         }
-        let min_parents = Self::configured_min_dag_parents_for_height(height);
+        let min_parents = Self::min_dag_parents_for_height(height, &network_name);
         if parents.len() < min_parents {
             return RpcResponse::err(
                 id,
@@ -2101,7 +2129,9 @@ impl RpcServer {
         }
 
         // ── GATE 2: DagShield full validation (anti-selfish, anti-flood, anti-spam) ──
-        if let Err(rej) = DagShield::validate_block(&block) {
+        if let Err(rej) =
+            DagShield::validate_block_for_network(&block, Self::network_mode_from_name(&network_name))
+        {
             return RpcResponse::err(
                 id,
                 ERR_INVALID_PARAMS,

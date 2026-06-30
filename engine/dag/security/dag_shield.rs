@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config::node::node_config::NetworkMode;
 use crate::domain::block::block::Block;
 use crate::domain::transaction::transaction::Transaction;
 use crate::engine::dag::security::dos_protection::{
@@ -60,8 +61,18 @@ impl DagShield {
         Self::validate_block(block).is_ok()
     }
 
-    /// Full block shield with rejection reason + ban severity.
+    /// Full block shield with rejection reason + ban severity (mainnet rules).
     pub fn validate_block(block: &Block) -> Result<(), ShieldRejection> {
+        Self::validate_block_for_network(block, NetworkMode::Mainnet)
+    }
+
+    /// Network-aware full block shield. The consensus path passes the node's
+    /// `NetworkMode` so test networks accept linear (single-parent) chains while
+    /// mainnet keeps the 2-parent anti-selfish-mining rule.
+    pub fn validate_block_for_network(
+        block: &Block,
+        network: NetworkMode,
+    ) -> Result<(), ShieldRejection> {
         // ─────────────────────────────────────────
         // 0. Genesis (special rules)
         // ─────────────────────────────────────────
@@ -99,7 +110,7 @@ impl DagShield {
         // ─────────────────────────────────────────
         // 3. Selfish mining (O(1) — parent count)
         // ─────────────────────────────────────────
-        if !SelfishMiningGuard::validate(block) {
+        if !SelfishMiningGuard::validate_for_network(block, network) {
             return Err(ShieldRejection::moderate(
                 "selfish mining (too few parents)",
             ));

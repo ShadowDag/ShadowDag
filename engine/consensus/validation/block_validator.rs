@@ -193,6 +193,16 @@ impl BlockValidator {
     /// **L1 Network** — cheapest checks first. Reject malformed data
     /// before spending CPU on crypto or DB lookups.
     pub fn validate_network_layer(block: &Block) -> Result<(), ConsensusError> {
+        Self::validate_network_layer_for_network(block, &NetworkMode::Mainnet)
+    }
+
+    /// Network-aware L1 layer. The live consensus path passes the node's
+    /// `NetworkMode` so the DagShield selfish-mining (min-parents) rule is
+    /// relaxed on test networks (see `SelfishMiningGuard::min_dag_parents_for`).
+    pub fn validate_network_layer_for_network(
+        block: &Block,
+        network: &NetworkMode,
+    ) -> Result<(), ConsensusError> {
         // ── Early cost guards (O(1), before ANY iteration) ──────────
         // Reject obviously oversized blocks before spending CPU on
         // serialization, signature checks, or merkle computation.
@@ -241,7 +251,7 @@ impl BlockValidator {
         Self::validate_block_size(block)?;
 
         // DagShield = unified fast filter (DoS + Spam + Flood + Selfish mining)
-        if let Err(rej) = DagShield::validate_block(block) {
+        if let Err(rej) = DagShield::validate_block_for_network(block, network.clone()) {
             return Err(ConsensusError::BlockValidation(format!(
                 "DagShield: {}",
                 rej.reason
@@ -461,7 +471,7 @@ impl BlockValidator {
     ) -> BlockValidationResult {
         // L1: Network layer — always runs, even for genesis.
         // Format, size, and DoS checks apply to ALL blocks regardless of height.
-        if let Err(reason) = Self::validate_network_layer(block) {
+        if let Err(reason) = Self::validate_network_layer_for_network(block, network) {
             return BlockValidationResult::fail(&reason.to_string());
         }
 
