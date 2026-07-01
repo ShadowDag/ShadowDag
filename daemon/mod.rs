@@ -349,6 +349,10 @@ impl DaemonNode {
                 stratum_clone.start();
             });
             slog_info!("daemon", "stratum_started", port => self.cfg.stratum_port);
+            if self.cfg.stratum_address.is_none() {
+                slog_warn!("daemon", "stratum_no_payout_address",
+                    hint => "set --stratum-address=<SD1...> so the pool can produce payable blocks");
+            }
         }
 
         // ── Explorer web UI ────────────────────────────────────────
@@ -511,24 +515,16 @@ impl DaemonNode {
                                 requeue_pending_blocks(ready);
                             }
 
-                            // Notify Stratum pool with a fresh block template
+                            // Notify Stratum pool with a fresh, VALID block
+                            // template (real coinbase + merkle root) so pool
+                            // miners produce acceptable blocks. Skipped silently
+                            // when no payout address is configured (warned once
+                            // at startup).
                             if let Some(ref stratum) = self.stratum_server {
-                                let template = BlockTemplate {
-                                    job_id: format!("{:x}", total_blocks_processed),
-                                    version: block.header.version,
-                                    prev_hash: block.header.hash.clone(),
-                                    parents: block.header.parents.clone(),
-                                    merkle_root: String::new(),
-                                    timestamp: std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs(),
-                                    difficulty: block.header.difficulty,
-                                    height: block.header.height + 1,
-                                    extra_nonce: 0,
-                                    clean_jobs: true,
-                                };
-                                stratum.update_template(template);
+                                let job_id = format!("{:x}", total_blocks_processed);
+                                if let Some(template) = self.build_stratum_template(block, job_id) {
+                                    stratum.update_template(template);
+                                }
                             }
                         }
                         Err(e) => {
@@ -829,6 +825,95 @@ impl DaemonNode {
 
     pub fn stratum_server(&self) -> &Option<Arc<StratumServer>> {
         &self.stratum_server
+    }
+
+    /// Build a VALID Stratum block template (real coinbase + merkle root) to
+    /// push to pool miners. Returns None if no payout address is configured
+    /// (`--stratum-address`), in which case the pool cannot produce a payable
+    /// block. Coinbase-only for now (reward = emission; the pool distributes to
+    /// workers off-chain) — including mempool txs in pool blocks is a follow-up.
+    ///
+    /// Uses the same tips/difficulty source (`get_dag_tips`/`get_next_difficulty`)
+    /// the node keeps in lockstep with `mining_state`, so the template agrees
+    /// with what `submitblock` expects.
+    fn build_stratum_template(
+        &self,
+        accepted: &crate::domain::block::block::Block,
+        job_id: String,
+    ) -> Option<BlockTemplate> {
+        use crate::config::consensus::consensus_params::ConsensusParams;
+        use crate::config::consensus::emission_schedule::EmissionSchedule;
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::block::merkle_tree::MerkleTree;
+        use crate::domain::transaction::tx_builder::build_coinbase_at_height;
+        use crate::service::network::nodes::full_node::{get_dag_tips, get_next_difficulty};
+
+        let pool_addr = self.cfg.stratum_address.clone()?;
+
+        // Parents = current DAG tips (fall back to the just-accepted block).
+        let mut parents: Vec<String> =
+            get_dag_tips().into_iter().filter(|h| !h.is_empty()).collect();
+        if parents.is_empty() {
+            parents.push(accepted.header.hash.clone());
+        }
+        parents.sort();
+        parents.dedup();
+        parents.truncate(ConsensusParams::MAX_PARENTS);
+
+        // Height = max(parent heights) + 1 (== best_height + 1).
+        let height = parents
+            .iter()
+            .filter_map(|h| self.block_store.get_block(h))
+            .map(|b| b.header.height)
+            .max()
+            .unwrap_or(accepted.header.height)
+            .saturating_add(1);
+
+        let difficulty = get_next_difficulty().max(1);
+
+        // Timestamp: strictly greater than every parent (R4), at least now.
+        let max_parent_ts = parents
+            .iter()
+            .filter_map(|h| self.block_store.get_block(h))
+            .map(|b| b.header.timestamp)
+            .max()
+            .unwrap_or(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let timestamp = now.max(max_parent_ts.saturating_add(1));
+
+        let dev_addr = match self.cfg.network {
+            NetworkMode::Mainnet => ConsensusParams::OWNER_REWARD_ADDRESS,
+            NetworkMode::Testnet => crate::config::genesis::genesis::TESTNET_DEV_ADDRESS,
+            NetworkMode::Regtest => crate::config::genesis::genesis::REGTEST_DEV_ADDRESS,
+        }
+        .to_string();
+        let emission = EmissionSchedule::block_reward(height);
+        let coinbase = build_coinbase_at_height(
+            pool_addr,
+            dev_addr,
+            emission,
+            ConsensusParams::MINER_PERCENT,
+            timestamp,
+            height,
+        );
+        let merkle_root = MerkleTree::build(std::slice::from_ref(&coinbase), height, &parents);
+
+        Some(BlockTemplate {
+            job_id,
+            version: 1,
+            prev_hash: accepted.header.hash.clone(),
+            parents,
+            merkle_root,
+            timestamp,
+            difficulty,
+            height,
+            extra_nonce: 0,
+            clean_jobs: true,
+            transactions: vec![coinbase],
+        })
     }
 
     // ── Crash Recovery ─────────────────────────────────────────

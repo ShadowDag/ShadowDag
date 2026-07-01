@@ -230,6 +230,11 @@ pub struct NodeConfig {
     pub enable_stratum: bool,
     /// TCP port for the Stratum mining pool (default: 7779).
     pub stratum_port: u16,
+    /// Payout address for pool-mined coinbases (`--stratum-address`). Required
+    /// for Stratum to produce valid blocks; the coinbase pays this address (the
+    /// pool then distributes to workers off-chain). None disables template
+    /// production even when Stratum is enabled.
+    pub stratum_address: Option<String>,
     /// Enable the built-in blockchain explorer web UI.
     pub enable_explorer: bool,
     /// HTTP port for the blockchain explorer (default: 8080).
@@ -266,6 +271,7 @@ impl NodeConfig {
             miner_addr: String::new(),
             enable_stratum: false,
             stratum_port: 7779,
+            stratum_address: None,
             enable_explorer: false,
             explorer_port: 8080,
             enable_wallet_ui: false,

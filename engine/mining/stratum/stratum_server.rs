@@ -20,6 +20,7 @@
 //   mining.subscribe → mining.authorize → mining.notify → mining.submit
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::domain::transaction::transaction::Transaction;
 use crate::errors::NetworkError;
 use crate::{slog_error, slog_info, slog_warn};
 use std::collections::{HashMap, HashSet};
@@ -366,6 +367,10 @@ pub struct BlockTemplate {
     pub height: u64,
     pub extra_nonce: u64,
     pub clean_jobs: bool, // True = discard previous work
+    /// Full block body (coinbase first, then any mempool txs) that the merkle
+    /// root commits to. Sent to the node on a found block so it can reconstruct
+    /// and validate the block. Miners never see this — they mine the header.
+    pub transactions: Vec<Transaction>,
 }
 
 impl BlockTemplate {
@@ -723,26 +728,23 @@ impl StratumServer {
             if self.meets_network_difficulty(nonce_hex, worker_extra_nonce, &template_snapshot) {
                 self.blocks_found.fetch_add(1, Ordering::Relaxed);
 
-                // Submit the found block to the node via RPC.
-                // Parse the nonce and submit via localhost JSON-RPC.
+                // Submit the FULL found block to the node: the ShadowHash block
+                // hash + the whole body (coinbase + txs) that the merkle root
+                // commits to. Without the hash and transactions, cmd_submitblock
+                // rejects the block (empty hash/merkle_root or empty body).
                 if let Ok(nonce) = u64::from_str_radix(nonce_hex, 16) {
                     let combined_en = combine_extra_nonce(template_snapshot.extra_nonce, worker_extra_nonce);
+                    let block_hash =
+                        self.share_block_hash(nonce, worker_extra_nonce, &template_snapshot);
+                    let params =
+                        Self::submitblock_params(&block_hash, nonce, combined_en, &template_snapshot);
                     let rpc_body = serde_json::json!({
                         "jsonrpc": "2.0",
                         "method": "submitblock",
-                        "params": [{
-                            "height": template_snapshot.height,
-                            "nonce": nonce,
-                            "extra_nonce": combined_en,
-                            "prev_hash": template_snapshot.prev_hash,
-                            "merkle_root": template_snapshot.merkle_root,
-                            "timestamp": template_snapshot.timestamp,
-                            "difficulty": template_snapshot.difficulty,
-                            "version": template_snapshot.version,
-                            "parents": template_snapshot.parents,
-                        }],
+                        "params": [params],
                         "id": 1
-                    }).to_string();
+                    })
+                    .to_string();
 
                     // Non-blocking submit — spawn a thread so we don't
                     // delay the stratum response to the miner.
@@ -1153,6 +1155,55 @@ impl StratumServer {
             template.difficulty,
         )
     }
+
+    /// Build the submitblock params for a found block: the ShadowHash block
+    /// hash, the solved header fields, and the FULL body (coinbase + txs) the
+    /// merkle root commits to — everything cmd_submitblock needs to reconstruct
+    /// and validate the block. (The old code sent no hash, no transactions, and
+    /// an empty merkle_root, so every pool block was rejected.)
+    fn submitblock_params(
+        block_hash: &str,
+        nonce: u64,
+        extra_nonce: u64,
+        template: &BlockTemplate,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "hash":         block_hash,
+            "height":       template.height,
+            "nonce":        nonce,
+            "extra_nonce":  extra_nonce,
+            "prev_hash":    template.prev_hash,
+            "merkle_root":  template.merkle_root,
+            "timestamp":    template.timestamp,
+            "difficulty":   template.difficulty,
+            "version":      template.version,
+            "parents":      template.parents,
+            "transactions": template.transactions,
+        })
+    }
+
+    /// Recompute the block hash for a solved share — ShadowHash over the header
+    /// (incl. merkle_root + combined extra_nonce). This is the EXACT value the
+    /// node recomputes and validates on submitblock, so the pool submits the
+    /// same hash it mined.
+    fn share_block_hash(
+        &self,
+        nonce: u64,
+        worker_extra_nonce: u64,
+        template: &BlockTemplate,
+    ) -> String {
+        let combined_extra_nonce = combine_extra_nonce(template.extra_nonce, worker_extra_nonce);
+        crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full(
+            template.version,
+            template.height,
+            template.timestamp,
+            nonce,
+            combined_extra_nonce,
+            template.difficulty,
+            &template.merkle_root,
+            &template.parents,
+        )
+    }
 }
 
 /// Payout schemes supported by ShadowDAG mining pools
@@ -1307,6 +1358,7 @@ mod tests {
             height: 1,
             extra_nonce: 0,
             clean_jobs: true,
+            transactions: vec![],
         });
     }
 
@@ -1419,6 +1471,48 @@ mod tests {
         assert!((w.acceptance_rate() - 0.6666).abs() < 0.01);
     }
 
+    /// A found-block submit MUST carry the block hash, the REAL merkle root, and
+    /// the FULL body (coinbase + txs). The old code sent none of these, so every
+    /// pool block was rejected (empty hash/merkle_root / empty body). Guards the
+    /// exact fix.
+    #[test]
+    fn submitblock_params_include_hash_and_full_body() {
+        use crate::domain::transaction::transaction::{Transaction, TxOutput};
+        let coinbase = Transaction::new_coinbase(
+            "cbhash".into(),
+            vec![TxOutput::new("SD1miner".into(), 1_000_000_000)],
+            0,
+            100,
+        );
+        let tpl = BlockTemplate {
+            job_id: "j".into(),
+            version: 1,
+            prev_hash: "p".repeat(64),
+            parents: vec!["a".repeat(64)],
+            merkle_root: "b".repeat(64),
+            timestamp: 100,
+            difficulty: 4,
+            height: 5,
+            extra_nonce: 0,
+            clean_jobs: true,
+            transactions: vec![coinbase],
+        };
+        let params = StratumServer::submitblock_params(&"c".repeat(64), 42, 7, &tpl);
+
+        assert_eq!(params["hash"], "c".repeat(64));
+        assert_eq!(params["merkle_root"], "b".repeat(64));
+        assert!(params["merkle_root"].as_str().unwrap() != "", "merkle must not be empty");
+        assert_eq!(params["nonce"], 42);
+        assert_eq!(params["extra_nonce"], 7);
+        assert_eq!(params["height"], 5);
+        // The full block body (coinbase) is included so the node can reconstruct
+        // and validate the block.
+        let txs = params["transactions"].as_array().unwrap();
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0]["hash"], "cbhash");
+        assert_eq!(txs[0]["is_coinbase"], true);
+    }
+
     #[test]
     fn block_template_json() {
         let tpl = BlockTemplate {
@@ -1432,6 +1526,7 @@ mod tests {
             height: 1,
             extra_nonce: 0,
             clean_jobs: true,
+            transactions: vec![],
         };
         let json = tpl.to_notify_json();
         assert!(json.contains("mining.notify"));
