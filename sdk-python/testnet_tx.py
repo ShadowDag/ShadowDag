@@ -51,8 +51,17 @@ def rpc_call(url, method, params, token=None, timeout=15):
     if token:
         headers["Authorization"] = "Bearer " + token
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        out = json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            out = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        # The node returns validation rejections as HTTP 500 with a JSON error
+        # body — surface that body instead of a bare "HTTP Error 500".
+        raw = e.read().decode(errors="replace")
+        try:
+            out = json.loads(raw)
+        except ValueError:
+            raise RuntimeError("RPC %s HTTP %s: %s" % (method, e.code, raw.strip()))
     if isinstance(out, dict) and out.get("error"):
         raise RuntimeError("RPC %s error: %s" % (method, out["error"]))
     return out.get("result") if isinstance(out, dict) else out
@@ -93,31 +102,49 @@ def cmd_send(args):
                  "Mine to this address and wait for coinbase maturity."
                  % (sender, res.get("spendable")))
 
-    # 2) Greedy coin selection to cover amount + fee.
-    need = args.amount + args.fee
-    selected, total_in = [], 0
-    for u in mature:
-        selected.append(u)
-        total_in += u["amount"]
-        if total_in >= need:
-            break
-    if total_in < need:
-        sys.exit("Insufficient funds: have %d, need %d (amount %d + fee %d)"
-                 % (total_in, need, args.amount, args.fee))
+    # 2) Estimate the fee from the actual canonical size. The node enforces a
+    #    per-byte floor (MIN_FEE_RATE = 1.0 sat/byte) on top of the flat
+    #    MIN_RELAY_FEE, so a flat 100-sat fee is rejected for a ~400-byte tx.
+    #    --fee acts as a lower bound; we bump it to size + margin when needed.
+    MIN_FEE_RATE = 1.0        # sat/byte (matches MempoolConfig::MIN_FEE_RATE)
+    FEE_MARGIN = 50           # small cushion so we sit strictly above the floor
 
-    inputs = [{"txid": u["txid"], "index": u["vout"], "owner": sender}
-              for u in selected]
-    outputs = [{"address": args.to, "amount": args.amount}]
-    change = total_in - args.amount - args.fee
-    if change > 0:
-        outputs.append({"address": sender, "amount": change})  # change back to self
+    def build(fee):
+        need = args.amount + fee
+        selected, total_in = [], 0
+        for u in mature:
+            selected.append(u)
+            total_in += u["amount"]
+            if total_in >= need:
+                break
+        if total_in < need:
+            sys.exit("Insufficient funds: have %d, need %d (amount %d + fee %d)"
+                     % (total_in, need, args.amount, fee))
+        inputs = [{"txid": u["txid"], "index": u["vout"], "owner": sender}
+                  for u in selected]
+        outputs = [{"address": args.to, "amount": args.amount}]
+        change = total_in - args.amount - fee
+        if change > 0:
+            outputs.append({"address": sender, "amount": change})  # change to self
+        return inputs, outputs, total_in
+
+    # First pass with the requested floor, measure the canonical size, then set
+    # the fee to satisfy the per-byte rate and rebuild (size is independent of
+    # the fee/change amounts, so a single re-estimate is exact).
+    inputs, outputs, total_in = build(args.fee)
+    ts = int(time.time())
+    size = len(sdk._canonical_bytes(inputs, pk_hex, outputs, args.fee, ts, None))
+    fee = max(args.fee, int(size * MIN_FEE_RATE) + FEE_MARGIN)
+    if fee != args.fee:
+        inputs, outputs, total_in = build(fee)
+        print("fee auto-sized to %d sat for a %d-byte tx (rate floor 1 sat/byte)"
+              % (fee, size))
 
     # 3) Build + sign the transfer with the SDK (matches node tx-id/sign scheme).
-    ts = int(time.time())
     tx = sdk.build_signed_transfer(
-        inputs, outputs, args.fee, ts, sk_hex, pk_hex, args.network)
+        inputs, outputs, fee, ts, sk_hex, pk_hex, args.network)
     print("tx hash:   ", tx["hash"])
-    print("inputs:    ", len(inputs), "  total_in:", total_in)
+    print("inputs:    ", len(inputs), "  total_in:", total_in, "  fee:", fee)
     print("outputs:   ", outputs)
 
     # 4) Authenticate (write RPC requires a bearer token) and broadcast.
