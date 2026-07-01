@@ -19,6 +19,7 @@ use crate::domain::utxo::utxo_set::UtxoSet;
 use crate::engine::privacy::confidential::pedersen::RealPedersenCommitment;
 use crate::engine::privacy::confidential::range_proof;
 use crate::engine::privacy::ringct::dual_clsag;
+use crate::engine::privacy::ringct::ring_signature::{MAX_RING_SIZE, MIN_RING_SIZE};
 use crate::engine::privacy::ringct::tx_confidential::{
     parse_confidential_input, parse_confidential_output,
 };
@@ -59,6 +60,23 @@ pub fn verify_confidential_tx(
             .ring_members
             .as_ref()
             .ok_or_else(|| err(format!("confidential tx {}: missing ring_members", tx.hash)))?;
+
+        // Minimum ring size is the anonymity-set floor and MUST be enforced in
+        // THIS shared gate — it is the only check run on the mempool, block-UTXO,
+        // and reorg/apply paths (RingValidator's size check only runs on the
+        // block-body structural layer). Without it a ring of size 1 verifies
+        // cryptographically and gets gossiped, revealing exactly which output was
+        // spent (full deanonymization). Bound above too, to cap DoS.
+        if members.len() < MIN_RING_SIZE || members.len() > MAX_RING_SIZE {
+            return Err(err(format!(
+                "confidential tx {}: ring size {} out of bounds [{}, {}]",
+                tx.hash,
+                members.len(),
+                MIN_RING_SIZE,
+                MAX_RING_SIZE
+            )));
+        }
+
         for (member, p_hex) in view.ring.iter().zip(members.iter()) {
             let c_hex = hex::encode(member.commitment.compress().as_bytes());
             match utxo_set.output_key_commitment(p_hex) {
@@ -362,6 +380,77 @@ mod tests {
         assert!(
             verify_confidential_tx(&tx, &set, &net(), &mut seen2).is_err(),
             "key image already spent must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_ring_below_min_size() {
+        // A CRYPTOGRAPHICALLY VALID confidential tx with a ring of size 1 must be
+        // rejected by the shared gate: a size-1 ring has zero anonymity (the sole
+        // member reveals the spent output). Before the floor was added here, this
+        // tx passed the mempool/UTXO paths. Money invariants are irrelevant — this
+        // is a privacy floor.
+        let set = UtxoSet::new_empty();
+        let g = RISTRETTO_BASEPOINT_POINT;
+        let h = generator_h();
+        let amt = 100u64;
+        let spend = Scalar::random(&mut OsRng);
+        let r_in = Scalar::random(&mut OsRng);
+        let pk = spend * g;
+        let c_in = Scalar::from(amt) * h + r_in * g;
+        set.record_output_key(&hexp(&pk), &hexp(&c_in)).unwrap();
+        let ring = vec![RingMember {
+            public_key: pk,
+            commitment: c_in,
+        }];
+        let r_prime = Scalar::random(&mut OsRng);
+        let pseudo = Scalar::from(amt) * h + r_prime * g;
+        let z = r_in - r_prime;
+        let out_commit = Scalar::from(amt) * h + r_prime * g;
+        let proof = prove(amt, &r_prime);
+        let mut tx = Transaction {
+            hash: "d".repeat(64),
+            inputs: vec![TxInput {
+                txid: "0".repeat(64),
+                index: 0,
+                owner: String::new(),
+                signature: String::new(),
+                pub_key: String::new(),
+                key_image: None,
+                ring_members: Some(vec![hexp(&pk)]),
+                ring_signature: None,
+                ring_commitments: Some(vec![hexp(&c_in)]),
+                pseudo_commitment: Some(hexp(&pseudo)),
+            }],
+            outputs: vec![TxOutput {
+                address: "SD1s".into(),
+                amount: 0,
+                commitment: Some(hexp(&out_commit)),
+                range_proof: Some(range_proof_to_hex(&proof)),
+                ephemeral_pubkey: Some(hexp(&(Scalar::random(&mut OsRng) * g))),
+                one_time_pubkey: Some(hexp(&(Scalar::random(&mut OsRng) * g))),
+                encrypted_amount: None,
+            }],
+            fee: 0,
+            timestamp: 1_735_689_600,
+            is_coinbase: false,
+            tx_type: TxType::Confidential,
+            payload_hash: None,
+            ..Default::default()
+        };
+        let ki = dual_clsag::key_image(&spend, &pk);
+        tx.inputs[0].key_image = Some(hexp(&ki));
+        let msg = TxHash::confidential_signing_message_for_network(&tx, &net());
+        let sig = dual_clsag::sign(&msg, &ring, &pseudo, 0, &spend, &z).unwrap();
+        tx.inputs[0].ring_signature = Some(dual_clsag::to_hex(&sig));
+
+        // The CLSAG is valid, but the ring-size floor rejects it.
+        let mut seen = HashSet::new();
+        let res = verify_confidential_tx(&tx, &set, &net(), &mut seen);
+        assert!(res.is_err(), "size-1 ring must be rejected by the shared gate");
+        assert!(
+            res.unwrap_err().to_string().contains("ring size"),
+            "rejection must be on the ring-size floor"
         );
     }
 

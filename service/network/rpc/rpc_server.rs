@@ -3547,7 +3547,7 @@ impl RpcServer {
     fn cmd_getringsize(id: Value) -> RpcResponse {
         RpcResponse::ok(
             id,
-            json!({"default_ring_size": 11, "min_ring_size": 3, "max_ring_size": 64, "algorithm": "CLSAG"}),
+            json!({"default_ring_size": 11, "min_ring_size": 4, "max_ring_size": 64, "algorithm": "CLSAG"}),
         )
     }
 

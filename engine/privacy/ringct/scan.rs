@@ -165,7 +165,7 @@ mod tests {
         let (b_view_priv, b_view_pub) = keypair();
         let (b_spend_priv, b_spend_pub) = keypair();
         let tx1 = build_confidential_transaction(
-            vec![owned(&set, 100, 3)],
+            vec![owned(&set, 100, 4)],
             vec![ConfRecipient { view_pub: b_view_pub, spend_pub: b_spend_pub, amount: 100 }],
             0,
             &net,
@@ -185,9 +185,10 @@ mod tests {
         let x = recover_spend_secret(out, &b_view_priv, &b_spend_priv).unwrap();
 
         // B builds a spend of 100 to C, using the recovered output as the real
-        // ring member (plus fresh decoys, all recorded).
+        // ring member (plus fresh decoys, all recorded). >=4 total for the
+        // consensus ring-size floor.
         let mut bring = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..3 {
             let sk = Scalar::random(&mut OsRng);
             let bl = Scalar::random(&mut OsRng);
             let pk = sk * g;
