@@ -198,13 +198,18 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         let timestamp = now_secs.max(template.min_timestamp);
 
         // â•گâ•گâ•گ STEP 2: Build coinbase transaction â•گâ•گâ•گ
+        // Include the node-selected mempool transactions so user transactions
+        // actually confirm; the coinbase claims their fees. The node's
+        // post-execution check requires coinbase_total == emission + applied_fees
+        // EXACTLY, so fees are summed over EXACTLY the txs included here.
+        let included_txs = template.transactions.clone();
+        let included_fees: u64 = included_txs
+            .iter()
+            .map(|t| t.fee)
+            .fold(0u64, |a, f| a.saturating_add(f));
         let emission = EmissionSchedule::block_reward(height);
-        // Coinbase reward = emission only.
-        // Fees can only be included when the miner also includes the
-        // corresponding mempool transactions in the block body.
-        // The node validates: coinbase_total == emission + applied_fees.
-        let miner_reward = (emission * ConsensusParams::MINER_PERCENT) / 100;
-        let dev_reward = emission - miner_reward;
+        let (miner_reward, dev_reward) =
+            coinbase_split(emission, included_fees, ConsensusParams::MINER_PERCENT);
 
         let cb_hash = {
             let mut h = Sha256::new();
@@ -255,7 +260,13 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         parents.sort();
         parents.dedup();
 
-        let merkle_root = MerkleTree::build(std::slice::from_ref(&coinbase), height, &parents);
+        // Body = coinbase first, then the selected mempool txs (in order). The
+        // merkle root commits to the FULL body; the node recomputes it over the
+        // same list and rejects a mismatch.
+        let mut block_txs = Vec::with_capacity(1 + included_txs.len());
+        block_txs.push(coinbase);
+        block_txs.extend(included_txs);
+        let merkle_root = MerkleTree::build(&block_txs, height, &parents);
 
         // â•گâ•گâ•گ STEP 3: Multi-threaded mining â•گâ•گâ•گ
         let start = Instant::now();
@@ -379,7 +390,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
                 state_root: None,
             },
             body: BlockBody {
-                transactions: vec![coinbase],
+                transactions: block_txs,
             },
         };
 
@@ -526,6 +537,10 @@ struct BlockTemplate {
     /// Minimum valid block timestamp (max parent ts + 1) supplied by the node
     /// so the miner never violates R4 (monotonic DAG time) on sub-second blocks.
     min_timestamp: u64,
+    /// Mempool transactions the node selected for this block (validated,
+    /// conflict-free). The miner includes them so user transactions confirm;
+    /// the coinbase claims their fees. Empty when the mempool is empty.
+    transactions: Vec<Transaction>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -666,6 +681,19 @@ fn rpc_call(addr: &str, method: &str, params: &str, bearer_token: Option<&str>) 
     String::from_utf8(body_buf).ok()
 }
 
+/// Split the coinbase reward: the base `emission` is split `miner_percent`/rest
+/// between miner and dev, and ALL `fees` go to the miner. This is the split that
+/// satisfies the consensus coinbase check (validate_coinbase_for_network):
+/// `total == emission + fees`, `dev == emission - miner_base` (>= the dev floor),
+/// and `miner == miner_base + fees` (<= miner_base + declared_fees). Returns
+/// `(miner_amount, dev_amount)`.
+fn coinbase_split(emission: u64, fees: u64, miner_percent: u64) -> (u64, u64) {
+    let miner_base = (emission as u128 * miner_percent as u128 / 100) as u64;
+    let dev = emission - miner_base;
+    let miner = miner_base.saturating_add(fees);
+    (miner, dev)
+}
+
 fn rpc_get_template(addr: &str, bearer_token: Option<&str>) -> Option<BlockTemplate> {
     let response = rpc_call(addr, "getblocktemplate", "", bearer_token)?;
 
@@ -702,6 +730,18 @@ fn rpc_get_template(addr: &str, bearer_token: Option<&str>) -> Option<BlockTempl
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
+    // Transactions the node selected for inclusion. Absent/empty => coinbase-only
+    // block. A tx that fails to deserialize is skipped (never included blindly).
+    let transactions: Vec<Transaction> = result
+        .get("transactions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| serde_json::from_value::<Transaction>(t.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+
     Some(BlockTemplate {
         height,
         prev_hash,
@@ -709,6 +749,7 @@ fn rpc_get_template(addr: &str, bearer_token: Option<&str>) -> Option<BlockTempl
         difficulty,
         total_fees,
         min_timestamp,
+        transactions,
     })
 }
 
@@ -928,5 +969,47 @@ fn parse_flag_opt(args: &[String], name: &str) -> Result<Option<String>, String>
 
 fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The coinbase split MUST satisfy the consensus rule the node enforces in
+    /// validate_coinbase_for_network, for any (emission, fees): total is exactly
+    /// emission+fees, the dev output is the base emission share, and the miner
+    /// output never exceeds base + declared fees. This is what lets a block that
+    /// includes mempool txs (claiming their fees) be accepted.
+    #[test]
+    fn coinbase_split_satisfies_consensus_bounds() {
+        let miner_percent = ConsensusParams::MINER_PERCENT; // 95
+        for &(emission, fees) in &[
+            (1_000_000_000u64, 0u64),
+            (1_000_000_000, 394),
+            (10, 5),
+            (777, 1_000),
+            (0, 250),
+        ] {
+            let (miner, dev) = coinbase_split(emission, fees, miner_percent);
+            let miner_base = (emission as u128 * miner_percent as u128 / 100) as u64;
+            let dev_base = emission - miner_base;
+
+            // total == emission + fees (exact post-execution check).
+            assert_eq!(
+                miner + dev,
+                emission + fees,
+                "total must equal emission + fees"
+            );
+            // dev output == base emission share (>= the enforced dev floor).
+            assert_eq!(dev, dev_base, "dev must be the base emission share");
+            // miner output <= base + declared fees (the enforced ceiling).
+            assert!(
+                miner <= miner_base + fees,
+                "miner must not exceed base + fees"
+            );
+            // All fees go to the miner, none siphoned to dev.
+            assert_eq!(miner, miner_base + fees);
+        }
+    }
 }
 

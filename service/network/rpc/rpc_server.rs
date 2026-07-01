@@ -1804,11 +1804,20 @@ impl RpcServer {
                 // Always read fresh chain state so height/hash are up-to-date
                 s.update_from_chain();
 
-                let txs = s.mempool.get_all_transactions();
-                let count = txs.len().min(ConsensusParams::MAX_BLOCK_TXS);
-                let total_fees: u64 = txs
+                // Select a validated, conflict-free transaction set against the
+                // CURRENT UTXO state (reserving one slot for the coinbase), so
+                // the miner can include real mempool txs and user transactions
+                // actually confirm. total_fees is computed over THIS exact set,
+                // so the miner's coinbase (emission + these fees) equals what the
+                // node will apply — the post-execution check requires
+                // coinbase_total == emission + applied_fees exactly.
+                let selected = s.mempool.select_transactions_for_block(
+                    &s.utxo_store,
+                    ConsensusParams::MAX_BLOCK_TXS.saturating_sub(1),
+                );
+                let count = selected.len();
+                let total_fees: u64 = selected
                     .iter()
-                    .take(count)
                     .map(|t| t.fee)
                     .fold(0u64, |a, f| a.saturating_add(f));
 
@@ -1913,6 +1922,9 @@ impl RpcServer {
                         "max_tx":        ConsensusParams::MAX_BLOCK_TXS,
                         "max_size":      ConsensusParams::MAX_BLOCK_SIZE,
                         "min_timestamp": min_timestamp,
+                        // The exact tx set the miner must include (coinbase is
+                        // added by the miner). Empty when the mempool is empty.
+                        "transactions":  selected,
                     }),
                 )
             }
