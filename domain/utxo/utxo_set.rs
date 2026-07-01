@@ -149,6 +149,13 @@ impl UtxoSet {
         self
     }
 
+    /// In-place form of [`with_network`], for state that learns its network
+    /// after construction (e.g. the RPC's UTXO set, wired by the daemon).
+    #[inline]
+    pub fn set_network(&mut self, network: NetworkMode) {
+        self.network = network;
+    }
+
     /// Coinbase maturity (blocks) for this node's network. Test networks mature
     /// fast (so a freshly-mined reward is spendable quickly for testing); mainnet
     /// uses the full window.

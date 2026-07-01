@@ -363,6 +363,13 @@ impl Mempool {
         &self.network
     }
 
+    /// Set the active network in place, for state wired after construction
+    /// (e.g. the RPC's mempool). See [`new_with_network`](Self::new_with_network).
+    #[inline]
+    pub fn set_network(&mut self, network: NetworkMode) {
+        self.network = network;
+    }
+
     /// Storage-only insertion. Does NOT validate UTXO/signatures.
     /// For production callers, use `add_transaction_validated()` instead.
     /// This method is public for tests and internal use only.

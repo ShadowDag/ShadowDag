@@ -568,6 +568,19 @@ impl RpcServer {
         }
     }
 
+    /// Wire the active `NetworkMode` into the consensus-affecting RPC state:
+    /// the UTXO set's coinbase-maturity window and the mempool's validation
+    /// rules. The daemon must call this after construction — without it the RPC
+    /// state defaults to Mainnet, which on a test network makes `listunspent`
+    /// misreport maturity and makes `sendrawtransaction` reject a testnet
+    /// coinbase spend (Mainnet maturity is 1000 blocks, testnet is 10).
+    pub fn set_network_mode(&self, network: crate::config::node::node_config::NetworkMode) {
+        if let Ok(mut s) = self.state.lock() {
+            s.utxo_store.set_network(network.clone());
+            s.mempool.set_network(network);
+        }
+    }
+
     /// Set the actual P2P/RPC ports for this network mode.
     /// Call this after construction so getnetworkinfo returns correct ports.
     pub fn set_network_ports(&self, p2p_port: u16, rpc_port: u16) {
@@ -5275,6 +5288,30 @@ mod tests {
             assert!(u["amount"].is_u64());
             assert!(u["mature"].is_boolean());
         }
+    }
+
+    #[test]
+    fn listunspent_uses_testnet_coinbase_maturity_after_set_network_mode() {
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::utxo::utxo_key::UtxoKey;
+        let s = make_server();
+        // The daemon calls this after construction; without it the RPC state is
+        // Mainnet (maturity 1000) and a testnet coinbase would never look mature.
+        s.set_network_mode(NetworkMode::Testnet);
+        let addr = "ST1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        {
+            let mut st = s.state.lock().unwrap();
+            // Coinbase created at height 0; advance the tip to 10 → 10 confirmations.
+            let k = UtxoKey::new(&"ef".repeat(32), 0);
+            st.utxo_store
+                .add_utxo_coinbase(&k, "owner".into(), 1000, addr.into(), 0);
+            st.best_height = 10; // no block store best-hash, so update_from_chain keeps this
+        }
+        let r = call_params(&s, "listunspent", json!([addr]));
+        let res = &r["result"];
+        // Testnet maturity is 10, so a height-0 coinbase is spendable at tip 10.
+        assert_eq!(res["spendable"], json!(1000));
+        assert_eq!(res["utxos"][0]["mature"], json!(true));
     }
 
     #[test]

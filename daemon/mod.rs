@@ -318,6 +318,10 @@ impl DaemonNode {
         .map_err(|e| NodeError::Init(format!("Failed to init RPC server: {}", e)))?;
         rpc.set_network_name(self.cfg.network.name());
         rpc.set_network_ports(self.cfg.p2p_port, self.cfg.rpc_port);
+        // Wire the real network into the RPC's UTXO set + mempool so coinbase
+        // maturity and tx validation match the active chain (they default to
+        // Mainnet otherwise — see RpcServer::set_network_mode).
+        rpc.set_network_mode(self.cfg.network.clone());
         rpc.set_contract_storage(Arc::clone(&self.contract_storage));
         rpc.start()
             .map_err(|e| NodeError::Init(format!("RPC start failed: {}", e)))?;
