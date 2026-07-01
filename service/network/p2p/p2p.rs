@@ -115,6 +115,22 @@ static ORPHAN_BLOCKS: Lazy<Arc<PlMutex<Vec<(String, Block)>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(256))));
 const MAX_ORPHAN_BLOCKS: usize = 5_000;
 
+/// Header-serve requests: (peer_id, from_hash, count). The GetHeaders handler
+/// queues these; the daemon walks the chain FORWARD from from_hash and returns
+/// a batch of block hashes so a behind/forked peer can bulk-download and catch
+/// up (the sequential orphan-walk alone is too slow for a fast chain).
+#[allow(clippy::type_complexity)]
+static PENDING_HEADER_REQUESTS: Lazy<Arc<PlMutex<Vec<(String, String, u32)>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(64))));
+const MAX_HEADER_REQUEST_QUEUE: usize = 2_000;
+
+/// Target addresses (host:p2p_port) with a live OUTBOUND connection. Prevents
+/// duplicate dials and drives auto-reconnect: the maintenance loop re-dials any
+/// known peer not in this set, so a node recovers from restarts, timeouts, and
+/// network blips instead of staying isolated until its own restart.
+static CONNECTED_OUTBOUND: Lazy<Arc<PlMutex<HashSet<String>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(HashSet::new())));
+
 /// Per-peer last acknowledged outbound broadcast sequence.
 /// Used to safely prune only messages that all currently connected peers
 /// have already consumed.
@@ -262,6 +278,10 @@ pub fn cleanup_peer_state(peer_id: &str) {
         q.retain(|(source, _)| source != peer_id);
     }
     {
+        let mut q = PENDING_HEADER_REQUESTS.lock();
+        q.retain(|(target, _, _)| target != peer_id);
+    }
+    {
         let mut p = PEER_PENDING.lock();
         p.remove(peer_id);
     }
@@ -319,6 +339,20 @@ pub fn take_orphans_for_parent(parent_hash: &str) -> Vec<(String, Block)> {
         }
     });
     ready
+}
+
+/// Queue a peer's GetHeaders request. The daemon walks the chain forward from
+/// `from_hash` and replies with a batch of block hashes for bulk catch-up.
+pub fn push_header_request(peer_id: &str, from_hash: &str, count: u32) {
+    let mut q = PENDING_HEADER_REQUESTS.lock();
+    if q.len() < MAX_HEADER_REQUEST_QUEUE {
+        q.push((peer_id.to_string(), from_hash.to_string(), count));
+    }
+}
+
+/// Drain queued header-serve requests (call from the node main loop).
+pub fn drain_header_requests() -> Vec<(String, String, u32)> {
+    std::mem::take(&mut *PENDING_HEADER_REQUESTS.lock())
 }
 
 /// Requeue excess blocks that couldn't be processed in this tick.
@@ -852,6 +886,8 @@ impl P2P {
             slog_warn!("p2p", "peer_discovery_found_none");
         }
         self.connect_to_peers();
+        // Keep connections alive across drops/restarts (auto-reconnect).
+        self.spawn_reconnect_loop();
 
         slog_info!("p2p", "peers_connected", count => self.peers.count());
 
@@ -1287,7 +1323,14 @@ impl P2P {
                         || msg.contains("wouldblock")
                         || msg.contains("temporarily unavailable")
                         || msg.contains("os error 11")
-                        || msg.contains("os error 10035");
+                        || msg.contains("os error 10035")
+                        // Windows returns WSAETIMEDOUT (10060) for an SO_RCVTIMEO
+                        // read-timeout expiry, not EWOULDBLOCK — without this a
+                        // Windows node drops every peer every 2s (the read poll
+                        // interval). Real dead connections are still caught by the
+                        // pong timeout below.
+                        || msg.contains("os error 10060")
+                        || msg.contains("did not properly respond");
 
                     if is_timeout {
                         // Keepalive ping
@@ -2094,7 +2137,7 @@ impl P2P {
                 }
             }
 
-            // ── GetHeaders: validate hash and respond with known headers ─
+            // ── GetHeaders: queue a forward-walk header response ─────────
             P2PMessage::GetHeaders { ref from_hash, .. } => {
                 if !from_hash.is_empty() {
                     if let Err(pe) = validate_hash_hex(from_hash) {
@@ -2107,25 +2150,14 @@ impl P2P {
                         return Ok(());
                     }
                 }
-                // Respond with block hashes the peer can use for sync.
-                // dispatch_message doesn't have direct block_store access,
-                // so we return DAG tips as our header set.
-                // TODO: When block_store access is available, walk from
-                // from_hash forward and return actual sequential headers.
-                let mut hashes = crate::service::network::nodes::full_node::get_dag_tips();
-                // Respect count parameter if provided (default: no limit → use protocol max)
                 let count = match msg {
-                    P2PMessage::GetHeaders { count, .. } => count as usize,
-                    _ => 2000,
+                    P2PMessage::GetHeaders { count, .. } => count,
+                    _ => 512,
                 };
-                // Cap at protocol limit to prevent oversized response
-                const MAX_HEADERS_RESPONSE: usize = 2_000;
-                hashes.truncate(count.min(MAX_HEADERS_RESPONSE));
-                if !hashes.is_empty() {
-                    let resp = P2PMessage::Headers { hashes };
-                    let bytes = Self::write_message(writer, &resp, magic)?;
-                    session.record_bytes_sent(bytes);
-                }
+                // Serving real sequential headers needs block_store access, which
+                // dispatch_message lacks. Queue for the daemon event loop, which
+                // walks the chain forward from from_hash and replies to this peer.
+                push_header_request(peer, from_hash, count);
             }
 
             // ── Headers: validate hash list and queue blocks for download ─
@@ -2261,22 +2293,60 @@ impl P2P {
         slog_info!("p2p", "connecting_to_peers", count => count);
 
         for addr in peer_list.into_iter().take(count) {
-            let addr_clone = addr.clone();
-            let peers_snapshot = known_peers.clone();
-            thread::spawn(move || match TcpStream::connect(&addr_clone) {
+            Self::spawn_outbound(addr, magic, known_peers.clone());
+        }
+    }
+
+    /// Dial one peer in its own thread, tracking the live connection in
+    /// CONNECTED_OUTBOUND so it is neither double-dialed nor left un-redialed.
+    /// Skips peers already connected; frees the slot when the connection ends so
+    /// the reconnect loop can re-dial. This is the unit of auto-reconnect.
+    fn spawn_outbound(addr: String, magic: [u8; 4], peers_snapshot: Vec<String>) {
+        // Reserve the slot up front (atomic check-and-insert) so two callers
+        // can't both dial the same peer.
+        {
+            let mut set = CONNECTED_OUTBOUND.lock();
+            if set.contains(&addr) {
+                return;
+            }
+            set.insert(addr.clone());
+        }
+        thread::spawn(move || {
+            match TcpStream::connect(&addr) {
                 Ok(stream) => {
-                    slog_info!("p2p", "outbound_connected", addr => &addr_clone);
+                    slog_info!("p2p", "outbound_connected", addr => &addr);
                     if let Err(e) =
                         Self::handle_peer_connection(stream, true, magic, peers_snapshot)
                     {
-                        slog_error!("p2p", "peer_connection_error", addr => &addr_clone, error => &e.to_string());
+                        slog_info!("p2p", "peer_connection_ended", addr => &addr, reason => &e.to_string());
                     }
                 }
                 Err(e) => {
-                    slog_error!("p2p", "outbound_connect_failed", addr => &addr_clone, error => &e.to_string());
+                    slog_warn!("p2p", "outbound_connect_failed", addr => &addr, error => &e.to_string());
                 }
-            });
-        }
+            }
+            // Connection ended or failed — free the slot for re-dial.
+            CONNECTED_OUTBOUND.lock().remove(&addr);
+        });
+    }
+
+    /// Background maintenance: every 15s, re-dial any known peer that has no live
+    /// outbound connection. Without this a node stays isolated after a restart,
+    /// a dropped connection, or a transient refusal — which is exactly why forked
+    /// nodes never reconverged. Runs for the life of the process.
+    fn spawn_reconnect_loop(&self) {
+        let peers = Arc::clone(&self.peers);
+        let magic = self.network_magic;
+        thread::spawn(move || loop {
+            thread::sleep(std::time::Duration::from_secs(15));
+            let known_snapshot = peers.get_addr_list_limited(100);
+            for addr in peers.get_peers() {
+                if CONNECTED_OUTBOUND.lock().contains(&addr) {
+                    continue;
+                }
+                Self::spawn_outbound(addr, magic, known_snapshot.clone());
+            }
+        });
     }
 
     /// Proactively request headers from all connected peers to initiate sync.

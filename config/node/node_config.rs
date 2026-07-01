@@ -242,6 +242,10 @@ pub struct NodeConfig {
     pub enable_ide: bool,
     /// HTTP port for the contract IDE (default: 3000).
     pub ide_port: u16,
+    /// Explicit peers to connect to (host:port), from `--connect`. Added on top
+    /// of the hardcoded bootstrap set — used for local multi-node testing and
+    /// custom/private deployments.
+    pub connect_peers: Vec<String>,
 }
 
 impl NodeConfig {
@@ -268,6 +272,7 @@ impl NodeConfig {
             wallet_ui_port: 8081,
             enable_ide: false,
             ide_port: 3000,
+            connect_peers: Vec::new(),
         }
     }
 
@@ -278,6 +283,7 @@ impl NodeConfig {
         let mut rpc_override = None;
         let mut mining = false;
         let mut miner_addr = String::new();
+        let mut connect_peers: Vec<String> = Vec::new();
 
         let mut i = 1;
         while i < args.len() {
@@ -323,6 +329,10 @@ impl NodeConfig {
                     miner_addr = args[i + 1].clone();
                     i += 1;
                 }
+                "--connect" if i + 1 < args.len() => {
+                    connect_peers.push(args[i + 1].clone());
+                    i += 1;
+                }
                 _ => {}
             }
             i += 1;
@@ -337,6 +347,7 @@ impl NodeConfig {
         }
         cfg.enable_mining = mining;
         cfg.miner_addr = miner_addr;
+        cfg.connect_peers = connect_peers;
         cfg
     }
 

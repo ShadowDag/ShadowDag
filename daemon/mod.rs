@@ -42,9 +42,9 @@ use crate::service::mempool::pools::tx_pool::TxPoolResult;
 use crate::service::network::dos_guard::{BanCategory, MAX_TX_BYTES};
 use crate::service::network::nodes::full_node::FullNode;
 use crate::service::network::p2p::p2p::{
-    buffer_orphan, drain_block_requests, drain_pending_blocks, drain_pending_txs, push_outbound,
-    push_outbound_to_peer, report_bad_peer, report_bad_peer_cat, requeue_pending_blocks,
-    requeue_pending_txs, take_orphans_for_parent, P2PMessage, P2P,
+    buffer_orphan, drain_block_requests, drain_header_requests, drain_pending_blocks,
+    drain_pending_txs, push_outbound, push_outbound_to_peer, report_bad_peer, report_bad_peer_cat,
+    requeue_pending_blocks, requeue_pending_txs, take_orphans_for_parent, P2PMessage, P2P,
 };
 use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::service::network::contract_ide::ContractIdeServer;
@@ -302,6 +302,13 @@ impl DaemonNode {
         // ── P2P ──────────────────────────────────────────────────
         let mut p2p = P2P::new_with_config_and_peers(&self.cfg, self.peer_manager.clone())?;
         p2p.peers.bootstrap_for_network(&self.cfg.network);
+        // Explicit --connect peers (local testing / private deployments).
+        for addr in &self.cfg.connect_peers {
+            match p2p.peers.add_peer(addr) {
+                Ok(()) => slog_info!("daemon", "connect_peer_added", addr => addr),
+                Err(e) => slog_warn!("daemon", "connect_peer_invalid", addr => addr, error => &e.to_string()),
+            }
+        }
         let discovered = p2p.peers.discover_peers();
         if discovered.is_empty() {
             slog_warn!("daemon", "peer_discovery_returned_empty",
@@ -406,6 +413,7 @@ impl DaemonNode {
         }
 
         let mut last_stats = Instant::now();
+        let mut last_sync_req = Instant::now();
         let mut total_blocks_processed: u64 = 0;
         let mut total_txs_processed: u64 = 0;
         let mut total_blocks_rejected: u64 = 0;
@@ -415,6 +423,22 @@ impl DaemonNode {
 
         while !shutdown.load(Ordering::SeqCst) {
             let mut did_work = false;
+
+            // ── Periodic chain-sync request ─────────────────────────
+            // Ask peers for headers forward of our best block so a behind or
+            // freshly-reconnected node catches up even without a gossip trigger.
+            // Peers walk their chain from our best_hash and reply (Headers ->
+            // GetBlock -> Block). If we forked, they don't have our best_hash and
+            // serve from genesis, so we download their chain and GHOSTDAG adopts
+            // the higher-blue-score one.
+            if last_sync_req.elapsed() >= std::time::Duration::from_secs(6) {
+                last_sync_req = Instant::now();
+                let from_hash = self.block_store.get_best_hash().unwrap_or_default();
+                push_outbound(P2PMessage::GetHeaders {
+                    from_hash,
+                    count: 512,
+                });
+            }
 
             // ── Drain pending blocks (peer-tagged) ─────────────────
             // Take only BLOCK_BATCH_LIMIT items; return excess to the queue
@@ -529,22 +553,31 @@ impl DaemonNode {
                             // Chain sync: an orphan means we are missing this
                             // block's parent(s). Ask the sending peer for each
                             // missing ancestor and buffer the orphan so it is
-                            // reprocessed once they arrive. This lets a forked /
-                            // behind node download and adopt a longer chain.
+                            // reprocessed once they arrive — but ONLY if the
+                            // orphan is higher than our current tip. Otherwise it
+                            // is a shorter/side fork not worth downloading;
+                            // chasing every fork thrashes the DAG (anti-thrash).
                             if err_msg.contains(ERR_ORPHAN) {
-                                for parent in &block.header.parents {
-                                    if !parent.is_empty()
-                                        && self.block_store.get_block(parent).is_none()
-                                    {
-                                        push_outbound_to_peer(
-                                            peer_id,
-                                            P2PMessage::GetBlock {
-                                                hash: parent.clone(),
-                                            },
-                                        );
+                                let best_h = self
+                                    .block_store
+                                    .get_best_hash()
+                                    .and_then(|h| self.block_store.get_block_height(&h))
+                                    .unwrap_or(0);
+                                if block.header.height > best_h {
+                                    for parent in &block.header.parents {
+                                        if !parent.is_empty()
+                                            && self.block_store.get_block(parent).is_none()
+                                        {
+                                            push_outbound_to_peer(
+                                                peer_id,
+                                                P2PMessage::GetBlock {
+                                                    hash: parent.clone(),
+                                                },
+                                            );
+                                        }
                                     }
+                                    buffer_orphan(peer_id, block.clone());
                                 }
-                                buffer_orphan(peer_id, block.clone());
                             }
                         }
                     }
@@ -578,6 +611,42 @@ impl DaemonNode {
                             push_outbound_to_peer(&req_peer, P2PMessage::Block { data: bytes });
                             served += 1;
                         }
+                    }
+                }
+            }
+
+            // ── Serve header requests: walk the chain FORWARD from from_hash ──
+            // and reply with a batch of hashes so a behind/forked peer can bulk-
+            // download and catch up (far faster than the sequential orphan-walk).
+            let header_reqs = drain_header_requests();
+            if !header_reqs.is_empty() {
+                did_work = true;
+                for (req_peer, from_hash, count) in header_reqs {
+                    // Start one past from_hash if we know it; else from genesis
+                    // (height 1) so a forked peer receives our whole chain.
+                    let start = self
+                        .block_store
+                        .get_block_height(&from_hash)
+                        .map(|h| h + 1)
+                        .unwrap_or(1);
+                    let want = (count as usize).clamp(1, 512);
+                    let mut hashes: Vec<String> = Vec::with_capacity(want);
+                    let mut h = start;
+                    while hashes.len() < want {
+                        let at = self.block_store.get_block_hashes_at_height(h);
+                        if at.is_empty() {
+                            break; // reached our tip
+                        }
+                        for hh in at {
+                            hashes.push(hh);
+                            if hashes.len() >= want {
+                                break;
+                            }
+                        }
+                        h += 1;
+                    }
+                    if !hashes.is_empty() {
+                        push_outbound_to_peer(&req_peer, P2PMessage::Headers { hashes });
                     }
                 }
             }

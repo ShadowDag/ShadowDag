@@ -248,8 +248,22 @@ fn parse_config(args: &[String]) -> Result<NodeConfig, BootError> {
         Some(s) => Some(parse_port(&s, "--ide-port")?),
         None => None,
     };
+    // Repeatable --connect host:port — explicit peers on top of bootstrap
+    // (local multi-node testing, private deployments).
+    let connect_peers: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter_map(|(i, a)| {
+            if a == "--connect" {
+                args.get(i + 1).cloned()
+            } else {
+                None
+            }
+        })
+        .collect();
 
     let mut cfg = NodeConfig::for_network(network);
+    cfg.connect_peers = connect_peers;
     if let Some(port) = rpc_port {
         cfg.rpc_port = port;
     }
