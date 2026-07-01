@@ -1854,10 +1854,29 @@ impl RpcServer {
                         if seen.insert(cursor.clone()) {
                             parent_hashes.push(cursor.clone());
                         }
+                        // Walk toward genesis to backfill parents up to
+                        // min_parents. Prefer selected_parent, but fall back to
+                        // the first DAG parent: an early block mined while
+                        // best_hash was still empty can carry an empty
+                        // selected_parent, which previously stalled the walk and
+                        // left the template short of min_parents (deadlocking a
+                        // low-tip mainnet at height 1).
                         cursor = s
                             .block_store
                             .get_block(&cursor)
-                            .and_then(|b| b.header.selected_parent.clone())
+                            .and_then(|b| {
+                                b.header
+                                    .selected_parent
+                                    .clone()
+                                    .filter(|p| !p.is_empty())
+                                    .or_else(|| {
+                                        b.header
+                                            .parents
+                                            .iter()
+                                            .find(|p| !p.is_empty())
+                                            .cloned()
+                                    })
+                            })
                             .unwrap_or_default();
                     }
                 }
