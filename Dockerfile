@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # ═══════════════════════════════════════════════════════════════════════════
 #  ShadowDAG — Multi-stage Docker build
 #
@@ -28,7 +29,20 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /build
 COPY . .
-RUN cargo build --release
+# BuildKit cache mounts persist the cargo registry and the target/ dir across
+# builds, so a source-only change recompiles just the changed crates instead of
+# the whole tree (cold build ~12 min; incremental ~1-2 min). target/ lives in
+# the cache mount (not in the image layer), so copy the release binaries into
+# /out within the same RUN — the runtime stage copies from there.
+RUN --mount=type=cache,target=/build/target \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo build --release && \
+    mkdir -p /out && \
+    cp target/release/shadowdag-node \
+       target/release/shadowdag-miner \
+       target/release/shadowdag-wallet \
+       target/release/shadowasm /out/
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -41,11 +55,11 @@ RUN apt-get update && apt-get install -y \
 # Create non-root user
 RUN useradd -m -s /bin/bash shadowdag
 
-# Copy binaries
-COPY --from=builder /build/target/release/shadowdag-node   /usr/local/bin/
-COPY --from=builder /build/target/release/shadowdag-miner  /usr/local/bin/
-COPY --from=builder /build/target/release/shadowdag-wallet /usr/local/bin/
-COPY --from=builder /build/target/release/shadowasm        /usr/local/bin/
+# Copy binaries (from /out — see the builder stage's cache-mount note)
+COPY --from=builder /build/out/shadowdag-node   /usr/local/bin/
+COPY --from=builder /build/out/shadowdag-miner  /usr/local/bin/
+COPY --from=builder /build/out/shadowdag-wallet /usr/local/bin/
+COPY --from=builder /build/out/shadowasm        /usr/local/bin/
 
 # Copy examples
 COPY examples/ /opt/shadowdag/examples/
