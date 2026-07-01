@@ -8,6 +8,7 @@ use crate::domain::address::address::Address;
 use crate::domain::address::invisible_wallet::InvisibleWallet;
 use crate::domain::block::block::Block;
 use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
+use crate::domain::transaction::tx_hash::TxHash;
 use crate::domain::utxo::utxo_set::UtxoSet;
 use crate::engine::privacy::ringct::builder::{
     build_confidential_transaction, ConfRecipient, OwnedInput,
@@ -664,46 +665,13 @@ impl Wallet {
             .as_ref()
             .ok_or(WalletError::Other("No session key".to_string()))?
             .clone();
+        let net: NetworkMode = self.network.parse().unwrap_or(NetworkMode::Mainnet);
+        let ts = unix_now();
 
-        let mut signed_inputs = Vec::new();
-        for utxo in &selected {
-            // Find which address owns this UTXO and derive the correct key
-            let wa = acc
-                .addresses
-                .iter()
-                .find(|a| a.address == utxo.address)
-                .ok_or(WalletError::AddressNotFound(utxo.address.clone()))?;
-            let sk = derive_key(&seed, wa.account, wa.index, wa.is_change)?;
-            // FIXED: Use the SAME signing message format as TxValidator (TxHash::signing_message)
-            // Format: SHA-256(CHAIN_ID || txid || index || to_address || amount || fee)
-            let chain_id = match self.network.as_str() {
-                "mainnet" => 0xDA0C_0001u32,
-                "testnet" => 0xDA0C_0002u32,
-                "regtest" => 0xDA0C_0003u32,
-                _ => 0xDA0C_0001u32, // fallback to mainnet
-            };
-            let mut h = sha2::Sha256::new();
-            sha2::Digest::update(&mut h, chain_id.to_le_bytes()); // Chain ID
-            sha2::Digest::update(&mut h, utxo.txid.as_bytes());
-            sha2::Digest::update(&mut h, utxo.index.to_le_bytes());
-            sha2::Digest::update(&mut h, to_address.as_bytes());
-            sha2::Digest::update(&mut h, amount.to_le_bytes());
-            sha2::Digest::update(&mut h, fee.to_le_bytes());
-            let msg = sha2::Digest::finalize(h);
-            let sig: Signature = sk.sign(&msg);
-            signed_inputs.push(SignedInput {
-                txid: utxo.txid.clone(),
-                index: utxo.index,
-                signature: hex::encode(sig.to_bytes()),
-                pub_key: wa.public_key.clone(),
-                address: utxo.address.clone(),
-            });
-        }
-
-        let mut outputs = vec![TxOut {
-            address: to_address.to_string(),
-            amount,
-        }];
+        // Outputs: recipient first, then change-to-self on a fresh canonical
+        // change address when it clears the dust threshold. Both must be known
+        // before hashing because the txid commits to the outputs.
+        let mut outputs = vec![TxOutput::new(to_address.to_string(), amount)];
         if change > DUST_LIMIT {
             let next_idx = acc
                 .addresses
@@ -713,28 +681,91 @@ impl Wallet {
                 .max()
                 .map(|x| x + 1)
                 .unwrap_or(1);
-            let change_addr = match self.derive_change_address(from_account, next_idx) {
-                Ok(wa) => wa.address,
-                Err(_) => {
-                    return Err(WalletError::Other("cannot derive change address".into()));
-                }
-            };
-            outputs.push(TxOut {
-                address: change_addr,
-                amount: change,
+            let change_addr = self
+                .derive_change_address(from_account, next_idx)
+                .map_err(|_| WalletError::Other("cannot derive change address".into()))?
+                .address;
+            outputs.push(TxOutput::new(change_addr, change));
+        }
+
+        // Build the REAL consensus transaction. owner + pub_key are set now
+        // (the txid commits to them); signatures are filled after hashing since
+        // canonical_bytes excludes signatures (Bitcoin-style, no circular hash).
+        let mut tx_inputs: Vec<TxInput> = Vec::with_capacity(selected.len());
+        for utxo in &selected {
+            let wa = acc
+                .addresses
+                .iter()
+                .find(|a| a.address == utxo.address)
+                .ok_or(WalletError::AddressNotFound(utxo.address.clone()))?;
+            tx_inputs.push(TxInput {
+                txid: utxo.txid.clone(),
+                index: utxo.index,
+                owner: utxo.address.clone(),
+                signature: String::new(),
+                pub_key: wa.public_key.clone(),
+                key_image: None,
+                ring_members: None,
+                ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
             });
         }
 
-        let txid = compute_txid(&signed_inputs, &outputs, fee);
+        let mut tx = Transaction::new(String::new(), tx_inputs, outputs, fee, ts);
+        // Canonical txid, then the signing message over that txid — the EXACT
+        // scheme the node validates (TxHash::{hash,signing_message}_for_network)
+        // and the WASM/Python SDKs replicate byte-for-byte.
+        tx.hash = TxHash::hash_for_network(&tx, &net);
+        let signing_msg = TxHash::signing_message_for_network(&tx, &net);
+
+        // Sign each input with the key that owns its UTXO. Every input signs the
+        // same tx-wide message but with its own key (multi-address spend safe).
+        for (i, utxo) in selected.iter().enumerate() {
+            let wa = acc
+                .addresses
+                .iter()
+                .find(|a| a.address == utxo.address)
+                .ok_or(WalletError::AddressNotFound(utxo.address.clone()))?;
+            let sk = derive_key(&seed, wa.account, wa.index, wa.is_change)?;
+            let sig: Signature = sk.sign(&signing_msg);
+            tx.inputs[i].signature = hex::encode(sig.to_bytes());
+        }
+
+        // Wallet-local views for CLI display, plus the broadcast-ready JSON.
+        // `raw_hex` now carries the serialized consensus Transaction that
+        // `sendrawtransaction` accepts (params[0] = this JSON string), NOT a
+        // placeholder.
+        let signed_inputs: Vec<SignedInput> = tx
+            .inputs
+            .iter()
+            .map(|inp| SignedInput {
+                txid: inp.txid.clone(),
+                index: inp.index,
+                signature: inp.signature.clone(),
+                pub_key: inp.pub_key.clone(),
+                address: inp.owner.clone(),
+            })
+            .collect();
+        let outputs: Vec<TxOut> = tx
+            .outputs
+            .iter()
+            .map(|o| TxOut {
+                address: o.address.clone(),
+                amount: o.amount,
+            })
+            .collect();
+        let raw_json = serde_json::to_string(&tx)
+            .map_err(|e| WalletError::Other(format!("serialize tx: {}", e)))?;
 
         Ok(BuiltTx {
-            txid: txid.clone(),
+            txid: tx.hash.clone(),
             inputs: signed_inputs,
             outputs,
             fee,
             memo: memo.to_string(),
-            timestamp: unix_now(),
-            raw_hex: format!("raw:{}", txid),
+            timestamp: ts,
+            raw_hex: raw_json,
         })
     }
 
@@ -1061,21 +1092,6 @@ fn make_address(pub_hex: &str, network: &str) -> Result<String, WalletError> {
         )));
     }
     Ok(Address::from_public_key(&pub_bytes, network).value)
-}
-
-fn compute_txid(inputs: &[SignedInput], outputs: &[TxOut], fee: u64) -> String {
-    let mut h = Sha3_256::new();
-    for inp in inputs {
-        h.update(inp.txid.as_bytes());
-        h.update(inp.index.to_le_bytes());
-        h.update(inp.signature.as_bytes());
-    }
-    for out in outputs {
-        h.update(out.address.as_bytes());
-        h.update(out.amount.to_le_bytes());
-    }
-    h.update(fee.to_le_bytes());
-    hex::encode(h.finalize())
 }
 
 fn entropy_to_mnemonic_simple(entropy: &[u8]) -> Vec<String> {
@@ -1614,5 +1630,63 @@ mod tests {
         );
         assert!(w.is_valid_address(&wa.address));
         assert_eq!(wa.address.len(), 3 + 40);
+    }
+
+    /// Acceptance oracle: build_tx must produce a REAL consensus transaction the
+    /// node accepts — canonical txid + a signature that passes the exact
+    /// ownership/signature check in TxValidator. Proves the shipped wallet can
+    /// now actually move a coin (the old build_tx returned a placeholder
+    /// "raw:{txid}" string that could never be broadcast).
+    #[test]
+    fn build_tx_produces_consensus_valid_transaction() {
+        use crate::domain::transaction::transaction::Transaction;
+        use crate::domain::transaction::tx_validator::TxValidator;
+
+        let mut w = Wallet::new("testnet");
+        w.restore_from_seed(vec![2u8; 64]).unwrap();
+        let from = w.address();
+
+        // Fund the wallet with one mature UTXO owned by its address.
+        w.update_utxos(
+            &from,
+            vec![Walletutxo {
+                txid: "aa".repeat(32),
+                index: 0,
+                amount: 1_000_000,
+                address: from.clone(),
+                height: 1,
+                confirmations: 100,
+                is_coinbase: true,
+                is_locked: false,
+            }],
+        );
+
+        let dest = format!("ST1{}", "11".repeat(20));
+        let built = w.build_tx(0, &dest, 400_000, 500, "").unwrap();
+
+        // raw_hex is now a serialized consensus Transaction, not a placeholder.
+        assert!(!built.raw_hex.starts_with("raw:"));
+        let tx: Transaction = serde_json::from_str(&built.raw_hex).expect("valid tx JSON");
+        assert_eq!(tx.hash, built.txid);
+
+        let net = NetworkMode::Testnet;
+        // Hash commits to content.
+        assert!(TxHash::verify_for_network(&tx, &net));
+        // Signature verifies under the canonical signing message AND the input
+        // pub_key derives to the owner address — exactly the consensus gate.
+        let msg = TxHash::signing_message_for_network(&tx, &net);
+        assert_eq!(tx.inputs.len(), 1);
+        assert!(TxValidator::verify_input_ownership_by_address(
+            &tx.inputs[0],
+            &from,
+            &msg
+        ));
+
+        // Recipient output + change-to-self output.
+        assert!(tx
+            .outputs
+            .iter()
+            .any(|o| o.address == dest && o.amount == 400_000));
+        assert!(tx.outputs.iter().any(|o| o.address != dest));
     }
 }
