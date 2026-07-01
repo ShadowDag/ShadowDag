@@ -187,10 +187,15 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
             slog_info!("miner", "connected_to_node", height => height - 1, difficulty => difficulty);
         }
 
-        let timestamp = SystemTime::now()
+        // Stamp at least max_parent_ts + 1 (from the template) so fast,
+        // sub-second blocks still satisfy R4 (monotonic DAG time: ts must be
+        // strictly greater than every parent's). Falls back to wall-clock when
+        // the node did not supply a floor.
+        let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let timestamp = now_secs.max(template.min_timestamp);
 
         // â•گâ•گâ•گ STEP 2: Build coinbase transaction â•گâ•گâ•گ
         let emission = EmissionSchedule::block_reward(height);
@@ -518,6 +523,9 @@ struct BlockTemplate {
     parent_hashes: Vec<String>,
     difficulty: u64,
     total_fees: u64,
+    /// Minimum valid block timestamp (max parent ts + 1) supplied by the node
+    /// so the miner never violates R4 (monotonic DAG time) on sub-second blocks.
+    min_timestamp: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -689,12 +697,18 @@ fn rpc_get_template(addr: &str, bearer_token: Option<&str>) -> Option<BlockTempl
         })
         .unwrap_or_else(|| vec![prev_hash.clone()]);
 
+    let min_timestamp = result
+        .get("min_timestamp")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
     Some(BlockTemplate {
         height,
         prev_hash,
         parent_hashes,
         difficulty,
         total_fees,
+        min_timestamp,
     })
 }
 

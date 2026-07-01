@@ -1866,6 +1866,20 @@ impl RpcServer {
                 // Limit to MAX_PARENTS
                 parent_hashes.truncate(ConsensusParams::MAX_PARENTS);
 
+                // Minimum valid block timestamp. R4 (monotonic DAG time) requires
+                // a block's timestamp to be STRICTLY greater than every parent's,
+                // but block timestamps are 1-second granular, so a miner producing
+                // sub-second blocks would stamp ts == parent ts and get rejected.
+                // Tell the miner the floor (max parent ts + 1); it stamps
+                // max(now, min_timestamp). Keeps R4 intact on every network.
+                let max_parent_ts = parent_hashes
+                    .iter()
+                    .filter_map(|h| s.block_store.get_block(h))
+                    .map(|b| b.header.timestamp)
+                    .max()
+                    .unwrap_or(0);
+                let min_timestamp = max_parent_ts.saturating_add(1);
+
                 RpcResponse::ok(
                     id,
                     json!({
@@ -1879,6 +1893,7 @@ impl RpcServer {
                         "target_time":   ConsensusParams::BLOCK_TIME,
                         "max_tx":        ConsensusParams::MAX_BLOCK_TXS,
                         "max_size":      ConsensusParams::MAX_BLOCK_SIZE,
+                        "min_timestamp": min_timestamp,
                     }),
                 )
             }
