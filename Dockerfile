@@ -101,14 +101,26 @@ echo "  P2P:      0.0.0.0:9333"
 echo "  Stratum:  0.0.0.0:7779"
 echo "═══════════════════════════════════════════"
 
-# Start miner in background if address is set
+# Start a resilient background miner if an address is configured. Wait for the
+# node to publish its RPC password, then mine in a restart loop. No --rpc flag:
+# the miner derives the correct port from --network (testnet=19332, mainnet=9332)
+# — hardcoding 9332 broke testnet mining. Output goes to the container log.
 if [ -n "$MINER_ADDRESS" ]; then
     echo "  Mining to: ${MINER_ADDRESS}"
     echo "  Threads:   ${MINER_THREADS}"
-    shadowdag-miner --network="${NETWORK}" \
-        --address="${MINER_ADDRESS}" \
-        --threads="${MINER_THREADS}" \
-        --rpc=127.0.0.1:9332 &
+    (
+        # The node writes rpc_password into the data dir shortly after start.
+        while [ ! -s "${SHADOWDAG_DATA_DIR}/rpc_password" ]; do sleep 1; done
+        MINER_PW="$(cat "${SHADOWDAG_DATA_DIR}/rpc_password")"
+        while true; do
+            shadowdag-miner --network="${NETWORK}" \
+                --address="${MINER_ADDRESS}" \
+                --threads="${MINER_THREADS}" \
+                --rpc-password="${MINER_PW}"
+            echo "[entrypoint] miner exited; restarting in 2s" >&2
+            sleep 2
+        done
+    ) &
 fi
 
 exec shadowdag-node $ARGS "$@"

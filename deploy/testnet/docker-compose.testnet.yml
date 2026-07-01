@@ -24,6 +24,12 @@ services:
       # connection is reset. RPC stays private: the host mapping below is
       # loopback-only (127.0.0.1:19332), so RPC is not exposed to the internet.
       - SHADOWDAG_RPC_BIND=0.0.0.0
+      # Optional built-in miner: set MINER_ADDRESS on the host to make THIS node
+      # mine (the entrypoint runs a resilient miner loop). Leave empty to not
+      # mine. Example:
+      #   MINER_ADDRESS=ST1b28a5... docker compose -f docker-compose.testnet.yml up -d
+      - MINER_ADDRESS=${MINER_ADDRESS:-}
+      - MINER_THREADS=${MINER_THREADS:-2}
     ports:
       - "19333:19333"             # P2P — PUBLIC (peers connect here)
       - "127.0.0.1:19332:19332"   # RPC  — localhost only (keep private)
