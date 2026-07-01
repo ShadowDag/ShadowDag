@@ -20,6 +20,7 @@ Chain (mirrors the node):
 
 import hashlib
 import hmac as _hmac
+import json
 import struct
 
 # ─────────────────────────── Ed25519 (RFC 8032 reference) ───────────────────
@@ -293,7 +294,10 @@ def build_signed_transfer(inputs, outputs, fee, timestamp, private_key_hex,
 
 
 def sendrawtransaction_body(tx, req_id=1):
-    return {"jsonrpc": "2.0", "id": req_id, "method": "sendrawtransaction", "params": [tx]}
+    # The node expects the tx as a JSON STRING in params[0] (it calls
+    # params[0].as_str() then serde_json::from_str), not a nested object.
+    return {"jsonrpc": "2.0", "id": req_id, "method": "sendrawtransaction",
+            "params": [json.dumps(tx)]}
 
 
 # ───────────────────────────── Self-test (reference vectors) ────────────────

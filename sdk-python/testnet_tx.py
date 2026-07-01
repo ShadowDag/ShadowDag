@@ -151,7 +151,10 @@ def cmd_send(args):
     token = rpc_call(args.rpc, "login",
                      [{"username": args.rpc_user, "password": args.rpc_password}])
     token = token["token"] if isinstance(token, dict) else token
-    result = rpc_call(args.rpc, "sendrawtransaction", [tx], token=token)
+    # sendrawtransaction expects params[0] to be the tx serialized as a JSON
+    # STRING (the node does params[0].as_str() then serde_json::from_str), not a
+    # nested JSON object.
+    result = rpc_call(args.rpc, "sendrawtransaction", [json.dumps(tx)], token=token)
     print("sendrawtransaction result:")
     print(json.dumps(result, indent=2))
 
