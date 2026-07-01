@@ -131,6 +131,14 @@ const MAX_HEADER_REQUEST_QUEUE: usize = 2_000;
 static CONNECTED_OUTBOUND: Lazy<Arc<PlMutex<HashSet<String>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(HashSet::new())));
 
+/// Last outbound dial time per target addr. The reconnect loop uses it to
+/// enforce a minimum interval between dials of the same peer, so a peer that
+/// keeps dropping (a banned peer, or the node's own IP self-connecting) is not
+/// hammered — which otherwise trips the DoS guard and bans everyone.
+static LAST_DIAL: Lazy<Arc<PlMutex<HashMap<String, Instant>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(HashMap::new())));
+const MIN_REDIAL_INTERVAL_SECS: u64 = 30;
+
 /// Per-peer last acknowledged outbound broadcast sequence.
 /// Used to safely prune only messages that all currently connected peers
 /// have already consumed.
@@ -2311,6 +2319,7 @@ impl P2P {
             }
             set.insert(addr.clone());
         }
+        LAST_DIAL.lock().insert(addr.clone(), Instant::now());
         thread::spawn(move || {
             match TcpStream::connect(&addr) {
                 Ok(stream) => {
@@ -2338,11 +2347,24 @@ impl P2P {
         let peers = Arc::clone(&self.peers);
         let magic = self.network_magic;
         thread::spawn(move || loop {
-            thread::sleep(std::time::Duration::from_secs(15));
+            thread::sleep(std::time::Duration::from_secs(10));
             let known_snapshot = peers.get_addr_list_limited(100);
             for addr in peers.get_peers() {
+                // Already connected — leave it.
                 if CONNECTED_OUTBOUND.lock().contains(&addr) {
                     continue;
+                }
+                // Never dial a banned peer (a stale ban or a real one): dialing
+                // it just gets rejected and re-bans via connection spam.
+                if peers.is_banned(&addr) {
+                    continue;
+                }
+                // Rate-limit re-dials of the same peer so a fast-failing target
+                // (banned, or our own IP self-connecting) doesn't churn.
+                if let Some(last) = LAST_DIAL.lock().get(&addr) {
+                    if last.elapsed() < std::time::Duration::from_secs(MIN_REDIAL_INTERVAL_SECS) {
+                        continue;
+                    }
                 }
                 Self::spawn_outbound(addr, magic, known_snapshot.clone());
             }
