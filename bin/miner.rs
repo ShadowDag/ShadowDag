@@ -152,6 +152,21 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
                 if total_mined == 0 {
                     slog_warn!("miner", "rpc_connect_failed", addr => &rpc_addr, retry_sec => 5);
                 }
+                // The one-shot login at startup can race node startup: if the
+                // RPC wasn't listening yet, we hold no token and every
+                // getblocktemplate returns None (unauthorized). Keep retrying
+                // login here so the miner recovers on its own instead of
+                // looping unauthenticated forever (the block-rejection relogin
+                // path below is never reached without a template).
+                if rpc_auth.bearer_token.is_none() && rpc_auth.password.as_deref().is_some() {
+                    if let Some(token) =
+                        rpc_login(&rpc_addr, &rpc_auth.username, rpc_auth.password.as_deref())
+                    {
+                        rpc_auth.bearer_token = Some(token);
+                        slog_info!("miner", "rpc_login_ok", user => &rpc_auth.username);
+                        continue; // retry the template immediately with fresh auth
+                    }
+                }
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 continue;
             }
