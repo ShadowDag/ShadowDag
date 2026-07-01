@@ -176,6 +176,29 @@ impl Wallet {
         Ok((mnemonic, enc))
     }
 
+    /// Restore a wallet from an existing recovery phrase, re-encrypting the
+    /// derived seed under `password`. Uses the SAME derivation as `create` (and
+    /// the Python/WASM SDKs), so the recovered addresses match byte-for-byte —
+    /// a phrase written down on one ShadowDAG tool restores everywhere. Returns
+    /// the encrypted seed to persist. Rejects an empty/blank phrase.
+    pub fn restore_from_mnemonic(
+        &mut self,
+        mnemonic: &[String],
+        password: &str,
+    ) -> Result<EncryptedSeed, WalletError> {
+        if mnemonic.is_empty() || mnemonic.iter().any(|w| w.trim().is_empty()) {
+            return Err(WalletError::Other("empty recovery phrase".into()));
+        }
+        let seed = mnemonic_to_seed_simple(mnemonic, "");
+        let enc = encrypt_bytes(&seed, password)?;
+        self.session_key = Some(seed);
+        self.locked = false;
+        if self.state.accounts.is_empty() {
+            self.add_account(0, "Default Account")?;
+        }
+        Ok(enc)
+    }
+
     pub fn restore_from_seed(&mut self, seed: Vec<u8>) -> Result<(), WalletError> {
         self.session_key = Some(seed);
         self.locked = false;
@@ -1591,6 +1614,36 @@ mod tests {
         let acc0 = w.account(0).unwrap().clone();
         assert_eq!(acc0.index, 0);
         assert!(!acc0.addresses.is_empty());
+    }
+
+    /// A recovery phrase from `create` must restore the SAME address (even under
+    /// a new password), and the re-encrypted seed must unlock under that new
+    /// password. Guards the reinstall/recovery path from silently diverging.
+    #[test]
+    fn restore_from_mnemonic_recovers_same_address() {
+        let mut a = Wallet::new("mainnet");
+        let (mnemonic, _enc) = a.create("pw-strong-123").unwrap();
+        let addr_a = a.address();
+
+        let mut b = Wallet::new("mainnet");
+        let enc_b = b
+            .restore_from_mnemonic(&mnemonic, "different-pw-456")
+            .unwrap();
+        assert_eq!(b.address(), addr_a, "restore must recover the same address");
+
+        // The re-encrypted seed unlocks under the NEW password → same address.
+        let mut c = Wallet::new("mainnet");
+        c.unlock(&enc_b, "different-pw-456").unwrap();
+        c.add_account(0, "Default Account").unwrap();
+        assert_eq!(c.address(), addr_a);
+
+        // Empty / blank phrases are rejected.
+        assert!(Wallet::new("mainnet")
+            .restore_from_mnemonic(&[], "pw")
+            .is_err());
+        assert!(Wallet::new("mainnet")
+            .restore_from_mnemonic(&["".to_string()], "pw")
+            .is_err());
     }
 
     #[test]

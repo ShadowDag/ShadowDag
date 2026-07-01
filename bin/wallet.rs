@@ -323,7 +323,7 @@ fn load_and_unlock_wallet() -> Result<Wallet, WalletError> {
 /// Known CLI subcommands — if the first arg matches one of these, run CLI mode.
 /// Anything else (no args, --gui, --rpc=, etc.) → GUI mode (if feature enabled).
 const CLI_COMMANDS: &[&str] = &[
-    "new", "create", "balance", "bal", "send", "transfer",
+    "new", "create", "restore", "import", "balance", "bal", "send", "transfer",
     "info", "stealth", "scan", "invisible", "export",
     "deploy", "deploy-package", "call", "receipt", "logs", "verify",
     "help", "--help", "-h", "version", "--version", "-v",
@@ -366,6 +366,7 @@ fn main() {
 fn run_cli(args: &[String], command: &str) {
     match command {
         "new" | "create" => cmd_new(args),
+        "restore" | "import" => cmd_restore(args),
         "balance" | "bal" => cmd_balance(args),
         "send" | "transfer" => cmd_send(args),
         "info" => cmd_info(),
@@ -494,6 +495,78 @@ fn cmd_new(args: &[String]) {
     println!("  WARNING: Save your mnemonic! It cannot be recovered.");
     println!("  WARNING: Never share your mnemonic with anyone.");
     println!("  Wallet saved to: {}", seed_path().display());
+}
+
+fn cmd_restore(args: &[String]) {
+    let network = args.get(2).map(|s| s.as_str()).unwrap_or("mainnet");
+
+    let env_network = wallet_network();
+    if network != env_network {
+        eprintln!(
+            "NOTE: Restoring wallet for '{}' but SHADOWDAG_NETWORK='{}'",
+            network, env_network
+        );
+    }
+
+    println!("======================================================");
+    println!("     S H A D O W D A G  --  Restore Wallet");
+    println!("======================================================");
+
+    // Read the recovery phrase from stdin (space-separated words). Read from a
+    // line rather than CLI args so the phrase does not land in shell history.
+    eprint!("Enter your recovery phrase (space-separated words): ");
+    io::stderr().flush().ok();
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).is_err() {
+        eprintln!("Error: could not read the recovery phrase.");
+        return;
+    }
+    let words: Vec<String> = line.split_whitespace().map(|s| s.to_string()).collect();
+    if words.is_empty() {
+        eprintln!("Error: empty recovery phrase.");
+        return;
+    }
+
+    let password = prompt_password("Choose a password to encrypt the restored wallet: ");
+    let confirm = prompt_password("Confirm password: ");
+    if *password != *confirm {
+        eprintln!("Error: passwords do not match.");
+        return;
+    }
+    drop(confirm);
+
+    let mut wallet = Wallet::new(network);
+    let enc_seed = match wallet.restore_from_mnemonic(&words, &password) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Error restoring wallet: {}", e);
+            return;
+        }
+    };
+
+    // Persist the encrypted seed. save_encrypted_seed uses create_new, so it
+    // refuses to clobber an existing wallet file — surface that clearly.
+    if let Err(e) = save_encrypted_seed(&enc_seed) {
+        eprintln!("Could not save the restored seed: {}", e);
+        eprintln!(
+            "If a wallet already exists at {}, move it aside first.",
+            seed_path().display()
+        );
+        return;
+    }
+    match WalletDB::new(&wallet_db_path()) {
+        Ok(db) => {
+            if let Err(e) = db.save_wallet(&wallet) {
+                eprintln!("Warning: wallet state not persisted: {}", e);
+            }
+        }
+        Err(e) => eprintln!("Warning: could not open wallet DB: {}", e),
+    }
+
+    println!();
+    println!("  Network : {}", network);
+    println!("  Address : {}", wallet.address());
+    println!("  Wallet restored and saved to: {}", seed_path().display());
 }
 
 fn cmd_balance(args: &[String]) {
@@ -1470,6 +1543,7 @@ fn print_help() {
     println!();
     println!("COMMANDS:");
     println!("  new [network]           Create a new wallet (mainnet/testnet/regtest)");
+    println!("  restore [network]       Restore a wallet from a recovery phrase (prompts for phrase)");
     println!("  balance [address]       Check address balance (uses wallet address if omitted)");
     println!("  send <to> <amount>      Send SDAG to address");
     println!("  stealth [base_addr]     Generate stealth address");
