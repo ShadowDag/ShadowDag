@@ -17,6 +17,13 @@ services:
     restart: unless-stopped
     environment:
       - NETWORK=testnet
+      # Bind RPC to 0.0.0.0 INSIDE the container so the published port is
+      # reachable. The app defaults to 127.0.0.1, which is the *container*
+      # loopback — Docker's port-publish forwards to the container's eth0, not
+      # its loopback, so a 127.0.0.1 bind is unreachable from the host and the
+      # connection is reset. RPC stays private: the host mapping below is
+      # loopback-only (127.0.0.1:19332), so RPC is not exposed to the internet.
+      - SHADOWDAG_RPC_BIND=0.0.0.0
     ports:
       - "19333:19333"             # P2P — PUBLIC (peers connect here)
       - "127.0.0.1:19332:19332"   # RPC  — localhost only (keep private)
