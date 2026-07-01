@@ -98,6 +98,23 @@ static OUTBOUND_MSGS: Lazy<Arc<PlMutex<(u64, Vec<(u64, P2PMessage)>)>>> =
 static TARGETED_MSGS: Lazy<Arc<PlMutex<Vec<(String, P2PMessage)>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(64))));
 
+/// Block-serve requests from peers: (requesting_peer_id, block_hash). Filled by
+/// the GetBlock/GetData handlers (which lack block_store access) and drained by
+/// the daemon event loop, which looks the block up and replies to that peer.
+/// Without this, GetBlock is a no-op and peers can never download missing
+/// ancestors — so forked nodes never converge.
+#[allow(clippy::type_complexity)]
+static PENDING_BLOCK_REQUESTS: Lazy<Arc<PlMutex<Vec<(String, String)>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(256))));
+const MAX_BLOCK_REQUEST_QUEUE: usize = 5_000;
+
+/// Orphan blocks: received blocks whose parent is not yet known, buffered for
+/// reprocessing once the missing ancestor arrives. (peer_id, block). Bounded.
+#[allow(clippy::type_complexity)]
+static ORPHAN_BLOCKS: Lazy<Arc<PlMutex<Vec<(String, Block)>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(256))));
+const MAX_ORPHAN_BLOCKS: usize = 5_000;
+
 /// Per-peer last acknowledged outbound broadcast sequence.
 /// Used to safely prune only messages that all currently connected peers
 /// have already consumed.
@@ -237,6 +254,14 @@ pub fn cleanup_peer_state(peer_id: &str) {
         q.retain(|(target, _)| target != peer_id);
     }
     {
+        let mut q = PENDING_BLOCK_REQUESTS.lock();
+        q.retain(|(target, _)| target != peer_id);
+    }
+    {
+        let mut q = ORPHAN_BLOCKS.lock();
+        q.retain(|(source, _)| source != peer_id);
+    }
+    {
         let mut p = PEER_PENDING.lock();
         p.remove(peer_id);
     }
@@ -250,6 +275,50 @@ pub fn cleanup_peer_state(peer_id: &str) {
 /// Thread-safe: works from ANY thread.
 pub fn drain_received_addrs() -> Vec<String> {
     std::mem::take(&mut *RECEIVED_ADDRS.lock())
+}
+
+/// Queue a peer's block-serve request. The GetBlock/GetData handlers call this;
+/// the daemon event loop drains it and serves the block from the BlockStore.
+pub fn push_block_request(peer_id: &str, hash: &str) {
+    let mut q = PENDING_BLOCK_REQUESTS.lock();
+    if q.len() < MAX_BLOCK_REQUEST_QUEUE {
+        q.push((peer_id.to_string(), hash.to_string()));
+    }
+}
+
+/// Drain queued block-serve requests (call from the node main loop).
+pub fn drain_block_requests() -> Vec<(String, String)> {
+    std::mem::take(&mut *PENDING_BLOCK_REQUESTS.lock())
+}
+
+/// Buffer an orphan block (parent not yet known) for reprocessing once the
+/// missing ancestor arrives. Deduplicated by hash; bounded (drops oldest).
+pub fn buffer_orphan(peer_id: &str, block: Block) {
+    let mut q = ORPHAN_BLOCKS.lock();
+    if q.iter().any(|(_, b)| b.header.hash == block.header.hash) {
+        return;
+    }
+    if q.len() >= MAX_ORPHAN_BLOCKS {
+        q.remove(0);
+    }
+    q.push((peer_id.to_string(), block));
+}
+
+/// Remove and return buffered orphans that list `parent_hash` among their
+/// parents. Called after a block is accepted: those orphans may now be
+/// processable (re-queue them; still-missing parents re-buffer + re-request).
+pub fn take_orphans_for_parent(parent_hash: &str) -> Vec<(String, Block)> {
+    let mut q = ORPHAN_BLOCKS.lock();
+    let mut ready = Vec::new();
+    q.retain(|(peer, b)| {
+        if b.header.parents.iter().any(|p| p == parent_hash) {
+            ready.push((peer.clone(), b.clone()));
+            false
+        } else {
+            true
+        }
+    });
+    ready
 }
 
 /// Requeue excess blocks that couldn't be processed in this tick.
@@ -2008,12 +2077,10 @@ impl P2P {
                 for item in items {
                     match item.kind.as_str() {
                         "block" => {
-                            // Block serving requires block_store access (not
-                            // available in dispatch_message). The daemon event
-                            // loop handles block serving for GetData requests.
-                            // Do NOT send GetBlock back — that creates a loop.
-                            slog_debug!("p2p", "getdata_block_serve_needed",
-                                hash => &item.hash, peer => peer);
+                            // Block serving needs block_store access (not
+                            // available here). Queue the request for the daemon
+                            // event loop, which serves it to this peer.
+                            push_block_request(peer, &item.hash);
                         }
                         "tx" => {
                             // TX serving requires mempool access which this layer
@@ -2111,11 +2178,10 @@ impl P2P {
                     );
                     return Ok(());
                 }
-                // Block serving requires block_store access which dispatch_message
-                // doesn't have directly. The daemon event loop handles block data
-                // retrieval and sends Block responses via the targeted queue.
-                // Log the request so operators can track block request patterns.
-                slog_debug!("p2p", "getblock_requested", hash => hash, peer => peer);
+                // Block serving needs block_store access (not available here).
+                // Queue the request for the daemon event loop, which looks the
+                // block up and replies to this peer via push_outbound_to_peer.
+                push_block_request(peer, hash);
             }
 
             // ── Reject: validate reason length ──────────────────────────

@@ -42,8 +42,9 @@ use crate::service::mempool::pools::tx_pool::TxPoolResult;
 use crate::service::network::dos_guard::{BanCategory, MAX_TX_BYTES};
 use crate::service::network::nodes::full_node::FullNode;
 use crate::service::network::p2p::p2p::{
-    drain_pending_blocks, drain_pending_txs, push_outbound, report_bad_peer, report_bad_peer_cat,
-    requeue_pending_blocks, requeue_pending_txs, P2PMessage, P2P,
+    buffer_orphan, drain_block_requests, drain_pending_blocks, drain_pending_txs, push_outbound,
+    push_outbound_to_peer, report_bad_peer, report_bad_peer_cat, requeue_pending_blocks,
+    requeue_pending_txs, take_orphans_for_parent, P2PMessage, P2P,
 };
 use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::service::network::contract_ide::ContractIdeServer;
@@ -477,6 +478,15 @@ impl DaemonNode {
                                 push_outbound(P2PMessage::Block { data: block_bytes });
                             }
 
+                            // Chain sync: any orphan that was waiting on THIS block
+                            // as a parent may now connect — requeue it so it is
+                            // reprocessed this pass. This is how a node walks a
+                            // downloaded ancestor chain forward and adopts it.
+                            let ready = take_orphans_for_parent(&block.header.hash);
+                            if !ready.is_empty() {
+                                requeue_pending_blocks(ready);
+                            }
+
                             // Notify Stratum pool with a fresh block template
                             if let Some(ref stratum) = self.stratum_server {
                                 let template = BlockTemplate {
@@ -515,6 +525,27 @@ impl DaemonNode {
                             } else {
                                 slog_warn!("daemon", "block_rejected_transient", hash => hash_prefix, peer => peer_id, error => err_msg);
                             }
+
+                            // Chain sync: an orphan means we are missing this
+                            // block's parent(s). Ask the sending peer for each
+                            // missing ancestor and buffer the orphan so it is
+                            // reprocessed once they arrive. This lets a forked /
+                            // behind node download and adopt a longer chain.
+                            if err_msg.contains(ERR_ORPHAN) {
+                                for parent in &block.header.parents {
+                                    if !parent.is_empty()
+                                        && self.block_store.get_block(parent).is_none()
+                                    {
+                                        push_outbound_to_peer(
+                                            peer_id,
+                                            P2PMessage::GetBlock {
+                                                hash: parent.clone(),
+                                            },
+                                        );
+                                    }
+                                }
+                                buffer_orphan(peer_id, block.clone());
+                            }
                         }
                     }
 
@@ -527,6 +558,27 @@ impl DaemonNode {
                 if processed_count < blocks.len() {
                     let remaining: Vec<_> = blocks.into_iter().skip(processed_count).collect();
                     requeue_pending_blocks(remaining);
+                }
+            }
+
+            // ── Serve block-download requests from peers (chain sync) ──
+            // A peer that hit an orphan asks us for the missing ancestor; reply
+            // with the block from our store so it can walk the chain forward and
+            // converge. Without this, GetBlock is a no-op and forks never heal.
+            let block_reqs = drain_block_requests();
+            if !block_reqs.is_empty() {
+                did_work = true;
+                let mut served = 0usize;
+                for (req_peer, hash) in block_reqs {
+                    if served >= 512 {
+                        break; // bound serving work per tick
+                    }
+                    if let Some(b) = self.block_store.get_block(&hash) {
+                        if let Ok(bytes) = bincode::serialize(&b) {
+                            push_outbound_to_peer(&req_peer, P2PMessage::Block { data: bytes });
+                            served += 1;
+                        }
+                    }
                 }
             }
 
