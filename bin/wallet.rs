@@ -45,10 +45,11 @@ static UNLOCK_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 use shadowdag::config::node::node_config::NetworkMode;
 use shadowdag::domain::address::invisible_wallet::InvisibleWallet;
+use shadowdag::domain::transaction::transaction::Transaction;
 use shadowdag::errors::WalletError;
 use shadowdag::infrastructure::storage::rocksdb::utxo::utxo_store::UtxoStore;
 use shadowdag::runtime::vm::contracts::contract_package::ContractPackage;
-use shadowdag::service::wallet::core::wallet::{EncryptedSeed, Wallet};
+use shadowdag::service::wallet::core::wallet::{EncryptedSeed, Wallet, Walletutxo};
 use shadowdag::service::wallet::storage::wallet_db::WalletDB;
 use shadowdag::slog_error;
 
@@ -689,23 +690,96 @@ fn cmd_send(args: &[String]) {
         return;
     }
 
-    // Build and sign transaction using the wallet's internal key derivation.
-    // The wallet selects UTXOs, derives signing keys from the encrypted seed,
-    // signs each input, and zeroizes key material — no raw keys exposed.
-    match wallet.build_tx(0, &to, amount, fee, "") {
-        Ok(built_tx) => {
-            println!("Transaction built and signed!");
-            println!("  TxID   : {}", built_tx.txid);
-            println!("  From   : {}", from_address);
-            println!("  To     : {}", to);
-            println!("  Amount : {} SDAG", amount_str);
-            println!("  Fee    : {:.8} SDAG", fee as f64 / 100_000_000.0);
-            println!("  Raw    : {}", built_tx.raw_hex);
-            println!();
-            println!("Broadcast this raw transaction to a running node to send it.");
+    // Transparent send: pull the wallet's spendable UTXOs from a running node,
+    // build a real signed transaction, and broadcast it.
+    let socket = cli_rpc_target();
+    let utxos = match fetch_utxos_via_rpc(socket, &from_address) {
+        Some(u) if !u.is_empty() => u,
+        Some(_) => {
+            eprintln!("No spendable (mature) UTXOs for {}.", from_address);
+            eprintln!("Receive funds first, or wait for coinbase maturity.");
+            return;
         }
+        None => {
+            eprintln!("Cannot reach node RPC at {} to fetch UTXOs.", socket);
+            eprintln!("Start your node, or set SHADOWDAG_RPC=host:port.");
+            return;
+        }
+    };
+    wallet.update_utxos(&from_address, utxos);
+
+    // Auto-size the fee to clear the relay floor: fee >= MIN_RELAY_FEE(100) AND
+    // fee / canonical_bytes().len() >= 1.0 sat/byte (the exact mempool basis).
+    // Build once to measure the canonical size, then rebuild with the floor.
+    let effective_fee = match wallet.build_tx(0, &to, amount, fee.max(100), "") {
+        Ok(probe) => match serde_json::from_str::<Transaction>(&probe.raw_hex) {
+            Ok(tx) => {
+                let size = tx.canonical_bytes().len() as u64;
+                // 1 sat/byte + a margin that also covers the tiny size change
+                // from larger fee digits on the rebuild.
+                fee.max(size.saturating_add(100)).max(100)
+            }
+            Err(_) => fee.max(100),
+        },
         Err(e) => {
             eprintln!("Error building transaction: {}", e);
+            return;
+        }
+    };
+
+    let built = match wallet.build_tx(0, &to, amount, effective_fee, "") {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Error building transaction: {}", e);
+            return;
+        }
+    };
+
+    println!("Transaction built and signed!");
+    println!("  TxID   : {}", built.txid);
+    println!("  From   : {}", from_address);
+    println!("  To     : {}", to);
+    println!("  Amount : {} SDAG", amount_str);
+    println!(
+        "  Fee    : {} sats ({:.8} SDAG)",
+        effective_fee,
+        effective_fee as f64 / 100_000_000.0
+    );
+
+    // Broadcast (needs write auth). Falls back to printing the raw tx so the
+    // user can submit it manually if no RPC password is configured.
+    match rpc_login(socket) {
+        Some(token) => match cli_rpc_call_auth(
+            socket,
+            "sendrawtransaction",
+            serde_json::json!([built.raw_hex]),
+            Some(&token),
+        ) {
+            Some(res) => {
+                let txid = res
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        res.get("txid")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| built.txid.clone());
+                println!();
+                println!("Broadcast OK — accepted to mempool. TxID: {}", txid);
+            }
+            None => {
+                eprintln!();
+                eprintln!("Broadcast failed (node rejected the tx or is unreachable).");
+                eprintln!("Raw tx (submit manually via sendrawtransaction):");
+                println!("{}", built.raw_hex);
+            }
+        },
+        None => {
+            println!();
+            println!("Not broadcast (no RPC auth). Set SHADOWDAG_RPC_PASSWORD (the node's");
+            println!("rpc_password) and re-run to auto-send, or submit this raw tx manually:");
+            println!("{}", built.raw_hex);
         }
     }
 }
@@ -825,15 +899,30 @@ fn cli_rpc_call(
     method: &str,
     params: serde_json::Value,
 ) -> Option<serde_json::Value> {
+    cli_rpc_call_auth(socket, method, params, None)
+}
+
+/// As [`cli_rpc_call`], but attaches `Authorization: Bearer {token}` when a
+/// token is supplied — required for write methods (e.g. `sendrawtransaction`).
+fn cli_rpc_call_auth(
+    socket: std::net::SocketAddr,
+    method: &str,
+    params: serde_json::Value,
+    token: Option<&str>,
+) -> Option<serde_json::Value> {
     use std::io::{BufRead, BufReader, Read, Write};
     let body = cli_rpc_request_body(method, &params);
     let mut stream =
         std::net::TcpStream::connect_timeout(&socket, std::time::Duration::from_secs(5)).ok()?;
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(20)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(20)));
+    let auth_line = match token {
+        Some(t) if !t.is_empty() => format!("Authorization: Bearer {}\r\n", t),
+        _ => String::new(),
+    };
     let req = format!(
-        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        socket, body.len(), body
+        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{}",
+        socket, body.len(), auth_line, body
     );
     stream.write_all(req.as_bytes()).ok()?;
     let _ = stream.flush();
@@ -862,6 +951,64 @@ fn cli_rpc_call(
     reader.read_exact(&mut buf).ok()?;
     let s = String::from_utf8(buf).ok()?;
     cli_rpc_extract_result(&s)
+}
+
+/// The RPC password for write auth. Read from `SHADOWDAG_RPC_PASSWORD`;
+/// None (skip auto-broadcast) when unset.
+fn rpc_password() -> Option<String> {
+    std::env::var("SHADOWDAG_RPC_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Log in to the node RPC and return a bearer token for write calls. Username
+/// defaults to "admin" (override via `SHADOWDAG_RPC_USER`). None if no password
+/// is configured or the login is rejected.
+fn rpc_login(socket: std::net::SocketAddr) -> Option<String> {
+    let password = rpc_password()?;
+    let username = std::env::var("SHADOWDAG_RPC_USER").unwrap_or_else(|_| "admin".to_string());
+    let resp = cli_rpc_call(
+        socket,
+        "login",
+        serde_json::json!([{ "username": username, "password": password }]),
+    )?;
+    resp.get("token")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Fetch this address's mature, spendable UTXOs from a running node via
+/// `listunspent` (open RPC). Immature coinbase outputs are skipped. None if the
+/// node is unreachable; `Some(empty)` if reachable but nothing is spendable.
+fn fetch_utxos_via_rpc(socket: std::net::SocketAddr, address: &str) -> Option<Vec<Walletutxo>> {
+    let resp = cli_rpc_call(socket, "listunspent", serde_json::json!([address]))?;
+    let arr = resp.get("utxos")?.as_array()?;
+    let mut out = Vec::new();
+    for u in arr {
+        if !u.get("mature").and_then(|m| m.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        let (txid, index, amount) = match (
+            u.get("txid").and_then(|v| v.as_str()),
+            u.get("vout").and_then(|v| v.as_u64()),
+            u.get("amount").and_then(|v| v.as_u64()),
+        ) {
+            (Some(t), Some(i), Some(a)) => (t.to_string(), i as u32, a),
+            _ => continue,
+        };
+        let is_coinbase = u.get("coinbase").and_then(|c| c.as_bool()).unwrap_or(false);
+        out.push(Walletutxo {
+            txid,
+            index,
+            amount,
+            address: address.to_string(),
+            height: 0,
+            confirmations: 0,
+            is_coinbase,
+            is_locked: false,
+        });
+    }
+    Some(out)
 }
 
 /// Scan a running node's chain for confidential outputs via RPC (getblockcount →
