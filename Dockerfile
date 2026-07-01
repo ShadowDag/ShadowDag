@@ -38,11 +38,11 @@ RUN --mount=type=cache,target=/build/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo build --release && \
-    mkdir -p /out && \
+    mkdir -p /build/out && \
     cp target/release/shadowdag-node \
        target/release/shadowdag-miner \
        target/release/shadowdag-wallet \
-       target/release/shadowasm /out/
+       target/release/shadowasm /build/out/
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────
 FROM debian:bookworm-slim
