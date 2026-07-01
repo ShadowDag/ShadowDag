@@ -4,6 +4,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::config::node::node_config::NetworkMode;
+use crate::domain::address::address::Address;
 use crate::domain::address::invisible_wallet::InvisibleWallet;
 use crate::domain::block::block::Block;
 use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
@@ -32,7 +33,6 @@ use zeroize::Zeroize;
 const PBKDF2_ITER: u32 = 600_000;
 const SALT_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
-const CHECKSUM_BYTES: usize = 4;
 const DUST_LIMIT: u64 = 546;
 /// Ring size for confidential sends: 1 real + (CONF_RING_SIZE-1) decoys.
 /// Must be ≥ the consensus minimum ring size (4) enforced by RingValidator.
@@ -738,37 +738,35 @@ impl Wallet {
         })
     }
 
-    /// Validate a ShadowDAG address.
+    /// Validate a ShadowDAG address on this wallet's network.
     ///
-    /// Address format produced by `make_address`:
-    ///   prefix (2 chars: "SD"/"ST"/"SR") + hex(version(1) + hash(32) + checksum(4))
-    ///   = prefix(2) + 74 hex chars = 76 total chars for standard addresses.
-    ///
-    /// Stealth addresses use a 4-char prefix ("SD1s"/"ST1s"/"SR1s") + 40 hex = 44 total.
+    /// Canonical forms (all `SD1`/`ST1`/`SR1`-prefixed):
+    ///   Standard:     `SD1` + 40 hex (20-byte SHA-256 pubkey hash)
+    ///   Typed s/k/h:  `SD1s`/`SD1k`/`SD1h` + 40 hex (stealth / Schnorr / P2SH)
+    ///   Confidential: `SD1p` + 136 hex (view_pub‖spend_pub + checksum)
+    /// `s`/`k`/`h`/`p` are not hex digits, so the subtype is unambiguous.
     pub fn is_valid_address(&self, addr: &str) -> bool {
-        let prefix = match self.network.as_str() {
-            "testnet" => "ST",
-            "regtest" => "SR",
-            _ => "SD",
+        let net_prefix = match self.network.as_str() {
+            "testnet" => "ST1",
+            "regtest" => "SR1",
+            _ => "SD1",
         };
-        if !addr.starts_with(prefix) {
-            return false;
-        }
-        let after_net = &addr[prefix.len()..];
+        let after = match addr.strip_prefix(net_prefix) {
+            Some(a) => a,
+            None => return false,
+        };
 
-        // Stealth addresses: prefix + "1s" + 40 hex = 4-char prefix total
-        if after_net.starts_with("1s") || after_net.starts_with("1c") || after_net.starts_with("1m")
-        {
-            let hex_part = &after_net[2..];
-            return hex_part.len() == 40 && hex_part.chars().all(|c| c.is_ascii_hexdigit());
+        // Confidential payment address: "p" + 136 hex.
+        if let Some(rest) = after.strip_prefix('p') {
+            return rest.len() == 136 && rest.bytes().all(|b| b.is_ascii_hexdigit());
         }
-
-        // Standard addresses: prefix(2) + 74 hex chars (version + hash + checksum)
-        // 74 hex chars = 37 bytes: 1 version + 32 hash + 4 checksum
-        if after_net.len() != 74 {
-            return false;
+        // Typed addresses: subtype char (s/k/h) + 40 hex.
+        if matches!(after.as_bytes().first(), Some(b's' | b'k' | b'h')) {
+            let body = &after[1..];
+            return body.len() == 40 && body.bytes().all(|b| b.is_ascii_hexdigit());
         }
-        after_net.chars().all(|c| c.is_ascii_hexdigit())
+        // Standard address: exactly 40 hex chars.
+        after.len() == 40 && after.bytes().all(|b| b.is_ascii_hexdigit())
     }
 
     /// Select UTXOs from an account to cover the requested amount.
@@ -1041,6 +1039,18 @@ fn derive_key(
     Ok(SigningKey::from_bytes(&key))
 }
 
+/// Canonical ShadowDAG address from an Ed25519 public key (hex).
+///
+/// Produces the ONLY form consensus recognizes:
+/// `prefix + hex(SHA256("ShadowDAG_Addr_v1" || pubkey)[..20])` (SD1/ST1/SR1 +
+/// 40 hex), identical to `domain::address::Address::from_public_key` and to the
+/// WASM/Python SDKs byte-for-byte. `tx_validator::verify_input_ownership`
+/// re-derives this exact string from the input pub_key and requires it to equal
+/// the UTXO owner, so coinbase/transfers to this address are spendable.
+///
+/// (Historically this emitted an SD+74hex Sha3 form that no pubkey could ever
+/// derive to, making every wallet-generated address unspendable — the ST0..
+/// bug. Do NOT reintroduce a non-canonical address here.)
 fn make_address(pub_hex: &str, network: &str) -> Result<String, WalletError> {
     let pub_bytes = hex::decode(pub_hex)
         .map_err(|e| WalletError::Other(format!("invalid public key hex: {}", e)))?;
@@ -1050,22 +1060,7 @@ fn make_address(pub_hex: &str, network: &str) -> Result<String, WalletError> {
             pub_bytes.len()
         )));
     }
-    let hash = Sha3_256::digest(&pub_bytes);
-    let version = match network {
-        "testnet" => 0x01u8,
-        "regtest" => 0x02,
-        _ => 0x00,
-    };
-    let mut payload = vec![version];
-    payload.extend_from_slice(&hash);
-    let cs = &Sha3_256::digest(Sha3_256::digest(&payload))[..CHECKSUM_BYTES];
-    payload.extend_from_slice(cs);
-    let prefix = match network {
-        "testnet" => "ST",
-        "regtest" => "SR",
-        _ => "SD",
-    };
-    Ok(format!("{}{}", prefix, hex::encode(&payload)))
+    Ok(Address::from_public_key(&pub_bytes, network).value)
 }
 
 fn compute_txid(inputs: &[SignedInput], outputs: &[TxOut], fee: u64) -> String {
@@ -1587,6 +1582,37 @@ mod tests {
         let mut w = Wallet::new("testnet");
         let _ = w.create("pw");
         let addr = w.accounts()[0].primary_address().unwrap().to_string();
-        assert!(addr.starts_with("ST"));
+        assert!(addr.starts_with("ST1"));
+    }
+
+    /// Regression: the wallet MUST produce the canonical, consensus-spendable
+    /// address — byte-identical to `Address::from_public_key` and to the
+    /// Python/WASM SDKs (which the live network uses). Pins the SDK reference
+    /// vector so any future change reintroducing the old unspendable SD+74hex
+    /// Sha3 form (the ST0.. bug) fails loudly.
+    #[test]
+    fn address_matches_canonical_sdk_vector() {
+        // Python SDK self-test vector: derive_key([2;64],0,0,false) -> pubkey
+        // 384d0633..., address_from_public_key(pubkey,"mainnet") == SD1f28fa3d...
+        let mut w = Wallet::new("mainnet");
+        w.restore_from_seed(vec![2u8; 64]).unwrap();
+        let wa = w.accounts()[0].addresses[0].clone();
+        assert_eq!(
+            wa.public_key,
+            "384d0633d25725798cb3fa2b349dff39d1ff2d623e8a5d79fcd632e91740c2c1",
+            "derived pubkey must match the cross-tool reference vector"
+        );
+        assert_eq!(
+            wa.address, "SD1f28fa3d42b184f0ce7e84809e89efde6637bd597",
+            "wallet address must equal the SDK / live-network canonical address"
+        );
+        // Cross-check against the in-crate canonical deriver + spendable shape.
+        let pk = hex::decode(&wa.public_key).unwrap();
+        assert_eq!(
+            wa.address,
+            crate::domain::address::address::Address::from_public_key(&pk, "mainnet").value
+        );
+        assert!(w.is_valid_address(&wa.address));
+        assert_eq!(wa.address.len(), 3 + 40);
     }
 }

@@ -539,27 +539,25 @@ fn cmd_balance(args: &[String]) {
     }
 }
 
-/// Validate a ShadowDAG address format.
+/// Validate a ShadowDAG address format (canonical forms only).
 ///
-/// Address formats produced by `make_address()` (in wallet core):
-///   Standard:  prefix(2: "SD"/"ST"/"SR") + hex(version(1) + hash(32) + checksum(4))
-///              = 2-char prefix + 74 hex chars = 76 total
-///   Stealth:   4-char prefix ("SD1s"/"ST1s"/"SR1s") + 40 hex chars = 44 total
-///   Contract:  4-char prefix ("SD1c"/"ST1c"/"SR1c") + 40 hex chars = 44 total
-///   Multisig:  4-char prefix ("SD1m"/"ST1m"/"SR1m") + 40 hex chars = 44 total
+/// All addresses share a 3-char network prefix ("SD1"/"ST1"/"SR1"):
+///   Standard:     "SD1" + 40 hex (20-byte SHA-256 pubkey hash) — spendable P2PKH
+///   Typed s/k/h:  "SD1s"/"SD1k"/"SD1h" + 40 hex (stealth / Schnorr / P2SH)
+///   Confidential: "SD1p" + 136 hex (view_pub‖spend_pub + checksum)
 ///
-/// Both standard and typed address formats are accepted.
+/// `s`/`k`/`h`/`p` are not hex digits, so the subtype is unambiguous. This
+/// matches `domain::address::Address` and the WASM/Python SDKs exactly.
 fn validate_address(addr: &str) -> Result<(), String> {
-    // Check network prefix (2 chars)
-    let valid_net = addr.starts_with("SD") || addr.starts_with("ST") || addr.starts_with("SR");
+    let valid_net = addr.starts_with("SD1") || addr.starts_with("ST1") || addr.starts_with("SR1");
     if !valid_net {
-        return Err("Invalid address prefix (expected SD/ST/SR)".to_string());
+        return Err("Invalid address prefix (expected SD1/ST1/SR1)".to_string());
     }
 
-    let after_net = &addr[2..];
+    let after = &addr[3..];
 
-    // Confidential payment address: "1p" + 136 hex (view_pub‖spend_pub + checksum).
-    if let Some(hex_part) = after_net.strip_prefix("1p") {
+    // Confidential payment address: "p" + 136 hex (view_pub‖spend_pub + checksum).
+    if let Some(hex_part) = after.strip_prefix('p') {
         if hex_part.len() != 136 {
             return Err(format!(
                 "Confidential address hex part must be 136 characters, got {}",
@@ -572,9 +570,9 @@ fn validate_address(addr: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    // Typed addresses: "1s", "1c", "1m" after network prefix => 4-char prefix + 40 hex
-    if after_net.starts_with("1s") || after_net.starts_with("1c") || after_net.starts_with("1m") {
-        let hex_part = &after_net[2..];
+    // Typed addresses: subtype char (s/k/h) + 40 hex.
+    if matches!(after.as_bytes().first(), Some(b's' | b'k' | b'h')) {
+        let hex_part = &after[1..];
         if hex_part.len() != 40 {
             return Err(format!(
                 "Typed address hex part must be 40 characters, got {}",
@@ -587,14 +585,14 @@ fn validate_address(addr: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    // Standard addresses: 2-char prefix + 74 hex (version + hash + checksum)
-    if after_net.len() != 74 {
+    // Standard address: exactly 40 hex chars.
+    if after.len() != 40 {
         return Err(format!(
-            "Standard address hex part must be 74 characters, got {}",
-            after_net.len()
+            "Standard address hex part must be 40 characters, got {}",
+            after.len()
         ));
     }
-    if !after_net.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !after.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("Address contains invalid hex characters".into());
     }
     Ok(())
