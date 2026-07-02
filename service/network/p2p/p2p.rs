@@ -566,6 +566,17 @@ pub fn push_outbound(msg: P2PMessage) {
     }
 }
 
+/// The current global broadcast sequence number. A freshly-connected peer must
+/// start its outbound cursor HERE (not at 0) so it only receives FUTURE
+/// broadcasts — the historical backlog is delivered via header-sync / IBD, never
+/// replayed through the broadcast queue. Without this, a new peer's cursor of 0
+/// against a high global counter is misread as thousands of seqs of "outbound
+/// lag" and the peer is wrongly disconnected as slow the instant it connects,
+/// which prevents a lagging node from ever catching up (chain never converges).
+fn current_outbound_seq() -> u64 {
+    OUTBOUND_MSGS.lock().0
+}
+
 /// Push a message targeted at a specific peer (Dandelion++ stem phase).
 /// Thread-safe: can be called from any thread.
 pub fn push_outbound_to_peer(peer_id: &str, msg: P2PMessage) {
@@ -774,7 +785,12 @@ impl ConnectionSession {
             lifecycle_violations: 0,
             legacy_peer: false,
             unsupported_msg_violations: 0,
-            last_outbound_seq: 0,
+            // Start at the CURRENT global seq, not 0: a new peer only needs
+            // future broadcasts (backlog comes via sync). Starting at 0 makes
+            // the outbound-lag check see the whole global counter as "lag" and
+            // disconnect the peer as slow on its first flush — which stalled
+            // convergence for any node behind the broadcast counter.
+            last_outbound_seq: current_outbound_seq(),
         }
     }
 
@@ -2487,6 +2503,24 @@ mod tests {
             g.stats().tracked_peers,
             0,
             "maintenance must decay + evict cleared DoS records"
+        );
+    }
+
+    #[test]
+    fn new_session_cursor_is_current_not_zero() {
+        // A fresh session must adopt the live broadcast counter, not 0. Starting
+        // at 0 made the outbound-lag check treat a newly-connected peer as
+        // thousands of seqs behind and disconnect it as "slow" — which stalled
+        // chain convergence for any node behind the counter (observed live:
+        // restarted peers could never catch up to the mining seed).
+        for _ in 0..3 {
+            push_outbound(P2PMessage::Ping { nonce: 7 });
+        }
+        let s = ConnectionSession::new("1.2.3.4:9333".parse().unwrap(), true);
+        assert!(
+            s.last_outbound_seq >= 3,
+            "new session cursor must track the global seq, got {}",
+            s.last_outbound_seq
         );
     }
 
