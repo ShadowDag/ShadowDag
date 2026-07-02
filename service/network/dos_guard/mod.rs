@@ -417,12 +417,16 @@ impl DosGuard {
             bucket.consume(cost)
         };
         if !allowed {
-            self.add_ban_score_cat(
-                peer,
-                BAN_SCORE_MINOR,
-                "rate exceeded",
-                BanCategory::Resource,
-            );
+            // Throttle only — do NOT accrue ban score on a token-bucket overflow.
+            // An overflow just means the peer sent VALID messages faster than our
+            // steady refill — exactly what happens when a peer serves us a block
+            // backlog during catch-up (sync). Dropping the excess message is
+            // sufficient flow control. Banning here banned the very peer helping
+            // us sync: 10 overflows × BAN_SCORE_MINOR = autoban, which stalled
+            // convergence permanently (a lagging node could never catch up to a
+            // busy/mining peer). Genuine abuse is still banned via the oversized /
+            // malformed / invalid-PoW / lifecycle paths, and the bandwidth cap +
+            // pong timeout bound a pure flooder whose messages are all dropped.
             return DosVerdict::RateLimited {
                 peer: peer.to_string(),
             };
@@ -684,6 +688,27 @@ mod tests {
         let g = DosGuard::new();
         let v = g.check("peer_tx", &MsgType::Tx, MAX_TX_BYTES + 1);
         assert!(matches!(v, DosVerdict::OversizedMessage { .. }));
+    }
+
+    #[test]
+    fn per_peer_rate_limit_throttles_without_banning() {
+        // Exhausting the per-peer token bucket (e.g. a peer serving us a block
+        // backlog during catch-up) must THROTTLE (RateLimited) but NEVER ban:
+        // banning the peer that helps us sync stalls convergence. Use Inv (no
+        // global cap) so we hit the per-peer bucket path.
+        let g = DosGuard::new();
+        let peer = "203.0.113.50:19333";
+        let mut throttled = false;
+        for _ in 0..((BUCKET_CAPACITY as usize) + 3000) {
+            if matches!(g.check(peer, &MsgType::Inv, 100), DosVerdict::RateLimited { .. }) {
+                throttled = true;
+            }
+        }
+        assert!(throttled, "sustained high rate must eventually throttle");
+        assert!(
+            !g.is_banned(peer),
+            "throttling must NOT ban a peer (banning a sync peer stalls convergence)"
+        );
     }
 
     #[test]
