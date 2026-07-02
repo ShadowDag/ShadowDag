@@ -67,6 +67,20 @@ const ERR_DIFFICULTY_RANGE: &str = "outside allowed range";
 const ERR_DIFFICULTY_MISMATCH: &str = "difficulty mismatch";
 const ERR_STALE_TEMPLATE: &str = "stale template";
 
+/// Whether an orphan block is worth resolving — i.e. we should fetch its missing
+/// parents and buffer it for reprocessing. True for any orphan within
+/// FINALITY_DEPTH of our tip, INCLUDING a competing chain at the SAME height:
+/// that is exactly what a node stuck on a side-branch tip must download to switch
+/// to the heavier chain and converge. Ancient orphans (deeper than the finality
+/// window below our tip) can never reorg us, so they are ignored (anti-thrash for
+/// old forks). A strict `orphan_height > best_height` gate silently broke
+/// convergence: a side-branch-stuck node fetched the canonical sibling, failed to
+/// place it, dropped it, and looped forever.
+#[inline]
+fn orphan_worth_resolving(orphan_height: u64, best_height: u64) -> bool {
+    orphan_height.saturating_add(crate::engine::consensus::reorg::FINALITY_DEPTH) > best_height
+}
+
 #[inline]
 fn is_transient_block_rejection(err_msg_lc: &str) -> bool {
     err_msg_lc.contains(ERR_DIFFICULTY_RANGE)
@@ -549,17 +563,27 @@ impl DaemonNode {
                             // Chain sync: an orphan means we are missing this
                             // block's parent(s). Ask the sending peer for each
                             // missing ancestor and buffer the orphan so it is
-                            // reprocessed once they arrive — but ONLY if the
-                            // orphan is higher than our current tip. Otherwise it
-                            // is a shorter/side fork not worth downloading;
-                            // chasing every fork thrashes the DAG (anti-thrash).
+                            // reprocessed once they arrive — for any orphan within
+                            // the reorg window of our tip.
+                            //
+                            // NOT just strictly ABOVE our tip: when we are stuck
+                            // on a side-branch tip, the canonical sibling we must
+                            // download sits at the SAME height, so a strict `>`
+                            // gate blocked its parent request — we would fetch the
+                            // sibling, fail to place it (its own parent still
+                            // missing), and drop it, looping forever without ever
+                            // healing the fork (a lagging node never converged).
+                            // FINALITY_DEPTH is exactly the set of competing
+                            // chains that could out-weigh us; ancient orphans
+                            // (below finality) still can't reorg us and stay
+                            // ignored, so anti-thrash is preserved for old forks.
                             if err_msg.contains(ERR_ORPHAN) {
                                 let best_h = self
                                     .block_store
                                     .get_best_hash()
                                     .and_then(|h| self.block_store.get_block_height(&h))
                                     .unwrap_or(0);
-                                if block.header.height > best_h {
+                                if orphan_worth_resolving(block.header.height, best_h) {
                                     for parent in &block.header.parents {
                                         if !parent.is_empty()
                                             && self.block_store.get_block(parent).is_none()
@@ -1272,6 +1296,28 @@ mod tests {
         let fn1 = d.full_node();
         let fn2 = d.full_node();
         assert!(Arc::ptr_eq(&fn1, &fn2));
+    }
+
+    #[test]
+    fn orphan_resolution_covers_same_height_and_reorg_window() {
+        // A competing chain at the SAME height as our tip MUST be resolved —
+        // this is the fix for a node stuck forever on a side-branch tip (its
+        // canonical sibling is at the same height, which the old strict `>` gate
+        // refused to fetch). Also resolve strictly-above and within the finality
+        // window below; ignore ancient orphans (anti-thrash).
+        assert!(
+            orphan_worth_resolving(1659, 1659),
+            "same-height competing chain must be resolved (side-branch convergence)"
+        );
+        assert!(orphan_worth_resolving(1660, 1659), "above-tip orphan resolved");
+        assert!(
+            orphan_worth_resolving(1659 - 199, 1659),
+            "within the finality window must be resolved"
+        );
+        assert!(
+            !orphan_worth_resolving(1659u64.saturating_sub(500), 1659),
+            "ancient orphan (below finality) ignored — anti-thrash"
+        );
     }
 
     #[test]
