@@ -156,8 +156,23 @@ const ORPHAN_EXPIRY_SECS: u64 = 120;
 /// deep-reorg attacks. Blocks older than this are considered final.
 const MAX_REORG_DEPTH: u64 = crate::engine::consensus::reorg::FINALITY_DEPTH;
 
-/// Maximum blocks accepted per peer per minute (rate limiting)
-const MAX_BLOCKS_PER_PEER_PER_MIN: usize = 60;
+/// Maximum blocks accepted per peer per minute — a COARSE backstop. DosGuard's
+/// per-peer token bucket (100 blk/s) + global cap (200 blk/s) are the real,
+/// fine-grained limiters; this only catches pathological cases above them.
+///
+/// It MUST scale with the block rate. At N BPS the chain itself produces N*60
+/// blocks/min, so a peer merely relaying the tip — let alone serving an IBD
+/// backfill of thousands of blocks — legitimately sends far more than any fixed
+/// small number. The old hardcoded 60/min was BELOW the 10-BPS network rate
+/// (600/min): every relaying peer was flagged "exceeds 60 blocks/min", banned,
+/// and the chain could never converge (lagging nodes stayed stuck thousands of
+/// blocks behind). Set to BPS*60*20 (12,000/min at 10 BPS) — comfortably above
+/// both the tip rate and DosGuard's per-peer ceiling, so this never trips on
+/// honest traffic while real floods are still bounded by DosGuard + PoW.
+const MAX_BLOCKS_PER_PEER_PER_MIN: usize =
+    crate::config::consensus::consensus_params::ConsensusParams::BLOCKS_PER_SECOND as usize
+        * 60
+        * 20;
 
 pub struct FullNode {
     pub block_store: Arc<BlockStore>,
@@ -2805,6 +2820,27 @@ fn verify_block_confidential_txs(
 #[cfg(test)]
 mod tests {
     use super::{verify_block_confidential_txs, FullNode};
+
+    #[test]
+    fn block_rate_limit_exceeds_network_production_rate() {
+        // A peer merely relaying the chain sends ~BPS*60 blocks/min; a peer
+        // serving an IBD backfill sends far more. The per-peer block rate limit
+        // MUST sit above the network's own production rate (with headroom) or
+        // every relaying peer is wrongly banned and lagging nodes can never
+        // converge. Regression guard for the old hardcoded 60/min, which was
+        // BELOW the 10-BPS network rate of 600/min.
+        use super::MAX_BLOCKS_PER_PEER_PER_MIN;
+        let net_rate_per_min =
+            crate::config::consensus::consensus_params::ConsensusParams::BLOCKS_PER_SECOND
+                as usize
+                * 60;
+        assert!(
+            MAX_BLOCKS_PER_PEER_PER_MIN >= net_rate_per_min * 2,
+            "per-peer block limit {} must exceed 2x the network rate {}/min so relaying peers are not banned",
+            MAX_BLOCKS_PER_PEER_PER_MIN,
+            net_rate_per_min
+        );
+    }
 
     #[test]
     fn retarget_rebuild_deterministic_from_canonical_chain() {
