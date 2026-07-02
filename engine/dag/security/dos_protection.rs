@@ -36,7 +36,6 @@ pub const MAX_OUTPUT_AMOUNT: u64 = u64::MAX / 2;
 
 /// Canonical value: 120s (see block_validator::MAX_FUTURE_SECS).
 pub const MAX_FUTURE_TIMESTAMP_SECS: u64 = 120;
-pub const MAX_PAST_TIMESTAMP_DRIFT: u64 = 600;
 
 pub struct DosProtection;
 
@@ -113,15 +112,17 @@ impl DosProtection {
             .as_secs();
 
         let future_limit = now.saturating_add(MAX_FUTURE_TIMESTAMP_SECS);
-        let past_limit = now.saturating_sub(MAX_PAST_TIMESTAMP_DRIFT);
 
         if block.header.timestamp > future_limit {
             return DosCheckResult::fail("Future timestamp".to_string());
         }
 
-        if block.header.timestamp < past_limit {
-            return DosCheckResult::fail("Old timestamp".to_string());
-        }
+        // NOTE: no wall-clock "too far in the past" reject. Blocks are historical
+        // by nature — during sync/IBD a lagging node receives blocks that are
+        // minutes/hours/days old, and rejecting them here (a consensus-layer
+        // reject that also bans the sender) made catch-up impossible. Past-time
+        // causality (ts > parents, MTP, jump limits) is enforced against the
+        // block's ancestry in block_validator::validate_timestamp().
 
         // Size (آخر خطوة)
         let bytes = match bincode::serialize(block) {

@@ -518,28 +518,24 @@ impl BlockValidator {
 
     /// Hardened timestamp validation — anti-timewarp for DAG.
     ///
-    /// Five rules enforced:
-    ///   R1  ts ≤ now + MAX_FUTURE_SECS              (no far-future)
-    ///   R2  ts ≥ now − MAX_PAST_BLOCK_SECS          (no far-past vs wall clock)
+    /// Rules enforced:
+    ///   R1  ts ≤ now + MAX_FUTURE_SECS              (no far-future vs wall clock)
     ///   R3  ts > MTP(ancestors)                      (monotonic progress)
-    ///   R4  ts ≥ max(parent_timestamps)              (DAG causality)
-    ///   R5  ts ≤ max(parent_ts) + MAX_TIMESTAMP_JUMP (no large jumps)
+    ///   R4  ts > max(parent_timestamps)              (strict DAG causality)
+    ///   R5  ts ≤ max(parent_ts) + MAX_TIMESTAMP_JUMP (no large forward jumps)
     ///
-    /// R2 is the critical anti-timewarp addition: it prevents miners from
-    /// setting timestamps to MTP+1 (far behind real time) to systematically
-    /// shrink the difficulty window, which would lower difficulty over time.
+    /// There is intentionally NO wall-clock "too far in the past" rule: blocks
+    /// are historical by nature and a past bound makes sync/IBD impossible (a
+    /// lagging node could never accept the backlog). Anti-timewarp is enforced
+    /// against ANCESTRY instead — R3+R4+R5 clamp the timestamp into a tight band
+    /// relative to parents, coupling it to the DAG structure. In a DAG, multiple
+    /// parents are independent timestamp witnesses, so an attacker would need to
+    /// control ALL tips to shift the band; and the band traces back to genesis.
+    /// This mirrors Bitcoin (future bound + MTP, no wall-clock past bound).
     ///
-    /// R4+R5 together clamp the timestamp into a tight band relative to
-    /// parents, which couples timestamps to the DAG structure. In a DAG,
-    /// multiple parents provide independent timestamp witnesses — an
-    /// attacker would need to control ALL tips to manipulate the band.
-    /// NOTE ON WALL-CLOCK DEPENDENCY (R1, R2):
-    /// SystemTime::now() is intentionally used as an anchor to prevent
-    /// timestamp manipulation. This is standard blockchain practice
-    /// (Bitcoin uses ±2 hours). Nodes with severely drifted clocks will
-    /// reject valid blocks, but this is the node operator's responsibility
-    /// (NTP is assumed). The DAG-based rules (R3–R6) provide secondary
-    /// protection independent of wall-clock accuracy.
+    /// NOTE ON WALL-CLOCK DEPENDENCY (R1 only): SystemTime::now() anchors just
+    /// the future bound. A node with a badly drifted clock may reject genuinely
+    /// future-dated blocks (NTP is assumed); R3–R5 are wall-clock-independent.
     #[cfg(test)]
     fn validate_timestamp(block: &Block, ancestors: &[u64]) -> Result<(), ConsensusError> {
         Self::validate_timestamp_for_network(block, ancestors, &NetworkMode::Mainnet)
@@ -571,17 +567,15 @@ impl BlockValidator {
             )));
         }
 
-        // R2: Not too far in the past (wall clock anchor — anti-timewarp)
-        // Without this, miners can set ts = MTP+1 which drifts behind real
-        // time, shrinking the difficulty window and lowering difficulty.
-        if ts < now.saturating_sub(MAX_PAST_BLOCK_SECS) {
-            return Err(ConsensusError::Timestamp(format!(
-                "timestamp {}s behind wall clock (max {}s)",
-                now.saturating_sub(ts),
-                MAX_PAST_BLOCK_SECS
-            )));
-        }
-
+        // NO wall-clock "too far in the past" bound. Blocks are historical by
+        // nature: during sync/IBD a lagging node receives blocks minutes/hours/
+        // days old, and a wall-clock past bound made catch-up IMPOSSIBLE (a node
+        // more than MAX_PAST_BLOCK_SECS behind rejected every backlog block —
+        // and the reject banned the peer serving it, so the chain never healed).
+        // Anti-timewarp is enforced against the block's ANCESTRY — the correct,
+        // wall-clock-independent anchor — by R3 (MTP), R4 (strict causality:
+        // ts > max parent) and R5 (forward-jump cap). This matches Bitcoin,
+        // which has a future bound + MTP but no wall-clock past bound.
         if ancestors.len() >= 2 {
             // R3: Must be after Median Time Past (monotonic progress)
             let mtp = Self::median_time_past(ancestors);
@@ -1551,7 +1545,7 @@ mod tests {
     #[test]
     fn timestamp_valid_passes() {
         let block = make_valid_block(5);
-        // Empty ancestors — only R1 and R2 are checked
+        // Empty ancestors — only R1 (future bound) is checked
         assert!(BlockValidator::validate_timestamp(&block, &[]).is_ok());
     }
 
@@ -1566,16 +1560,17 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_too_far_in_past_fails() {
+    fn timestamp_old_wall_clock_allowed_for_sync() {
+        // Historical blocks (old wall-clock ts, no ancestry context) MUST pass —
+        // otherwise a lagging node can never sync the backlog. There is no
+        // wall-clock past bound; anti-timewarp is enforced via MTP/causality
+        // against ancestry (see timestamp_before_mtp_fails).
         let mut block = make_valid_block(5);
-        block.header.timestamp = now_secs().saturating_sub(MAX_PAST_BLOCK_SECS + 60);
-
-        let result = BlockValidator::validate_timestamp(&block, &[]);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("behind wall clock"));
+        block.header.timestamp = now_secs().saturating_sub(MAX_PAST_BLOCK_SECS + 3600);
+        assert!(
+            BlockValidator::validate_timestamp(&block, &[]).is_ok(),
+            "an old historical block must validate during sync"
+        );
     }
 
     #[test]
@@ -1588,7 +1583,7 @@ mod tests {
         block.header.timestamp = now - 1;
 
         let result = BlockValidator::validate_timestamp(&block, &ancestors);
-        // Will fail either on R2 (past wall clock) or R3 (MTP) or R4 (causality)
+        // Anti-timewarp still holds via ancestry: R3 (MTP) / R4 (causality).
         assert!(result.is_err());
     }
 
@@ -1631,7 +1626,7 @@ mod tests {
         // so we can test merkle root + parent + timestamp validation cleanly.
         let cb = make_coinbase(5);
         let block = make_block(5, vec![cb]);
-        // With empty ancestors, timestamp validation only checks R1+R2
+        // With empty ancestors, timestamp validation only checks R1 (future).
         assert!(
             BlockValidator::validate_structural_layer(&block, &[], &NetworkMode::Mainnet,).is_ok()
         );
