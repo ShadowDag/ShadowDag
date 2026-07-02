@@ -139,6 +139,23 @@ static LAST_DIAL: Lazy<Arc<PlMutex<HashMap<String, Instant>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(HashMap::new())));
 const MIN_REDIAL_INTERVAL_SECS: u64 = 30;
 
+/// IPs discovered to be OURSELVES (a Version echoing our identity nonce). Once
+/// an address is here, the dial loop never targets it again — this stops a node
+/// from endlessly re-connecting to its own IP (which is in the seed list) and
+/// frees those attempts to reach real peers.
+static SELF_ADDRS: Lazy<Arc<PlMutex<HashSet<String>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(HashSet::new())));
+
+/// Record a peer address whose IP is ourselves, so we stop dialing it.
+fn mark_self_addr(addr: &str) {
+    SELF_ADDRS.lock().insert(extract_ban_ip(addr));
+}
+
+/// True if this address's IP was previously identified as our own.
+fn is_self_addr(addr: &str) -> bool {
+    SELF_ADDRS.lock().contains(&extract_ban_ip(addr))
+}
+
 /// Per-peer last acknowledged outbound broadcast sequence.
 /// Used to safely prune only messages that all currently connected peers
 /// have already consumed.
@@ -1815,6 +1832,20 @@ impl P2P {
                 services,
                 nonce,
             } => {
+                // Self-connection: the peer echoed OUR stable identity nonce, so
+                // this connection is to ourselves (our own IP is in the seed
+                // list). Record the IP so the dial/reconnect loop stops targeting
+                // it, and drop the connection (NO ban — it's us). Without this a
+                // node churns endlessly connecting to itself instead of to real
+                // peers, and never catches up.
+                if nonce == crate::service::network::p2p::protocol::local_identity_nonce() {
+                    mark_self_addr(peer);
+                    slog_info!("p2p", "self_connection_dropped", addr => peer);
+                    return Err(NetworkError::ConnectionFailed(format!(
+                        "self-connection to {} dropped",
+                        peer
+                    )));
+                }
                 // Build VersionPayload and validate through protocol state machine.
                 // Do NOT normalize zero values — reject them outright.
                 // Zero bps/services indicates a broken or malicious peer; silently
@@ -2357,6 +2388,12 @@ impl P2P {
     /// Skips peers already connected; frees the slot when the connection ends so
     /// the reconnect loop can re-dial. This is the unit of auto-reconnect.
     fn spawn_outbound(addr: String, magic: [u8; 4], peers_snapshot: Vec<String>) {
+        // Never dial our own IP (identified via the identity-nonce self-check).
+        // The seed list contains this node's own address; without this the node
+        // wastes every dial re-connecting to itself instead of to real peers.
+        if is_self_addr(&addr) {
+            return;
+        }
         // Reserve the slot up front (atomic check-and-insert) so two callers
         // can't both dial the same peer.
         {
@@ -2506,6 +2543,24 @@ mod tests {
         }
         // Over-release must not underflow/panic.
         release_inbound_ip(ip);
+    }
+
+    #[test]
+    fn self_addr_marking_stops_dialing_own_ip() {
+        // A documentation-range IP unique to this test. Marking it as self must
+        // make it recognized as self on ANY port (so the dial loop skips it),
+        // while other IPs stay non-self.
+        assert!(!is_self_addr("203.0.113.211:19333"));
+        mark_self_addr("203.0.113.211:19333");
+        assert!(is_self_addr("203.0.113.211:19333"));
+        assert!(
+            is_self_addr("203.0.113.211:41122"),
+            "self is matched by IP, any port"
+        );
+        assert!(
+            !is_self_addr("198.51.100.211:19333"),
+            "a different IP must not be treated as self"
+        );
     }
 
     #[test]
