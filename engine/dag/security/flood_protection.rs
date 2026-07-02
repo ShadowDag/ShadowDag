@@ -15,16 +15,22 @@ pub const MIN_VALID_NONCE: u64 = 0;
 // حدود الوقت
 /// Canonical value: 120s (see block_validator::MAX_FUTURE_SECS).
 pub const MAX_FUTURE_SECS: u64 = 120;
-pub const MAX_PAST_SECS: u64 = 600;
 
 pub struct FloodProtection;
 
 impl FloodProtection {
     pub fn validate(block: &Block) -> bool {
-        // 1️⃣ Timestamp — wall-clock sanity only.
-        //    Full timestamp validation (MTP, causality, jump limits) is in
-        //    block_validator::validate_timestamp(). This is just a fast
-        //    pre-filter to reject obviously bogus timestamps at the P2P layer.
+        // Timestamp sanity — reject ONLY blocks dated too far in the FUTURE (a
+        // block cannot come from ahead of the wall clock). We deliberately do
+        // NOT reject blocks with OLD timestamps: during sync/IBD a node
+        // legitimately receives HISTORICAL blocks that are minutes/hours/days
+        // old. A wall-clock "too far in the past" reject here made catch-up
+        // IMPOSSIBLE — any node more than a few minutes behind rejected every
+        // backlog block at the P2P layer (and, being a consensus-layer reject,
+        // banned the peer serving the backlog), so the chain never converged.
+        // Past-timestamp causality (ts > parents, MTP, jump limits) is enforced
+        // against the block's ANCESTRY in block_validator::validate_timestamp(),
+        // which is the correct place — not against the wall clock.
         let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(t) => t.as_secs(),
             Err(_) => return false,
@@ -32,14 +38,8 @@ impl FloodProtection {
 
         let ts = block.header.timestamp;
 
-        // Block cannot be too far in the future
+        // Block cannot be too far in the future.
         if ts > now.saturating_add(MAX_FUTURE_SECS) {
-            return false;
-        }
-
-        // Block cannot be too far in the past (relative to system clock)
-        // Generous: 1 hour. Tighter checks are in block_validator R2.
-        if ts < now.saturating_sub(MAX_PAST_SECS) {
             return false;
         }
 
@@ -141,10 +141,16 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_far_past_rejected() {
-        let ts = now_secs().saturating_sub(MAX_PAST_SECS + 100);
+    fn timestamp_far_past_allowed_for_sync() {
+        // Historical blocks (hours/days old) MUST pass this pre-filter so a
+        // lagging node can sync the backlog. Rejecting them here made catch-up
+        // impossible. Causality vs. parents is checked in block_validator.
+        let ts = now_secs().saturating_sub(7 * 24 * 3600); // a week old
         let b = make_block_ts(42, ts, vec!["aabbccdd"]);
-        assert!(!FloodProtection::validate(&b));
+        assert!(
+            FloodProtection::validate(&b),
+            "old historical blocks must pass the P2P flood pre-filter (sync)"
+        );
     }
 
     #[test]
