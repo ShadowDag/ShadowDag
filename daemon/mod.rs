@@ -98,6 +98,51 @@ fn is_non_penalized_block_rejection(err_msg_lc: &str) -> bool {
         || err_msg_lc.contains("dos_rejected")
 }
 
+/// Walk our chain FORWARD from the requester's tip and collect up to `count`
+/// block hashes for a Headers reply, so a behind/forked peer can bulk-download
+/// and converge (far faster than the sequential orphan-walk).
+///
+/// `from_height` is the height of the requester's `from_hash` in OUR store
+/// (None if we have never seen it). The walk begins AT that height — NOT one
+/// past it — so a forked requester also receives the canonical SIBLING(s) at
+/// its own tip height: the block it must adopt to heal a one-block fork. Under
+/// the old `from_height + 1` start the sibling was never served, and a node
+/// stuck on a side-branch tip could only heal via the slow orphan-walk (or not
+/// at all when the relaying peer lacked the ancestor). `from_hash` itself is
+/// skipped (the requester already has it). When `from_hash` is unknown we serve
+/// from genesis (height 1) so a forked peer receives our whole chain.
+///
+/// `at_height` yields every block hash we store at a given height (both DAG
+/// branches). Bounded to 512 hashes; stops at the first empty height (our tip).
+fn collect_forward_headers(
+    from_hash: &str,
+    from_height: Option<u64>,
+    count: u32,
+    at_height: impl Fn(u64) -> Vec<String>,
+) -> Vec<String> {
+    let start = from_height.unwrap_or(1);
+    let want = (count as usize).clamp(1, 512);
+    let mut hashes: Vec<String> = Vec::with_capacity(want);
+    let mut h = start;
+    while hashes.len() < want {
+        let at = at_height(h);
+        if at.is_empty() {
+            break; // reached our tip
+        }
+        for hh in at {
+            if hh == from_hash {
+                continue; // requester already has its own tip
+            }
+            hashes.push(hh);
+            if hashes.len() >= want {
+                break;
+            }
+        }
+        h += 1;
+    }
+    hashes
+}
+
 /// Ban score for peers that send invalid blocks rejected by consensus.
 const BAN_SCORE_INVALID_BLOCK: u64 = 20;
 /// Ban score for peers that send invalid transactions rejected by mempool.
@@ -476,6 +521,11 @@ impl DaemonNode {
                 let mut processed_count = 0usize;
                 let mut seen_hashes: std::collections::HashSet<String> =
                     std::collections::HashSet::with_capacity(blocks.len());
+                // Missing-parent hashes already requested this drain — avoids
+                // re-broadcasting the same GetBlock when several orphans in one
+                // batch share an ancestor.
+                let mut requested_parents: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 for (peer_id, block) in blocks.iter() {
                     // Skip duplicate hashes within the same drained batch.
                     // Multiple peers may relay the same block nearly simultaneously.
@@ -587,13 +637,20 @@ impl DaemonNode {
                                     for parent in &block.header.parents {
                                         if !parent.is_empty()
                                             && self.block_store.get_block(parent).is_none()
+                                            && requested_parents.insert(parent.clone())
                                         {
-                                            push_outbound_to_peer(
-                                                peer_id,
-                                                P2PMessage::GetBlock {
-                                                    hash: parent.clone(),
-                                                },
-                                            );
+                                            // Broadcast, not just to the relaying
+                                            // peer: during multi-peer gossip the
+                                            // relayer is often a fellow lagging node
+                                            // that lacks the ancestor, while an
+                                            // up-to-date peer has it. A peer without
+                                            // the block ignores the request (block
+                                            // serving is a store lookup that no-ops
+                                            // on miss), so this reliably reaches
+                                            // whoever can heal the fork.
+                                            push_outbound(P2PMessage::GetBlock {
+                                                hash: parent.clone(),
+                                            });
                                         }
                                     }
                                     buffer_orphan(peer_id, block.clone());
@@ -642,29 +699,13 @@ impl DaemonNode {
             if !header_reqs.is_empty() {
                 did_work = true;
                 for (req_peer, from_hash, count) in header_reqs {
-                    // Start one past from_hash if we know it; else from genesis
-                    // (height 1) so a forked peer receives our whole chain.
-                    let start = self
-                        .block_store
-                        .get_block_height(&from_hash)
-                        .map(|h| h + 1)
-                        .unwrap_or(1);
-                    let want = (count as usize).clamp(1, 512);
-                    let mut hashes: Vec<String> = Vec::with_capacity(want);
-                    let mut h = start;
-                    while hashes.len() < want {
-                        let at = self.block_store.get_block_hashes_at_height(h);
-                        if at.is_empty() {
-                            break; // reached our tip
-                        }
-                        for hh in at {
-                            hashes.push(hh);
-                            if hashes.len() >= want {
-                                break;
-                            }
-                        }
-                        h += 1;
-                    }
+                    // Walk forward from the requester's tip, INCLUDING same-height
+                    // siblings, so a forked peer receives the canonical sibling it
+                    // must adopt to heal (see collect_forward_headers).
+                    let from_height = self.block_store.get_block_height(&from_hash);
+                    let hashes = collect_forward_headers(&from_hash, from_height, count, |h| {
+                        self.block_store.get_block_hashes_at_height(h)
+                    });
                     if !hashes.is_empty() {
                         push_outbound_to_peer(&req_peer, P2PMessage::Headers { hashes });
                     }
@@ -1318,6 +1359,88 @@ mod tests {
             !orphan_worth_resolving(1659u64.saturating_sub(500), 1659),
             "ancient orphan (below finality) ignored — anti-thrash"
         );
+    }
+
+    #[test]
+    fn header_serve_includes_canonical_sibling_at_tip_height() {
+        // A node stuck on a side-branch tip must receive the CANONICAL sibling at
+        // its OWN height to heal the fork. The walk starts AT from_hash's height,
+        // returns the sibling, and skips from_hash itself.
+        let from_hash = "aaaa"; // requester's side-branch tip at height 1659
+        let sibling = "bbbb"; // canonical block at the SAME height
+        let next = "cccc"; // canonical child at height 1660
+        let at = |h: u64| -> Vec<String> {
+            match h {
+                1659 => vec![from_hash.to_string(), sibling.to_string()],
+                1660 => vec![next.to_string()],
+                _ => vec![],
+            }
+        };
+        let out = collect_forward_headers(from_hash, Some(1659), 512, at);
+        assert!(
+            out.contains(&sibling.to_string()),
+            "canonical sibling at the requester's own height must be served"
+        );
+        assert!(
+            out.contains(&next.to_string()),
+            "forward blocks past the tip must be served"
+        );
+        assert!(
+            !out.contains(&from_hash.to_string()),
+            "requester's own tip must be skipped"
+        );
+        // Ordering: the same-height sibling precedes the next-height child.
+        let si = out.iter().position(|x| x == sibling).unwrap();
+        let ni = out.iter().position(|x| x == next).unwrap();
+        assert!(si < ni, "same-height sibling served before the next-height child");
+    }
+
+    #[test]
+    fn header_serve_unknown_tip_starts_from_genesis() {
+        // If we have never seen the requester's tip, serve from genesis so a
+        // forked peer receives our whole chain.
+        let at = |h: u64| -> Vec<String> {
+            match h {
+                1 => vec!["g1".to_string()],
+                2 => vec!["g2".to_string()],
+                _ => vec![],
+            }
+        };
+        let out = collect_forward_headers("unknown", None, 512, at);
+        assert_eq!(out, vec!["g1".to_string(), "g2".to_string()]);
+    }
+
+    #[test]
+    fn header_serve_respects_count_cap() {
+        // The reply is bounded by the requested count (itself clamped to 512).
+        let at = |h: u64| -> Vec<String> {
+            if h <= 1000 {
+                vec![format!("h{}", h)]
+            } else {
+                vec![]
+            }
+        };
+        let out = collect_forward_headers("x", Some(0), 10, at);
+        assert_eq!(out.len(), 10, "must not exceed the requested count");
+        assert_eq!(out[0], "h0", "walk begins at the requester's own height");
+    }
+
+    #[test]
+    fn header_serve_no_sibling_walks_forward_normally() {
+        // The common (non-forked) case: the requester's tip has no sibling, so
+        // the walk yields only strictly-forward blocks (no regression, no dup of
+        // the requester's own tip).
+        let tip = "tip";
+        let at = |h: u64| -> Vec<String> {
+            match h {
+                100 => vec![tip.to_string()],
+                101 => vec!["n1".to_string()],
+                102 => vec!["n2".to_string()],
+                _ => vec![],
+            }
+        };
+        let out = collect_forward_headers(tip, Some(100), 512, at);
+        assert_eq!(out, vec!["n1".to_string(), "n2".to_string()]);
     }
 
     #[test]
