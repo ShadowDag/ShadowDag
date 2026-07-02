@@ -1097,6 +1097,23 @@ impl FullNode {
                 continue;
             }
 
+            // Partially-applied block (UTXO commitment present, contract marker
+            // missing — e.g. a crash between the two DBs, or a recovery replay
+            // that rewrote UTXO state without contract markers): re-execution
+            // MUST start from a clean slate. Otherwise apply_block_dag_ordered
+            // DUP-skips the block's OWN transactions (their tx_seen markers
+            // already exist), returning applied_fees=0 — and the post-execution
+            // coinbase check then rejects a perfectly valid block by exactly
+            // its fee sum, which at boot is fatal (permanent crash loop). The
+            // stored undo data (written by every apply path) makes the
+            // rollback+reapply sequence idempotent.
+            if self.utxo_set.get_commitment(block_hash).is_some() {
+                if let Err(e) = self.utxo_set.rollback_block_undo(block_hash) {
+                    slog_warn!("node", "partial_block_rollback_before_reapply_failed",
+                        block => block_hash, error => &format!("{}", e));
+                }
+            }
+
             if let Some(block) = self.block_store.get_block(block_hash) {
                 // ── CONFIDENTIAL (RingCT) CONSENSUS GATE ───────────────────
                 // CRITICAL: block_validator only runs the STRUCTURAL

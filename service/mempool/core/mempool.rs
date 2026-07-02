@@ -1035,6 +1035,14 @@ impl Mempool {
                 let hash = String::from_utf8(hash_bytes.to_vec()).unwrap_or_default();
                 self.get_transaction(&hash)
             })
+            // CONSENSUS-CRITICAL: exclude txs already applied by ANY block
+            // in the DAG (tx_seen marker). Execution skips such a tx as a
+            // duplicate with ZERO fee contribution, so a template that
+            // re-includes it makes the coinbase claim fees that will never
+            // be applied — the mined block then fails the post-execution
+            // coinbase check on every full validator, and followers can
+            // never sync past it (this froze the testnet at height 1659).
+            .filter(|tx| !utxo_set.is_tx_seen(&tx.hash))
             .collect();
 
         let tx_hashes: HashSet<String> = candidates.iter().map(|t| t.hash.clone()).collect();

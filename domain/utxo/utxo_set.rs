@@ -412,6 +412,19 @@ impl UtxoSet {
         matches!(self.get_utxo(key), Some(utxo) if !utxo.spent)
     }
 
+    /// Whether a transaction has already been applied by ANY block in the
+    /// active DAG (the `tx_seen:` marker written by the apply paths).
+    ///
+    /// CONSENSUS-CRITICAL for block templates: execution skips an
+    /// already-seen tx as a duplicate with ZERO fee contribution, so a
+    /// template that re-includes it makes the coinbase claim fees that
+    /// will never be applied — every such block fails the post-execution
+    /// coinbase check on full validators and is permanently un-syncable.
+    pub fn is_tx_seen(&self, tx_hash: &str) -> bool {
+        let seen_key = format!("tx_seen:{}", tx_hash);
+        self.store.get_raw(seen_key.as_bytes()).is_some()
+    }
+
     pub fn get_balance(&self, address: &str) -> u64 {
         match self.store.get_balance(address) {
             Ok(bal) => bal,
@@ -1644,6 +1657,18 @@ impl UtxoSet {
     #[cfg(test)]
     pub fn add_utxo_str(&self, key: &str, owner: String, amount: u64, address: String) {
         self.add_utxo(&Self::parse_utxo_key(key), owner, amount, address);
+    }
+
+    /// Mark a tx as applied on-chain (`tx_seen:` marker) — convenience for
+    /// tests. The production writers are the block-apply paths, which
+    /// require fully-signed transactions.
+    #[cfg(test)]
+    pub fn mark_tx_seen_test(&self, tx_hash: &str) {
+        let seen_key = format!("tx_seen:{}", tx_hash);
+        let _ = self.store.write_batch(vec![BatchWrite::Put {
+            key: seen_key.as_bytes().to_vec(),
+            value: b"test".to_vec(),
+        }]);
     }
 
     /// add_utxo_coinbase by string key — convenience for tests.

@@ -565,6 +565,28 @@ impl DaemonNode {
                                 dag_width.max(1),
                             );
 
+                            // Evict mined txs from the mempool (with dependents).
+                            // CONSENSUS-CRITICAL: without this a confirmed tx
+                            // stays pooled forever and is re-included in every
+                            // future template; execution then skips it as a
+                            // duplicate (ZERO fees), so every coinbase claiming
+                            // its fee is invalid and followers reject the whole
+                            // chain from that block on (testnet froze at 1659).
+                            // Conflict-skipped txs are double-spends of the
+                            // winning tx, so evicting them too is correct.
+                            let confirmed: Vec<String> = block
+                                .body
+                                .transactions
+                                .iter()
+                                .filter(|t| !t.is_coinbase())
+                                .map(|t| t.hash.clone())
+                                .collect();
+                            if !confirmed.is_empty() {
+                                self.mempool
+                                    .lock()
+                                    .on_new_block(block.header.height, &confirmed);
+                            }
+
                             // Broadcast accepted block to peers (gossip propagation)
                             if let Ok(block_bytes) = bincode::serialize(block) {
                                 push_outbound(P2PMessage::Block { data: block_bytes });

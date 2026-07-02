@@ -191,6 +191,44 @@ mod tests {
         assert!(selected.len() <= 10, "Must return at most 10 transactions");
     }
 
+    // ── 8b. On-chain-seen txs excluded from block templates ───────────────
+    #[test]
+    fn select_excludes_txs_already_applied_on_chain() {
+        // CONSENSUS-CRITICAL: a tx already applied by ANY block (tx_seen
+        // marker) is DUP-skipped at execution with ZERO fee contribution.
+        // A template re-including it makes the coinbase claim fees that
+        // will never be applied — the mined block then fails the
+        // post-execution coinbase check on every full validator, and
+        // followers can never sync past it (this froze the testnet).
+        let pool = tmp_mempool("tx_seen_filter");
+        let seen_tx = make_tx("seen_onchain_tx_01", 5, 1_000);
+        let fresh_tx = make_tx("fresh_pool_tx_01", 5, 1_000);
+        pool.add_transaction_test(&seen_tx);
+        pool.add_transaction_test(&fresh_tx);
+
+        let mut us = dummy_utxo_set();
+        for tx in &[&seen_tx, &fresh_tx] {
+            for inp in &tx.inputs {
+                let key = format!("{}:{}", inp.txid, inp.index);
+                us.add_test_utxo(&key, 2_000, "shadow1mempool");
+            }
+        }
+        // Mark seen_tx as already applied on-chain.
+        us.mark_tx_seen_test(&seen_tx.hash);
+        assert!(us.is_tx_seen(&seen_tx.hash));
+        assert!(!us.is_tx_seen(&fresh_tx.hash));
+
+        let selected = pool.select_transactions_for_block(&us, 10);
+        assert!(
+            selected.iter().any(|t| t.hash == fresh_tx.hash),
+            "fresh mempool tx must still be selected"
+        );
+        assert!(
+            !selected.iter().any(|t| t.hash == seen_tx.hash),
+            "a tx already applied on-chain must never enter a template"
+        );
+    }
+
     // ── 9. Stats available ────────────────────────────────────────────────
     #[test]
     fn mempool_stats_available() {
