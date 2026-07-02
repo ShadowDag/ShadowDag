@@ -628,7 +628,7 @@ impl FullNode {
         // NOT insert into the DAG (no topology without data).
         // ═══════════════════════════════════════════════════════════════
 
-        if !self.block_store.save_block(block) {
+        if !self.save_block_normalized(block) {
             return Err(NodeError::BlockRejected(format!(
                 "BlockStore save failed for {} — refusing to add to DAG without persistence",
                 &block.header.hash
@@ -728,7 +728,7 @@ impl FullNode {
         BlockValidator::validate_parents_exist(block, &self.block_store, &self.dag_manager)
             .map_err(|e| NodeError::BlockRejected(e.to_string()))?;
 
-        if !self.block_store.save_block(block) {
+        if !self.save_block_normalized(block) {
             return Err(NodeError::BlockRejected(format!(
                 "BlockStore save failed for {} — refusing to add to DAG without persistence",
                 &block.header.hash
@@ -824,7 +824,10 @@ impl FullNode {
             match block_store.get_block(&cursor) {
                 Some(b) => {
                     pending.push((cursor.clone(), b.header.difficulty as u128));
-                    cursor = b.header.selected_parent.clone().unwrap_or_default();
+                    // resolved_selected_parent: stored blocks may carry None
+                    // (submitblock), which would truncate the work sum to one
+                    // block and cripple fork choice.
+                    cursor = b.header.resolved_selected_parent().unwrap_or_default();
                 }
                 None => break, // missing ancestor: treat as chain base
             }
@@ -836,6 +839,24 @@ impl FullNode {
             cache.insert(h, acc);
         }
         cache.get(hash).copied().unwrap_or(base)
+    }
+
+    /// Persist a block with its canonical selected_parent filled in.
+    ///
+    /// submitblock stores blocks with `selected_parent=None` by design
+    /// (client input is untrusted), and gossiped blocks may carry a stale
+    /// or foreign value. The PoW preimage does NOT cover selected_parent
+    /// (only `parents`, whose order it fixes), so normalizing before save
+    /// is hash-safe — and every stored block becomes walkable by the
+    /// cumulative-work / retarget / reorg / pruning selected-parent walks.
+    fn save_block_normalized(&self, block: &Block) -> bool {
+        let resolved = block.header.resolved_selected_parent();
+        if block.header.selected_parent == resolved {
+            return self.block_store.save_block(block);
+        }
+        let mut normalized = block.clone();
+        normalized.header.selected_parent = resolved;
+        self.block_store.save_block(&normalized)
     }
 
     /// Select the best tip by HEAVIEST CUMULATIVE WORK (Nakamoto/Kaspa rule),
@@ -898,7 +919,7 @@ impl FullNode {
         while chain.len() < SHORT_WINDOW && !cursor.is_empty() {
             match block_store.get_block(&cursor) {
                 Some(b) => {
-                    let parent = b.header.selected_parent.clone().unwrap_or_default();
+                    let parent = b.header.resolved_selected_parent().unwrap_or_default();
                     chain.push(b);
                     cursor = parent;
                 }
@@ -975,7 +996,12 @@ impl FullNode {
         // back via selected_parent to find where they diverge.
         use std::collections::HashSet;
 
-        // First, collect the old chain's selected-parent ancestry
+        // First, collect the old chain's selected-parent ancestry.
+        // resolved_selected_parent throughout these walks: stored blocks may
+        // carry selected_parent=None (submitblock path), which made every walk
+        // stop after one hop — fork_point became the new tip itself, so EVERY
+        // insert rolled back the current tip and applied only the new block,
+        // leaving the UTXO set holding just the newest coinbases.
         let mut old_chain_set = HashSet::new();
         {
             let mut cursor = current_best.clone();
@@ -984,7 +1010,7 @@ impl FullNode {
                 cursor = self
                     .block_store
                     .get_block(&cursor)
-                    .and_then(|b| b.header.selected_parent.clone())
+                    .and_then(|b| b.header.resolved_selected_parent())
                     .unwrap_or_default();
             }
         }
@@ -1004,8 +1030,8 @@ impl FullNode {
             // Walk to selected parent
             match self.block_store.get_block(&cursor) {
                 Some(b) => {
-                    match b.header.selected_parent {
-                        Some(ref sp) => cursor = sp.clone(),
+                    match b.header.resolved_selected_parent() {
+                        Some(sp) => cursor = sp,
                         None => break, // Genesis
                     }
                 }
@@ -1047,7 +1073,7 @@ impl FullNode {
                 cursor = self
                     .block_store
                     .get_block(&cursor)
-                    .and_then(|b| b.header.selected_parent.clone())
+                    .and_then(|b| b.header.resolved_selected_parent())
                     .unwrap_or_default();
             }
         }
@@ -1070,7 +1096,7 @@ impl FullNode {
                 cursor = self
                     .block_store
                     .get_block(&cursor)
-                    .and_then(|b| b.header.selected_parent.clone())
+                    .and_then(|b| b.header.resolved_selected_parent())
                     .unwrap_or_default();
             }
             if rollback_count > 0 {
@@ -1662,7 +1688,7 @@ impl FullNode {
                                         break;
                                     }
                                 }
-                                cursor = b.header.selected_parent.clone().unwrap_or_default();
+                                cursor = b.header.resolved_selected_parent().unwrap_or_default();
                             } else {
                                 break;
                             }

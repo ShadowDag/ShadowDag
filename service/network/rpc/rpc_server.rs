@@ -2152,11 +2152,12 @@ impl RpcServer {
             );
         }
 
-        // Do NOT set selected_parent from client input (parents[0]) —
-        // it must be determined by GHOSTDAG during consensus validation.
-        // Setting it here would let the submitter influence fork-choice
-        // traversal paths. The FullNode pipeline computes and stores
-        // the correct GHOSTDAG-selected parent on block acceptance.
+        // Do NOT set selected_parent from client input — a submitter-chosen
+        // value could steer fork-choice traversal. FullNode normalizes it at
+        // acceptance (save_block_normalized): the stored value becomes
+        // BlockHeader::resolved_selected_parent(), i.e. the first PoW-covered
+        // parent, so every persisted block is walkable by the cumulative-work
+        // and reorg walks regardless of what the client sent.
         let selected_parent = None;
         let block = Block {
             header: BlockHeader {
@@ -3426,7 +3427,7 @@ impl RpcServer {
                     match s.block_store.get_block(&current) {
                         Some(b) => {
                             chain.push(json!({"hash": b.header.hash, "height": b.header.height}));
-                            current = b.header.selected_parent.unwrap_or_default();
+                            current = b.header.resolved_selected_parent().unwrap_or_default();
                             if current.is_empty() {
                                 break;
                             }
