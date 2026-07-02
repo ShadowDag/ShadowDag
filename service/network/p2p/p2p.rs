@@ -522,6 +522,16 @@ fn extract_ban_ip(addr: &str) -> String {
     addr.to_string()
 }
 
+/// One round of DoS-guard maintenance: decay every peer's ban score toward 0,
+/// then evict records that are fully cleared (score 0 and not banned). Composed
+/// (decay THEN evict) so a peer that has served out its penalty is dropped from
+/// the table the same tick. Takes the guard explicitly so it is unit-testable
+/// without the process-global `DOS_GUARD`.
+fn maintain_dos_guard(dos: &DosGuard) {
+    dos.tick_decay();
+    dos.evict_inactive();
+}
+
 /// Report a bad TX/block to the DoS guard (called by event loop on rejection).
 /// Closes the feedback loop: event_loop → ban_score → P2P disconnects peer.
 /// Bans both the full ip:port key AND the IP-only key so reconnecting with a
@@ -896,6 +906,9 @@ impl P2P {
         self.connect_to_peers();
         // Keep connections alive across drops/restarts (auto-reconnect).
         self.spawn_reconnect_loop();
+        // Decay DoS ban scores + evict cleared records so peers recover from
+        // transient bans and the ban/penalty tables stay bounded on a long node.
+        self.spawn_maintenance_loop();
 
         slog_info!("p2p", "peers_connected", count => self.peers.count());
 
@@ -2371,6 +2384,21 @@ impl P2P {
         });
     }
 
+    /// Periodic network-health maintenance (every 60s): decay DoS ban scores +
+    /// evict cleared records (so a peer wrongly/transiently banned recovers and
+    /// the ban table stays bounded), and decay the peer-manager penalty scores +
+    /// bound the addr cache. These `tick_decay`/`evict_inactive`/`decay_penalties`
+    /// primitives existed but were never driven by any running loop.
+    fn spawn_maintenance_loop(&self) {
+        let peers = Arc::clone(&self.peers);
+        thread::spawn(move || loop {
+            thread::sleep(std::time::Duration::from_secs(60));
+            maintain_dos_guard(&DOS_GUARD);
+            peers.decay_penalties();
+            peers.evict_addr_cache_if_full();
+        });
+    }
+
     /// Proactively request headers from all connected peers to initiate sync.
     /// Sends GetHeaders with the latest known DAG tip so peers respond with
     /// any blocks we don't have yet.
@@ -2444,6 +2472,22 @@ mod tests {
         }
         // Over-release must not underflow/panic.
         release_inbound_ip(ip);
+    }
+
+    #[test]
+    fn maintenance_evicts_cleared_dos_records() {
+        // Two tracked-but-cleared peers (score 0, not banned) must be evicted by
+        // one maintenance round — the wiring that keeps the ban table bounded.
+        let g = DosGuard::new();
+        g.check("p_a", &MsgType::Ping, 10);
+        g.check("p_b", &MsgType::Ping, 10);
+        assert_eq!(g.stats().tracked_peers, 2);
+        maintain_dos_guard(&g);
+        assert_eq!(
+            g.stats().tracked_peers,
+            0,
+            "maintenance must decay + evict cleared DoS records"
+        );
     }
 
     #[test]
