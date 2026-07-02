@@ -2521,6 +2521,12 @@ impl FullNode {
     /// Check if a peer exceeds block rate limit (DoS protection).
     /// Returns true if the peer should be throttled.
     fn is_peer_rate_limited(&self, peer_id: &str) -> bool {
+        // Trusted seeds are never rate-limited (they must serve unbounded IBD
+        // backfill to a lagging peer). This is the FullNode-local limiter,
+        // separate from DosGuard, so it needs its own whitelist check.
+        if crate::service::network::dos_guard::is_whitelisted(peer_id) {
+            return false;
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

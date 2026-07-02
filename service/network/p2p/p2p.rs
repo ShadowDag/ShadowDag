@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -915,6 +915,24 @@ impl P2P {
         });
 
         self.peers.bootstrap_for_network(&self.network);
+
+        // Whitelist the trusted seeds so the operator's own nodes never DoS-ban
+        // each other: seeds must serve an unbounded IBD backlog to a lagging peer
+        // without tripping rate/lag heuristics (which otherwise stall convergence
+        // for an hour-long Resource ban). Resolve each seed (IP literal or DNS)
+        // to its IP(s); on resolution failure, whitelist the literal as fallback.
+        for seed in crate::config::network::bootstrap_nodes::BootstrapNodes::for_network(&self.network)
+        {
+            match seed.to_socket_addrs() {
+                Ok(addrs) => {
+                    for a in addrs {
+                        crate::service::network::dos_guard::whitelist_peer(&a.ip().to_string());
+                    }
+                }
+                Err(_) => crate::service::network::dos_guard::whitelist_peer(seed),
+            }
+        }
+
         let discovered = self.peers.discover_peers();
         if discovered.is_empty() {
             slog_warn!("p2p", "peer_discovery_found_none");
