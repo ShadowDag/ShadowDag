@@ -837,6 +837,30 @@ impl BlockValidator {
         }
     }
 
+    /// SELF-CONSISTENT validation only — the checks that need ONLY the block
+    /// itself, not its (possibly un-synced) ancestry: the L1 network layer
+    /// (format/size/DoS) and PoW (ShadowHash meets the block's own claimed
+    /// difficulty). Deliberately EXCLUDES ancestry-dependent rules — L2
+    /// timestamps (MTP/parent causality) and L3 difficulty (claimed vs the
+    /// value implied by the parent window).
+    ///
+    /// Used to junk-filter an ORPHAN before buffering it: a far-behind node
+    /// must be able to accept an ahead-of-tip block without validating its
+    /// difficulty against our own un-synced tip (which would spuriously
+    /// mismatch). PoW here bounds the cost so an attacker cannot flood the
+    /// orphan pool with work-free blocks. The FULL ancestry-dependent
+    /// validation runs when the orphan reconnects — before it is ever applied.
+    pub fn validate_self_consistent(
+        block: &Block,
+        network: &NetworkMode,
+    ) -> Result<(), ConsensusError> {
+        Self::validate_network_layer_for_network(block, network)?;
+        if block.header.height != 0 {
+            Self::validate_pow(block)?;
+        }
+        Ok(())
+    }
+
     // ─────────────────────────────────────────
 
     fn validate_parents(block: &Block) -> Result<(), ConsensusError> {
@@ -1416,6 +1440,24 @@ mod tests {
         t1.hash = TxHash::hash_for_network(&t1, &NetworkMode::Mainnet);
         let block = make_block(5, vec![cb, t1]);
         assert!(BlockValidator::validate_network_layer(&block).is_ok());
+    }
+
+    #[test]
+    fn validate_self_consistent_runs_pow_not_ancestry_difficulty() {
+        // W4: the orphan junk-filter runs L1 + PoW but NEVER the ancestry-
+        // dependent difficulty check (it takes no expected_difficulty — it
+        // structurally cannot compute one). A placeholder-hash block fails on
+        // PoW (proving PoW runs), and the failure is never a difficulty-anchor
+        // / difficulty-mismatch error (proving L3 difficulty is NOT run here).
+        let block = make_block(5, vec![make_coinbase(5)]);
+        let r = BlockValidator::validate_self_consistent(&block, &NetworkMode::Mainnet);
+        assert!(r.is_err(), "a non-PoW block must fail self-consistent validation");
+        let msg = format!("{:?}", r).to_lowercase();
+        assert!(
+            !msg.contains("difficulty anchor") && !msg.contains("difficulty mismatch"),
+            "self-consistent validation must not perform the ancestry-difficulty check: {:?}",
+            r
+        );
     }
 
     #[test]

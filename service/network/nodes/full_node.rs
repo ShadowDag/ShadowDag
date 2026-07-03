@@ -554,40 +554,64 @@ impl FullNode {
         // ═══════════════════════════════════════════════════════════════
         // CONSENSUS-CRITICAL VALIDATION PIPELINE
         //
-        // Three strictly-separated phases. Ordering is a SAFETY INVARIANT:
+        //   0. PARENT EXISTENCE (cheap DB read). Decides orphan vs connectable.
+        //      An ORPHAN gets SELF-CONSISTENT validation only (L1 + PoW) and is
+        //      buffered — ancestry-dependent checks are DEFERRED (see W4 below).
+        //   1. FULL validation for a connectable block: L1 → PoW → L2 (merkle,
+        //      timestamps, signatures) → L3 (difficulty, checkpoints, coinbase).
+        //      Now safe because the parents (hence the difficulty window and MTP
+        //      ancestors) are present.
+        //   2. PERSIST + DAG/GHOSTDAG insertion (block_store, dag_manager).
+        //   3. UTXO EXECUTION in GHOSTDAG order (recompute_virtual_chain),
+        //      sequential, atomic rollback on failure.
         //
-        //   Phase 1 (STATELESS): L1→PoW→L2→L3 — NO DB/UTXO reads.
-        //     Inputs:  block header + body only (+ pre-collected ancestor timestamps)
-        //     Checks:  format, size, signatures, merkle root, PoW, difficulty
-        //     Merkle tree uses rayon par_iter — SAFE because deterministic
-        //     (same TX order → same hash, regardless of thread scheduling)
-        //
-        //   Phase 2 (DAG): Parent existence + DAG insertion — reads block_store
-        //     Only reached if Phase 1 passes. No UTXO changes.
-        //
-        //   Phase 3 (UTXO EXECUTION): Apply transactions in GHOSTDAG order
-        //     Only reached after Phase 2. Reads/writes UTXO set.
-        //     Sequential, single-threaded, atomic rollback on failure.
-        //
-        // INVARIANT: Phase 1 validation (PoW, merkle root, signatures)
-        // is stateless. The only DB read is collect_ancestor_timestamps
-        // for MTP/timestamp rules — this is a controlled exception that
-        // reads block_store headers (immutable after save) and does not
-        // affect consensus determinism (all nodes have the same ancestors).
+        // SECURITY: an orphan is buffered only after PoW passes (bounds the
+        // cost — no work-free orphan flood), and it is NEVER applied until it
+        // reconnects and passes the FULL validation. So every ancestry-
+        // dependent rule (difficulty, MTP) is still enforced before apply —
+        // only its timing moves to reconnect. This is what lets a far-behind
+        // node accept ahead-of-tip blocks instead of hard-rejecting valid ones
+        // on a difficulty computed from its own un-synced tip.
         // ═══════════════════════════════════════════════════════════════
 
-        // NOTE: ema_difficulty() returns the tip-chain's difficulty
-        // estimate. For side-chain blocks this may differ from the
-        // difficulty their parents imply, but ShadowDAG's GHOSTDAG
-        // reorg mechanism re-validates after insertion, so a block
-        // accepted on this path will be re-checked when (if) it
-        // becomes part of the selected chain. A per-parent-context
-        // retarget would be more precise but requires walking the
-        // parent chain for every incoming block — acceptable for now.
+        // ─── PARENT-EXISTENCE FIRST (W4) ─────────────────────────────────
+        // Ancestry-dependent validation (difficulty, MTP timestamps) requires
+        // the block's parents. For an ORPHAN (parents not yet present) we
+        // CANNOT compute the expected difficulty — computing it against our own
+        // un-synced tip spuriously mismatches and hard-rejects a perfectly
+        // valid ahead-of-tip block, which is exactly what stops a far-behind
+        // node from ever catching up. So: validate only the SELF-CONSISTENT
+        // checks (structure + PoW — enough to reject junk and bound cost), then
+        // buffer the orphan. Its FULL ancestry-dependent validation (difficulty
+        // etc.) runs when it reconnects — before it is ever applied — so the
+        // security guarantee is preserved, only deferred.
+        match BlockValidator::validate_parents_exist(block, &self.block_store, &self.dag_manager) {
+            Ok(()) => {}
+            Err(e) if e.to_string().contains("not found") => {
+                if let Err(reason) =
+                    BlockValidator::validate_self_consistent(block, &self.network)
+                {
+                    return Err(NodeError::BlockRejected(format!(
+                        "Block validation failed: {}",
+                        reason
+                    )));
+                }
+                self.add_orphan(block.clone(), peer_id);
+                return Err(NodeError::BlockRejected(format!("ORPHAN: {}", e)));
+            }
+            Err(e) => {
+                return Err(NodeError::BlockRejected(format!(
+                    "Parent validation failed: {}",
+                    e
+                )))
+            }
+        }
+
+        // Parents are present → FULL validation, incl. ancestry-dependent
+        // difficulty (computed from the now-available parent window) and
+        // timestamps. A block that reaches here is fully connectable.
         let expected_diff = Some(self.expected_difficulty_for_block(block)?);
-
         let ancestor_ts = self.collect_ancestor_timestamps(block);
-
         let result = BlockValidator::validate_block_full_with_difficulty(
             block,
             &self.utxo_set,
@@ -600,23 +624,6 @@ impl FullNode {
                 "Block validation failed: {}",
                 result.reason.unwrap_or_else(|| "unknown".to_string())
             )));
-        }
-
-        // ─── PHASE 1 END ─── (above: stateless only, no DB reads) ───
-
-        // ─── PHASE 2 START ─── (stateful: reads block_store, dag_manager) ───
-        match BlockValidator::validate_parents_exist(block, &self.block_store, &self.dag_manager) {
-            Ok(()) => {}
-            Err(e) if e.to_string().contains("not found") => {
-                self.add_orphan(block.clone(), peer_id);
-                return Err(NodeError::BlockRejected(format!("ORPHAN: {}", e)));
-            }
-            Err(e) => {
-                return Err(NodeError::BlockRejected(format!(
-                    "Parent validation failed: {}",
-                    e
-                )))
-            }
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -700,18 +707,22 @@ impl FullNode {
             return Err(NodeError::BlockRejected("already exists".to_string()));
         }
 
-        // NOTE: ema_difficulty() returns the tip-chain's difficulty
-        // estimate. For side-chain blocks this may differ from the
-        // difficulty their parents imply, but ShadowDAG's GHOSTDAG
-        // reorg mechanism re-validates after insertion, so a block
-        // accepted on this path will be re-checked when (if) it
-        // becomes part of the selected chain. A per-parent-context
-        // retarget would be more precise but requires walking the
-        // parent chain for every incoming block — acceptable for now.
+        // Parent-existence FIRST (W4): ancestry-dependent validation
+        // (difficulty, MTP) needs the parents. This is the orphan-REPROCESS
+        // path; if a parent is still missing (e.g. a deeper ancestor hasn't
+        // arrived), fail WITHOUT the spurious difficulty check and WITHOUT
+        // re-buffering (the caller manages the orphan pool; this variant must
+        // not recurse into orphan handling). Only self-consistent checks would
+        // apply to a still-orphan, and it's already buffered, so just return.
+        if let Err(e) =
+            BlockValidator::validate_parents_exist(block, &self.block_store, &self.dag_manager)
+        {
+            return Err(NodeError::BlockRejected(e.to_string()));
+        }
+
+        // Parents present → full ancestry-dependent validation.
         let expected_diff = Some(self.expected_difficulty_for_block(block)?);
-
         let ancestor_ts = self.collect_ancestor_timestamps(block);
-
         let result = BlockValidator::validate_block_full_with_difficulty(
             block,
             &self.utxo_set,
@@ -724,9 +735,6 @@ impl FullNode {
                 result.reason.unwrap_or_else(|| "unknown".to_string()),
             ));
         }
-
-        BlockValidator::validate_parents_exist(block, &self.block_store, &self.dag_manager)
-            .map_err(|e| NodeError::BlockRejected(e.to_string()))?;
 
         if !self.save_block_normalized(block) {
             return Err(NodeError::BlockRejected(format!(
