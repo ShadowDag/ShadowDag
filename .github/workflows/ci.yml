@@ -72,6 +72,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
 
+  security-audit:
+    name: Security Audit (cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Scan the dependency tree against the RustSec advisory DB for known
+      # vulnerabilities. A money-handling node MUST not ship a dependency with
+      # a published CVE. --locked audits exactly what Cargo.lock pins.
+      # Deny warnings (unmaintained/yanked) too — surface them before mainnet.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit dependencies
+        run: cargo audit --deny warnings
+
   shadowasm-check:
     name: shadowasm Build Check
     runs-on: ubuntu-latest
