@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use rocksdb::DB;
 
-use crate::{slog_error, slog_info, slog_warn};
+use crate::{slog_debug, slog_error, slog_info, slog_warn};
 
 use crate::config::genesis::genesis::create_genesis_block_for;
 use crate::config::node::node_config::{NetworkMode, NodeConfig};
@@ -79,6 +79,26 @@ const ERR_STALE_TEMPLATE: &str = "stale template";
 #[inline]
 fn orphan_worth_resolving(orphan_height: u64, best_height: u64) -> bool {
     orphan_height.saturating_add(crate::engine::consensus::reorg::FINALITY_DEPTH) > best_height
+}
+
+/// How far above our tip a gossiped block must be before we drop it CHEAPLY
+/// instead of running full validation + orphan buffering on it. Comfortably
+/// above FINALITY_DEPTH (the reorg-competitor window) and the header-sync
+/// batch size, so genuine competing tips and requested catch-up blocks are
+/// NEVER dropped.
+const FAR_FUTURE_GOSSIP_WINDOW: u64 = crate::engine::consensus::reorg::FINALITY_DEPTH * 4;
+
+/// Whether a gossiped block is so far above our tip that processing it now is
+/// pure waste. Such a block cannot connect (its ancestors are far ahead) and
+/// is NOT a reorg competitor (those sit within FINALITY_DEPTH). Header-sync
+/// backfills the gap IN ORDER, so dropping the far-future flood cheaply keeps
+/// the event loop free for header-sync. Without this, a far-behind node burns
+/// all its CPU validating+rejecting gossip (a flood that grows with chain
+/// height) and never catches up — the reproduced "a new node cannot join a
+/// tall chain" convergence blocker.
+#[inline]
+fn is_far_future_gossip(block_height: u64, best_height: u64) -> bool {
+    block_height > best_height.saturating_add(FAR_FUTURE_GOSSIP_WINDOW)
 }
 
 #[inline]
@@ -529,6 +549,15 @@ impl DaemonNode {
                 // Whether any block was accepted this batch → fsync the WAL once
                 // at the end (durable block-commit boundary).
                 let mut accepted_this_batch = false;
+                // Our tip height at batch start, for the far-future-gossip gate.
+                // Computed once (a lower bound — accepting blocks this batch only
+                // raises the real tip, making the gate strictly more permissive).
+                let batch_best_height = self
+                    .block_store
+                    .get_best_hash()
+                    .and_then(|h| self.block_store.get_block_height(&h))
+                    .unwrap_or(0);
+                let mut far_future_dropped = 0u64;
                 for (peer_id, block) in blocks.iter() {
                     // Skip duplicate hashes within the same drained batch.
                     // Multiple peers may relay the same block nearly simultaneously.
@@ -548,6 +577,18 @@ impl DaemonNode {
                         total_blocks_rejected += 1;
                         report_bad_peer(peer_id, rej.ban_score as u64, rej.reason);
                         slog_warn!("daemon", "block_rejected_dagshield", hash => hash_prefix, reason => rej.reason);
+                        processed_count += 1;
+                        continue;
+                    }
+
+                    // ── Far-future gossip gate (anti-flood, pro-convergence) ──
+                    // Drop CHEAPLY (no validation, no orphan buffering, no ban)
+                    // any gossiped block far above our tip: it can't connect and
+                    // isn't a reorg competitor; header-sync backfills the gap in
+                    // order. This keeps the loop free for header-sync so a
+                    // far-behind node can actually catch up to a tall chain.
+                    if is_far_future_gossip(block.header.height, batch_best_height) {
+                        far_future_dropped += 1;
                         processed_count += 1;
                         continue;
                     }
@@ -718,6 +759,11 @@ impl DaemonNode {
                     if let Err(e) = self.db.flush_wal(true) {
                         slog_warn!("daemon", "wal_flush_failed", error => &e.to_string());
                     }
+                }
+                if far_future_dropped > 0 {
+                    slog_debug!("daemon", "far_future_gossip_dropped",
+                        count => &far_future_dropped.to_string(),
+                        tip => &batch_best_height.to_string());
                 }
             }
 
@@ -1489,6 +1535,28 @@ mod tests {
             !orphan_worth_resolving(1659u64.saturating_sub(500), 1659),
             "ancient orphan (below finality) ignored — anti-thrash"
         );
+    }
+
+    #[test]
+    fn far_future_gossip_gate_drops_flood_but_keeps_reorg_and_catchup() {
+        use crate::engine::consensus::reorg::FINALITY_DEPTH;
+        let tip = 9u64; // a far-behind node
+        // The tall-chain flood (height ~10000) is dropped cheaply.
+        assert!(is_far_future_gossip(10_000, tip), "far-future flood must be dropped");
+        // The very next block and header-sync catch-up blocks are KEPT.
+        assert!(!is_far_future_gossip(tip + 1, tip), "next block must be processed");
+        assert!(!is_far_future_gossip(tip + 64, tip), "header-sync batch must be processed");
+        // A genuine reorg competitor (within FINALITY_DEPTH of the tip) is KEPT.
+        assert!(
+            !is_far_future_gossip(tip + FINALITY_DEPTH, tip),
+            "a reorg competitor within FINALITY_DEPTH must never be dropped"
+        );
+        // A caught-up node never sees far-future gossip: its next block is in-window.
+        let caught_up = 10_000u64;
+        assert!(!is_far_future_gossip(caught_up + 1, caught_up));
+        // The boundary: exactly at the window edge is kept; one past is dropped.
+        assert!(!is_far_future_gossip(tip + FAR_FUTURE_GOSSIP_WINDOW, tip));
+        assert!(is_far_future_gossip(tip + FAR_FUTURE_GOSSIP_WINDOW + 1, tip));
     }
 
     #[test]
