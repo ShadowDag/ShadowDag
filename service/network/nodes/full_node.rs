@@ -841,21 +841,34 @@ impl FullNode {
         cache.get(hash).copied().unwrap_or(base)
     }
 
-    /// Persist a block with its canonical selected_parent filled in.
+    /// Persist a block with its canonical GHOSTDAG selected parent filled in.
     ///
-    /// submitblock stores blocks with `selected_parent=None` by design
-    /// (client input is untrusted), and gossiped blocks may carry a stale
-    /// or foreign value. The PoW preimage does NOT cover selected_parent
-    /// (only `parents`, whose order it fixes), so normalizing before save
-    /// is hash-safe — and every stored block becomes walkable by the
-    /// cumulative-work / retarget / reorg / pruning selected-parent walks.
+    /// submitblock stores blocks with `selected_parent=None` by design (client
+    /// input is untrusted) and gossiped blocks may carry a stale/foreign value,
+    /// so the node must set it. The CANONICAL value is GHOSTDAG's selected
+    /// parent — argmax over the parents of (blue_score, chain_height, hash) via
+    /// `GhostDag::select_parent` — NOT `parents[0]`. On a multi-parent block
+    /// those differ, and the header's selected parent feeds the consensus walks
+    /// (cumulative work / fork choice, difficulty retarget, reorg fork-point,
+    /// undo pruning, recovery replay). Storing GHOSTDAG's value makes the
+    /// header agree EXACTLY with what `ghostdag.add_block` computes and stores
+    /// internally for this block, so every walk follows the true blue chain.
+    ///
+    /// The parents' blue scores are already known here (parents were accepted
+    /// earlier), so this is computable before THIS block enters GHOSTDAG.
+    /// Hash-safe: the PoW preimage covers `parents`, not `selected_parent`.
+    /// Genesis (no parents) stores None, which terminates the walks.
     fn save_block_normalized(&self, block: &Block) -> bool {
-        let resolved = block.header.resolved_selected_parent();
-        if block.header.selected_parent == resolved {
+        let canonical = if block.header.parents.is_empty() {
+            None
+        } else {
+            Some(self.ghostdag.select_parent(&block.header.parents))
+        };
+        if block.header.selected_parent == canonical {
             return self.block_store.save_block(block);
         }
         let mut normalized = block.clone();
-        normalized.header.selected_parent = resolved;
+        normalized.header.selected_parent = canonical;
         self.block_store.save_block(&normalized)
     }
 

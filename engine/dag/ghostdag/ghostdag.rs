@@ -839,6 +839,36 @@ mod tests {
         assert_eq!(dag.get_blue_score(""), 0);
     }
 
+    #[test]
+    fn select_parent_picks_max_blue_not_first_parent() {
+        // The canonical GHOSTDAG selected parent is argmax(blue_score), NOT
+        // parents[0]. save_block_normalized (full_node) relies on this to store
+        // the header's selected parent so every fork-choice/reorg/recovery walk
+        // follows the true blue chain on a multi-parent block.
+        let dag = make_ghostdag("select_parent_blue");
+        dag.store_blue_score("p_low", 5);
+        dag.store_blue_score("p_high", 9);
+        // parents[0] = p_low (lower score) — the WRONG choice for a naive
+        // parents[0] rule; select_parent must return the higher-scored p_high.
+        let parents = vec!["p_low".to_string(), "p_high".to_string()];
+        assert_eq!(dag.select_parent(&parents), "p_high");
+        // Order-independent: same result if the high-score parent is first.
+        let parents_rev = vec!["p_high".to_string(), "p_low".to_string()];
+        assert_eq!(dag.select_parent(&parents_rev), "p_high");
+    }
+
+    #[test]
+    fn select_parent_tie_breaks_deterministically_by_hash() {
+        // Equal blue score + height → deterministic tie-break (max hash), so
+        // every node computes the SAME selected parent (no split).
+        let dag = make_ghostdag("select_parent_tie");
+        dag.store_blue_score("aaaa", 7);
+        dag.store_blue_score("bbbb", 7);
+        let a = dag.select_parent(&["aaaa".to_string(), "bbbb".to_string()]);
+        let b = dag.select_parent(&["bbbb".to_string(), "aaaa".to_string()]);
+        assert_eq!(a, b, "tie-break must be order-independent");
+    }
+
     // ── Multiple blocks can have scores stored and retrieved ──────────
 
     #[test]
