@@ -176,6 +176,33 @@ impl Transaction {
         self.tx_type == TxType::Confidential
     }
 
+    /// Whether this tx runs through ShadowVM during block execution
+    /// (ContractCreate / ContractCall). Only these consume gas.
+    pub fn is_contract_tx(&self) -> bool {
+        matches!(self.tx_type, TxType::ContractCreate | TxType::ContractCall)
+    }
+
+    /// The gas this tx is allowed to consume during block execution — the
+    /// SINGLE SOURCE OF TRUTH shared by the block-gas validator and the
+    /// executor so they can never disagree.
+    ///
+    /// CONSENSUS-CRITICAL: a contract tx with no explicit `gas_limit` still
+    /// executes up to `DEFAULT_CONTRACT_GAS_LIMIT`, so it MUST count that much
+    /// against MAX_BLOCK_GAS. Counting it as 0 (the old validator behavior)
+    /// let a hostile miner pack thousands of unbounded-gas contract txs that
+    /// passed the cap yet forced every node to execute far beyond it. Non-VM
+    /// txs (Transfer/Confidential/etc.) never run code, so they contribute 0
+    /// regardless of any stray `gas_limit` value.
+    pub fn effective_gas_limit(&self) -> u64 {
+        if self.is_contract_tx() {
+            self.gas_limit.unwrap_or(
+                crate::config::consensus::consensus_params::ConsensusParams::DEFAULT_CONTRACT_GAS_LIMIT,
+            )
+        } else {
+            0
+        }
+    }
+
     /// Sum of all output amounts. Returns None on overflow (attack detection).
     pub fn total_output_checked(&self) -> Option<u64> {
         let mut total: u64 = 0;
@@ -530,6 +557,27 @@ impl TxOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::consensus::consensus_params::ConsensusParams;
+
+    #[test]
+    fn effective_gas_limit_matches_executor_default() {
+        // Contract tx, no explicit gas → the implicit executor budget.
+        let mut t = Transaction::new(String::new(), vec![], vec![], 0, 0);
+        t.tx_type = TxType::ContractCall;
+        t.gas_limit = None;
+        assert_eq!(
+            t.effective_gas_limit(),
+            ConsensusParams::DEFAULT_CONTRACT_GAS_LIMIT
+        );
+        // Explicit gas is honored.
+        t.gas_limit = Some(42);
+        assert_eq!(t.effective_gas_limit(), 42);
+        // Non-contract txs never run the VM → 0 regardless of gas_limit.
+        t.tx_type = TxType::Transfer;
+        t.gas_limit = Some(999_999);
+        assert_eq!(t.effective_gas_limit(), 0);
+        assert!(!t.is_contract_tx());
+    }
 
     #[test]
     fn ring_signature_changes_canonical_bytes() {

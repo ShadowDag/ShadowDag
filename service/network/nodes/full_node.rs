@@ -2016,7 +2016,9 @@ impl FullNode {
                         continue;
                     }
                     let value = tx.outputs.first().map(|o| o.amount).unwrap_or(0);
-                    let gas_limit = tx.gas_limit.unwrap_or(10_000_000u64);
+                    // effective_gas_limit: the exact amount the block-gas
+                    // validator charged for this tx (single source of truth).
+                    let gas_limit = tx.effective_gas_limit();
 
                     // Compute the contract address via the canonical
                     // `ContractDeployer::compute_create_address`
@@ -2350,7 +2352,9 @@ impl FullNode {
                         continue;
                     }
                     let value = tx.outputs.first().map(|o| o.amount).unwrap_or(0);
-                    let gas_limit = tx.gas_limit.unwrap_or(10_000_000u64);
+                    // effective_gas_limit: the exact amount the block-gas
+                    // validator charged for this tx (single source of truth).
+                    let gas_limit = tx.effective_gas_limit();
 
                     // Lazy-load the target's code from disk on
                     // first touch. `load_contract_from_storage`

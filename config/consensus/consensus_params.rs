@@ -54,6 +54,12 @@ impl ConsensusParams {
     // ── Block Limits ───────────────────────────────────────────────────────
     /// Maximum gas per block (sum of all tx gas_limits in one block)
     pub const MAX_BLOCK_GAS: u64 = 100_000_000; // 100M gas per block
+    /// Gas a contract tx is allowed to consume during block execution when it
+    /// declares no explicit `gas_limit`. CONSENSUS-CRITICAL: this is the single
+    /// source of truth for the implicit budget — the block-gas validator and
+    /// the executor MUST charge the same value, or a block that passes the
+    /// MAX_BLOCK_GAS check can still execute far beyond it (CPU DoS).
+    pub const DEFAULT_CONTRACT_GAS_LIMIT: u64 = 10_000_000; // 10M gas
     pub const MAX_BLOCK_SIZE: usize = 2 * 1024 * 1024; // 2 MB
     pub const MAX_BLOCK_TXS: usize = 10_000;
     pub const MAX_TX_SIZE: usize = 100 * 1024; // 100 KB

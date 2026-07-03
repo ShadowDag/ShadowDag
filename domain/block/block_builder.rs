@@ -54,7 +54,9 @@ impl BlockBuilder {
         let max_block_gas = ConsensusParams::MAX_BLOCK_GAS;
 
         for tx in mempool_txs {
-            let tx_gas = tx.gas_limit.unwrap_or(0);
+            // effective_gas_limit: match the block-gas validator exactly so a
+            // template we build always passes the same cap the network enforces.
+            let tx_gas = tx.effective_gas_limit();
             if tx_gas > 0 {
                 // BUG FIX: Use checked_add to prevent overflow.
                 // A malicious TX with gas_limit near u64::MAX could wrap

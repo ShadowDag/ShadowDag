@@ -213,15 +213,18 @@ impl BlockValidator {
                 MAX_TXS_PER_BLOCK_VALIDATION
             )));
         }
-        // Block gas budget: sum of declared tx gas_limits must not exceed
+        // Block gas budget: sum of tx EFFECTIVE gas must not exceed
         // MAX_BLOCK_GAS. Enforced HERE (not just in block_builder) so a peer
         // cannot pack a block with unbounded contract execution and force every
         // node to burn CPU far beyond the intended per-block bound (DoS).
+        // effective_gas_limit charges a contract tx its implicit default when
+        // gas_limit is None — the SAME amount the executor spends — so a
+        // None-gas contract tx can no longer count as 0 here yet run at 10M.
         // checked_add: a gas_limit near u64::MAX must not wrap past the cap.
         {
             let mut block_gas: u64 = 0;
             for tx in &block.body.transactions {
-                let g = tx.gas_limit.unwrap_or(0);
+                let g = tx.effective_gas_limit();
                 if g == 0 {
                     continue;
                 }
@@ -1383,13 +1386,16 @@ mod tests {
 
     #[test]
     fn network_layer_rejects_block_over_gas_limit() {
-        // Regression: a peer block whose tx gas_limits sum beyond MAX_BLOCK_GAS
-        // must be rejected (otherwise unbounded contract execution = CPU DoS).
+        // Regression: a peer block whose CONTRACT tx gas_limits sum beyond
+        // MAX_BLOCK_GAS must be rejected (otherwise unbounded contract
+        // execution = CPU DoS). Gas only counts for VM txs (ContractCall).
         let cb = make_coinbase(5);
         let mut t1 = make_regular_tx("gas_tx_1");
+        t1.tx_type = TxType::ContractCall;
         t1.gas_limit = Some(ConsensusParams::MAX_BLOCK_GAS);
         t1.hash = TxHash::hash_for_network(&t1, &NetworkMode::Mainnet);
         let mut t2 = make_regular_tx("gas_tx_2");
+        t2.tx_type = TxType::ContractCall;
         t2.gas_limit = Some(1);
         t2.hash = TxHash::hash_for_network(&t2, &NetworkMode::Mainnet);
         let block = make_block(5, vec![cb, t1, t2]);
@@ -1410,6 +1416,52 @@ mod tests {
         t1.hash = TxHash::hash_for_network(&t1, &NetworkMode::Mainnet);
         let block = make_block(5, vec![cb, t1]);
         assert!(BlockValidator::validate_network_layer(&block).is_ok());
+    }
+
+    #[test]
+    fn network_layer_charges_none_gas_contract_tx_its_default() {
+        // DoS regression: a hostile miner packs contract txs that declare NO
+        // gas_limit. The executor runs each at DEFAULT_CONTRACT_GAS_LIMIT, so
+        // the block-gas validator MUST charge the same — otherwise None counted
+        // as 0, the block passed the cap, yet execution burned 10M per tx.
+        let per_tx = ConsensusParams::DEFAULT_CONTRACT_GAS_LIMIT;
+        // Enough None-gas contract txs to blow past MAX_BLOCK_GAS at 10M each.
+        let n = (ConsensusParams::MAX_BLOCK_GAS / per_tx) as usize + 2;
+        let mut txs = vec![make_coinbase(5)];
+        for i in 0..n {
+            let mut t = make_regular_tx(&format!("none_gas_{:04x}", i));
+            t.tx_type = TxType::ContractCall;
+            t.gas_limit = None; // <-- the attack: implicit budget
+            t.hash = TxHash::hash_for_network(&t, &NetworkMode::Mainnet);
+            txs.push(t);
+        }
+        let block = make_block(5, txs);
+        let r = BlockValidator::validate_network_layer(&block);
+        assert!(
+            r.is_err(),
+            "None-gas contract txs summing past MAX_BLOCK_GAS must be rejected"
+        );
+        assert!(
+            format!("{:?}", r).to_lowercase().contains("gas"),
+            "rejection reason should mention gas: {:?}",
+            r
+        );
+    }
+
+    #[test]
+    fn network_layer_ignores_gas_on_non_contract_tx() {
+        // A Transfer never runs the VM, so a stray gas_limit must NOT count
+        // against the block gas budget (effective_gas_limit returns 0 for it).
+        let cb = make_coinbase(5);
+        let mut t1 = make_regular_tx("transfer_gas");
+        t1.tx_type = TxType::Transfer;
+        t1.gas_limit = Some(ConsensusParams::MAX_BLOCK_GAS * 4); // absurd, but non-VM
+        t1.hash = TxHash::hash_for_network(&t1, &NetworkMode::Mainnet);
+        let block = make_block(5, vec![cb, t1]);
+        assert!(
+            BlockValidator::validate_network_layer(&block).is_ok(),
+            "gas on a non-contract tx must not count toward MAX_BLOCK_GAS"
+        );
     }
 
     #[test]
