@@ -22,13 +22,30 @@ consensus/privacy/hardening commits this session are correctness-clean. This is 
 
 ## 2. Confirmed root causes (each observed in live logs)
 
-1. **Difficulty divergence on out-of-order blocks (the hard blocker).**
-   A behind node receives, via gossip, blocks far ahead of its tip. It computes the
-   *expected* difficulty from **its own (un-synced) ancestry** and rejects them:
-   `difficulty mismatch: claimed 4096 expected 3892`. Difficulty is only correct if blocks
-   are validated **in order** (genesis→tip), because each block's target depends on the
-   preceding window. A node that cannot IBD in order can therefore validate *nothing* it
-   receives out of order.
+1. **Difficulty divergence (THE hard blocker — root-caused to the exact line 2026-07-04).**
+   With W1–W4 landed, header-sync now works end-to-end (traced live: a fresh node SENDS
+   `GetHeaders` from its tip, the peer SERVES 512 headers, the node RECEIVES 512). But the
+   next block is still rejected `difficulty mismatch: claimed 4096 expected 3892`, so IBD
+   never advances past the tip. **Exact cause:** `FullNode::build_retarget_from_canonical`
+   (full_node.rs:966) computes the difficulty using
+   `dag_width = block_store.blocks_at_height(h)` — the **full DAG width** at each height.
+   A partially-synced node does not have the same set of blocks at each height as a full
+   node (missing red/side siblings, and its stored `selected_parent` edges may differ), so
+   its `dag_width` — and therefore the difficulty it computes for the next block — diverges
+   from what the miner produced. Both the miner (full_node.rs:1668) and validation (via
+   `self.retarget`, seeded from the same function) go through `build_retarget_from_canonical`,
+   so the divergence is entirely inside that one function's dependence on non-deterministic
+   store contents (`blocks_at_height`).
+   **Fix (consensus-formula change → external review + a testnet wipe):** make the width a
+   DETERMINISTIC function of the selected chain, identical across sync states — the natural
+   choice is the GHOSTDAG mergeset blue count (`ghostdag.get_blue_score(b) −
+   get_blue_score(selected_parent(b))`), which is computed on acceptance and identical on all
+   nodes that hold the block. This requires threading `ghostdag` into
+   `build_retarget_from_canonical` (+ its 3 callers + the test) and re-mining genesis (the
+   difficulty *values* change). NOTE: the header's own `blue_score` field is 0 for mined
+   blocks (GHOSTDAG assigns the real value on acceptance), so use `ghostdag.get_blue_score`,
+   not `header.blue_score`. Verify: a fresh node IBDs a tall single-miner chain with zero
+   `difficulty mismatch`.
 
 2. **Header-sync is emitted but does not reliably pull.**
    The daemon sends `GetHeaders{from_hash=best, count=512}` every 6 s
