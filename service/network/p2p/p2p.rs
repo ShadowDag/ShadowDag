@@ -2340,7 +2340,14 @@ impl P2P {
                 // A malicious peer could send 2000 header hashes to trigger
                 // 2000 outbound GetBlock requests in one message.
                 let mut seen = std::collections::HashSet::new();
-                let max_requests = 64; // Max blocks to request per Headers message
+                // Max blocks to request per Headers message. Bounded to cap the
+                // outbound amplification a hostile peer can trigger, but large
+                // enough that IBD backfill isn't throttled to a crawl — a node
+                // catching up a tall chain needs to pull the served range (up to
+                // 512 hashes) in a few round-trips, not 64 at a time (W3). The
+                // GetBlock serve side is itself bounded (512/tick), so this is
+                // safe. (was 64 — too slow to close a large gap.)
+                let max_requests = 512; // one full served Headers range per round
                 let mut request_count = 0;
                 for hash in hashes {
                     if request_count >= max_requests {
