@@ -950,7 +950,21 @@ impl FullNode {
         chain.reverse(); // oldest → newest
         let mut next_diff = genesis_diff;
         for b in &chain {
-            let dag_width = (block_store.blocks_at_height(b.header.height) as u64).max(1);
+            // CONSENSUS-CRITICAL: the per-block DAG-rate weight MUST be a
+            // deterministic function of the block itself, identical on every
+            // node regardless of which side/red blocks it happens to hold.
+            // `blocks_at_height` counts blocks in the LOCAL store at this
+            // height, which differs between a full miner (holds all siblings)
+            // and a syncing follower (holds only the selected chain) — so the
+            // two computed DIFFERENT next-block difficulties for the same
+            // canonical tip and the follower rejected the miner's block forever
+            // ("difficulty mismatch"), stalling IBD. `parents.len()` is committed
+            // in the header and covered by PoW (see
+            // BlockHeader::resolved_selected_parent), so it is identical on all
+            // nodes and still scales with merge width (a block merging W tips
+            // contributes W), preserving the DAG-rate correction while making it
+            // deterministic across sync states.
+            let dag_width = (b.header.parents.len() as u64).max(1);
             next_diff = engine.on_new_block(BlockTimeRecord {
                 height: b.header.height,
                 timestamp: b.header.timestamp,
@@ -2974,6 +2988,115 @@ mod tests {
         let (_e2, d2) = FullNode::build_retarget_from_canonical(&store, &net, "b2");
         assert_eq!(d1, d2, "rebuild must be deterministic for the same canonical chain");
         assert!(d1 > 0, "difficulty must be positive");
+    }
+
+    #[test]
+    fn retarget_is_independent_of_dag_width_the_node_happens_to_hold() {
+        // CONSENSUS-CRITICAL REGRESSION GUARD. Two nodes with the IDENTICAL
+        // selected chain but a DIFFERENT set of same-height side/red blocks MUST
+        // compute the SAME next difficulty. Before the fix, difficulty depended
+        // on `blocks_at_height` (the LOCAL DAG width a node happens to hold), so
+        // a full miner (holds all siblings) and a syncing follower (holds only
+        // the selected chain) diverged wildly — this exact test produced 242 vs
+        // 11 — and the follower rejected the miner's next block forever with
+        // "difficulty mismatch", stalling IBD past the tip. The fix keys the
+        // DAG-rate weight on the block's own PoW-committed `parents.len()`, which
+        // is identical on every node. This test asserts the two agree.
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::block::block::Block;
+        use crate::domain::block::block_body::BlockBody;
+        use crate::domain::block::block_header::BlockHeader;
+        use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
+        use crate::infrastructure::storage::rocksdb::core::db::NodeDB;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let id = CTR.fetch_add(1, Ordering::Relaxed);
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        // A block with an explicit parent list; `selected_parent` is the first
+        // entry, so the canonical walk still follows the linear selected chain.
+        let mk = |hash: &str, height: u64, parents: &[&str], ts: u64| Block {
+            header: BlockHeader {
+                version: 1,
+                hash: hash.into(),
+                parents: parents.iter().map(|p| p.to_string()).collect(),
+                merkle_root: "m".into(),
+                timestamp: ts,
+                nonce: 0,
+                difficulty: 1000,
+                height,
+                blue_score: height,
+                selected_parent: parents.first().map(|p| p.to_string()),
+                utxo_commitment: None,
+                extra_nonce: 0,
+                receipt_root: None,
+                state_root: None,
+            },
+            body: BlockBody { transactions: vec![] },
+        };
+        const N: u64 = 80;
+        // OFF-TARGET spacing (3s ≫ 1s target) so the retarget's DAG-rate
+        // correction (retarget.rs:199) is NOT floored to a no-op: with slower
+        // blocks blended_time is large, so dividing it by the DAG-to-chain
+        // ratio actually changes the computed difficulty. This is the regime the
+        // live chain runs in — an on-target chain would hide the bug.
+        const DT: u64 = 3;
+        // Extra red siblings per height on the "full" node only. Under the OLD
+        // (buggy) code these inflated its blocks_at_height and diverged it from
+        // the follower; under the fix they are irrelevant (never walked).
+        const SIBS: u64 = 2;
+        let build = |label: &str, with_siblings: bool| -> u64 {
+            let path = format!(
+                "{}/rt_width_{}_{}_{}_{}",
+                std::env::temp_dir().display(),
+                label,
+                std::process::id(),
+                uniq,
+                id
+            );
+            let store = BlockStore::new(NodeDB::new(&path).unwrap().shared()).unwrap();
+            assert!(store.save_block(&mk("h0", 0, &[], 1000)));
+            assert!(store.save_block(&mk("h1", 1, &["h0"], 1000 + DT)));
+            let mut prev = "h1".to_string();
+            let mut prev_prev = "h0".to_string();
+            for h in 2..=N {
+                let hash = format!("h{}", h);
+                // Each selected block MERGES its grandparent (both on the selected
+                // chain, present in BOTH stores) → parents.len()=2, so the DAG-rate
+                // path is ACTIVE and, being header-committed, deterministic.
+                assert!(store.save_block(&mk(
+                    &hash,
+                    h,
+                    &[prev.as_str(), prev_prev.as_str()],
+                    1000 + h * DT
+                )));
+                if with_siblings {
+                    for s in 0..SIBS {
+                        // Red siblings at this height (full node only). Same-height
+                        // as the selected block, so ONLY blocks_at_height sees them.
+                        let sib = format!("r{}_{}", h, s);
+                        assert!(store.save_block(&mk(&sib, h, &[prev.as_str()], 1000 + h * DT)));
+                    }
+                }
+                prev_prev = prev;
+                prev = hash;
+            }
+            let tip = format!("h{}", N);
+            let (_e, d) =
+                FullNode::build_retarget_from_canonical(&store, &NetworkMode::Regtest, &tip);
+            d
+        };
+        let full_node_diff = build("full", true);
+        let syncing_diff = build("partial", false);
+        assert_eq!(
+            full_node_diff, syncing_diff,
+            "next difficulty must be a pure function of the SELECTED chain, not the \
+             set of same-height siblings a node happens to have downloaded — a \
+             syncing node otherwise rejects the miner's next block forever"
+        );
     }
 
     #[test]

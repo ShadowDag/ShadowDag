@@ -22,30 +22,45 @@ consensus/privacy/hardening commits this session are correctness-clean. This is 
 
 ## 2. Confirmed root causes (each observed in live logs)
 
-1. **Difficulty divergence (THE hard blocker — root-caused to the exact line 2026-07-04).**
+1. **Difficulty divergence (THE hard blocker — ROOT-CAUSED, CONFIRMED, and FIXED 2026-07-04).**
    With W1–W4 landed, header-sync now works end-to-end (traced live: a fresh node SENDS
    `GetHeaders` from its tip, the peer SERVES 512 headers, the node RECEIVES 512). But the
-   next block is still rejected `difficulty mismatch: claimed 4096 expected 3892`, so IBD
-   never advances past the tip. **Exact cause:** `FullNode::build_retarget_from_canonical`
-   (full_node.rs:966) computes the difficulty using
-   `dag_width = block_store.blocks_at_height(h)` — the **full DAG width** at each height.
-   A partially-synced node does not have the same set of blocks at each height as a full
-   node (missing red/side siblings, and its stored `selected_parent` edges may differ), so
-   its `dag_width` — and therefore the difficulty it computes for the next block — diverges
-   from what the miner produced. Both the miner (full_node.rs:1668) and validation (via
-   `self.retarget`, seeded from the same function) go through `build_retarget_from_canonical`,
-   so the divergence is entirely inside that one function's dependence on non-deterministic
-   store contents (`blocks_at_height`).
-   **Fix (consensus-formula change → external review + a testnet wipe):** make the width a
-   DETERMINISTIC function of the selected chain, identical across sync states — the natural
-   choice is the GHOSTDAG mergeset blue count (`ghostdag.get_blue_score(b) −
-   get_blue_score(selected_parent(b))`), which is computed on acceptance and identical on all
-   nodes that hold the block. This requires threading `ghostdag` into
-   `build_retarget_from_canonical` (+ its 3 callers + the test) and re-mining genesis (the
-   difficulty *values* change). NOTE: the header's own `blue_score` field is 0 for mined
-   blocks (GHOSTDAG assigns the real value on acceptance), so use `ghostdag.get_blue_score`,
-   not `header.blue_score`. Verify: a fresh node IBDs a tall single-miner chain with zero
-   `difficulty mismatch`.
+   next block was still rejected `difficulty mismatch: claimed 4096 expected 3892`, so IBD
+   never advanced past the tip. The divergence was inside
+   `FullNode::build_retarget_from_canonical` — both the miner (recompute_virtual_chain, which
+   rebuilds `self.retarget` on every accept) and tip-extension validation
+   (`expected_difficulty_for_block`, via `self.retarget.ema_difficulty()`) go through it, so a
+   syncing node computing a different value for the same tip rejected the miner's next block
+   forever.
+
+   **Confirmed cause: `dag_width = block_store.blocks_at_height(h)`.** That fed the retarget's
+   per-block `dag_block_count` from the LOCAL store's count of blocks at each height — which
+   differs between a full miner (holds all red/side siblings) and a syncing follower (holds
+   only the selected chain). Via the DAG-rate path (retarget.rs:199, active when
+   `dag_blocks_in_window > n`) that changed the computed difficulty. A first unit test with
+   *on-target* (1 s) spacing wrongly suggested width-independence — but that regime floors the
+   correction (`blended_time` is already 1, so dividing by the ratio and `.max(1)` is a
+   no-op). Re-running with *off-target* (3 s) spacing and width 3-vs-1 produced **242 vs 11**
+   from the identical selected chain — a 22× divergence — proving the mechanism. The live
+   `4096 vs 3892` is the mild real-world version (small real width gap).
+
+   **Fix (LANDED): key the DAG-rate weight on `b.header.parents.len()`.** The parents list is
+   committed in the header and covered by PoW (see `BlockHeader::resolved_selected_parent`),
+   so it is IDENTICAL on every node regardless of which siblings it holds, yet still scales
+   with merge width (a block merging W tips contributes W) — preserving the DAG-rate
+   correction while making it deterministic across sync states. No GHOSTDAG threading needed
+   (the earlier `ghostdag.get_blue_score` idea is unnecessary — and `header.blue_score` is 0
+   for mined blocks anyway). Guard test:
+   `retarget_is_independent_of_dag_width_the_node_happens_to_hold` (full_node.rs) builds two
+   stores with the identical selected chain but different siblings and asserts equal
+   difficulty; it FAILED pre-fix (242 vs 11) and PASSES post-fix. Full suite: 2267 pass.
+   **CONSENSUS-FORMULA CHANGE:** difficulty *values* change vs the old formula, so this is a
+   hard fork — requires a genesis re-mine / testnet wipe on deploy, and merits external
+   review of the economic behavior (single-miner linear chain → parents.len()≈1 → pure chain
+   retarget; wide DAG → correction scales with merge width). No live chain not already being
+   reset is broken by it (docker testnet is wiped; frozen mainnet is being relaunched).
+   **Verify live:** wipe a follower and confirm it IBDs a tall single-miner chain to the tip
+   with zero `difficulty mismatch`.
 
 2. **Header-sync is emitted but does not reliably pull.**
    The daemon sends `GetHeaders{from_hash=best, count=512}` every 6 s
