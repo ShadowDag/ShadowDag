@@ -1,14 +1,58 @@
 # ShadowDAG — Mainnet Readiness
 
 Honest status of the codebase for a public **mainnet with real economic value**.
-Last updated by the security-hardening pass (2026-06).
+Last updated: 2026-07 (consensus/privacy/sync hardening pass).
 
 ## TL;DR
 
-- **Testnet / internal / demo:** READY. Builds, all tests pass, binaries run.
-- **Mainnet with real money:** NOT YET. Requires (1) the two deferred consensus/
-  storage redesigns below, (2) an independent external crypto + consensus audit,
-  and (3) weeks of public testnet. None of these can be self-certified.
+- **Testnet / internal / demo:** READY for a level, always-online set of nodes.
+  Builds, ~2266 tests pass, binaries run, the 3-seed testnet converges and stays
+  converged; a fee-bearing wallet tx mines and confirms.
+- **Mainnet with real money:** NOT YET. Blockers, in order: (1) **fresh/far-behind
+  node convergence** on a tall chain (design spec written, partly implemented —
+  see below); (2) the consensus/storage redesigns (A1/G state-root-in-PoW, A3
+  fee-attribution, ST1); (3) an independent external crypto + consensus audit;
+  (4) weeks of public **multi-miner** testnet. None can be self-certified.
+
+## 2026-07 session — consensus / privacy / sync hardening (all pushed, tests green)
+
+Fixed + regression-tested this pass (correctness verified: all synced nodes agree
+on the chain, no fork):
+
+- **Coinbase fee accounting** — the mempool never evicted mined txs, so templates
+  re-claimed fees execution would drop → every coinbase invalid → followers
+  rejected the chain (froze the testnet at height 1659). Fixed (evict on accept +
+  `is_tx_seen` template filter + idempotent recompute).
+- **Selected-parent walks** — blocks stored with `selected_parent=None` truncated
+  every fork-choice/recovery walk; now resolved to the GHOSTDAG max-blue parent.
+- **Recovery replayed ALL blocks** (incl. red/side coinbases = inflation past the
+  cap); now replays only the selected chain, tie-stable with the live tip.
+- **Gas-limit DoS** — a `None`-gas contract tx counted as 0 in the block-gas cap
+  but executed at 10M; unified via `effective_gas_limit`.
+- **GHOSTDAG selected parent, ring size 5→11, anti-eclipse /16 subnet caps, WAL
+  fsync at the commit boundary.**
+- **Adversarial re-review** of the above caught + fixed a HIGH recovery tie-flip
+  and a MEDIUM mempool over-eviction it had introduced.
+- **DISPROVEN a claimed inflation gap (A2):** the live path mints only the selected
+  chain (strictly-increasing heights), so per-height issuance ≤ the schedule — no
+  per-block over-issuance. (The real vector was the recovery replay, now fixed.)
+
+**Remaining #1 convergence blocker — a fresh/far-behind node cannot join a TALL
+chain.** Root-caused live and partly fixed (W1 in-order batch processing, W2
+orphan-resolution capped to the reorg window, W3 512-block backfill cap, W4
+defer ancestry-difficulty for orphans). Live result: still stalls because forward
+header-sync delivers 0 Headers under load — the remaining hard core. Full design
++ remaining work in
+[`docs/superpowers/specs/2026-07-03-sync-protocol-convergence-redesign.md`](superpowers/specs/2026-07-03-sync-protocol-convergence-redesign.md).
+**Needs a 2-node regtest harness to iterate in seconds + focused header-sync
+tracing — not more live redeploy cycles.**
+
+**GEN1 — genesis metadata contradiction (launch-time fix):** `GENESIS_MESSAGE`
+says `2026-01-01` but `GENESIS_TIMESTAMP` = `1_735_689_600` (2025-01-01);
+testnet has the same mismatch. Genesis is re-mined once at launch with the FINAL
+date (any change re-derives the nonce + hash), so align the message/timestamp and
+re-mine `MAINNET/TESTNET_GENESIS_NONCE` + `_HASH` then (`mine_genesis` +
+`pow_genesis_tests`). Doing it now against a placeholder date is throwaway.
 
 ## What was done (security hardening)
 
