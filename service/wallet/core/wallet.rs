@@ -36,8 +36,17 @@ const SALT_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
 const DUST_LIMIT: u64 = 546;
 /// Ring size for confidential sends: 1 real + (CONF_RING_SIZE-1) decoys.
-/// Must be ≥ the consensus minimum ring size (4) enforced by RingValidator.
-const CONF_RING_SIZE: usize = 5;
+///
+/// Sourced from the crypto layer's DEFAULT_RING_SIZE (11) so the wallet and
+/// the ring primitives can never drift. A larger ring is a direct privacy win
+/// (each input hides among 11 outputs, not 5) and a UNIFORM size across wallets
+/// avoids the ring-size fingerprint that a small/odd ring would leak on-chain.
+/// Must stay within the consensus bounds [MIN_RING_SIZE=4, MAX_RING_SIZE=64]
+/// enforced by verify_confidential_tx. On a young chain with fewer than
+/// CONF_RING_SIZE-1 confidential outputs, build_confidential_send returns a
+/// clean "not enough decoys on-chain yet" error until the anonymity set grows.
+const CONF_RING_SIZE: usize =
+    crate::engine::privacy::ringct::ring_signature::DEFAULT_RING_SIZE;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct WalletAddress {
@@ -1324,7 +1333,9 @@ mod tests {
             )
             .unwrap();
         };
-        for _ in 0..8 {
+        // Seed enough confidential outputs for a full CONF_RING_SIZE ring
+        // (needs CONF_RING_SIZE-1 = 10 decoys per input), with margin.
+        for _ in 0..24 {
             rec(&set, Scalar::random(&mut OsRng) * G, Scalar::from(9u64) * h + Scalar::random(&mut OsRng) * G);
         }
 
@@ -1399,7 +1410,9 @@ mod tests {
             .unwrap();
         };
         // Seed decoys.
-        for _ in 0..8 {
+        // Seed enough confidential outputs for a full CONF_RING_SIZE ring
+        // (needs CONF_RING_SIZE-1 = 10 decoys per input), with margin.
+        for _ in 0..24 {
             rec(&set, Scalar::random(&mut OsRng) * G, Scalar::from(9u64) * h + Scalar::random(&mut OsRng) * G);
         }
 
@@ -1447,6 +1460,15 @@ mod tests {
         let tx = a
             .build_confidential_send(&b.confidential_receive_address().unwrap(), 60, 0, &set)
             .unwrap();
+        // PRIVACY (A7): every input hides in a full CONF_RING_SIZE ring.
+        for inp in &tx.inputs {
+            assert_eq!(
+                inp.ring_members.as_ref().map(|r| r.len()),
+                Some(CONF_RING_SIZE),
+                "wallet must build a {}-member ring per input",
+                CONF_RING_SIZE
+            );
+        }
         let mut seen = HashSet::new();
         assert!(
             verify_confidential_tx(&tx, &set, &net, &mut seen).is_ok(),
