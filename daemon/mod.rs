@@ -78,7 +78,20 @@ const ERR_STALE_TEMPLATE: &str = "stale template";
 /// place it, dropped it, and looped forever.
 #[inline]
 fn orphan_worth_resolving(orphan_height: u64, best_height: u64) -> bool {
-    orphan_height.saturating_add(crate::engine::consensus::reorg::FINALITY_DEPTH) > best_height
+    use crate::engine::consensus::reorg::FINALITY_DEPTH;
+    // Resolve (fetch missing parents + buffer) only orphans within the reorg
+    // window on BOTH sides of our tip:
+    //   • not deeper than FINALITY_DEPTH below the tip (anti-thrash for old forks)
+    //   • not further than FINALITY_DEPTH ABOVE the tip.
+    // The upper bound is the W2 fix: a FAR-ahead orphan must be reached by
+    // FORWARD header-sync (batched, in order), NOT a backward orphan-walk —
+    // that walk is O(gap) round-trips and, for a far-behind node joining a tall
+    // chain, floods the event loop (each orphan re-requests its parent), which
+    // starves forward header-sync so the node never catches up. A far-ahead
+    // block also can't reorg us (that needs a > MAX_REORG_DEPTH rollback, which
+    // is rejected regardless), so orphan-walking toward it is pure waste.
+    orphan_height.saturating_add(FINALITY_DEPTH) > best_height
+        && orphan_height <= best_height.saturating_add(FINALITY_DEPTH)
 }
 
 /// How far above our tip a gossiped block must be before we drop it CHEAPLY
@@ -1534,6 +1547,21 @@ mod tests {
         assert!(
             !orphan_worth_resolving(1659u64.saturating_sub(500), 1659),
             "ancient orphan (below finality) ignored — anti-thrash"
+        );
+        // W2: a FAR-ahead orphan must NOT trigger a backward orphan-walk — it is
+        // reached by forward header-sync. Resolving it floods a far-behind node
+        // and it can't reorg us anyway.
+        assert!(
+            orphan_worth_resolving(1659 + 200, 1659),
+            "an orphan exactly FINALITY_DEPTH above the tip is still a competitor"
+        );
+        assert!(
+            !orphan_worth_resolving(1659 + 201, 1659),
+            "an orphan beyond FINALITY_DEPTH above the tip is left for forward header-sync"
+        );
+        assert!(
+            !orphan_worth_resolving(9 + 500, 9),
+            "a fresh node must NOT orphan-walk far-ahead gossip (the flood cause)"
         );
     }
 
