@@ -1076,17 +1076,27 @@ impl DaemonNode {
             // (the previous pre-commitment behaviour), which is reorg-independent
             // and never false-FATALs.
             slog_info!("daemon", "utxo_count_integrity_check");
-            let expected = self.compute_expected_utxo_count();
             let actual = utxo_count;
-            let tolerance = std::cmp::max(expected / 100, 10);
-            let diff = expected.abs_diff(actual);
-            if expected > 0 && diff > tolerance {
-                slog_warn!("daemon", "utxo_count_mismatch_rebuilding", expected => expected, actual => actual);
-                self.utxo_set.clear_all();
-                self.replay_blocks()?;
-                slog_info!("daemon", "utxo_rebuilt", entries => self.utxo_set.count_utxos());
-            } else {
-                slog_info!("daemon", "utxo_ok_count_based", actual => actual, expected => expected);
+            match self.compute_expected_utxo_count() {
+                Some(expected) => {
+                    let tolerance = std::cmp::max(expected / 100, 10);
+                    let diff = expected.abs_diff(actual);
+                    if expected > 0 && diff > tolerance {
+                        slog_warn!("daemon", "utxo_count_mismatch_rebuilding", expected => expected, actual => actual);
+                        self.utxo_set.clear_all();
+                        self.replay_blocks()?;
+                        slog_info!("daemon", "utxo_rebuilt", entries => self.utxo_set.count_utxos());
+                    } else {
+                        slog_info!("daemon", "utxo_ok_count_based", actual => actual, expected => expected);
+                    }
+                }
+                None => {
+                    // Selected-chain walk broken (corruption) — cannot compute a
+                    // trustworthy expected count. Skip the heuristic rather than
+                    // trigger a rebuild that would itself fail; leave the store
+                    // as-is and let the operator decide to --reindex.
+                    slog_warn!("daemon", "utxo_integrity_check_skipped_broken_selected_chain", actual => actual);
+                }
             }
         } else {
             slog_info!("daemon", "utxo_ok", entries => utxo_count);
@@ -1217,32 +1227,36 @@ impl DaemonNode {
         Ok(())
     }
 
-    /// Replay blocks along the selected-parent chain to rebuild UTXO state.
+    /// Replay the SELECTED (virtual) chain to rebuild UTXO state.
     ///
-    /// Walks the selected-parent chain from best_tip back to genesis, reverses
-    /// the order, then replays in GHOSTDAG order using apply_block_dag_ordered().
-    /// This produces identical UTXO state to the live path (which also uses
-    /// GHOSTDAG ordering), unlike the previous height-sorted approach which
-    /// could diverge when parallel blocks exist at the same height.
-    /// Replay ALL blocks from genesis to tip to rebuild the UTXO set.
+    /// Walks the selected-parent chain from the best tip back to genesis
+    /// (recovery_blocks), then replays oldest→newest via
+    /// apply_block_dag_ordered — the SAME set the live recompute_virtual_chain
+    /// applies, so recovery reproduces the live UTXO state exactly.
     ///
-    /// BUG FIX: The previous implementation walked the `selected_parent`
-    /// chain from best tip backwards. This only worked if GHOSTDAG had
-    /// set `selected_parent` on every block in the chain AND persisted
-    /// it to BlockStore. In practice, `selected_parent` was `None` for
-    /// most blocks (GHOSTDAG assigns it after block storage), so the
-    /// walk stopped after just 1 block — causing the infamous
-    /// "utxo_replay_complete blocks=1" crash on every non-clean restart.
-    ///
-    /// The fix iterates ALL blocks sorted by height (same as
-    /// `compute_expected_utxo_count`) and applies each one's
-    /// transactions via `apply_block_dag_ordered`. This is correct
-    /// for a BlockDAG because `apply_block_dag_ordered` handles
-    /// DAG-specific ordering internally.
+    /// Replaying every stored block (the old behavior) also applied red /
+    /// side-branch coinbases, minting UTXOs the canonical chain never created
+    /// = inflation. The historical "utxo_replay_complete blocks=1" crash that
+    /// pushed the old code to all-blocks was a DIFFERENT bug — stored
+    /// selected_parent was None so the walk stopped after one hop; that is now
+    /// fixed by BlockHeader::resolved_selected_parent (falls back to the first
+    /// PoW-covered parent), so the selected-chain walk is safe again.
     fn replay_blocks(&self) -> Result<(), NodeError> {
         slog_info!("daemon", "utxo_replay_start");
 
-        let blocks = self.block_store.get_all_blocks_sorted_by_height();
+        // Replay the SELECTED chain only (not every stored block) so red /
+        // side-branch coinbases are never minted into the UTXO set — that
+        // would create spendable coins beyond the canonical emission
+        // (inflation). Matches the live recompute_virtual_chain apply set.
+        // A broken walk (corruption) is fatal — refuse to rebuild an incorrect
+        // ledger; the operator must --reindex.
+        let blocks = self.recovery_blocks().ok_or_else(|| {
+            NodeError::Init(
+                "cannot rebuild UTXO set: the selected-parent chain is broken (missing ancestor \
+                 or cycle). Run with --reindex or delete the data directory to force a full rebuild."
+                    .into(),
+            )
+        })?;
 
         if blocks.is_empty() {
             slog_info!("daemon", "utxo_replay_complete", blocks => 0);
@@ -1268,11 +1282,69 @@ impl DaemonNode {
         Ok(())
     }
 
-    /// Compute expected UTXO count by walking all blocks.
-    /// For each block: outputs created - inputs spent = net change.
-    /// Sum all net changes = expected unspent UTXO count.
-    fn compute_expected_utxo_count(&self) -> usize {
-        let blocks = self.block_store.get_all_blocks_sorted_by_height();
+    /// Walk the SELECTED (virtual) chain from `tip` back to genesis via each
+    /// block's resolved selected parent, returning blocks oldest→newest.
+    ///
+    /// CONSENSUS-CRITICAL: recovery must reflect the SAME set of blocks the
+    /// live apply path (recompute_virtual_chain) applies — the selected chain
+    /// ONLY. Replaying every stored block (get_all_blocks_sorted_by_height)
+    /// also applies RED / side-branch coinbases, minting UTXOs that the
+    /// canonical chain never created → spendable coins beyond the per-height
+    /// emission schedule (inflation past MAX_SUPPLY on any DAG with width).
+    ///
+    /// Returns None if the walk is broken (missing ancestor or a cycle) so the
+    /// caller can fall back to the full block set rather than rebuild an
+    /// INCOMPLETE UTXO state. Pure over `get_block` for unit testing.
+    fn selected_chain_from(
+        tip: Option<String>,
+        get_block: impl Fn(&str) -> Option<crate::domain::block::block::Block>,
+    ) -> Option<Vec<crate::domain::block::block::Block>> {
+        let mut cursor = tip?;
+        let mut chain: Vec<crate::domain::block::block::Block> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            if !seen.insert(cursor.clone()) {
+                return None; // cycle — corrupt topology
+            }
+            let block = get_block(&cursor)?; // missing ancestor → broken walk
+            let parent = block.header.resolved_selected_parent();
+            chain.push(block);
+            match parent {
+                Some(p) if !p.is_empty() => cursor = p,
+                _ => break, // reached genesis
+            }
+        }
+        chain.reverse(); // oldest → newest (GHOSTDAG apply order)
+        Some(chain)
+    }
+
+    /// The blocks recovery should replay/count: the SELECTED chain, walked
+    /// from the best tip back to genesis.
+    ///
+    /// Returns None when the walk is broken (a missing ancestor or a cycle =
+    /// block-store corruption). We deliberately do NOT fall back to the full
+    /// stored set: that would replay every red / side-branch coinbase and mint
+    /// UTXOs beyond the canonical emission (inflation), which is strictly worse
+    /// than refusing to proceed. Callers surface the corruption and ask the
+    /// operator to --reindex. DAG + GHOSTDAG are rebuilt earlier in recovery
+    /// (Step B), so an intact store always yields a complete walk here.
+    fn recovery_blocks(&self) -> Option<Vec<crate::domain::block::block::Block>> {
+        let tip = {
+            let tips = self.ghostdag.get_tips();
+            self.full_node
+                .select_best_tip(&tips)
+                .or_else(|| self.block_store.get_best_hash())
+        };
+        Self::selected_chain_from(tip, |h| self.block_store.get_block(h))
+    }
+
+    /// Compute expected UTXO count by walking the SELECTED chain (matching the
+    /// live UTXO state). For each block: outputs created - inputs spent = net
+    /// change. Sum all net changes = expected unspent UTXO count. None when the
+    /// selected chain can't be walked (corruption) — the caller then SKIPS the
+    /// count check rather than triggering a rebuild that would also fail.
+    fn compute_expected_utxo_count(&self) -> Option<usize> {
+        let blocks = self.recovery_blocks()?;
         let mut total_created: usize = 0;
         let mut total_spent: usize = 0;
 
@@ -1290,7 +1362,7 @@ impl DaemonNode {
             }
         }
 
-        total_created.saturating_sub(total_spent)
+        Some(total_created.saturating_sub(total_spent))
     }
 
     fn print_banner(&self) {
@@ -1463,6 +1535,99 @@ mod tests {
         };
         let out = collect_forward_headers(tip, Some(100), 512, at);
         assert_eq!(out, vec!["n1".to_string(), "n2".to_string()]);
+    }
+
+    /// Minimal block for selected-chain-walk tests: only hash, parents, and
+    /// selected_parent matter to selected_chain_from.
+    fn mock_block(hash: &str, parents: &[&str], selected: Option<&str>) -> crate::domain::block::block::Block {
+        use crate::domain::block::block::Block;
+        use crate::domain::block::block_body::BlockBody;
+        use crate::domain::block::block_header::BlockHeader;
+        let mut h = BlockHeader::new_with_defaults(
+            1,
+            hash.to_string(),
+            parents.iter().map(|p| p.to_string()).collect(),
+            "m".into(),
+            0,
+            0,
+            1,
+            1,
+        );
+        h.selected_parent = selected.map(String::from);
+        Block {
+            header: h,
+            body: BlockBody { transactions: vec![] },
+        }
+    }
+
+    #[test]
+    fn selected_chain_excludes_red_side_blocks() {
+        // g -> b1 -> b2(tip) is the selected chain. r2 is a RED sibling of b2
+        // (shares parent b1) that must NOT be replayed — its coinbase would
+        // otherwise mint inflationary UTXOs on recovery.
+        let g = mock_block("g", &[], None);
+        let b1 = mock_block("b1", &["g"], Some("g"));
+        let b2 = mock_block("b2", &["b1"], Some("b1"));
+        let r2 = mock_block("r2", &["b1"], Some("b1")); // red, not on the tip's chain
+        let store = |h: &str| match h {
+            "g" => Some(g.clone()),
+            "b1" => Some(b1.clone()),
+            "b2" => Some(b2.clone()),
+            "r2" => Some(r2.clone()),
+            _ => None,
+        };
+        let chain = DaemonNode::selected_chain_from(Some("b2".to_string()), store).unwrap();
+        let hashes: Vec<&str> = chain.iter().map(|b| b.header.hash.as_str()).collect();
+        assert_eq!(hashes, vec!["g", "b1", "b2"], "oldest→newest selected chain only");
+        assert!(!hashes.contains(&"r2"), "red side block must be excluded");
+    }
+
+    #[test]
+    fn selected_chain_uses_first_parent_when_selected_parent_none() {
+        // submitblock stores selected_parent=None; resolved_selected_parent
+        // falls back to the first PoW-covered parent, so the walk still works.
+        let g = mock_block("g", &[], None);
+        let b1 = mock_block("b1", &["g"], None);
+        let b2 = mock_block("b2", &["b1"], None);
+        let store = |h: &str| match h {
+            "g" => Some(g.clone()),
+            "b1" => Some(b1.clone()),
+            "b2" => Some(b2.clone()),
+            _ => None,
+        };
+        let chain = DaemonNode::selected_chain_from(Some("b2".to_string()), store).unwrap();
+        let hashes: Vec<&str> = chain.iter().map(|b| b.header.hash.as_str()).collect();
+        assert_eq!(hashes, vec!["g", "b1", "b2"]);
+    }
+
+    #[test]
+    fn selected_chain_broken_walk_returns_none_for_fallback() {
+        // A missing ancestor must return None so recovery falls back to the
+        // full block set (never rebuilds an INCOMPLETE UTXO state).
+        let b2 = mock_block("b2", &["missing"], Some("missing"));
+        let store = |h: &str| match h {
+            "b2" => Some(b2.clone()),
+            _ => None, // "missing" is absent
+        };
+        assert!(DaemonNode::selected_chain_from(Some("b2".to_string()), store).is_none());
+    }
+
+    #[test]
+    fn selected_chain_cycle_returns_none() {
+        // Corrupt topology (a -> b -> a) must not loop forever.
+        let a = mock_block("a", &["b"], Some("b"));
+        let b = mock_block("b", &["a"], Some("a"));
+        let store = |h: &str| match h {
+            "a" => Some(a.clone()),
+            "b" => Some(b.clone()),
+            _ => None,
+        };
+        assert!(DaemonNode::selected_chain_from(Some("a".to_string()), store).is_none());
+    }
+
+    #[test]
+    fn selected_chain_no_tip_is_none() {
+        assert!(DaemonNode::selected_chain_from(None, |_| None).is_none());
     }
 
     #[test]
