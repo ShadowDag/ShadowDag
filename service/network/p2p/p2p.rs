@@ -217,6 +217,68 @@ fn release_inbound_ip(ip: &str) {
     }
 }
 
+/// Max concurrent inbound connections from a single /16 subnet (anti-eclipse).
+///
+/// The per-IP cap (MAX_PEERS_PER_IP) is bypassed by an attacker who controls a
+/// whole /16 range: each distinct IP passes the per-IP check, so one subnet can
+/// still fill every inbound slot and eclipse the node. Capping per /16 closes
+/// that while leaving room for a handful of honest hosts behind one ISP block.
+const MAX_INBOUND_PER_SUBNET: u32 = 8;
+
+/// Live inbound connection count per /16 subnet (anti-eclipse). Parallel to
+/// INBOUND_CONN_PER_IP but keyed on `subnet_16` so a single subnet cannot
+/// monopolize inbound slots using many distinct IPs.
+static INBOUND_CONN_PER_SUBNET: Lazy<Arc<PlMutex<HashMap<String, u32>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(HashMap::new())));
+
+/// Register one inbound connection for `ip`'s /16 subnet and report whether the
+/// subnet is still WITHIN `MAX_INBOUND_PER_SUBNET`. ALWAYS increments (pair with
+/// exactly one `release_inbound_subnet`), so a caller that rejects on `false`
+/// can release immediately without desyncing the counter — and a whitelisted
+/// peer that bypasses the cap is still tracked and released symmetrically.
+fn register_inbound_subnet(ip: &str) -> bool {
+    use crate::service::network::p2p::peer_diversity::subnet_16;
+    let subnet = subnet_16(ip);
+    let mut map = INBOUND_CONN_PER_SUBNET.lock();
+    let entry = map.entry(subnet).or_insert(0);
+    *entry += 1;
+    *entry <= MAX_INBOUND_PER_SUBNET
+}
+
+/// Release one live inbound connection for `ip`'s /16 subnet (call exactly once
+/// per successful `try_register_inbound_subnet`).
+fn release_inbound_subnet(ip: &str) {
+    use crate::service::network::p2p::peer_diversity::subnet_16;
+    let subnet = subnet_16(ip);
+    let mut map = INBOUND_CONN_PER_SUBNET.lock();
+    if let Some(c) = map.get_mut(&subnet) {
+        *c = c.saturating_sub(1);
+        if *c == 0 {
+            map.remove(&subnet);
+        }
+    }
+}
+
+/// Whether dialing `addr` would exceed the outbound /16-subnet diversity limit
+/// (MAX_PEERS_PER_SUBNET) among currently-connected OUTBOUND peers. Stateless:
+/// derived from the live CONNECTED_OUTBOUND set, so it needs no register/release
+/// bookkeeping. Anti-eclipse: outbound links must span distinct subnets, or an
+/// attacker owning one /16 can occupy every outbound slot and control the
+/// node's view of the chain.
+fn outbound_subnet_would_saturate(addr: &str) -> bool {
+    let set = CONNECTED_OUTBOUND.lock();
+    subnet_saturated_among(addr, set.iter())
+}
+
+/// Pure core of `outbound_subnet_would_saturate`: whether `addr`'s /16 already
+/// holds `MAX_PEERS_PER_SUBNET` of the given connected addresses.
+fn subnet_saturated_among<'a>(addr: &str, connected: impl Iterator<Item = &'a String>) -> bool {
+    use crate::service::network::p2p::peer_diversity::{subnet_16, MAX_PEERS_PER_SUBNET};
+    let subnet = subnet_16(addr);
+    let count = connected.filter(|a| subnet_16(a) == subnet).count();
+    count >= MAX_PEERS_PER_SUBNET
+}
+
 /// Deserialize untrusted wire bytes with a byte limit equal to the input
 /// length. Plain `bincode::deserialize` reads an inner collection's length
 /// prefix and may pre-allocate `Vec::with_capacity(len)` from it — a single
@@ -1041,6 +1103,22 @@ impl P2P {
                         continue;
                     }
 
+                    // ── Anti-eclipse: cap live inbound connections per /16 ──
+                    // Closes the per-IP bypass where an attacker owning a whole
+                    // /16 opens many distinct IPs. Whitelisted trusted seeds
+                    // bypass the cap (a node must always accept its seeds); they
+                    // are still counted + released symmetrically.
+                    if !register_inbound_subnet(&ban_key)
+                        && !crate::service::network::dos_guard::is_whitelisted(&ban_key)
+                    {
+                        release_inbound_subnet(&ban_key);
+                        release_inbound_ip(&ban_key);
+                        pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        slog_warn!("p2p", "rejected_too_many_per_subnet", addr => &peer_addr);
+                        drop(s);
+                        continue;
+                    }
+
                     slog_info!("p2p", "inbound_connection", addr => &peer_addr);
                     // Query fresh peer list on each connection (fix stale snapshot)
                     let peers_snapshot = peer_manager.get_addr_list_limited(100);
@@ -1051,6 +1129,7 @@ impl P2P {
                         let result = Self::handle_peer_connection(s, false, magic, peers_snapshot);
                         pending_clone.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         release_inbound_ip(&ip_key);
+                        release_inbound_subnet(&ip_key);
                         if let Err(e) = result {
                             slog_error!("p2p", "peer_connection_error", addr => &peer_addr, error => &e.to_string());
                         }
@@ -2394,6 +2473,17 @@ impl P2P {
         if is_self_addr(&addr) {
             return;
         }
+        // Anti-eclipse: keep OUTBOUND links spread across /16 subnets so an
+        // attacker owning one subnet can't occupy every outbound slot and
+        // control our view of the chain. Whitelisted trusted seeds are exempt
+        // (a node must always be able to reach its configured seeds); the limit
+        // therefore constrains only untrusted peers.
+        if !crate::service::network::dos_guard::is_whitelisted(&addr)
+            && outbound_subnet_would_saturate(&addr)
+        {
+            slog_debug!("p2p", "outbound_subnet_diversity_skip", addr => &addr);
+            return;
+        }
         // Reserve the slot up front (atomic check-and-insert) so two callers
         // can't both dial the same peer.
         {
@@ -2543,6 +2633,61 @@ mod tests {
         }
         // Over-release must not underflow/panic.
         release_inbound_ip(ip);
+    }
+
+    #[test]
+    fn inbound_per_subnet_cap_enforced_and_released() {
+        // Distinct IPs in the SAME /16 (198.51.x) — the per-IP cap would let
+        // each in, but the per-subnet cap must bound the /16 total. Unique
+        // second octet keeps this test off other tests' subnets.
+        let ip = |h: u32| format!("198.51.{}.{}", h / 250, h % 250);
+        // Register up to the subnet cap: each returns "within cap" == true.
+        for i in 0..MAX_INBOUND_PER_SUBNET {
+            assert!(
+                register_inbound_subnet(&ip(i)),
+                "within subnet cap must be within-limit"
+            );
+        }
+        // The next distinct IP in the same /16 is OVER the cap.
+        assert!(
+            !register_inbound_subnet(&ip(999)),
+            "over subnet cap must report over-limit"
+        );
+        // That over-cap call still incremented (always-increment semantics), so
+        // release it to stay symmetric, then release the in-cap registrations.
+        release_inbound_subnet(&ip(999));
+        // Releasing one frees a subnet slot.
+        release_inbound_subnet(&ip(0));
+        assert!(
+            register_inbound_subnet(&ip(1000)),
+            "subnet slot freed after release"
+        );
+        // Clean up the whole subnet so it does not leak across the suite.
+        release_inbound_subnet(&ip(1000));
+        for i in 1..MAX_INBOUND_PER_SUBNET {
+            release_inbound_subnet(&ip(i));
+        }
+        release_inbound_subnet(&ip(0)); // idempotent / no underflow
+    }
+
+    #[test]
+    fn outbound_subnet_diversity_limits_same_16() {
+        use crate::service::network::p2p::peer_diversity::MAX_PEERS_PER_SUBNET;
+        // Two peers already connected from the same /16 (192.0.2.x) saturate it.
+        let connected: std::collections::HashSet<String> = (0..MAX_PEERS_PER_SUBNET)
+            .map(|i| format!("192.0.2.{}:19333", i + 1))
+            .collect();
+        assert!(
+            subnet_saturated_among("192.0.2.200:19333", connected.iter()),
+            "a third peer in the same /16 must be blocked"
+        );
+        // A peer in a DIFFERENT /16 is allowed (diversity, not a global cap).
+        assert!(
+            !subnet_saturated_among("198.51.100.9:19333", connected.iter()),
+            "a distinct /16 must still be dialable"
+        );
+        // Empty connected set never saturates.
+        assert!(!subnet_saturated_among("192.0.2.1:19333", std::iter::empty()));
     }
 
     #[test]
