@@ -82,10 +82,25 @@ consensus/privacy/hardening commits this session are correctness-clean. This is 
   connection exempt from slow-peer teardown during IBD; raise/parameterize the per-`Headers`
   request cap (`p2p.rs`, currently 64) so backfill isn't throttled. *Accept:* sustained
   backfill throughput ≫ current; the sync link survives a full IBD.
-- **W4 — In-order apply guarantee.** Ensure the follower applies fetched blocks strictly in
-  height order so difficulty always validates; never surface a difficulty-mismatch for a
-  block that is simply ahead of an incomplete chain (treat as "need parent", not "invalid").
-  *Accept:* zero `difficulty mismatch` rejections during a healthy IBD.
+- **W4 — Defer ancestry-dependent difficulty for orphans (the hard blocker).**
+  *Confirmed mechanism (full_node.rs):* `process_block_inner` runs Phase 1
+  (`validate_block_full_with_difficulty`, line ~591) BEFORE the Phase 2 parent-existence /
+  orphan check (line ~608). For a block far ahead of our tip (`height > best + 1`),
+  `expected_difficulty_for_block` (line 538-543) returns OUR TIP's EMA difficulty — wrong,
+  because the block's real target is fixed by ITS OWN un-synced ancestry. So a valid future
+  block is hard-rejected `difficulty mismatch: claimed X expected Y` and NEVER reaches the
+  orphan buffer. A behind node therefore cannot ingest anything ahead of it, and IBD stalls.
+  *Fix (consensus-critical refactor — external review):* split validation into
+  (i) SELF-CONSISTENT checks that need only the block (format, PoW-vs-claimed-difficulty,
+  merkle, signatures) — always run, reject junk; and (ii) ANCESTRY-DEPENDENT difficulty
+  (claimed vs expected-from-parent-window) — run ONLY once the block's parents are present.
+  A block with missing parents passes (i), is buffered as an orphan (bounded pool, PoW
+  already checked so no junk-flood), and (ii) is validated when it is re-processed after its
+  parents arrive in order (before it is ever applied). Difficulty is thus ALWAYS validated
+  pre-apply — just deferred for not-yet-connectable blocks. *Accept:* zero `difficulty
+  mismatch` rejections during a healthy IBD; a fresh node ingests the miner's chain in order.
+  *Do NOT* simply reorder Phase 1/Phase 2 wholesale (breaks the stateless-Phase-1 invariant
+  and could buffer non-PoW junk) — split the checks as above.
 - **W5 — Bootstrap hygiene.** Provision the DNS seeds (or de-prioritize unresolved names and
   back off their retry) so logs aren't flooded and dial effort goes to reachable peers.
   *Accept:* no `Name or service not known` spam; fresh node connects within seconds.
