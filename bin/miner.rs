@@ -195,6 +195,28 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+
+        // LIVENESS THROTTLE: at 1-second timestamp granularity, R4 forces every
+        // block to ts >= max_parent_ts + 1, so producing blocks faster than one
+        // per wall-second drifts the tip timestamp AHEAD of real time. Once the
+        // drift exceeds the consensus future window (MAX_FUTURE_TIMESTAMP_SECS
+        // = 120s, dag_shield.rs) the next block is rejected "future timestamp"
+        // and mining stalls. Bound the drift well below that limit: if the
+        // required floor is already too far ahead of our clock, wait for the
+        // clock to catch up rather than stamp a block every honest node will
+        // reject. This caps sustained selected-chain throughput at ~1 block/sec
+        // — an inherent limit of 1-second timestamps; true higher BPS needs
+        // millisecond timestamps (a separate consensus change).
+        const TS_DRIFT_BUDGET_SECS: u64 = 30; // << 120s window, robust to peer clock skew
+        if template.min_timestamp > now_secs.saturating_add(TS_DRIFT_BUDGET_SECS) {
+            let wait = (template.min_timestamp - now_secs - TS_DRIFT_BUDGET_SECS).min(15);
+            slog_info!("miner", "timestamp_drift_throttle",
+                min_timestamp => template.min_timestamp,
+                now => now_secs,
+                wait_secs => wait);
+            std::thread::sleep(Duration::from_secs(wait.max(1)));
+            continue; // refetch a fresh template with an advanced wall-clock
+        }
         let timestamp = now_secs.max(template.min_timestamp);
 
         // â•گâ•گâ•گ STEP 2: Build coinbase transaction â•گâ•گâ•گ
