@@ -526,6 +526,9 @@ impl DaemonNode {
                 // batch share an ancestor.
                 let mut requested_parents: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
+                // Whether any block was accepted this batch → fsync the WAL once
+                // at the end (durable block-commit boundary).
+                let mut accepted_this_batch = false;
                 for (peer_id, block) in blocks.iter() {
                     // Skip duplicate hashes within the same drained batch.
                     // Multiple peers may relay the same block nearly simultaneously.
@@ -552,6 +555,7 @@ impl DaemonNode {
                     match self.full_node.process_block_from_peer(block, peer_id) {
                         Ok(()) => {
                             total_blocks_processed += 1;
+                            accepted_this_batch = true;
                             slog_info!("daemon", "block_processed", hash => hash_prefix, height => block.header.height, txs => block.body.transactions.len());
 
                             // Notify finality manager with real DAG data
@@ -700,6 +704,20 @@ impl DaemonNode {
                 if processed_count < blocks.len() {
                     let remaining: Vec<_> = blocks.into_iter().skip(processed_count).collect();
                     requeue_pending_blocks(remaining);
+                }
+
+                // DURABLE COMMIT BOUNDARY: fsync the WAL once per accepted batch.
+                // Sub-writes (block/UTXO/GHOSTDAG on the shared DB) use async WAL
+                // for throughput; without a periodic sync an OS/power crash could
+                // drop just-accepted blocks. One amortized fsync per batch makes
+                // accepted state durable without an fsync per write. Recovery
+                // rebuilds any un-synced tail from peers, and TolerateCorrupted-
+                // TailRecords keeps the node bootable regardless. Contract state
+                // lives in a separate DB (flushed by its own path when used).
+                if accepted_this_batch {
+                    if let Err(e) = self.db.flush_wal(true) {
+                        slog_warn!("daemon", "wal_flush_failed", error => &e.to_string());
+                    }
                 }
             }
 
