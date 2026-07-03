@@ -540,6 +540,15 @@ impl DaemonNode {
             // Take only BLOCK_BATCH_LIMIT items; return excess to the queue
             // so they're processed on the next tick (no message loss under load).
             let mut blocks = drain_pending_blocks();
+            // Process in HEIGHT ORDER (W1). Blocks arrive out of order — a peer
+            // serves a whole 512-block range concurrently, so height 11 can land
+            // before height 10. Applying 11 first makes it a needless orphan
+            // (parent 10 not yet applied), which cascades into an orphan-pool
+            // flood that starves IBD catch-up. Sorting the batch by height, and
+            // keeping the LOWEST via split_off, means each block's parent is
+            // applied before it, so the requested range connects in sequence
+            // with no orphan churn. Cheap for the near-tip case (few blocks).
+            blocks.sort_by_key(|(_, b)| b.header.height);
             let excess_blocks = if blocks.len() > BLOCK_BATCH_LIMIT {
                 blocks.split_off(BLOCK_BATCH_LIMIT)
             } else {
