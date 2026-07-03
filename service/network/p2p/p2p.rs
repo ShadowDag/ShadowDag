@@ -2327,6 +2327,7 @@ impl P2P {
 
             // ── Headers: validate hash list and queue blocks for download ─
             P2PMessage::Headers { ref hashes } => {
+                slog_info!("p2p", "headers_received", from => peer, count => hashes.len());
                 if let Err(pe) = validate_headers_list(hashes) {
                     DOS_GUARD.add_ban_score_cat(
                         peer,

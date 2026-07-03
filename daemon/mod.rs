@@ -530,6 +530,8 @@ impl DaemonNode {
             if last_sync_req.elapsed() >= std::time::Duration::from_secs(6) {
                 last_sync_req = Instant::now();
                 let from_hash = self.block_store.get_best_hash().unwrap_or_default();
+                slog_info!("daemon", "header_sync_request_sent",
+                    from => from_hash.get(..16).unwrap_or(&from_hash));
                 push_outbound(P2PMessage::GetHeaders {
                     from_hash,
                     count: 512,
@@ -824,6 +826,11 @@ impl DaemonNode {
                     let hashes = collect_forward_headers(&from_hash, from_height, count, |h| {
                         self.block_store.get_block_hashes_at_height(h)
                     });
+                    slog_info!("daemon", "header_serve",
+                        to => &req_peer,
+                        from => from_hash.get(..16).unwrap_or(&from_hash),
+                        from_height => &from_height.map(|h| h.to_string()).unwrap_or_else(|| "none".into()),
+                        served => hashes.len());
                     if !hashes.is_empty() {
                         push_outbound_to_peer(&req_peer, P2PMessage::Headers { hashes });
                     }
