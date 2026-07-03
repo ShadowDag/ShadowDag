@@ -572,13 +572,23 @@ impl DaemonNode {
                             // duplicate (ZERO fees), so every coinbase claiming
                             // its fee is invalid and followers reject the whole
                             // chain from that block on (testnet froze at 1659).
-                            // Conflict-skipped txs are double-spends of the
-                            // winning tx, so evicting them too is correct.
+                            //
+                            // Evict ONLY txs actually applied on the SELECTED
+                            // chain — those with a tx_seen marker (self.utxo_set
+                            // shares full_node's store). A block returning Ok is
+                            // merely ACCEPTED INTO THE DAG; a losing side-branch
+                            // block's txs were never applied, so evicting them by
+                            // raw block-body membership would silently drop
+                            // still-unconfirmed txs from this node's mempool with
+                            // no reorg re-injection (a censorship/liveness gap).
+                            // This mirrors the is_tx_seen template filter, so
+                            // eviction and template selection stay consistent.
                             let confirmed: Vec<String> = block
                                 .body
                                 .transactions
                                 .iter()
                                 .filter(|t| !t.is_coinbase())
+                                .filter(|t| self.utxo_set.is_tx_seen(&t.hash))
                                 .map(|t| t.hash.clone())
                                 .collect();
                             if !confirmed.is_empty() {
@@ -1329,12 +1339,20 @@ impl DaemonNode {
     /// operator to --reindex. DAG + GHOSTDAG are rebuilt earlier in recovery
     /// (Step B), so an intact store always yields a complete walk here.
     fn recovery_blocks(&self) -> Option<Vec<crate::domain::block::block::Block>> {
-        let tip = {
+        // Use the PERSISTED best_hash — the exact tip the live path selected
+        // and applied. The live recompute_virtual_chain uses
+        // should_keep_current_tip_on_tie, which on a 3-way (cumulative_work,
+        // blue_score, chain_height) tie KEEPS the current tip regardless of
+        // hash, then persists it. Recomputing here via select_best_tip (whose
+        // tiebreak is lower-hash, with no current-tip context) could pick the
+        // OTHER sibling, so the rebuilt UTXO set would reflect a different
+        // chain than the stored best_hash → post-recovery ledger/tip divergence
+        // (a consensus-split risk on any width>1 DAG with a genuine tie).
+        // Fall back to select_best_tip only when nothing is persisted yet.
+        let tip = self.block_store.get_best_hash().or_else(|| {
             let tips = self.ghostdag.get_tips();
-            self.full_node
-                .select_best_tip(&tips)
-                .or_else(|| self.block_store.get_best_hash())
-        };
+            self.full_node.select_best_tip(&tips)
+        });
         Self::selected_chain_from(tip, |h| self.block_store.get_block(h))
     }
 
