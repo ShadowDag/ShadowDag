@@ -27,6 +27,8 @@ use shadowdag::domain::block::block_header::BlockHeader;
 use shadowdag::domain::block::merkle_tree::MerkleTree;
 use shadowdag::domain::transaction::transaction::{Transaction, TxOutput, TxType};
 use shadowdag::engine::mining::algorithms::shadowhash::{meets_difficulty, shadow_hash_raw_full};
+use shadowdag::engine::mining::algorithms::umbrahash;
+use shadowdag::engine::mining::pow::pow_validator::PowValidator;
 use shadowdag::errors::NodeError;
 use shadowdag::{slog_error, slog_fatal, slog_info, slog_warn};
 use std::io::{BufRead, Read, Write};
@@ -104,6 +106,23 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         eprintln!("[miner] --gpu requested but this binary was built WITHOUT the 'gpu-opencl' feature.");
         eprintln!("[miner] Rebuild: cargo build --release --features gpu-opencl --bin shadowdag-miner");
         eprintln!("[miner] Falling back to CPU mining.");
+    }
+
+    // UmbraHash PoW mode (memory-hard, version-gated). Opt-in via --pow=umbra;
+    // default stays ShadowHash so existing chains and tests are unaffected. In
+    // this mode the miner produces version-UMBRA_POW_VERSION blocks and the node
+    // validates them via the UmbraHash path.
+    let umbra_mode = parse_flag(args, "--pow", "shadow").eq_ignore_ascii_case("umbra");
+    let block_version: u32 = if umbra_mode {
+        umbrahash::UMBRA_POW_VERSION
+    } else {
+        2 // ms-timestamp era (ShadowHash)
+    };
+    if umbra_mode {
+        println!(
+            "[miner] PoW = UmbraHash (memory-hard, block version {}); CPU cache-verify mining",
+            block_version
+        );
     }
 
     let rpc_port = match network {
@@ -341,20 +360,39 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         let max_mine_nonce = u64::MAX - 1;
         let nonces_per_thread = (max_mine_nonce as u128 / threads as u128) as u64;
 
-        // GPU search when active (built with gpu-opencl AND a device initialized);
-        // otherwise CPU. Structured as a match (not a labeled block) so the default
-        // build carries no unused-label warning.
+        // UmbraHash CPU search (opt-in). Returns (nonce, hash=result, mix_hash).
+        let umbra_result: Option<(u64, String, String)> = if umbra_mode {
+            let hh = umbrahash::header_hash(
+                block_version, height, timestamp, 0, difficulty, &merkle_root, &parents,
+            );
+            let target = PowValidator::difficulty_to_target_bytes(difficulty);
+            let cache = umbrahash::cache_for_epoch(umbrahash::epoch_of(height));
+            umbra_mine_cpu(&cache, &hh, &target, threads, &found, &hash_count, &start, height)
+        } else {
+            None
+        };
+
+        // ShadowHash search (default). GPU path serves ShadowHash only; both are
+        // skipped in UmbraHash mode. Structured as a match (not a labeled block)
+        // so the default build carries no unused-label warning.
         #[cfg(feature = "gpu-opencl")]
-        let gpu_outcome: Option<Option<(u64, String)>> = gpu_miner.as_ref().map(|g| {
-            gpu_search(
-                g, height, timestamp, difficulty, &merkle_root, &parents, &found, &hash_count,
-                &start,
-            )
-        });
+        let gpu_outcome: Option<Option<(u64, String)>> = if umbra_mode {
+            None
+        } else {
+            gpu_miner.as_ref().map(|g| {
+                gpu_search(
+                    g, height, timestamp, difficulty, &merkle_root, &parents, &found, &hash_count,
+                    &start,
+                )
+            })
+        };
         #[cfg(not(feature = "gpu-opencl"))]
         let gpu_outcome: Option<Option<(u64, String)>> = None;
 
-        let result: Option<(u64, String)> = match gpu_outcome {
+        let result: Option<(u64, String)> = if umbra_mode {
+            None
+        } else {
+            match gpu_outcome {
             Some(outcome) => outcome,
             None => {
                 use rayon::prelude::*;
@@ -413,17 +451,28 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
                 }
                 })
             }
+            }
         };
 
         let elapsed = start.elapsed().as_secs_f64();
         let total_hashes = hash_count.load(Ordering::Relaxed);
         let hashrate = total_hashes as f64 / elapsed.max(0.001);
 
-        let (nonce, hash) = match result {
-            Some(r) => r,
-            None => {
-                slog_warn!("miner", "no_valid_nonce_found");
-                continue;
+        let (nonce, hash, mix_hash) = if umbra_mode {
+            match umbra_result {
+                Some(r) => r,
+                None => {
+                    slog_warn!("miner", "no_valid_nonce_found");
+                    continue;
+                }
+            }
+        } else {
+            match result {
+                Some((n, h)) => (n, h, String::new()),
+                None => {
+                    slog_warn!("miner", "no_valid_nonce_found");
+                    continue;
+                }
             }
         };
 
@@ -444,7 +493,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         // â•گâ•گâ•گ STEP 4: Build full block and submit â•گâ•گâ•گ
         let block = Block {
             header: BlockHeader {
-                version: 2, // ms-timestamp era (matches GENESIS_VERSION)
+                version: block_version, // 2 = ShadowHash; UMBRA_POW_VERSION = UmbraHash
                 hash: hash.clone(),
                 parents,
                 merkle_root,
@@ -458,7 +507,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
                 extra_nonce: 0,
                 receipt_root: None,
                 state_root: None,
-                mix_hash: String::new(),
+                mix_hash, // hex(mix) for UmbraHash, empty for ShadowHash
             },
             body: BlockBody {
                 transactions: block_txs,
@@ -1044,6 +1093,64 @@ fn parse_flag_opt(args: &[String], name: &str) -> Result<Option<String>, String>
 
 fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+/// UmbraHash CPU nonce search (rayon across threads). Each thread runs the
+/// cache-only `hashimoto_light` (no 1 GiB dataset) and returns the first
+/// `(nonce, hash=result_hex, mix_hash=mix_hex)` whose result <= target. This is
+/// the memory-hard, ASIC-resistant PoW; a resident-dataset / GPU path would be
+/// faster but this is correct and needs no multi-GB generation.
+#[allow(clippy::too_many_arguments)]
+fn umbra_mine_cpu(
+    cache: &[u8],
+    header_hash: &[u8; 32],
+    target: &[u8; 32],
+    threads: usize,
+    found: &Arc<AtomicBool>,
+    hash_count: &Arc<AtomicU64>,
+    start: &Instant,
+    height: u64,
+) -> Option<(u64, String, String)> {
+    use rayon::prelude::*;
+    let max_nonce = u64::MAX - 1;
+    let per_thread = (max_nonce as u128 / threads as u128) as u64;
+    (0..threads).into_par_iter().find_map_any(|tid| {
+        let s = tid as u64 * per_thread;
+        let e = if tid == threads - 1 {
+            max_nonce
+        } else {
+            s.saturating_add(per_thread).min(max_nonce)
+        };
+        let mut nonce = s;
+        loop {
+            if found.load(Ordering::Relaxed) {
+                return None;
+            }
+            let (mix, result) =
+                umbrahash::hashimoto_light(cache, umbrahash::DATASET_BYTES, header_hash, nonce);
+            hash_count.fetch_add(1, Ordering::Relaxed);
+            // result <= target (big-endian) → valid solution.
+            if result <= *target {
+                found.store(true, Ordering::Relaxed);
+                return Some((nonce, hex::encode(result), hex::encode(mix)));
+            }
+            if nonce == e {
+                return None;
+            }
+            nonce = nonce.wrapping_add(1);
+            if tid == 0 && nonce.wrapping_sub(s).is_multiple_of(2_000) {
+                let el = start.elapsed().as_secs_f64();
+                let tot = hash_count.load(Ordering::Relaxed);
+                print!(
+                    "\r[umbra-mining] height={} hashes={} rate={:.0} H/s   ",
+                    height,
+                    tot,
+                    tot as f64 / el.max(0.001)
+                );
+                let _ = std::io::stdout().flush();
+            }
+        }
+    })
 }
 
 /// GPU nonce search for one block template. Loops OpenCL batches until a nonce

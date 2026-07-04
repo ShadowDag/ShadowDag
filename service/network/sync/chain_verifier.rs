@@ -149,17 +149,13 @@ impl ChainVerifier {
             // nonce, extra_nonce, difficulty, merkle_root, parents) — all
             // available in the header without the block body.
             {
-                use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
-                let recomputed = shadow_hash_raw_full(
-                    header.version,
-                    header.height,
-                    header.timestamp,
-                    header.nonce,
-                    header.extra_nonce,
-                    header.difficulty,
-                    &header.merkle_root,
-                    &header.parents,
-                );
+                // Version-gated: UmbraHash (v>=UMBRA_POW_VERSION) recomputes the
+                // hashimoto result; older recomputes shadow_hash — matching what
+                // a valid block's identity hash is in each era.
+                let recomputed =
+                    crate::engine::mining::pow::pow_validator::PowValidator::recompute_identity_hash(
+                        header,
+                    );
                 if recomputed != header.hash {
                     return ChainVerifyResult::InvalidPoW {
                         height: header.height,

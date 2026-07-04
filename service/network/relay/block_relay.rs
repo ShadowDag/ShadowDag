@@ -220,18 +220,10 @@ impl BlockRelay {
         // header.hash to any low value that "meets target" without doing real
         // work, defeating this admission gate and cheaply churning/evicting
         // honest orphans (the pool is bounded + evicts oldest).
-        use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
         use crate::engine::mining::pow::pow_validator::PowValidator;
-        let computed = shadow_hash_raw_full(
-            block.header.version,
-            block.header.height,
-            block.header.timestamp,
-            block.header.nonce,
-            block.header.extra_nonce,
-            block.header.difficulty,
-            &block.header.merkle_root,
-            &block.header.parents,
-        );
+        // Version-gated identity recompute (UmbraHash result for v>=3, else
+        // shadow_hash) binds header.hash to the header content (anti-spoof).
+        let computed = PowValidator::recompute_identity_hash(&block.header);
         if computed != block.header.hash {
             slog_warn!("relay", "orphan_rejected_hash_mismatch",
                 claimed => &block.header.hash[..block.header.hash.len().min(16)],

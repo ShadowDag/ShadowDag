@@ -126,6 +126,30 @@ impl PowValidator {
         Ok(result_hex)
     }
 
+    /// Recompute the identity hash a VALID block of this header would carry,
+    /// version-gated: UmbraHash (version >= UMBRA_POW_VERSION) → the hashimoto
+    /// result (hex); older → shadow_hash. Cheap admission gates use this to bind
+    /// `header.hash` to the header content (anti-spoof). NOTE: for UmbraHash this
+    /// generates/uses the epoch cache (memoized) + one hashimoto_light.
+    pub fn recompute_identity_hash(header: &BlockHeader) -> String {
+        if header.version >= umbrahash::UMBRA_POW_VERSION {
+            let hh = umbrahash::header_hash(
+                header.version, header.height, header.timestamp, header.extra_nonce,
+                header.difficulty, &header.merkle_root, &header.parents,
+            );
+            let cache = umbrahash::cache_for_epoch(umbrahash::epoch_of(header.height));
+            let (_mix, result) =
+                umbrahash::hashimoto_light(&cache, umbrahash::DATASET_BYTES, &hh, header.nonce);
+            hex::encode(result)
+        } else {
+            use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
+            shadow_hash_raw_full(
+                header.version, header.height, header.timestamp, header.nonce,
+                header.extra_nonce, header.difficulty, &header.merkle_root, &header.parents,
+            )
+        }
+    }
+
     /// Validate a header independently (recompute hash from fields including extra_nonce)
     pub fn validate_header(header: &BlockHeader) -> bool {
         if header.version >= umbrahash::UMBRA_POW_VERSION {
@@ -200,7 +224,7 @@ impl PowValidator {
 
     /// Convert difficulty to a 256-bit target: target = MAX_TARGET / difficulty.
     /// Returns 32-byte big-endian representation.
-    fn difficulty_to_target_bytes(difficulty: u64) -> [u8; 32] {
+    pub fn difficulty_to_target_bytes(difficulty: u64) -> [u8; 32] {
         if difficulty == 0 {
             return [0xFF; 32]; // MAX_TARGET
         }

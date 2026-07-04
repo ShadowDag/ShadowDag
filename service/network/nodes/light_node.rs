@@ -84,18 +84,9 @@ impl LightNode {
         // 2. PoW: recompute hash from header fields, then check target.
         //    Without recomputation, an attacker can send a fake hash
         //    that meets PoW but doesn't correspond to the header content.
-        use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
         use crate::engine::mining::pow::pow_validator::PowValidator;
-        let recomputed = shadow_hash_raw_full(
-            header.version,
-            header.height,
-            header.timestamp,
-            header.nonce,
-            header.extra_nonce,
-            header.difficulty,
-            &header.merkle_root,
-            &header.parents,
-        );
+        // Version-gated identity recompute (UmbraHash result for v>=3, else shadow_hash).
+        let recomputed = PowValidator::recompute_identity_hash(header);
         if recomputed != header.hash {
             return false;
         }
