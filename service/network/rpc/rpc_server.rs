@@ -2024,6 +2024,15 @@ impl RpcServer {
                 )
             }
         };
+        // mix_hash: present only for UmbraHash (v>=UMBRA_POW_VERSION) blocks;
+        // absent/empty for ShadowHash. Preserving it is REQUIRED — the UmbraHash
+        // PoW check recomputes the mix and rejects a block whose stored mix_hash
+        // doesn't match, so dropping it here fails every UmbraHash submission.
+        let mix_hash: String = block_json
+            .get("mix_hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         let parents: Vec<String> = block_json
             .get("parents")
@@ -2177,7 +2186,7 @@ impl RpcServer {
                 extra_nonce,
                 receipt_root: None,
                 state_root: None,
-                mix_hash: String::new(),
+                mix_hash,
             },
             body: BlockBody { transactions },
         };

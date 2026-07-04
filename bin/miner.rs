@@ -897,6 +897,7 @@ fn rpc_submit_block(addr: &str, block: &Block, bearer_token: Option<&str>) -> Su
         "merkle_root":  block.header.merkle_root,
         "parents":      block.header.parents,
         "version":      block.header.version,
+        "mix_hash":     block.header.mix_hash, // UmbraHash PoW mix (empty for ShadowHash)
         "transactions": txs_json,
     });
 
