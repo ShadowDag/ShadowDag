@@ -3,9 +3,10 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// Memory-hard PoW core — Ethash-derived (the algorithm family used by Ethereum
-// (Ethash) and Ergo (Autolykos)): GPU-first, strongly ASIC-resistant, and — the
-// crucial part for a 10 BPS chain — cheaply verifiable.
+// UmbraHash — ShadowDAG's memory-hard PoW ("umbra" = the darkest part of a
+// shadow). Ethash-derived (the algorithm family used by Ethereum (Ethash) and
+// Ergo (Autolykos)): GPU-first, strongly ASIC-resistant, and — the crucial part
+// for a 10 BPS chain — cheaply verifiable.
 //
 // The asymmetry: MINING needs a large dataset (GiBs) resident in VRAM, accessed
 // randomly and DEPENDENTLY (each read's address depends on the previous read's

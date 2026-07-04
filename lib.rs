@@ -192,8 +192,8 @@ pub mod engine {
         pub mod algorithms {
             pub mod anti_asic;
             pub mod hash_mix;
-            pub mod memory_hard;
             pub mod shadowhash;
+            pub mod umbrahash;
         }
         pub mod gpu {
             // Real OpenCL GPU miner for ShadowHash. Feature-gated: the default
