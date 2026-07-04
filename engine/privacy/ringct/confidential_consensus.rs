@@ -15,8 +15,10 @@
 use crate::config::node::node_config::NetworkMode;
 use crate::domain::transaction::transaction::Transaction;
 use crate::domain::transaction::tx_hash::TxHash;
-use crate::domain::utxo::utxo_set::UtxoSet;
+use crate::domain::transaction::tx_validator::TxValidator;
+use crate::domain::utxo::utxo_set::{utxo_key, UtxoSet};
 use crate::engine::privacy::confidential::pedersen::RealPedersenCommitment;
+use curve25519_dalek::scalar::Scalar;
 use crate::engine::privacy::confidential::range_proof;
 use crate::engine::privacy::ringct::dual_clsag;
 use crate::engine::privacy::ringct::ring_signature::{MAX_RING_SIZE, MIN_RING_SIZE};
@@ -28,6 +30,132 @@ use std::collections::HashSet;
 
 fn err(msg: String) -> StorageError {
     StorageError::Other(msg)
+}
+
+/// Parse a canonical 32-byte Ristretto scalar from hex.
+fn scalar_from_hex(h: &str) -> Option<Scalar> {
+    let bytes = hex::decode(h).ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    Option::<Scalar>::from(Scalar::from_canonical_bytes(arr))
+}
+
+/// Verify a SHIELD transaction: TRANSPARENT inputs -> CONFIDENTIAL outputs.
+///
+/// The entry point into the RingCT pool. Each transparent input's PUBLIC amount
+/// `A_i` is read from the UTXO SET (never the tx) and turned into the input
+/// pseudo-commitment `C_in = A_i·H + r_i·G` (ShadowDAG convention: amount on H,
+/// blinding on G — see pedersen.rs). The blinding `r_i` (the tx's
+/// `shield_blinding`) is the ONLY input-side value the tx supplies; it cannot
+/// move value once `A_i` is chain-fixed, only balance the output blindings.
+/// Outputs are confidential (amount==0 + range proof). The existing homomorphic
+/// balance `Σ C_in == Σ C_out + fee·H` then forces `Σ A_i = Σ a_j + fee`.
+///
+/// PURE: reads the UTXO set, no mutation. Double-spend of the transparent inputs
+/// (mark-spent) is enforced on the APPLY path, not here. SECURITY: consensus-
+/// critical / inflation-risk — external cryptographic review required before
+/// mainnet. See docs/superpowers/specs/2026-07-04-shield-tx-design.md.
+pub fn verify_shield_tx(
+    tx: &Transaction,
+    utxo_set: &UtxoSet,
+    network: &NetworkMode,
+) -> Result<(), StorageError> {
+    if tx.inputs.is_empty() || tx.outputs.is_empty() {
+        return Err(err(format!("shield tx {} empty inputs/outputs", tx.hash)));
+    }
+
+    // Transparent inputs are PUBLIC spends — Ed25519 ownership, NOT ring/CLSAG.
+    if !TxValidator::verify_signatures_for_network(tx, network) {
+        return Err(err(format!("shield tx {}: invalid input signature(s)", tx.hash)));
+    }
+    let signing_msg = TxHash::signing_message_for_network(tx, network);
+
+    // ── Inputs: reconstruct C_in = A_i·H + r_i·G from the CHAIN amount ──
+    let mut input_commitments = Vec::with_capacity(tx.inputs.len());
+    let mut sum_in: u64 = 0;
+    let mut seen_outpoints: HashSet<String> = HashSet::new();
+    for input in &tx.inputs {
+        // Type separation (inflation V3): a shield input must NOT carry any
+        // ring/confidential field — it is a plain transparent spend.
+        if input.key_image.is_some()
+            || input.ring_members.is_some()
+            || input.ring_signature.is_some()
+            || input.ring_commitments.is_some()
+            || input.pseudo_commitment.is_some()
+        {
+            return Err(err(format!(
+                "shield tx {}: input carries confidential/ring fields (must be transparent)",
+                tx.hash
+            )));
+        }
+
+        // Reject duplicate outpoints within the tx (anti self/double-count).
+        if !seen_outpoints.insert(format!("{}:{}", input.txid, input.index)) {
+            return Err(err(format!("shield tx {}: duplicate input outpoint", tx.hash)));
+        }
+
+        // Authoritative amount from the UTXO SET — NEVER from the tx (inflation V2).
+        let key = utxo_key(&input.txid, input.index)
+            .map_err(|e| err(format!("shield tx {}: bad outpoint: {}", tx.hash, e)))?;
+        let utxo = utxo_set
+            .get_utxo(&key)
+            .ok_or_else(|| err(format!("shield tx {}: input {} not found", tx.hash, key)))?;
+        if utxo.spent {
+            return Err(err(format!("shield tx {}: input {} already spent", tx.hash, key)));
+        }
+        if !TxValidator::verify_input_ownership_by_address(input, &utxo.address, &signing_msg) {
+            return Err(err(format!(
+                "shield tx {}: input {} ownership mismatch",
+                tx.hash, key
+            )));
+        }
+
+        // r_i — the ONLY input-side value the tx supplies (a blinding, not value).
+        let r_i = scalar_from_hex(input.shield_blinding.as_deref().unwrap_or("")).ok_or_else(|| {
+            err(format!("shield tx {}: missing/invalid shield_blinding", tx.hash))
+        })?;
+
+        // C_in = A_i·H + r_i·G via the shared commit primitive (inflation V1:
+        // amount on H, NEVER A_i·G).
+        input_commitments.push(RealPedersenCommitment::commit(utxo.amount, r_i).commitment);
+        sum_in = sum_in
+            .checked_add(utxo.amount)
+            .ok_or_else(|| err(format!("shield tx {}: input amount overflow", tx.hash)))?;
+    }
+
+    // ── Outputs: confidential (amount==0 + range proof) ──
+    let mut output_commitments = Vec::with_capacity(tx.outputs.len());
+    for output in &tx.outputs {
+        if output.amount != 0 {
+            return Err(err(format!(
+                "shield tx {}: confidential output amount must be 0 (value hidden in commitment)",
+                tx.hash
+            )));
+        }
+        let view = parse_confidential_output(output)
+            .ok_or_else(|| err(format!("shield tx {}: malformed confidential output", tx.hash)))?;
+        if !range_proof::verify(&view.commitment, &view.range_proof) {
+            return Err(err(format!("shield tx {}: range proof failed", tx.hash)));
+        }
+        output_commitments.push(view.commitment);
+    }
+
+    // Fee is public and on H; must not exceed the public input total (inflation V5).
+    if tx.fee > sum_in {
+        return Err(err(format!(
+            "shield tx {}: fee {} exceeds input sum {}",
+            tx.hash, tx.fee, sum_in
+        )));
+    }
+
+    // ── Homomorphic balance: Σ C_in == Σ C_out + fee·H ──
+    if !RealPedersenCommitment::verify_balance(&input_commitments, &output_commitments, tx.fee) {
+        return Err(err(format!(
+            "shield tx {}: commitments do not balance",
+            tx.hash
+        )));
+    }
+
+    Ok(())
 }
 
 /// Verify all confidential aspects of one tx. `seen_ki` accumulates key images
@@ -263,6 +391,125 @@ mod tests {
         let tx = valid_conf_tx(&set, 100);
         let mut seen = HashSet::new();
         assert!(verify_confidential_tx(&tx, &set, &net(), &mut seen).is_ok());
+    }
+
+    // ── Shield tests (transparent -> confidential) ──────────────────────────
+
+    /// Build a valid 1-in/1-out shield tx: a transparent UTXO of `amt` owned by
+    /// a fresh keypair is seeded into `set` (via a coinbase apply), then shielded
+    /// into one confidential output of `amt - fee`. Returns (tx, seeded amount).
+    fn valid_shield_tx(set: &UtxoSet, amt: u64, fee: u64) -> Transaction {
+        use crate::domain::transaction::transaction::Transaction as Tx;
+        use ed25519_dalek::{Signer, SigningKey};
+        use sha2::{Digest, Sha256};
+
+        // Keypair + mainnet address = SD1 + sha256("ShadowDAG_Addr_v1"||pk)[..20].
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = sk.verifying_key();
+        let pk_hex = hex::encode(pk.to_bytes());
+        let mut ah = Sha256::new();
+        ah.update(b"ShadowDAG_Addr_v1");
+        ah.update(pk.to_bytes());
+        let address = format!("SD1{}", hex::encode(&ah.finalize()[..20]));
+
+        // Seed a transparent UTXO owned by `address` via a coinbase apply.
+        let cb_hash = "a".repeat(64);
+        let mut cb = Tx::new_coinbase(cb_hash.clone(), vec![TxOutput::new(address.clone(), amt)], 0, 1);
+        cb.hash = cb_hash.clone();
+        set.apply_block_dag_ordered(std::slice::from_ref(&cb), 0, &"b".repeat(64))
+            .unwrap();
+
+        // One confidential output of value (amt - fee). Balance (1-in/1-out):
+        // C_in = amt·H + r_i·G, C_out = (amt-fee)·H + r_out·G, plus fee·H ⇒ r_i = r_out.
+        let g = RISTRETTO_BASEPOINT_POINT;
+        let h = generator_h();
+        let out_val = amt - fee;
+        let r_out = Scalar::random(&mut OsRng);
+        let r_i = r_out; // makes the blindings balance
+        let out_commit = Scalar::from(out_val) * h + r_out * g;
+        let proof = prove(out_val, &r_out);
+        let one_time = Scalar::random(&mut OsRng) * g;
+        let eph = Scalar::random(&mut OsRng) * g;
+
+        let mut tx = Transaction {
+            hash: "5".repeat(64),
+            inputs: vec![TxInput {
+                txid: cb_hash,
+                index: 0,
+                owner: address,
+                signature: String::new(),
+                pub_key: pk_hex.clone(),
+                key_image: None,
+                ring_members: None,
+                ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
+                shield_blinding: Some(hex::encode(r_i.to_bytes())),
+            }],
+            outputs: vec![TxOutput {
+                address: "SD1p".into(),
+                amount: 0,
+                commitment: Some(hexp(&out_commit)),
+                range_proof: Some(range_proof_to_hex(&proof)),
+                ephemeral_pubkey: Some(hexp(&eph)),
+                one_time_pubkey: Some(hexp(&one_time)),
+                encrypted_amount: None,
+            }],
+            fee,
+            timestamp: 1_735_689_600_000,
+            is_coinbase: false,
+            tx_type: TxType::Shield,
+            payload_hash: None,
+            ..Default::default()
+        };
+        // Ed25519 sign the transparent-ownership message.
+        let msg = TxHash::signing_message_for_network(&tx, &net());
+        let sig = sk.sign(&msg);
+        tx.inputs[0].signature = hex::encode(sig.to_bytes());
+        tx
+    }
+
+    #[test]
+    fn accepts_valid_shield_tx() {
+        let set = UtxoSet::new_empty();
+        let tx = valid_shield_tx(&set, 1_000, 10);
+        assert!(
+            verify_shield_tx(&tx, &set, &net()).is_ok(),
+            "a balanced shield tx must verify"
+        );
+    }
+
+    #[test]
+    fn shield_rejects_inflated_output() {
+        // INFLATION: an output committing to MORE than the input value must fail
+        // balance. The input amount A is chain-fixed (read from the UTXO set), so
+        // the attacker cannot make Σ outputs exceed Σ A - fee.
+        let set = UtxoSet::new_empty();
+        let mut tx = valid_shield_tx(&set, 1_000, 10);
+        assert!(verify_shield_tx(&tx, &set, &net()).is_ok());
+        // Re-commit the output to 1_000_000 (mint) with a fresh blinding.
+        let g = RISTRETTO_BASEPOINT_POINT;
+        let h = generator_h();
+        let r = Scalar::random(&mut OsRng);
+        let fat = Scalar::from(1_000_000u64) * h + r * g;
+        tx.outputs[0].commitment = Some(hexp(&fat));
+        tx.outputs[0].range_proof = Some(range_proof_to_hex(&prove(1_000_000, &r)));
+        assert!(
+            verify_shield_tx(&tx, &set, &net()).is_err(),
+            "an inflated output (value > input) must be rejected by the balance"
+        );
+    }
+
+    #[test]
+    fn shield_rejects_confidential_input_fields() {
+        // TYPE SEPARATION: a shield input must not carry ring/confidential fields.
+        let set = UtxoSet::new_empty();
+        let mut tx = valid_shield_tx(&set, 1_000, 10);
+        tx.inputs[0].key_image = Some("00".repeat(32));
+        assert!(
+            verify_shield_tx(&tx, &set, &net()).is_err(),
+            "a shield input carrying a key image must be rejected"
+        );
     }
 
     #[test]
