@@ -2177,6 +2177,7 @@ impl RpcServer {
                 extra_nonce,
                 receipt_root: None,
                 state_root: None,
+                mix_hash: String::new(),
             },
             body: BlockBody { transactions },
         };
@@ -5282,6 +5283,7 @@ mod tests {
                 extra_nonce: 0,
                 receipt_root: None,
                 state_root: None,
+                mix_hash: String::new(),
             },
             body: BlockBody {
                 transactions: vec![],

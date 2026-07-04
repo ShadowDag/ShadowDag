@@ -408,6 +408,7 @@ fn build_block(p: GenesisParams) -> Block {
             extra_nonce: 0,
             receipt_root: None,
             state_root: None,
+            mix_hash: String::new(),
         },
         body: BlockBody {
             transactions: vec![coinbase],

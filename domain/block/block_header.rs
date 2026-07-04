@@ -45,6 +45,12 @@ pub struct BlockHeader {
     /// None for blocks with no contract state changes.
     #[serde(default)]
     pub state_root: Option<String>,
+
+    /// UmbraHash PoW mix digest (32-byte hex). Committed alongside `nonce`:
+    /// the node recomputes it cheaply from the epoch cache and rejects a block
+    /// whose recomputed mix != this field. Empty for pre-UmbraHash blocks.
+    #[serde(default)]
+    pub mix_hash: String,
 }
 
 impl BlockHeader {
@@ -74,6 +80,7 @@ impl BlockHeader {
             extra_nonce: 0,
             receipt_root: None,
             state_root: None,
+            mix_hash: String::new(),
         }
     }
 

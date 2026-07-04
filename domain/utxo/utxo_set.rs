@@ -517,6 +517,7 @@ impl UtxoSet {
                 extra_nonce: 0,
                 receipt_root: None,
                 state_root: None,
+                mix_hash: String::new(),
             },
             body: crate::domain::block::block_body::BlockBody {
                 transactions: transactions.to_vec(),

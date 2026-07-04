@@ -269,6 +269,7 @@ mod tests {
             extra_nonce,
             receipt_root: None,
             state_root: None,
+            mix_hash: String::new(),
         }
     }
 

@@ -224,6 +224,32 @@ pub fn epoch_of(height: u64) -> u64 {
     height / EPOCH_BLOCKS
 }
 
+/// The UmbraHash PoW pre-image: SHA3-256 over the header fields EXCLUDING `nonce`
+/// and `mix_hash`. The miner varies `nonce` over this fixed pre-image to search
+/// for a `(mix_hash, result)` that meets the target. Reuses the single-source
+/// header serializer (with nonce zeroed, so the pre-image is nonce-independent).
+#[allow(clippy::too_many_arguments)]
+pub fn header_hash(
+    version: u32,
+    height: u64,
+    timestamp: u64,
+    extra_nonce: u64,
+    difficulty: u64,
+    merkle_root: &str,
+    parents: &[String],
+) -> [u8; 32] {
+    let bytes = crate::engine::mining::algorithms::shadowhash::serialize_header_template(
+        version,
+        height,
+        timestamp,
+        extra_nonce,
+        difficulty,
+        merkle_root,
+        parents,
+    );
+    sha3_256_bytes(&bytes)
+}
+
 /// Big-endian `a <= b` over 32 bytes (hash-meets-target comparison).
 fn le_or_eq_be(a: &[u8; 32], b: &[u8; 32]) -> bool {
     for i in 0..32 {
@@ -347,6 +373,16 @@ mod tests {
             }
         }
         assert!(!verify_light(&cache, FULL_SIZE, &header, nonce, &mix, &strict));
+    }
+
+    #[test]
+    fn header_hash_is_deterministic_and_field_sensitive() {
+        let parents = vec!["a".repeat(64)];
+        let a = header_hash(2, 100, 1_700_000_000_000, 0, 4096, "mr", &parents);
+        let b = header_hash(2, 100, 1_700_000_000_000, 0, 4096, "mr", &parents);
+        assert_eq!(a, b, "same fields → same pre-image");
+        let c = header_hash(2, 101, 1_700_000_000_000, 0, 4096, "mr", &parents);
+        assert_ne!(a, c, "different height → different pre-image");
     }
 
     #[test]

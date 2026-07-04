@@ -788,6 +788,7 @@ mod tests {
                 extra_nonce: 0,
                 receipt_root: None,
                 state_root: None,
+                mix_hash: String::new(),
             },
             body: BlockBody {
                 transactions: vec![],
