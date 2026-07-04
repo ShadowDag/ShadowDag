@@ -148,6 +148,13 @@ fn shadow_hash_bytes(data: &[u8]) -> String {
     hex::encode(round3)
 }
 
+/// Hash arbitrary bytes with the ShadowHash pipeline. This is the exact
+/// transform a GPU kernel reproduces; exposing it lets the miner/tests verify a
+/// GPU-found nonce against the canonical CPU hash.
+pub fn shadow_hash_of_bytes(data: &[u8]) -> String {
+    shadow_hash_bytes(data)
+}
+
 /// Check if a hash meets the target difficulty.
 /// Unified: delegates to the canonical 256-bit target comparison.
 pub fn meets_difficulty(hash: &str, difficulty: u64) -> bool {
@@ -213,6 +220,39 @@ fn serialize_header_raw(
     buf
 }
 
+/// Byte offset of the 8-byte little-endian `nonce` field inside the serialized
+/// header, i.e. after the 18-byte domain tag + version(4) + height(8) +
+/// timestamp(8). A GPU miner patches these 8 bytes per work-item, so this MUST
+/// stay in sync with `serialize_header_raw`.
+pub const HEADER_NONCE_OFFSET: usize = 18 + 4 + 8 + 8;
+
+/// Serialize the exact bytes `shadow_hash_raw_full` hashes, with the `nonce`
+/// field left as zero. A GPU miner hashes this template while overwriting the 8
+/// bytes at `HEADER_NONCE_OFFSET` with each candidate nonce — producing the
+/// identical input the CPU path would for that nonce.
+#[allow(clippy::too_many_arguments)]
+pub fn serialize_header_template(
+    version: u32,
+    height: u64,
+    timestamp: u64,
+    extra_nonce: u64,
+    difficulty: u64,
+    merkle_root: &str,
+    parents: &[String],
+) -> Vec<u8> {
+    let mut buf = serialize_header_raw(
+        version,
+        height,
+        timestamp,
+        0, // nonce placeholder — the GPU overwrites HEADER_NONCE_OFFSET..+8
+        difficulty,
+        merkle_root,
+        parents,
+    );
+    buf.extend_from_slice(&extra_nonce.to_le_bytes());
+    buf
+}
+
 /// Hash a string (utility function used in Merkle trees, etc.)
 pub fn shadow_hash_str(data: &str) -> String {
     let mut h = Sha256::new();
@@ -265,6 +305,24 @@ mod tests {
         assert_eq!(t.len(), 64);
         // 256-bit target: MAX_TARGET / 3 → starts with "55" (0x55 = 0xFF/3)
         assert!(t.starts_with("55"));
+    }
+
+    #[test]
+    fn gpu_template_plus_nonce_matches_raw_full() {
+        // The GPU miner hashes serialize_header_template(...) after overwriting 8
+        // bytes at HEADER_NONCE_OFFSET with the candidate nonce. That MUST equal
+        // the canonical shadow_hash_raw_full for the same nonce, or GPU-mined
+        // blocks would be rejected by consensus.
+        let parents = vec!["a".repeat(64), "f".repeat(64)];
+        let mr = "deadbeef".repeat(8);
+        for &nonce in &[0u64, 1, 42, 9_999_999, u64::MAX] {
+            let mut tmpl = serialize_header_template(2, 123, 1_735_689_600_000, 7, 4096, &mr, &parents);
+            tmpl[HEADER_NONCE_OFFSET..HEADER_NONCE_OFFSET + 8]
+                .copy_from_slice(&nonce.to_le_bytes());
+            let via_template = shadow_hash_of_bytes(&tmpl);
+            let via_raw = shadow_hash_raw_full(2, 123, 1_735_689_600_000, nonce, 7, 4096, &mr, &parents);
+            assert_eq!(via_template, via_raw, "template+nonce must equal raw_full (nonce={})", nonce);
+        }
     }
 
     #[test]

@@ -10,6 +10,8 @@
 //   shadowdag-miner --threads=8                 # Set thread count
 //   shadowdag-miner --rpc=127.0.0.1:19332       # RPC address
 //   shadowdag-miner --network=testnet           # Mine on testnet
+//   shadowdag-miner --gpu [--gpu-batch=8192]     # GPU mining (needs the
+//                                                # 'gpu-opencl' build feature)
 // â•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گâ•گ
 
 use sha2::{Digest, Sha256};
@@ -89,6 +91,21 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         .unwrap_or(4)
         .clamp(1, 256);
 
+    // GPU mining (real OpenCL ShadowHash). Only active if this binary was built
+    // with `--features gpu-opencl` AND `--gpu` is passed.
+    let use_gpu = args.iter().any(|a| a == "--gpu");
+    #[cfg(feature = "gpu-opencl")]
+    let gpu_batch: usize = parse_flag(args, "--gpu-batch", "8192")
+        .parse()
+        .unwrap_or(8192)
+        .clamp(256, 1_000_000);
+    #[cfg(not(feature = "gpu-opencl"))]
+    if use_gpu {
+        eprintln!("[miner] --gpu requested but this binary was built WITHOUT the 'gpu-opencl' feature.");
+        eprintln!("[miner] Rebuild: cargo build --release --features gpu-opencl --bin shadowdag-miner");
+        eprintln!("[miner] Falling back to CPU mining.");
+    }
+
     let rpc_port = match network {
         NetworkMode::Testnet => 19332,
         NetworkMode::Regtest => 29332,
@@ -140,6 +157,23 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
     let mut last_submit_attempt_at: Option<Instant> = None;
     let mut stale_reject_streak: u32 = 0;
     let session_start = Instant::now();
+
+    // Build the GPU miner once (reused across blocks). None = CPU mining.
+    #[cfg(feature = "gpu-opencl")]
+    let gpu_miner: Option<shadowdag::engine::mining::gpu::opencl::OpenClMiner> = if use_gpu {
+        match shadowdag::engine::mining::gpu::opencl::OpenClMiner::new(gpu_batch) {
+            Ok(m) => {
+                println!("[miner] GPU mining ENABLED — device: {} (batch={})", m.device_name(), m.batch());
+                Some(m)
+            }
+            Err(e) => {
+                eprintln!("[miner] GPU init failed ({}); falling back to CPU.", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     slog_info!("miner", "mining_loop_started");
 
@@ -307,9 +341,24 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         let max_mine_nonce = u64::MAX - 1;
         let nonces_per_thread = (max_mine_nonce as u128 / threads as u128) as u64;
 
-        let result: Option<(u64, String)> = {
-            use rayon::prelude::*;
-            (0..threads).into_par_iter().find_map_any(|thread_id| {
+        // GPU search when active (built with gpu-opencl AND a device initialized);
+        // otherwise CPU. Structured as a match (not a labeled block) so the default
+        // build carries no unused-label warning.
+        #[cfg(feature = "gpu-opencl")]
+        let gpu_outcome: Option<Option<(u64, String)>> = gpu_miner.as_ref().map(|g| {
+            gpu_search(
+                g, height, timestamp, difficulty, &merkle_root, &parents, &found, &hash_count,
+                &start,
+            )
+        });
+        #[cfg(not(feature = "gpu-opencl"))]
+        let gpu_outcome: Option<Option<(u64, String)>> = None;
+
+        let result: Option<(u64, String)> = match gpu_outcome {
+            Some(outcome) => outcome,
+            None => {
+                use rayon::prelude::*;
+                (0..threads).into_par_iter().find_map_any(|thread_id| {
                 let start_nonce = thread_id as u64 * nonces_per_thread;
                 let end_nonce = if thread_id == threads - 1 {
                     max_mine_nonce
@@ -362,7 +411,8 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
                         let _ = std::io::stdout().flush();
                     }
                 }
-            })
+                })
+            }
         };
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -993,6 +1043,92 @@ fn parse_flag_opt(args: &[String], name: &str) -> Result<Option<String>, String>
 
 fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+/// GPU nonce search for one block template. Loops OpenCL batches until a nonce
+/// whose ShadowHash meets the target is found (re-verified on the CPU consensus
+/// path before returning), another thread flags `found`, or the per-template
+/// nonce window is exhausted (returns None → the outer loop refetches).
+#[cfg(feature = "gpu-opencl")]
+#[allow(clippy::too_many_arguments)]
+fn gpu_search(
+    gpu: &shadowdag::engine::mining::gpu::opencl::OpenClMiner,
+    height: u64,
+    timestamp: u64,
+    difficulty: u64,
+    merkle_root: &str,
+    parents: &[String],
+    found: &Arc<AtomicBool>,
+    hash_count: &Arc<AtomicU64>,
+    start: &Instant,
+) -> Option<(u64, String)> {
+    use shadowdag::engine::mining::algorithms::shadowhash::{
+        serialize_header_template, HEADER_NONCE_OFFSET,
+    };
+
+    if difficulty == 0 {
+        return None; // genesis-only edge; let the CPU path handle it
+    }
+    let target = difficulty_target_bytes(difficulty)?;
+    let tmpl = serialize_header_template(2, height, timestamp, 0, difficulty, merkle_root, parents);
+    if tmpl.len() > 512 {
+        eprintln!("[gpu] header {}B exceeds kernel cap; using CPU", tmpl.len());
+        return None;
+    }
+
+    let batch = gpu.batch() as u64;
+    let cap: u64 = 400_000_000; // refresh the template periodically
+    let mut base: u64 = 0;
+    while base < cap {
+        if found.load(Ordering::Relaxed) {
+            return None;
+        }
+        match gpu.mine_batch(&tmpl, HEADER_NONCE_OFFSET, &target, base) {
+            Ok(Some(nonce)) => {
+                // Authoritative re-check on the consensus CPU hash.
+                let hash = shadow_hash_raw_full(
+                    2, height, timestamp, nonce, 0, difficulty, merkle_root, parents,
+                );
+                if meets_difficulty(&hash, difficulty) {
+                    found.store(true, Ordering::Relaxed);
+                    return Some((nonce, hash));
+                }
+                eprintln!("[gpu] WARNING: GPU nonce {} rejected by CPU re-check; skipping", nonce);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("[gpu] error: {} — falling back to CPU", e);
+                return None;
+            }
+        }
+        hash_count.fetch_add(batch, Ordering::Relaxed);
+        let elapsed = start.elapsed().as_secs_f64();
+        let total = hash_count.load(Ordering::Relaxed);
+        print!(
+            "\r[gpu-mining] height={} hashes={:.2}M rate={:.0} H/s   ",
+            height,
+            total as f64 / 1_000_000.0,
+            total as f64 / elapsed.max(0.001)
+        );
+        let _ = std::io::stdout().flush();
+        base = base.saturating_add(batch);
+    }
+    None
+}
+
+/// The 256-bit PoW target for `difficulty`, as 32 big-endian bytes (matches the
+/// kernel's byte-wise `hash <= target` comparison). None on any parse failure.
+#[cfg(feature = "gpu-opencl")]
+fn difficulty_target_bytes(difficulty: u64) -> Option<[u8; 32]> {
+    let hex_str =
+        shadowdag::engine::mining::pow::pow_validator::PowValidator::difficulty_to_target(difficulty);
+    let bytes = hex::decode(hex_str).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut t = [0u8; 32];
+    t.copy_from_slice(&bytes);
+    Some(t)
 }
 
 #[cfg(test)]

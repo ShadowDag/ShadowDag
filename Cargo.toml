@@ -31,6 +31,10 @@ pq-dilithium = ["pqcrypto-dilithium"]
 ringct_bypass = []
 # Native desktop wallet GUI (requires WebView2 on Windows)
 desktop = ["dep:tao", "dep:wry"]
+# Real OpenCL GPU miner for ShadowHash. OFF by default so the standard build
+# (servers/CI, no GPU or OpenCL SDK) stays portable and dependency-free. Enable
+# with `--features gpu-opencl` on a machine that has an OpenCL driver.
+gpu-opencl = ["dep:ocl"]
 
 [lib]
 name = "shadowdag"
@@ -177,6 +181,11 @@ proptest           = "1"
 # This avoids pulling deprecated GTK3/WebKit transitive deps on Linux nodes.
 tao                = { version = "0.30", optional = true }
 wry                = { version = "0.44", optional = true }
+
+# Real GPU miner (feature "gpu-opencl"). Optional so the default build pulls no
+# OpenCL toolchain. Linked against the OpenCL ICD at build time; at runtime the
+# miner uses the GPU driver's OpenCL runtime.
+ocl                = { version = "0.19", optional = true }
 
 [[bench]]
 name = "core_benchmarks"

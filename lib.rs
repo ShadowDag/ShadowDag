@@ -195,9 +195,13 @@ pub mod engine {
             pub mod shadowhash;
         }
         pub mod gpu {
-            pub mod cuda_miner;
-            pub mod gpu_miner;
-            pub mod opencl_miner;
+            // Real OpenCL GPU miner for ShadowHash. Feature-gated: the default
+            // build compiles NO GPU code and keeps zero OpenCL dependencies, so
+            // servers/CI are unaffected. Build with `--features gpu-opencl`.
+            // (The former cuda_miner/gpu_miner/opencl_miner modules were removed —
+            // they were CPU-rayon stubs with GPU-labeled logging, not real GPU.)
+            #[cfg(feature = "gpu-opencl")]
+            pub mod opencl;
         }
         pub mod miner {
             pub mod block_template;
