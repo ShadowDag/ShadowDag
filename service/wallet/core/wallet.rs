@@ -1550,6 +1550,85 @@ mod tests {
     }
 
     #[test]
+    fn shield_bootstraps_pool_then_confidential_send_finds_decoys() {
+        // END-TO-END BOOTSTRAP (spec tests 11-12, minus the network layer): on a
+        // transparent-only chain there are no confidential outputs, so a
+        // confidential send has no decoys. Shielding several coinbases fills the
+        // pool; once it holds >= CONF_RING_SIZE outputs, A's confidential->
+        // confidential send to B finds its 10 decoys, verifies, and B receives.
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::transaction::transaction::{Transaction as Tx, TxOutput};
+        use crate::domain::utxo::utxo_set::UtxoSet;
+        use crate::engine::privacy::ringct::confidential_consensus::{
+            verify_confidential_tx, verify_shield_tx,
+        };
+        use std::collections::HashSet;
+
+        let net = NetworkMode::Mainnet;
+        let set = UtxoSet::new_empty();
+        let mut a = Wallet::new("mainnet");
+        a.restore_from_seed(vec![91u8; 32]).unwrap();
+        let mut b = Wallet::new("mainnet");
+        b.restore_from_seed(vec![92u8; 32]).unwrap();
+        let addr = a.address();
+        let a_conf = a.confidential_receive_address().unwrap();
+
+        // Shield 6 mature coinbases, each -> 2 confidential outputs to A (500 +
+        // 490 change), for 12 pool outputs total (> CONF_RING_SIZE = 11).
+        for i in 0..6u64 {
+            let cb_hash = format!("{:0>64}", format!("c0{}", i));
+            let mut cb = Tx::new_coinbase(cb_hash.clone(), vec![TxOutput::new(addr.clone(), 1000)], 0, 1);
+            cb.hash = cb_hash.clone();
+            // Coinbase at height 0; shield later at a mature height.
+            set.apply_block_dag_ordered(std::slice::from_ref(&cb), 0, &format!("cbblk{}", i)).unwrap();
+            // Wallet sees ONLY this coinbase now (avoids re-selecting a spent one).
+            a.update_utxos(
+                &addr,
+                vec![Walletutxo {
+                    txid: cb_hash,
+                    index: 0,
+                    amount: 1000,
+                    address: addr.clone(),
+                    height: 0,
+                    confirmations: 5000,
+                    is_coinbase: true,
+                    is_locked: false,
+                }],
+            );
+            let sh = a.build_shield(0, &a_conf, 500, 10).unwrap();
+            assert!(verify_shield_tx(&sh, &set, &net).is_ok(), "shield {} must verify", i);
+            set.apply_block_dag_ordered(std::slice::from_ref(&sh), 2000 + i, &format!("shblk{}", i)).unwrap();
+            a.scan_confidential(&sh); // record A's two new confidential UTXOs
+        }
+
+        // The pool is now bootstrapped: A holds spendable confidential funds and
+        // the chain has enough outputs to source a full ring.
+        assert!(a.confidential_balance() >= 500, "A must hold shielded confidential funds");
+        assert!(
+            set.confidential_output_count() >= 11,
+            "pool must hold >= CONF_RING_SIZE outputs, got {}",
+            set.confidential_output_count()
+        );
+
+        // A -> B confidential send: this is what FAILED before shielding existed
+        // ("insufficient confidential funds" / "not enough decoys"). It must now
+        // build (finding 10 decoys), verify, and be received by B.
+        let send = a
+            .build_confidential_send(&b.confidential_receive_address().unwrap(), 100, 0, &set)
+            .expect("confidential send must succeed once the pool is bootstrapped");
+        let mut seen = HashSet::new();
+        assert!(
+            verify_confidential_tx(&send, &set, &net, &mut seen).is_ok(),
+            "the bootstrapped confidential send must pass consensus"
+        );
+        assert_eq!(
+            b.scan_confidential(&send).iter().map(|u| u.amount).sum::<u64>(),
+            100,
+            "B must receive the confidential 100"
+        );
+    }
+
+    #[test]
     fn full_confidential_roundtrip_a_to_b_then_b_spends() {
         use crate::config::node::node_config::NetworkMode;
         use crate::domain::utxo::utxo_set::UtxoSet;
