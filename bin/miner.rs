@@ -324,7 +324,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
                     }
 
                     let hash = shadow_hash_raw_full(
-                        1, // version
+                        2, // version — ms-timestamp era; MUST match the header's version (line ~397)
                         height,
                         timestamp,
                         nonce,
