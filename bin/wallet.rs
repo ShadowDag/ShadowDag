@@ -339,7 +339,7 @@ fn load_and_unlock_wallet() -> Result<Wallet, WalletError> {
 /// Anything else (no args, --gui, --rpc=, etc.) → GUI mode (if feature enabled).
 const CLI_COMMANDS: &[&str] = &[
     "new", "create", "restore", "import", "balance", "bal", "send", "transfer",
-    "info", "stealth", "scan", "invisible", "export",
+    "shield", "info", "stealth", "scan", "invisible", "export",
     "deploy", "deploy-package", "call", "receipt", "logs", "verify",
     "help", "--help", "-h", "version", "--version", "-v",
     "--cli",
@@ -384,6 +384,7 @@ fn run_cli(args: &[String], command: &str) {
         "restore" | "import" => cmd_restore(args),
         "balance" | "bal" => cmd_balance(args),
         "send" | "transfer" => cmd_send(args),
+        "shield" => cmd_shield(args),
         "info" => cmd_info(),
         "stealth" => cmd_stealth(args),
         "scan" => cmd_scan(args),
@@ -873,6 +874,148 @@ fn cmd_send(args: &[String]) {
             println!("Not broadcast (no RPC auth). Set SHADOWDAG_RPC_PASSWORD (the node's");
             println!("rpc_password) and re-run to auto-send, or submit this raw tx manually:");
             println!("{}", built.raw_hex);
+        }
+    }
+}
+
+/// `shield <confidential_addr> <amount> [fee]` — move transparent funds into
+/// the confidential pool. The recipient MUST be a confidential (`…1p`) address;
+/// change returns to the wallet's own confidential address. This bootstraps the
+/// confidential pool so later `send` to a `…1p` address has funds + decoys.
+fn cmd_shield(args: &[String]) {
+    let to = match args.get(2) {
+        Some(addr) => addr.clone(),
+        None => {
+            eprintln!("Usage: shadowdag-wallet shield <confidential_1p_address> <amount> [fee]");
+            return;
+        }
+    };
+    if !is_confidential_addr(&to) {
+        eprintln!("Error: shield recipient must be a confidential address (…1p).");
+        eprintln!("Get one from `shadowdag-wallet stealth` on the receiving wallet.");
+        return;
+    }
+    let amount_str = match args.get(3) {
+        Some(s) => s.as_str(),
+        None => {
+            eprintln!("Usage: shadowdag-wallet shield <confidential_1p_address> <amount> [fee]");
+            return;
+        }
+    };
+    let amount = match safe_sdag_to_sats(amount_str) {
+        Some(a) => a,
+        None => {
+            eprintln!("Error: invalid amount (must be 0 < amount <= 21,000,000,000)");
+            return;
+        }
+    };
+    let req_fee: u64 = args.get(4).and_then(|s| safe_sdag_to_sats(s)).unwrap_or(1);
+
+    let mut wallet = match load_and_unlock_wallet() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("Cannot load wallet: {}", e);
+            return;
+        }
+    };
+    let from_address = wallet.address();
+    if from_address.is_empty() {
+        eprintln!("Error: wallet has no accounts. Create a wallet first.");
+        return;
+    }
+
+    // Pull the wallet's spendable transparent UTXOs from a running node.
+    let socket = cli_rpc_target();
+    let utxos = match fetch_utxos_via_rpc(socket, &from_address) {
+        Some(u) if !u.is_empty() => u,
+        Some(_) => {
+            eprintln!("No spendable (mature) transparent UTXOs for {}.", from_address);
+            eprintln!("Receive funds first, or wait for coinbase maturity.");
+            return;
+        }
+        None => {
+            eprintln!("Cannot reach node RPC at {} to fetch UTXOs.", socket);
+            eprintln!("Start your node, or set SHADOWDAG_RPC=host:port.");
+            return;
+        }
+    };
+    wallet.update_utxos(&from_address, utxos);
+
+    // Auto-size the fee to clear the relay floor. Shield txs are large (range
+    // proofs), so build once at a floor to measure canonical size, then rebuild
+    // with fee >= size sat (1 sat/byte) + margin. The amount balance is exact,
+    // so a larger fee simply shrinks the confidential change.
+    let effective_fee = match wallet.build_shield(0, &to, amount, req_fee.max(1000)) {
+        Ok(probe) => {
+            let size = probe.canonical_bytes().len() as u64;
+            req_fee.max(size.saturating_add(200)).max(1000)
+        }
+        Err(e) => {
+            eprintln!("Error building shield transaction: {}", e);
+            return;
+        }
+    };
+
+    let tx = match wallet.build_shield(0, &to, amount, effective_fee) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Error building shield transaction: {}", e);
+            return;
+        }
+    };
+    let raw = match serde_json::to_vec(&tx) {
+        Ok(b) => hex::encode(b),
+        Err(e) => {
+            eprintln!("Error serializing shield transaction: {}", e);
+            return;
+        }
+    };
+
+    println!("Shield transaction built and signed!");
+    println!("  TxID   : {}", tx.hash);
+    println!("  From   : {} (transparent)", from_address);
+    println!("  To     : {} (confidential)", to);
+    println!("  Amount : {} SDAG (hidden after shielding)", amount_str);
+    println!(
+        "  Fee    : {} sats ({:.8} SDAG)",
+        effective_fee,
+        effective_fee as f64 / 100_000_000.0
+    );
+
+    // Broadcast (needs write auth), falling back to the raw tx for manual submit.
+    match rpc_login(socket) {
+        Some(token) => match cli_rpc_call_auth(
+            socket,
+            "sendrawtransaction",
+            serde_json::json!([raw]),
+            Some(&token),
+        ) {
+            Some(res) => {
+                let txid = res
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        res.get("txid")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| tx.hash.clone());
+                println!();
+                println!("Broadcast OK — accepted to mempool. TxID: {}", txid);
+                println!("(On the receiving wallet, run 'scan' to detect the confidential funds.)");
+            }
+            None => {
+                eprintln!();
+                eprintln!("Broadcast failed (node rejected the tx or is unreachable).");
+                eprintln!("Raw tx (submit manually via sendrawtransaction):");
+                println!("{}", raw);
+            }
+        },
+        None => {
+            println!();
+            println!("Not broadcast (no RPC auth). Set SHADOWDAG_RPC_PASSWORD and re-run to");
+            println!("auto-send, or submit this raw tx manually via sendrawtransaction:");
+            println!("{}", raw);
         }
     }
 }
@@ -1565,7 +1708,8 @@ fn print_help() {
     println!("  new [network]           Create a new wallet (mainnet/testnet/regtest)");
     println!("  restore [network]       Restore a wallet from a recovery phrase (prompts for phrase)");
     println!("  balance [address]       Check address balance (uses wallet address if omitted)");
-    println!("  send <to> <amount>      Send SDAG to address");
+    println!("  send <to> <amount>      Send SDAG to address (…1p = confidential)");
+    println!("  shield <1p_addr> <amt>  Shield transparent funds into the confidential pool");
     println!("  stealth [base_addr]     Generate stealth address");
     println!("  invisible [network]     Create invisible wallet (ghost mode)");
     println!("  export                  Export wallet keys as JSON");

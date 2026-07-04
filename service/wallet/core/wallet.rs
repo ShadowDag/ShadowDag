@@ -11,7 +11,7 @@ use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, Tx
 use crate::domain::transaction::tx_hash::TxHash;
 use crate::domain::utxo::utxo_set::UtxoSet;
 use crate::engine::privacy::ringct::builder::{
-    build_confidential_transaction, ConfRecipient, OwnedInput,
+    build_confidential_transaction, build_shield_transaction, ConfRecipient, OwnedInput, ShieldInput,
 };
 use crate::engine::privacy::ringct::decoy::select_decoys;
 use crate::engine::privacy::ringct::dual_clsag::RingMember;
@@ -455,6 +455,113 @@ impl Wallet {
 
         build_confidential_transaction(owned, recipients, fee, &net)
             .map_err(|e| WalletError::Other(format!("build confidential tx failed: {}", e)))
+    }
+
+    /// Build a SHIELD transaction: move `amount` of this wallet's TRANSPARENT
+    /// balance into the confidential pool. The `amount` goes to a confidential
+    /// payment address (`…1p`); any change returns to THIS wallet's own
+    /// confidential address (change is confidential too — it never leaks back to
+    /// a transparent output). The returned tx is Ed25519-signed and
+    /// broadcast-ready; the caller submits it via RPC `sendrawtransaction`.
+    ///
+    /// This is the bootstrap into the confidential pool: with no confidential
+    /// UTXOs yet, `build_confidential_send` has nothing to spend — a shield
+    /// creates the first confidential outputs from transparent funds.
+    pub fn build_shield(
+        &self,
+        from_account: u32,
+        recipient_addr: &str,
+        amount: u64,
+        fee: u64,
+    ) -> Result<Transaction, WalletError> {
+        if self.locked {
+            return Err(WalletError::Locked);
+        }
+        let ck = self.confidential_keys().ok_or(WalletError::Locked)?;
+        let net = self.network_mode();
+        let (view_pub, spend_pub) =
+            InvisibleWallet::parse_confidential_address(recipient_addr, &self.network)
+                .map_err(|e| WalletError::Other(format!("bad recipient address: {}", e)))?;
+
+        let seed = self
+            .session_key
+            .as_ref()
+            .ok_or(WalletError::Locked)?
+            .clone();
+        let acc = self
+            .account(from_account)
+            .ok_or(WalletError::Other("Account not found".into()))?
+            .clone();
+
+        let need = amount
+            .checked_add(fee)
+            .ok_or_else(|| WalletError::Other("amount+fee overflow".into()))?;
+
+        // Gather this account's transparent UTXOs, largest-first, until covered.
+        let mut utxos: Vec<Walletutxo> = acc
+            .addresses
+            .iter()
+            .flat_map(|a| self.utxos_for(&a.address))
+            .cloned()
+            .collect();
+        utxos.sort_by(|a, b| b.amount.cmp(&a.amount));
+        let mut total_in = 0u64;
+        let mut selected: Vec<Walletutxo> = Vec::new();
+        for u in utxos {
+            if total_in >= need {
+                break;
+            }
+            total_in = total_in
+                .checked_add(u.amount)
+                .ok_or(WalletError::BalanceOverflow)?;
+            selected.push(u);
+        }
+        if total_in < need {
+            return Err(WalletError::InsufficientFunds {
+                need,
+                have: total_in,
+            });
+        }
+
+        // One ShieldInput per selected UTXO, each carrying the address's derived
+        // Ed25519 signing key (the builder signs the transparent message).
+        let mut inputs = Vec::with_capacity(selected.len());
+        for utxo in &selected {
+            let wa = acc
+                .addresses
+                .iter()
+                .find(|a| a.address == utxo.address)
+                .ok_or(WalletError::AddressNotFound(utxo.address.clone()))?;
+            let sk = derive_key(&seed, wa.account, wa.index, wa.is_change)?;
+            inputs.push(ShieldInput {
+                txid: utxo.txid.clone(),
+                index: utxo.index,
+                owner: utxo.address.clone(),
+                amount: utxo.amount,
+                pub_key_hex: wa.public_key.clone(),
+                signing_key: sk,
+            });
+        }
+
+        // Recipients: the target + confidential change back to self. Amount
+        // balance is exact (Σ inputs == Σ recipients + fee), so the change
+        // absorbs the remainder — no dust is silently burned into the fee.
+        let mut recipients = vec![ConfRecipient {
+            view_pub,
+            spend_pub,
+            amount,
+        }];
+        let change = total_in - need;
+        if change > 0 {
+            recipients.push(ConfRecipient {
+                view_pub: ck.view_public(),
+                spend_pub: ck.spend_public(),
+                amount: change,
+            });
+        }
+
+        build_shield_transaction(inputs, recipients, fee, &net)
+            .map_err(|e| WalletError::Other(format!("build shield tx failed: {}", e)))
     }
 
     pub fn is_locked(&self) -> bool {
@@ -1387,6 +1494,59 @@ mod tests {
         a.scan_confidential(&tx);
         assert_eq!(a.confidential_balance(), 0, "spent UTXO must drop from balance");
         assert!(a.confidential_utxos().iter().all(|u| u.spent));
+    }
+
+    #[test]
+    fn build_shield_from_transparent_passes_consensus_with_change() {
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::transaction::transaction::{Transaction as Tx, TxOutput, TxType};
+        use crate::domain::utxo::utxo_set::UtxoSet;
+        use crate::engine::privacy::ringct::confidential_consensus::verify_shield_tx;
+
+        let net = NetworkMode::Mainnet;
+        let set = UtxoSet::new_empty();
+
+        // Spending wallet A (transparent funds) + receiving wallet B (…1p addr).
+        let mut a = Wallet::new("mainnet");
+        a.restore_from_seed(vec![77u8; 32]).unwrap();
+        let mut b = Wallet::new("mainnet");
+        b.restore_from_seed(vec![88u8; 32]).unwrap();
+        let addr = a.address();
+
+        // Seed a transparent coinbase of 1000 to A on the node UTXO set, and
+        // mirror it into A's wallet-local UTXO view (as `send`/`shield` would
+        // after fetching from RPC).
+        let cb_hash = "b".repeat(64);
+        let mut cb = Tx::new_coinbase(cb_hash.clone(), vec![TxOutput::new(addr.clone(), 1000)], 0, 1);
+        cb.hash = cb_hash.clone();
+        set.apply_block_dag_ordered(std::slice::from_ref(&cb), 0, "cbblk").unwrap();
+        a.update_utxos(
+            &addr,
+            vec![Walletutxo {
+                txid: cb_hash,
+                index: 0,
+                amount: 1000,
+                address: addr.clone(),
+                height: 0,
+                confirmations: 100,
+                is_coinbase: true,
+                is_locked: false,
+            }],
+        );
+
+        // Shield 600 to B; 390 confidential change returns to A (fee 10).
+        let recipient = b.confidential_receive_address().unwrap();
+        let tx = a.build_shield(0, &recipient, 600, 10).unwrap();
+
+        assert_eq!(tx.tx_type, TxType::Shield);
+        assert_eq!(tx.outputs.len(), 2, "recipient + confidential change");
+        assert!(
+            verify_shield_tx(&tx, &set, &net).is_ok(),
+            "wallet-built shield tx must pass the consensus gate"
+        );
+        // B detects the shielded 600; A rescans and detects its own 390 change.
+        assert_eq!(b.scan_confidential(&tx).iter().map(|u| u.amount).sum::<u64>(), 600);
+        assert_eq!(a.scan_confidential(&tx).iter().map(|u| u.amount).sum::<u64>(), 390);
     }
 
     #[test]
