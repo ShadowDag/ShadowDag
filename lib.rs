@@ -203,6 +203,8 @@ pub mod engine {
             // they were CPU-rayon stubs with GPU-labeled logging, not real GPU.)
             #[cfg(feature = "gpu-opencl")]
             pub mod opencl;
+            #[cfg(feature = "gpu-opencl")]
+            pub mod umbra;
         }
         pub mod miner {
             pub mod block_template;
