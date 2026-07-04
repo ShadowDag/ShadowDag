@@ -207,6 +207,52 @@ pub fn hashimoto_full(dataset: &[u8], header_hash: &[u8; 32], nonce: u64) -> ([u
     })
 }
 
+// ─────────────────────────── Consensus parameters ───────────────────────────
+// Blocks per epoch: at 10 BPS this is ~3.5 days of dataset freshness.
+pub const EPOCH_BLOCKS: u64 = 3_000_000;
+// Fixed dataset size (light on cards: fits any 2GB+ GPU) and its verification
+// cache. Both are multiples of MIX_BYTES(128); dataset item-count is even so the
+// hashimoto `mixhashes=2` fetch never runs off the end.
+// TODO(external-review): Ethash uses the largest PRIME item-count below the byte
+// target to avoid cache/dataset cycles; power-of-two is functionally correct but
+// a prime count is the stronger, review-blessed choice before mainnet.
+pub const DATASET_BYTES: usize = 1 << 30; // 1 GiB
+pub const CACHE_BYTES: usize = 16 << 20; // 16 MiB
+
+/// The epoch a block height belongs to.
+pub fn epoch_of(height: u64) -> u64 {
+    height / EPOCH_BLOCKS
+}
+
+/// Big-endian `a <= b` over 32 bytes (hash-meets-target comparison).
+fn le_or_eq_be(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    for i in 0..32 {
+        if a[i] < b[i] {
+            return true;
+        }
+        if a[i] > b[i] {
+            return false;
+        }
+    }
+    true // equal
+}
+
+/// Consensus light-verification of a PoW solution. Recomputes `(mix_hash,
+/// result)` from the epoch cache (cheap — no dataset needed) and requires the
+/// block's committed `mix_hash` to match AND `result <= target` (big-endian).
+/// This is exactly what every node runs per block.
+pub fn verify_light(
+    cache: &[u8],
+    full_size: usize,
+    header_hash: &[u8; 32],
+    nonce: u64,
+    mix_hash: &[u8; 32],
+    target: &[u8; 32],
+) -> bool {
+    let (mix, result) = hashimoto_light(cache, full_size, header_hash, nonce);
+    &mix == mix_hash && le_or_eq_be(&result, target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +317,45 @@ mod tests {
         assert_eq!(epoch_seed(0), [0u8; 32]);
         assert_ne!(epoch_seed(0), epoch_seed(1));
         assert_ne!(epoch_seed(1), epoch_seed(2));
+    }
+
+    #[test]
+    fn verify_light_accepts_valid_and_rejects_tampering() {
+        let cache = mkcache(CACHE_SIZE, &epoch_seed(0));
+        let dataset = generate_dataset(&cache, FULL_SIZE);
+        let header = hh(5);
+        let nonce = 9_999u64;
+        let (mix, result) = hashimoto_full(&dataset, &header, nonce);
+
+        // target == result → result <= target holds → accept (with the real mix).
+        assert!(
+            verify_light(&cache, FULL_SIZE, &header, nonce, &mix, &result),
+            "a valid solution must verify"
+        );
+        // Wrong mix_hash → reject.
+        let mut bad_mix = mix;
+        bad_mix[0] ^= 0xff;
+        assert!(!verify_light(&cache, FULL_SIZE, &header, nonce, &bad_mix, &result));
+        // Target one below the result (big-endian) → result > target → reject.
+        let mut strict = result;
+        for b in strict.iter_mut().rev() {
+            if *b > 0 {
+                *b -= 1;
+                break;
+            } else {
+                *b = 0xff;
+            }
+        }
+        assert!(!verify_light(&cache, FULL_SIZE, &header, nonce, &mix, &strict));
+    }
+
+    #[test]
+    fn consensus_params_are_well_formed() {
+        assert!(DATASET_BYTES.is_multiple_of(MIX_BYTES));
+        assert!(CACHE_BYTES.is_multiple_of(HASH_BYTES));
+        assert!((DATASET_BYTES / HASH_BYTES).is_multiple_of(2), "item count must be even");
+        assert_eq!(epoch_of(0), 0);
+        assert_eq!(epoch_of(EPOCH_BLOCKS - 1), 0);
+        assert_eq!(epoch_of(EPOCH_BLOCKS), 1);
     }
 }
