@@ -287,6 +287,45 @@ fn le_or_eq_be(a: &[u8; 32], b: &[u8; 32]) -> bool {
     true // equal
 }
 
+/// Miner hot loop over a RESIDENT full dataset (fast). Searches nonces
+/// `[start, start+count)` and returns the first `(nonce, mix_hash, result)`
+/// whose `result <= target`. The miner sets header.nonce=nonce,
+/// header.mix_hash=hex(mix), header.hash=hex(result).
+pub fn mine_full(
+    dataset: &[u8],
+    header_hash: &[u8; 32],
+    target: &[u8; 32],
+    start: u64,
+    count: u64,
+) -> Option<(u64, [u8; 32], [u8; 32])> {
+    for nonce in start..start.saturating_add(count) {
+        let (mix, result) = hashimoto_full(dataset, header_hash, nonce);
+        if le_or_eq_be(&result, target) {
+            return Some((nonce, mix, result));
+        }
+    }
+    None
+}
+
+/// Cache-only miner (no 1 GiB dataset): regenerates the touched items per nonce.
+/// Slow — for tests, genesis, and very-low-power fallback only.
+pub fn mine_light(
+    cache: &[u8],
+    full_size: usize,
+    header_hash: &[u8; 32],
+    target: &[u8; 32],
+    start: u64,
+    count: u64,
+) -> Option<(u64, [u8; 32], [u8; 32])> {
+    for nonce in start..start.saturating_add(count) {
+        let (mix, result) = hashimoto_light(cache, full_size, header_hash, nonce);
+        if le_or_eq_be(&result, target) {
+            return Some((nonce, mix, result));
+        }
+    }
+    None
+}
+
 /// Consensus light-verification of a PoW solution. Recomputes `(mix_hash,
 /// result)` from the epoch cache (cheap — no dataset needed) and requires the
 /// block's committed `mix_hash` to match AND `result <= target` (big-endian).
@@ -397,6 +436,26 @@ mod tests {
             }
         }
         assert!(!verify_light(&cache, FULL_SIZE, &header, nonce, &mix, &strict));
+    }
+
+    #[test]
+    fn mine_finds_a_block_that_light_verify_accepts() {
+        // Mine against the full dataset with a 1/256 target, then confirm the
+        // cheap light-verify (what a node runs) accepts the mined solution —
+        // proving mine (full) and verify (light) agree end-to-end.
+        let cache = mkcache(CACHE_SIZE, &epoch_seed(0));
+        let dataset = generate_dataset(&cache, FULL_SIZE);
+        let header = hh(7);
+        let mut target = [0xffu8; 32];
+        target[0] = 0x00; // ~1/256
+
+        let (nonce, mix, result) =
+            mine_full(&dataset, &header, &target, 0, 100_000).expect("should find a nonce");
+        assert!(le_or_eq_be(&result, &target), "mined result must meet target");
+        assert!(
+            verify_light(&cache, FULL_SIZE, &header, nonce, &mix, &target),
+            "node light-verify must accept the mined (nonce, mix)"
+        );
     }
 
     #[test]
