@@ -2345,4 +2345,48 @@ mod ringct_phase1_store_tests {
         assert_eq!(s2, 1, "the second shield must be skipped");
         assert!(!set.output_key_exists(&"c2".repeat(32)), "skipped shield must record NO confidential output");
     }
+
+    #[test]
+    fn shield_same_block_double_spend_applies_once() {
+        // DOUBLE-SPEND (V8, same block): two shields referencing the SAME outpoint
+        // inside ONE block — the first spends it (staged_spent), the second must
+        // be skipped so the input is never consumed twice within a block.
+        let set = UtxoSet::new_empty();
+        let cb_hash = "aa".repeat(32);
+        seed_coinbase(&set, &cb_hash);
+        let tx1 = shield_tx(&"e1".repeat(32), &cb_hash, &"c1".repeat(32));
+        let tx2 = shield_tx(&"e2".repeat(32), &cb_hash, &"c2".repeat(32));
+        let block = [tx1, tx2];
+        let (applied, skipped, _) = set
+            .apply_block_dag_ordered(&block, 2000, "sameblk")
+            .unwrap();
+        assert_eq!(applied, 1, "exactly one shield may spend the outpoint");
+        assert_eq!(skipped, 1, "the same-block re-spend must be skipped");
+        assert!(set.output_key_exists(&"c1".repeat(32)), "the applied shield records its output");
+        assert!(!set.output_key_exists(&"c2".repeat(32)), "the skipped shield records no output");
+    }
+
+    #[test]
+    fn shield_then_transparent_spend_same_outpoint_rejected() {
+        // CROSS-WORLD DOUBLE-SPEND (V8): once a shield spends a transparent
+        // outpoint, a later transparent tx spending the SAME outpoint must find it
+        // already spent (no shield→transparent double dip across blocks).
+        let set = UtxoSet::new_empty();
+        let cb_hash = "aa".repeat(32);
+        seed_coinbase(&set, &cb_hash);
+        let sh = shield_tx(&"e1".repeat(32), &cb_hash, &"c1".repeat(32));
+        set.apply_block_dag_ordered(std::slice::from_ref(&sh), 2000, "shblk").unwrap();
+        let in_key = utxo_key(&cb_hash, 0).unwrap();
+        assert!(set.get_utxo(&in_key).unwrap().spent, "shield spent the outpoint");
+
+        // A transparent tx spending the same coinbase output must not re-consume it.
+        use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput};
+        let inp = TxInput::new(cb_hash.clone(), 0, "ST1miner".into(), "sig".into(), "pk".into());
+        let mut ttx = Transaction::new("f0".repeat(32), vec![inp], vec![TxOutput::new("ST1dest".into(), 4999)], 1, 1);
+        ttx.hash = "f0".repeat(32);
+        let (applied, skipped, _) = set
+            .apply_block_dag_ordered(std::slice::from_ref(&ttx), 2001, "tblk")
+            .unwrap();
+        assert_eq!((applied, skipped), (0, 1), "transparent re-spend of a shielded outpoint must be skipped");
+    }
 }

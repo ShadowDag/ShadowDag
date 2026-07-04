@@ -178,6 +178,16 @@ pub fn verify_confidential_tx(
     // ── Inputs: ring authenticity + CLSAG + key-image uniqueness ──
     let mut pseudo_outs = Vec::with_capacity(tx.inputs.len());
     for input in &tx.inputs {
+        // Strict type separation (spec §4.5): a confidential (ring) input must
+        // NOT carry the shield-only blinding scalar. It is inert on this path
+        // (value comes from the ring/pseudo-commitment, not shield_blinding), but
+        // an ambiguous tx shape is rejected so the two input worlds never blur.
+        if input.shield_blinding.is_some() {
+            return Err(err(format!(
+                "confidential tx {}: ring input must not carry shield_blinding",
+                tx.hash
+            )));
+        }
         let view = parse_confidential_input(input)
             .ok_or_else(|| err(format!("confidential tx {}: malformed input", tx.hash)))?;
 
@@ -397,8 +407,31 @@ mod tests {
 
     /// Build a valid 1-in/1-out shield tx: a transparent UTXO of `amt` owned by
     /// a fresh keypair is seeded into `set` (via a coinbase apply), then shielded
-    /// into one confidential output of `amt - fee`. Returns (tx, seeded amount).
+    /// into one confidential output of `amt - fee`.
     fn valid_shield_tx(set: &UtxoSet, amt: u64, fee: u64) -> Transaction {
+        valid_shield_tx_with_key(set, amt, fee).0
+    }
+
+    /// Ed25519-sign every input of a shield tx over its (current) transparent
+    /// signing message. Call AFTER any mutation to fields committed by
+    /// `canonical_bytes` (fee, outputs, inputs) so the signature stays valid and
+    /// the SPECIFIC consensus rule — not tamper detection — is what rejects it.
+    fn resign_shield(tx: &mut Transaction, sk: &ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        let msg = TxHash::signing_message_for_network(tx, &net());
+        let sig = sk.sign(&msg);
+        for inp in tx.inputs.iter_mut() {
+            inp.signature = hex::encode(sig.to_bytes());
+        }
+    }
+
+    /// Same as `valid_shield_tx`, also returning the input's signing key so a
+    /// test can craft a malicious variant and re-sign it (via `resign_shield`).
+    fn valid_shield_tx_with_key(
+        set: &UtxoSet,
+        amt: u64,
+        fee: u64,
+    ) -> (Transaction, ed25519_dalek::SigningKey) {
         use crate::domain::transaction::transaction::Transaction as Tx;
         use ed25519_dalek::{Signer, SigningKey};
         use sha2::{Digest, Sha256};
@@ -466,7 +499,7 @@ mod tests {
         let msg = TxHash::signing_message_for_network(&tx, &net());
         let sig = sk.sign(&msg);
         tx.inputs[0].signature = hex::encode(sig.to_bytes());
-        tx
+        (tx, sk)
     }
 
     #[test]
@@ -509,6 +542,64 @@ mod tests {
         assert!(
             verify_shield_tx(&tx, &set, &net()).is_err(),
             "a shield input carrying a key image must be rejected"
+        );
+    }
+
+    #[test]
+    fn shield_rejects_duplicate_input_outpoint() {
+        // DOUBLE-COUNT (V4): the same transparent outpoint listed twice in one
+        // shield would count its value twice. Duplicate the (signed) input, then
+        // re-sign the 2-input tx so the duplicate-outpoint rule — not a stale
+        // signature — is what rejects it.
+        let set = UtxoSet::new_empty();
+        let (mut tx, sk) = valid_shield_tx_with_key(&set, 1_000, 10);
+        let dup = tx.inputs[0].clone();
+        tx.inputs.push(dup);
+        resign_shield(&mut tx, &sk);
+        let e = verify_shield_tx(&tx, &set, &net()).unwrap_err().to_string();
+        assert!(e.contains("duplicate input outpoint"), "must reject on duplicate outpoint, got: {}", e);
+    }
+
+    #[test]
+    fn shield_rejects_fee_exceeding_input_sum() {
+        // INFLATION (V5): fee is public and paid to the coinbase; a fee larger
+        // than the shielded input total would let the miner mint the difference.
+        let set = UtxoSet::new_empty();
+        let (mut tx, sk) = valid_shield_tx_with_key(&set, 1_000, 10);
+        tx.fee = 5_000; // > sum_in (1_000)
+        resign_shield(&mut tx, &sk);
+        let e = verify_shield_tx(&tx, &set, &net()).unwrap_err().to_string();
+        assert!(e.contains("exceeds input sum"), "must reject fee > Σ inputs, got: {}", e);
+    }
+
+    #[test]
+    fn shield_rejects_nonzero_plaintext_output_amount() {
+        // PRIVACY (V6): a shield output is confidential — its plaintext `amount`
+        // must be 0 (value lives in the commitment). A nonzero amount both leaks
+        // the value AND (on transparent-summing paths) could be double-counted.
+        let set = UtxoSet::new_empty();
+        let (mut tx, sk) = valid_shield_tx_with_key(&set, 1_000, 10);
+        tx.outputs[0].amount = 990; // leak the value in the clear
+        resign_shield(&mut tx, &sk);
+        let e = verify_shield_tx(&tx, &set, &net()).unwrap_err().to_string();
+        assert!(e.contains("amount must be 0"), "must reject nonzero output amount, got: {}", e);
+    }
+
+    #[test]
+    fn confidential_rejects_input_carrying_shield_blinding() {
+        // TYPE SEPARATION (V3, reverse): a ring input must NOT carry the
+        // shield-only blinding scalar — an ambiguous input shape is rejected.
+        let set = UtxoSet::new_empty();
+        let mut tx = valid_conf_tx(&set, 100);
+        tx.inputs[0].shield_blinding = Some("00".repeat(32));
+        let mut seen = HashSet::new();
+        let e = verify_confidential_tx(&tx, &set, &net(), &mut seen)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("must not carry shield_blinding"),
+            "ring input with shield_blinding must be rejected, got: {}",
+            e
         );
     }
 
