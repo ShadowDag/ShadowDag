@@ -22,6 +22,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use sha3::{Digest, Sha3_256, Sha3_512};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const HASH_BYTES: usize = 64; // one hash unit
 pub const WORD_BYTES: usize = 4; // 32-bit word
@@ -218,6 +219,29 @@ pub const EPOCH_BLOCKS: u64 = 3_000_000;
 // a prime count is the stronger, review-blessed choice before mainnet.
 pub const DATASET_BYTES: usize = 1 << 30; // 1 GiB
 pub const CACHE_BYTES: usize = 16 << 20; // 16 MiB
+
+/// Header version at/above which a block uses UmbraHash PoW (below = ShadowHash).
+/// This version-gates the hard fork so pre-fork blocks still validate.
+pub const UMBRA_POW_VERSION: u32 = 3;
+
+/// Process-wide memoized verification cache (holds the current epoch's 16 MiB
+/// cache). Nodes call this per block; regenerated only when the epoch changes.
+/// Generating the cache is ~hundreds of ms; verification then regenerates only
+/// the ~64 touched dataset items on demand (no 1 GiB dataset needed).
+pub fn cache_for_epoch(epoch: u64) -> Arc<Vec<u8>> {
+    type EpochCacheSlot = OnceLock<Mutex<Option<(u64, Arc<Vec<u8>>)>>>;
+    static CACHE: EpochCacheSlot = OnceLock::new();
+    let cell = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((e, c)) = guard.as_ref() {
+        if *e == epoch {
+            return Arc::clone(c);
+        }
+    }
+    let cache = Arc::new(mkcache(CACHE_BYTES, &epoch_seed(epoch)));
+    *guard = Some((epoch, Arc::clone(&cache)));
+    cache
+}
 
 /// The epoch a block height belongs to.
 pub fn epoch_of(height: u64) -> u64 {

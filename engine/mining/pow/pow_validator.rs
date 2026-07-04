@@ -12,6 +12,7 @@
 use crate::domain::block::block::Block;
 use crate::domain::block::block_header::BlockHeader;
 use crate::engine::mining::algorithms::shadowhash::shadow_hash;
+use crate::engine::mining::algorithms::umbrahash;
 
 /// Maximum target: 2^256 - 1, represented as 32 bytes (all 0xFF).
 /// In hex this is 64 'f' characters.
@@ -29,6 +30,13 @@ pub struct PowValidator;
 impl PowValidator {
     /// Full block PoW validation
     pub fn validate(block: &Block) -> PowResult {
+        // Hard-fork gate: version >= UMBRA_POW_VERSION uses UmbraHash (memory-hard).
+        if block.header.version >= umbrahash::UMBRA_POW_VERSION {
+            return match Self::umbra_check(&block.header) {
+                Ok(hash) => PowResult::ok(hash),
+                Err(e) => PowResult::fail(e),
+            };
+        }
         // 1. Recompute the hash using ShadowHash
         let computed_hash = shadow_hash(block);
 
@@ -85,8 +93,44 @@ impl PowValidator {
         PowResult::ok(computed_hash)
     }
 
+    /// UmbraHash PoW check (version >= UMBRA_POW_VERSION). Recomputes
+    /// `(mix_hash, result)` from the epoch cache and requires: the header's
+    /// identity `hash` equals the hashimoto result, the committed `mix_hash`
+    /// matches, and `result <= target`. Genesis (difficulty 0 at height 0) passes.
+    /// Returns Ok(identity hash) or Err(reason).
+    fn umbra_check(h: &BlockHeader) -> Result<String, String> {
+        if h.difficulty == 0 && h.height > 0 {
+            return Err("difficulty 0 is not valid for non-genesis blocks".to_string());
+        }
+        if h.difficulty > MAX_DIFFICULTY {
+            return Err(format!("difficulty {} exceeds MAX_DIFFICULTY {}", h.difficulty, MAX_DIFFICULTY));
+        }
+        if h.difficulty == 0 {
+            return Ok(h.hash.clone()); // genesis (height 0, checked above)
+        }
+        let hh = umbrahash::header_hash(
+            h.version, h.height, h.timestamp, h.extra_nonce, h.difficulty, &h.merkle_root, &h.parents,
+        );
+        let cache = umbrahash::cache_for_epoch(umbrahash::epoch_of(h.height));
+        let (mix, result) = umbrahash::hashimoto_light(&cache, umbrahash::DATASET_BYTES, &hh, h.nonce);
+        let result_hex = hex::encode(result);
+        if result_hex != h.hash {
+            return Err("umbra: identity hash != hashimoto result".to_string());
+        }
+        if hex::encode(mix) != h.mix_hash {
+            return Err("umbra: mix_hash does not match recomputed mix".to_string());
+        }
+        if !Self::hash_meets_target(&result_hex, h.difficulty) {
+            return Err(format!("umbra: result does not meet difficulty {}", h.difficulty));
+        }
+        Ok(result_hex)
+    }
+
     /// Validate a header independently (recompute hash from fields including extra_nonce)
     pub fn validate_header(header: &BlockHeader) -> bool {
+        if header.version >= umbrahash::UMBRA_POW_VERSION {
+            return Self::umbra_check(header).is_ok();
+        }
         use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
         let recomputed = shadow_hash_raw_full(
             header.version,
@@ -326,6 +370,52 @@ mod tests {
     fn hashrate_estimation() {
         let hr = PowValidator::estimated_hashrate(1000, 10);
         assert!((hr - 100.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn umbra_version_block_validates_and_rejects_tampering() {
+        use crate::domain::block::block::Block;
+        use crate::domain::block::block_body::BlockBody;
+        use crate::engine::mining::algorithms::umbrahash;
+
+        // Difficulty 1 → target = MAX → any result meets it (no search needed).
+        let mut header = BlockHeader::new_with_defaults(
+            umbrahash::UMBRA_POW_VERSION,
+            String::new(),
+            vec!["p".repeat(64)],
+            "merkle".into(),
+            1_700_000_000_000,
+            0, // nonce
+            1, // difficulty
+            1, // height (non-genesis → PoW enforced)
+        );
+        // "Mine": compute UmbraHash for this header at nonce 0 and commit it.
+        let hh = umbrahash::header_hash(
+            header.version, header.height, header.timestamp, header.extra_nonce,
+            header.difficulty, &header.merkle_root, &header.parents,
+        );
+        let cache = umbrahash::cache_for_epoch(umbrahash::epoch_of(header.height));
+        let (mix, result) =
+            umbrahash::hashimoto_light(&cache, umbrahash::DATASET_BYTES, &hh, header.nonce);
+        header.hash = hex::encode(result);
+        header.mix_hash = hex::encode(mix);
+
+        assert!(PowValidator::validate_header(&header), "valid UmbraHash header must pass");
+        let block = Block { header: header.clone(), body: BlockBody { transactions: vec![] } };
+        assert!(PowValidator::validate(&block).valid, "valid UmbraHash block must pass");
+
+        // Tampering must fail closed.
+        let mut bad_mix = header.clone();
+        bad_mix.mix_hash = "00".repeat(32);
+        assert!(!PowValidator::validate_header(&bad_mix), "wrong mix_hash must fail");
+
+        let mut bad_hash = header.clone();
+        bad_hash.hash = "ab".repeat(32);
+        assert!(!PowValidator::validate_header(&bad_hash), "wrong identity hash must fail");
+
+        let mut bad_nonce = header.clone();
+        bad_nonce.nonce = 12_345;
+        assert!(!PowValidator::validate_header(&bad_nonce), "wrong nonce must fail");
     }
 
     #[test]
