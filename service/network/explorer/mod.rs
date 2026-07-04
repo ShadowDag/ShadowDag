@@ -125,16 +125,22 @@ impl ExplorerServer {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "127.0.0.1".to_string());
-        // Security hardening: Explorer exposes chain/query surfaces without RPC auth,
-        // so it must remain loopback-only by default.
+        // Security hardening: the Explorer exposes chain/query surfaces WITHOUT RPC
+        // auth, so it stays loopback-only by DEFAULT. A non-loopback bind is allowed
+        // ONLY with an explicit opt-in (SHADOWDAG_EXPLORER_ALLOW_PUBLIC=1), for a
+        // public READ-ONLY testnet explorer where that exposure is intended.
         let bind_lower = bind_host.to_ascii_lowercase();
         let is_loopback = matches!(
             bind_lower.as_str(),
             "127.0.0.1" | "localhost" | "::1" | "[::1]"
         );
-        if !is_loopback {
+        let allow_public = std::env::var("SHADOWDAG_EXPLORER_ALLOW_PUBLIC")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        if !is_loopback && !allow_public {
             return Err(format!(
-                "Refusing to bind Explorer to non-loopback host '{}'. Use 127.0.0.1/localhost only.",
+                "Refusing to bind Explorer to non-loopback host '{}' without \
+                 SHADOWDAG_EXPLORER_ALLOW_PUBLIC=1 (Explorer has no auth).",
                 bind_host
             ));
         }
