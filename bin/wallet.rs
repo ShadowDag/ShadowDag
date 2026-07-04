@@ -220,6 +220,21 @@ fn load_encrypted_seed() -> Result<EncryptedSeed, WalletError> {
 ///
 /// Returns a Zeroizing<String> so the buffer is wiped on drop.
 fn prompt_password(prompt_msg: &str) -> Zeroizing<String> {
+    // Headless / scripted fallback. rpassword reads from the controlling TTY
+    // (/dev/tty), which does not exist under `docker exec -i`, cron, or CI —
+    // there it fails with "No such device or address". Allow the password via
+    // SHADOWDAG_WALLET_PASSWORD for automation and testnet exercising. SECURITY:
+    // an env var is visible to the process tree and shell history; use only for
+    // testing/automation, never for production key custody (prefer the TTY).
+    if let Ok(pw) = std::env::var("SHADOWDAG_WALLET_PASSWORD") {
+        let trimmed = Zeroizing::new(pw.trim().to_string());
+        if trimmed.len() < 8 {
+            slog_error!("wallet", "env_password_too_short", min_length => "8");
+            std::process::exit(1);
+        }
+        return trimmed;
+    }
+
     eprint!("{}", prompt_msg);
     io::stderr().flush().ok();
 
