@@ -479,6 +479,12 @@ impl TxValidator {
         if tx.is_confidential() {
             return Self::validate_confidential(tx, utxo_set, network);
         }
+        // Shield: transparent inputs -> confidential outputs. Validated entirely
+        // by the shield gate and RETURNS (its outputs are confidential; falling
+        // through to the transparent output/balance logic would misjudge it).
+        if tx.is_shield() {
+            return Self::validate_shield(tx, utxo_set, network);
+        }
 
         let mut seen_inputs: HashSet<UtxoKey> = HashSet::with_capacity(tx.inputs.len());
         let mut input_sum: u64 = 0;
@@ -564,6 +570,16 @@ impl TxValidator {
         .is_ok()
     }
 
+    /// Validate a SHIELD tx (transparent inputs -> confidential outputs) through
+    /// the shared shield gate — the SAME `verify_shield_tx` used on the block and
+    /// reorg paths, so mempool/block/reorg all agree.
+    pub fn validate_shield(tx: &Transaction, utxo_set: &UtxoSet, network: &NetworkMode) -> bool {
+        crate::engine::privacy::ringct::confidential_consensus::verify_shield_tx(
+            tx, utxo_set, network,
+        )
+        .is_ok()
+    }
+
     /// Full UTXO-aware validation with descriptive error messages.
     /// Checks ALL validation gaps from issue #3:
     ///   1. Duplicate inputs within same tx
@@ -605,6 +621,17 @@ impl TxValidator {
             } else {
                 Err(StorageError::Other(format!(
                     "confidential (RingCT) verification failed for tx {}",
+                    tx.hash
+                )))
+            };
+        }
+        // Shield (transparent -> confidential): shared shield gate, then RETURN.
+        if tx.is_shield() {
+            return if Self::validate_shield(tx, utxo_set, &network) {
+                Ok(())
+            } else {
+                Err(StorageError::Other(format!(
+                    "shield verification failed for tx {}",
                     tx.hash
                 )))
             };

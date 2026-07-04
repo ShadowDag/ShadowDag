@@ -933,6 +933,122 @@ impl UtxoSet {
                 continue;
             }
 
+            // ── SHIELD: transparent inputs SPENT + confidential outputs RECORDED ──
+            // The crypto + homomorphic balance were validated by verify_shield_tx
+            // at the gate (mempool/block/reorg — see the shield routing). Here we
+            // (1) enforce the TRANSPARENT-input rules — exists, unspent, mature,
+            // no intra-block conflict — and mark them spent in the SAME namespace
+            // as ordinary transparent spends (spent-flag + staged_spent + undo),
+            // and (2) record the CONFIDENTIAL outputs (okey/okeyidx). Both go in
+            // ONE atomic batch; if ANY input is invalid the WHOLE tx is skipped so
+            // no confidential output is ever minted without its inputs being spent.
+            if tx.is_shield() {
+                let mut ok = true;
+                let mut spend_set: Vec<(UtxoKey, crate::domain::utxo::utxo::Utxo)> =
+                    Vec::with_capacity(tx.inputs.len());
+                for input in &tx.inputs {
+                    let key = utxo_key(&input.txid, input.index)?;
+                    if staged_spent.contains(&key) {
+                        ok = false;
+                        break;
+                    }
+                    let utxo = if let Some(u) = staged_outputs.get(&key) {
+                        // A coinbase created in THIS block is immature.
+                        if staged_coinbase.contains(&key) {
+                            ok = false;
+                            break;
+                        }
+                        u.clone()
+                    } else if let Some(raw) = self.store.get_raw(key.as_ref()) {
+                        match bincode::deserialize::<crate::domain::utxo::utxo::Utxo>(&raw) {
+                            Ok(u) if !u.spent => u,
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    } else {
+                        ok = false;
+                        break;
+                    };
+                    // Coinbase maturity (has block_height here; verify_shield_tx cannot).
+                    let mut meta_key = Vec::with_capacity(10 + 36);
+                    meta_key.extend_from_slice(b"cb_height:");
+                    meta_key.extend_from_slice(key.as_ref());
+                    if let Some(raw) = self.store.get_raw(&meta_key) {
+                        if raw.len() >= 8 {
+                            let cb_h = u64::from_le_bytes(raw[..8].try_into().unwrap_or([0; 8]));
+                            if block_height < cb_h + self.coinbase_maturity() {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    spend_set.push((key, utxo));
+                }
+                if !ok {
+                    skipped += 1;
+                    commitment_hasher.update(b"SKIP");
+                    commitment_hasher.update(tx.hash.as_bytes());
+                    continue;
+                }
+                // Spend the transparent inputs (same namespace as a normal spend).
+                for (key, utxo) in &spend_set {
+                    let key_str = key.to_string();
+                    undo.spent_utxos.push((key_str.clone(), utxo.clone()));
+                    let addr_key = format!("addr:{}:{}", utxo.address, key_str);
+                    ops.push(BatchWrite::Delete {
+                        key: addr_key.as_bytes().to_vec(),
+                    });
+                    undo.deleted_addr_indexes.push((addr_key, key_str));
+                    let mut spent_utxo = utxo.clone();
+                    spent_utxo.spent = true;
+                    let data = bincode::serialize(&spent_utxo).map_err(|e| {
+                        StorageError::Serialization(format!("shield spent UTXO {}: {}", key, e))
+                    })?;
+                    ops.push(BatchWrite::Put {
+                        key: key.as_ref().to_vec(),
+                        value: data,
+                    });
+                    staged_spent.insert(*key);
+                    staged_outputs.remove(key);
+                    mh.remove_by_key(key.as_ref(), utxo.amount, &utxo.address);
+                    commitment_hasher.update(b"S");
+                    commitment_hasher.update(key.as_ref());
+                    commitment_hasher.update(utxo.amount.to_le_bytes());
+                }
+                // Record the confidential outputs (okey/okeyidx). These are NOT
+                // transparent UTXOs, so they do not enter staged_outputs or the
+                // transparent MuHash accumulator.
+                for output in &tx.outputs {
+                    if let (Some(otk), Some(c)) = (&output.one_time_pubkey, &output.commitment) {
+                        ops.push(BatchWrite::Put {
+                            key: Self::okey_key(otk),
+                            value: c.as_bytes().to_vec(),
+                        });
+                        ops.push(BatchWrite::Put {
+                            key: Self::okeyidx_at_key(conf_out_index),
+                            value: otk.as_bytes().to_vec(),
+                        });
+                        undo.created_output_keys.push(otk.clone());
+                        conf_out_index += 1;
+                        commitment_hasher.update(b"C");
+                        commitment_hasher.update(otk.as_bytes());
+                    }
+                }
+                let seen_key = format!("tx_seen:{}", tx.hash);
+                ops.push(BatchWrite::Put {
+                    key: seen_key.as_bytes().to_vec(),
+                    value: block_hash.as_bytes().to_vec(),
+                });
+                undo.applied_tx_ids.push(tx.hash.clone());
+                commitment_hasher.update(b"SHIELD");
+                commitment_hasher.update(tx.hash.as_bytes());
+                applied += 1;
+                applied_fees = applied_fees.saturating_add(tx.fee);
+                continue;
+            }
+
             if tx.is_coinbase() {
                 for (idx, output) in tx.outputs.iter().enumerate() {
                     let key = utxo_key(&tx.hash, idx as u32)?;
@@ -2149,5 +2265,84 @@ mod ringct_phase1_store_tests {
         assert_eq!(set.muhash_commitment(), after_a, "rollback must restore the accumulator");
         assert_eq!(set.muhash_commitment(), set.compute_muhash_from_set().finalize());
         assert_eq!(set.verify_muhash_integrity(), Some(true));
+    }
+
+    // ── Shield apply/rollback (P4) ──────────────────────────────────────────
+    // These exercise apply_block_dag_ordered directly (the crypto/balance is the
+    // gate's job, verified separately); here we prove the MUTATION half: a shield
+    // spends its transparent input AND records its confidential output atomically,
+    // rollback reverses BOTH, and a spent input cannot be re-shielded.
+
+    fn shield_tx(hash: &str, in_txid: &str, otk: &str) -> crate::domain::transaction::transaction::Transaction {
+        use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
+        let mut inp = TxInput::new(in_txid.into(), 0, "ST1miner".into(), "sig".into(), "pk".into());
+        inp.shield_blinding = Some("00".repeat(32));
+        let mut out = TxOutput::new("SD1p".into(), 0);
+        out.one_time_pubkey = Some(otk.to_string());
+        out.commitment = Some("dd".repeat(32));
+        let mut tx = Transaction::new(hash.into(), vec![inp], vec![out], 0, 1);
+        tx.hash = hash.into();
+        tx.tx_type = TxType::Shield;
+        tx
+    }
+
+    fn seed_coinbase(set: &UtxoSet, cb_hash: &str) {
+        use crate::domain::transaction::transaction::{Transaction, TxOutput};
+        let mut cb = Transaction::new_coinbase(cb_hash.into(), vec![TxOutput::new("ST1miner".into(), 5000)], 0, 1);
+        cb.hash = cb_hash.into();
+        set.apply_block_dag_ordered(std::slice::from_ref(&cb), 0, "cbblk").unwrap();
+    }
+
+    #[test]
+    fn shield_apply_spends_input_and_records_confidential_output() {
+        let set = UtxoSet::new_empty();
+        let cb_hash = "aa".repeat(32);
+        seed_coinbase(&set, &cb_hash);
+        let in_key = utxo_key(&cb_hash, 0).unwrap();
+        assert!(!set.get_utxo(&in_key).unwrap().spent);
+
+        let otk = "cc".repeat(32);
+        let tx = shield_tx(&"ee".repeat(32), &cb_hash, &otk);
+        // Height 2000 > coinbase maturity (Mainnet default 1000).
+        let (applied, skipped, _) = set
+            .apply_block_dag_ordered(std::slice::from_ref(&tx), 2000, "shblk")
+            .unwrap();
+        assert_eq!((applied, skipped), (1, 0), "shield must apply");
+        assert!(set.get_utxo(&in_key).unwrap().spent, "shield must SPEND its transparent input");
+        assert!(set.output_key_exists(&otk), "shield must RECORD its confidential output");
+    }
+
+    #[test]
+    fn shield_rollback_restores_input_and_deletes_output() {
+        let set = UtxoSet::new_empty();
+        let cb_hash = "aa".repeat(32);
+        seed_coinbase(&set, &cb_hash);
+        let in_key = utxo_key(&cb_hash, 0).unwrap();
+        let otk = "cc".repeat(32);
+        let tx = shield_tx(&"ee".repeat(32), &cb_hash, &otk);
+        set.apply_block_dag_ordered(std::slice::from_ref(&tx), 2000, "shblk").unwrap();
+        assert!(set.get_utxo(&in_key).unwrap().spent);
+        assert!(set.output_key_exists(&otk));
+
+        set.rollback_block_undo("shblk").unwrap();
+        assert!(!set.get_utxo(&in_key).unwrap().spent, "rollback must RESTORE the transparent input");
+        assert!(!set.output_key_exists(&otk), "rollback must DELETE the confidential output");
+    }
+
+    #[test]
+    fn shield_cannot_re_spend_a_spent_input() {
+        // Double-spend: a shield input marked spent cannot be shielded again (a
+        // second shield referencing the same outpoint, different tx hash, skips).
+        let set = UtxoSet::new_empty();
+        let cb_hash = "aa".repeat(32);
+        seed_coinbase(&set, &cb_hash);
+        let tx1 = shield_tx(&"e1".repeat(32), &cb_hash, &"c1".repeat(32));
+        let tx2 = shield_tx(&"e2".repeat(32), &cb_hash, &"c2".repeat(32));
+        let (a1, _, _) = set.apply_block_dag_ordered(std::slice::from_ref(&tx1), 2000, "b1").unwrap();
+        assert_eq!(a1, 1);
+        let (a2, s2, _) = set.apply_block_dag_ordered(std::slice::from_ref(&tx2), 2001, "b2").unwrap();
+        assert_eq!(a2, 0, "re-shielding a spent input must NOT apply");
+        assert_eq!(s2, 1, "the second shield must be skipped");
+        assert!(!set.output_key_exists(&"c2".repeat(32)), "skipped shield must record NO confidential output");
     }
 }

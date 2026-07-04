@@ -2900,6 +2900,14 @@ fn verify_block_confidential_txs(
                 tx, utxo_set, network, &mut seen_ki,
             )
             .map_err(|e| format!("confidential tx {} failed consensus gate: {}", tx.hash, e))?;
+        } else if tx.is_shield() {
+            // Shield (transparent -> confidential): same shield gate as mempool +
+            // block-UTXO validation, so the reorg/apply path never records
+            // confidential shield state without the crypto/balance check.
+            crate::engine::privacy::ringct::confidential_consensus::verify_shield_tx(
+                tx, utxo_set, network,
+            )
+            .map_err(|e| format!("shield tx {} failed consensus gate: {}", tx.hash, e))?;
         }
     }
     Ok(())

@@ -197,6 +197,17 @@ impl UtxoValidator {
                 )?;
                 continue;
             }
+            // Shield (transparent -> confidential): verified by the shield gate.
+            // Its transparent inputs ARE spent (in apply), but the crypto/balance
+            // is checked here via the shared gate, same as mempool + reorg.
+            if tx.is_shield() {
+                crate::engine::privacy::ringct::confidential_consensus::verify_shield_tx(
+                    tx,
+                    utxo_set,
+                    &conf_network,
+                )?;
+                continue;
+            }
 
             // Non-coinbase must have inputs
             if tx.inputs.is_empty() {
