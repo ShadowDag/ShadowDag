@@ -120,6 +120,7 @@ mod tests {
             ring_signature: Some(dual_clsag::to_hex(&sig)),
             ring_commitments: Some(ring.iter().map(|m| hexp(&m.commitment)).collect()),
             pseudo_commitment: Some(hexp(&pseudo)),
+            shield_blinding: None,
         };
         (input, ring, pseudo)
     }

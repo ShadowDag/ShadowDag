@@ -173,6 +173,9 @@ impl Serializer {
             TxType::TokenTransfer => 0x06,
             TxType::SwapTx => 0x07,
             TxType::DexOrder => 0x08,
+            // MUST match Transaction::canonical_bytes (transaction.rs) — a divergent
+            // discriminant here would give the same tx two different hashes.
+            TxType::Shield => 0x09,
         }
     }
 
@@ -390,6 +393,7 @@ mod tests {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput {
                 address: "bob".to_string(),

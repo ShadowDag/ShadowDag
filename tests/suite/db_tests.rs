@@ -142,6 +142,7 @@ mod tests {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput {
                 address: "shadow1rb_out".into(),

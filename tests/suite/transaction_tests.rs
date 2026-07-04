@@ -166,6 +166,7 @@ mod tests {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             })
             .collect();
         let mut tx = Transaction {
@@ -248,6 +249,7 @@ mod tests {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput {
                 address: "addr".into(),
@@ -320,6 +322,7 @@ mod tests {
             ring_signature: None,
             ring_commitments: None,
             pseudo_commitment: None,
+            shield_blinding: None,
         };
         let tx = Transaction {
             hash: "dup_input_tx".to_string(),

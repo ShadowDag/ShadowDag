@@ -741,6 +741,7 @@ impl Wallet {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             });
         }
 
@@ -906,6 +907,7 @@ impl Wallet {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             })
             .collect();
 
@@ -996,6 +998,7 @@ impl Wallet {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             })
             .collect();
 

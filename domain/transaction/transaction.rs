@@ -26,6 +26,11 @@ pub enum TxType {
     SwapTx,
     /// DEX order placement/cancellation transaction
     DexOrder,
+    /// Shield transaction — TRANSPARENT inputs -> CONFIDENTIAL outputs. The entry
+    /// point into the RingCT pool: public input amounts (read from the UTXO set)
+    /// are converted into hidden-amount confidential outputs. CONSENSUS-CRITICAL,
+    /// inflation-risk — see docs/superpowers/specs/2026-07-04-shield-tx-design.md.
+    Shield,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -57,6 +62,13 @@ pub struct TxInput {
     /// None for transparent inputs.
     #[serde(default)]
     pub pseudo_commitment: Option<String>,
+    /// SHIELD only: the Pedersen blinding scalar r_i (hex) for a transparent
+    /// input consumed by a Shield tx. The verifier forms the input commitment
+    /// C_in = A_i·H + r_i·G where A_i is the input UTXO's amount read from the
+    /// UTXO SET (never from the tx) — so r_i cannot move value, only balance the
+    /// output blindings. None for transparent/confidential inputs.
+    #[serde(default)]
+    pub shield_blinding: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -176,6 +188,13 @@ impl Transaction {
         self.tx_type == TxType::Confidential
     }
 
+    /// Returns true if this is a SHIELD transaction (transparent inputs ->
+    /// confidential outputs). It lives in BOTH worlds, so every routing site
+    /// that special-cases `is_confidential()` must also handle `is_shield()`.
+    pub fn is_shield(&self) -> bool {
+        self.tx_type == TxType::Shield
+    }
+
     /// Whether this tx runs through ShadowVM during block execution
     /// (ContractCreate / ContractCall). Only these consume gas.
     pub fn is_contract_tx(&self) -> bool {
@@ -248,6 +267,7 @@ impl Transaction {
             TxType::TokenTransfer => 0x06,
             TxType::SwapTx => 0x07,
             TxType::DexOrder => 0x08,
+            TxType::Shield => 0x09,
         };
         buf.push(tx_type_byte);
 
@@ -342,6 +362,16 @@ impl Transaction {
                 let pb = pc.as_bytes();
                 buf.extend_from_slice(&(pb.len() as u32).to_le_bytes());
                 buf.extend_from_slice(pb);
+            } else {
+                buf.push(0x00);
+            }
+            // SHIELD: per-input blinding r_i, bound into the txid so it cannot be
+            // altered without changing the transaction identity.
+            if let Some(ref sb) = inp.shield_blinding {
+                buf.push(0x01);
+                let sbb = sb.as_bytes();
+                buf.extend_from_slice(&(sbb.len() as u32).to_le_bytes());
+                buf.extend_from_slice(sbb);
             } else {
                 buf.push(0x00);
             }
@@ -493,6 +523,7 @@ impl TxInput {
             ring_signature: None,
             ring_commitments: None,
             pseudo_commitment: None,
+            shield_blinding: None,
         }
     }
 
@@ -517,6 +548,7 @@ impl TxInput {
             ring_signature: None,
             ring_commitments: None,
             pseudo_commitment: None,
+            shield_blinding: None,
         }
     }
 }
@@ -594,6 +626,7 @@ mod tests {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             }],
             vec![TxOutput::new("SD1x".into(), 10)],
             1,
@@ -620,6 +653,7 @@ mod tests {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             }],
             vec![TxOutput::new("SD1x".into(), 10)],
             1,
@@ -664,6 +698,7 @@ mod tests {
                 ring_signature: Some("aa".repeat(40)),
                 ring_commitments: Some(vec!["44".repeat(32), "55".repeat(32)]),
                 pseudo_commitment: Some("66".repeat(32)),
+                shield_blinding: None,
             }],
             vec![TxOutput {
                 address: "SD1s".into(),

@@ -315,6 +315,7 @@ fn generate_test_tx_invalid(from: &str, to: &str, seq: u64) -> Transaction {
             ring_signature: None,
             ring_commitments: None,
             pseudo_commitment: None,
+            shield_blinding: None,
         }],
         outputs: vec![TxOutput {
             address: to.to_string(),
@@ -365,6 +366,7 @@ fn generate_valid_transfer_tx(n: u64, from_addr: &str, to_addr: &str) -> Transac
             ring_signature: None,
             ring_commitments: None,
             pseudo_commitment: None,
+            shield_blinding: None,
         }],
         outputs: vec![TxOutput {
             address: to_addr.to_string(),

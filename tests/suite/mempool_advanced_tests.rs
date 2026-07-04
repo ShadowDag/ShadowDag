@@ -44,6 +44,7 @@ mod tests {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput {
                 address: "shadow1mempool".into(),
@@ -255,6 +256,7 @@ mod tests {
             ring_signature: None,
             ring_commitments: None,
             pseudo_commitment: None,
+            shield_blinding: None,
         };
 
         let tx1 = Transaction {
@@ -321,6 +323,7 @@ mod tests {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput {
                 address: "addr".into(),

@@ -117,6 +117,7 @@ pub fn build_transaction_with_anchor(
             ring_signature: None,
             ring_commitments: None,
             pseudo_commitment: None,
+            shield_blinding: None,
         })
         .collect();
 
@@ -394,6 +395,7 @@ mod tests {
             ring_signature: None,
             ring_commitments: None,
             pseudo_commitment: None,
+            shield_blinding: None,
         }];
         let outputs = vec![TxOutput {
             address: format!("SD1{}", "11".repeat(20)),

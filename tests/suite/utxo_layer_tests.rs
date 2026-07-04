@@ -75,6 +75,7 @@ mod utxo_validator_tests {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput {
                 address: "dest".to_string(),
@@ -147,6 +148,7 @@ mod utxo_validator_tests {
                     ring_signature: None,
                     ring_commitments: None,
                     pseudo_commitment: None,
+                    shield_blinding: None,
                 },
                 TxInput {
                     txid: "dup".to_string(),
@@ -159,6 +161,7 @@ mod utxo_validator_tests {
                     ring_signature: None,
                     ring_commitments: None,
                     pseudo_commitment: None,
+                    shield_blinding: None,
                 },
             ],
             outputs: vec![TxOutput {
@@ -211,6 +214,7 @@ mod utxo_spend_tests {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput {
                 address: "shadow1bob".to_string(),

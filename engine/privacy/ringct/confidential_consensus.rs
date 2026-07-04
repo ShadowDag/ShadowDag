@@ -230,6 +230,7 @@ mod tests {
                 ring_signature: None,
                 ring_commitments: Some(ring.iter().map(|m| hexp(&m.commitment)).collect()),
                 pseudo_commitment: Some(hexp(&pseudo)),
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput {
                 address: "SD1s".into(),
@@ -421,6 +422,7 @@ mod tests {
                 ring_signature: None,
                 ring_commitments: Some(vec![hexp(&c_in)]),
                 pseudo_commitment: Some(hexp(&pseudo)),
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput {
                 address: "SD1s".into(),

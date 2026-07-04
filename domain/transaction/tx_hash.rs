@@ -254,6 +254,7 @@ mod tests {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput {
                 address: "bob".to_string(),
@@ -397,6 +398,7 @@ mod tests {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             },
             TxInput {
                 txid: "tx_bbb".into(),
@@ -409,6 +411,7 @@ mod tests {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             },
         ];
         let inputs_b = vec![
@@ -423,6 +426,7 @@ mod tests {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             },
             TxInput {
                 txid: "tx_aaa".into(),
@@ -435,6 +439,7 @@ mod tests {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             },
         ];
         let outputs = vec![TxOutput {
@@ -494,6 +499,7 @@ mod tests {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput::new("SD1dest".into(), 1000)],
             fee: 100,

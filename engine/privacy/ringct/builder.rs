@@ -143,6 +143,7 @@ pub fn build_confidential_transaction(
             ring_signature: None,
             ring_commitments: Some(inp.ring.iter().map(|m| hexp(&m.commitment)).collect()),
             pseudo_commitment: Some(hexp(&pseudo)),
+            shield_blinding: None,
         });
     }
 

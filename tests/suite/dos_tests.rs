@@ -51,6 +51,7 @@ mod tests {
                     ring_signature: None,
                     ring_commitments: None,
                     pseudo_commitment: None,
+                    shield_blinding: None,
                 })
                 .collect(),
             outputs: vec![TxOutput {

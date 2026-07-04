@@ -22,6 +22,7 @@ mod tx_hash_tests {
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput {
                 address: "shadow1bob".to_string(),
