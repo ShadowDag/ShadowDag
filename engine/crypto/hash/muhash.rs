@@ -43,8 +43,16 @@ const PRIME: u128 = 0xFFFF_FFFF_FFFF_FFC5; // Largest 64-bit prime (2^64 - 59)
 /// Domain tag for UTXO hashing
 const UTXO_HASH_TAG: &[u8] = b"ShadowDAG_MuHash_UTXO_v1";
 
-/// MuHash accumulator for UTXO set commitment
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// MuHash accumulator for UTXO set commitment.
+///
+/// NOTE ON FIELD SIZE (security scope): the accumulator operates in a 64-bit
+/// prime field. That is adequate for a LOCAL, NON-ADVERSARIAL integrity check
+/// (detecting accidental UTXO-set corruption / apply-logic bugs on crash
+/// recovery), which is how ShadowDAG uses it. It is NOT strong enough to be a
+/// CONSENSUS commitment validated across mutually-distrusting nodes — a ~2^32
+/// birthday attack could forge a colliding accumulator. Promoting this to a
+/// header-validated consensus commitment requires a full 256-bit field first.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MuHash {
     /// Multiplicative accumulator (starts at 1)
     numerator: u128,
@@ -80,6 +88,26 @@ impl MuHash {
     /// Remove a UTXO from the set: acc *= H(utxo)^(-1)
     pub fn remove_utxo(&mut self, txid: &str, index: u32, amount: u64, address: &str) {
         let h = Self::hash_utxo(txid, index, amount, address);
+        self.denominator = Self::mul_mod(self.denominator, h);
+        if self.count > 0 {
+            self.count -= 1;
+        }
+    }
+
+    /// Add a UTXO identified by its raw binary key (the canonical UtxoKey
+    /// bytes) plus amount and address. Symmetric with `remove_by_key`. Used by
+    /// the incremental UTXO-set accumulator: apply uses the SAME raw key bytes
+    /// at create and at spend, so the element cancels exactly (no txid-string
+    /// round-trip). The element is H(TAG | key | amount_le | address).
+    pub fn add_by_key(&mut self, key: &[u8], amount: u64, address: &str) {
+        let h = Self::hash_by_key(key, amount, address);
+        self.numerator = Self::mul_mod(self.numerator, h);
+        self.count += 1;
+    }
+
+    /// Remove a UTXO by its raw binary key (inverse of `add_by_key`).
+    pub fn remove_by_key(&mut self, key: &[u8], amount: u64, address: &str) {
+        let h = Self::hash_by_key(key, amount, address);
         self.denominator = Self::mul_mod(self.denominator, h);
         if self.count > 0 {
             self.count -= 1;
@@ -150,6 +178,19 @@ impl MuHash {
         arr.copy_from_slice(&digest[..16]);
         let val = u128::from_le_bytes(arr);
         (val % PRIME).max(1) // Must be non-zero in multiplicative group
+    }
+
+    /// Hash a UTXO (raw key bytes + amount + address) to a field element.
+    fn hash_by_key(key: &[u8], amount: u64, address: &str) -> u128 {
+        let mut h = Sha256::new();
+        h.update(UTXO_HASH_TAG);
+        h.update(key);
+        h.update(amount.to_le_bytes());
+        h.update(address.as_bytes());
+        let digest = h.finalize();
+        let mut arr = [0u8; 16];
+        arr.copy_from_slice(&digest[..16]);
+        (u128::from_le_bytes(arr) % PRIME).max(1)
     }
 
     /// Hash arbitrary data to a field element
@@ -358,6 +399,36 @@ mod tests {
             after_genesis, after_rollback,
             "Rollback must restore original commitment"
         );
+    }
+
+    #[test]
+    fn by_key_add_remove_cancels() {
+        let empty = MuHash::new().finalize();
+        let mut mh = MuHash::new();
+        let key = [7u8; 36];
+        mh.add_by_key(&key, 1000, "SD1a");
+        mh.remove_by_key(&key, 1000, "SD1a");
+        assert_eq!(mh.finalize(), empty, "add_by_key then remove_by_key must cancel");
+        assert_eq!(mh.count(), 0);
+    }
+
+    #[test]
+    fn by_key_order_independent_and_serde() {
+        let k1 = [1u8; 36];
+        let k2 = [2u8; 36];
+        let mut a = MuHash::new();
+        a.add_by_key(&k1, 100, "SD1a");
+        a.add_by_key(&k2, 200, "SD1b");
+        let mut b = MuHash::new();
+        b.add_by_key(&k2, 200, "SD1b");
+        b.add_by_key(&k1, 100, "SD1a");
+        assert_eq!(a.finalize(), b.finalize(), "by_key must be order-independent");
+
+        // State round-trips through bincode (used to persist the accumulator).
+        let bytes = bincode::serialize(&a).unwrap();
+        let restored: MuHash = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(a, restored);
+        assert_eq!(a.finalize(), restored.finalize());
     }
 
     #[test]

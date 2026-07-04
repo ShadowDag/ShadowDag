@@ -1168,39 +1168,53 @@ impl DaemonNode {
         } else if best_block.header.height > 0 {
             // Level 2: UTXO integrity check on restart.
             //
-            // NOTE: we intentionally do NOT compare the per-block stored
-            // commitment here. That stored value (`utxo:commitment:{hash}`) is an
-            // incremental CHAINED hash — a function of block-apply HISTORY
-            // (including reorg order), not of the current UTXO set — so it is
-            // structurally incomparable to a snapshot of the live set. The old
-            // code compared it against `compute_commitment_hash()` (a set
-            // snapshot); those two algorithms can never be equal, so EVERY
-            // restart past genesis wiped the UTXO set, replayed, still mismatched
-            // and FATAL'd — bricking the node. Until a proper snapshot/Merkle
-            // UTXO commitment exists, use the count-based consistency check
-            // (the previous pre-commitment behaviour), which is reorg-independent
-            // and never false-FATALs.
-            slog_info!("daemon", "utxo_count_integrity_check");
+            // PRIMARY: an EXACT cryptographic check via the rolling MuHash
+            // accumulator. Unlike the per-block CHAINED commitment
+            // (`utxo:commitment:{hash}`, a function of apply HISTORY and thus
+            // incomparable to a set snapshot), the MuHash is a commitment to the
+            // current unspent SET: recomputing it from the live set and comparing
+            // to the value persisted atomically with the last apply detects
+            // corruption or an apply/rollback bug exactly. Persisted per block, so
+            // it is reorg-independent. FALLBACK: when no MuHash baseline exists
+            // yet (first start after this landed, or legacy data), use the
+            // reorg-independent ±1% count heuristic and then persist a baseline.
             let actual = utxo_count;
-            match self.compute_expected_utxo_count() {
-                Some(expected) => {
-                    let tolerance = std::cmp::max(expected / 100, 10);
-                    let diff = expected.abs_diff(actual);
-                    if expected > 0 && diff > tolerance {
-                        slog_warn!("daemon", "utxo_count_mismatch_rebuilding", expected => expected, actual => actual);
-                        self.utxo_set.clear_all();
-                        self.replay_blocks()?;
-                        slog_info!("daemon", "utxo_rebuilt", entries => self.utxo_set.count_utxos());
-                    } else {
-                        slog_info!("daemon", "utxo_ok_count_based", actual => actual, expected => expected);
-                    }
+            match self.utxo_set.verify_muhash_integrity() {
+                Some(true) => {
+                    slog_info!("daemon", "utxo_ok_muhash", entries => actual);
+                }
+                Some(false) => {
+                    slog_warn!("daemon", "utxo_muhash_mismatch_rebuilding", entries => actual);
+                    self.utxo_set.clear_all();
+                    self.replay_blocks()?;
+                    slog_info!("daemon", "utxo_rebuilt", entries => self.utxo_set.count_utxos());
                 }
                 None => {
-                    // Selected-chain walk broken (corruption) — cannot compute a
-                    // trustworthy expected count. Skip the heuristic rather than
-                    // trigger a rebuild that would itself fail; leave the store
-                    // as-is and let the operator decide to --reindex.
-                    slog_warn!("daemon", "utxo_integrity_check_skipped_broken_selected_chain", actual => actual);
+                    slog_info!("daemon", "utxo_count_integrity_check_no_muhash_baseline");
+                    match self.compute_expected_utxo_count() {
+                        Some(expected) => {
+                            let tolerance = std::cmp::max(expected / 100, 10);
+                            let diff = expected.abs_diff(actual);
+                            if expected > 0 && diff > tolerance {
+                                slog_warn!("daemon", "utxo_count_mismatch_rebuilding", expected => expected, actual => actual);
+                                self.utxo_set.clear_all();
+                                self.replay_blocks()?;
+                                slog_info!("daemon", "utxo_rebuilt", entries => self.utxo_set.count_utxos());
+                            } else {
+                                // Count looks good and there was no baseline — persist
+                                // one now so future restarts get the exact MuHash check.
+                                self.utxo_set.rebuild_and_persist_muhash();
+                                slog_info!("daemon", "utxo_ok_count_based_muhash_baseline_set", actual => actual, expected => expected);
+                            }
+                        }
+                        None => {
+                            // Selected-chain walk broken (corruption) — cannot compute a
+                            // trustworthy expected count. Skip the heuristic rather than
+                            // trigger a rebuild that would itself fail; leave the store
+                            // as-is and let the operator decide to --reindex.
+                            slog_warn!("daemon", "utxo_integrity_check_skipped_broken_selected_chain", actual => actual);
+                        }
+                    }
                 }
             }
         } else {

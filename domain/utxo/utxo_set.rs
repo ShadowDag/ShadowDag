@@ -9,6 +9,7 @@ use std::sync::Arc; // 🔥 ADD
 
 use crate::config::node::node_config::NetworkMode;
 use crate::domain::block::block::Block;
+use crate::engine::crypto::hash::muhash::MuHash;
 use crate::domain::traits::utxo_backend::{BatchWrite, UtxoBackend};
 use crate::domain::transaction::transaction::Transaction;
 use crate::domain::transaction::tx_hash::TxHash;
@@ -120,6 +121,14 @@ pub struct UtxoSet {
     /// mature fast so transactions can be tested without a long wait; mainnet
     /// uses the full `COINBASE_MATURITY`. Defaults to Mainnet (see `with_network`).
     network: NetworkMode,
+    /// Rolling MuHash accumulator over the TRANSPARENT unspent set — a LOCAL,
+    /// non-consensus integrity aid for crash recovery. Maintained incrementally
+    /// on apply (add created / remove spent) and its commitment persisted
+    /// atomically per block; on rollback it is recomputed from the set. On
+    /// startup, recovery recomputes it from the set and compares to the
+    /// persisted value to detect corruption (replaces the ±1% count heuristic).
+    /// NOT validated across nodes — see MuHash's field-size note.
+    muhash: RwLock<MuHash>,
 }
 
 impl UtxoSet {
@@ -139,6 +148,7 @@ impl UtxoSet {
             store,
             cache: RwLock::new(HashMap::with_capacity(MAX_CACHE_SIZE / 4)),
             network: NetworkMode::Mainnet,
+            muhash: RwLock::new(MuHash::new()),
         }
     }
 
@@ -467,6 +477,9 @@ impl UtxoSet {
     pub fn clear_all(&self) {
         // Clear in-memory cache
         self.cache.write().clear();
+        // Reset the MuHash accumulator — the set is now empty, so a subsequent
+        // replay rebuilds it incrementally from the identity.
+        *self.muhash.write() = MuHash::new();
         // Clear DB via store
         self.store.clear_all();
     }
@@ -557,6 +570,11 @@ impl UtxoSet {
         commitment_hasher.update(block_hash.as_bytes());
         commitment_hasher.update(block_height.to_le_bytes());
 
+        // Working copy of the rolling MuHash integrity accumulator (see
+        // apply_block_dag_ordered for the rationale). This apply path builds
+        // genesis and full blocks; both must feed the accumulator.
+        let mut mh = self.muhash.read().clone();
+
         for tx in transactions {
             if tx.is_coinbase() {
                 for (idx, output) in tx.outputs.iter().enumerate() {
@@ -599,6 +617,7 @@ impl UtxoSet {
                     commitment_hasher.update(key.as_ref());
                     commitment_hasher.update(output.address.as_bytes());
                     commitment_hasher.update(output.amount.to_le_bytes());
+                    mh.add_by_key(key.as_ref(), output.amount, &output.address);
                 }
             } else {
                 for input in &tx.inputs {
@@ -639,6 +658,7 @@ impl UtxoSet {
                     commitment_hasher.update(b"S");
                     commitment_hasher.update(key.as_ref());
                     commitment_hasher.update(utxo.amount.to_le_bytes());
+                    mh.remove_by_key(key.as_ref(), utxo.amount, &utxo.address);
 
                     utxo.spent = true;
                     let data = bincode::serialize(&utxo).map_err(|e| {
@@ -680,6 +700,7 @@ impl UtxoSet {
                     commitment_hasher.update(key.as_ref());
                     commitment_hasher.update(output.address.as_bytes());
                     commitment_hasher.update(output.amount.to_le_bytes());
+                    mh.add_by_key(key.as_ref(), output.amount, &output.address);
                 }
             }
 
@@ -725,10 +746,18 @@ impl UtxoSet {
             value: undo_data,
         });
 
+        // Persist the MuHash accumulator in this SAME atomic batch.
+        if let Some(w) = Self::muhash_state_write(&mh) {
+            ops.push(w);
+        }
+
         // ATOMIC COMMIT — UTXO + commitment + undo = all or nothing
         self.store
             .write_batch(ops)
             .map_err(|e| StorageError::WriteFailed(format!("apply_block atomic write: {}", e)))?;
+
+        // Batch committed — publish the accumulator update (matches on-disk state).
+        *self.muhash.write() = mh;
 
         // Update cache after successful DB write
         for tx in transactions {
@@ -800,6 +829,13 @@ impl UtxoSet {
         }
         commitment_hasher.update(block_hash.as_bytes());
         commitment_hasher.update(block_height.to_le_bytes());
+
+        // Working copy of the rolling MuHash integrity accumulator. Updated
+        // alongside each transparent create/spend below (observational — it
+        // reads the same UTXOs the apply already handles and cannot alter which
+        // UTXOs are written), then persisted in this same atomic batch and
+        // committed to `self.muhash` only after the batch write succeeds.
+        let mut mh = self.muhash.read().clone();
 
         let mut applied = 0usize;
         let mut skipped = 0usize;
@@ -936,6 +972,7 @@ impl UtxoSet {
                     commitment_hasher.update(key.as_ref());
                     commitment_hasher.update(output.address.as_bytes());
                     commitment_hasher.update(output.amount.to_le_bytes());
+                    mh.add_by_key(key.as_ref(), output.amount, &output.address);
                 }
                 applied += 1;
                 continue;
@@ -1156,6 +1193,7 @@ impl UtxoSet {
                 commitment_hasher.update(b"S");
                 commitment_hasher.update(key.as_ref());
                 commitment_hasher.update(utxo.amount.to_le_bytes());
+                mh.remove_by_key(key.as_ref(), utxo.amount, &utxo.address);
             }
 
             for (idx, output) in tx.outputs.iter().enumerate() {
@@ -1186,6 +1224,7 @@ impl UtxoSet {
                 commitment_hasher.update(key.as_ref());
                 commitment_hasher.update(output.address.as_bytes());
                 commitment_hasher.update(output.amount.to_le_bytes());
+                mh.add_by_key(key.as_ref(), output.amount, &output.address);
             }
 
             // Mark tx as seen (uniqueness) + record for undo
@@ -1236,10 +1275,20 @@ impl UtxoSet {
             });
         }
 
+        // Persist the updated MuHash accumulator IN THIS SAME BATCH so its
+        // commitment is crash-atomic with the UTXO set it commits to (recovery
+        // recomputes it from the set and compares — see verify_muhash_integrity).
+        if let Some(w) = Self::muhash_state_write(&mh) {
+            ops.push(w);
+        }
+
         // ATOMIC COMMIT
         self.store.write_batch(ops).map_err(|e| {
             StorageError::WriteFailed(format!("apply_block_dag atomic write: {}", e))
         })?;
+
+        // Batch committed — publish the accumulator update (matches on-disk state).
+        *self.muhash.write() = mh;
 
         // Update cache
         for (key_str, _) in &undo.spent_utxos {
@@ -1412,6 +1461,15 @@ impl UtxoSet {
                 }
             }
         }
+        drop(cache);
+
+        // Recompute the MuHash from the restored set. The undo record lists
+        // created UTXOs by KEY only (no amount/address), so the incremental
+        // inverse is not available here; a full recompute (O(n)) is acceptable
+        // because reorgs are rare and depth-bounded (MAX_REORG_DEPTH). A crash
+        // between the rollback write above and this persist only causes a
+        // (safe) false-mismatch replay on the next recovery, never corruption.
+        self.rebuild_and_persist_muhash();
 
         Ok(())
     }
@@ -1612,6 +1670,80 @@ impl UtxoSet {
         format!("{:x}", master_hasher.finalize())
     }
 
+    // ── MuHash integrity (local crash-recovery aid; NOT a consensus commitment) ──
+
+    /// RocksDB key holding the persisted MuHash accumulator state (bincode).
+    const MUHASH_STATE_KEY: &'static [u8] = b"utxo:muhash_state";
+
+    /// Recompute the MuHash of the current transparent unspent set from scratch
+    /// (O(n) full scan). Used at startup/recovery and after a rollback. Equal to
+    /// what the incremental accumulator converges to (product over unspent
+    /// UTXOs), so the two can be compared for integrity.
+    pub fn compute_muhash_from_set(&self) -> MuHash {
+        let mut mh = MuHash::new();
+        for (key, utxo) in self.export_all() {
+            // export_all already returns only unspent transparent UTXOs; the
+            // guard is defensive.
+            if utxo.spent {
+                continue;
+            }
+            mh.add_by_key(key.as_ref(), utxo.amount, &utxo.address);
+        }
+        mh
+    }
+
+    /// Current in-memory MuHash commitment (64-char hex).
+    pub fn muhash_commitment(&self) -> String {
+        self.muhash.read().finalize()
+    }
+
+    /// The persisted MuHash accumulator, if present and well-formed.
+    fn load_persisted_muhash(&self) -> Option<MuHash> {
+        let raw = self.store.get_raw(Self::MUHASH_STATE_KEY)?;
+        bincode::deserialize(&raw).ok()
+    }
+
+    /// A `BatchWrite` persisting the accumulator state — pushed into the SAME
+    /// atomic batch as a block's UTXO mutations so the persisted commitment can
+    /// never be a block ahead of / behind the set it commits to.
+    fn muhash_state_write(mh: &MuHash) -> Option<BatchWrite> {
+        bincode::serialize(mh).ok().map(|bytes| BatchWrite::Put {
+            key: Self::MUHASH_STATE_KEY.to_vec(),
+            value: bytes,
+        })
+    }
+
+    /// Recompute the accumulator from the current set, store it in memory, and
+    /// persist it. Called at startup and after a rollback (where the incremental
+    /// delta is not recoverable from undo data, which omits created amounts).
+    pub fn rebuild_and_persist_muhash(&self) -> String {
+        let mh = self.compute_muhash_from_set();
+        let commit = mh.finalize();
+        if let Ok(bytes) = bincode::serialize(&mh) {
+            let _ = self.store.put_raw(Self::MUHASH_STATE_KEY, &bytes);
+        }
+        *self.muhash.write() = mh;
+        commit
+    }
+
+    /// Crash-recovery integrity check. Recomputes the accumulator from the
+    /// persisted set and compares it to the persisted accumulator. Returns
+    /// `Some(true)` when the set matches its committed accumulator (integrity
+    /// OK), `Some(false)` when the set diverges from the persisted commitment
+    /// (disk corruption or an apply/rollback bug — the caller should replay), or
+    /// `None` when no persisted baseline exists yet (fresh/upgraded chain — the
+    /// caller falls back to the count heuristic). Side effect: the in-memory
+    /// accumulator is (re)initialised from the live set so subsequent
+    /// incremental apply updates start from a correct base.
+    pub fn verify_muhash_integrity(&self) -> Option<bool> {
+        let computed = self.compute_muhash_from_set();
+        let result = self
+            .load_persisted_muhash()
+            .map(|persisted| persisted.finalize() == computed.finalize());
+        *self.muhash.write() = computed;
+        result
+    }
+
     // ── test helpers ────────────────────────────────────────────────────
     // Everything below until coinbase_created_height() is test-only.
     // Gated behind #[cfg(test)] so none of this compiles into production.
@@ -1632,6 +1764,7 @@ impl UtxoSet {
             store: Arc::new(store) as Arc<dyn UtxoBackend>,
             cache: RwLock::new(HM::with_capacity(64)),
             network: NetworkMode::Mainnet,
+            muhash: RwLock::new(MuHash::new()),
         })
     }
 
@@ -1942,5 +2075,79 @@ mod ringct_phase1_store_tests {
             .expect("coinbase utxo must exist");
         let utxo: crate::domain::utxo::utxo::Utxo = bincode::deserialize(&raw).unwrap();
         assert!(!utxo.spent, "coinbase output must remain unspent");
+    }
+
+    #[test]
+    fn muhash_incremental_matches_recompute_and_detects_corruption() {
+        use crate::domain::transaction::transaction::{Transaction, TxOutput};
+        let set = UtxoSet::new_empty();
+
+        // Apply two coinbase blocks (each creates a transparent output).
+        for (h, tag) in [(0u64, "aa"), (1u64, "bb")] {
+            let cbh = tag.repeat(32);
+            let mut cb = Transaction::new_coinbase(
+                cbh.clone(),
+                vec![TxOutput::new(format!("addr_{}", tag), 5000 + h)],
+                0,
+                1000,
+            );
+            cb.hash = cbh;
+            set.apply_block_dag_ordered(std::slice::from_ref(&cb), h, &format!("blk_{}", tag))
+                .unwrap();
+        }
+
+        // INVARIANT: the incrementally-maintained accumulator equals a fresh
+        // recompute over the whole set. This is what makes recovery sound.
+        assert_eq!(
+            set.muhash_commitment(),
+            set.compute_muhash_from_set().finalize(),
+            "incremental MuHash must equal recompute-from-set"
+        );
+        // A baseline was persisted atomically by apply, and it matches.
+        assert_eq!(
+            set.verify_muhash_integrity(),
+            Some(true),
+            "integrity must hold after clean applies"
+        );
+
+        // Corrupt the set OUT OF BAND: inject a UTXO straight into the store,
+        // bypassing apply (so the persisted accumulator does NOT know about it).
+        let rogue_key = utxo_key(&"cc".repeat(32), 0).unwrap();
+        let rogue = crate::domain::utxo::utxo::Utxo::new("evil".into(), "evil".into(), 999);
+        set.store
+            .put_raw(rogue_key.as_ref(), &bincode::serialize(&rogue).unwrap())
+            .unwrap();
+
+        // The live set now diverges from the persisted commitment → detected.
+        assert_eq!(
+            set.verify_muhash_integrity(),
+            Some(false),
+            "an out-of-band UTXO must be detected as a MuHash mismatch"
+        );
+    }
+
+    #[test]
+    fn muhash_restored_by_rollback() {
+        use crate::domain::transaction::transaction::{Transaction, TxOutput};
+        let set = UtxoSet::new_empty();
+
+        let mut cb_a =
+            Transaction::new_coinbase("aa".repeat(32), vec![TxOutput::new("addr_a".into(), 5000)], 0, 1000);
+        cb_a.hash = "aa".repeat(32);
+        set.apply_block_dag_ordered(std::slice::from_ref(&cb_a), 0, "blkA").unwrap();
+        let after_a = set.muhash_commitment();
+
+        let mut cb_b =
+            Transaction::new_coinbase("bb".repeat(32), vec![TxOutput::new("addr_b".into(), 6000)], 0, 1000);
+        cb_b.hash = "bb".repeat(32);
+        set.apply_block_dag_ordered(std::slice::from_ref(&cb_b), 1, "blkB").unwrap();
+        assert_ne!(set.muhash_commitment(), after_a, "applying B must change the commitment");
+
+        // Rolling back B must restore the accumulator to its post-A value, and
+        // the recomputed-from-set value must agree (rollback recomputes it).
+        set.rollback_block_undo("blkB").unwrap();
+        assert_eq!(set.muhash_commitment(), after_a, "rollback must restore the accumulator");
+        assert_eq!(set.muhash_commitment(), set.compute_muhash_from_set().finalize());
+        assert_eq!(set.verify_muhash_integrity(), Some(true));
     }
 }
