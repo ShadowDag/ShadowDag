@@ -10,7 +10,7 @@ use crate::config::node::node_config::NetworkMode;
 use crate::domain::block::block::Block;
 use crate::domain::transaction::transaction::Transaction;
 use crate::engine::dag::security::dos_protection::{
-    DosProtection, MAX_DAG_PARENTS, MAX_FUTURE_TIMESTAMP_SECS, MAX_OUTPUT_AMOUNT, MAX_TX_INPUTS,
+    DosProtection, MAX_DAG_PARENTS, MAX_FUTURE_TIMESTAMP_MS, MAX_OUTPUT_AMOUNT, MAX_TX_INPUTS,
     MAX_TX_OUTPUTS, MAX_TX_SIZE_BYTES, MIN_TX_SIZE_BYTES,
 };
 use crate::engine::dag::security::flood_protection::FloodProtection;
@@ -170,19 +170,19 @@ impl DagShield {
         if parents.len() > MAX_DAG_PARENTS {
             return Err(ShieldRejection::severe("too many parents"));
         }
-        // Reject far-future/far-past timestamps (wall clock only, cheap)
+        // Reject far-future/far-past timestamps (wall clock only, cheap; ms vs ms)
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
-        if block.header.timestamp > now + MAX_FUTURE_TIMESTAMP_SECS {
+            .as_millis() as u64;
+        if block.header.timestamp > now + MAX_FUTURE_TIMESTAMP_MS {
             return Err(ShieldRejection::minor("future timestamp"));
         }
         // NOTE: We intentionally do NOT reject old timestamps here.
         // During Initial Block Download (IBD), all historical blocks are
         // legitimately old. Timestamp validation for new blocks happens in
         // L2 (validate_structural_layer → validate_timestamp) which uses
-        // MAX_PAST_BLOCK_SECS relative to parent timestamps, not wall clock.
+        // MAX_PAST_BLOCK_MS relative to parent timestamps, not wall clock.
         // The future-timestamp check above is safe because future blocks
         // are never valid regardless of sync mode.
         Ok(())
@@ -225,16 +225,16 @@ impl DagShield {
             return Err(ShieldRejection::severe("too many outputs"));
         }
 
-        // Timestamp: reject far-future or ancient TXs
+        // Timestamp: reject far-future or ancient TXs (ms vs ms)
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
-        if tx.timestamp > now + 120 {
+            .as_millis() as u64;
+        if tx.timestamp > now + 120_000 {
             return Err(ShieldRejection::minor("future TX timestamp"));
         }
-        // TX older than 24h is stale (MAX_TX_AGE_SECS from tx_validator)
-        if tx.timestamp + 86_400 < now {
+        // TX older than 24h is stale (MAX_TX_AGE_MS from tx_validator)
+        if tx.timestamp + 86_400_000 < now {
             return Err(ShieldRejection::minor("stale TX timestamp"));
         }
 
@@ -458,11 +458,11 @@ mod tests {
     use crate::domain::block::block_header::BlockHeader;
     use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
 
-    fn now_secs() -> u64 {
+    fn now_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs()
+            .as_millis() as u64
     }
 
     fn valid_hash() -> String {
@@ -494,7 +494,7 @@ mod tests {
                 encrypted_amount: None,
             }],
             fee,
-            timestamp: now_secs(),
+            timestamp: now_ms(),
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
@@ -516,7 +516,7 @@ mod tests {
                 encrypted_amount: None,
             }],
             fee: 0,
-            timestamp: now_secs(),
+            timestamp: now_ms(),
             is_coinbase: true,
             tx_type: TxType::Transfer,
             payload_hash: None,
@@ -583,7 +583,7 @@ mod tests {
     #[test]
     fn future_timestamp_rejected() {
         let mut tx = make_tx(&valid_hash(), 5);
-        tx.timestamp = now_secs() + 300; // 5 min future
+        tx.timestamp = now_ms() + 300_000; // 5 min future (ms)
         assert!(DagShield::pre_validate_tx(&tx).is_err());
     }
 
@@ -636,7 +636,7 @@ mod tests {
                 valid_hash(),
                 parents,
                 valid_hash(),
-                now_secs(),
+                now_ms(),
                 42,
                 1,
                 height,
@@ -670,7 +670,7 @@ mod tests {
     #[test]
     fn block_future_timestamp_rejected() {
         let mut block = make_block(5, 3);
-        block.header.timestamp = now_secs() + 1000;
+        block.header.timestamp = now_ms() + 200_000; // > MAX_FUTURE_MS
         assert!(DagShield::pre_validate_block(&block).is_err());
     }
 

@@ -146,10 +146,11 @@ pub fn build_confidential_transaction(
         });
     }
 
+    // Unix epoch MILLISECONDS (confidential tx timestamps are ms).
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_millis() as u64;
     let mut tx = Transaction {
         hash: String::new(),
         inputs: tx_inputs,

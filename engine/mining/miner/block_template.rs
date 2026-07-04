@@ -184,7 +184,7 @@ impl BlockTemplateBuilder {
         };
 
         let header = BlockHeader {
-            version: 1,
+            version: 2, // ms-timestamp era (matches GENESIS_VERSION)
             hash: String::new(),
             parents,
             merkle_root,
@@ -261,7 +261,7 @@ impl BlockTemplateBuilder {
         let selected_parent = parents.first().cloned();
 
         let header = BlockHeader {
-            version: 1,
+            version: 2, // ms-timestamp era (matches GENESIS_VERSION)
             hash: String::new(),
             parents,
             merkle_root,

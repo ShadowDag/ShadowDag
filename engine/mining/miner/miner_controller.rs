@@ -96,10 +96,11 @@ impl<'a> MinerController<'a> {
     /// 6. Mine the block (find valid nonce via PoW)
     /// 7. Return the mined block for submission to the DAG
     pub fn build_and_mine(&self, miner_address: &str) -> Result<Block, ConsensusError> {
+        // Unix epoch MILLISECONDS (block/coinbase timestamps are ms).
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
 
         // Avoid process-global difficulty state here. Controllers should use
         // the miner instance difficulty configured by the node that owns this

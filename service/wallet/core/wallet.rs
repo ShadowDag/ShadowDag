@@ -941,7 +941,7 @@ impl Wallet {
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_secs(),
+                .as_millis() as u64,
             is_coinbase: false,
             tx_type: TxType::ContractCreate,
             payload_hash: None,
@@ -1030,7 +1030,7 @@ impl Wallet {
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_secs(),
+                .as_millis() as u64,
             is_coinbase: false,
             tx_type: TxType::ContractCall,
             payload_hash: None,
@@ -1250,11 +1250,12 @@ fn decrypt_bytes(
 }
 
 fn unix_now() -> u64 {
+    // Unix epoch MILLISECONDS (wallet tx timestamps are ms).
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs()
+        .as_millis() as u64
 }
 
 /// Decode a hex-encoded canonical Ristretto scalar (32 bytes).

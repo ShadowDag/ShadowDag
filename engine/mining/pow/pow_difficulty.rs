@@ -43,7 +43,8 @@ use std::collections::VecDeque;
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Target block time in milliseconds (1 second)
-pub const TARGET_BLOCK_TIME_MS: u64 = 1_000;
+pub const TARGET_BLOCK_TIME_MS: u64 =
+    crate::config::consensus::consensus_params::ConsensusParams::TARGET_BLOCK_TIME_MS; // 100 ms at 10 BPS
 
 /// Short window in SECONDS (not blocks) — 2.4 minutes regardless of BPS.
 /// At runtime: actual_short_window = SHORT_WINDOW_SECS * ConsensusParams::BLOCKS_PER_SECOND
@@ -556,9 +557,9 @@ mod tests {
     fn fast_blocks_increase_difficulty() {
         let mut engine = DifficultyEngine::new(1000);
         let mut ts = test_base_ts();
-        // Feed blocks at 500ms (too fast)
+        // Feed blocks at 50ms (too fast vs the 100ms target)
         for i in 0..50 {
-            ts += 500;
+            ts += 50;
             engine.on_new_block(make_record(i, ts, engine.difficulty()));
         }
         assert!(
@@ -589,7 +590,7 @@ mod tests {
     #[test]
     fn spike_filtered() {
         let mut engine = DifficultyEngine::new(1000);
-        let filtered = engine.filter_block_time(10); // 10ms = absurdly fast
+        let filtered = engine.filter_block_time(5); // 5ms = absurdly fast (< target/10 = 10ms)
         assert!(
             filtered >= TARGET_BLOCK_TIME_MS / SPIKE_THRESHOLD_DIV,
             "Spike should be filtered to minimum"
@@ -725,9 +726,9 @@ mod tests {
         let mut ts = test_base_ts();
         let initial = engine.difficulty();
 
-        // 500 blocks at exactly target time
+        // 500 blocks at exactly target time (100ms)
         for i in 0..500 {
-            ts += 1_000;
+            ts += 100;
             engine.on_new_block(make_record(i, ts, engine.difficulty()));
         }
 

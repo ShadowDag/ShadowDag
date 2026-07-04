@@ -29,9 +29,15 @@ use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
 
 // ─────────────────────────────────────────
 
-/// Canonical maximum future timestamp drift for the entire codebase (120 seconds).
-/// All other modules should reference this value.
-pub const MAX_FUTURE_SECS: u64 = 120;
+/// Canonical maximum future timestamp drift for the entire codebase, in
+/// MILLISECONDS (120 s of real-time clock-skew tolerance). Timestamps are unix
+/// epoch milliseconds. Shares ConsensusParams::MAX_FUTURE_MS so every block-ts
+/// future gate uses one value.
+pub const MAX_FUTURE_MS: u64 = ConsensusParams::MAX_FUTURE_MS;
+/// MTP window length in BLOCKS (unit-agnostic count). REVIEW ITEM (spec open
+/// Q#2): at 100 ms spacing an 11-block window spans ~1.1 s of real time; a
+/// larger span (~99) would restore ~10 s of coverage. Kept at 11 pending the
+/// external reviewer's security/latency call — a count change, not a unit bug.
 pub const MEDIAN_TIME_SPAN: usize = 11;
 pub const MAX_BLOCK_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_TX_BYTES_IN_BLOCK: usize = 100 * 1024;
@@ -40,24 +46,24 @@ pub const MAX_TX_BYTES_IN_BLOCK: usize = 100 * 1024;
 /// Prevents worst-case CPU consumption from blocks with excessive TXs.
 pub const MAX_TXS_PER_BLOCK_VALIDATION: usize = 10_000;
 
-/// Maximum how far in the past a block timestamp can be relative to wall clock.
-/// Prevents miners from backdating blocks to manipulate difficulty windows.
-/// 10 minutes is generous enough for clock skew but tight enough to prevent
-/// systematic timewarp attacks.
-pub const MAX_PAST_BLOCK_SECS: u64 = 600;
+/// Maximum how far in the past a block timestamp can be relative to wall clock,
+/// in MILLISECONDS. NOTE: not enforced on the live validation path (referenced
+/// only by tests/docs); converted to ms to keep test semantics meaningful.
+pub const MAX_PAST_BLOCK_MS: u64 = 600_000;
 
-/// Maximum forward timestamp jump from the best parent.
+/// Maximum forward timestamp jump from the best parent, in MILLISECONDS.
 /// Must be large enough to handle legitimate mining delays (difficulty
 /// overshoot, network partitions, miner restarts) without rejecting valid
-/// blocks. At 10 BPS with 100ms target, 30s = 300 blocks max jump —
-/// tight enough to prevent timewarp manipulation while allowing recovery.
-pub const MAX_TIMESTAMP_JUMP_SECS: u64 = 30;
+/// blocks. 30_000 ms keeps the historical 30 s window (at 10 BPS / 100 ms that
+/// is ~300 blocks of allowed jump) — tight enough to bound timewarp while
+/// allowing recovery. REVIEW ITEM (spec open Q#4): reviewer may tighten.
+pub const MAX_TIMESTAMP_JUMP_MS: u64 = 30_000;
 
-/// Stricter timestamp drift for DAG-dense heights. When multiple parallel
-/// blocks exist at the same height, a tighter cap prevents timewarp attacks
-/// that exploit DAG parallelism. Used as a secondary check when the block
-/// has ≥3 parents (indicating high DAG density at that height).
-pub const MAX_DAG_DENSE_TIMESTAMP_JUMP_SECS: u64 = 10;
+/// Stricter timestamp drift for DAG-dense heights, in MILLISECONDS. When
+/// multiple parallel blocks exist at the same height, a tighter cap prevents
+/// timewarp attacks that exploit DAG parallelism. Used as a secondary check
+/// when the block has ≥3 parents (indicating high DAG density at that height).
+pub const MAX_DAG_DENSE_TIMESTAMP_JUMP_MS: u64 = 10_000;
 
 // ─────────────────────────────────────────
 
@@ -312,15 +318,18 @@ impl BlockValidator {
         // block that carries it. We bound against the BLOCK header timestamp (not
         // wall clock) so legitimately-old historical txs are NOT rejected during
         // IBD/replay. Coinbase is exempt (its timestamp is the block's own).
-        const MAX_TX_FUTURE_SECS: u64 = 15; // matches the mempool future bound
+        // MILLISECONDS: tx and block timestamps are both unix epoch ms and are
+        // compared directly here, so both must migrate together (mixed units
+        // would fork). Matches the mempool future bound (tx_validator).
+        const MAX_TX_FUTURE_MS: u64 = 15_000; // 15 s of tx-vs-block drift
         for tx in &block.body.transactions {
             if tx.is_coinbase() {
                 continue;
             }
-            if tx.timestamp > block.header.timestamp.saturating_add(MAX_TX_FUTURE_SECS) {
+            if tx.timestamp > block.header.timestamp.saturating_add(MAX_TX_FUTURE_MS) {
                 return Err(ConsensusError::BlockValidation(format!(
-                    "tx {} timestamp {} is after block timestamp {} (+{}s)",
-                    tx.hash, tx.timestamp, block.header.timestamp, MAX_TX_FUTURE_SECS
+                    "tx {} timestamp {} is after block timestamp {} (+{}ms)",
+                    tx.hash, tx.timestamp, block.header.timestamp, MAX_TX_FUTURE_MS
                 )));
             }
         }
@@ -522,7 +531,7 @@ impl BlockValidator {
     /// Hardened timestamp validation — anti-timewarp for DAG.
     ///
     /// Rules enforced:
-    ///   R1  ts ≤ now + MAX_FUTURE_SECS              (no far-future vs wall clock)
+    ///   R1  ts ≤ now + MAX_FUTURE_MS                (no far-future vs wall clock)
     ///   R3  ts > MTP(ancestors)                      (monotonic progress)
     ///   R4  ts > max(parent_timestamps)              (strict DAG causality)
     ///   R5  ts ≤ max(parent_ts) + MAX_TIMESTAMP_JUMP (no large forward jumps)
@@ -554,26 +563,29 @@ impl BlockValidator {
         ancestors: &[u64],
         network: &NetworkMode,
     ) -> Result<(), ConsensusError> {
+        // MILLISECONDS: block timestamps are unix epoch ms, so the wall-clock
+        // anchor for R1 must also be ms. Reading as_secs() here while ts is ms
+        // would make every block look ~1000x in the future = universal rejection.
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
 
         let ts = block.header.timestamp;
 
         // R1: Not too far in the future
-        if ts > now + MAX_FUTURE_SECS {
+        if ts > now + MAX_FUTURE_MS {
             return Err(ConsensusError::Timestamp(format!(
-                "timestamp {}s in future (max {}s)",
+                "timestamp {}ms in future (max {}ms)",
                 ts.saturating_sub(now),
-                MAX_FUTURE_SECS
+                MAX_FUTURE_MS
             )));
         }
 
         // NO wall-clock "too far in the past" bound. Blocks are historical by
         // nature: during sync/IBD a lagging node receives blocks minutes/hours/
         // days old, and a wall-clock past bound made catch-up IMPOSSIBLE (a node
-        // more than MAX_PAST_BLOCK_SECS behind rejected every backlog block —
+        // more than MAX_PAST_BLOCK_MS behind rejected every backlog block —
         // and the reject banned the peer serving it, so the chain never healed).
         // Anti-timewarp is enforced against the block's ANCESTRY — the correct,
         // wall-clock-independent anchor — by R3 (MTP), R4 (strict causality:
@@ -611,12 +623,12 @@ impl BlockValidator {
             // Skipped on test networks so an idle chain can resume (R1 still
             // bounds future-dated timestamps on all networks).
             if matches!(network, NetworkMode::Mainnet)
-                && ts > max_parent_ts + MAX_TIMESTAMP_JUMP_SECS
+                && ts > max_parent_ts + MAX_TIMESTAMP_JUMP_MS
             {
                 return Err(ConsensusError::Timestamp(format!(
-                    "timestamp jump {}s from parent (max {}s)",
+                    "timestamp jump {}ms from parent (max {}ms)",
                     ts.saturating_sub(max_parent_ts),
-                    MAX_TIMESTAMP_JUMP_SECS
+                    MAX_TIMESTAMP_JUMP_MS
                 )));
             }
 
@@ -626,12 +638,12 @@ impl BlockValidator {
             // allowed timestamp jump to prevent timewarp exploits that abuse
             // DAG parallelism to inflate the difficulty window.
             if block.header.parents.len() >= 3
-                && ts > max_parent_ts + MAX_DAG_DENSE_TIMESTAMP_JUMP_SECS
+                && ts > max_parent_ts + MAX_DAG_DENSE_TIMESTAMP_JUMP_MS
             {
                 return Err(ConsensusError::Timestamp(format!(
-                    "DAG-dense timestamp jump {}s from parent (max {}s with {} parents)",
+                    "DAG-dense timestamp jump {}ms from parent (max {}ms with {} parents)",
                     ts.saturating_sub(max_parent_ts),
-                    MAX_DAG_DENSE_TIMESTAMP_JUMP_SECS,
+                    MAX_DAG_DENSE_TIMESTAMP_JUMP_MS,
                     block.header.parents.len()
                 )));
             }
@@ -1282,11 +1294,11 @@ mod tests {
     //  Helpers
     // ─────────────────────────────────────────
 
-    fn now_secs() -> u64 {
+    fn now_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs()
+            .as_millis() as u64
     }
 
     /// Build a coinbase transaction with correct 2-output structure
@@ -1303,7 +1315,7 @@ mod tests {
                 TxOutput::new(ConsensusParams::OWNER_REWARD_ADDRESS.into(), dev_reward),
             ],
             0,
-            now_secs(),
+            now_ms(),
         );
         tx.hash = TxHash::hash_for_network(&tx, &NetworkMode::Mainnet);
         tx
@@ -1313,7 +1325,7 @@ mod tests {
     /// Input txid must be 64 hex chars (DagShield requirement).
     /// The TX hash is computed from canonical bytes for structural validity.
     fn make_regular_tx(seed: &str) -> Transaction {
-        let ts = now_secs();
+        let ts = now_ms();
         let mut tx = Transaction::new(
             String::new(), // placeholder
             vec![TxInput::new(
@@ -1351,7 +1363,7 @@ mod tests {
     /// Parents are valid 64-char hex strings and we provide at least 2
     /// (required by SelfishMiningGuard for height > 1).
     fn make_block(height: u64, txs: Vec<Transaction>) -> Block {
-        let ts = now_secs();
+        let ts = now_ms();
         // DagShield requires parents to be exactly 64 hex chars, unique,
         // and at least MIN_DAG_PARENTS (2) for height > 1.
         let parents = if height <= 1 {
@@ -1646,7 +1658,7 @@ mod tests {
     #[test]
     fn timestamp_too_far_in_future_fails() {
         let mut block = make_valid_block(5);
-        block.header.timestamp = now_secs() + MAX_FUTURE_SECS + 60;
+        block.header.timestamp = now_ms() + MAX_FUTURE_MS + 60_000;
 
         let result = BlockValidator::validate_timestamp(&block, &[]);
         assert!(result.is_err());
@@ -1660,7 +1672,7 @@ mod tests {
         // wall-clock past bound; anti-timewarp is enforced via MTP/causality
         // against ancestry (see timestamp_before_mtp_fails).
         let mut block = make_valid_block(5);
-        block.header.timestamp = now_secs().saturating_sub(MAX_PAST_BLOCK_SECS + 3600);
+        block.header.timestamp = now_ms().saturating_sub(MAX_PAST_BLOCK_MS + 3_600_000);
         assert!(
             BlockValidator::validate_timestamp(&block, &[]).is_ok(),
             "an old historical block must validate during sync"
@@ -1669,7 +1681,7 @@ mod tests {
 
     #[test]
     fn timestamp_before_mtp_fails() {
-        let now = now_secs();
+        let now = now_ms();
         let mut block = make_valid_block(5);
         // Set ancestors all at current time — MTP will be ~now
         let ancestors: Vec<u64> = vec![now; 5];
@@ -1683,18 +1695,59 @@ mod tests {
 
     #[test]
     fn timestamp_large_jump_from_parent_fails() {
-        let now = now_secs();
+        let now = now_ms();
         let mut block = make_valid_block(5);
         // Parent timestamps from ~10 minutes ago — within R2 wall clock limit
-        let parent_ts = now - MAX_TIMESTAMP_JUMP_SECS - 100;
+        let parent_ts = now - MAX_TIMESTAMP_JUMP_MS - 100;
         let ancestors = vec![parent_ts; 3];
-        // Block timestamp = now, which is MAX_TIMESTAMP_JUMP_SECS + 100 after parent
+        // Block timestamp = now, which is MAX_TIMESTAMP_JUMP_MS + 100 ms after parent
         // This exceeds the R5 jump limit
         block.header.timestamp = now;
 
         let result = BlockValidator::validate_timestamp(&block, &ancestors);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("jump"));
+    }
+
+    #[test]
+    fn ms_future_boundary_r1() {
+        // R1 in MILLISECONDS: a block at the edge (now + MAX_FUTURE_MS) is
+        // accepted; one clearly beyond the window is rejected. Guards against a
+        // half-migrated gate that reads wall-clock seconds while ts is ms (which
+        // would make every ms block look ~1000x in the future).
+        let mut ok = make_valid_block(5);
+        ok.header.timestamp = now_ms() + MAX_FUTURE_MS;
+        assert!(
+            BlockValidator::validate_timestamp(&ok, &[]).is_ok(),
+            "a block at the future edge must be accepted"
+        );
+        let mut bad = make_valid_block(5);
+        bad.header.timestamp = now_ms() + MAX_FUTURE_MS + 5_000; // 5 s beyond
+        assert!(
+            BlockValidator::validate_timestamp(&bad, &[]).is_err(),
+            "a block past the future window must be rejected"
+        );
+    }
+
+    #[test]
+    fn ms_monotonic_r4_one_ms_progress() {
+        // R4 stays strict `>` — in ms that is >= 1 ms progress, so the selected
+        // chain can advance up to ~1000 blocks/sec (well above 10 BPS). A child
+        // one ms after its parents is valid; equal timestamps are rejected.
+        let parent_ts = 1_700_000_000_000u64; // ms, in the recent past
+        let ancestors = vec![parent_ts; 3];
+        let mut ok = make_valid_block(5);
+        ok.header.timestamp = parent_ts + 1; // +1 ms
+        assert!(
+            BlockValidator::validate_timestamp(&ok, &ancestors).is_ok(),
+            "a block 1 ms after its parents must be accepted"
+        );
+        let mut bad = make_valid_block(5);
+        bad.header.timestamp = parent_ts; // no progress
+        assert!(
+            BlockValidator::validate_timestamp(&bad, &ancestors).is_err(),
+            "a block at the parent timestamp must be rejected (R4)"
+        );
     }
 
     // ─────────────────────────────────────────
@@ -1735,7 +1788,7 @@ mod tests {
         let mut tx = make_regular_tx("future_ts");
         // Build a block first so we know the header timestamp, then push tx 1 day ahead.
         let mut block = make_block(5, vec![cb.clone(), tx.clone()]);
-        tx.timestamp = block.header.timestamp + 86_400; // 1 day after the block
+        tx.timestamp = block.header.timestamp + 86_400_000; // 1 day (ms) after the block
         tx.hash = TxHash::hash_for_network(&tx, &NetworkMode::Mainnet);
         block.body.transactions = vec![cb, tx];
         block.header.merkle_root =
@@ -1807,7 +1860,7 @@ mod tests {
             "cb_one_output".into(),
             vec![TxOutput::new("miner".into(), reward)],
             0,
-            now_secs(),
+            now_ms(),
         );
         let tx = make_regular_tx("tx_1");
         let block = make_block(5, vec![cb, tx]);
@@ -1830,7 +1883,7 @@ mod tests {
                 TxOutput::new(ConsensusParams::OWNER_REWARD_ADDRESS.into(), 1),
             ],
             0,
-            now_secs(),
+            now_ms(),
         );
         let tx = make_regular_tx("tx_1");
         let block = make_block(5, vec![cb, tx]);
@@ -1853,7 +1906,7 @@ mod tests {
                 TxOutput::new("wrong_dev_address".into(), dev_reward),
             ],
             0,
-            now_secs(),
+            now_ms(),
         );
         let tx = make_regular_tx("tx_1");
         let block = make_block(5, vec![cb, tx]);
@@ -1879,7 +1932,7 @@ mod tests {
                 TxOutput::new(ConsensusParams::OWNER_REWARD_ADDRESS.into(), dev_reward),
             ],
             10, // nonzero fee
-            now_secs(),
+            now_ms(),
         );
         let tx = make_regular_tx("tx_1");
         let block = make_block(5, vec![cb, tx]);
@@ -1939,7 +1992,7 @@ mod tests {
             )],
             vec![TxOutput::new("a".into(), 50)],
             1,
-            now_secs(),
+            now_ms(),
         );
         let tx2 = Transaction::new(
             "tx_ds_2".into(),
@@ -1952,7 +2005,7 @@ mod tests {
             )],
             vec![TxOutput::new("b".into(), 50)],
             1,
-            now_secs(),
+            now_ms(),
         );
         let block = make_block(5, vec![cb, tx1, tx2]);
 
@@ -2007,7 +2060,7 @@ mod tests {
                 hash: "11".repeat(32), // wrong genesis hash
                 parents,
                 merkle_root: merkle,
-                timestamp: now_secs(),
+                timestamp: now_ms(),
                 nonce: 0,
                 difficulty: 1,
                 height: 0,

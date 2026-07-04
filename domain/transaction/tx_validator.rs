@@ -24,18 +24,20 @@ pub const DUST_LIMIT: u64 = 546;
 pub const SIGNATURE_BYTES: usize = 64;
 pub const PUBKEY_BYTES: usize = 32;
 
-/// Maximum age of a TX timestamp before it's rejected (24 hours).
-/// Prevents replay of stale signed TXs after long delays.
-pub const MAX_TX_AGE_SECS: u64 = 24 * 3_600;
-/// Maximum how far in the future a TX timestamp can be (15 seconds).
+/// Maximum age of a TX timestamp before it's rejected (24 hours), in MILLISECONDS.
+/// TX timestamps are unix epoch ms (migrated with block timestamps). Prevents
+/// replay of stale signed TXs after long delays.
+pub const MAX_TX_AGE_MS: u64 = 24 * 3_600 * 1_000;
+/// Maximum how far in the future a TX timestamp can be (15 seconds), in MILLISECONDS.
 ///
 /// CLOCK REQUIREMENT: All nodes MUST synchronize their clocks via NTP
 /// to within ±5 seconds of UTC. The 15-second window provides a 10-second
 /// margin above the 5-second NTP budget. A wider window (e.g., 120s)
 /// allows nodes with drifted clocks to disagree on TX validity, causing
 /// mempool divergence and stale transactions sitting in some mempools
-/// but rejected by others.
-pub const MAX_TX_FUTURE_SECS: u64 = 15;
+/// but rejected by others. MUST match block_validator's MAX_TX_FUTURE_MS
+/// (tx ts is compared to block ts there).
+pub const MAX_TX_FUTURE_MS: u64 = 15_000;
 /// Maximum age of the block referenced by payload_hash (48 hours in blocks).
 /// At 10 BPS this is ~1.7M blocks. We check existence, not depth.
 pub const PAYLOAD_HASH_HEX_LEN: usize = 64;
@@ -1009,9 +1011,9 @@ impl TxValidator {
     }
 
     /// Validate TX timestamp is within acceptable range of current time.
-    /// Rejects TXs older than MAX_TX_AGE_SECS or more than MAX_TX_FUTURE_SECS
-    /// in the future. Coinbase TXs are exempt (their timestamp comes from
-    /// the block header which has its own validation).
+    /// Rejects TXs older than MAX_TX_AGE_MS or more than MAX_TX_FUTURE_MS
+    /// in the future (all MILLISECONDS). Coinbase TXs are exempt (their
+    /// timestamp comes from the block header which has its own validation).
     pub fn validate_tx_timestamp(tx: &Transaction) -> Result<(), ConsensusError> {
         if tx.is_coinbase() {
             return Ok(());
@@ -1020,23 +1022,23 @@ impl TxValidator {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
 
-        if tx.timestamp > now + MAX_TX_FUTURE_SECS {
+        if tx.timestamp > now + MAX_TX_FUTURE_MS {
             return Err(ConsensusError::Timestamp(format!(
-                "tx timestamp {} is {}s in the future (max {}s)",
+                "tx timestamp {} is {}ms in the future (max {}ms)",
                 tx.timestamp,
                 tx.timestamp - now,
-                MAX_TX_FUTURE_SECS
+                MAX_TX_FUTURE_MS
             )));
         }
 
-        if now > tx.timestamp && (now - tx.timestamp) > MAX_TX_AGE_SECS {
+        if now > tx.timestamp && (now - tx.timestamp) > MAX_TX_AGE_MS {
             return Err(ConsensusError::Timestamp(format!(
-                "tx timestamp {} is {}s old (max {}s)",
+                "tx timestamp {} is {}ms old (max {}ms)",
                 tx.timestamp,
                 now - tx.timestamp,
-                MAX_TX_AGE_SECS
+                MAX_TX_AGE_MS
             )));
         }
 

@@ -38,9 +38,12 @@ pub const GENESIS_MESSAGE: &str = "ShadowDAG/Genesis/2026-01-01/Privacy-is-a-rig
 //                      MAINNET GENESIS CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub const GENESIS_VERSION: u32 = 1;
+// Version 2 = millisecond-timestamp era (v1 was unix-seconds). The version is
+// part of the PoW preimage, so bumping it (like the ms timestamp) requires a
+// genesis re-mine; it lets tooling distinguish s-era from ms-era blocks.
+pub const GENESIS_VERSION: u32 = 2;
 pub const GENESIS_HEIGHT: u64 = 0;
-pub const GENESIS_TIMESTAMP: u64 = 1_735_689_600; // 2025-01-01 00:00:00 UTC
+pub const GENESIS_TIMESTAMP: u64 = 1_735_689_600_000; // 2025-01-01 00:00:00 UTC (ms)
 pub const GENESIS_DIFFICULTY: u64 = 8192;
 
 /// Developer wallet address — receives 5% of every block reward
@@ -59,21 +62,24 @@ pub const DEV_REWARD_PCT: u64 = 5;
 // ── HARDCODED PoW RESULTS (mined with ShadowHash algorithm) ──────────────
 // These were mined by running `mine-genesis` binary.
 // Every node verifies these on startup. If they don't match, the node panics.
-pub const MAINNET_GENESIS_NONCE: u64 = 4034;
+// Re-mined 2026-07-04 for the ms-timestamp / version-2 era (GENESIS_TIMESTAMP in
+// ms + GENESIS_VERSION=2 change the PoW preimage). Produced by the
+// mine_new_genesis_constants test.
+pub const MAINNET_GENESIS_NONCE: u64 = 6878;
 pub const MAINNET_GENESIS_HASH: &str =
-    "00008c3137892f3b3081ee4a8b35fdd3c3a36b3b19d44e779db6c0e34ca26f38";
+    "00011e7401f0e62cf48083ba9a5467247571f6ec6b9ba12b4e24f735cff9fcb5";
 pub const MAINNET_MERKLE_ROOT: &str =
-    "7dd883946da1f206fed84f21c0daa77304ffe7876f2bffae5cd05fc904602e8a";
+    "7a56948a71e9460192d1c74d28ec559d7d9a6dd206f8a41155d23453aaabdca7";
 pub const MAINNET_COINBASE_HASH: &str =
-    "7dd883946da1f206fed84f21c0daa77304ffe7876f2bffae5cd05fc904602e8a";
+    "7a56948a71e9460192d1c74d28ec559d7d9a6dd206f8a41155d23453aaabdca7";
 
-pub const TESTNET_GENESIS_NONCE: u64 = 11242;
+pub const TESTNET_GENESIS_NONCE: u64 = 1334;
 pub const TESTNET_GENESIS_HASH: &str =
-    "000e9dbf3c0ad3fe540ccec65cd72d09dfa0a32aff8d4f3a3b2e67d98ea73068";
+    "000fd07e8dc114a97fd8cb89c81e4fb799b9d03a9e0ee4986a9a3ff740894226";
 
 pub const REGTEST_GENESIS_NONCE: u64 = 0;
 pub const REGTEST_GENESIS_HASH: &str =
-    "ec4447ead9c537678a2293f09f652affb8194e713a0f117b548f47015a1d0a4f";
+    "d033fd44463ab76af878793fffbe74bc7300d11c308b05a586424892907491ae";
 
 // ═══════════════════════════════════════════════════════════════════════════
 //                      TESTNET GENESIS CONSTANTS
@@ -91,7 +97,7 @@ pub const REGTEST_GENESIS_HASH: &str =
 // Re-mine with `mine-genesis --network testnet` after changing any constant.
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub const TESTNET_TIMESTAMP: u64 = 1_735_776_000; // 2025-01-02 00:00:00 UTC
+pub const TESTNET_TIMESTAMP: u64 = 1_735_776_000_000; // 2025-01-02 00:00:00 UTC (ms)
 pub const TESTNET_DIFFICULTY: u64 = 4096;
 pub const TESTNET_REWARD: u64 = 1_000_000_000;
 pub const TESTNET_MESSAGE: &str = "ShadowDAG/Testnet/2026-01-02/Testing-the-shadows";
@@ -856,9 +862,11 @@ mod tests {
     }
 
     #[test]
-    fn genesis_version_is_one() {
+    fn genesis_version_is_current() {
+        // Version 2 = millisecond-timestamp era (v1 was unix seconds).
         let g = create_genesis_block();
-        assert_eq!(g.header.version, 1);
+        assert_eq!(g.header.version, GENESIS_VERSION);
+        assert_eq!(GENESIS_VERSION, 2);
     }
 
     #[test]

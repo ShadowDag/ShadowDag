@@ -132,7 +132,7 @@ def cmd_send(args):
     # the fee to satisfy the per-byte rate and rebuild (size is independent of
     # the fee/change amounts, so a single re-estimate is exact).
     inputs, outputs, total_in = build(args.fee)
-    ts = int(time.time())
+    ts = int(time.time() * 1000)  # unix epoch MILLISECONDS (block/tx ts are ms)
     size = len(sdk._canonical_bytes(inputs, pk_hex, outputs, args.fee, ts, None))
     fee = max(args.fee, int(size * MIN_FEE_RATE) + FEE_MARGIN)
     if fee != args.fee:

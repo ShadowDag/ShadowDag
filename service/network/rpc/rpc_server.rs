@@ -1894,12 +1894,12 @@ impl RpcServer {
                 // Limit to MAX_PARENTS
                 parent_hashes.truncate(ConsensusParams::MAX_PARENTS);
 
-                // Minimum valid block timestamp. R4 (monotonic DAG time) requires
-                // a block's timestamp to be STRICTLY greater than every parent's,
-                // but block timestamps are 1-second granular, so a miner producing
-                // sub-second blocks would stamp ts == parent ts and get rejected.
-                // Tell the miner the floor (max parent ts + 1); it stamps
-                // max(now, min_timestamp). Keeps R4 intact on every network.
+                // Minimum valid block timestamp, in MILLISECONDS. R4 (monotonic
+                // DAG time) requires a block's timestamp to be STRICTLY greater
+                // than every parent's. Block timestamps are unix epoch ms, so the
+                // floor is max(parent ts) + 1 MS. Tell the miner that floor; it
+                // stamps max(now_ms, min_timestamp). Keeps R4 intact on every
+                // network. (max_parent_ts is already ms from the parent headers.)
                 let max_parent_ts = parent_hashes
                     .iter()
                     .filter_map(|h| s.block_store.get_block(h))
@@ -1918,7 +1918,9 @@ impl RpcServer {
                         "block_reward":  block_reward,
                         "tx_count":      count,
                         "total_fees":    total_fees,
-                        "target_time":   ConsensusParams::BLOCK_TIME,
+                        // Target block spacing in MILLISECONDS (100 ms at 10 BPS).
+                        // Block/tx timestamps and min_timestamp are unix epoch ms.
+                        "target_time_ms": ConsensusParams::TARGET_BLOCK_TIME_MS,
                         "max_tx":        ConsensusParams::MAX_BLOCK_TXS,
                         "max_size":      ConsensusParams::MAX_BLOCK_SIZE,
                         "min_timestamp": min_timestamp,
@@ -5462,7 +5464,7 @@ mod tests {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
         let block = json!({
             "hash": "a".repeat(64),
             "height": 1,
@@ -5506,7 +5508,7 @@ mod tests {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
         let block = json!({
             "hash": "not_hex_or_64",
             "height": 1,

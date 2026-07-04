@@ -84,10 +84,12 @@ pub fn build_transaction_with_anchor(
     public_key_hex: &str,
     anchor_block_hash: Option<String>,
 ) -> Result<Transaction, CryptoError> {
+    // Unix epoch MILLISECONDS (tx timestamps migrated with block timestamps;
+    // this value is hashed into the txid and signing preimage).
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_millis() as u64;
 
     let tx_outputs: Vec<TxOutput> = outputs
         .into_iter()

@@ -151,7 +151,7 @@ impl PendingMultisig {
             tx_hash,
             config,
             signatures: Vec::new(),
-            created_at: now_secs(),
+            created_at: now_ms(),
             tx_data,
         }
     }
@@ -190,7 +190,7 @@ impl PendingMultisig {
         self.signatures.push(PartialSignature {
             signer_pubkey: pubkey.to_string(),
             signature: signature.to_string(),
-            signed_at: now_secs(),
+            signed_at: now_ms(),
         });
 
         Ok(())
@@ -208,7 +208,7 @@ impl PendingMultisig {
 
     /// Check if the pending tx has expired
     pub fn is_expired(&self) -> bool {
-        now_secs().saturating_sub(self.created_at) > SIG_TIMEOUT_SECS
+        now_ms().saturating_sub(self.created_at) > SIG_TIMEOUT_SECS
     }
 
     /// Get aggregated signature (when complete).
@@ -340,11 +340,12 @@ impl MultisigManager {
     }
 }
 
-fn now_secs() -> u64 {
+fn now_ms() -> u64 {
+    // Unix epoch MILLISECONDS (multisig tx timestamps are ms).
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs()
+        .as_millis() as u64
 }
 
 fn verify_ed25519_signature(

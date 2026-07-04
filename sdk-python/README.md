@@ -44,7 +44,7 @@ priv = sk.hex(); pub = pubkey.hex()
 tx = sdk.build_signed_transfer(
     inputs=[{"txid": utxo_txid, "index": 0, "owner": addr}],
     outputs=[{"address": to_addr, "amount": 1000}],
-    fee=10, timestamp=int(__import__("time").time()),
+    fee=10, timestamp=int(__import__("time").time() * 1000),  # ms
     private_key_hex=priv, public_key_hex=pub, network="mainnet",
     anchor=recent_tip_hash,   # optional replay protection; omit/None for none
 )

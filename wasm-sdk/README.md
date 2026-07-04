@@ -100,7 +100,7 @@ await init();
 
 const inputs  = [JSON.stringify({ txid: utxoTxid, index: 0, owner: myAddress })];
 const outputs = [JSON.stringify({ address: toAddress, amount: 1000n })];
-const now = BigInt(Math.floor(Date.now() / 1000));
+const now = BigInt(Date.now()); // unix epoch MILLISECONDS
 
 const txJson = sdk.build_signed_transfer_json(
   inputs, outputs, 10n, now, recentTipHash, privHex, pubHex, 'mainnet');

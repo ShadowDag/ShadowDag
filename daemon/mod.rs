@@ -1062,6 +1062,8 @@ impl DaemonNode {
         let difficulty = get_next_difficulty().max(1);
 
         // Timestamp: strictly greater than every parent (R4), at least now.
+        // Unix epoch MILLISECONDS; the +1 is now +1 ms (the ms granularity that
+        // lets the selected chain advance faster than one block per wall-second).
         let max_parent_ts = parents
             .iter()
             .filter_map(|h| self.block_store.get_block(h))
@@ -1070,7 +1072,7 @@ impl DaemonNode {
             .unwrap_or(0);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
+            .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let timestamp = now.max(max_parent_ts.saturating_add(1));
 
@@ -1093,7 +1095,7 @@ impl DaemonNode {
 
         Some(BlockTemplate {
             job_id,
-            version: 1,
+            version: 2, // ms-timestamp era (matches GENESIS_VERSION)
             prev_hash: accepted.header.hash.clone(),
             parents,
             merkle_root,

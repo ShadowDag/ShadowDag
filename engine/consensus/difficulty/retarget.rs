@@ -4,14 +4,14 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use std::collections::VecDeque;
-pub const TARGET_BLOCK_TIME_SECS: u64 = 1;
+/// Target time between selected-chain blocks, in MILLISECONDS. CONSENSUS-CRITICAL:
+/// shares ConsensusParams::TARGET_BLOCK_TIME_MS so this engine, difficulty_adjustment,
+/// and pow_difficulty compute the SAME difficulty (a divergent target = chain split).
+/// At 10 BPS this is 100 ms. Timestamps are unix epoch milliseconds.
+pub const TARGET_BLOCK_TIME_MS: u64 =
+    crate::config::consensus::consensus_params::ConsensusParams::TARGET_BLOCK_TIME_MS;
 pub const SHORT_WINDOW: usize = 144;
 pub const LONG_WINDOW: usize = 2016;
-
-/// Maximum timestamp drift allowed between a DAG block and its parents.
-/// Tighter than the block validator's MAX_TIMESTAMP_JUMP_SECS (30s) to
-/// prevent timewarp in high-BPS DAGs where many blocks share timestamps.
-pub const MAX_DAG_TIMESTAMP_DRIFT: u64 = 5;
 
 pub const EMA_ALPHA_NUM: u64 = 1;
 pub const EMA_ALPHA_DEN: u64 = 20;
@@ -29,7 +29,7 @@ pub const MIN_DIFFICULTY: u64 = 1;
 pub const MAX_DIFFICULTY: u64 = u64::MAX / 2;
 
 pub const CLIFF_DETECT_RATIO: u64 = 10;
-pub const MAX_BLOCK_SPACING: u64 = TARGET_BLOCK_TIME_SECS * 10;
+pub const MAX_BLOCK_SPACING: u64 = TARGET_BLOCK_TIME_MS * 10;
 
 #[derive(Debug, Clone)]
 pub struct BlockTimeRecord {
@@ -170,25 +170,11 @@ impl RetargetEngine {
         let blended_time = (lwma as u128 * 7 + long_avg as u128 * 3) / 10;
         let mut blended_time = (blended_time as u64).max(1);
 
-        // ── Sub-second block detection ─────────────────────────────────
-        // With 1-second timestamp resolution, blocks mined in <1s get dt=0
-        // which is clamped to 1 = TARGET. The retarget can't distinguish
-        // "perfect 1s blocks" from "instant mining".
-        //
-        // Fix: count same-timestamp pairs. If >25% of block pairs share
-        // a timestamp, blocks are arriving faster than 1s — halve the
-        // effective block time to force difficulty upward.
-        let same_ts = self.count_same_timestamp_pairs();
-        let total_pairs = (n - 1) as u64;
-        if total_pairs > 0 && same_ts > 0 {
-            let same_pct = (same_ts * 100) / total_pairs;
-            if same_pct > 25 {
-                // Reduce effective block time proportionally
-                // e.g. 50% same-ts → blended_time / 2
-                let divisor = (same_pct / 25).clamp(1, 4);
-                blended_time = (blended_time / divisor).max(1);
-            }
-        }
+        // (Sub-second block detection removed: it was a 1-second-resolution hack
+        // to detect same-timestamp pairs. With MILLISECOND timestamps the selected
+        // chain is strictly monotonic at ~100 ms spacing (R4 forces ts > parent),
+        // so same-timestamp pairs cannot occur in the window and the heuristic
+        // only ever mis-fired. Rate is now measured directly from the ms dt.)
 
         // ── DAG-wide block rate correction ────────────────────────────
         // The chain-only view sees 1 block/sec (best-tip), but the DAG has
@@ -227,13 +213,17 @@ impl RetargetEngine {
         if n >= 10 && self.blue_score_window_end > self.blue_score_window_start {
             let first_ts = self.short_window.front().map(|r| r.timestamp).unwrap_or(0);
             let last_ts = self.short_window.back().map(|r| r.timestamp).unwrap_or(0);
-            let time_span = last_ts.saturating_sub(first_ts).max(1);
+            let time_span = last_ts.saturating_sub(first_ts).max(1); // MILLISECONDS
 
             let blue_delta = self.blue_score_window_end - self.blue_score_window_start;
 
-            // Expected blue score delta = time_span × expected_bps
-            // (each second should produce ~BPS blue blocks)
-            let expected_blue = time_span * self.expected_bps;
+            // Expected blue score delta = seconds × expected_bps. time_span is in
+            // MILLISECONDS and expected_bps is per-SECOND, so divide by 1000 (was
+            // a plain product when timestamps were seconds). Exact since
+            // expected_bps is an integer. A span < 1000/expected_bps ms yields 0,
+            // and the `> 0` guard below then correctly skips the blue-rate
+            // adjustment (too short a window to measure blue rate meaningfully).
+            let expected_blue = time_span * self.expected_bps / 1000;
 
             if expected_blue > 0 {
                 // blue_ratio > 1.0 means faster than expected, < 1.0 means slower
@@ -261,8 +251,8 @@ impl RetargetEngine {
         let mut new_diff = self.adjust_difficulty(window_diff, blended_time);
 
         // Cliff protection: if blocks are extremely slow, reduce difficulty
-        if blended_time > TARGET_BLOCK_TIME_SECS * CLIFF_DETECT_RATIO {
-            let ratio = blended_time.saturating_div(TARGET_BLOCK_TIME_SECS.max(1));
+        if blended_time > TARGET_BLOCK_TIME_MS * CLIFF_DETECT_RATIO {
+            let ratio = blended_time.saturating_div(TARGET_BLOCK_TIME_MS.max(1));
             let factor = ratio.clamp(1, 64);
             new_diff /= factor.max(2);
         }
@@ -287,26 +277,11 @@ impl RetargetEngine {
         self.ema_diff
     }
 
-    /// Count consecutive block pairs with identical timestamps.
-    /// When blocks mine in <1 second, they get the same Unix timestamp.
-    fn count_same_timestamp_pairs(&self) -> u64 {
-        let mut count = 0u64;
-        let mut prev_ts = 0u64;
-        let mut first = true;
-        for rec in &self.short_window {
-            if !first && rec.timestamp == prev_ts {
-                count += 1;
-            }
-            prev_ts = rec.timestamp;
-            first = false;
-        }
-        count
-    }
 
     fn adjust_difficulty(&self, current_diff: u64, actual_time: u64) -> u64 {
         let actual_time = actual_time.max(1);
 
-        let nd = (current_diff as u128).saturating_mul(TARGET_BLOCK_TIME_SECS as u128)
+        let nd = (current_diff as u128).saturating_mul(TARGET_BLOCK_TIME_MS as u128)
             / actual_time as u128;
 
         let nd = nd as u64;
@@ -320,7 +295,7 @@ impl RetargetEngine {
     fn compute_lwma(&self, window: &VecDeque<BlockTimeRecord>) -> u64 {
         let n = window.len();
         if n < 2 {
-            return TARGET_BLOCK_TIME_SECS;
+            return TARGET_BLOCK_TIME_MS;
         }
 
         let mut weighted_sum = 0u128;
@@ -347,7 +322,7 @@ impl RetargetEngine {
         }
 
         if weight_total == 0 {
-            return TARGET_BLOCK_TIME_SECS;
+            return TARGET_BLOCK_TIME_MS;
         }
 
         (weighted_sum / weight_total) as u64
@@ -357,7 +332,7 @@ impl RetargetEngine {
     fn compute_average_time_integer(&self, window: &VecDeque<BlockTimeRecord>) -> u64 {
         let n = window.len();
         if n < 2 {
-            return TARGET_BLOCK_TIME_SECS;
+            return TARGET_BLOCK_TIME_MS;
         }
 
         let mut times: Vec<u64> = window.iter().map(|r| r.timestamp).collect();
@@ -368,12 +343,12 @@ impl RetargetEngine {
 
         let span = median.saturating_sub(oldest).max(1);
 
-        let max_span = TARGET_BLOCK_TIME_SECS * LONG_WINDOW as u64;
+        let max_span = TARGET_BLOCK_TIME_MS * LONG_WINDOW as u64;
         let clamped_span = span.min(max_span).max(1);
 
         let denom = (n - 1) as u64;
         if denom == 0 {
-            return TARGET_BLOCK_TIME_SECS;
+            return TARGET_BLOCK_TIME_MS;
         }
 
         // Integer division with rounding: (span + denom/2) / denom
@@ -461,7 +436,7 @@ impl RetargetEngine {
 pub fn adjust_difficulty(current: u64, actual_secs: u64) -> u64 {
     let actual_secs = actual_secs.max(1);
 
-    let nd = (current as u128).saturating_mul(TARGET_BLOCK_TIME_SECS as u128) / actual_secs as u128;
+    let nd = (current as u128).saturating_mul(TARGET_BLOCK_TIME_MS as u128) / actual_secs as u128;
 
     let nd = nd as u64;
 
@@ -503,7 +478,7 @@ mod tests {
         let mut diff = init;
 
         for i in 0..200 {
-            let r = block(i, i * TARGET_BLOCK_TIME_SECS, diff);
+            let r = block(i, i * TARGET_BLOCK_TIME_MS, diff);
             diff = engine.on_new_block(r);
         }
 
@@ -514,7 +489,7 @@ mod tests {
 
     #[test]
     fn increases_when_blocks_too_fast() {
-        // When blocks arrive faster than TARGET_BLOCK_TIME_SECS (< 1s apart),
+        // When blocks arrive faster than TARGET_BLOCK_TIME_MS (< 1s apart),
         // timestamps are integers so the minimum gap is 1s = target. To simulate
         // "too fast", we report higher difficulty blocks arriving at target pace,
         // which the EMA tracks upward. Verify the EMA tracks reported difficulty.
@@ -524,7 +499,7 @@ mod tests {
         // The EMA should track upward toward the reported difficulty
         for i in 0..200u64 {
             let reported_diff = 50u64; // much higher than init
-            let r = block(i, i * TARGET_BLOCK_TIME_SECS, reported_diff);
+            let r = block(i, i * TARGET_BLOCK_TIME_MS, reported_diff);
             let _ = engine.on_new_block(r);
         }
         let diff = engine.ema_difficulty();
@@ -539,11 +514,13 @@ mod tests {
     #[test]
     fn decreases_when_blocks_too_slow() {
         let init = 10_000u64; // start high so it can decrease
-        let mut engine = RetargetEngine::new(init);
+        // 10 BPS engine (matches the 100 ms target); feed 1000 ms spacing = 10x
+        // slower than target, so difficulty must fall.
+        let mut engine = RetargetEngine::new_with_bps(init, 10);
         let mut diff = init;
 
         for i in 0..200u64 {
-            let r = block(i, i * 10, diff);
+            let r = block(i, i * 1000, diff);
             diff = engine.on_new_block(r);
         }
         assert!(diff < init, "Diff should have decreased: {}", diff);
@@ -562,7 +539,7 @@ mod tests {
 
     #[test]
     fn legacy_adjust_function() {
-        let d = adjust_difficulty(32, TARGET_BLOCK_TIME_SECS);
+        let d = adjust_difficulty(32, TARGET_BLOCK_TIME_MS);
         assert_eq!(d, 32);
     }
 
@@ -597,7 +574,7 @@ mod tests {
         // Feed 200 blocks at 1s interval, each representing ~20 DAG/blue blocks
         // so DAG-rate and blue-rate signals are consistent.
         for i in 0..200u64 {
-            let r = scored_block(i, i * TARGET_BLOCK_TIME_SECS, diff, 20, i * 20);
+            let r = scored_block(i, i * TARGET_BLOCK_TIME_MS, diff, 20, i * 20);
             diff = engine.on_new_block(r);
         }
 
@@ -631,17 +608,19 @@ mod tests {
 
     #[test]
     fn dag_block_count_1_is_backward_compatible() {
-        // When dag_block_count=1, behavior should be identical to old engine
+        // When dag_block_count=1, behavior should be identical to old engine.
+        // 10 BPS engine; feed on-target 100 ms spacing (= TARGET_BLOCK_TIME_MS),
+        // so a chain-only view (dag_count=1, blue advancing at 10/s) stays stable.
         let init = 1000u64;
-        let mut engine = RetargetEngine::new(init);
+        let mut engine = RetargetEngine::new_with_bps(init, 10);
         let mut diff = init;
 
         for i in 0..200u64 {
-            let r = block(i, i * TARGET_BLOCK_TIME_SECS, diff);
+            let r = block(i, i * TARGET_BLOCK_TIME_MS, diff);
             diff = engine.on_new_block(r);
         }
 
-        // Should stay roughly stable (chain-only view sees 1 block/sec = target)
+        // Should stay roughly stable (chain-only view sees 10 blocks/sec = target)
         assert!(
             diff >= init / 3 && diff <= init * 3,
             "Backward compat: init={}, got={}",

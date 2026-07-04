@@ -102,9 +102,10 @@ impl DagManager {
         })
     }
 
-    /// Maximum allowed future timestamp drift (consensus: 120 seconds).
-    /// Canonical value defined in block_validator::MAX_FUTURE_SECS.
-    const MAX_FUTURE_TIMESTAMP: u64 = 120;
+    /// Maximum allowed future timestamp drift, in MILLISECONDS (120 s of real
+    /// time). Timestamps are unix epoch ms. Shares ConsensusParams::MAX_FUTURE_MS.
+    const MAX_FUTURE_TIMESTAMP: u64 =
+        crate::config::consensus::consensus_params::ConsensusParams::MAX_FUTURE_MS;
 
     /// Maximum children any single block can have in the DAG.
     /// Prevents any block from becoming a "hotspot" that slows traversal.
@@ -158,14 +159,14 @@ impl DagManager {
                 )));
             }
 
-            // 2. Timestamp must not be too far in the future
+            // 2. Timestamp must not be too far in the future (ms vs ms)
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_secs();
+                .as_millis() as u64;
             if block.header.timestamp > now + Self::MAX_FUTURE_TIMESTAMP {
                 return Self::reject(DagError::Other(format!(
-                    "block timestamp {} is too far in the future (now={}, max_drift={}s)",
+                    "block timestamp {} is too far in the future (now={}, max_drift={}ms)",
                     block.header.timestamp,
                     now,
                     Self::MAX_FUTURE_TIMESTAMP

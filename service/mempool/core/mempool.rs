@@ -27,7 +27,7 @@ pub const MAX_BLOCK_TX_COUNT: usize = MempoolConfig::MAX_BLOCK_TX_COUNT;
 pub const MIN_RELAY_FEE: u64 = MempoolConfig::MIN_RELAY_FEE;
 pub const MIN_FEE_RATE: f64 = MempoolConfig::MIN_FEE_RATE;
 const EVICT_BATCH_SIZE: usize = MempoolConfig::EVICTION_BATCH_SIZE;
-pub const MAX_MEMPOOL_TX_AGE_SECS: u64 = MempoolConfig::MAX_MEMPOOL_TX_AGE_SECS;
+pub const MAX_MEMPOOL_TX_AGE_MS: u64 = MempoolConfig::MAX_MEMPOOL_TX_AGE_MS;
 
 /// Maximum number of unconfirmed transactions from the same sender address.
 /// Prevents a single wallet from monopolizing the mempool with min-fee TXs.
@@ -927,7 +927,7 @@ impl Mempool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
 
         // Collect hashes from fee index, then check timestamps individually
         let all_hashes: Vec<String> = self
@@ -941,7 +941,7 @@ impl Mempool {
         let mut expired = Vec::new();
         for hash in &all_hashes {
             if let Some(tx) = self.get_transaction(hash) {
-                if now.saturating_sub(tx.timestamp) > MAX_MEMPOOL_TX_AGE_SECS {
+                if now.saturating_sub(tx.timestamp) > MAX_MEMPOOL_TX_AGE_MS {
                     expired.push(hash.clone());
                 }
             }
@@ -1279,11 +1279,11 @@ impl Mempool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
 
         // Expired count: approximate from oldest timestamp instead of full scan.
         // If oldest TX is within the age limit, there are 0 expired.
-        let expired = if oldest_ts > 0 && now.saturating_sub(oldest_ts) > MAX_MEMPOOL_TX_AGE_SECS {
+        let expired = if oldest_ts > 0 && now.saturating_sub(oldest_ts) > MAX_MEMPOOL_TX_AGE_MS {
             // There are expired TXs; count them by scanning timestamps.
             // This only happens when pool has stale TXs (rare during normal operation).
             self.count_expired(now)
@@ -1354,7 +1354,7 @@ impl Mempool {
             .take_while(|(k, _)| k.starts_with(PFX_FEE))
             .filter_map(|(_, v)| String::from_utf8(v.to_vec()).ok())
             .filter_map(|hash| self.get_transaction(&hash))
-            .filter(|tx| now.saturating_sub(tx.timestamp) > MAX_MEMPOOL_TX_AGE_SECS)
+            .filter(|tx| now.saturating_sub(tx.timestamp) > MAX_MEMPOOL_TX_AGE_MS)
             .count()
     }
 
@@ -1704,7 +1704,7 @@ mod tests {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs()
+            .as_millis() as u64
     }
 
     #[test]
@@ -1846,7 +1846,7 @@ mod cpfp_tests {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs()
+            .as_millis() as u64
     }
 
     fn coinbase(hash: &str, fee: u64) -> Transaction {
@@ -2073,7 +2073,7 @@ mod policy_tests {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs()
+            .as_millis() as u64
     }
 
     fn coinbase(hash: &str, fee: u64) -> Transaction {
@@ -2176,7 +2176,7 @@ mod policy_tests {
 const PFX_ORPHAN: &[u8] = b"orphan:";
 
 pub const MAX_ORPHAN_POOL_SIZE: usize = MempoolConfig::MAX_ORPHAN_POOL_SIZE;
-pub const MAX_ORPHAN_AGE_SECS: u64 = MempoolConfig::MAX_ORPHAN_AGE_SECS;
+pub const MAX_ORPHAN_AGE_MS: u64 = MempoolConfig::MAX_ORPHAN_AGE_MS;
 
 impl Mempool {
     pub fn add_orphan(&self, tx: &Transaction) -> bool {
@@ -2201,7 +2201,7 @@ impl Mempool {
                     let receive_time = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
-                        .as_secs();
+                        .as_millis() as u64;
                     let ts_key = format!("orphan_ts:{}", tx.hash);
                     let _ = self.db.put(ts_key.as_bytes(), receive_time.to_le_bytes());
                 }
@@ -2263,7 +2263,7 @@ impl Mempool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
 
         // BUG FIX: Use the receive-time metadata key (orphan_ts:{hash}) instead
         // of tx.timestamp.  tx.timestamp is set by the sender and can be
@@ -2295,7 +2295,7 @@ impl Mempool {
                         tx.timestamp
                     }
                 };
-                if now.saturating_sub(receive_time) > MAX_ORPHAN_AGE_SECS {
+                if now.saturating_sub(receive_time) > MAX_ORPHAN_AGE_MS {
                     Some(k.to_vec())
                 } else {
                     None
@@ -2347,7 +2347,7 @@ mod orphan_tests {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs()
+            .as_millis() as u64
     }
 
     fn orphan_tx(hash: &str, parent: &str) -> Transaction {

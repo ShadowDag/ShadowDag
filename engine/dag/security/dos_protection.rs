@@ -34,8 +34,10 @@ pub const MIN_FEE_PER_BYTE: u64 = 1;
 pub const MAX_NONCE: u64 = u64::MAX;
 pub const MAX_OUTPUT_AMOUNT: u64 = u64::MAX / 2;
 
-/// Canonical value: 120s (see block_validator::MAX_FUTURE_SECS).
-pub const MAX_FUTURE_TIMESTAMP_SECS: u64 = 120;
+/// Canonical future-drift bound in MILLISECONDS (120 s of real time).
+/// Timestamps are unix epoch ms. Shares ConsensusParams::MAX_FUTURE_MS.
+pub const MAX_FUTURE_TIMESTAMP_MS: u64 =
+    crate::config::consensus::consensus_params::ConsensusParams::MAX_FUTURE_MS;
 
 pub struct DosProtection;
 
@@ -105,13 +107,13 @@ impl DosProtection {
             return DosCheckResult::fail("Invalid nonce (MAX_NONCE sentinel)".to_string());
         }
 
-        // Timestamp
+        // Timestamp (ms vs ms)
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
 
-        let future_limit = now.saturating_add(MAX_FUTURE_TIMESTAMP_SECS);
+        let future_limit = now.saturating_add(MAX_FUTURE_TIMESTAMP_MS);
 
         if block.header.timestamp > future_limit {
             return DosCheckResult::fail("Future timestamp".to_string());

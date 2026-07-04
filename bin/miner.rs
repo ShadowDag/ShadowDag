@@ -189,35 +189,33 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
 
         // Stamp at least max_parent_ts + 1 (from the template) so fast,
         // sub-second blocks still satisfy R4 (monotonic DAG time: ts must be
-        // strictly greater than every parent's). Falls back to wall-clock when
-        // the node did not supply a floor.
-        let now_secs = SystemTime::now()
+        // strictly greater than every parent's). Timestamps are unix epoch
+        // MILLISECONDS. Falls back to wall-clock when the node supplied no floor.
+        let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
 
-        // LIVENESS THROTTLE: at 1-second timestamp granularity, R4 forces every
-        // block to ts >= max_parent_ts + 1, so producing blocks faster than one
-        // per wall-second drifts the tip timestamp AHEAD of real time. Once the
-        // drift exceeds the consensus future window (MAX_FUTURE_TIMESTAMP_SECS
-        // = 120s, dag_shield.rs) the next block is rejected "future timestamp"
-        // and mining stalls. Bound the drift well below that limit: if the
-        // required floor is already too far ahead of our clock, wait for the
-        // clock to catch up rather than stamp a block every honest node will
-        // reject. This caps sustained selected-chain throughput at ~1 block/sec
-        // — an inherent limit of 1-second timestamps; true higher BPS needs
-        // millisecond timestamps (a separate consensus change).
-        const TS_DRIFT_BUDGET_SECS: u64 = 30; // << 120s window, robust to peer clock skew
-        if template.min_timestamp > now_secs.saturating_add(TS_DRIFT_BUDGET_SECS) {
-            let wait = (template.min_timestamp - now_secs - TS_DRIFT_BUDGET_SECS).min(15);
+        // LIVENESS THROTTLE (MILLISECONDS): R4 forces ts >= max_parent_ts + 1,
+        // now +1 MS. At the 100ms target the tip timestamp tracks wall-clock and
+        // drift no longer accrues, so this should essentially never fire (unlike
+        // the 1-second era, where +1s/block drifted the tip ahead of real time
+        // and stalled mining on the future gate). It remains a safety valve: if
+        // the required floor is already far ahead of our clock (e.g. a burst
+        // pushed timestamps forward), wait for the clock to catch up rather than
+        // stamp a block beyond the consensus future window (MAX_FUTURE_MS =
+        // 120_000 ms) that every honest node would reject.
+        const TS_DRIFT_BUDGET_MS: u64 = 30_000; // << 120_000 ms window, robust to clock skew
+        if template.min_timestamp > now_ms.saturating_add(TS_DRIFT_BUDGET_MS) {
+            let wait_ms = (template.min_timestamp - now_ms - TS_DRIFT_BUDGET_MS).min(15_000);
             slog_info!("miner", "timestamp_drift_throttle",
                 min_timestamp => template.min_timestamp,
-                now => now_secs,
-                wait_secs => wait);
-            std::thread::sleep(Duration::from_secs(wait.max(1)));
+                now => now_ms,
+                wait_ms => wait_ms);
+            std::thread::sleep(Duration::from_millis(wait_ms.max(1)));
             continue; // refetch a fresh template with an advanced wall-clock
         }
-        let timestamp = now_secs.max(template.min_timestamp);
+        let timestamp = now_ms.max(template.min_timestamp);
 
         // â•گâ•گâ•گ STEP 2: Build coinbase transaction â•گâ•گâ•گ
         // Include the node-selected mempool transactions so user transactions
@@ -396,7 +394,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         // â•گâ•گâ•گ STEP 4: Build full block and submit â•گâ•گâ•گ
         let block = Block {
             header: BlockHeader {
-                version: 1,
+                version: 2, // ms-timestamp era (matches GENESIS_VERSION)
                 hash: hash.clone(),
                 parents,
                 merkle_root,
@@ -599,7 +597,11 @@ enum SubmitResult {
 
 const MAX_RESPONSE: usize = 1_000_000; // 1 MB
 const MAX_HEADER_LINES: usize = 100;
-const MIN_SUBMIT_INTERVAL_MS: u64 = 700; // keep below write rate-limit (100 req/min)
+// Minimum gap between block submissions. Set below the 100 ms target so the
+// miner can sustain ~10 blocks/sec (the ms-timestamp target). Safe because the
+// co-located miner connects over loopback (127.0.0.1), which the node's RPC
+// rate limiter exempts; a remote miner would still be rate-limited upstream.
+const MIN_SUBMIT_INTERVAL_MS: u64 = 50;
 
 fn rpc_call(addr: &str, method: &str, params: &str, bearer_token: Option<&str>) -> Option<String> {
     let body = format!(
