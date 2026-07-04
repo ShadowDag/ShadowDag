@@ -74,6 +74,16 @@ impl ExplorerServer {
     }
 
     fn is_safe_local_request(host: Option<&str>, origin: Option<&str>) -> bool {
+        // Public read-only explorer opt-in: when SHADOWDAG_EXPLORER_ALLOW_PUBLIC is
+        // set (the same flag that permits a non-loopback bind), the Host/Origin
+        // loopback guard is bypassed. The explorer serves only READ-ONLY chain data
+        // (no state-mutating endpoints), so cross-origin GETs carry no CSRF risk.
+        if std::env::var("SHADOWDAG_EXPLORER_ALLOW_PUBLIC")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+        {
+            return true;
+        }
         let Some(h) = host else {
             return false;
         };
