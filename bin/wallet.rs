@@ -424,11 +424,16 @@ fn run_gui(_args: &[String]) {
 // ---------------------------------------------------------------------------
 
 fn cmd_new(args: &[String]) {
-    let network = args.get(2).map(|s| s.as_str()).unwrap_or("mainnet");
-
-    // Warn if the specified network doesn't match the SHADOWDAG_NETWORK env var
+    // Network precedence: explicit positional arg > SHADOWDAG_NETWORK env >
+    // mainnet. Previously this defaulted straight to "mainnet", so `new` created
+    // a MAINNET (SD1) wallet even under SHADOWDAG_NETWORK=testnet, while every
+    // other command (stealth/send/balance) derives addresses from the env — the
+    // stored wallet could then not be found ("no wallet found for ST1…").
     let env_network = wallet_network();
-    if network != env_network {
+    let network = args.get(2).map(|s| s.as_str()).unwrap_or(&env_network);
+
+    // Warn only when an explicit arg disagrees with the env var.
+    if args.get(2).is_some() && network != env_network {
         eprintln!(
             "NOTE: Creating wallet for '{}' but SHADOWDAG_NETWORK='{}'",
             network, env_network
