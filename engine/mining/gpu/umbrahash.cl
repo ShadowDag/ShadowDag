@@ -74,7 +74,10 @@ __kernel void umbra_calc_items(__global const uchar* cache, uint n, uint base, _
     uint gid = get_global_id(0);
     uchar item[64];
     calc_item(cache, n, base + gid, item);
-    for (uint k=0;k<64;k++) out[gid*64u+k]=item[k];
+    // Write at the ABSOLUTE item index so this kernel can fill the full dataset
+    // buffer in batches (out[(base+gid)*64 ..]). With base=0 this is out[gid*64].
+    ulong off = ((ulong)base + gid) * 64u;
+    for (uint k=0;k<64;k++) out[off+k]=item[k];
 }
 
 // hashimoto over a resident dataset (n items). Returns mix_hash(32) + result(32).

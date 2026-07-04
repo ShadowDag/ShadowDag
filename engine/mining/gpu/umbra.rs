@@ -145,6 +145,155 @@ pub fn gpu_hashimoto(
     Ok(out)
 }
 
+/// A GPU UmbraHash miner: generates the (large) dataset once per epoch into VRAM,
+/// then searches nonces against it with the `umbra_mine` kernel. Reuses the
+/// OpenCL toolchain. `dataset_bytes`/`cache_bytes` are parameters so the miner
+/// uses the consensus sizes (umbrahash::DATASET_BYTES / CACHE_BYTES) while tests
+/// can use small ones.
+pub struct UmbraGpuMiner {
+    device_name: String,
+    batch: usize,
+    cache_bytes: usize,
+    n: u32,
+    queue: Queue,
+    program: Program,
+    dataset: Buffer<u8>,
+    loaded_epoch: Option<u64>,
+}
+
+impl UmbraGpuMiner {
+    pub fn new(batch: usize, dataset_bytes: usize, cache_bytes: usize) -> Result<Self, String> {
+        let (platform, device) = pick_device()?;
+        let device_name = device.name().map_err(|e| e.to_string())?;
+        let (program, queue) = build(device, platform)?;
+        let dataset = Buffer::<u8>::builder()
+            .queue(queue.clone())
+            .len(dataset_bytes)
+            .build()
+            .map_err(|e| format!("VRAM dataset alloc ({} bytes) failed: {}", dataset_bytes, e))?;
+        Ok(Self {
+            device_name,
+            batch,
+            cache_bytes,
+            n: (dataset_bytes / 64) as u32,
+            queue,
+            program,
+            dataset,
+            loaded_epoch: None,
+        })
+    }
+
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+    pub fn batch(&self) -> usize {
+        self.batch
+    }
+
+    /// Generate the epoch dataset into VRAM (once per epoch). `cache` must be the
+    /// `cache_bytes`-sized cache for `epoch`.
+    pub fn ensure_dataset(&mut self, cache: &[u8], epoch: u64) -> Result<(), String> {
+        if self.loaded_epoch == Some(epoch) {
+            return Ok(());
+        }
+        if cache.len() != self.cache_bytes {
+            return Err("cache size mismatch".into());
+        }
+        let cache_buf = Buffer::<u8>::builder()
+            .queue(self.queue.clone())
+            .len(cache.len())
+            .copy_host_slice(cache)
+            .build()
+            .map_err(|e| e.to_string())?;
+        let cache_n = (self.cache_bytes / 64) as u32;
+        let items = self.n as usize;
+        let gen_batch = 262_144usize.min(items); // work-items per launch
+        let mut base = 0usize;
+        while base < items {
+            let this = gen_batch.min(items - base);
+            let kernel = Kernel::builder()
+                .program(&self.program)
+                .name("umbra_calc_items")
+                .queue(self.queue.clone())
+                .global_work_size(this)
+                .arg(&cache_buf)
+                .arg(cache_n)
+                .arg(base as u32)
+                .arg(&self.dataset)
+                .build()
+                .map_err(|e| e.to_string())?;
+            unsafe {
+                kernel.enq().map_err(|e| e.to_string())?;
+            }
+            base += this;
+        }
+        self.queue.finish().map_err(|e| e.to_string())?;
+        self.loaded_epoch = Some(epoch);
+        Ok(())
+    }
+
+    /// Search `batch` nonces from `base_nonce` against the resident dataset.
+    /// Returns the first nonce whose result <= target (caller recomputes
+    /// mix/result on the CPU for the header + a consensus cross-check).
+    pub fn mine(
+        &self,
+        header_hash: &[u8; 32],
+        target: &[u8; 32],
+        base_nonce: u64,
+    ) -> Result<Option<u64>, String> {
+        let hh_buf = Buffer::<u8>::builder()
+            .queue(self.queue.clone())
+            .len(32)
+            .copy_host_slice(&header_hash[..])
+            .build()
+            .map_err(|e| e.to_string())?;
+        let tgt_buf = Buffer::<u8>::builder()
+            .queue(self.queue.clone())
+            .len(32)
+            .copy_host_slice(&target[..])
+            .build()
+            .map_err(|e| e.to_string())?;
+        let res_buf = Buffer::<u32>::builder()
+            .queue(self.queue.clone())
+            .len(3)
+            .copy_host_slice(&[0u32; 3])
+            .build()
+            .map_err(|e| e.to_string())?;
+        let win_buf = Buffer::<u8>::builder()
+            .queue(self.queue.clone())
+            .len(32)
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        let kernel = Kernel::builder()
+            .program(&self.program)
+            .name("umbra_mine")
+            .queue(self.queue.clone())
+            .global_work_size(self.batch)
+            .arg(&self.dataset)
+            .arg(self.n)
+            .arg(&hh_buf)
+            .arg(base_nonce)
+            .arg(&tgt_buf)
+            .arg(&res_buf)
+            .arg(&win_buf)
+            .build()
+            .map_err(|e| e.to_string())?;
+        unsafe {
+            kernel.enq().map_err(|e| e.to_string())?;
+        }
+        self.queue.finish().map_err(|e| e.to_string())?;
+
+        let mut r = [0u32; 3];
+        res_buf.read(&mut r[..]).enq().map_err(|e| e.to_string())?;
+        if r[0] == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(r[1] as u64 | ((r[2] as u64) << 32)))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +322,44 @@ mod tests {
                 i
             );
         }
+    }
+
+    #[test]
+    fn gpu_miner_finds_nonce_the_cpu_accepts() {
+        const DS: usize = 64 * 512; // 512 dataset items
+        const CS: usize = 64 * 128; // 128 cache items
+        let mut miner = match UmbraGpuMiner::new(4096, DS, CS) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("skipping GPU miner test (no device): {}", e);
+                return;
+            }
+        };
+        let cache = umbrahash::mkcache(CS, &umbrahash::epoch_seed(0));
+        miner.ensure_dataset(&cache, 0).expect("dataset gen");
+        let header: [u8; 32] = {
+            use sha3::{Digest, Sha3_256};
+            let mut h = Sha3_256::new();
+            h.update(b"gpu-mine");
+            h.finalize().into()
+        };
+        let mut target = [0xffu8; 32];
+        target[0] = 0x00; // ~1/256
+
+        let mut found = None;
+        for round in 0..16u64 {
+            if let Some(n) = miner.mine(&header, &target, round * 4096).expect("mine") {
+                found = Some(n);
+                break;
+            }
+        }
+        let nonce = found.expect("a 1/256 target should yield a nonce within 64k");
+        // CPU cross-check: the GPU-found nonce must pass node light-verify.
+        let (mix, _result) = umbrahash::hashimoto_light(&cache, DS, &header, nonce);
+        assert!(
+            umbrahash::verify_light(&cache, DS, &header, nonce, &mix, &target),
+            "GPU-found nonce must pass CPU light-verify"
+        );
     }
 
     #[test]

@@ -177,22 +177,50 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
     let mut stale_reject_streak: u32 = 0;
     let session_start = Instant::now();
 
-    // Build the GPU miner once (reused across blocks). None = CPU mining.
+    // Build the ShadowHash GPU miner once (reused across blocks). None = CPU.
+    // Not used in UmbraHash mode (which has its own GPU miner below).
     #[cfg(feature = "gpu-opencl")]
-    let gpu_miner: Option<shadowdag::engine::mining::gpu::opencl::OpenClMiner> = if use_gpu {
-        match shadowdag::engine::mining::gpu::opencl::OpenClMiner::new(gpu_batch) {
-            Ok(m) => {
-                println!("[miner] GPU mining ENABLED — device: {} (batch={})", m.device_name(), m.batch());
-                Some(m)
+    let gpu_miner: Option<shadowdag::engine::mining::gpu::opencl::OpenClMiner> =
+        if use_gpu && !umbra_mode {
+            match shadowdag::engine::mining::gpu::opencl::OpenClMiner::new(gpu_batch) {
+                Ok(m) => {
+                    println!("[miner] GPU mining ENABLED — device: {} (batch={})", m.device_name(), m.batch());
+                    Some(m)
+                }
+                Err(e) => {
+                    eprintln!("[miner] GPU init failed ({}); falling back to CPU.", e);
+                    None
+                }
             }
-            Err(e) => {
-                eprintln!("[miner] GPU init failed ({}); falling back to CPU.", e);
-                None
+        } else {
+            None
+        };
+
+    // UmbraHash GPU miner (generates the ~1 GiB dataset into VRAM once per epoch).
+    #[cfg(feature = "gpu-opencl")]
+    let mut umbra_gpu: Option<shadowdag::engine::mining::gpu::umbra::UmbraGpuMiner> =
+        if umbra_mode && use_gpu {
+            match shadowdag::engine::mining::gpu::umbra::UmbraGpuMiner::new(
+                gpu_batch,
+                umbrahash::DATASET_BYTES,
+                umbrahash::CACHE_BYTES,
+            ) {
+                Ok(m) => {
+                    println!(
+                        "[miner] UmbraHash GPU mining on {} (batch={}, dataset=1GiB VRAM)",
+                        m.device_name(),
+                        m.batch()
+                    );
+                    Some(m)
+                }
+                Err(e) => {
+                    eprintln!("[miner] Umbra GPU init failed ({}); CPU fallback.", e);
+                    None
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     slog_info!("miner", "mining_loop_started");
 
@@ -367,7 +395,21 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
             );
             let target = PowValidator::difficulty_to_target_bytes(difficulty);
             let cache = umbrahash::cache_for_epoch(umbrahash::epoch_of(height));
-            umbra_mine_cpu(&cache, &hh, &target, threads, &found, &hash_count, &start, height)
+            #[cfg(feature = "gpu-opencl")]
+            {
+                if let Some(g) = umbra_gpu.as_mut() {
+                    umbra_mine_gpu(
+                        g, &cache, umbrahash::epoch_of(height), &hh, &target, &found, &hash_count,
+                        &start, height,
+                    )
+                } else {
+                    umbra_mine_cpu(&cache, &hh, &target, threads, &found, &hash_count, &start, height)
+                }
+            }
+            #[cfg(not(feature = "gpu-opencl"))]
+            {
+                umbra_mine_cpu(&cache, &hh, &target, threads, &found, &hash_count, &start, height)
+            }
         } else {
             None
         };
@@ -1094,6 +1136,67 @@ fn parse_flag_opt(args: &[String], name: &str) -> Result<Option<String>, String>
 
 fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+/// UmbraHash GPU nonce search: ensure the epoch dataset is resident in VRAM,
+/// then loop `umbra_mine` batches until a nonce whose result <= target is found
+/// (re-verified on the CPU consensus path before returning).
+#[cfg(feature = "gpu-opencl")]
+#[allow(clippy::too_many_arguments)]
+fn umbra_mine_gpu(
+    g: &mut shadowdag::engine::mining::gpu::umbra::UmbraGpuMiner,
+    cache: &[u8],
+    epoch: u64,
+    header_hash: &[u8; 32],
+    target: &[u8; 32],
+    found: &Arc<AtomicBool>,
+    hash_count: &Arc<AtomicU64>,
+    start: &Instant,
+    height: u64,
+) -> Option<(u64, String, String)> {
+    if let Err(e) = g.ensure_dataset(cache, epoch) {
+        eprintln!("[umbra-gpu] dataset gen failed: {}", e);
+        return None;
+    }
+    let batch = g.batch() as u64;
+    let cap: u64 = 4_000_000_000;
+    let mut base: u64 = 0;
+    while base < cap {
+        if found.load(Ordering::Relaxed) {
+            return None;
+        }
+        match g.mine(header_hash, target, base) {
+            Ok(Some(nonce)) => {
+                // Authoritative CPU re-check (consensus path) + header fields.
+                let (mix, result) =
+                    umbrahash::hashimoto_light(cache, umbrahash::DATASET_BYTES, header_hash, nonce);
+                if umbrahash::verify_light(
+                    cache, umbrahash::DATASET_BYTES, header_hash, nonce, &mix, target,
+                ) {
+                    found.store(true, Ordering::Relaxed);
+                    return Some((nonce, hex::encode(result), hex::encode(mix)));
+                }
+                eprintln!("[umbra-gpu] WARNING: GPU nonce {} rejected by CPU re-check", nonce);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("[umbra-gpu] error: {}", e);
+                return None;
+            }
+        }
+        hash_count.fetch_add(batch, Ordering::Relaxed);
+        let el = start.elapsed().as_secs_f64();
+        let tot = hash_count.load(Ordering::Relaxed);
+        print!(
+            "\r[umbra-gpu] height={} hashes={:.2}M rate={:.0} H/s   ",
+            height,
+            tot as f64 / 1_000_000.0,
+            tot as f64 / el.max(0.001)
+        );
+        let _ = std::io::stdout().flush();
+        base = base.saturating_add(batch);
+    }
+    None
 }
 
 /// UmbraHash CPU nonce search (rayon across threads). Each thread runs the
