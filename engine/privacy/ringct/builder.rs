@@ -39,6 +39,19 @@ pub struct ConfRecipient {
     pub amount: u64,
 }
 
+/// A TRANSPARENT input being SHIELDED (spent into the confidential pool).
+pub struct ShieldInput {
+    pub txid: String,
+    pub index: u32,
+    pub owner: String,
+    /// PUBLIC amount of the input UTXO — MUST equal the on-chain amount (the
+    /// node reads it from the UTXO set; a mismatch is rejected by verify_shield_tx).
+    pub amount: u64,
+    pub pub_key_hex: String,
+    /// Ed25519 signing key that owns this outpoint.
+    pub signing_key: ed25519_dalek::SigningKey,
+}
+
 fn hexp(p: &RistrettoPoint) -> String {
     hex::encode(p.compress().as_bytes())
 }
@@ -188,13 +201,181 @@ pub fn build_confidential_transaction(
     Ok(tx)
 }
 
+/// Build a SHIELD transaction: TRANSPARENT inputs -> CONFIDENTIAL outputs.
+///
+/// The entry point into the confidential pool. Reuses the confidential OUTPUT
+/// construction (stealth + Pedersen commitment + range proof + encrypted
+/// amount); the transparent input blindings `r_i` are chosen so `Σ r_i == Σ`
+/// (derived output blindings), and each input is Ed25519-signed over the
+/// transparent signing message. The returned tx passes `verify_shield_tx` when
+/// each input's `amount` equals its on-chain UTXO amount.
+pub fn build_shield_transaction(
+    inputs: Vec<ShieldInput>,
+    recipients: Vec<ConfRecipient>,
+    fee: u64,
+    network: &NetworkMode,
+) -> Result<Transaction, CryptoError> {
+    use ed25519_dalek::Signer;
+    use rand::rngs::OsRng;
+    use zeroize::Zeroize;
+
+    if inputs.is_empty() || recipients.is_empty() {
+        return Err(CryptoError::Other(
+            "shield tx needs >= 1 input and >= 1 recipient".into(),
+        ));
+    }
+    let g = RISTRETTO_BASEPOINT_POINT;
+    let h = generator_h();
+
+    // Amount balance: Σ public input amounts == Σ recipient amounts + fee.
+    let in_sum: u128 = inputs.iter().map(|i| i.amount as u128).sum();
+    let out_sum: u128 = recipients.iter().map(|r| r.amount as u128).sum();
+    if in_sum != out_sum + fee as u128 {
+        return Err(CryptoError::Other(
+            "shield build: inputs != outputs + fee".into(),
+        ));
+    }
+
+    // Confidential outputs (identical to build_confidential_transaction).
+    let mut out_blinding_sum = Scalar::ZERO;
+    let mut tx_outputs = Vec::with_capacity(recipients.len());
+    for (i, r) in recipients.iter().enumerate() {
+        let (stealth, ss) = StealthAddress::generate_full_for_network_with_secret(
+            &r.view_pub,
+            &r.spend_pub,
+            network.short_name(),
+        )?;
+        let blinding = amount_encoding::derive_blinding(&ss, i as u32);
+        out_blinding_sum += blinding;
+        let c_out = Scalar::from(r.amount) * h + blinding * g;
+        let proof = range_proof::prove(r.amount, &blinding);
+        let mask = amount_encoding::amount_mask(&ss, i as u32);
+        let enc = amount_encoding::encrypt_amount(r.amount, &mask);
+        tx_outputs.push(TxOutput {
+            address: stealth.one_time_address,
+            amount: 0,
+            commitment: Some(hexp(&c_out)),
+            range_proof: Some(range_proof_to_hex(&proof)),
+            ephemeral_pubkey: Some(stealth.ephemeral_pubkey),
+            one_time_pubkey: Some(stealth.one_time_pubkey),
+            encrypted_amount: Some(amount_encoding::enc_to_hex(&enc)),
+        });
+    }
+
+    // Transparent input blindings: random per input EXCEPT the last, which
+    // absorbs the difference so Σ r_i == Σ derived_out_blindings (the H/amount
+    // terms already balance). C_in = A_i·H + r_i·G is reconstructed by the node.
+    let mut in_blindings: Vec<Scalar> =
+        (0..inputs.len()).map(|_| Scalar::random(&mut OsRng)).collect();
+    let last = inputs.len() - 1;
+    let sum_other: Scalar = in_blindings[..last].iter().sum();
+    in_blindings[last] = out_blinding_sum - sum_other;
+
+    let mut tx_inputs = Vec::with_capacity(inputs.len());
+    for (i, inp) in inputs.iter().enumerate() {
+        tx_inputs.push(TxInput {
+            txid: inp.txid.clone(),
+            index: inp.index,
+            owner: inp.owner.clone(),
+            signature: String::new(),
+            pub_key: inp.pub_key_hex.clone(),
+            key_image: None,
+            ring_members: None,
+            ring_signature: None,
+            ring_commitments: None,
+            pseudo_commitment: None,
+            shield_blinding: Some(hex::encode(in_blindings[i].to_bytes())),
+        });
+    }
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut tx = Transaction {
+        hash: String::new(),
+        inputs: tx_inputs,
+        outputs: tx_outputs,
+        fee,
+        timestamp,
+        is_coinbase: false,
+        tx_type: TxType::Shield,
+        payload_hash: None,
+        ..Default::default()
+    };
+    tx.hash = TxHash::hash_for_network(&tx, network);
+
+    // Ed25519 sign each input over the transparent signing message (hash is set).
+    let msg = TxHash::signing_message_for_network(&tx, network);
+    for (i, inp) in inputs.iter().enumerate() {
+        let sig = inp.signing_key.sign(&msg);
+        tx.inputs[i].signature = hex::encode(sig.to_bytes());
+    }
+
+    for b in in_blindings.iter_mut() {
+        b.zeroize();
+    }
+    Ok(tx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::utxo::utxo_set::UtxoSet;
-    use crate::engine::privacy::ringct::confidential_consensus::verify_confidential_tx;
+    use crate::engine::privacy::ringct::confidential_consensus::{
+        verify_confidential_tx, verify_shield_tx,
+    };
     use rand::rngs::OsRng;
     use std::collections::HashSet;
+
+    #[test]
+    fn built_shield_tx_passes_the_consensus_gate() {
+        use crate::domain::transaction::transaction::{Transaction as Tx, TxOutput, TxType};
+        use ed25519_dalek::SigningKey;
+        use sha2::{Digest, Sha256};
+
+        let set = UtxoSet::new_empty();
+        // Keypair + mainnet address.
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = sk.verifying_key();
+        let pk_hex = hex::encode(pk.to_bytes());
+        let mut ah = Sha256::new();
+        ah.update(b"ShadowDAG_Addr_v1");
+        ah.update(pk.to_bytes());
+        let address = format!("SD1{}", hex::encode(&ah.finalize()[..20]));
+
+        // Seed a transparent coinbase of 1000 owned by `address`.
+        let cb_hash = "a".repeat(64);
+        let mut cb = Tx::new_coinbase(cb_hash.clone(), vec![TxOutput::new(address.clone(), 1000)], 0, 1);
+        cb.hash = cb_hash.clone();
+        set.apply_block_dag_ordered(std::slice::from_ref(&cb), 0, "cbblk").unwrap();
+
+        // Recipient stealth pubkeys + shield the whole input (minus fee).
+        let g = RISTRETTO_BASEPOINT_POINT;
+        let view_pub = Scalar::random(&mut OsRng) * g;
+        let spend_pub = Scalar::random(&mut OsRng) * g;
+        let fee = 10u64;
+        let tx = build_shield_transaction(
+            vec![ShieldInput {
+                txid: cb_hash,
+                index: 0,
+                owner: address,
+                amount: 1000,
+                pub_key_hex: pk_hex,
+                signing_key: sk,
+            }],
+            vec![ConfRecipient { view_pub, spend_pub, amount: 1000 - fee }],
+            fee,
+            &NetworkMode::Mainnet,
+        )
+        .unwrap();
+
+        assert_eq!(tx.tx_type, TxType::Shield);
+        assert!(
+            verify_shield_tx(&tx, &set, &NetworkMode::Mainnet).is_ok(),
+            "a built shield tx must pass verify_shield_tx (build -> verify round-trip)"
+        );
+    }
 
     /// Build one OwnedInput holding `amount`: a ring of `ring_size` real
     /// on-chain outputs (all recorded into `set`'s okey), signer at `idx`.
