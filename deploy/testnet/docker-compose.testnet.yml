@@ -30,6 +30,7 @@ services:
       #   MINER_ADDRESS=ST1b28a5... docker compose -f docker-compose.testnet.yml up -d
       - MINER_ADDRESS=${MINER_ADDRESS:-}
       - MINER_THREADS=${MINER_THREADS:-2}
+      - MINER_POW=${MINER_POW:-}
     ports:
       - "19333:19333"             # P2P — PUBLIC (peers connect here)
       - "127.0.0.1:19332:19332"   # RPC  — localhost only (keep private)

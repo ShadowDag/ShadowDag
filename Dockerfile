@@ -73,6 +73,7 @@ ENV SHADOWDAG_DATA_DIR=/data
 ENV NETWORK=mainnet
 ENV MINER_ADDRESS=""
 ENV MINER_THREADS=1
+ENV MINER_POW=""
 
 # Ports
 # 9332: RPC  |  9333: P2P  |  7779: Stratum  |  8080: Explorer  |  3000: IDE
@@ -112,10 +113,13 @@ if [ -n "$MINER_ADDRESS" ]; then
         # The node writes rpc_password into the data dir shortly after start.
         while [ ! -s "${SHADOWDAG_DATA_DIR}/rpc_password" ]; do sleep 1; done
         MINER_PW="$(cat "${SHADOWDAG_DATA_DIR}/rpc_password")"
+        POW_ARG=""
+        [ -n "${MINER_POW}" ] && POW_ARG="--pow=${MINER_POW}"
         while true; do
             shadowdag-miner --network="${NETWORK}" \
                 --address="${MINER_ADDRESS}" \
                 --threads="${MINER_THREADS}" \
+                ${POW_ARG} \
                 --rpc-password="${MINER_PW}"
             echo "[entrypoint] miner exited; restarting in 2s" >&2
             sleep 2
