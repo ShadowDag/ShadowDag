@@ -435,6 +435,15 @@ impl UtxoSet {
         self.store.get_raw(seen_key.as_bytes()).is_some()
     }
 
+    /// The block hash that included `tx_hash` on-chain (the `tx_seen:` value),
+    /// or None if the tx is not on the active DAG. Used for confirmations.
+    pub fn tx_seen_block(&self, tx_hash: &str) -> Option<String> {
+        let seen_key = format!("tx_seen:{}", tx_hash);
+        self.store
+            .get_raw(seen_key.as_bytes())
+            .and_then(|v| String::from_utf8(v).ok())
+    }
+
     pub fn get_balance(&self, address: &str) -> u64 {
         match self.store.get_balance(address) {
             Ok(bal) => bal,

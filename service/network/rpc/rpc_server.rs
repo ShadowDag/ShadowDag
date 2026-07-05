@@ -2683,16 +2683,30 @@ impl RpcServer {
 
     fn cmd_getsyncstatus(id: Value, state: &SharedState) -> RpcResponse {
         match state.lock() {
-            Ok(s) => RpcResponse::ok(
-                id,
-                json!({
-                    "best_height":    s.best_height,
-                    "best_hash":      s.best_hash,
-                    "block_count":    s.block_store.count(),
-                    "sync_mode":      "header_first",
-                    "is_synced":      true,
-                }),
-            ),
+            Ok(s) => {
+                let peer_best = s
+                    .peer_manager
+                    .get_peer_records()
+                    .iter()
+                    .map(|p| p.best_height)
+                    .max()
+                    .unwrap_or(0);
+                // Synced when within a couple of blocks of the best peer (or when
+                // no peer advertises a higher height).
+                let is_synced = s.best_height.saturating_add(2) >= peer_best;
+                RpcResponse::ok(
+                    id,
+                    json!({
+                        "best_height":      s.best_height,
+                        "best_hash":        s.best_hash,
+                        "block_count":      s.block_store.count(),
+                        "peer_best_height": peer_best,
+                        "blocks_behind":    peer_best.saturating_sub(s.best_height),
+                        "sync_mode":        "header_first",
+                        "is_synced":        is_synced,
+                    }),
+                )
+            }
             Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
         }
     }
@@ -3264,12 +3278,36 @@ impl RpcServer {
         }
     }
 
-    fn cmd_gettxconfirmations(params: Vec<Value>, id: Value, _state: &SharedState) -> RpcResponse {
+    fn cmd_gettxconfirmations(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
         let txid = params.first().and_then(|v| v.as_str()).unwrap_or("");
-        RpcResponse::ok(
-            id,
-            json!({"txid": txid, "confirmations": 0, "note": "requires tx index lookup"}),
-        )
+        match state.lock() {
+            Ok(s) => {
+                match s
+                    .utxo_store
+                    .tx_seen_block(txid)
+                    .and_then(|bh| s.block_store.get_block(&bh))
+                {
+                    Some(block) => {
+                        let h = block.header.height;
+                        let confirmations = s.best_height.saturating_sub(h).saturating_add(1);
+                        RpcResponse::ok(
+                            id,
+                            json!({
+                                "txid": txid,
+                                "confirmations": confirmations,
+                                "block_height": h,
+                                "status": "confirmed",
+                            }),
+                        )
+                    }
+                    None => RpcResponse::ok(
+                        id,
+                        json!({"txid": txid, "confirmations": 0, "status": "unconfirmed"}),
+                    ),
+                }
+            }
+            Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        }
     }
 
     fn cmd_decodetransaction(params: Vec<Value>, id: Value) -> RpcResponse {
@@ -3666,13 +3704,15 @@ impl RpcServer {
 
     fn cmd_gethardwarewalletinfo(id: Value) -> RpcResponse {
         use crate::service::wallet::keys::hardware_wallet::HardwareWalletManager;
+        // Hardware-wallet signing (Ledger/Trezor over USB HID) is not implemented
+        // yet, so report the honest capability rather than a false "supported".
         RpcResponse::ok(
             id,
             json!({
-                "supported": true,
-                "devices": ["Ledger Nano S/X/S+", "Trezor Model T/One", "FIDO2/U2F"],
+                "supported": false,
+                "reason": "hardware-wallet signing (USB HID) is not yet implemented",
+                "planned_types": ["Ledger", "Trezor"],
                 "derivation_paths": HardwareWalletManager::derivation_paths(),
-                "signing": "Ed25519 + Schnorr",
                 "coin_type": 9999,
             }),
         )
@@ -4380,16 +4420,48 @@ impl RpcServer {
     }
 
     fn cmd_verifymerkleproof(params: Vec<Value>, id: Value) -> RpcResponse {
+        // params: [tx_hash, merkle_root, proof_hashes[hex], proof_directions[bool]]
         let tx_hash = params.first().and_then(|v| v.as_str()).unwrap_or("");
         let merkle_root = params.get(1).and_then(|v| v.as_str()).unwrap_or("");
-        // Simplified verification - full proof data would come from client
+        let (hashes, dirs) = match (
+            params.get(2).and_then(|v| v.as_array()),
+            params.get(3).and_then(|v| v.as_array()),
+        ) {
+            (Some(h), Some(d)) if h.len() == d.len() => (h, d),
+            _ => {
+                return RpcResponse::err(
+                    id,
+                    ERR_INVALID_PARAMS,
+                    "Expected [tx_hash, merkle_root, proof_hashes[], proof_directions[]] with equal-length arrays",
+                )
+            }
+        };
+        let mut proof: Vec<([u8; 32], bool)> = Vec::with_capacity(hashes.len());
+        for (h, dir) in hashes.iter().zip(dirs.iter()) {
+            let bytes = match h
+                .as_str()
+                .and_then(|s| hex::decode(s).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            {
+                Some(a) => a,
+                None => {
+                    return RpcResponse::err(
+                        id,
+                        ERR_INVALID_PARAMS,
+                        "each proof hash must be 32-byte hex",
+                    )
+                }
+            };
+            proof.push((bytes, dir.as_bool().unwrap_or(false)));
+        }
+        let valid = crate::domain::block::merkle_tree::MerkleTree::verify_proof(
+            tx_hash,
+            &proof,
+            merkle_root,
+        );
         RpcResponse::ok(
             id,
-            json!({
-                "tx_hash": tx_hash, "merkle_root": merkle_root,
-                "note": "Submit proof_hashes and proof_directions for full verification",
-                "algorithm": "BLAKE2b-256 with domain separation",
-            }),
+            json!({ "tx_hash": tx_hash, "merkle_root": merkle_root, "valid": valid }),
         )
     }
 
@@ -4489,8 +4561,26 @@ impl RpcServer {
         )
     }
 
-    fn cmd_getbannedpeers(id: Value, _state: &SharedState) -> RpcResponse {
-        RpcResponse::ok(id, json!({"banned_count": 0, "banned": []}))
+    fn cmd_getbannedpeers(id: Value, state: &SharedState) -> RpcResponse {
+        match state.lock() {
+            Ok(s) => {
+                let banned: Vec<Value> = s
+                    .peer_manager
+                    .get_peer_records()
+                    .into_iter()
+                    .filter(|p| s.peer_manager.is_banned(&p.addr))
+                    .map(|p| {
+                        json!({
+                            "addr":      p.addr,
+                            "ban_until": s.peer_manager.get_ban_expiry(&p.addr),
+                            "ban_score": p.ban_score,
+                        })
+                    })
+                    .collect();
+                RpcResponse::ok(id, json!({"banned_count": banned.len(), "banned": banned}))
+            }
+            Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        }
     }
 
     fn cmd_getpeerversions(id: Value, state: &SharedState) -> RpcResponse {
