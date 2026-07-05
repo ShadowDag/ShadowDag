@@ -1001,22 +1001,34 @@ impl Wallet {
         let total_needed = value.saturating_add(fee);
         let (selected, total_in) = self.select_utxos(&acc, total_needed)?;
 
-        let inputs: Vec<TxInput> = selected
-            .iter()
-            .map(|u| TxInput {
+        let seed = self
+            .session_key
+            .as_ref()
+            .ok_or(WalletError::Other("No session key".to_string()))?
+            .clone();
+        let net: NetworkMode = self.network.parse().unwrap_or(NetworkMode::Mainnet);
+
+        let mut inputs: Vec<TxInput> = Vec::with_capacity(selected.len());
+        for u in &selected {
+            let wa = acc
+                .addresses
+                .iter()
+                .find(|a| a.address == u.address)
+                .ok_or(WalletError::AddressNotFound(u.address.clone()))?;
+            inputs.push(TxInput {
                 txid: u.txid.clone(),
                 index: u.index,
-                owner: addr.clone(),
+                owner: u.address.clone(),
                 signature: String::new(),
-                pub_key: String::new(),
+                pub_key: wa.public_key.clone(),
                 key_image: None,
                 ring_members: None,
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
                 shield_blinding: None,
-            })
-            .collect();
+            });
+        }
 
         let mut outputs = vec![TxOutput {
             address: "contract_deploy".into(), // placeholder — actual address computed by VM
@@ -1042,15 +1054,12 @@ impl Wallet {
             });
         }
 
-        let tx = Transaction {
-            hash: String::new(), // computed after signing
+        let mut tx = Transaction {
+            hash: String::new(),
             inputs,
             outputs,
             fee,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
+            timestamp: unix_now(),
             is_coinbase: false,
             tx_type: TxType::ContractCreate,
             payload_hash: None,
@@ -1061,8 +1070,18 @@ impl Wallet {
             vm_version: Some(1),
         };
 
-        // Sign (use existing signing logic from build_tx)
-        // For now, return unsigned — signing requires private key access
+        tx.hash = TxHash::hash_for_network(&tx, &net);
+        let signing_msg = TxHash::signing_message_for_network(&tx, &net);
+        for (i, u) in selected.iter().enumerate() {
+            let wa = acc
+                .addresses
+                .iter()
+                .find(|a| a.address == u.address)
+                .ok_or(WalletError::AddressNotFound(u.address.clone()))?;
+            let sk = derive_key(&seed, wa.account, wa.index, wa.is_change)?;
+            let sig: Signature = sk.sign(&signing_msg);
+            tx.inputs[i].signature = hex::encode(sig.to_bytes());
+        }
         Ok(tx)
     }
 
@@ -1092,22 +1111,34 @@ impl Wallet {
         let total_needed = value.saturating_add(fee);
         let (selected, total_in) = self.select_utxos(&acc, total_needed)?;
 
-        let inputs: Vec<TxInput> = selected
-            .iter()
-            .map(|u| TxInput {
+        let seed = self
+            .session_key
+            .as_ref()
+            .ok_or(WalletError::Other("No session key".to_string()))?
+            .clone();
+        let net: NetworkMode = self.network.parse().unwrap_or(NetworkMode::Mainnet);
+
+        let mut inputs: Vec<TxInput> = Vec::with_capacity(selected.len());
+        for u in &selected {
+            let wa = acc
+                .addresses
+                .iter()
+                .find(|a| a.address == u.address)
+                .ok_or(WalletError::AddressNotFound(u.address.clone()))?;
+            inputs.push(TxInput {
                 txid: u.txid.clone(),
                 index: u.index,
-                owner: addr.clone(),
+                owner: u.address.clone(),
                 signature: String::new(),
-                pub_key: String::new(),
+                pub_key: wa.public_key.clone(),
                 key_image: None,
                 ring_members: None,
                 ring_signature: None,
                 ring_commitments: None,
                 pseudo_commitment: None,
                 shield_blinding: None,
-            })
-            .collect();
+            });
+        }
 
         let mut outputs = vec![TxOutput {
             address: contract_addr.to_string(),
@@ -1132,15 +1163,12 @@ impl Wallet {
             });
         }
 
-        Ok(Transaction {
+        let mut tx = Transaction {
             hash: String::new(),
             inputs,
             outputs,
             fee,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
+            timestamp: unix_now(),
             is_coinbase: false,
             tx_type: TxType::ContractCall,
             payload_hash: None,
@@ -1149,7 +1177,21 @@ impl Wallet {
             calldata: Some(calldata),
             contract_address: Some(contract_addr.to_string()),
             vm_version: Some(1),
-        })
+        };
+
+        tx.hash = TxHash::hash_for_network(&tx, &net);
+        let signing_msg = TxHash::signing_message_for_network(&tx, &net);
+        for (i, u) in selected.iter().enumerate() {
+            let wa = acc
+                .addresses
+                .iter()
+                .find(|a| a.address == u.address)
+                .ok_or(WalletError::AddressNotFound(u.address.clone()))?;
+            let sk = derive_key(&seed, wa.account, wa.index, wa.is_change)?;
+            let sig: Signature = sk.sign(&signing_msg);
+            tx.inputs[i].signature = hex::encode(sig.to_bytes());
+        }
+        Ok(tx)
     }
 }
 
@@ -1955,6 +1997,48 @@ mod tests {
     /// ownership/signature check in TxValidator. Proves the shipped wallet can
     /// now actually move a coin (the old build_tx returned a placeholder
     /// "raw:{txid}" string that could never be broadcast).
+    #[test]
+    fn build_deploy_and_call_txs_are_signed() {
+        use crate::domain::transaction::tx_validator::TxValidator;
+        let mut w = Wallet::new("testnet");
+        w.restore_from_seed(vec![9u8; 64]).unwrap();
+        let from = w.address();
+        w.update_utxos(
+            &from,
+            vec![Walletutxo {
+                txid: "bb".repeat(32),
+                index: 0,
+                amount: 1_000_000,
+                address: from.clone(),
+                height: 1,
+                confirmations: 100,
+                is_coinbase: true,
+                is_locked: false,
+            }],
+        );
+        let net = NetworkMode::Testnet;
+
+        let dep = w.build_deploy_tx(0, vec![0x60, 0x00], 0, 100_000, 500).unwrap();
+        assert!(!dep.hash.is_empty(), "deploy tx must be hashed");
+        assert!(TxHash::verify_for_network(&dep, &net));
+        let msg = TxHash::signing_message_for_network(&dep, &net);
+        assert!(!dep.inputs.is_empty());
+        assert!(
+            TxValidator::verify_input_ownership_by_address(&dep.inputs[0], &from, &msg),
+            "deploy tx input must be validly signed by its owner"
+        );
+
+        let dest = format!("ST1{}", "22".repeat(20));
+        let call = w.build_call_tx(0, &dest, vec![0xde, 0xad], 0, 100_000, 500).unwrap();
+        assert!(!call.hash.is_empty(), "call tx must be hashed");
+        assert!(TxHash::verify_for_network(&call, &net));
+        let msg2 = TxHash::signing_message_for_network(&call, &net);
+        assert!(
+            TxValidator::verify_input_ownership_by_address(&call.inputs[0], &from, &msg2),
+            "call tx input must be validly signed by its owner"
+        );
+    }
+
     #[test]
     fn build_tx_produces_consensus_valid_transaction() {
         use crate::domain::transaction::transaction::Transaction;
