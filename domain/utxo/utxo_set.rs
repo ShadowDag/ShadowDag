@@ -39,9 +39,12 @@ pub const COINBASE_MATURITY: u64 =
 #[inline]
 pub fn utxo_key(tx_hash: &str, index: u32) -> Result<UtxoKey, StorageError> {
     UtxoKey::try_new(tx_hash, index).ok_or_else(|| {
+        // Char-boundary-safe preview: byte-slicing `tx_hash[..24]` panics when a
+        // multibyte codepoint straddles byte 24, and tx_hash is attacker-supplied.
+        let preview: String = tx_hash.chars().take(24).collect();
         StorageError::Other(format!(
             "invalid tx hash for UtxoKey (must be 64 hex chars, got '{}...')",
-            &tx_hash[..tx_hash.len().min(24)]
+            preview
         ))
     })
 }

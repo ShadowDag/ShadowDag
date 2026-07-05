@@ -5,7 +5,22 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::utxo::utxo_set::UtxoSet;
+    use crate::domain::utxo::utxo_set::{utxo_key, UtxoSet};
+
+    // Regression (B3-H01): a non-ASCII txid whose codepoint straddles the
+    // error-preview cut point (byte 24) must return Err, never panic. The old
+    // code sliced `&tx_hash[..24]` and panicked on such input, crashing the
+    // tx-validation / block-builder thread (remote DoS via a crafted tx).
+    #[test]
+    fn utxo_key_rejects_non_ascii_txid_without_panic() {
+        // 22 ASCII bytes + a 4-byte emoji → byte index 24 lands mid-codepoint.
+        let malicious = format!("{}\u{1F600}", "a".repeat(22));
+        assert_eq!(malicious.len(), 26); // bytes, not chars
+        assert!(
+            utxo_key(&malicious, 0).is_err(),
+            "a malformed non-ASCII txid must return Err, not panic"
+        );
+    }
 
     #[test]
     fn add_and_get_utxo() {
