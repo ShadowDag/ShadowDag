@@ -33,9 +33,9 @@ pub struct PowValidator;
 /// version so the label reflects the algorithm actually being mined.
 pub fn pow_algorithm_name(version: u32) -> &'static str {
     if version >= umbrahash::UMBRA_POW_VERSION {
-        "UmbraHash (memory-hard Ethash-style + mini-ProgPoW)"
+        "UmbraHash"
     } else {
-        "ShadowHash (SHA256+Blake3+SHA3-256+AntiASIC)"
+        "ShadowHash"
     }
 }
 

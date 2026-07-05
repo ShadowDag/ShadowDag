@@ -2618,7 +2618,7 @@ impl RpcServer {
                 // The node validates BOTH: legacy ShadowHash (v2) and the
                 // memory-hard UmbraHash (v3, opt-in via --pow=umbra). The active
                 // algorithm on-chain is the tip's — see getmininginfo/getpowinfo.
-                "pow_algorithm":     "ShadowHash (v2) / UmbraHash (v3, memory-hard Ethash-style + mini-ProgPoW)",
+                "pow_algorithm":     "UmbraHash",
                 "asic_resistant":    true,
                 "privacy":           ConsensusParams::PRIVACY_ENABLED,
                 "smart_contracts":   ConsensusParams::SMART_CONTRACTS_ENABLED,
@@ -2762,23 +2762,14 @@ impl RpcServer {
     }
 
     fn cmd_getpowinfo(id: Value) -> RpcResponse {
-        use crate::engine::mining::algorithms::shadowhash::SCRATCHPAD_SIZE;
         use crate::engine::mining::algorithms::umbrahash::{CACHE_BYTES, DATASET_BYTES};
         RpcResponse::ok(
             id,
             json!({
-                "algorithm":       "ShadowHash (v2) / UmbraHash (v3, opt-in)",
-                "shadowhash": {
-                    "pipeline":      ["SHA-256", "Memory-hard (64KB scratchpad)", "Anti-ASIC (16KB, 256 rounds)", "SHA3-256"],
-                    "scratchpad_kb": SCRATCHPAD_SIZE / 1024,
-                },
-                "umbrahash": {
-                    "type":          "Ethash-style memory-hard + mini-ProgPoW ALU layer",
-                    "dataset_mib":   DATASET_BYTES / (1024 * 1024),
-                    "cache_mib":     CACHE_BYTES / (1024 * 1024),
-                    "cheap_verify":  true,
-                    "note":          "GPU-first, ASIC-resistant; opt-in via --pow=umbra (header version 3)",
-                },
+                "algorithm":       "UmbraHash",
+                "dataset_mib":     DATASET_BYTES / (1024 * 1024),
+                "cache_mib":       CACHE_BYTES / (1024 * 1024),
+                "cheap_verify":    true,
                 "asic_resistant":  true,
                 "gpu_mining":      true,
                 "gpu_backends":    ["OpenCL", "Rayon (CPU multi-thread)"],

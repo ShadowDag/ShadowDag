@@ -322,7 +322,7 @@ fn print_info() {
     println!("GHOSTDAG K       : 180");
     println!("Max Parents      : 80");
     println!("Max Block Size   : 2 MB");
-    println!("Mining Algorithm : ShadowHash (v2) / UmbraHash (v3, memory-hard, opt-in --pow=umbra)");
+    println!("Mining Algorithm : UmbraHash");
     println!("Privacy          : CLSAG + Pedersen + Dandelion++ (native)");
     println!("Smart Contracts  : ShadowVM (U256 stack, 90+ opcodes, gas metering)");
 }
