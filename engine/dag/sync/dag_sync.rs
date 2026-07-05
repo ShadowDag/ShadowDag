@@ -174,16 +174,7 @@ impl DagSync {
         let c = self.counter.fetch_add(1, Ordering::SeqCst);
 
         if c.is_multiple_of(1000) && self.seen_cache.len() > CACHE_LIMIT {
-            let mut removed = 0;
-
-            for entry in self.seen_cache.iter() {
-                self.seen_cache.remove(entry.key());
-                removed += 1;
-
-                if removed >= CACHE_TRIM {
-                    break;
-                }
-            }
+            Self::trim_seen_cache(&self.seen_cache, CACHE_TRIM);
         }
 
         //////////////////////////////////////////////////////////////
@@ -261,6 +252,22 @@ impl DagSync {
         self.inflight.fetch_sub(1, Ordering::Release);
     }
 
+    /// Evict up to `max_evict` entries from `cache` in one safe pass.
+    ///
+    /// Uses `retain` rather than iterate-then-remove: a DashSet iterator holds a
+    /// shard read guard while `remove()` needs that same shard's write guard, so
+    /// removing inside the loop can self-deadlock and freeze block ingestion.
+    fn trim_seen_cache(cache: &DashSet<[u8; 32]>, max_evict: usize) {
+        let mut removed = 0usize;
+        cache.retain(|_| {
+            let keep = removed >= max_evict;
+            if !keep {
+                removed += 1;
+            }
+            keep
+        });
+    }
+
     //////////////////////////////////////////////////////////////
     /// REQUEST SYNC
     //////////////////////////////////////////////////////////////
@@ -294,5 +301,28 @@ impl DagSync {
             let hint = hex::encode(&key);
             slog_debug!("dag", "sync_seen_block", hash => &hint);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DagSync;
+    use dashmap::DashSet;
+
+    // Regression (B1-H03): the seen-cache trim must evict a bounded count without
+    // deadlocking. The old form iterated the DashSet while calling remove() inside
+    // the loop, holding a shard read guard across a write acquire on the same shard.
+    #[test]
+    fn trim_seen_cache_evicts_bounded_count_without_deadlock() {
+        let cache: DashSet<[u8; 32]> = DashSet::new();
+        for i in 0..3000u32 {
+            let mut k = [0u8; 32];
+            k[..4].copy_from_slice(&i.to_le_bytes());
+            cache.insert(k);
+        }
+        assert_eq!(cache.len(), 3000);
+
+        DagSync::trim_seen_cache(&cache, 2000);
+        assert_eq!(cache.len(), 1000, "trim must evict exactly max_evict entries");
     }
 }
