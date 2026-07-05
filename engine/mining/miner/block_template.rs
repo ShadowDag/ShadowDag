@@ -16,6 +16,7 @@ use crate::domain::transaction::tx_validator::TxValidator;
 use crate::domain::utxo::utxo_key::UtxoKey;
 use crate::domain::utxo::utxo_set::{utxo_key, UtxoSet};
 use crate::engine::dag::core::dag_manager::DagManager;
+use crate::engine::mining::miner::fair_ordering::FairOrdering;
 use crate::engine::dag::security::dos_protection::{MAX_BLOCK_TX_COUNT, MAX_DAG_PARENTS};
 use crate::engine::dag::tips::tip_manager::TipManager;
 use crate::errors::ConsensusError;
@@ -291,10 +292,25 @@ impl BlockTemplateBuilder {
     }
 
     fn select_valid_transactions(
-        candidates: Vec<Transaction>,
+        mut candidates: Vec<Transaction>,
         utxo_set: &UtxoSet,
         network: &NetworkMode,
     ) -> BlockTemplate {
+        // MEV-resistant fair ordering: deterministic effective-fee (fee + mempool
+        // age bonus) descending with a hash tiebreaker, applied before the
+        // topological (dependency) sort so independent txs follow the fair order.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let ranking = FairOrdering::order_for_block(&candidates, now);
+        let rank: HashMap<&str, usize> = ranking
+            .iter()
+            .enumerate()
+            .map(|(i, o)| (o.tx_hash.as_str(), i))
+            .collect();
+        candidates.sort_by_key(|tx| rank.get(tx.hash.as_str()).copied().unwrap_or(usize::MAX));
+
         let mut staged_utxos: HashMap<UtxoKey, (String, u64)> = HashMap::new();
 
         let mut spent_in_block: HashSet<UtxoKey> = HashSet::new();
