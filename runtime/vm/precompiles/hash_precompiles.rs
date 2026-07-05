@@ -23,34 +23,20 @@ pub fn sha256_precompile(input: &[u8], _gas_limit: u64) -> PrecompileResult {
     PrecompileResult::ok(result.to_vec(), gas_used)
 }
 
-/// 0x03: RIPEMD-160 emulation via SHA-256 truncation.
-///
-/// **WARNING: This is NOT real RIPEMD-160.** It uses SHA-256 (domain-separated
-/// with `"RIPEMD160_SHADOW"`) truncated to 20 bytes. Contracts expecting
-/// actual RIPEMD-160 output will get wrong results -- the two hash functions
-/// produce completely different digests for the same input.
-///
-/// The output format matches EVM conventions (12 zero bytes + 20-byte hash)
-/// but the underlying hash function differs. Retained at address 0x03 for
-/// EVM precompile slot compatibility.
-///
-/// # TODO
-/// Replace with a real RIPEMD-160 implementation (e.g. the `ripemd` crate)
-/// so that Bitcoin-style address derivation and Ethereum RIPEMD-160 contracts
-/// produce correct results.
+/// 0x03: RIPEMD-160, EVM-compatible. Real RIPEMD-160 over the input; the
+/// 20-byte digest is left-padded to 32 bytes per EVM convention.
 pub fn ripemd160_precompile(input: &[u8], _gas_limit: u64) -> PrecompileResult {
+    use ripemd::{Digest as RipemdDigest, Ripemd160};
     let words = (input.len() as u64).div_ceil(32);
     let gas_used = 600u64.saturating_add(words.saturating_mul(120));
 
-    // RIPEMD-160 produces 20 bytes, padded to 32 bytes (left-padded with zeros)
-    let mut hasher = <Sha256 as Sha2Digest>::new();
-    Sha2Digest::update(&mut hasher, b"RIPEMD160_SHADOW");
-    Sha2Digest::update(&mut hasher, input);
-    let hash = Sha2Digest::finalize(hasher);
+    let mut hasher = Ripemd160::new();
+    RipemdDigest::update(&mut hasher, input);
+    let hash = hasher.finalize();
 
-    // Return 32 bytes: 12 zero bytes + 20 bytes of hash
+    // EVM convention: the 20-byte digest left-padded to 32 bytes.
     let mut output = vec![0u8; 12];
-    output.extend_from_slice(&hash[..20]);
+    output.extend_from_slice(&hash);
 
     PrecompileResult::ok(output, gas_used)
 }
@@ -138,6 +124,21 @@ mod tests {
         assert_eq!(r.output.len(), 32);
         // First 12 bytes should be zero
         assert!(r.output[..12].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn ripemd160_known_answer_vectors() {
+        // Real RIPEMD-160 KATs, left-padded to 32 bytes per EVM convention.
+        let empty = ripemd160_precompile(b"", 100_000);
+        assert_eq!(
+            hex::encode(&empty.output[12..32]),
+            "9c1185a5c5e9fc54612808977ee8f548b2258d31"
+        );
+        let abc = ripemd160_precompile(b"abc", 100_000);
+        assert_eq!(
+            hex::encode(&abc.output[12..32]),
+            "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc"
+        );
     }
 
     #[test]

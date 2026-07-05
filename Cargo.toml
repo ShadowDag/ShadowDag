@@ -109,10 +109,14 @@ pqcrypto-traits    = "0.3"
 # ─── Hashing ──────────────────────────────────────────────────────────────────
 sha2               = "0.10"
 sha3               = "0.10"
+ripemd             = "0.1"
 blake2             = "0.10"
 blake2b_simd       = "1"
 blake3             = "1"
 digest             = "0.10"
+
+# ─── secp256k1 (EVM ecrecover precompile) ─────────────────────────────────────
+k256               = { version = "0.13", features = ["ecdsa"] }
 
 # ─── Parallelism ──────────────────────────────────────────────────────────────
 rayon              = "1"
