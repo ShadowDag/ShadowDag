@@ -94,6 +94,7 @@ pub fn gpu_hashimoto(
     dataset: &[u8],
     header_hash: &[u8; 32],
     nonces: &[u64],
+    prog_seed: u64,
 ) -> Result<Vec<u8>, String> {
     let (platform, device) = pick_device()?;
     let (program, queue) = build(device, platform)?;
@@ -132,6 +133,7 @@ pub fn gpu_hashimoto(
         .arg(n)
         .arg(&hh_buf)
         .arg(&nonce_buf)
+        .arg(prog_seed)
         .arg(&out_buf)
         .build()
         .map_err(|e| e.to_string())?;
@@ -239,6 +241,7 @@ impl UmbraGpuMiner {
         &self,
         header_hash: &[u8; 32],
         target: &[u8; 32],
+        prog_seed: u64,
         base_nonce: u64,
     ) -> Result<Option<u64>, String> {
         let hh_buf = Buffer::<u8>::builder()
@@ -274,6 +277,7 @@ impl UmbraGpuMiner {
             .arg(self.n)
             .arg(&hh_buf)
             .arg(base_nonce)
+            .arg(prog_seed)
             .arg(&tgt_buf)
             .arg(&res_buf)
             .arg(&win_buf)
@@ -346,18 +350,19 @@ mod tests {
         let mut target = [0xffu8; 32];
         target[0] = 0x00; // ~1/256
 
+        let ps = 3u64;
         let mut found = None;
         for round in 0..16u64 {
-            if let Some(n) = miner.mine(&header, &target, round * 4096).expect("mine") {
+            if let Some(n) = miner.mine(&header, &target, ps, round * 4096).expect("mine") {
                 found = Some(n);
                 break;
             }
         }
         let nonce = found.expect("a 1/256 target should yield a nonce within 64k");
         // CPU cross-check: the GPU-found nonce must pass node light-verify.
-        let (mix, _result) = umbrahash::hashimoto_light(&cache, DS, &header, nonce);
+        let (mix, _result) = umbrahash::hashimoto_light(&cache, DS, &header, nonce, ps);
         assert!(
-            umbrahash::verify_light(&cache, DS, &header, nonce, &mix, &target),
+            umbrahash::verify_light(&cache, DS, &header, nonce, ps, &mix, &target),
             "GPU-found nonce must pass CPU light-verify"
         );
     }
@@ -373,7 +378,8 @@ mod tests {
             h.finalize().into()
         };
         let nonces: Vec<u64> = vec![1, 2, 42, 12_345, 0xdead_beef, u64::MAX];
-        let gpu = match gpu_hashimoto(&dataset, &hh, &nonces) {
+        let ps = 5u64;
+        let gpu = match gpu_hashimoto(&dataset, &hh, &nonces, ps) {
             Ok(g) => g,
             Err(e) => {
                 eprintln!("skipping GPU test (no device): {}", e);
@@ -381,7 +387,7 @@ mod tests {
             }
         };
         for (k, &nonce) in nonces.iter().enumerate() {
-            let (cmix, cres) = umbrahash::hashimoto_full(&dataset, &hh, nonce);
+            let (cmix, cres) = umbrahash::hashimoto_full(&dataset, &hh, nonce, ps);
             assert_eq!(&gpu[k * 64..k * 64 + 32], &cmix[..], "mix_hash mismatch nonce {}", nonce);
             assert_eq!(&gpu[k * 64 + 32..k * 64 + 64], &cres[..], "result mismatch nonce {}", nonce);
         }

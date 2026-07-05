@@ -395,20 +395,25 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
             );
             let target = PowValidator::difficulty_to_target_bytes(difficulty);
             let cache = umbrahash::cache_for_epoch(umbrahash::epoch_of(height));
+            let prog_seed = umbrahash::prog_seed_from_height(height);
             #[cfg(feature = "gpu-opencl")]
             {
                 if let Some(g) = umbra_gpu.as_mut() {
                     umbra_mine_gpu(
-                        g, &cache, umbrahash::epoch_of(height), &hh, &target, &found, &hash_count,
-                        &start, height,
+                        g, &cache, umbrahash::epoch_of(height), &hh, &target, prog_seed, &found,
+                        &hash_count, &start, height,
                     )
                 } else {
-                    umbra_mine_cpu(&cache, &hh, &target, threads, &found, &hash_count, &start, height)
+                    umbra_mine_cpu(
+                        &cache, &hh, &target, prog_seed, threads, &found, &hash_count, &start, height,
+                    )
                 }
             }
             #[cfg(not(feature = "gpu-opencl"))]
             {
-                umbra_mine_cpu(&cache, &hh, &target, threads, &found, &hash_count, &start, height)
+                umbra_mine_cpu(
+                    &cache, &hh, &target, prog_seed, threads, &found, &hash_count, &start, height,
+                )
             }
         } else {
             None
@@ -1149,6 +1154,7 @@ fn umbra_mine_gpu(
     epoch: u64,
     header_hash: &[u8; 32],
     target: &[u8; 32],
+    prog_seed: u64,
     found: &Arc<AtomicBool>,
     hash_count: &Arc<AtomicU64>,
     start: &Instant,
@@ -1165,13 +1171,18 @@ fn umbra_mine_gpu(
         if found.load(Ordering::Relaxed) {
             return None;
         }
-        match g.mine(header_hash, target, base) {
+        match g.mine(header_hash, target, prog_seed, base) {
             Ok(Some(nonce)) => {
                 // Authoritative CPU re-check (consensus path) + header fields.
-                let (mix, result) =
-                    umbrahash::hashimoto_light(cache, umbrahash::DATASET_BYTES, header_hash, nonce);
+                let (mix, result) = umbrahash::hashimoto_light(
+                    cache,
+                    umbrahash::DATASET_BYTES,
+                    header_hash,
+                    nonce,
+                    prog_seed,
+                );
                 if umbrahash::verify_light(
-                    cache, umbrahash::DATASET_BYTES, header_hash, nonce, &mix, target,
+                    cache, umbrahash::DATASET_BYTES, header_hash, nonce, prog_seed, &mix, target,
                 ) {
                     found.store(true, Ordering::Relaxed);
                     return Some((nonce, hex::encode(result), hex::encode(mix)));
@@ -1209,6 +1220,7 @@ fn umbra_mine_cpu(
     cache: &[u8],
     header_hash: &[u8; 32],
     target: &[u8; 32],
+    prog_seed: u64,
     threads: usize,
     found: &Arc<AtomicBool>,
     hash_count: &Arc<AtomicU64>,
@@ -1230,8 +1242,13 @@ fn umbra_mine_cpu(
             if found.load(Ordering::Relaxed) {
                 return None;
             }
-            let (mix, result) =
-                umbrahash::hashimoto_light(cache, umbrahash::DATASET_BYTES, header_hash, nonce);
+            let (mix, result) = umbrahash::hashimoto_light(
+                cache,
+                umbrahash::DATASET_BYTES,
+                header_hash,
+                nonce,
+                prog_seed,
+            );
             hash_count.fetch_add(1, Ordering::Relaxed);
             // result <= target (big-endian) → valid solution.
             if result <= *target {

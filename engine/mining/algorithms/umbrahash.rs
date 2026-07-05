@@ -136,17 +136,115 @@ pub fn generate_dataset(cache: &[u8], full_size: usize) -> Vec<u8> {
     out
 }
 
+// ─────────────────── mini-ProgPoW (ASIC-resistance ALU layer) ───────────────────
+// Forces GPU-friendly 32-bit ALU work into the hashimoto loop. An ASIC would have
+// to embed a general ALU (mul_hi/rotate/popcount/clz/…) to compute these — i.e.
+// become a GPU — which removes its economic edge. The op SEQUENCE (the "program")
+// is fixed per period (prog_seed = height / PROGPOW_PERIOD) so a GPU can optimize
+// within a period but an ASIC cannot hard-wire it. Adds NO memory (compute only),
+// so light-verify == full-mine still holds. All ops are byte-exact CPU<->GPU.
+
+/// Blocks per "program" period. The random-math sequence changes every period.
+pub const PROGPOW_PERIOD: u64 = 10;
+/// Random-math ops per hashimoto access iteration (64 iters * this = total).
+pub const PROGPOW_CNT_MATH: usize = 8;
+const FNV_OFFSET: u32 = 0x811c_9dc5;
+
+/// The program seed for a block height (stable within a PROGPOW_PERIOD window).
+pub fn prog_seed_from_height(height: u64) -> u64 {
+    height / PROGPOW_PERIOD
+}
+
+#[inline]
+fn fnv1a(h: u32, d: u32) -> u32 {
+    (h ^ d).wrapping_mul(FNV_PRIME)
+}
+// rotate_left(n) rotates by n % 32 — identical to the GPU kernel's `n & 31`
+// handling, so these stay byte-exact CPU<->GPU.
+#[inline]
+fn rotl32(a: u32, n: u32) -> u32 {
+    a.rotate_left(n)
+}
+#[inline]
+fn rotr32(a: u32, n: u32) -> u32 {
+    a.rotate_right(n)
+}
+#[inline]
+fn mul_hi(a: u32, b: u32) -> u32 {
+    ((a as u64 * b as u64) >> 32) as u32
+}
+
+/// KISS99 PRNG (ProgPoW's), seeded deterministically from the program seed.
+struct Kiss99 {
+    z: u32,
+    w: u32,
+    jsr: u32,
+    jcong: u32,
+}
+impl Kiss99 {
+    fn seed(prog_seed: u64) -> Self {
+        let lo = prog_seed as u32;
+        let hi = (prog_seed >> 32) as u32;
+        let z = fnv1a(FNV_OFFSET, lo);
+        let w = fnv1a(z, hi);
+        let jsr = fnv1a(w, lo);
+        let jcong = fnv1a(jsr, hi);
+        Kiss99 { z, w, jsr, jcong }
+    }
+    fn next(&mut self) -> u32 {
+        self.z = 36969u32.wrapping_mul(self.z & 0xffff).wrapping_add(self.z >> 16);
+        self.w = 18000u32.wrapping_mul(self.w & 0xffff).wrapping_add(self.w >> 16);
+        let mwc = (self.z << 16).wrapping_add(self.w);
+        self.jsr ^= self.jsr << 17;
+        self.jsr ^= self.jsr >> 13;
+        self.jsr ^= self.jsr << 5;
+        self.jcong = 69069u32.wrapping_mul(self.jcong).wrapping_add(1_234_567);
+        (mwc ^ self.jcong).wrapping_add(self.jsr)
+    }
+}
+
+/// ProgPoW random-math: one of 11 GPU-friendly ALU ops selected by `sel`.
+fn prog_math(a: u32, b: u32, sel: u32) -> u32 {
+    match sel % 11 {
+        0 => a.wrapping_add(b),
+        1 => a.wrapping_mul(b),
+        2 => mul_hi(a, b),
+        3 => a.min(b),
+        4 => rotl32(a, b),
+        5 => rotr32(a, b),
+        6 => a & b,
+        7 => a | b,
+        8 => a ^ b,
+        9 => a.leading_zeros().wrapping_add(b.leading_zeros()),
+        _ => a.count_ones().wrapping_add(b.count_ones()),
+    }
+}
+/// ProgPoW merge: fold `b` into `a` by one of 4 selectors.
+fn prog_merge(a: u32, b: u32, sel: u32) -> u32 {
+    match sel % 4 {
+        0 => a.wrapping_mul(33).wrapping_add(b),
+        1 => (a ^ b).wrapping_mul(33),
+        2 => rotl32(a, (sel >> 16) & 31) ^ b,
+        _ => rotr32(a, (sel >> 16) & 31) ^ b,
+    }
+}
+
 /// Core hashimoto: returns (mix_hash, result). `lookup(index)` fetches a 64-byte
 /// dataset item — from VRAM when mining, regenerated from cache when verifying.
+/// `prog_seed` selects the per-period mini-ProgPoW math program.
 fn hashimoto<F: FnMut(u32) -> [u8; 64]>(
     header_hash: &[u8; 32],
     nonce: u64,
     full_size: usize,
+    prog_seed: u64,
     mut lookup: F,
 ) -> ([u8; 32], [u8; 32]) {
     let n = (full_size / HASH_BYTES) as u32;
     let w = MIX_BYTES / WORD_BYTES; // 32 words
     let mixhashes = (MIX_BYTES / HASH_BYTES) as u32; // 2
+    // mini-ProgPoW program PRNG — seeded once, advanced through all iterations so
+    // the op sequence is a deterministic function of prog_seed (same per period).
+    let mut rng = Kiss99::seed(prog_seed);
 
     let mut seed_in = [0u8; 40];
     seed_in[0..32].copy_from_slice(header_hash);
@@ -168,6 +266,19 @@ fn hashimoto<F: FnMut(u32) -> [u8; 64]>(
         for word in 0..w {
             let f = fnv(u32le(&mix, word), u32le(&newdata, word));
             put_u32le(&mut mix, word, f);
+        }
+        // mini-ProgPoW: PROGPOW_CNT_MATH random-math ops on the mix lanes. Draw
+        // order (src1, src2, dst, sel_math, sel_merge) MUST match the GPU kernel.
+        let wu = w as u32;
+        for _ in 0..PROGPOW_CNT_MATH {
+            let src1 = (rng.next() % wu) as usize;
+            let src2 = (rng.next() % wu) as usize;
+            let dst = (rng.next() % wu) as usize;
+            let sel_math = rng.next();
+            let sel_merge = rng.next();
+            let res = prog_math(u32le(&mix, src1), u32le(&mix, src2), sel_math);
+            let merged = prog_merge(u32le(&mix, dst), res, sel_merge);
+            put_u32le(&mut mix, dst, merged);
         }
     }
 
@@ -194,13 +305,21 @@ pub fn hashimoto_light(
     full_size: usize,
     header_hash: &[u8; 32],
     nonce: u64,
+    prog_seed: u64,
 ) -> ([u8; 32], [u8; 32]) {
-    hashimoto(header_hash, nonce, full_size, |idx| calc_dataset_item(cache, idx))
+    hashimoto(header_hash, nonce, full_size, prog_seed, |idx| {
+        calc_dataset_item(cache, idx)
+    })
 }
 
 /// Mining path: read items from the resident full dataset.
-pub fn hashimoto_full(dataset: &[u8], header_hash: &[u8; 32], nonce: u64) -> ([u8; 32], [u8; 32]) {
-    hashimoto(header_hash, nonce, dataset.len(), |idx| {
+pub fn hashimoto_full(
+    dataset: &[u8],
+    header_hash: &[u8; 32],
+    nonce: u64,
+    prog_seed: u64,
+) -> ([u8; 32], [u8; 32]) {
+    hashimoto(header_hash, nonce, dataset.len(), prog_seed, |idx| {
         let off = idx as usize * HASH_BYTES;
         let mut item = [0u8; 64];
         item.copy_from_slice(&dataset[off..off + 64]);
@@ -291,15 +410,17 @@ fn le_or_eq_be(a: &[u8; 32], b: &[u8; 32]) -> bool {
 /// `[start, start+count)` and returns the first `(nonce, mix_hash, result)`
 /// whose `result <= target`. The miner sets header.nonce=nonce,
 /// header.mix_hash=hex(mix), header.hash=hex(result).
+#[allow(clippy::too_many_arguments)]
 pub fn mine_full(
     dataset: &[u8],
     header_hash: &[u8; 32],
     target: &[u8; 32],
+    prog_seed: u64,
     start: u64,
     count: u64,
 ) -> Option<(u64, [u8; 32], [u8; 32])> {
     for nonce in start..start.saturating_add(count) {
-        let (mix, result) = hashimoto_full(dataset, header_hash, nonce);
+        let (mix, result) = hashimoto_full(dataset, header_hash, nonce, prog_seed);
         if le_or_eq_be(&result, target) {
             return Some((nonce, mix, result));
         }
@@ -309,16 +430,18 @@ pub fn mine_full(
 
 /// Cache-only miner (no 1 GiB dataset): regenerates the touched items per nonce.
 /// Slow — for tests, genesis, and very-low-power fallback only.
+#[allow(clippy::too_many_arguments)]
 pub fn mine_light(
     cache: &[u8],
     full_size: usize,
     header_hash: &[u8; 32],
     target: &[u8; 32],
+    prog_seed: u64,
     start: u64,
     count: u64,
 ) -> Option<(u64, [u8; 32], [u8; 32])> {
     for nonce in start..start.saturating_add(count) {
-        let (mix, result) = hashimoto_light(cache, full_size, header_hash, nonce);
+        let (mix, result) = hashimoto_light(cache, full_size, header_hash, nonce, prog_seed);
         if le_or_eq_be(&result, target) {
             return Some((nonce, mix, result));
         }
@@ -330,15 +453,17 @@ pub fn mine_light(
 /// result)` from the epoch cache (cheap — no dataset needed) and requires the
 /// block's committed `mix_hash` to match AND `result <= target` (big-endian).
 /// This is exactly what every node runs per block.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_light(
     cache: &[u8],
     full_size: usize,
     header_hash: &[u8; 32],
     nonce: u64,
+    prog_seed: u64,
     mix_hash: &[u8; 32],
     target: &[u8; 32],
 ) -> bool {
-    let (mix, result) = hashimoto_light(cache, full_size, header_hash, nonce);
+    let (mix, result) = hashimoto_light(cache, full_size, header_hash, nonce, prog_seed);
     &mix == mix_hash && le_or_eq_be(&result, target)
 }
 
@@ -349,6 +474,8 @@ mod tests {
     // Small params for fast tests. full_size must be a multiple of MIX_BYTES(128).
     const CACHE_SIZE: usize = 64 * 128; // 128 items
     const FULL_SIZE: usize = 64 * 512; // 512 items (even → mixhashes ok)
+
+    const PS: u64 = 3; // a fixed mini-ProgPoW program seed for tests
 
     fn hh(nonce: u64) -> [u8; 32] {
         sha3_256_bytes(&nonce.to_le_bytes())
@@ -362,8 +489,8 @@ mod tests {
         let dataset = generate_dataset(&cache, FULL_SIZE);
         for &nonce in &[1u64, 42, 12_345, 0xdead_beef, u64::MAX] {
             let h = hh(nonce);
-            let light = hashimoto_light(&cache, FULL_SIZE, &h, nonce);
-            let full = hashimoto_full(&dataset, &h, nonce);
+            let light = hashimoto_light(&cache, FULL_SIZE, &h, nonce, PS);
+            let full = hashimoto_full(&dataset, &h, nonce, PS);
             assert_eq!(light, full, "light != full for nonce {}", nonce);
         }
     }
@@ -375,8 +502,8 @@ mod tests {
         assert_eq!(c1, c2, "cache generation must be deterministic");
         let h = hh(7);
         assert_eq!(
-            hashimoto_light(&c1, FULL_SIZE, &h, 7),
-            hashimoto_light(&c2, FULL_SIZE, &h, 7)
+            hashimoto_light(&c1, FULL_SIZE, &h, 7, PS),
+            hashimoto_light(&c2, FULL_SIZE, &h, 7, PS)
         );
     }
 
@@ -396,8 +523,8 @@ mod tests {
     #[test]
     fn nonce_avalanche() {
         let cache = mkcache(CACHE_SIZE, &epoch_seed(0));
-        let r1 = hashimoto_light(&cache, FULL_SIZE, &hh(1), 1).1;
-        let r2 = hashimoto_light(&cache, FULL_SIZE, &hh(1), 2).1;
+        let r1 = hashimoto_light(&cache, FULL_SIZE, &hh(1), 1, PS).1;
+        let r2 = hashimoto_light(&cache, FULL_SIZE, &hh(1), 2, PS).1;
         assert_ne!(r1, r2, "adjacent nonces must give different results");
     }
 
@@ -414,17 +541,17 @@ mod tests {
         let dataset = generate_dataset(&cache, FULL_SIZE);
         let header = hh(5);
         let nonce = 9_999u64;
-        let (mix, result) = hashimoto_full(&dataset, &header, nonce);
+        let (mix, result) = hashimoto_full(&dataset, &header, nonce, PS);
 
         // target == result → result <= target holds → accept (with the real mix).
         assert!(
-            verify_light(&cache, FULL_SIZE, &header, nonce, &mix, &result),
+            verify_light(&cache, FULL_SIZE, &header, nonce, PS, &mix, &result),
             "a valid solution must verify"
         );
         // Wrong mix_hash → reject.
         let mut bad_mix = mix;
         bad_mix[0] ^= 0xff;
-        assert!(!verify_light(&cache, FULL_SIZE, &header, nonce, &bad_mix, &result));
+        assert!(!verify_light(&cache, FULL_SIZE, &header, nonce, PS, &bad_mix, &result));
         // Target one below the result (big-endian) → result > target → reject.
         let mut strict = result;
         for b in strict.iter_mut().rev() {
@@ -435,7 +562,7 @@ mod tests {
                 *b = 0xff;
             }
         }
-        assert!(!verify_light(&cache, FULL_SIZE, &header, nonce, &mix, &strict));
+        assert!(!verify_light(&cache, FULL_SIZE, &header, nonce, PS, &mix, &strict));
     }
 
     #[test]
@@ -450,10 +577,10 @@ mod tests {
         target[0] = 0x00; // ~1/256
 
         let (nonce, mix, result) =
-            mine_full(&dataset, &header, &target, 0, 100_000).expect("should find a nonce");
+            mine_full(&dataset, &header, &target, PS, 0, 100_000).expect("should find a nonce");
         assert!(le_or_eq_be(&result, &target), "mined result must meet target");
         assert!(
-            verify_light(&cache, FULL_SIZE, &header, nonce, &mix, &target),
+            verify_light(&cache, FULL_SIZE, &header, nonce, PS, &mix, &target),
             "node light-verify must accept the mined (nonce, mix)"
         );
     }

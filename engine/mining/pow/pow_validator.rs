@@ -112,7 +112,13 @@ impl PowValidator {
             h.version, h.height, h.timestamp, h.extra_nonce, h.difficulty, &h.merkle_root, &h.parents,
         );
         let cache = umbrahash::cache_for_epoch(umbrahash::epoch_of(h.height));
-        let (mix, result) = umbrahash::hashimoto_light(&cache, umbrahash::DATASET_BYTES, &hh, h.nonce);
+        let (mix, result) = umbrahash::hashimoto_light(
+            &cache,
+            umbrahash::DATASET_BYTES,
+            &hh,
+            h.nonce,
+            umbrahash::prog_seed_from_height(h.height),
+        );
         let result_hex = hex::encode(result);
         if result_hex != h.hash {
             return Err("umbra: identity hash != hashimoto result".to_string());
@@ -138,8 +144,13 @@ impl PowValidator {
                 header.difficulty, &header.merkle_root, &header.parents,
             );
             let cache = umbrahash::cache_for_epoch(umbrahash::epoch_of(header.height));
-            let (_mix, result) =
-                umbrahash::hashimoto_light(&cache, umbrahash::DATASET_BYTES, &hh, header.nonce);
+            let (_mix, result) = umbrahash::hashimoto_light(
+                &cache,
+                umbrahash::DATASET_BYTES,
+                &hh,
+                header.nonce,
+                umbrahash::prog_seed_from_height(header.height),
+            );
             hex::encode(result)
         } else {
             use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
@@ -419,8 +430,13 @@ mod tests {
             header.difficulty, &header.merkle_root, &header.parents,
         );
         let cache = umbrahash::cache_for_epoch(umbrahash::epoch_of(header.height));
-        let (mix, result) =
-            umbrahash::hashimoto_light(&cache, umbrahash::DATASET_BYTES, &hh, header.nonce);
+        let (mix, result) = umbrahash::hashimoto_light(
+            &cache,
+            umbrahash::DATASET_BYTES,
+            &hh,
+            header.nonce,
+            umbrahash::prog_seed_from_height(header.height),
+        );
         header.hash = hex::encode(result);
         header.mix_hash = hex::encode(mix);
 

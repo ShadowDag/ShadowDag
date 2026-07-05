@@ -80,9 +80,56 @@ __kernel void umbra_calc_items(__global const uchar* cache, uint n, uint base, _
     for (uint k=0;k<64;k++) out[off+k]=item[k];
 }
 
+// ───────── mini-ProgPoW (byte-exact with the CPU umbrahash.rs) ─────────
+inline uint fnv1a(uint h, uint d){ return (h ^ d) * 0x01000193u; }
+inline uint rotl32(uint a, uint n){ n &= 31u; return n==0u ? a : ((a << n) | (a >> (32u-n))); }
+inline uint rotr32(uint a, uint n){ n &= 31u; return n==0u ? a : ((a >> n) | (a << (32u-n))); }
+
+typedef struct { uint z, w, jsr, jcong; } kiss99_t;
+kiss99_t kiss99_seed(ulong prog_seed){
+    uint lo=(uint)prog_seed, hi=(uint)(prog_seed>>32);
+    kiss99_t st;
+    st.z = fnv1a(0x811c9dc5u, lo);
+    st.w = fnv1a(st.z, hi);
+    st.jsr = fnv1a(st.w, lo);
+    st.jcong = fnv1a(st.jsr, hi);
+    return st;
+}
+uint kiss99_next(__private kiss99_t* st){
+    st->z = 36969u*(st->z & 0xffffu) + (st->z >> 16);
+    st->w = 18000u*(st->w & 0xffffu) + (st->w >> 16);
+    uint mwc = (st->z << 16) + st->w;
+    st->jsr ^= st->jsr << 17; st->jsr ^= st->jsr >> 13; st->jsr ^= st->jsr << 5;
+    st->jcong = 69069u*st->jcong + 1234567u;
+    return (mwc ^ st->jcong) + st->jsr;
+}
+uint prog_math(uint a, uint b, uint sel){
+    switch(sel % 11u){
+        case 0: return a + b;
+        case 1: return a * b;
+        case 2: return mul_hi(a, b);
+        case 3: return min(a, b);
+        case 4: return rotl32(a, b);
+        case 5: return rotr32(a, b);
+        case 6: return a & b;
+        case 7: return a | b;
+        case 8: return a ^ b;
+        case 9: return clz(a) + clz(b);
+        default: return popcount(a) + popcount(b);
+    }
+}
+uint prog_merge(uint a, uint b, uint sel){
+    switch(sel % 4u){
+        case 0: return a*33u + b;
+        case 1: return (a ^ b)*33u;
+        case 2: return rotl32(a, (sel>>16)&31u) ^ b;
+        default: return rotr32(a, (sel>>16)&31u) ^ b;
+    }
+}
+
 // hashimoto over a resident dataset (n items). Returns mix_hash(32) + result(32).
 void hashimoto_full_dev(__global const uchar* dataset, uint n,
-                        __private const uchar* header_hash, ulong nonce,
+                        __private const uchar* header_hash, ulong nonce, ulong prog_seed,
                         __private uchar* mix_out, __private uchar* result_out) {
     uchar seed_in[40];
     for (uint k=0;k<32;k++) seed_in[k]=header_hash[k];
@@ -94,6 +141,7 @@ void hashimoto_full_dev(__global const uchar* dataset, uint n,
     for (uint k=0;k<64;k++){ mix[k]=s[k]; mix[64+k]=s[k]; }
     uint s0 = u32le_p(s, 0);
     uint w = 32u, mixhashes = 2u;
+    kiss99_t rng = kiss99_seed(prog_seed);
 
     for (uint i=0;i<64u;i++){
         uint p = (fnv(i ^ s0, u32le_p(mix, i % w)) % (n / mixhashes)) * mixhashes;
@@ -102,6 +150,17 @@ void hashimoto_full_dev(__global const uchar* dataset, uint n,
         for (uint word=0; word<w; word++){
             uint f = fnv(u32le_p(mix, word), u32le_p(newdata, word));
             put_u32le_p(mix, word, f);
+        }
+        // mini-ProgPoW: 8 random-math ops (draw order matches the CPU exactly).
+        for (uint m=0; m<8u; m++){
+            uint src1 = kiss99_next(&rng) % w;
+            uint src2 = kiss99_next(&rng) % w;
+            uint dst  = kiss99_next(&rng) % w;
+            uint selm = kiss99_next(&rng);
+            uint selg = kiss99_next(&rng);
+            uint res = prog_math(u32le_p(mix, src1), u32le_p(mix, src2), selm);
+            uint merged = prog_merge(u32le_p(mix, dst), res, selg);
+            put_u32le_p(mix, dst, merged);
         }
     }
     for (uint i=0;i<8u;i++){
@@ -117,11 +176,11 @@ void hashimoto_full_dev(__global const uchar* dataset, uint n,
 // Validation kernel: one (mix_hash,result) per input nonce.
 __kernel void umbra_hashimoto(__global const uchar* dataset, uint n,
                               __global const uchar* header_hash,
-                              __global const ulong* nonces, __global uchar* out) {
+                              __global const ulong* nonces, ulong prog_seed, __global uchar* out) {
     uint gid = get_global_id(0);
     uchar hh[32]; for (uint k=0;k<32;k++) hh[k]=header_hash[k];
     uchar mix[32], res[32];
-    hashimoto_full_dev(dataset, n, hh, nonces[gid], mix, res);
+    hashimoto_full_dev(dataset, n, hh, nonces[gid], prog_seed, mix, res);
     for (uint k=0;k<32;k++){ out[gid*64u+k]=mix[k]; out[gid*64u+32+k]=res[k]; }
 }
 
@@ -129,14 +188,14 @@ __kernel void umbra_hashimoto(__global const uchar* dataset, uint n,
 // target (big-endian). result[0]=count, [1]=nonce_lo, [2]=nonce_hi; winner's
 // 32-byte mix_hash written to win_mix.
 __kernel void umbra_mine(__global const uchar* dataset, uint n,
-                         __global const uchar* header_hash, ulong base_nonce,
+                         __global const uchar* header_hash, ulong base_nonce, ulong prog_seed,
                          __global const uchar* target,
                          __global uint* result, __global uchar* win_mix) {
     uint gid = get_global_id(0);
     ulong nonce = base_nonce + (ulong)gid;
     uchar hh[32]; for (uint k=0;k<32;k++) hh[k]=header_hash[k];
     uchar mix[32], res[32];
-    hashimoto_full_dev(dataset, n, hh, nonce, mix, res);
+    hashimoto_full_dev(dataset, n, hh, nonce, prog_seed, mix, res);
     bool meets = true;
     for (uint i=0;i<32u;i++){ if(res[i]<target[i]){meets=true;break;} if(res[i]>target[i]){meets=false;break;} }
     if (meets){
