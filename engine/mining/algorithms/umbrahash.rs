@@ -354,6 +354,28 @@ pub const CACHE_BYTES: usize = 16 << 20; // 16 MiB
 /// This version-gates the hard fork so pre-fork blocks still validate.
 pub const UMBRA_POW_VERSION: u32 = 3;
 
+/// Height at/above which UmbraHash is MANDATORY (a block with a lower version is
+/// rejected instead of validated by the cheap legacy ShadowHash path).
+///
+/// `None` = the fork is NOT scheduled yet, so both algorithms stay valid and
+/// behavior is unchanged (UmbraHash remains opt-in). Set this to `Some(height)`
+/// when the hard fork is scheduled — WITHOUT it, an attacker could keep mining
+/// cheap version-2 ShadowHash blocks at the same difficulty/target after the
+/// fork and bypass memory-hardness forever. The activation height is a
+/// governance/deployment decision.
+pub const UMBRA_ACTIVATION_HEIGHT: Option<u64> = None;
+
+/// Whether a block at `height` MUST use UmbraHash under the given schedule.
+/// Pure over `activation` so the rule is testable without mutating the const.
+pub fn umbra_required_at_with(height: u64, activation: Option<u64>) -> bool {
+    matches!(activation, Some(a) if height >= a)
+}
+
+/// Whether a block at `height` MUST use UmbraHash under the live schedule.
+pub fn umbra_required_at(height: u64) -> bool {
+    umbra_required_at_with(height, UMBRA_ACTIVATION_HEIGHT)
+}
+
 /// Process-wide memoized verification cache (holds the current epoch's 16 MiB
 /// cache). Nodes call this per block; regenerated only when the epoch changes.
 /// Generating the cache is ~hundreds of ms; verification then regenerates only
@@ -563,6 +585,21 @@ mod tests {
         assert!(!slots.iter().any(|(e, _)| *e == 1), "epoch 1 must be evicted as LRU");
         assert!(slots.iter().any(|(e, _)| *e == 0), "epoch 0 (recently used) must survive");
         assert!(slots.len() <= 3, "LRU never exceeds MAX_EPOCH_CACHES");
+    }
+
+    #[test]
+    fn umbra_activation_floor_logic() {
+        // Not scheduled → never required (inert; preserves the current opt-in
+        // behavior where both algorithms are valid).
+        assert!(!umbra_required_at_with(0, None));
+        assert!(!umbra_required_at_with(u64::MAX, None));
+        // Scheduled at height A → required at and above A, not below.
+        assert!(!umbra_required_at_with(49, Some(50)));
+        assert!(umbra_required_at_with(50, Some(50)));
+        assert!(umbra_required_at_with(51, Some(50)));
+        // The live schedule is currently unscheduled (the fork is not yet set).
+        assert_eq!(UMBRA_ACTIVATION_HEIGHT, None);
+        assert!(!umbra_required_at(u64::MAX));
     }
 
     #[test]

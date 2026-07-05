@@ -30,6 +30,19 @@ pub struct PowValidator;
 impl PowValidator {
     /// Full block PoW validation
     pub fn validate(block: &Block) -> PowResult {
+        // Fork-activation floor: once UmbraHash is mandatory at this height, a
+        // legacy (cheaper ShadowHash) version must NOT be accepted — otherwise a
+        // miner downgrades to v2 at the same target and bypasses memory-hardness.
+        if umbrahash::umbra_required_at(block.header.height)
+            && block.header.version < umbrahash::UMBRA_POW_VERSION
+        {
+            return PowResult::fail(format!(
+                "version {} below UMBRA_POW_VERSION {} required at height {}",
+                block.header.version,
+                umbrahash::UMBRA_POW_VERSION,
+                block.header.height
+            ));
+        }
         // Hard-fork gate: version >= UMBRA_POW_VERSION uses UmbraHash (memory-hard).
         if block.header.version >= umbrahash::UMBRA_POW_VERSION {
             return match Self::umbra_check(&block.header) {
@@ -180,6 +193,13 @@ impl PowValidator {
 
     /// Validate a header independently (recompute hash from fields including extra_nonce)
     pub fn validate_header(header: &BlockHeader) -> bool {
+        // Fork-activation floor (see validate): reject a legacy version once
+        // UmbraHash is mandatory at this height.
+        if umbrahash::umbra_required_at(header.height)
+            && header.version < umbrahash::UMBRA_POW_VERSION
+        {
+            return false;
+        }
         if header.version >= umbrahash::UMBRA_POW_VERSION {
             return Self::umbra_check(header).is_ok();
         }
