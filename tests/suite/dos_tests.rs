@@ -243,6 +243,34 @@ mod tests {
         );
     }
 
+    // Regression (shield structural validation): the block path validates each tx
+    // via TxValidator::validate_structure_for_network, whose sum_outputs() dust
+    // floor rejected amount=0 shield outputs, so a mined block carrying a shield tx
+    // failed with "tx N structural validation failed" and shield stayed unminable
+    // on-chain (found by live testnet E2E, not covered by the dos/spam fix).
+    #[test]
+    fn shield_zero_output_passes_structural_validation() {
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::transaction::tx_hash::TxHash;
+        use crate::domain::transaction::tx_validator::TxValidator;
+
+        let mut tx = shield_tx("shield_structural_regression");
+        tx.hash = TxHash::hash_for_network(&tx, &NetworkMode::Mainnet);
+        assert!(
+            TxValidator::validate_structure_for_network(&tx, &NetworkMode::Mainnet),
+            "shield tx (amount=0 outputs) must pass block structural validation"
+        );
+
+        // Differential: a transparent tx with a zero (sub-dust) output still fails.
+        let mut transparent = shield_tx("transparent_dust_regression");
+        transparent.tx_type = TxType::Transfer;
+        transparent.hash = TxHash::hash_for_network(&transparent, &NetworkMode::Mainnet);
+        assert!(
+            !TxValidator::validate_structure_for_network(&transparent, &NetworkMode::Mainnet),
+            "transparent tx with a zero-amount (sub-dust) output must fail structural validation"
+        );
+    }
+
     #[test]
     fn dos_constants_are_reasonable() {
         const { assert!(MAX_TX_INPUTS >= 50) }; // MAX_TX_INPUTS should be at least 50

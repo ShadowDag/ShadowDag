@@ -1129,10 +1129,13 @@ impl TxValidator {
     }
 
     fn sum_outputs(tx: &Transaction) -> Option<u64> {
+        // Confidential (RingCT) AND shield outputs carry amount=0 by design (value
+        // in the commitment); the dust floor is a transparent-only anti-spam rule.
+        let is_conf = tx.is_confidential() || tx.is_shield();
         let mut total: u64 = 0;
 
         for output in &tx.outputs {
-            if output.amount < DUST_LIMIT {
+            if !is_conf && output.amount < DUST_LIMIT {
                 return None;
             }
             if output.amount > MAX_OUTPUT_AMOUNT {
