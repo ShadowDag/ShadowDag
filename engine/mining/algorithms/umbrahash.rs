@@ -330,6 +330,17 @@ pub fn hashimoto_full(
 // ─────────────────────────── Consensus parameters ───────────────────────────
 // Blocks per epoch: at 10 BPS this is ~3.5 days of dataset freshness.
 pub const EPOCH_BLOCKS: u64 = 3_000_000;
+
+// Consensus ceiling on block height for UmbraHash validation. `epoch_seed`
+// chains SHA3-256 `epoch` times and `epoch = height / EPOCH_BLOCKS`, so an
+// UNBOUNDED attacker-supplied height (e.g. u64::MAX ⇒ ~6.1e12 iterations) would
+// force hours of hashing BEFORE any PoW/target check — a remote CPU-exhaustion
+// stall. Every UmbraHash entry point rejects `height > UMBRA_MAX_HEIGHT` up
+// front, capping the epoch (and thus epoch_seed) to a few-ms worst case. At
+// 10 BPS this ceiling is ~3170 years of blocks, far beyond any real chain.
+// TODO(external-review): a tip-relative height bound at the network/relay layer
+// is the tighter defense; this absolute ceiling is the cheap, context-free floor.
+pub const UMBRA_MAX_HEIGHT: u64 = 1_000_000_000_000; // 1e12
 // Fixed dataset size (light on cards: fits any 2GB+ GPU) and its verification
 // cache. Both are multiples of MIX_BYTES(128); dataset item-count is even so the
 // hashimoto `mixhashes=2` fetch never runs off the end.

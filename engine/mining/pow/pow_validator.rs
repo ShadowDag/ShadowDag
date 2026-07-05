@@ -105,6 +105,15 @@ impl PowValidator {
         if h.difficulty > MAX_DIFFICULTY {
             return Err(format!("difficulty {} exceeds MAX_DIFFICULTY {}", h.difficulty, MAX_DIFFICULTY));
         }
+        // Cheap height ceiling BEFORE any epoch/cache work: an unbounded
+        // attacker-chosen height would make epoch_seed chain SHA3 for hours
+        // (remote CPU-exhaustion) before the PoW check. Reject up front.
+        if h.height > umbrahash::UMBRA_MAX_HEIGHT {
+            return Err(format!(
+                "umbra: height {} exceeds UMBRA_MAX_HEIGHT {}",
+                h.height, umbrahash::UMBRA_MAX_HEIGHT
+            ));
+        }
         if h.difficulty == 0 {
             return Ok(h.hash.clone()); // genesis (height 0, checked above)
         }
@@ -139,6 +148,14 @@ impl PowValidator {
     /// generates/uses the epoch cache (memoized) + one hashimoto_light.
     pub fn recompute_identity_hash(header: &BlockHeader) -> String {
         if header.version >= umbrahash::UMBRA_POW_VERSION {
+            // Height ceiling BEFORE the epoch cache: this cheap anti-spoof gate
+            // runs on UNVALIDATED headers (orphan admission, sync, light node)
+            // ahead of the PoW check, so an absurd height must NOT be allowed to
+            // trigger epoch_seed/mkcache. Return a sentinel that cannot match a
+            // real hashimoto result; full validation then rejects the header.
+            if header.height > umbrahash::UMBRA_MAX_HEIGHT {
+                return String::new();
+            }
             let hh = umbrahash::header_hash(
                 header.version, header.height, header.timestamp, header.extra_nonce,
                 header.difficulty, &header.merkle_root, &header.parents,
@@ -456,6 +473,34 @@ mod tests {
         let mut bad_nonce = header.clone();
         bad_nonce.nonce = 12_345;
         assert!(!PowValidator::validate_header(&bad_nonce), "wrong nonce must fail");
+    }
+
+    #[test]
+    fn umbra_rejects_absurd_height_without_cache_work() {
+        use crate::engine::mining::algorithms::umbrahash;
+        // SECURITY (CRITICAL DoS): a v>=3 header with height above the consensus
+        // ceiling must be rejected by the CHEAP guard BEFORE epoch_seed/mkcache.
+        // With height = u64::MAX (epoch ~6.1e12), an unguarded path would chain
+        // SHA3-256 for hours; the guard makes both entry points return instantly.
+        let mut header = BlockHeader::new_with_defaults(
+            umbrahash::UMBRA_POW_VERSION,
+            String::new(),
+            vec!["p".repeat(64)],
+            "merkle".into(),
+            1_700_000_000_000,
+            0,        // nonce
+            1,        // difficulty (non-zero → PoW enforced)
+            u64::MAX, // height → epoch ~6.1e12 if unguarded
+        );
+        header.hash = "ab".repeat(32);
+        header.mix_hash = "cd".repeat(32);
+        assert!(
+            !PowValidator::validate_header(&header),
+            "height above UMBRA_MAX_HEIGHT must be rejected"
+        );
+        // The cheap anti-spoof recompute must return the empty sentinel (it did
+        // NO cache work); a real hashimoto result is always 64 hex chars.
+        assert_eq!(PowValidator::recompute_identity_hash(&header), "");
     }
 
     #[test]
