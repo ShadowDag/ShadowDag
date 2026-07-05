@@ -210,6 +210,8 @@ pub struct FullNode {
     /// block's cumulative work is fixed once it exists. Rebuilt lazily after
     /// restart. See `cumulative_work`.
     cwork_cache: Mutex<HashMap<String, u128>>,
+    /// Height at which block bodies were last pruned (throttle for maybe_prune).
+    last_prune_height: AtomicU64,
 }
 
 impl FullNode {
@@ -334,6 +336,39 @@ impl FullNode {
             receipt_store: ReceiptStore::new(100_000),
             mining_state,
             cwork_cache: Mutex::new(HashMap::new()),
+            last_prune_height: AtomicU64::new(0),
+        }
+    }
+
+    /// Prune block bodies far below the tip to bound disk growth. Deletes only
+    /// blocks whose height is more than PRUNE_KEEP_DEPTH below the best height —
+    /// well beyond MAX_REORG_DEPTH (1000) — so no reorg or DAG parent link can
+    /// need them; the UTXO set and height/commit indexes are untouched.
+    /// Throttled to run at most once per PRUNE_INTERVAL of new height.
+    fn maybe_prune(&self) {
+        const PRUNE_KEEP_DEPTH: u64 = 2_000;
+        const PRUNE_INTERVAL: u64 = 500;
+        let best = match self
+            .block_store
+            .get_best_hash()
+            .and_then(|h| self.block_store.get_block(&h))
+        {
+            Some(b) => b.header.height,
+            None => return,
+        };
+        if best <= PRUNE_KEEP_DEPTH {
+            return;
+        }
+        let last = self.last_prune_height.load(Ordering::Relaxed);
+        if best < last.saturating_add(PRUNE_INTERVAL) {
+            return;
+        }
+        self.last_prune_height.store(best, Ordering::Relaxed);
+        let cutoff = best - PRUNE_KEEP_DEPTH;
+        let pruned = self.block_store.prune_blocks_below_height(cutoff);
+        if pruned > 0 {
+            slog_warn!("pruning", "pruned_old_block_bodies",
+                count => pruned, below_height => cutoff, best_height => best);
         }
     }
 
@@ -413,12 +448,20 @@ impl FullNode {
         }
 
         // ── L1 → L2 → L3 → DAG → L4 ────────────────────────────────
-        self.process_block_inner(block, peer_id)
+        let r = self.process_block_inner(block, peer_id);
+        if r.is_ok() {
+            self.maybe_prune();
+        }
+        r
     }
 
     /// Process a block (internal use, no peer tracking).
     pub fn process_block(&self, block: &Block) -> Result<(), NodeError> {
-        self.process_block_inner(block, "local")
+        let r = self.process_block_inner(block, "local");
+        if r.is_ok() {
+            self.maybe_prune();
+        }
+        r
     }
 
     /// Collect ancestor timestamps by walking the DAG deeply.
