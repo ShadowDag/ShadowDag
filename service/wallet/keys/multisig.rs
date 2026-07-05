@@ -208,7 +208,9 @@ impl PendingMultisig {
 
     /// Check if the pending tx has expired
     pub fn is_expired(&self) -> bool {
-        now_ms().saturating_sub(self.created_at) > SIG_TIMEOUT_SECS
+        // created_at and now_ms() are epoch MILLISECONDS; SIG_TIMEOUT_SECS is in
+        // seconds, so scale it to ms (else the window collapses to 3.6 seconds).
+        now_ms().saturating_sub(self.created_at) > SIG_TIMEOUT_SECS.saturating_mul(1000)
     }
 
     /// Get aggregated signature (when complete).
@@ -423,6 +425,24 @@ mod tests {
         assert_eq!(config.total, 3);
         assert!(config.address.starts_with("SD1m"));
         assert_eq!(config.display(), "2-of-3");
+    }
+
+    // Regression (B6-M03): is_expired() compares a ms elapsed time against the
+    // SIG_TIMEOUT_SECS constant, which must be scaled to ms — else the collection
+    // window collapses from 1 hour to 3.6 seconds.
+    #[test]
+    fn pending_multisig_expiry_window_is_one_hour_not_seconds() {
+        let keys = make_signing_keys(3);
+        let config = MultisigConfig::new(2, pubkeys_hex(&keys), "mainnet").unwrap();
+        let mut pending = PendingMultisig::new("abcd".into(), config, vec![]);
+
+        // Created 5 seconds ago (5000 ms) — must still be well within the window.
+        pending.created_at = now_ms().saturating_sub(5_000);
+        assert!(!pending.is_expired(), "must NOT expire 5 seconds after creation");
+
+        // Created just over 1 hour ago — now expired.
+        pending.created_at = now_ms().saturating_sub(SIG_TIMEOUT_SECS * 1000 + 1_000);
+        assert!(pending.is_expired(), "must expire > 1 hour after creation");
     }
 
     #[test]

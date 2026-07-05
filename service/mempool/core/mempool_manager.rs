@@ -140,7 +140,9 @@ impl MempoolManager {
         self.current_height = height;
 
         for txid in confirmed_txids {
-            self.tx_pool.remove_with_dependents(txid);
+            // Confirmed txs leave the pool, but their still-valid children (CPFP)
+            // must NOT be cascade-evicted — the parent's outputs are now on-chain.
+            self.tx_pool.remove_confirmed(txid);
         }
 
         self.orphan_pool.evict_old(height);

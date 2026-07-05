@@ -37,7 +37,6 @@ const MAX_TXS_PER_SENDER: usize = 25;
 
 const PFX_TX: &[u8] = b"tx:";
 const PFX_FEE: &[u8] = b"fee:";
-const PFX_RDEP: &[u8] = b"rdep:";
 /// Metadata key for tracking total serialized bytes in the pool.
 const META_TOTAL_BYTES: &[u8] = b"_meta:total_bytes";
 /// Metadata key for tracking TX count without full scan.
@@ -830,6 +829,14 @@ impl Mempool {
         }
     }
 
+    /// Remove a transaction that was CONFIRMED on-chain, WITHOUT cascading to its
+    /// dependents. Unlike `remove_transaction` (eviction/RBF, where a removed
+    /// parent orphans its children), a confirmed parent's outputs now exist
+    /// on-chain, so its mempool children are still valid and must be kept.
+    pub fn remove_confirmed_tx(&self, txid: &str) {
+        self.remove_single_tx(txid);
+    }
+
     /// Delete a single transaction's records from the pool (no cascade).
     /// Callers that need cascade removal use `remove_transaction`.
     fn remove_single_tx(&self, txid: &str) {
@@ -853,17 +860,12 @@ impl Mempool {
                 batch.delete(sender_key.as_bytes());
             }
 
-            let fee_keys: Vec<Vec<u8>> = self
-                .db
-                .prefix_iterator(PFX_FEE)
-                .filter_map(|r| r.ok())
-                .take_while(|(k, _)| k.starts_with(PFX_FEE))
-                .filter(|(_, v)| String::from_utf8(v.to_vec()).unwrap_or_default() == txid)
-                .map(|(k, _)| k.to_vec())
-                .collect();
-            for k in fee_keys {
-                batch.delete(&k);
-            }
+            // Reconstruct the fee key deterministically (same formula as insertion)
+            // instead of scanning EVERY fee: key and matching by value — that scan
+            // made each removal O(n), so a cascade/eviction was O(n^2).
+            let fee_size = tx.canonical_bytes().len().max(1) as u64;
+            let fee_rate = tx.fee.saturating_mul(1000) / fee_size;
+            batch.delete(format!("fee:{:020}:{}", u64::MAX - fee_rate, txid).as_bytes());
 
             let dep_prefix = format!("dep:{}:", txid);
             let dep_prefix_bytes = dep_prefix.as_bytes().to_vec();
@@ -878,20 +880,12 @@ impl Mempool {
                 batch.delete(k);
             }
 
-            let rdep_candidates: Vec<Vec<u8>> = self
-                .db
-                .prefix_iterator(PFX_RDEP)
-                .filter_map(|r| r.ok())
-                .take_while(|(k, _)| k.starts_with(PFX_RDEP))
-                .filter(|(k, _)| {
-                    String::from_utf8(k.to_vec())
-                        .map(|s| s.ends_with(&format!(":{}", txid)))
-                        .unwrap_or(false)
-                })
-                .map(|(k, _)| k.to_vec())
-                .collect();
-            for k in rdep_candidates {
-                batch.delete(&k);
+            // Reconstruct the rdep-as-child edges (rdep:{parent}:{index}:{this})
+            // from the tx's own inputs instead of scanning EVERY rdep: key by
+            // suffix. Insertion only writes the edge when the parent is pooled, but
+            // deleting a non-existent key is a no-op, so covering all inputs is safe.
+            for input in &tx.inputs {
+                batch.delete(format!("rdep:{}:{}:{}", input.txid, input.index, txid).as_bytes());
             }
 
             let rdep_prefix = format!("rdep:{}:", txid);
@@ -1740,6 +1734,73 @@ mod tests {
         assert!(
             mp.add_transaction_test(&tx2),
             "After removal, new TX should be accepted"
+        );
+    }
+
+    // Regression (B6-M01): confirming a parent must NOT cascade-evict its
+    // still-valid children (CPFP); only the cascading remove_transaction should.
+    #[test]
+    fn remove_confirmed_tx_keeps_valid_children_unlike_cascade() {
+        let mp = Mempool::try_new(format!(
+            "/tmp/test_mp_v9_cpfp_{}_{}",
+            std::process::id(),
+            line!()
+        ))
+        .expect("test mp");
+        mp.flush();
+
+        mp.add_transaction_test(&coinbase_tx("cpfp_parent", 10));
+        mp.add_transaction_test(&tx_with_input("cpfp_child", "cpfp_parent", 0, 5));
+        assert!(mp.get_transaction("cpfp_child").is_some(), "child pooled");
+
+        mp.remove_confirmed_tx("cpfp_parent");
+        assert!(
+            mp.get_transaction("cpfp_parent").is_none(),
+            "confirmed parent removed"
+        );
+        assert!(
+            mp.get_transaction("cpfp_child").is_some(),
+            "valid child must survive parent confirmation (no cascade)"
+        );
+
+        // Contrast: the cascading remove_transaction DOES evict the child.
+        mp.add_transaction_test(&coinbase_tx("cpfp_parent2", 10));
+        mp.add_transaction_test(&tx_with_input("cpfp_child2", "cpfp_parent2", 0, 5));
+        mp.remove_transaction("cpfp_parent2");
+        assert!(
+            mp.get_transaction("cpfp_child2").is_none(),
+            "cascade removal evicts the child"
+        );
+    }
+
+    // Regression (B6-M02): removal must delete the fee-index entry via a
+    // RECONSTRUCTED key (not an O(n) scan). A wrong reconstruction leaves the key.
+    #[test]
+    fn remove_deletes_reconstructed_fee_index_entry() {
+        let mp = Mempool::try_new(format!(
+            "/tmp/test_mp_v9_feeidx_{}_{}",
+            std::process::id(),
+            line!()
+        ))
+        .expect("test mp");
+        mp.flush();
+
+        let count_fee = |m: &Mempool| -> usize {
+            m.db
+                .prefix_iterator(PFX_FEE)
+                .filter_map(|r| r.ok())
+                .take_while(|(k, _)| k.starts_with(PFX_FEE))
+                .filter(|(_, v)| String::from_utf8(v.to_vec()).unwrap_or_default() == "feeidx_tx")
+                .count()
+        };
+
+        mp.add_transaction_test(&tx_with_input("feeidx_tx", "utxo_fee", 0, 7));
+        assert_eq!(count_fee(&mp), 1, "fee index has the tx after add");
+        mp.remove_transaction("feeidx_tx");
+        assert_eq!(
+            count_fee(&mp),
+            0,
+            "reconstructed fee key must delete the fee-index entry on removal"
         );
     }
 
