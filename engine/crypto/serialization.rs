@@ -141,6 +141,14 @@ impl Serializer {
     // TRANSACTION
     // ─────────────────────────────────────────
 
+    /// ⚠️ NON-CANONICAL — DO NOT USE FOR txid / merkle / wire / consensus.
+    /// This encoder OMITS every RingCT/Shield field (`serialize_tx_input` drops
+    /// ring_members/ring_signature/ring_commitments/pseudo_commitment/
+    /// shield_blinding; `serialize_tx_output` drops one_time_pubkey/
+    /// encrypted_amount), so it is NOT injective over confidential/shield txs:
+    /// two txs differing only in an omitted field collide to identical bytes.
+    /// The authoritative txid uses `Transaction::canonical_bytes` (which commits
+    /// all of those fields) — always use that. Kept only for legacy/test use.
     #[inline(always)]
     pub fn serialize_transaction(tx: &Transaction) -> Vec<u8> {
         let mut buf = Vec::with_capacity(64 + tx.inputs.len() * 64 + tx.outputs.len() * 64);
@@ -267,6 +275,9 @@ impl Serializer {
     // BLOCK
     // ─────────────────────────────────────────
 
+    /// ⚠️ NON-CANONICAL (see `serialize_transaction`): embeds the incomplete tx
+    /// encoding, so this is NOT a consensus block encoding. Do not use for a
+    /// block hash / wire format. Legacy/test use only.
     #[inline(always)]
     pub fn serialize_block(block: &Block) -> Vec<u8> {
         let mut buf = Vec::with_capacity(512);
@@ -294,6 +305,10 @@ impl Serializer {
     // HASHING (🔥 ZERO COPY + NO CLONE)
     // ─────────────────────────────────────────
 
+    /// ⚠️ NON-CANONICAL HASH — NOT the on-chain txid. Hashes the incomplete
+    /// `serialize_transaction` encoding (omits RingCT/Shield fields), so it
+    /// COLLIDES for txs differing only in a commitment/blinding/one-time-key.
+    /// The real txid is `TxHash`/`Transaction::canonical_bytes`. Legacy/test only.
     #[inline(always)]
     pub fn tx_hash(tx: &Transaction) -> String {
         use sha2::{Digest, Sha256};
