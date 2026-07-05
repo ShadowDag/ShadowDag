@@ -49,10 +49,17 @@ Files in scope:
 | 1 | 🔴 CRITICAL | PoW DoS | `umbrahash.rs` epoch_seed | **FIXED** `aebd91d` |
 | 2 | 🟠 HIGH | PoW DoS | `umbrahash.rs` cache_for_epoch | **FIXED** `ec24c8e` |
 | 3 | 🟠 HIGH | RingCT integrity | `confidential_consensus.rs` (okey) | **FIXED (gate)** `0b47c24` |
-| 4 | 🟠 HIGH (latent) | Fork activation | `pow_validator.rs` version gate | **OPEN — pre-fork** |
-| 5 | 🟡 LOW | validate/apply divergence | `utxo_validator.rs` will_spend | **OPEN — hardening** |
-| 6 | 🟡 LOW | txid binding (dead code) | `tx_validator.rs` ordering | **OPEN — hygiene** |
-| 7 | ⚪ INFO | dead non-injective encoder | `serialization.rs` | **OPEN — hygiene** |
+| 4 | 🟠 HIGH (latent) | Fork activation | `pow_validator.rs` version gate | **SCAFFOLDED** `975366f` (set activation height before fork) |
+| 5 | 🟡 LOW | validate/apply divergence | `utxo_validator.rs` will_spend | **FIXED** `8bd6b2d` |
+| 6 | 🟡 LOW | txid binding (dead code) | `tx_validator.rs` ordering | **FIXED** `8bd6b2d` |
+| 7 | ⚪ INFO | dead non-injective encoder | `serialization.rs` | **DOCUMENTED** `cdcbb22` |
+
+All seven findings are now addressed in code. #4's enforcement mechanism is in
+place but inert (`UMBRA_ACTIVATION_HEIGHT = None`); the project must set the
+activation height before scheduling the hard fork. #3's gate fix covers the
+mempool/validate/reorg paths; the intra-block cross-tx dedup and an authoritative
+apply-path guard remain for when RingCT block-enforcement is finalized. The
+external audit items below are unchanged and remain the hard gate to mainnet.
 
 Out-of-scope for this review but REQUIRED for external audit: the cryptographic
 primitives themselves — `engine/privacy/confidential/pedersen.rs`
@@ -120,7 +127,7 @@ an authoritative okey-freshness guard inside `apply_block_dag_ordered` — becau
 the live block-acceptance path is documented as not fully gating on the shared
 validator yet. These should land when RingCT block-enforcement is finalized.
 
-## 4. HIGH (latent) — UmbraHash fork gated only by version, no activation floor  *(OPEN)*
+## 4. HIGH (latent) — UmbraHash fork gated only by version, no activation floor  *(SCAFFOLDED 975366f — set the activation height before the fork)*
 
 The fork is selected purely by `header.version >= UMBRA_POW_VERSION` in
 `validate()`, `recompute_identity_hash`, and `validate_header`. There is no
@@ -139,7 +146,7 @@ verifier. The activation height is a governance/deployment decision — it shoul
 be chosen by the project, which is why it is left open here rather than picked
 unilaterally.
 
-## 5. LOW — shield transparent inputs not added to `will_spend`  *(OPEN, hardening)*
+## 5. LOW — shield transparent inputs not added to `will_spend`  *(FIXED 8bd6b2d)*
 
 `validate_block_utxos` routes a Shield tx to `verify_shield_tx` then `continue`s
 without inserting its transparent inputs into the block-wide `will_spend` set, so
@@ -150,7 +157,7 @@ path does not gate on `validate_block_utxos`. **Fix:** insert each shield
 transparent input into `will_spend` (and reject on duplicate), matching the
 transparent loop.
 
-## 6. LOW — `validate_transaction` shield/confidential early-return skips txid check  *(OPEN, dead code)*
+## 6. LOW — `validate_transaction` shield/confidential early-return skips txid check  *(FIXED 8bd6b2d)*
 
 In `TxValidator::validate_transaction`, the shield/confidential branches return
 before the `tx.hash == canonical_bytes` check, so on that path the txid is not
@@ -159,7 +166,7 @@ callers; the live mempool path (`validate_tx_for_network`) and the block path
 bind the hash first. **Fix:** move the `is_shield()/is_confidential()`
 early-returns to after the `verify_for_network` check.
 
-## 7. INFO — dead `Serializer` is non-injective over RingCT/Shield fields  *(OPEN, hygiene)*
+## 7. INFO — dead `Serializer` is non-injective over RingCT/Shield fields  *(DOCUMENTED cdcbb22)*
 
 `engine/crypto/serialization.rs` `serialize_tx_input/output` omit every RingCT /
 Shield field, so `Serializer::tx_hash` collides for txs differing only in a
@@ -194,8 +201,8 @@ cryptographic review of the composition is essential.
    `dual_clsag.rs`. Shield's inflation-resistance depends on them.
 2. **Consensus review of UmbraHash composition** (Ethash DAG + mini-ProgPoW) and
    the light==full equivalence for all inputs.
-3. **Fix finding #4** (fork activation floor) before scheduling the fork.
+3. **Set `UMBRA_ACTIVATION_HEIGHT`** (finding #4; enforcement mechanism scaffolded
+   in `975366f`, currently `None`) before scheduling the hard fork.
 4. Finalize RingCT block-enforcement and land the remaining okey hardening (#3
-   follow-ups) and #5.
-5. Clean up #6/#7 dead code.
-6. Re-run this adversarial review after the above.
+   follow-ups: intra-block cross-tx dedup + an authoritative apply-path guard).
+5. Re-run this adversarial review after the above.
