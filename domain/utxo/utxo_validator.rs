@@ -206,6 +206,20 @@ impl UtxoValidator {
                     utxo_set,
                     &conf_network,
                 )?;
+                // A shield tx SPENDS its transparent inputs (in apply). Reserve
+                // them in the block-wide will_spend set so the same transparent
+                // outpoint cannot be consumed by another tx in the same block —
+                // matching the transparent loop and the authoritative apply-path
+                // staged_spent skip (keeps validate and apply in agreement).
+                for input in &tx.inputs {
+                    let key = utxo_key(&input.txid, input.index)?;
+                    if !will_spend.insert(key) {
+                        return Err(StorageError::Other(format!(
+                            "validate_block_utxos: double-spend within block: {} (shield tx {})",
+                            key, tx.hash
+                        )));
+                    }
+                }
                 continue;
             }
 

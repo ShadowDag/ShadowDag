@@ -611,6 +611,17 @@ impl TxValidator {
             return Err(StorageError::Other(format!("tx {}: {}", tx.hash, reason)));
         }
 
+        // Bind tx.hash to canonical content BEFORE the confidential/shield
+        // early-returns — otherwise those paths never check txid == canonical
+        // bytes and a mismatched/forged txid would slip through. Matches
+        // validate_tx_for_network's ordering (hash check before the branches).
+        if !TxHash::verify_for_network(tx, &network) {
+            return Err(StorageError::Other(format!(
+                "transaction hash verification failed for {}",
+                tx.hash
+            )));
+        }
+
         // Confidential (RingCT) TXs: validated entirely by the confidential gate
         // and RETURN — must not fall through to the transparent UTXO loop below
         // (their inputs carry dummy outpoints). Mirrors validate_tx_for_network
@@ -659,12 +670,8 @@ impl TxValidator {
             )));
         }
 
-        if !TxHash::verify_for_network(tx, &network) {
-            return Err(StorageError::Other(format!(
-                "transaction hash verification failed for {}",
-                tx.hash
-            )));
-        }
+        // (tx.hash canonical binding already verified above, before the
+        // confidential/shield branches.)
 
         if tx.inputs.len() > MAX_TX_INPUTS {
             return Err(StorageError::Other(format!(
