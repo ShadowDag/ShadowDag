@@ -757,8 +757,8 @@ fn cmd_send(args: &[String]) {
         );
         match wallet.build_confidential_send(&to, amount, fee, &utxo_set) {
             Ok(tx) => {
-                let raw = match serde_json::to_vec(&tx) {
-                    Ok(b) => hex::encode(b),
+                let raw = match serde_json::to_string(&tx) {
+                    Ok(s) => s,
                     Err(e) => {
                         eprintln!("Error serializing confidential transaction: {}", e);
                         return;
@@ -958,8 +958,8 @@ fn cmd_shield(args: &[String]) {
             return;
         }
     };
-    let raw = match serde_json::to_vec(&tx) {
-        Ok(b) => hex::encode(b),
+    let raw = match serde_json::to_string(&tx) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("Error serializing shield transaction: {}", e);
             return;
