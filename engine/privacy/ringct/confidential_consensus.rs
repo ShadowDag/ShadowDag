@@ -124,12 +124,32 @@ pub fn verify_shield_tx(
 
     // ── Outputs: confidential (amount==0 + range proof) ──
     let mut output_commitments = Vec::with_capacity(tx.outputs.len());
+    let mut seen_otk: HashSet<&str> = HashSet::new();
     for output in &tx.outputs {
         if output.amount != 0 {
             return Err(err(format!(
                 "shield tx {}: confidential output amount must be 0 (value hidden in commitment)",
                 tx.hash
             )));
+        }
+        // OTK freshness (mirrors the key-image uniqueness guard): a confidential
+        // output's one-time pubkey MUST be globally fresh. Without this, a tx can
+        // reuse an existing on-chain okey; apply then overwrites okey->commitment
+        // (making the earlier output uncitable as a ring member) and a reorg
+        // rollback deletes the victim's still-live entry, desyncing okeyidx.
+        if let Some(otk) = output.one_time_pubkey.as_deref() {
+            if utxo_set.output_key_exists(otk) {
+                return Err(err(format!(
+                    "shield tx {}: output one-time key already exists on-chain",
+                    tx.hash
+                )));
+            }
+            if !seen_otk.insert(otk) {
+                return Err(err(format!(
+                    "shield tx {}: duplicate output one-time key within tx",
+                    tx.hash
+                )));
+            }
         }
         let view = parse_confidential_output(output)
             .ok_or_else(|| err(format!("shield tx {}: malformed confidential output", tx.hash)))?;
@@ -259,6 +279,7 @@ pub fn verify_confidential_tx(
 
     // ── Outputs: range proofs ──
     let mut output_commitments = Vec::with_capacity(tx.outputs.len());
+    let mut seen_otk: HashSet<&str> = HashSet::new();
     for output in &tx.outputs {
         // PRIVACY INVARIANT: a confidential output's value lives ONLY in its
         // Pedersen commitment. The plaintext `amount` field MUST be 0 — otherwise
@@ -270,6 +291,24 @@ pub fn verify_confidential_tx(
                 "confidential tx {}: plaintext output amount must be 0 (value is hidden in the commitment)",
                 tx.hash
             )));
+        }
+        // OTK freshness (mirrors the key-image uniqueness guard): the output's
+        // one-time pubkey MUST be globally fresh. Reusing an existing on-chain
+        // okey lets apply overwrite okey->commitment and a reorg rollback delete
+        // the victim's entry (uncitable ring member + okeyidx desync).
+        if let Some(otk) = output.one_time_pubkey.as_deref() {
+            if utxo_set.output_key_exists(otk) {
+                return Err(err(format!(
+                    "confidential tx {}: output one-time key already exists on-chain",
+                    tx.hash
+                )));
+            }
+            if !seen_otk.insert(otk) {
+                return Err(err(format!(
+                    "confidential tx {}: duplicate output one-time key within tx",
+                    tx.hash
+                )));
+            }
         }
         let view = parse_confidential_output(output)
             .ok_or_else(|| err(format!("confidential tx {}: malformed output", tx.hash)))?;
@@ -583,6 +622,48 @@ mod tests {
         resign_shield(&mut tx, &sk);
         let e = verify_shield_tx(&tx, &set, &net()).unwrap_err().to_string();
         assert!(e.contains("amount must be 0"), "must reject nonzero output amount, got: {}", e);
+    }
+
+    #[test]
+    fn shield_rejects_reused_output_key() {
+        // OTK FRESHNESS: a shield output whose one_time_pubkey already exists on
+        // chain must be rejected — else apply overwrites the prior okey and a
+        // reorg rollback deletes the victim's still-live confidential output.
+        let set = UtxoSet::new_empty();
+        let tx = valid_shield_tx(&set, 1_000, 10);
+        assert!(verify_shield_tx(&tx, &set, &net()).is_ok(), "sanity: fresh OTK verifies");
+        // Pre-record the output's OTK as if a prior block already used it.
+        let otk = tx.outputs[0].one_time_pubkey.clone().unwrap();
+        set.record_output_key(&otk, &"ff".repeat(32)).unwrap();
+        let e = verify_shield_tx(&tx, &set, &net()).unwrap_err().to_string();
+        assert!(
+            e.contains("one-time key already exists"),
+            "must reject reused OTK, got: {}",
+            e
+        );
+    }
+
+    #[test]
+    fn confidential_rejects_reused_output_key() {
+        // OTK FRESHNESS on the ring path: the output one-time pubkey must be
+        // fresh, mirroring the key-image uniqueness guard.
+        let set = UtxoSet::new_empty();
+        let tx = valid_conf_tx(&set, 100);
+        let mut seen = HashSet::new();
+        assert!(verify_confidential_tx(&tx, &set, &net(), &mut seen).is_ok());
+        // Pre-record the output's OTK; a NEW verification (fresh seen set) must
+        // now reject on OTK reuse before the balance check.
+        let otk = tx.outputs[0].one_time_pubkey.clone().unwrap();
+        set.record_output_key(&otk, &"ff".repeat(32)).unwrap();
+        let mut seen2 = HashSet::new();
+        let e = verify_confidential_tx(&tx, &set, &net(), &mut seen2)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("one-time key already exists"),
+            "must reject reused OTK, got: {}",
+            e
+        );
     }
 
     #[test]
