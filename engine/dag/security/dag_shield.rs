@@ -238,10 +238,10 @@ impl DagShield {
             return Err(ShieldRejection::minor("stale TX timestamp"));
         }
 
-        // Output amount sanity (cheap O(n)). Confidential (RingCT) outputs carry
-        // amount=0 by design (value hidden in the commitment), so the zero-amount
-        // rejection applies to transparent outputs only.
-        let is_conf = tx.is_confidential();
+        // Output amount sanity (cheap O(n)). Confidential (RingCT) AND shield
+        // outputs carry amount=0 by design (value hidden in the commitment), so
+        // the zero-amount rejection applies to transparent outputs only.
+        let is_conf = tx.is_confidential() || tx.is_shield();
         let mut total: u128 = 0;
         for output in &tx.outputs {
             if output.amount == 0 && !is_conf {
@@ -533,6 +533,17 @@ mod tests {
     fn valid_tx_passes_pre_validate() {
         let tx = make_tx(&valid_hash(), 5);
         assert!(DagShield::pre_validate_tx(&tx).is_ok());
+    }
+
+    #[test]
+    fn shield_tx_zero_amount_output_passes_pre_validate() {
+        let mut tx = make_tx(&valid_hash(), 10);
+        tx.tx_type = TxType::Shield;
+        tx.outputs[0].amount = 0;
+        assert!(
+            DagShield::pre_validate_tx(&tx).is_ok(),
+            "shield tx with a zero-amount confidential output must not be rejected"
+        );
     }
 
     #[test]
