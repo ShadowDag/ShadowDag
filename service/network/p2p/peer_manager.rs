@@ -274,6 +274,15 @@ impl PeerManager {
     }
 
     pub fn add_peer_record(&self, record: PeerRecord) -> Result<(), NetworkError> {
+        if Self::extract_ip(&record.addr)
+            .parse::<std::net::IpAddr>()
+            .is_err()
+        {
+            return Err(NetworkError::ConnectionFailed(format!(
+                "peer address is not a resolved IP: {}",
+                record.addr
+            )));
+        }
         if self.is_banned(&record.addr) {
             return Err(NetworkError::PeerBanned(record.addr.clone()));
         }
