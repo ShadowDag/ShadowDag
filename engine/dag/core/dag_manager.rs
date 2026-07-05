@@ -21,8 +21,6 @@ use crate::{slog_error, slog_warn};
 //   - tip:{hash}      — current tip status
 //   - meta:block_count — running block counter
 
-pub const MAX_ANCESTOR_WALK: usize = 50_000;
-
 const META_BLOCK_COUNT: &[u8] = b"meta:block_count";
 
 #[inline]
@@ -223,10 +221,9 @@ impl DagManager {
                 return Self::reject(DagError::OrphanBlock(hash.to_string(), p.to_string()));
             }
 
-            // Conservative: if walk limit exceeded, treat as cycle (reject block)
-            if self.would_create_cycle(hash, p).unwrap_or(true) {
-                return Self::reject(DagError::Other(format!("cycle detected via {}", p)));
-            }
+            // A new block (rejected above if it already exists) referencing only
+            // pre-existing parents is reachable from no block in the DAG, so it
+            // cannot close a cycle. No ancestor walk is needed or performed here.
 
             // Fanout limit: reject if parent already has too many children.
             // This prevents any block from becoming a traversal bottleneck.
@@ -389,47 +386,6 @@ impl DagManager {
     #[deprecated(note = "Use TipManager::select_parents() for mining")]
     pub fn select_parent_simple(&self, tips: &[String]) -> Option<String> {
         tips.iter().min().cloned()
-    }
-
-    // BFS cycle detection — returns Err when walk limit is exceeded
-    // (conservative: callers should treat Err as "assume cycle")
-    fn would_create_cycle(&self, target: &str, start: &str) -> Result<bool, DagError> {
-        let mut visited: HashSet<String> = HashSet::with_capacity(64);
-        let mut queue: VecDeque<String> = VecDeque::with_capacity(64);
-        let mut cache: HashMap<String, Vec<String>> = HashMap::new();
-
-        queue.push_back(start.to_string());
-
-        let mut walked = 0;
-
-        while let Some(current) = queue.pop_front() {
-            if walked >= MAX_ANCESTOR_WALK {
-                return Err(DagError::Other(format!(
-                    "cycle detection walk limit {} exceeded",
-                    MAX_ANCESTOR_WALK
-                )));
-            }
-            walked += 1;
-
-            if current == target {
-                return Ok(true);
-            }
-
-            if !cache.contains_key(&current) {
-                let parents = self.get_parents(&current);
-                cache.insert(current.clone(), parents);
-            }
-
-            let parents = &cache[&current];
-
-            for parent in parents {
-                if visited.insert(parent.clone()) {
-                    queue.push_back(parent.clone());
-                }
-            }
-        }
-
-        Ok(false)
     }
 
     // DAG SIZE
