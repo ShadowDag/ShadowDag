@@ -24,6 +24,8 @@ services:
       # connection is reset. RPC stays private: the host mapping below is
       # loopback-only (127.0.0.1:19332), so RPC is not exposed to the internet.
       - SHADOWDAG_RPC_BIND=0.0.0.0
+      - SHADOWDAG_EXPLORER_BIND=0.0.0.0
+      - SHADOWDAG_EXPLORER_ALLOW_PUBLIC=1
       # Optional built-in miner: set MINER_ADDRESS on the host to make THIS node
       # mine (the entrypoint runs a resilient miner loop). Leave empty to not
       # mine. Example:
@@ -34,10 +36,7 @@ services:
     ports:
       - "19333:19333"             # P2P — PUBLIC (peers connect here)
       - "127.0.0.1:19332:19332"   # RPC  — localhost only (keep private)
-      # Explorer is run inside the container but NOT published by default (it
-      # conflicts with anything already on host 8080, and a seed node doesn't
-      # need it). To expose it, add a free host port, e.g.:
-      #   - "127.0.0.1:18080:8080"
+      - "18080:8080"
     volumes:
       - shadowdag-testnet-data:/data
 
