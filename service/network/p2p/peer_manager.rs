@@ -288,7 +288,16 @@ impl PeerManager {
         }
 
         let ip = Self::extract_ip(&record.addr);
-        let count = self.conn_count_for_ip(ip);
+
+        let data =
+            bincode::serialize(&record).map_err(|e| NetworkError::Serialization(e.to_string()))?;
+        let db = self.lock_db();
+
+        // Per-IP cap read + all writes under ONE lock hold, so the check-then-write
+        // is atomic: concurrent adds for the same IP can no longer both pass the cap
+        // and each persist count+1 (which exceeded MAX_PEERS_PER_IP and corrupted
+        // the counter).
+        let count = Self::conn_count_for_ip_inner(&db, ip);
         if count >= MAX_PEERS_PER_IP {
             return Err(NetworkError::ConnectionFailed(format!(
                 "IP {} already has {} connections",
@@ -296,9 +305,6 @@ impl PeerManager {
             )));
         }
 
-        let data =
-            bincode::serialize(&record).map_err(|e| NetworkError::Serialization(e.to_string()))?;
-        let db = self.lock_db();
         let already_exists = db
             .get(format!("{}{}", PFX_PEER, record.addr).as_bytes())
             .map(|v| v.is_some())
@@ -752,6 +758,12 @@ impl PeerManager {
 
     fn conn_count_for_ip(&self, ip: &str) -> u32 {
         let db = self.lock_db();
+        Self::conn_count_for_ip_inner(&db, ip)
+    }
+
+    /// Read the per-IP connection count from an ALREADY-LOCKED db, so the caller
+    /// can keep the cap check and the write in one lock hold (no TOCTOU).
+    fn conn_count_for_ip_inner(db: &DB, ip: &str) -> u32 {
         match db.get(format!("{}{}", PFX_CONN_COUNT, ip).as_bytes()) {
             Ok(Some(data)) => data
                 .get(..4)
@@ -916,6 +928,24 @@ mod tests {
         assert!(pm.peer_exists("1.2.3.4:9333"));
         assert!(pm.remove_peer("1.2.3.4:9333").is_ok());
         assert!(!pm.peer_exists("1.2.3.4:9333"));
+    }
+
+    // B4-M01: the per-IP connection cap must be enforced (the fix makes the
+    // count-read + write atomic; a true concurrent race is not unit-testable, but
+    // this guards the cap logic itself).
+    #[test]
+    fn per_ip_connection_cap_enforced() {
+        let path = tmp("per_ip_cap");
+        let _ = fs::remove_dir_all(&path);
+        let pm = PeerManager::open(&path).unwrap();
+        // Same IP, distinct ports: exactly MAX_PEERS_PER_IP accepted, then rejected.
+        assert!(pm.add_peer("5.5.5.5:1").is_ok());
+        assert!(pm.add_peer("5.5.5.5:2").is_ok());
+        assert!(pm.add_peer("5.5.5.5:3").is_ok());
+        assert!(
+            pm.add_peer("5.5.5.5:4").is_err(),
+            "4th connection from one IP must exceed MAX_PEERS_PER_IP"
+        );
     }
 
     #[test]

@@ -434,6 +434,15 @@ impl Mempool {
             return false;
         }
 
+        // ── L1.4 Integrity: tx.hash MUST commit to the tx content ────
+        // The relay + mempool dedup keys are keyed on tx.hash; without binding it
+        // to the content, an attacker can relay a tx carrying a VICTIM's predictable
+        // hash and poison those keys, censoring the victim's genuine tx (B4-M03).
+        // The block path already enforces this (validate_structure_for_network).
+        if !crate::domain::transaction::tx_hash::TxHash::verify_for_network(tx, &self.network) {
+            return false;
+        }
+
         // ── L1.5 Anti-replay: reject stale/future TXs ───────────────
         if TxValidator::validate_tx_timestamp(tx).is_err() {
             return false;
