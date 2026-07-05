@@ -69,7 +69,6 @@ impl SpamFilter {
             // Confidential (RingCT) AND shield outputs carry amount=0 by design
             // (value in the commitment); the zero-amount rejection is transparent-only.
             let is_conf = tx.is_confidential() || tx.is_shield();
-            let mut seen_outputs = HashSet::with_capacity(tx.outputs.len());
             let mut total: u128 = 0;
 
             for output in &tx.outputs {
@@ -78,11 +77,10 @@ impl SpamFilter {
                     return false;
                 }
 
-                // ❌ duplicate outputs
-                let key = (&output.address, output.amount);
-                if !seen_outputs.insert(key) {
-                    return false;
-                }
+                // NOTE (B1-M04): duplicate (address, amount) outputs are NOT rejected
+                // — two equal payments to the same address are a valid tx shape, and
+                // dos_protection allows them too. Rejecting here censored valid txs
+                // (and whole blocks carrying them) chain-wide.
 
                 // 🔥 overflow protection
                 total = match total.checked_add(output.amount as u128) {

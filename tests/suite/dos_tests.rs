@@ -271,6 +271,76 @@ mod tests {
         );
     }
 
+    // Regression (B1-M04): the spam filter must ALLOW duplicate (address, amount)
+    // outputs — two equal payments to one address are a valid tx shape (dos_protection
+    // allows them); rejecting them censored valid txs and their blocks chain-wide.
+    #[test]
+    fn spam_filter_allows_duplicate_outputs() {
+        let out = |addr: &str, amt: u64| TxOutput {
+            address: addr.into(),
+            amount: amt,
+            commitment: None,
+            range_proof: None,
+            ephemeral_pubkey: None,
+            one_time_pubkey: None,
+            encrypted_amount: None,
+        };
+        let coinbase = Transaction {
+            hash: "cb_dup_block".into(),
+            inputs: vec![],
+            outputs: vec![out("shadow1miner", 1_000_000_000)],
+            fee: 0,
+            timestamp: 1735689600,
+            is_coinbase: true,
+            tx_type: TxType::Transfer,
+            payload_hash: None,
+            ..Default::default()
+        };
+        let dup_tx = Transaction {
+            hash: "dup_out_tx".into(),
+            inputs: vec![TxInput {
+                txid: "b".repeat(64),
+                index: 0,
+                owner: String::new(),
+                signature: String::new(),
+                pub_key: String::new(),
+                key_image: None,
+                ring_members: None,
+                ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
+                shield_blinding: None,
+            }],
+            // Two identical (address, amount) outputs — must be allowed.
+            outputs: vec![out("shadow1dup", 1000), out("shadow1dup", 1000)],
+            fee: 1,
+            timestamp: 1735689600,
+            is_coinbase: false,
+            tx_type: TxType::Transfer,
+            payload_hash: None,
+            ..Default::default()
+        };
+        let block = Block {
+            header: BlockHeader::new_with_defaults(
+                1,
+                "dup_block_hash".into(),
+                vec!["parent_hash".into()],
+                "merkle_root".into(),
+                1735689600,
+                0,
+                ConsensusParams::GENESIS_DIFFICULTY,
+                1,
+            ),
+            body: BlockBody {
+                transactions: vec![coinbase, dup_tx],
+            },
+        };
+        assert!(
+            SpamFilter::validate(&block),
+            "spam filter must allow duplicate (address, amount) outputs"
+        );
+    }
+
     #[test]
     fn dos_constants_are_reasonable() {
         const { assert!(MAX_TX_INPUTS >= 50) }; // MAX_TX_INPUTS should be at least 50

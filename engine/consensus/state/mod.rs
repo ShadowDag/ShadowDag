@@ -96,6 +96,22 @@ impl ConsensusState {
         if !issues.is_empty() {
             slog_warn!("consensus", "consistency_issues_after_recovery", count => issues.len());
         }
+        // FATAL per the module's own contract (B1-M01): a selected tip that is
+        // absent from the recovered block_data yields a bogus single-element chain
+        // path that corrupts fork choice + finality. Refuse to start rather than
+        // run on inconsistent consensus state. This does NOT false-positive under
+        // pruning — the tip is the most recent block and is always loaded (unlike
+        // the parent-completeness check, which pruning can legitimately break, so
+        // that one stays a warning above).
+        if !s.chain.selected_tip.is_empty() && !s.block_data.contains_key(&s.chain.selected_tip) {
+            let msg = format!(
+                "recovered selected tip '{}' is missing from block_data ({} blocks loaded)",
+                s.chain.selected_tip,
+                s.block_data.len()
+            );
+            slog_error!("consensus", "fatal_inconsistent_recovery", error => &msg);
+            return Err(ConsensusError::BlockValidation(msg));
+        }
         Ok(s)
     }
 
