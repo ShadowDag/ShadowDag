@@ -614,22 +614,17 @@ fn cmd_balance(args: &[String]) {
         }
     };
 
-    let db_path = utxo_db_path();
-    match UtxoStore::new(db_path.as_str()) {
-        Ok(store) => match store.get_balance(&address) {
-            Ok(balance) => {
-                let sdag = balance as f64 / 100_000_000.0;
-                println!("Address : {}", address);
-                println!("Balance : {:.8} SDAG ({} sats)", sdag, balance);
-            }
-            Err(e) => {
-                eprintln!("Error querying balance: {}", e);
-            }
-        },
-        Err(e) => {
-            slog_error!("wallet", "utxo_db_open_failed", path => &db_path, error => &e.to_string());
-            eprintln!("Make sure a ShadowDAG node has been run at least once,");
-            eprintln!("or set SHADOWDAG_DB to the correct path.");
+    let socket = cli_rpc_target();
+    match fetch_utxos_via_rpc(socket, &address) {
+        Some(utxos) => {
+            let balance: u64 = utxos.iter().map(|u| u.amount).sum();
+            let sdag = balance as f64 / 100_000_000.0;
+            println!("Address : {}", address);
+            println!("Balance : {:.8} SDAG ({} sats)", sdag, balance);
+        }
+        None => {
+            eprintln!("Could not reach a running node RPC to query the balance.");
+            eprintln!("Start a node, or set SHADOWDAG_RPC to host:port.");
         }
     }
 }
