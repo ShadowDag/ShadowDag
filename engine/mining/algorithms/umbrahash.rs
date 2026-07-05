@@ -358,19 +358,46 @@ pub const UMBRA_POW_VERSION: u32 = 3;
 /// cache). Nodes call this per block; regenerated only when the epoch changes.
 /// Generating the cache is ~hundreds of ms; verification then regenerates only
 /// the ~64 touched dataset items on demand (no 1 GiB dataset needed).
-pub fn cache_for_epoch(epoch: u64) -> Arc<Vec<u8>> {
-    type EpochCacheSlot = OnceLock<Mutex<Option<(u64, Arc<Vec<u8>>)>>>;
-    static CACHE: EpochCacheSlot = OnceLock::new();
-    let cell = CACHE.get_or_init(|| Mutex::new(None));
-    let mut guard = cell.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((e, c)) = guard.as_ref() {
-        if *e == epoch {
-            return Arc::clone(c);
-        }
+/// Number of recent epoch caches kept resident. A SINGLE slot let an attacker
+/// thrash the memo by alternating two epochs across a boundary, forcing a full
+/// 16 MiB mkcache on every header BEFORE the PoW check (amplification DoS). A
+/// small LRU keeps the current and adjacent epochs resident so honest
+/// validation (and near-boundary crossings) never regenerates, and 2-epoch
+/// alternation no longer evicts. Cost: MAX_EPOCH_CACHES × 16 MiB resident.
+pub const MAX_EPOCH_CACHES: usize = 3;
+
+/// LRU core: return the cached bytes for `epoch`, building via `build` on a miss
+/// and evicting the least-recently-used slot past `max_slots`. A hit moves the
+/// entry to most-recently-used. Pure over `slots` so it is cheaply testable
+/// without the (heavy) real mkcache.
+fn epoch_cache_lru<F: FnOnce() -> Arc<Vec<u8>>>(
+    slots: &mut Vec<(u64, Arc<Vec<u8>>)>,
+    epoch: u64,
+    max_slots: usize,
+    build: F,
+) -> Arc<Vec<u8>> {
+    if let Some(pos) = slots.iter().position(|(e, _)| *e == epoch) {
+        let hit = slots.remove(pos);
+        let c = Arc::clone(&hit.1);
+        slots.push(hit); // move-to-most-recently-used
+        return c;
     }
-    let cache = Arc::new(mkcache(CACHE_BYTES, &epoch_seed(epoch)));
-    *guard = Some((epoch, Arc::clone(&cache)));
+    let cache = build();
+    slots.push((epoch, Arc::clone(&cache)));
+    while slots.len() > max_slots {
+        slots.remove(0); // evict least-recently-used
+    }
     cache
+}
+
+pub fn cache_for_epoch(epoch: u64) -> Arc<Vec<u8>> {
+    type EpochCacheLru = OnceLock<Mutex<Vec<(u64, Arc<Vec<u8>>)>>>;
+    static CACHE: EpochCacheLru = OnceLock::new();
+    let cell = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = cell.lock().unwrap_or_else(|p| p.into_inner());
+    epoch_cache_lru(&mut guard, epoch, MAX_EPOCH_CACHES, || {
+        Arc::new(mkcache(CACHE_BYTES, &epoch_seed(epoch)))
+    })
 }
 
 /// The epoch a block height belongs to.
@@ -504,6 +531,38 @@ mod tests {
             let full = hashimoto_full(&dataset, &h, nonce, PS);
             assert_eq!(light, full, "light != full for nonce {}", nonce);
         }
+    }
+
+    #[test]
+    fn epoch_cache_lru_keeps_recent_and_evicts_oldest() {
+        // Uses a trivial builder (no heavy mkcache) to exercise the LRU that
+        // defends against the single-slot cross-epoch thrash DoS.
+        use std::cell::Cell;
+        let mut slots: Vec<(u64, Arc<Vec<u8>>)> = Vec::new();
+        let builds = Cell::new(0u32);
+        let get = |slots: &mut Vec<(u64, Arc<Vec<u8>>)>, e: u64| {
+            epoch_cache_lru(slots, e, 3, || {
+                builds.set(builds.get() + 1);
+                Arc::new(vec![e as u8])
+            })
+        };
+
+        let a0 = get(&mut slots, 0);
+        let _b1 = get(&mut slots, 1);
+        // Requesting epoch 0 again must HIT (no rebuild) even after touching 1 —
+        // the exact 2-epoch alternation the single slot used to thrash.
+        let a0b = get(&mut slots, 0);
+        assert!(Arc::ptr_eq(&a0, &a0b), "epoch 0 must stay cached across epoch 1");
+        assert_eq!(builds.get(), 2, "only epochs 0 and 1 were built");
+
+        // Fill past capacity: with [1,0] resident (0 now MRU), add 2 then 3 →
+        // capacity 3 holds {1,0,2} then evicts LRU (1) when 3 arrives.
+        let _c2 = get(&mut slots, 2);
+        let _d3 = get(&mut slots, 3);
+        assert_eq!(builds.get(), 4);
+        assert!(!slots.iter().any(|(e, _)| *e == 1), "epoch 1 must be evicted as LRU");
+        assert!(slots.iter().any(|(e, _)| *e == 0), "epoch 0 (recently used) must survive");
+        assert!(slots.len() <= 3, "LRU never exceeds MAX_EPOCH_CACHES");
     }
 
     #[test]
