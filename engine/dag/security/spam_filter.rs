@@ -66,9 +66,9 @@ impl SpamFilter {
             }
 
             // 🔥 outputs checks (يشمل الجميع)
-            // Confidential (RingCT) outputs carry amount=0 by design (value in the
-            // commitment); the zero-amount rejection is transparent-only.
-            let is_conf = tx.is_confidential();
+            // Confidential (RingCT) AND shield outputs carry amount=0 by design
+            // (value in the commitment); the zero-amount rejection is transparent-only.
+            let is_conf = tx.is_confidential() || tx.is_shield();
             let mut seen_outputs = HashSet::with_capacity(tx.outputs.len());
             let mut total: u128 = 0;
 

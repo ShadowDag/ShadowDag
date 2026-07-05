@@ -10,6 +10,12 @@ mod tests {
     use crate::domain::transaction::tx_validator::{
         MAX_OUTPUT_AMOUNT, MAX_TX_INPUTS, MAX_TX_OUTPUTS,
     };
+    use crate::config::consensus::consensus_params::ConsensusParams;
+    use crate::domain::block::block::Block;
+    use crate::domain::block::block_body::BlockBody;
+    use crate::domain::block::block_header::BlockHeader;
+    use crate::engine::dag::security::dos_protection::DosProtection;
+    use crate::engine::dag::security::spam_filter::SpamFilter;
 
     fn make_tx_with_n_outputs(n: usize) -> Transaction {
         use crate::domain::transaction::tx_validator::DUST_LIMIT;
@@ -132,6 +138,108 @@ mod tests {
         assert!(
             !validate_tx(&tx),
             "TX with output exceeding MAX_OUTPUT_AMOUNT should fail"
+        );
+    }
+
+    // ── Regression (B1-H02): Shield tx outputs carry amount=0 by design (value
+    //    hidden in the commitment) and must be exempt from the "zero output" rule
+    //    in the structural DoS/spam validators, exactly like RingCT confidential
+    //    outputs. Before the fix `is_conf` checked only is_confidential(), so any
+    //    block carrying a Shield tx was rejected chain-wide (shield unminable).
+    fn shield_tx(hash: &str) -> Transaction {
+        Transaction {
+            hash: hash.to_string(),
+            inputs: vec![TxInput {
+                txid: "a".repeat(64), // valid 64-hex so utxo_key() succeeds
+                index: 0,
+                owner: String::new(),
+                signature: String::new(),
+                pub_key: String::new(),
+                key_image: None,
+                ring_members: None,
+                ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
+                shield_blinding: None,
+            }],
+            outputs: vec![TxOutput {
+                address: "SD1pshieldoutputaddress000000000000000000".into(),
+                amount: 0, // shield output — value is in the commitment
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
+            }],
+            fee: 1,
+            timestamp: 1735689600,
+            is_coinbase: false,
+            tx_type: TxType::Shield,
+            payload_hash: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn shield_zero_output_passes_dos_protection() {
+        let tx = shield_tx("shield_dos_regression");
+        let res = DosProtection::validate_transaction(&tx);
+        assert!(
+            res.is_ok(),
+            "Shield tx (amount=0 outputs) must not be rejected by DoS protection: {:?}",
+            res.reason
+        );
+
+        // Differential: the SAME tx as a transparent transfer is still rejected.
+        let mut transparent = tx.clone();
+        transparent.tx_type = TxType::Transfer;
+        let res_t = DosProtection::validate_transaction(&transparent);
+        assert!(
+            !res_t.is_ok() && res_t.reason.as_deref() == Some("Zero output"),
+            "transparent tx with a zero-amount output must fail with 'Zero output', got {:?}",
+            res_t.reason
+        );
+    }
+
+    #[test]
+    fn shield_zero_output_passes_spam_filter() {
+        let coinbase = Transaction {
+            hash: "cb_shield_block".into(),
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                address: "shadow1miner".into(),
+                amount: 1_000_000_000,
+                commitment: None,
+                range_proof: None,
+                ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
+            }],
+            fee: 0,
+            timestamp: 1735689600,
+            is_coinbase: true,
+            tx_type: TxType::Transfer,
+            payload_hash: None,
+            ..Default::default()
+        };
+        let block = Block {
+            header: BlockHeader::new_with_defaults(
+                1,
+                "shield_block_hash".into(),
+                vec!["parent_hash".into()],
+                "merkle_root".into(),
+                1735689600,
+                0,
+                ConsensusParams::GENESIS_DIFFICULTY,
+                1,
+            ),
+            body: BlockBody {
+                transactions: vec![coinbase, shield_tx("shield_spam_regression")],
+            },
+        };
+        assert!(
+            SpamFilter::validate(&block),
+            "a block carrying a valid Shield tx must pass the spam filter"
         );
     }
 

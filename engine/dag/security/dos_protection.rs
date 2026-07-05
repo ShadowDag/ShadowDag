@@ -191,9 +191,10 @@ impl DosProtection {
             }
         }
 
-        // Outputs. Confidential (RingCT) outputs carry amount=0 by design (value
-        // in the commitment); the zero-amount rejection is transparent-only.
-        let is_conf = tx.is_confidential();
+        // Outputs. Confidential (RingCT) AND shield outputs carry amount=0 by
+        // design (value in the commitment); the zero-amount rejection is
+        // transparent-only.
+        let is_conf = tx.is_confidential() || tx.is_shield();
         let mut total: u128 = 0;
 
         for output in &tx.outputs {
