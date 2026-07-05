@@ -330,6 +330,20 @@ impl ExplorerServer {
     fn api_stats(stream: &mut TcpStream, state: &SharedState) {
         let data = match state.lock() {
             Ok(s) => {
+                // Derive the algorithm label from the CURRENT TIP's version so the
+                // explorer reflects what is actually being mined (ShadowHash for
+                // v2, UmbraHash for v3) instead of a hardcoded string.
+                let algorithm = s
+                    .block_store
+                    .get_block(&s.best_hash)
+                    .map(|b| {
+                        crate::engine::mining::pow::pow_validator::pow_algorithm_name(
+                            b.header.version,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        crate::engine::mining::pow::pow_validator::pow_algorithm_name(0)
+                    });
                 json!({
                     "best_height": s.best_height,
                     "best_hash": s.best_hash,
@@ -343,7 +357,7 @@ impl ExplorerServer {
                     "chain_name": ConsensusParams::CHAIN_NAME,
                     "chain_id": format!("0x{:08X}", ConsensusParams::CHAIN_ID),
                     "max_supply": ConsensusParams::MAX_SUPPLY,
-                    "algorithm": "ShadowHash (SHA256+Blake3+SHA3-256+AntiASIC)",
+                    "algorithm": algorithm,
                 })
             }
             Err(_) => json!({"error": "state locked"}),

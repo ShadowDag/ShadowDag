@@ -27,6 +27,18 @@ pub const MIN_DIFFICULTY: u64 = 1;
 
 pub struct PowValidator;
 
+/// Human-readable PoW algorithm name for a header version, for explorer/RPC
+/// display. Version-gated exactly like validation: >= UMBRA_POW_VERSION is the
+/// memory-hard UmbraHash, below is the legacy ShadowHash. Use the current tip's
+/// version so the label reflects the algorithm actually being mined.
+pub fn pow_algorithm_name(version: u32) -> &'static str {
+    if version >= umbrahash::UMBRA_POW_VERSION {
+        "UmbraHash (memory-hard Ethash-style + mini-ProgPoW)"
+    } else {
+        "ShadowHash (SHA256+Blake3+SHA3-256+AntiASIC)"
+    }
+}
+
 impl PowValidator {
     /// Full block PoW validation
     pub fn validate(block: &Block) -> PowResult {

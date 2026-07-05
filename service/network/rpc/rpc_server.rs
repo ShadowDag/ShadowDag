@@ -1742,7 +1742,11 @@ impl RpcServer {
                         "block_reward": crate::config::consensus::emission_schedule::EmissionSchedule::block_reward(s.best_height),
                         "miner_pct":    ConsensusParams::MINER_PERCENT,
                         "network":      s.network_name,
-                        "algorithm":    "ShadowHash (SHA256+Blake3+SHA3-256+AntiASIC)",
+                        // Version-gated from the current tip: ShadowHash (v2) or
+                        // UmbraHash (v3) — reflects what is actually being mined.
+                        "algorithm":    crate::engine::mining::pow::pow_validator::pow_algorithm_name(
+                            s.block_store.get_block(&s.best_hash).map(|b| b.header.version).unwrap_or(0)
+                        ),
                     }),
                 )
             }
@@ -2611,7 +2615,10 @@ impl RpcServer {
             json!({
                 "shadowdag_version": "1.0.0",
                 "consensus":         "GHOSTDAG",
-                "pow_algorithm":     "ShadowHash (SHA256 + 64KB Scratchpad + Anti-ASIC + SHA3-256)",
+                // The node validates BOTH: legacy ShadowHash (v2) and the
+                // memory-hard UmbraHash (v3, opt-in via --pow=umbra). The active
+                // algorithm on-chain is the tip's — see getmininginfo/getpowinfo.
+                "pow_algorithm":     "ShadowHash (v2) / UmbraHash (v3, memory-hard Ethash-style + mini-ProgPoW)",
                 "asic_resistant":    true,
                 "privacy":           ConsensusParams::PRIVACY_ENABLED,
                 "smart_contracts":   ConsensusParams::SMART_CONTRACTS_ENABLED,
@@ -2756,15 +2763,25 @@ impl RpcServer {
 
     fn cmd_getpowinfo(id: Value) -> RpcResponse {
         use crate::engine::mining::algorithms::shadowhash::SCRATCHPAD_SIZE;
+        use crate::engine::mining::algorithms::umbrahash::{CACHE_BYTES, DATASET_BYTES};
         RpcResponse::ok(
             id,
             json!({
-                "algorithm":       "ShadowHash",
-                "pipeline":        ["SHA-256", "Memory-hard (64KB scratchpad)", "Anti-ASIC (16KB, 256 rounds)", "SHA3-256"],
-                "scratchpad_kb":   SCRATCHPAD_SIZE / 1024,
+                "algorithm":       "ShadowHash (v2) / UmbraHash (v3, opt-in)",
+                "shadowhash": {
+                    "pipeline":      ["SHA-256", "Memory-hard (64KB scratchpad)", "Anti-ASIC (16KB, 256 rounds)", "SHA3-256"],
+                    "scratchpad_kb": SCRATCHPAD_SIZE / 1024,
+                },
+                "umbrahash": {
+                    "type":          "Ethash-style memory-hard + mini-ProgPoW ALU layer",
+                    "dataset_mib":   DATASET_BYTES / (1024 * 1024),
+                    "cache_mib":     CACHE_BYTES / (1024 * 1024),
+                    "cheap_verify":  true,
+                    "note":          "GPU-first, ASIC-resistant; opt-in via --pow=umbra (header version 3)",
+                },
                 "asic_resistant":  true,
                 "gpu_mining":      true,
-                "gpu_backends":    ["CUDA", "OpenCL", "Rayon (CPU multi-thread)"],
+                "gpu_backends":    ["OpenCL", "Rayon (CPU multi-thread)"],
                 "stratum_v1":      true,
                 "target_type":     "256-bit numeric (target = MAX_TARGET / difficulty)",
             }),
