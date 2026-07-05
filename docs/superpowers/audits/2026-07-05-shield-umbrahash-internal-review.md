@@ -194,11 +194,99 @@ cryptographic review of the composition is essential.
 
 ---
 
+## Part 2 — Cryptographic primitive review (2026-07-05)
+
+A second adversarial pass (crypto-review lens: five layers, severity by attacker
+impact, red-flags list) covered the RingCT primitives that Part 1 had left out of
+scope. Method: 7 dimension-agents read the files in full, each finding was
+re-verified by a refute-first pass, and the three crown-jewel files were **also
+read in full by hand** (independent confirmation). Threat model: a malicious tx
+author / miner attacking *others* — inflate, forge a spend, double-spend,
+de-anonymize, or recover a key.
+
+**Result: NO reachable break found.** 19 candidate findings were raised; 18 were
+refuted as non-exploitable (no inflation/forgery/double-spend/deanon/key-recovery
+on any reachable path), 1 confirmed and it is INFO. This is an **internal,
+time-boxed** result — it *reduces* risk, it does not certify. The hand-rolled
+constructions' soundness is **assumed** to reduce to ECDLP on Ristretto until an
+external cryptographer proves it.
+
+**Per-primitive assessment (crown jewels, hand-read):**
+
+| File | Verdict | Basis |
+|------|---------|-------|
+| `pedersen.rs` | ✅ sound | `generator_h` = `from_uniform_bytes(SHA512("ShadowDAG_Pedersen_H_v1"))` — a proper nothing-up-my-sleeve point, no known `log_G(H)` ⇒ binding holds (no generator-relation inflation). `verify_balance` checks `Σ C_in == Σ C_out + fee·H` correctly; Ristretto's type rejects torsion/non-canonical points. Security **depends on** the range proof for the non-negative bound. |
+| `dual_clsag.rs` | ✅ well-built | Fresh `alpha` per signature from `OsRng` + zeroize (no ECDSA-`k` reuse); challenge + aggregation transcripts bind message + full ring + pseudo-out + both key images, domain-separated; correct dual-key binding `w = μ_P·p + μ_C·z`; rejects identity key-image/D; constant-count signing loop. |
+| `range_proof.rs` | ⚠️ weakest link | Hand-rolled 64-bit Borromean bit-decomposition. Structurally sound (each bit ring forces `bit∈{0,1}` given H⊥G; the `Σ 2^i·C_i == C` check pins value to `[0,2^64)` — a `C_i = 2·H+r·G` forge was empirically rejected). But it is **hand-rolled**, its Fiat-Shamir transcript is **thin** (`bit_challenge` omits `C_i`/`H`/commitment/context — soundness survives only because the ring keys enter via the `L` points and the sum-check pins `C_i`), and it is large/slow (~64 points + 192 scalars/output vs ~700 B for Bulletproofs). |
+
+**Findings (all non-exploitable on reachable paths):**
+
+- **INFO — `pedersen.rs::commit` accepts zero/low-entropy blinding.** A caller
+  passing `blinding = 0` produces `C = value·H`, brute-forceable to leak the
+  amount. Self-inflicted (harms only a misusing sender); consensus/soundness
+  intact. Guidance: callers MUST use a CSPRNG blinding (`commit_random`); zero is
+  correct *only* for the public fee term.
+- **MEDIUM (hardening, not a break) — thin Fiat-Shamir in `range_proof.rs`.**
+  Bind `C_i`, `H`, the output commitment, and a tx/output context into
+  `bit_challenge` to make soundness robust against future refactors. Verified
+  non-exploitable today.
+- **MEDIUM (hygiene) — `dual_clsag.rs::hash_to_point` lacks a domain tag.** It is
+  `SHA512(P.compress())` with no prefix (byte-identical preimage space to any
+  other bare-SHA512 use). Add a domain separator to the key-image generator.
+- **LOW — `dual_clsag::verify` accepts a size-1 ring.** Zero anonymity, but the
+  consensus gate (`confidential_consensus.rs:228`, `MIN_RING_SIZE = 4`) rejects
+  it before signature verification — so gated, not reachable. Belt-and-suspenders:
+  reject `n < 2` in the primitive too.
+- **LOW — `dual_clsag::from_bytes` trusts an attacker `u32 count`.** `need`
+  arithmetic could overflow on a 32-bit target; the `b.len() != need` check gates
+  the `Vec::with_capacity(count)` allocation on 64-bit (ShadowDAG's target), so no
+  practical DoS. Add a `count ≤ MAX_RING_SIZE` bound for defense-in-depth.
+- **LOW / footgun — the legacy `ring_signature.rs::RingSignature` primitive is
+  cryptographically broken** (key image = `SHA256(domain‖privkey)` with no ring
+  binding; "group op" is an XOR chain — unforgeability and linkability both
+  absent). It is **dead w.r.t. consensus**: its broken crypto
+  (`verify_signature`/`sign_with_key`) has zero non-test callers, and its only
+  live caller `RingValidator::validate` uses the *structural-only*
+  `RingSignature::verify(tx)` (key-image format + ring size), while real spend
+  authorization uses `dual_clsag`/`clsag` (Ristretto). It is already
+  `#[deprecated]`. **Action:** delete or `#[cfg(test)]`-gate the broken crypto and
+  its misleading "sound" doc-comments so no future caller wires it in.
+
+**Structural gap this surfaced (the central RingCT item):** on the live block
+path, a confidential tx currently passes only `RingValidator::validate`
+(structural) — the CLSAG crypto gate (`verify_confidential_tx` /
+`verify_clsag`) is run on the mempool and `validate_block_utxos` paths but **not
+the live apply path**, exactly as `README.md` documents RingCT sender-privacy as
+"experimental, not consensus-enforced." Confidential txs are not enabled/live, so
+this is not an active exploit — but **finalizing RingCT block-enforcement (wiring
+the crypto gate into the live apply path) is required before confidential value
+is allowed on mainnet.**
+
+**Recommendations for the external cryptographer (priority order):**
+1. **Replace the hand-rolled Borromean range proof with a vetted Bulletproofs
+   implementation** (e.g. dalek `bulletproofs`) — ~12× smaller, peer-reviewed,
+   and removes the thin-Fiat-Shamir risk class entirely. Highest-value change.
+2. Prove (or refute) soundness of the current range proof and dual-CLSAG under a
+   stated model; confirm the ECDLP-on-Ristretto reduction the code assumes.
+3. Add domain separation to `hash_to_point`; consolidate the two parallel CLSAG
+   modules (`clsag.rs` and `dual_clsag.rs`) to one audited implementation.
+4. Delete the broken `RingSignature` primitive.
+5. Finalize RingCT block-enforcement (run the crypto gate on the live path).
+
+*Note: the hardening items above are deliberately NOT changed piecemeal in this
+pass — the primitives are pre-external-review and the recommended Bulletproofs
+migration would supersede several of them; changing crypto derivations now would
+churn consensus for no gain before the reviewer sets the final construction.*
+
+---
+
 ## Required before mainnet (external audit checklist)
 
-1. **Cryptographer review of the primitives** (out of scope here):
-   `pedersen.rs` (H/G independence, `verify_balance`), `range_proof.rs`,
-   `dual_clsag.rs`. Shield's inflation-resistance depends on them.
+1. **Cryptographer review of the primitives** — Part 2 above is an INTERNAL pass
+   that found no reachable break, but external sign-off is still the hard gate:
+   `pedersen.rs` (H/G independence, `verify_balance`), `range_proof.rs`
+   (hand-rolled → recommend Bulletproofs), `dual_clsag.rs`. Shield's
+   inflation-resistance depends on them.
 2. **Consensus review of UmbraHash composition** (Ethash DAG + mini-ProgPoW) and
    the light==full equivalence for all inputs.
 3. **Set `UMBRA_ACTIVATION_HEIGHT`** (finding #4; enforcement mechanism scaffolded
