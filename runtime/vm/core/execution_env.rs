@@ -81,6 +81,8 @@ pub const NEW_ACCOUNT_GAS: u64 = 25_000;
 pub const CALL_STIPEND: u64 = 2_300;
 pub const CODE_DEPOSIT_GAS_PER_BYTE: u64 = 200;
 pub const CREATE2_WORD_GAS: u64 = 6;
+/// Per-byte gas for LOG data payload (EVM LOG schedule: 8 gas/byte).
+pub const LOG_DATA_GAS_PER_BYTE: u64 = 8;
 
 /// Block-level context (immutable for a transaction)
 #[derive(Debug, Clone)]
@@ -3337,6 +3339,18 @@ impl ExecutionEnvironment {
                     }
                     let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
                     let length = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    // Per-byte log-data gas (EVM LOG: 8 gas/byte). The base opcode
+                    // gas covers 375 + 375*topics but NOT the payload; without this a
+                    // loop of LOG over warm memory forces every validating node to
+                    // materialize huge log payloads far below the intended cost (B5-M01).
+                    if let GasResult::OutOfGas { .. } =
+                        gas.consume((length as u64).saturating_mul(LOG_DATA_GAS_PER_BYTE))
+                    {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let mut topics = Vec::with_capacity(num_topics);
                     for _ in 0..num_topics {
                         topics.push(pop1!(stack, gas, snapshot, self));

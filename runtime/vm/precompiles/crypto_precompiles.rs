@@ -6,7 +6,7 @@
 // Cryptographic precompiles — signature verification, key recovery, commitments.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use super::precompile_registry::PrecompileResult;
@@ -99,7 +99,11 @@ pub fn ed25519_verify(input: &[u8], _gas_limit: u64) -> PrecompileResult {
 
     let sig = Signature::from_bytes(&sig_bytes);
 
-    if vk.verify(message, &sig).is_ok() {
+    // verify_strict rejects malleable/non-canonical signatures (torsion / small-
+    // order points), matching the tx path (TxValidator uses verify_strict). Plain
+    // verify() let a contract-reachable 0x08 accept a second valid signature for
+    // one (key, message), defeating replay/uniqueness assumptions (B5-M02).
+    if vk.verify_strict(message, &sig).is_ok() {
         PrecompileResult::ok(vec![0x01], gas_used)
     } else {
         PrecompileResult::ok(vec![0x00], gas_used)
