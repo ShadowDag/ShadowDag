@@ -648,21 +648,26 @@ impl StratumServer {
             }
         };
 
-        // Find the submitting worker by name AND validate peer_addr matches
-        let mut workers = self.workers.write().unwrap_or_else(|e| e.into_inner());
-        let worker = match workers.values_mut().find(|w| w.name == *worker_name) {
-            Some(w) => {
-                // Verify the submit comes from the same connection that authorized
-                if w.peer_addr != peer_addr {
-                    return StratumResponse::err(req.id, "Worker peer address mismatch");
+        // Find the worker, validate its connection, and SNAPSHOT the fields needed
+        // for hashing — then DROP the workers lock BEFORE the expensive ShadowHash.
+        // Holding the global write lock across the hash serialized every worker's
+        // submit/authorize/disconnect behind one CPU-heavy op (B2-M01).
+        let (worker_id, worker_difficulty, worker_extra_nonce) = {
+            let mut workers = self.workers.write().unwrap_or_else(|e| e.into_inner());
+            match workers.values_mut().find(|w| w.name == *worker_name) {
+                Some(w) => {
+                    // Verify the submit comes from the same connection that authorized.
+                    if w.peer_addr != peer_addr {
+                        return StratumResponse::err(req.id, "Worker peer address mismatch");
+                    }
+                    (w.id, w.difficulty, w.extra_nonce)
                 }
-                w
+                None => return StratumResponse::err(req.id, "Worker not authorized"),
             }
-            None => return StratumResponse::err(req.id, "Worker not authorized"),
         };
 
         // Share replay prevention key for this worker/job/nonce.
-        let share_key = (job_id.clone(), nonce_hex.to_lowercase(), worker.id);
+        let share_key = (job_id.clone(), nonce_hex.to_lowercase(), worker_id);
         // Fast duplicate check before expensive hashing.
         if self
             .seen_shares
@@ -673,11 +678,8 @@ impl StratumServer {
             return StratumResponse::err(req.id, "Duplicate share");
         }
 
-        let worker_difficulty = worker.difficulty;
-        let worker_extra_nonce = worker.extra_nonce;
-
-        // Validate share against the worker's current vardiff difficulty,
-        // using the template snapshot captured above (avoids TOCTOU).
+        // Validate share against the worker's snapshotted vardiff difficulty and the
+        // template snapshot — the heavy ShadowHash runs with NO lock held.
         let share_valid = self.validate_share(
             nonce_hex,
             worker_difficulty,
@@ -710,21 +712,24 @@ impl StratumServer {
                 seen.insert(share_key);
             }
 
-            worker.accept_share();
-
-            // Adjust difficulty when enough shares have accumulated in
-            // the current window. The old approach (elapsed % 60 == 0)
-            // was fragile — it could miss the exact second or fire
-            // multiple times. Checking shares_in_window is deterministic.
-            if worker.shares_in_window >= TARGET_SHARES_PER_MIN && worker.vardiff_adjust() {
-                // Flag the worker so the connection handler sends
-                // mining.set_difficulty after writing the submit response.
-                // We cannot write to the TCP stream here because
-                // handle_submit has no access to the writer.
-                worker.pending_difficulty_update = true;
+            // Re-acquire the workers lock ONLY to record the accepted share +
+            // vardiff (cheap). The worker may have disconnected meanwhile — if so,
+            // nothing to update. The share result stands on the snapshot above.
+            {
+                let mut workers = self.workers.write().unwrap_or_else(|e| e.into_inner());
+                if let Some(worker) = workers.values_mut().find(|w| w.id == worker_id) {
+                    worker.accept_share();
+                    // Deterministic vardiff: adjust once enough shares accumulate in
+                    // the window; the connection handler sends mining.set_difficulty.
+                    if worker.shares_in_window >= TARGET_SHARES_PER_MIN && worker.vardiff_adjust()
+                    {
+                        worker.pending_difficulty_update = true;
+                    }
+                }
             }
 
-            // Check if share also meets network difficulty (block found!)
+            // Check if share also meets network difficulty (block found!) — this
+            // hash also runs with NO workers lock held.
             if self.meets_network_difficulty(nonce_hex, worker_extra_nonce, &template_snapshot) {
                 self.blocks_found.fetch_add(1, Ordering::Relaxed);
 
@@ -759,7 +764,11 @@ impl StratumServer {
 
             StratumResponse::ok(req.id, "true")
         } else {
-            worker.reject_share();
+            // Re-acquire the lock only to record the rejection (worker may be gone).
+            let mut workers = self.workers.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(worker) = workers.values_mut().find(|w| w.id == worker_id) {
+                worker.reject_share();
+            }
             StratumResponse::err(req.id, "Low difficulty share")
         }
     }
