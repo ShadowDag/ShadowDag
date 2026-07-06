@@ -189,11 +189,14 @@ impl ChainVerifier {
             // too far in the future. Without this, an attacker could
             // serve a chain with all timestamps set years ahead and
             // it would pass the relative monotonicity/gap checks.
+            // Header timestamps are epoch MILLISECONDS; compare against a ms bound
+            // (MAX_HEADER_TIME_GAP_SECS * 1000), else every real header is wrongly
+            // rejected as "future" (B4-L07).
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_secs();
-            if header.timestamp > now + MAX_HEADER_TIME_GAP_SECS {
+                .as_millis() as u64;
+            if header.timestamp > now + MAX_HEADER_TIME_GAP_SECS * 1000 {
                 return ChainVerifyResult::TimestampGap {
                     height: header.height,
                     gap_secs: header.timestamp - now,
@@ -243,8 +246,9 @@ impl ChainVerifier {
                         prev_timestamp,
                     };
                 }
+                // gap is a MILLISECOND delta; compare against the bound in ms (B4-L08).
                 let gap = header.timestamp - prev_timestamp;
-                if gap > MAX_HEADER_TIME_GAP_SECS {
+                if gap > MAX_HEADER_TIME_GAP_SECS * 1000 {
                     return ChainVerifyResult::TimestampGap {
                         height: header.height,
                         gap_secs: gap,

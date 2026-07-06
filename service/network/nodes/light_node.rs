@@ -103,9 +103,11 @@ impl LightNode {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
-        if header.timestamp > now + 120 {
-            // MAX_FUTURE_SECS
+            .as_millis() as u64;
+        // Header timestamps are epoch MILLISECONDS; the future bound must be in ms
+        // (120 s = 120_000 ms), else every real ms header is rejected as "future"
+        // and SPV header sync never accepts a single header (B4-L03).
+        if header.timestamp > now + 120_000 {
             return false;
         }
         true
