@@ -519,9 +519,12 @@ fn cmd_new(args: &[String]) {
 }
 
 fn cmd_restore(args: &[String]) {
-    let network = args.get(2).map(|s| s.as_str()).unwrap_or("mainnet");
-
     let env_network = wallet_network();
+    // Default to SHADOWDAG_NETWORK (matching cmd_new). Hardcoding "mainnet" here
+    // persisted an SD1 wallet under a testnet env that later env-derived commands
+    // (ST1) could not find — the exact footgun cmd_new was fixed to avoid (B7-L02).
+    let network = args.get(2).map(|s| s.as_str()).unwrap_or(&env_network);
+
     if network != env_network {
         eprintln!(
             "NOTE: Restoring wallet for '{}' but SHADOWDAG_NETWORK='{}'",

@@ -198,6 +198,15 @@ impl Wallet {
         if mnemonic.is_empty() || mnemonic.iter().any(|w| w.trim().is_empty()) {
             return Err(WalletError::Other("empty recovery phrase".into()));
         }
+        // Reject non-standard word counts so a missing/extra-word typo fails loudly
+        // instead of silently deriving a different (empty) wallet. A full per-word
+        // checksum would change the derivation and break existing wallets (B6-L01).
+        if !matches!(mnemonic.len(), 12 | 15 | 18 | 21 | 24) {
+            return Err(WalletError::Other(format!(
+                "recovery phrase must be 12/15/18/21/24 words (got {})",
+                mnemonic.len()
+            )));
+        }
         let seed = mnemonic_to_seed_simple(mnemonic, "");
         let enc = encrypt_bytes(&seed, password)?;
         self.session_key = Some(seed);
@@ -782,7 +791,7 @@ impl Wallet {
             .ok_or(WalletError::BalanceOverflow)?;
         if avail_bal < amount.saturating_add(fee) {
             return Err(WalletError::InsufficientFunds {
-                need: amount + fee,
+                need: amount.saturating_add(fee),
                 have: avail_bal,
             });
         }
@@ -1950,6 +1959,13 @@ mod tests {
             .is_err());
         assert!(Wallet::new("mainnet")
             .restore_from_mnemonic(&["".to_string()], "pw")
+            .is_err());
+
+        // B6-L01: a non-standard word count (a missing/extra-word typo) is rejected
+        // instead of silently deriving a different, empty wallet.
+        let three_words: Vec<String> = vec!["abandon".into(), "ability".into(), "able".into()];
+        assert!(Wallet::new("mainnet")
+            .restore_from_mnemonic(&three_words, "pw-strong-123")
             .is_err());
     }
 

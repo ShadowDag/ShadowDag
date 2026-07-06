@@ -303,11 +303,14 @@ impl NodeConfig {
                 "--network" if i + 1 < args.len() => {
                     let val = &args[i + 1];
                     network = val.parse().unwrap_or_else(|_| {
+                        // Abort rather than fail open: silently defaulting an
+                        // unrecognized --network to Mainnet (mainnet magic/peers/data
+                        // dir) is the most dangerous outcome for a CLI typo (B7-L01).
                         eprintln!(
-                            "WARNING: Unknown --network '{}', falling back to mainnet",
+                            "Error: unknown --network '{}' (expected mainnet | testnet | regtest)",
                             val
                         );
-                        NetworkMode::Mainnet
+                        std::process::exit(1);
                     });
                     i += 1;
                 }
