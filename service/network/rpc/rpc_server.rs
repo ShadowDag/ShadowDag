@@ -3921,7 +3921,7 @@ impl RpcServer {
         match state.lock() {
             Ok(s) => {
                 let mut layers = Vec::new();
-                for h in from_height..from_height + count as u64 {
+                for h in from_height..from_height.saturating_add(count as u64) {
                     let hashes = s.block_store.get_block_hashes_at_height(h);
                     if !hashes.is_empty() {
                         layers.push(json!({"height": h, "blocks": hashes, "width": hashes.len()}));
@@ -4176,8 +4176,8 @@ impl RpcServer {
         let to = params
             .get(1)
             .and_then(|v| v.as_u64())
-            .unwrap_or(from + 10)
-            .min(from + 100);
+            .unwrap_or(from.saturating_add(10))
+            .min(from.saturating_add(100));
         match state.lock() {
             Ok(s) => {
                 let mut blocks = Vec::new();

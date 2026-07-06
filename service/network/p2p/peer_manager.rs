@@ -341,12 +341,19 @@ impl PeerManager {
     }
 
     pub fn remove_peer(&self, addr: &str) -> Result<(), NetworkError> {
-        if !self.peer_exists(addr) {
+        let ip = Self::extract_ip(addr);
+        let db = self.lock_db();
+        // Existence check + per-IP count read + the writes all happen under ONE lock
+        // hold, so two concurrent removes of the same addr can no longer both pass
+        // the check and each decrement meta:peer_count (drifting it below truth) — B4-L04.
+        let exists = db
+            .get(format!("{}{}", PFX_PEER, addr).as_bytes())
+            .map(|v| v.is_some())
+            .unwrap_or(false);
+        if !exists {
             return Ok(()); // Nothing to remove
         }
-        let ip = Self::extract_ip(addr);
-        let count = self.conn_count_for_ip(ip);
-        let db = self.lock_db();
+        let count = Self::conn_count_for_ip_inner(&db, ip);
         let mut batch = WriteBatch::default();
         batch.delete(format!("{}{}", PFX_PEER, addr).as_bytes());
         batch.delete(format!("{}{}", PFX_LAST_SEEN, addr).as_bytes());
@@ -754,11 +761,6 @@ impl PeerManager {
         while cache.len() >= MAX_ADDR_CACHE_SIZE {
             cache.remove(0);
         }
-    }
-
-    fn conn_count_for_ip(&self, ip: &str) -> u32 {
-        let db = self.lock_db();
-        Self::conn_count_for_ip_inner(&db, ip)
     }
 
     /// Read the per-IP connection count from an ALREADY-LOCKED db, so the caller

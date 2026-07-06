@@ -146,6 +146,9 @@ const MAX_ORPHAN_BLOCKS: usize = 500;
 
 /// Maximum orphan blocks per peer (prevents single-peer flood)
 const MAX_ORPHAN_PER_PEER: usize = 25;
+/// Bound on distinct peer_ids tracked in `peer_block_timestamps` before a stale
+/// sweep runs, so rotated peer identities can't grow that map without limit.
+const MAX_TRACKED_PEERS: usize = 10_000;
 
 /// Maximum age (seconds) before an orphan is evicted.
 /// Tightened from 600s to 120s to reduce the selfish mining withholding
@@ -2658,6 +2661,12 @@ impl FullNode {
             .as_secs();
 
         if let Ok(mut timestamps) = self.peer_block_timestamps.lock() {
+            // Bound the map: when it grows large, drop peers whose timestamps are ALL
+            // stale (they stopped submitting) — otherwise rotated peer_ids leak entries
+            // forever, since a peer's entry is only revisited when it submits again (B4-L01).
+            if timestamps.len() > MAX_TRACKED_PEERS {
+                timestamps.retain(|_, ts| ts.iter().any(|t| now.saturating_sub(*t) < 60));
+            }
             let entry = timestamps
                 .entry(peer_id.to_string())
                 .or_insert_with(Vec::new);
@@ -2719,6 +2728,23 @@ impl FullNode {
                                 *c = c.saturating_sub(1);
                                 if *c == 0 {
                                     counts.remove(&peer_id);
+                                }
+                            }
+                        }
+                        // Clean this orphan's dangling entries under its OTHER parents:
+                        // add_orphan registered it under EVERY parent, and it was only
+                        // drained from the parent that arrived, leaking hashes under the
+                        // rest (evict_expired can't reclaim them once pooled) — B4-L02.
+                        if let Ok(mut by_parent) = self.orphan_by_parent.lock() {
+                            for p in &block.header.parents {
+                                let now_empty = if let Some(list) = by_parent.get_mut(p) {
+                                    list.retain(|h| h != &hash);
+                                    list.is_empty()
+                                } else {
+                                    false
+                                };
+                                if now_empty {
+                                    by_parent.remove(p);
                                 }
                             }
                         }
