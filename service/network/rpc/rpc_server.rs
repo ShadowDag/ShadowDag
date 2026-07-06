@@ -57,6 +57,11 @@ pub const MAX_REQUEST_SIZE: usize = MAX_BODY;
 
 pub const MAX_GETBLOCKS_RANGE: usize = 500;
 
+/// Max confidential outputs returned per `getconfidentialoutputs` page. Lets a
+/// wallet page the global okey→commitment index (for decoy selection) in bounded
+/// chunks instead of walking every block.
+pub const MAX_CONF_OUTPUTS_RANGE: usize = 2000;
+
 pub const MAX_MEMPOOL_RESPONSE: usize = 10_000;
 
 pub const RPC_READ_TIMEOUT_SECS: u64 = 10;
@@ -1191,6 +1196,7 @@ impl RpcServer {
             "getblockfull" => Self::cmd_getblockfull(params, id, state),
             "getblocks" => Self::cmd_getblocks(params, id, state),
             "getblockcount" => Self::cmd_getblockcount(id, state),
+            "getconfidentialoutputs" => Self::cmd_getconfidentialoutputs(params, id, state),
             "getbestblockhash" => Self::cmd_getbestblockhash(id, state),
             "sendrawtransaction" => Self::cmd_sendrawtransaction(params, id, state),
             "getbalance" => Self::cmd_getbalance(params, id, state),
@@ -1565,6 +1571,59 @@ impl RpcServer {
                         "start_height": start_height,
                         "count":        blocks.len(),
                         "blocks":       blocks,
+                    }),
+                )
+            }
+            Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        }
+    }
+
+    /// Read-only: page the global confidential-output index (okey→commitment) so a
+    /// wallet can select decoys and look up real inputs WITHOUT walking every block
+    /// or opening the node's UTXO DB. Params: [start, count]. Outputs are returned
+    /// in global-index order; `total` is the full index size. Served from the live
+    /// node UtxoSet, so it reflects all indexed outputs (no external-DB staleness).
+    fn cmd_getconfidentialoutputs(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
+        let start = params.first().and_then(|v| v.as_u64()).unwrap_or(0);
+        let count_raw = params
+            .get(1)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(MAX_CONF_OUTPUTS_RANGE as u64) as usize;
+        if count_raw > MAX_CONF_OUTPUTS_RANGE {
+            return RpcResponse::err(
+                id,
+                ERR_INVALID_PARAMS,
+                format!(
+                    "Requested {} outputs exceeds MAX_CONF_OUTPUTS_RANGE ({})",
+                    count_raw, MAX_CONF_OUTPUTS_RANGE
+                ),
+            );
+        }
+        match state.lock() {
+            Ok(s) => {
+                let total = s.utxo_store.confidential_output_count();
+                let end = start.saturating_add(count_raw as u64).min(total);
+                let mut outputs: Vec<Value> = Vec::new();
+                let mut i = start;
+                while i < end {
+                    if let Some(okey) = s.utxo_store.confidential_output_at(i) {
+                        if let Some(commitment) = s.utxo_store.output_key_commitment(&okey) {
+                            outputs.push(json!({
+                                "index": i,
+                                "okey": okey,
+                                "commitment": commitment,
+                            }));
+                        }
+                    }
+                    i += 1;
+                }
+                RpcResponse::ok(
+                    id,
+                    json!({
+                        "total":   total,
+                        "start":   start,
+                        "count":   outputs.len(),
+                        "outputs": outputs,
                     }),
                 )
             }
@@ -2643,6 +2702,7 @@ impl RpcServer {
                     {"name": "getblock",           "params": "[hash]",     "description": "Get full block by hash"},
                     {"name": "getblocks",          "params": "[start, count]", "description": "Get blocks by height range"},
                     {"name": "getblockcount",      "params": "[]",        "description": "Get current block count"},
+                    {"name": "getconfidentialoutputs", "params": "[start, count]", "description": "Page the confidential-output index (okey/commitment) for decoy selection"},
                     {"name": "getbestblockhash",   "params": "[]",        "description": "Get best block hash"},
                     {"name": "sendrawtransaction", "params": "[tx_json]", "description": "Submit a transaction"},
                     {"name": "getbalance",         "params": "[address]", "description": "Get address balance"},
@@ -5509,6 +5569,38 @@ mod tests {
         let s = make_server();
         let r = call_params(&s, "sendrawtransaction", json!(["not-valid-json"]));
         assert!(r["error"].is_object());
+    }
+
+    #[test]
+    fn getconfidentialoutputs_pages_the_index() {
+        let s = make_server();
+        {
+            let st = s.shared_state();
+            let g = st.lock().unwrap();
+            g.utxo_store
+                .record_confidential_output_indexed("okey_a", "comm_a")
+                .unwrap();
+            g.utxo_store
+                .record_confidential_output_indexed("okey_b", "comm_b")
+                .unwrap();
+            g.utxo_store
+                .record_confidential_output_indexed("okey_c", "comm_c")
+                .unwrap();
+        }
+        // Full page returns all three in global-index order, with commitments.
+        let r = call_params(&s, "getconfidentialoutputs", json!([0, 100]));
+        assert_eq!(r["result"]["total"], json!(3));
+        let outs = r["result"]["outputs"].as_array().unwrap();
+        assert_eq!(outs.len(), 3);
+        assert_eq!(outs[0]["okey"], json!("okey_a"));
+        assert_eq!(outs[0]["commitment"], json!("comm_a"));
+        assert_eq!(outs[2]["okey"], json!("okey_c"));
+        // Paging window: start=1, count=1 → just the middle output.
+        let r2 = call_params(&s, "getconfidentialoutputs", json!([1, 1]));
+        assert_eq!(r2["result"]["total"], json!(3));
+        let outs2 = r2["result"]["outputs"].as_array().unwrap();
+        assert_eq!(outs2.len(), 1);
+        assert_eq!(outs2[0]["okey"], json!("okey_b"));
     }
 
     #[test]

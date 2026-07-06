@@ -1298,25 +1298,17 @@ fn fetch_utxos_via_rpc(socket: std::net::SocketAddr, address: &str) -> Option<Ve
 }
 
 /// Build an in-memory `UtxoSet` holding the global confidential-output index
-/// (okey→commitment plus the sequential okeyidx) by walking the chain over RPC.
-/// A confidential send uses this to look up each real input's commitment and to
-/// select decoys WITHOUT opening the node's live UTXO RocksDB — that DB is held
-/// under an exclusive lock by the running node and lives at a network-namespaced
-/// path, so a direct open races the node and can corrupt it. Returns None if the
-/// node is unreachable over RPC. NETWORK PATH: live-node only.
+/// (okey→commitment plus the sequential okeyidx) by PAGING the node's
+/// `getconfidentialoutputs` RPC. A confidential send uses this to look up each
+/// real input's commitment and to select decoys WITHOUT opening the node's live
+/// UTXO RocksDB (held under an exclusive lock, at a network-namespaced path — a
+/// direct open races the node and can corrupt it). This is O(pool size), not
+/// O(chain length): the node queries its okey index once per page rather than the
+/// wallet re-scanning every block. Returns None if the node is unreachable.
 fn confidential_index_via_rpc() -> Option<shadowdag::domain::utxo::utxo_set::UtxoSet> {
-    use shadowdag::domain::block::block::Block;
-    use std::collections::HashSet;
-    // Sanity ceiling: the height comes from a possibly-hostile node (SHADOWDAG_RPC).
-    const MAX_SCAN_HEIGHT: u64 = 100_000_000;
-    const PAGE: u64 = 500; // must be <= server MAX_GETBLOCKS_RANGE
+    const PAGE: u64 = 2000; // must be <= server MAX_CONF_OUTPUTS_RANGE
 
     let socket = cli_rpc_target();
-    let count_v = cli_rpc_call(socket, "getblockcount", serde_json::json!([]))?;
-    let height = count_v
-        .as_u64()
-        .or_else(|| count_v.get("best_height").and_then(|v| v.as_u64()))?
-        .min(MAX_SCAN_HEIGHT);
 
     // Build the index in a fresh THROWAWAY temp RocksDB (scratch — NOT the node's
     // live UTXO store). Reused per run: clear any prior scratch dir first.
@@ -1327,37 +1319,33 @@ fn confidential_index_via_rpc() -> Option<shadowdag::domain::utxo::utxo_set::Utx
         std::sync::Arc::new(store)
             as std::sync::Arc<dyn shadowdag::domain::traits::utxo_backend::UtxoBackend>,
     );
-    let mut seen: HashSet<String> = HashSet::new();
+
+    // Page the node's confidential-output index in global-index order; recording
+    // in the same order reproduces the okeyidx the node exposes.
     let mut start = 0u64;
-    while start <= height {
-        let resp = cli_rpc_call(socket, "getblocks", serde_json::json!([start, PAGE]))?;
-        let arr = match resp.get("blocks").and_then(|b| b.as_array()) {
-            Some(a) if !a.is_empty() => a.clone(),
+    loop {
+        let resp = cli_rpc_call(
+            socket,
+            "getconfidentialoutputs",
+            serde_json::json!([start, PAGE]),
+        )?;
+        let arr = match resp.get("outputs").and_then(|o| o.as_array()) {
+            Some(a) if !a.is_empty() => a,
             _ => break,
         };
-        for item in &arr {
-            if let Some(hash) = item.get("hash").and_then(|h| h.as_str()) {
-                if let Some(full) = cli_rpc_call(socket, "getblockfull", serde_json::json!([hash])) {
-                    if let Ok(block) = serde_json::from_value::<Block>(full) {
-                        for tx in &block.body.transactions {
-                            for out in &tx.outputs {
-                                if let (Some(otk), Some(c)) =
-                                    (out.one_time_pubkey.as_ref(), out.commitment.as_ref())
-                                {
-                                    // Dedup: an okey is globally unique on-chain; recording
-                                    // it twice would inflate the index count and break decoy
-                                    // selection's distinct-member guarantee.
-                                    if seen.insert(otk.clone()) {
-                                        let _ = set.record_confidential_output_indexed(otk, c);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        for item in arr {
+            if let (Some(okey), Some(c)) = (
+                item.get("okey").and_then(|v| v.as_str()),
+                item.get("commitment").and_then(|v| v.as_str()),
+            ) {
+                let _ = set.record_confidential_output_indexed(okey, c);
             }
         }
-        start = start.checked_add(PAGE)?;
+        let total = resp.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+        start = start.checked_add(arr.len() as u64)?;
+        if start >= total {
+            break;
+        }
     }
     Some(set)
 }
