@@ -338,10 +338,13 @@ impl RetargetEngine {
         let mut times: Vec<u64> = window.iter().map(|r| r.timestamp).collect();
         times.sort_unstable();
 
-        let median = times[n / 2];
+        // Full-window average inter-block time: (newest - oldest) / (n-1) intervals.
+        // Previously used the MEDIAN (times[n/2]) as the span endpoint yet still
+        // divided by the full n-1 interval count, ~halving the result (B1-L01).
+        let newest = times[n - 1];
         let oldest = times[0];
 
-        let span = median.saturating_sub(oldest).max(1);
+        let span = newest.saturating_sub(oldest).max(1);
 
         let max_span = TARGET_BLOCK_TIME_MS * LONG_WINDOW as u64;
         let clamped_span = span.min(max_span).max(1);
@@ -469,6 +472,22 @@ mod tests {
             dag_block_count: dag_count,
             blue_score: blue,
         }
+    }
+
+    #[test]
+    fn average_time_uses_full_window_span() {
+        // Regression (B1-L01): the inter-block average must be the FULL-span mean
+        // (newest - oldest)/(n-1), not the median-endpoint value that ~halved it.
+        let engine = RetargetEngine::new(1000);
+        let mut window: VecDeque<BlockTimeRecord> = VecDeque::new();
+        for i in 0..20u64 {
+            window.push_back(block(i, i * TARGET_BLOCK_TIME_MS, 1000));
+        }
+        // 20 blocks spaced exactly TARGET apart -> average must equal TARGET.
+        assert_eq!(
+            engine.compute_average_time_integer(&window),
+            TARGET_BLOCK_TIME_MS
+        );
     }
 
     #[test]

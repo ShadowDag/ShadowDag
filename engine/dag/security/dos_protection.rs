@@ -31,7 +31,6 @@ pub const MIN_RELAY_FEE: u64 =
     crate::config::consensus::mempool_config::MempoolConfig::MIN_RELAY_FEE;
 pub const MIN_FEE_PER_BYTE: u64 = 1;
 
-pub const MAX_NONCE: u64 = u64::MAX;
 pub const MAX_OUTPUT_AMOUNT: u64 = u64::MAX / 2;
 
 /// Canonical future-drift bound in MILLISECONDS (120 s of real time).
@@ -101,11 +100,9 @@ impl DosProtection {
             }
         }
 
-        // Nonce — only reject the MAX_NONCE sentinel value.
-        // nonce==0 is rare but valid: a miner can solve PoW on the first try.
-        if block.header.nonce == MAX_NONCE {
-            return DosCheckResult::fail("Invalid nonce (MAX_NONCE sentinel)".to_string());
-        }
+        // Nonce: any u64 is valid (the nonce is validated by PoW). The old sentinel
+        // reject dropped a legitimately-mined block whose PoW happened to land on
+        // u64::MAX, and disagreed with flood_protection which accepts it (B1-L02).
 
         // Timestamp (ms vs ms)
         let now = SystemTime::now()

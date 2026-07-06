@@ -83,6 +83,8 @@ pub const CODE_DEPOSIT_GAS_PER_BYTE: u64 = 200;
 pub const CREATE2_WORD_GAS: u64 = 6;
 /// Per-byte gas for LOG data payload (EVM LOG schedule: 8 gas/byte).
 pub const LOG_DATA_GAS_PER_BYTE: u64 = 8;
+/// Per-exponent-byte gas for EXP (EVM schedule: 50 gas per byte of the exponent).
+pub const EXP_GAS_PER_BYTE: u64 = 50;
 
 /// Block-level context (immutable for a transaction)
 #[derive(Debug, Clone)]
@@ -1547,9 +1549,16 @@ impl ExecutionEnvironment {
                 }
                 OpCode::EXP => {
                     let (base, exp) = pop2!(stack, gas, snapshot, self);
+                    // Per-exponent-byte gas (EVM: 50 per byte of the exponent) on top of
+                    // the flat base, so heavy exponentiation is not undercharged relative
+                    // to the native square-and-multiply work (B5-L01).
+                    let exp_byte_cost =
+                        (exp.bit_len() as u64).div_ceil(8).saturating_mul(EXP_GAS_PER_BYTE);
+                    if let GasResult::OutOfGas { .. } = gas.consume(exp_byte_cost) {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure { gas_used: gas.gas_used() };
+                    }
                     // Full 256-bit exponent via square-and-multiply (mod 2^256).
-                    // The old code capped the exponent at 255 and read only its
-                    // low 64 bits, giving wrong results (e.g. EXP(2,256) != 0).
                     stack.push(base.wrapping_pow(exp));
                 }
                 OpCode::ADDMOD => {
@@ -3941,6 +3950,46 @@ mod tests {
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Success { .. }));
+    }
+
+    #[test]
+    fn exp_charges_per_exponent_byte() {
+        // Regression (B5-L01): EXP charges EXP_GAS_PER_BYTE per byte of the exponent,
+        // so a 32-byte operand pair costs ~31*50 gas more than a 1-byte pair. Both
+        // operands are made equal-width so the test is independent of pop2! order.
+        fn run_exp(push: &[u8]) -> u64 {
+            let mut env = make_env();
+            let mut code: Vec<u8> = Vec::new();
+            code.extend_from_slice(push); // base
+            code.extend_from_slice(push); // exponent
+            code.push(0x25); // EXP (vm.rs OpCode encoding)
+            code.push(0x00); // STOP
+            env.state.set_code("c", code).unwrap();
+            let ctx = CallContext {
+                address: "c".into(),
+                code_address: "c".into(),
+                caller: "u".into(),
+                value: 0,
+                gas_limit: 1_000_000,
+                calldata: vec![],
+                is_static: false,
+                depth: 0,
+                is_delegate: false,
+            };
+            match env.execute_frame(&ctx) {
+                CallOutcome::Success { gas_used, .. } => gas_used,
+                _ => panic!("EXP execution did not succeed"),
+            }
+        }
+        let small = run_exp(&[0x10, 3]); // PUSH1 3  -> 1-byte exponent
+        let mut big_push = vec![0x15]; // PUSH32
+        big_push.extend_from_slice(&[0xFF; 32]); // 32-byte operand
+        let big = run_exp(&big_push);
+        assert!(
+            big >= small + 31 * EXP_GAS_PER_BYTE,
+            "big={big} small={small} expected diff >= {}",
+            31 * EXP_GAS_PER_BYTE
+        );
     }
 
     #[test]
