@@ -83,12 +83,36 @@ impl BlockTemplateBuilder {
         timestamp: u64,
         difficulty: u64,
     ) -> Result<Block, ConsensusError> {
-        let parents = Self::select_dag_parents(tip_manager, dag_manager)?;
+        // Read tips ONCE: select the parents AND capture the snapshot their
+        // height/blue_score are read from in a SINGLE lock. Previously the
+        // parents came from select_dag_parents' own tip read and the height map
+        // from a SECOND get_tips read — a tip evicted between the two dropped a
+        // parent from the map, collapsing the block height (max(parent_heights)+1
+        // fell short) and wasting the miner's PoW on a rejected template (B2-L01).
+        let max_parents = ConsensusParams::MAX_PARENTS.min(MAX_DAG_PARENTS);
+        let (candidates, tips) = tip_manager.select_parents_with_snapshot(max_parents);
+        if candidates.is_empty() {
+            return Err(ConsensusError::Other(
+                "No DAG tips available for parent selection".to_string(),
+            ));
+        }
+        // Validate all parent blocks exist in the DAG (as select_dag_parents did).
+        let mut parents: Vec<String> = Vec::with_capacity(candidates.len());
+        for parent_hash in &candidates {
+            if !dag_manager.block_exists(parent_hash) {
+                slog_warn!("mining", "tip_not_found_in_dag", hash_prefix => &parent_hash[..parent_hash.len().min(16)]);
+                continue;
+            }
+            parents.push(parent_hash.clone());
+        }
+        if parents.is_empty() {
+            return Err(ConsensusError::Other(
+                "No valid parent blocks found in DAG".to_string(),
+            ));
+        }
+        // Deterministic parent ordering — consensus requires all nodes agree.
+        parents.sort();
 
-        // Read tips ONCE to avoid TOCTOU between height, selected_parent,
-        // and blue_score computations. If tips change between reads, the
-        // template could have an inconsistent combination.
-        let tips = tip_manager.get_tips();
         let tip_map_height: std::collections::HashMap<&str, u64> =
             tips.iter().map(|t| (t.hash.as_str(), t.height)).collect();
         let tip_map_score: std::collections::HashMap<&str, u64> = tips
