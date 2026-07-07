@@ -946,6 +946,22 @@ impl TxValidator {
             return true;
         }
 
+        // Confidential (RingCT) inputs are RING-signed: their `signature`/`pub_key`
+        // are empty and authenticity is proven by the dual-key CLSAG gate
+        // (`verify_confidential_tx`), the SOLE authority for confidential inputs.
+        // That gate provably runs before apply on every consensus path — mempool
+        // (`validate_tx_for_network` -> `validate_confidential`), block/reorg
+        // (`verify_block_confidential_txs` before `apply_block_dag_ordered`), and
+        // genesis (`validate_block_utxos`). Running the transparent Ed25519 check
+        // here would reject every confidential send BEFORE that gate ever runs. A
+        // confidential tx cannot spend transparent UTXOs (ring members must be real
+        // on-chain confidential outputs), so this skip is not an inflation vector.
+        // SHIELD txs are NOT skipped: their inputs are transparent Ed25519 and
+        // `verify_shield_tx` relies on this very check.
+        if tx.is_confidential() {
+            return true;
+        }
+
         let msg = TxHash::signing_message_for_network(tx, network);
 
         // Use parallel verification for transactions with many inputs (4+).
@@ -1585,5 +1601,42 @@ mod tests {
             &set,
             &NetworkMode::Mainnet
         ));
+    }
+
+    #[test]
+    fn verify_signatures_skips_confidential_but_gates_transparent() {
+        // A confidential (RingCT) send carries ring-signed inputs whose Ed25519
+        // signature/pub_key are EMPTY; verify_signatures_for_network must SKIP them
+        // so the dual-key CLSAG gate is the sole authority. The skip is type-gated:
+        // the SAME empty-signature input on a non-confidential tx must still fail.
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::transaction::transaction::TxInput;
+
+        let mut tx = Transaction::new(
+            "e".repeat(64),
+            vec![TxInput::new_confidential(
+                "0".repeat(64),
+                0,
+                "owner".into(),
+                String::new(),
+                String::new(),
+                hex::encode([7u8; 32]),
+                (0..4).map(|i| hex::encode([i as u8; 32])).collect(),
+            )],
+            vec![TxOutput::new("SD1dest".into(), 0)],
+            0,
+            1_700_000_000,
+        );
+        tx.tx_type = TxType::Confidential;
+        assert!(
+            TxValidator::verify_signatures_for_network(&tx, &NetworkMode::Mainnet),
+            "confidential ring inputs must skip the Ed25519 check (CLSAG gate is authority)"
+        );
+
+        tx.tx_type = TxType::Transfer;
+        assert!(
+            !TxValidator::verify_signatures_for_network(&tx, &NetworkMode::Mainnet),
+            "a non-confidential tx with empty Ed25519 signatures must still be rejected"
+        );
     }
 }

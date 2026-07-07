@@ -442,6 +442,45 @@ mod tests {
         assert!(verify_confidential_tx(&tx, &set, &net(), &mut seen).is_ok());
     }
 
+    #[test]
+    fn confidential_send_skips_sig_gate_and_clsag_gate_is_authority() {
+        // Regression for the RingCT block-enforcement fix: a confidential send has
+        // ring-signed inputs (empty Ed25519 signature/pub_key), so it must SKIP the
+        // transparent signature gate (`verify_signatures_for_network`) and be gated
+        // solely by the dual-key CLSAG gate. A forged tx still skips the sig gate
+        // but is rejected by the CLSAG gate — proving where the real authority lies.
+        use crate::domain::transaction::tx_validator::TxValidator;
+
+        let set = UtxoSet::new_empty();
+        let tx = valid_conf_tx(&set, 100);
+
+        assert!(
+            TxValidator::verify_signatures_for_network(&tx, &net()),
+            "confidential send must pass (skip) the transparent Ed25519 signature gate"
+        );
+        let mut seen = HashSet::new();
+        assert!(
+            verify_confidential_tx(&tx, &set, &net(), &mut seen).is_ok(),
+            "valid confidential send must pass the CLSAG consensus gate"
+        );
+
+        // Forge the hidden output value. The sig gate still skips it (still
+        // confidential), but the CLSAG gate rejects it.
+        let mut forged = tx.clone();
+        let bogus = Scalar::from(101u64) * generator_h()
+            + Scalar::random(&mut OsRng) * RISTRETTO_BASEPOINT_POINT;
+        forged.outputs[0].commitment = Some(hexp(&bogus));
+        assert!(
+            TxValidator::verify_signatures_for_network(&forged, &net()),
+            "forged confidential tx still skips the sig gate (CLSAG is the authority)"
+        );
+        let mut seen2 = HashSet::new();
+        assert!(
+            verify_confidential_tx(&forged, &set, &net(), &mut seen2).is_err(),
+            "forged confidential tx must be rejected by the CLSAG consensus gate"
+        );
+    }
+
     // ── Shield tests (transparent -> confidential) ──────────────────────────
 
     /// Build a valid 1-in/1-out shield tx: a transparent UTXO of `amt` owned by

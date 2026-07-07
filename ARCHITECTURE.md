@@ -327,19 +327,22 @@ Multiplier = 2^(utilization x 6), capped at 64x
 | Shadow Pool | `shadow_pool/` | Privacy-first TX aggregation |
 | Dandelion++ | `service/network/propagation/` | Network-layer anonymity |
 
-> **Status (RingCT phase 1 — sender privacy): PARTIAL, NOT consensus-enforced.**
-> `TxValidator::validate_confidential` implements the CLSAG gate (verify_clsag +
-> `ki:` key-image uniqueness + `okey:` ring-member authenticity), and it is wired
-> into the **mempool** admission path only. It is **NOT** yet called by block
-> validation (`UtxoValidator::validate_block_utxos`) or the live apply path
-> (`UtxoSet::apply_block_dag_ordered`), and key-image/output-key recording is not
-> wired into the live apply path either. Net effect today: confidential TXs are
-> rejected at the mempool (the `okey:` set is empty) and treated as transparent
-> (Ed25519 ownership + balance) inside blocks — the ring signature is not enforced
-> in consensus. Known follow-ups: wire the gate + recording into the block path,
-> fix `okey:` to index one-time output keys, dedup ring members, bind key-image +
-> ring into the CLSAG challenge. **Amounts remain plaintext** (dual-key CLSAG
-> deferred). Do not rely on this for privacy yet.
+> **Status (RingCT — sender privacy + hidden amounts): ENFORCED on all consensus
+> paths, EXTERNAL-REVIEW-GATED (not mainnet-final).**
+> The dual-key CLSAG gate `verify_confidential_tx` (dual-key CLSAG + `ki:`
+> key-image uniqueness + on-chain `okey:` ring-member authenticity binding P AND C
+> + per-output range proofs + homomorphic balance `Σ C'_in == Σ C_out + fee·H`) is
+> wired into every path: **mempool** (`TxValidator::validate_confidential`),
+> **block validation** (`UtxoValidator::validate_block_utxos`), and **reorg/apply**
+> (`verify_block_confidential_txs`, run before `apply_block_dag_ordered`, which
+> records `ki:`/`okey:` atomically with rollback undo). The transparent Ed25519
+> gate (`TxValidator::verify_signatures_for_network`) skips confidential ring
+> inputs (empty `signature`/`pub_key`) so confidential sends reach the CLSAG gate;
+> shield txs keep the Ed25519 check (their inputs are transparent). Amounts are
+> hidden (plaintext output `amount` forced to 0; value lives in the commitment).
+> **This CHANGES BLOCK VALIDITY and is inflation-risk: it requires MANDATORY
+> external cryptographic + consensus review before mainnet. Do not rely on it for
+> privacy on mainnet yet.**
 
 ---
 

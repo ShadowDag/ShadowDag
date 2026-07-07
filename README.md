@@ -295,8 +295,8 @@ Honest snapshot of what is wired vs. in progress (as of 2026-06-29):
 | Mining (ShadowHash + Stratum pool) | Implemented |
 | GPU mining | CPU fallback only — no CUDA/OpenCL kernels |
 | Privacy primitives (CLSAG / Pedersen / range proofs / stealth) | Implemented (unit-tested) |
-| Sender privacy in consensus (RingCT phase 1) | **Partial / not enforced in blocks.** The CLSAG gate (`TxValidator::validate_confidential`) runs only in the mempool path; block validation (`validate_block_utxos`) and the live apply path (`apply_block_dag_ordered`) do NOT yet run it, and key-image/output-key recording is not wired into the live apply path. Treat as experimental, not consensus-enforced. |
-| Confidential amounts (hidden amounts) | Not yet — requires dual-key CLSAG; amounts currently plaintext |
+| Sender privacy in consensus (RingCT) | **Enforced on all consensus paths — external-review-gated, not mainnet-final.** The dual-key CLSAG gate (`verify_confidential_tx`) runs in the mempool (`TxValidator::validate_confidential`), block validation (`UtxoValidator::validate_block_utxos`), and reorg/apply (`verify_block_confidential_txs`, before `apply_block_dag_ordered`); `ki:`/`okey:` are recorded atomically with rollback undo, and the transparent Ed25519 gate (`verify_signatures_for_network`) skips ring inputs so confidential sends reach the CLSAG gate. **Pending MANDATORY external cryptographic + consensus review before mainnet — do not treat as final or rely on it for privacy on mainnet yet.** |
+| Confidential amounts (hidden amounts) | Implemented for confidential/shield outputs (dual-key CLSAG; plaintext `amount` forced to 0, value hidden in the Pedersen commitment + range proof). External-review-gated, not mainnet-final. |
 | HD wallet (BIP39 + SLIP-0010) | Implemented |
 
 ## License
