@@ -495,6 +495,7 @@ impl DaemonNode {
 
         const POLL_INTERVAL: Duration = Duration::from_millis(50);
         const STATS_INTERVAL: Duration = Duration::from_secs(30);
+        const FLUSH_INTERVAL: Duration = Duration::from_secs(15);
         const TX_BATCH_LIMIT: usize = 500; // Max TXs per tick (backpressure)
         const BLOCK_BATCH_LIMIT: usize = 50; // Max blocks per tick
 
@@ -509,6 +510,7 @@ impl DaemonNode {
         }
 
         let mut last_stats = Instant::now();
+        let mut last_flush = Instant::now();
         let mut last_sync_req = Instant::now();
         let mut total_blocks_processed: u64 = 0;
         let mut total_txs_processed: u64 = 0;
@@ -949,6 +951,16 @@ impl DaemonNode {
                 last_stats = Instant::now();
             }
 
+            // ── Periodic durability checkpoint ──────────────────────
+            // Flush memtables to SST + fsync the WAL every FLUSH_INTERVAL so an
+            // unclean stop (SIGKILL / lost WAL across a container recreate)
+            // cannot leave the shared store effectively empty and force a full
+            // replay. Bounds worst-case loss to one flush window.
+            if last_flush.elapsed() >= FLUSH_INTERVAL {
+                self.flush_persist();
+                last_flush = Instant::now();
+            }
+
             // ── Adaptive sleep ──────────────────────────────────────
             // If we did work, poll again immediately (more data may be waiting).
             // If idle, sleep briefly to avoid busy-waiting.
@@ -966,11 +978,20 @@ impl DaemonNode {
             txs_rejected => total_txs_rejected
         );
 
-        // Flush RocksDB WAL to prevent corruption
+        self.flush_persist();
+        slog_info!("daemon", "shutdown_complete");
+    }
+
+    /// Durably persist the shared DB: flush memtables to SST, then fsync the WAL.
+    /// Called periodically during the event loop and once on graceful shutdown so
+    /// an unclean stop cannot leave the store effectively empty.
+    pub fn flush_persist(&self) {
         if let Err(e) = self.db.flush() {
             slog_warn!("daemon", "rocksdb_flush_failed", error => e);
         }
-        slog_info!("daemon", "shutdown_complete");
+        if let Err(e) = self.db.flush_wal(true) {
+            slog_warn!("daemon", "rocksdb_wal_flush_failed", error => e);
+        }
     }
 
     // ── Public API ───────────────────────────────────────────────
@@ -1815,5 +1836,56 @@ mod tests {
         assert!(!is_non_penalized_block_rejection(
             "block validation failed: invalid coinbase"
         ));
+    }
+
+    fn regtest_cfg_in(dir: std::path::PathBuf) -> NodeConfig {
+        let mut cfg = NodeConfig::for_network(NetworkMode::Regtest);
+        cfg.data_dir = dir;
+        cfg
+    }
+
+    /// DURABILITY REGRESSION: UTXO state persisted via `flush_persist` must
+    /// survive a full close + reopen of the shared RocksDB (memtable -> SST +
+    /// WAL fsync). This is the guarantee that an unclean stop cannot leave the
+    /// store effectively empty and force the full-replay crash loop. Guards the
+    /// ctrlc-termination + periodic-flush fix.
+    #[test]
+    fn flushed_utxo_survives_db_reopen() {
+        use crate::domain::utxo::utxo_set::utxo_key;
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::path::PathBuf::from(format!(
+            "{}/shadowdag_reopen_{}",
+            std::env::temp_dir().display(),
+            ts
+        ));
+        let n = 4usize;
+
+        let expected;
+        {
+            let d = DaemonNode::new(regtest_cfg_in(dir.clone()))
+                .expect("first daemon open must succeed");
+            let base = d.utxo_set.count_utxos();
+            for i in 0..n {
+                let txh = format!("{:064x}", i + 1);
+                let key = utxo_key(&txh, 0).expect("valid utxo key");
+                d.utxo_set
+                    .add_utxo(&key, format!("owner{}", i), 5_000 + i as u64, format!("owner{}", i));
+            }
+            expected = base + n;
+            assert_eq!(d.utxo_set.count_utxos(), expected, "added UTXOs must be counted");
+            d.flush_persist();
+        }
+
+        let d2 = DaemonNode::new(regtest_cfg_in(dir))
+            .expect("reopen on same data dir must succeed");
+        assert_eq!(
+            d2.utxo_set.count_utxos(),
+            expected,
+            "flushed UTXO set must survive a DB close + reopen"
+        );
     }
 }
