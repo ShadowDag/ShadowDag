@@ -71,6 +71,10 @@ pub mod contract_e2e_tests;
 #[path = "tests/suite/multi_node_tests.rs"]
 pub mod multi_node_tests;
 
+// ── Initial Block Download (IBD) from a static peer ─────────────────
+#[path = "tests/suite/ibd_sync_tests.rs"]
+pub mod ibd_sync_tests;
+
 // ── Soak, chaos, and adversarial tests ─────────────────────────────
 #[path = "tests/suite/chaos_tests.rs"]
 pub mod chaos_tests;

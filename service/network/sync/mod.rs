@@ -8,11 +8,51 @@ pub mod chain_verifier;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
+
 pub const MAX_IN_FLIGHT: usize = 128;
 pub const PEER_TIMEOUT_SECS: u64 = 15;
 pub const MAX_RETRIES: u32 = 3;
 pub const HEADERS_BATCH_SIZE: usize = 2_000;
 pub const BLOCKS_BATCH_SIZE: usize = 128;
+
+pub const MAX_SERVE_HEADERS: usize = 2_000;
+
+pub fn build_headers_response(
+    store: &BlockStore,
+    best_height: u64,
+    from_hash: &str,
+    count: usize,
+) -> Vec<String> {
+    let cap = count.clamp(1, MAX_SERVE_HEADERS);
+    let start_h = if from_hash.is_empty() {
+        1
+    } else {
+        match store.get_block_height(from_hash) {
+            Some(h) => h.saturating_add(1),
+            None => 1,
+        }
+    };
+
+    let mut out = Vec::new();
+    let mut h = start_h;
+    while out.len() < cap && h <= best_height {
+        for hash in store.get_block_hashes_at_height(h) {
+            out.push(hash);
+            if out.len() >= cap {
+                break;
+            }
+        }
+        h += 1;
+    }
+    out
+}
+
+pub fn serve_block_bytes(store: &BlockStore, hash: &str) -> Option<Vec<u8>> {
+    store
+        .get_block(hash)
+        .and_then(|b| bincode::serialize(&b).ok())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SyncState {

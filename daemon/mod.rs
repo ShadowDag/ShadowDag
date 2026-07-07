@@ -40,11 +40,13 @@ use crate::runtime::node_runtime::lifecycle::Lifecycle;
 use crate::service::mempool::core::mempool_manager::MempoolManager;
 use crate::service::mempool::pools::tx_pool::TxPoolResult;
 use crate::service::network::dos_guard::{BanCategory, MAX_TX_BYTES};
-use crate::service::network::nodes::full_node::FullNode;
+use crate::service::network::nodes::full_node::{get_dag_tips, set_local_height, FullNode};
 use crate::service::network::p2p::p2p::{
-    drain_pending_blocks, drain_pending_txs, push_outbound, report_bad_peer, report_bad_peer_cat,
-    requeue_pending_blocks, requeue_pending_txs, P2PMessage, P2P,
+    drain_pending_blocks, drain_pending_txs, drain_serve_requests, peer_best_height, push_outbound,
+    push_outbound_to_peer, report_bad_peer, report_bad_peer_cat, requeue_pending_blocks,
+    requeue_pending_txs, P2PMessage, P2P,
 };
+use crate::service::network::sync::{build_headers_response, serve_block_bytes};
 use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::service::network::contract_ide::ContractIdeServer;
 use crate::service::network::explorer::ExplorerServer;
@@ -386,6 +388,8 @@ impl DaemonNode {
         const STATS_INTERVAL: Duration = Duration::from_secs(30);
         const TX_BATCH_LIMIT: usize = 500; // Max TXs per tick (backpressure)
         const BLOCK_BATCH_LIMIT: usize = 50; // Max blocks per tick
+        const SYNC_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
+        const SERVE_BATCH_LIMIT: usize = 256;
 
         // Register Ctrl+C handler for graceful shutdown
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -398,6 +402,9 @@ impl DaemonNode {
         }
 
         let mut last_stats = Instant::now();
+        let mut last_sync_req = Instant::now()
+            .checked_sub(SYNC_REQUEST_INTERVAL)
+            .unwrap_or_else(Instant::now);
         let mut total_blocks_processed: u64 = 0;
         let mut total_txs_processed: u64 = 0;
         let mut total_blocks_rejected: u64 = 0;
@@ -627,6 +634,91 @@ impl DaemonNode {
                 }
             }
 
+            // ── Serve IBD requests (GetHeaders / GetBlock / GetData) ─
+            {
+                let mut serve = drain_serve_requests();
+                if serve.len() > SERVE_BATCH_LIMIT {
+                    let excess = serve.split_off(SERVE_BATCH_LIMIT);
+                    for (peer_id, req) in excess {
+                        crate::service::network::p2p::p2p::push_serve_request(&peer_id, req);
+                    }
+                }
+                if !serve.is_empty() {
+                    did_work = true;
+                    let best_h = self.local_best_height();
+                    for (peer_id, req) in serve {
+                        match req {
+                            P2PMessage::GetHeaders { from_hash, count } => {
+                                let hashes = build_headers_response(
+                                    &self.block_store,
+                                    best_h,
+                                    &from_hash,
+                                    count as usize,
+                                );
+                                if !hashes.is_empty() {
+                                    push_outbound_to_peer(
+                                        &peer_id,
+                                        P2PMessage::Headers { hashes },
+                                    );
+                                }
+                            }
+                            P2PMessage::GetBlock { hash } => {
+                                if let Some(data) = serve_block_bytes(&self.block_store, &hash) {
+                                    push_outbound_to_peer(
+                                        &peer_id,
+                                        P2PMessage::Block { data },
+                                    );
+                                }
+                            }
+                            P2PMessage::GetData { items } => {
+                                for item in items {
+                                    if item.kind == "block" {
+                                        if let Some(data) =
+                                            serve_block_bytes(&self.block_store, &item.hash)
+                                        {
+                                            push_outbound_to_peer(
+                                                &peer_id,
+                                                P2PMessage::Block { data },
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            // ── Self-driven IBD request loop ────────────────────────
+            {
+                let local = self.local_best_height();
+                set_local_height(local);
+                if last_sync_req.elapsed() >= SYNC_REQUEST_INTERVAL {
+                    let target = peer_best_height();
+                    if target > local {
+                        let mut tips = get_dag_tips();
+                        tips.sort();
+                        if tips.is_empty() {
+                            push_outbound(P2PMessage::GetHeaders {
+                                from_hash: String::new(),
+                                count: 2000,
+                            });
+                        } else {
+                            for tip in tips.iter().take(8) {
+                                push_outbound(P2PMessage::GetHeaders {
+                                    from_hash: tip.clone(),
+                                    count: 2000,
+                                });
+                            }
+                        }
+                        slog_info!("daemon", "ibd_request",
+                            local_height => local, target_height => target);
+                    }
+                    last_sync_req = Instant::now();
+                }
+            }
+
             // ── Periodic stats ──────────────────────────────────────
             if last_stats.elapsed() >= STATS_INTERVAL {
                 slog_info!("daemon", "event_loop_stats",
@@ -661,6 +753,13 @@ impl DaemonNode {
             slog_warn!("daemon", "rocksdb_flush_failed", error => e);
         }
         slog_info!("daemon", "shutdown_complete");
+    }
+
+    fn local_best_height(&self) -> u64 {
+        match self.block_store.get_best_hash() {
+            Some(best) => self.ghostdag.get_chain_height(&best),
+            None => 0,
+        }
     }
 
     // ── Public API ───────────────────────────────────────────────
