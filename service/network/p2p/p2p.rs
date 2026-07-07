@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -105,6 +106,32 @@ static PEER_LAST_OUTBOUND: Lazy<Arc<PlMutex<HashMap<String, u64>>>> =
 /// and fed to PeerManager.
 static RECEIVED_ADDRS: Lazy<Arc<PlMutex<Vec<String>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(Vec::new())));
+
+static PEER_BEST_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+static PENDING_SERVE: Lazy<Arc<PlMutex<Vec<(String, P2PMessage)>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(256))));
+
+pub fn peer_best_height() -> u64 {
+    PEER_BEST_HEIGHT.load(Ordering::Relaxed)
+}
+
+pub fn note_peer_height(height: u64) {
+    PEER_BEST_HEIGHT.fetch_max(height, Ordering::Relaxed);
+}
+
+pub fn push_serve_request(peer_id: &str, request: P2PMessage) {
+    let mut q = PENDING_SERVE.lock();
+    if q.len() < 10_000 {
+        q.push((peer_id.to_string(), request));
+    } else {
+        slog_warn!("p2p", "serve_queue_full");
+    }
+}
+
+pub fn drain_serve_requests() -> Vec<(String, P2PMessage)> {
+    std::mem::take(&mut *PENDING_SERVE.lock())
+}
 
 /// Drain all pending transactions received by P2P (call from node main loop).
 /// Returns (peer_id, transaction) tuples for ban attribution.
@@ -953,7 +980,8 @@ impl P2P {
         }
 
         // ── Send our Version (after puzzle phase) ──────────────────────────
-        let bytes = Self::send_version(&mut writer, 0, magic)?;
+        let our_height = crate::service::network::nodes::full_node::get_local_height();
+        let bytes = Self::send_version(&mut writer, our_height, magic)?;
         session.record_bytes_sent(bytes);
         session
             .protocol
@@ -1604,6 +1632,7 @@ impl P2P {
 
                 // Initiate sync if peer is ahead
                 let peer_height = session.protocol.peer_height();
+                note_peer_height(peer_height);
                 if peer_height > 0 {
                     session.protocol.begin_header_sync(peer_height);
                 } else {
@@ -1846,12 +1875,12 @@ impl P2P {
                 for item in items {
                     match item.kind.as_str() {
                         "block" => {
-                            // Block serving requires block_store access (not
-                            // available in dispatch_message). The daemon event
-                            // loop handles block serving for GetData requests.
-                            // Do NOT send GetBlock back — that creates a loop.
-                            slog_debug!("p2p", "getdata_block_serve_needed",
-                                hash => &item.hash, peer => peer);
+                            push_serve_request(
+                                peer,
+                                P2PMessage::GetBlock {
+                                    hash: item.hash.clone(),
+                                },
+                            );
                         }
                         "tx" => {
                             // TX serving requires mempool access which this layer
@@ -1865,8 +1894,11 @@ impl P2P {
                 }
             }
 
-            // ── GetHeaders: validate hash and respond with known headers ─
-            P2PMessage::GetHeaders { ref from_hash, .. } => {
+            // ── GetHeaders: validate then enqueue for the daemon to serve ─
+            P2PMessage::GetHeaders {
+                ref from_hash,
+                count,
+            } => {
                 if !from_hash.is_empty() {
                     if let Err(pe) = validate_hash_hex(from_hash) {
                         DOS_GUARD.add_ban_score_cat(
@@ -1878,25 +1910,13 @@ impl P2P {
                         return Ok(());
                     }
                 }
-                // Respond with block hashes the peer can use for sync.
-                // dispatch_message doesn't have direct block_store access,
-                // so we return DAG tips as our header set.
-                // TODO: When block_store access is available, walk from
-                // from_hash forward and return actual sequential headers.
-                let mut hashes = crate::service::network::nodes::full_node::get_dag_tips();
-                // Respect count parameter if provided (default: no limit → use protocol max)
-                let count = match msg {
-                    P2PMessage::GetHeaders { count, .. } => count as usize,
-                    _ => 2000,
-                };
-                // Cap at protocol limit to prevent oversized response
-                const MAX_HEADERS_RESPONSE: usize = 2_000;
-                hashes.truncate(count.min(MAX_HEADERS_RESPONSE));
-                if !hashes.is_empty() {
-                    let resp = P2PMessage::Headers { hashes };
-                    let bytes = Self::write_message(writer, &resp, magic)?;
-                    session.record_bytes_sent(bytes);
-                }
+                push_serve_request(
+                    peer,
+                    P2PMessage::GetHeaders {
+                        from_hash: from_hash.clone(),
+                        count,
+                    },
+                );
             }
 
             // ── Headers: validate hash list and queue blocks for download ─
@@ -1949,10 +1969,7 @@ impl P2P {
                     );
                     return Ok(());
                 }
-                // Block serving requires block_store access which dispatch_message
-                // doesn't have directly. The daemon event loop handles block data
-                // retrieval and sends Block responses via the targeted queue.
-                // Log the request so operators can track block request patterns.
+                push_serve_request(peer, P2PMessage::GetBlock { hash: hash.clone() });
                 slog_debug!("p2p", "getblock_requested", hash => hash, peer => peer);
             }
 

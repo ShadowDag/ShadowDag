@@ -68,6 +68,7 @@ use crate::{slog_error, slog_info, slog_warn};
 pub struct MiningTemplateState {
     next_difficulty: AtomicU64,
     dag_tips: Mutex<Vec<String>>,
+    local_height: AtomicU64,
 }
 
 impl MiningTemplateState {
@@ -75,6 +76,7 @@ impl MiningTemplateState {
         Self {
             next_difficulty: AtomicU64::new(1),
             dag_tips: Mutex::new(Vec::new()),
+            local_height: AtomicU64::new(0),
         }
     }
 
@@ -94,6 +96,14 @@ impl MiningTemplateState {
         if let Ok(mut t) = self.dag_tips.lock() {
             *t = tips;
         }
+    }
+
+    pub fn local_height(&self) -> u64 {
+        self.local_height.load(Ordering::Relaxed)
+    }
+
+    pub fn set_local_height(&self, height: u64) {
+        self.local_height.store(height, Ordering::Relaxed);
     }
 }
 
@@ -132,6 +142,14 @@ pub fn get_dag_tips() -> Vec<String> {
 
 fn set_dag_tips(tips: Vec<String>) {
     PROCESS_DEFAULT_MINING_STATE.set_dag_tips(tips)
+}
+
+pub fn get_local_height() -> u64 {
+    PROCESS_DEFAULT_MINING_STATE.local_height()
+}
+
+pub fn set_local_height(height: u64) {
+    PROCESS_DEFAULT_MINING_STATE.set_local_height(height)
 }
 
 /// Reset the process-default mining template cell. Test-only.
@@ -254,6 +272,10 @@ impl FullNode {
         let initial_tips = dag_manager.get_tips();
         if !initial_tips.is_empty() {
             set_dag_tips(initial_tips.clone());
+        }
+
+        if let Some(best_hash) = block_store.get_best_hash() {
+            set_local_height(ghostdag.get_chain_height(&best_hash));
         }
 
         // ── Startup recovery: verify contract state_root ──────────
@@ -1373,6 +1395,8 @@ impl FullNode {
             self.mining_state.set_dag_tips(tips.clone());
             set_dag_tips(tips);
         }
+
+        set_local_height(self.ghostdag.get_chain_height(&best_tip));
 
         // ── FINALITY: prune undo data for finalized blocks ────────────
         // Blocks deeper than FINALITY_DEPTH below the tip are irreversible.
