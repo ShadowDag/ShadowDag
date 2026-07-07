@@ -78,6 +78,12 @@ shadowdag-miner --network=testnet --address=<A_ST1_transparent> --threads=2 --rp
 
 > Or set `MINER_ADDRESS=<A_ST1>` in the compose file to mine from the built-in miner.
 
+> **Automation:** Phases 4–6 can be run end-to-end by
+> [`ringct_confidential_e2e.sh`](./ringct_confidential_e2e.sh) once the fix is
+> deployed and wallets A/B exist with A funded. It shields to seed decoys, sends
+> A→B, then scans B and asserts the output arrived (the acceptance oracle). See
+> the header of that script for the environment variables it takes.
+
 ## Phase 4 — Bootstrap the confidential pool (decoys) via `shield`
 
 A confidential send needs at least `MIN_RING_SIZE` (4) on-chain confidential
