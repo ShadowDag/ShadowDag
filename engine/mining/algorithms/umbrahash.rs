@@ -711,4 +711,74 @@ mod tests {
         assert_eq!(epoch_of(EPOCH_BLOCKS - 1), 0);
         assert_eq!(epoch_of(EPOCH_BLOCKS), 1);
     }
+
+    #[test]
+    #[ignore = "CPU hashrate benchmark; run with --release -- --ignored --nocapture"]
+    fn umbra_cpu_hashrate_benchmark() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+
+        let cache = mkcache(CACHE_BYTES, &epoch_seed(0));
+        let prog_seed = prog_seed_from_height(0);
+        let header = hh(0x00C0_FFEE);
+        let window = Duration::from_secs(10);
+
+        println!(
+            "\n=== UmbraHash CPU hashrate benchmark (hashimoto_light, cache={} MiB, full_size={} MiB) ===",
+            CACHE_BYTES >> 20,
+            DATASET_BYTES >> 20
+        );
+
+        for n in 0..32u64 {
+            let _ = hashimoto_light(&cache, DATASET_BYTES, &header, n, prog_seed);
+        }
+        let mut nonce = 1_000u64;
+        let mut count1 = 0u64;
+        let start = Instant::now();
+        while start.elapsed() < window {
+            let _ = hashimoto_light(&cache, DATASET_BYTES, &header, nonce, prog_seed);
+            nonce = nonce.wrapping_add(1);
+            count1 += 1;
+        }
+        let el1 = start.elapsed().as_secs_f64();
+        let hps1 = count1 as f64 / el1;
+        println!("single-thread : {:>10} hashes in {:.2}s => {:>8.1} H/s", count1, el1, hps1);
+
+        let threads = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(4);
+        let counter = AtomicU64::new(0);
+        let stop = AtomicBool::new(false);
+        let start = Instant::now();
+        std::thread::scope(|s| {
+            for t in 0..threads {
+                let counter = &counter;
+                let stop = &stop;
+                let cache = &cache;
+                let header = &header;
+                s.spawn(move || {
+                    let mut nonce = (t as u64).wrapping_mul(1_000_000_007).wrapping_add(1);
+                    let mut local = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = hashimoto_light(cache, DATASET_BYTES, header, nonce, prog_seed);
+                        nonce = nonce.wrapping_add(1);
+                        local += 1;
+                        if local.is_multiple_of(128) {
+                            counter.fetch_add(128, Ordering::Relaxed);
+                            local = 0;
+                        }
+                    }
+                    counter.fetch_add(local, Ordering::Relaxed);
+                });
+            }
+            std::thread::sleep(window);
+            stop.store(true, Ordering::Relaxed);
+        });
+        let el_n = start.elapsed().as_secs_f64();
+        let count_n = counter.load(Ordering::Relaxed);
+        let hps_n = count_n as f64 / el_n;
+        println!(
+            "multi-thread  : {:>10} hashes in {:.2}s => {:>8.1} H/s ({:.2} kH/s) across {} threads",
+            count_n, el_n, hps_n, hps_n / 1000.0, threads
+        );
+        println!("=== end CPU benchmark ===\n");
+    }
 }

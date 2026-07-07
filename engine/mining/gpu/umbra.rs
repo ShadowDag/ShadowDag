@@ -392,4 +392,78 @@ mod tests {
             assert_eq!(&gpu[k * 64 + 32..k * 64 + 64], &cres[..], "result mismatch nonce {}", nonce);
         }
     }
+
+    #[test]
+    #[ignore = "GPU hashrate benchmark; run with --release --features gpu-opencl -- --ignored --nocapture"]
+    fn umbra_gpu_hashrate_benchmark() {
+        use std::time::{Duration, Instant};
+
+        let epoch = 0u64;
+        let seed = umbrahash::epoch_seed(epoch);
+        let t_cache = Instant::now();
+        let cache = umbrahash::mkcache(umbrahash::CACHE_BYTES, &seed);
+        let cache_secs = t_cache.elapsed().as_secs_f64();
+        let prog_seed = umbrahash::prog_seed_from_height(0);
+
+        let header: [u8; 32] = {
+            use sha3::{Digest, Sha3_256};
+            let mut h = Sha3_256::new();
+            h.update(b"umbra-gpu-hashrate-benchmark");
+            h.finalize().into()
+        };
+        let impossible_target = [0u8; 32];
+
+        println!(
+            "\n=== UmbraHash GPU hashrate benchmark (consensus sizes: dataset={} MiB, cache={} MiB) ===",
+            umbrahash::DATASET_BYTES >> 20,
+            umbrahash::CACHE_BYTES >> 20
+        );
+        println!("cache built on CPU in {:.2}s", cache_secs);
+
+        let window = Duration::from_secs(12);
+        for &batch in &[8192usize, 32768, 131072] {
+            let mut miner = match UmbraGpuMiner::new(batch, umbrahash::DATASET_BYTES, umbrahash::CACHE_BYTES) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("skipping GPU benchmark (no device): {}", e);
+                    return;
+                }
+            };
+            let t_ds = Instant::now();
+            miner.ensure_dataset(&cache, epoch).expect("dataset gen");
+            let ds_secs = t_ds.elapsed().as_secs_f64();
+
+            for w in 0..4u64 {
+                let hit = miner
+                    .mine(&header, &impossible_target, prog_seed, w * batch as u64)
+                    .expect("warmup mine");
+                assert!(hit.is_none(), "impossible target must never win");
+            }
+
+            let mut base: u64 = 1_000 * batch as u64;
+            let mut calls: u64 = 0;
+            let start = Instant::now();
+            while start.elapsed() < window {
+                let hit = miner.mine(&header, &impossible_target, prog_seed, base).expect("mine");
+                assert!(hit.is_none(), "impossible target must never win");
+                calls += 1;
+                base = base.wrapping_add(batch as u64);
+            }
+            let elapsed = start.elapsed().as_secs_f64();
+            let hashes = calls * batch as u64;
+            let hps = hashes as f64 / elapsed;
+            println!(
+                "device={} batch={:>7} dataset_gen={:.2}s | {:>6} batches, {:>10} hashes in {:.2}s => {:>8.0} H/s ({:.2} kH/s)",
+                miner.device_name(),
+                batch,
+                ds_secs,
+                calls,
+                hashes,
+                elapsed,
+                hps,
+                hps / 1000.0
+            );
+        }
+        println!("=== end benchmark ===\n");
+    }
 }
