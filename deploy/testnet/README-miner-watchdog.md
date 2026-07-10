@@ -48,4 +48,8 @@ The unit name is deliberately distinct from the bare-metal mainnet
   That is harmless: the watchdog only heals on a real stall, so a healthy
   entrypoint miner is left alone; on watchdog (re)start its kill+start converges
   to a single instance.
+- A `down -v` wipes the data volume, deleting `/data/miner_loop.sh`; the watchdog
+  self-installs it (an embedded copy in `ensure_loop_script`) before starting a
+  miner, so a wipe cannot silently freeze mining. The embedded copy must stay in
+  sync with `miner_loop.sh` (same payout address / threads).
 - Adjust the payout address / threads in `miner_loop.sh` before installing.

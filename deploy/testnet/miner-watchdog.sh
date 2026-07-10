@@ -2,8 +2,11 @@
 # Liveness watchdog for the dockerized ShadowDAG testnet miner.
 # Health signal = block height ADVANCING (ps is unreliable in this container).
 # On stall: kill ALL stray in-container miners/loops (root+bash builtin), start one.
+# Self-installs /data/miner_loop.sh if missing (e.g. after a `down -v` wiped the
+# data volume) so a wipe can never leave the watchdog with nothing to start.
 set +e
 CT=shadowdag-testnet
+LOOP_PATH=/data/miner_loop.sh
 INTERVAL=30
 STALL_LIMIT=3
 log(){ echo "[wd $(date +%H:%M:%S)] $*"; }
@@ -14,6 +17,26 @@ height(){
     -H "Authorization: Bearer $rp" -H "content-type: application/json" \
     --data '{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}' 2>/dev/null \
     | grep -oE '"result":[0-9]+' | grep -oE '[0-9]+'
+}
+ensure_loop_script(){
+  # A `down -v` wipes the data volume, taking /data/miner_loop.sh with it, which
+  # would make start_one silently fail (No such file) and freeze mining. Recreate
+  # it from this embedded copy if it is missing. Keep in sync with miner_loop.sh.
+  if docker exec "$CT" test -f "$LOOP_PATH" 2>/dev/null; then return; fi
+  log "miner loop $LOOP_PATH missing -> installing"
+  docker exec -u root -i "$CT" tee "$LOOP_PATH" >/dev/null <<'LOOP'
+#!/bin/bash
+while true; do
+  RP=$(cat /data/rpc_password)
+  shadowdag-miner --network=testnet \
+    --address=ST139bb5faaf52e899a029c75ca59425babc0a1efce \
+    --threads=2 --pow=umbra \
+    --rpc-password="$RP"
+  echo "[miner-loop] miner exited; restart in 2s" >&2
+  sleep 2
+done
+LOOP
+  docker exec -u root "$CT" chmod +x "$LOOP_PATH"
 }
 kill_all_miners(){
   docker exec -u root "$CT" bash -c '
@@ -26,7 +49,7 @@ kill_all_miners(){
     done
   '
 }
-start_one(){ docker exec -d "$CT" bash /data/miner_loop.sh; }
+start_one(){ ensure_loop_script; docker exec -d "$CT" bash "$LOOP_PATH"; }
 
 log "start: resetting to a single miner instance"
 kill_all_miners
