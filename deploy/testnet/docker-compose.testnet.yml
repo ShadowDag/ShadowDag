@@ -33,6 +33,9 @@ services:
       - MINER_ADDRESS=${MINER_ADDRESS:-}
       - MINER_THREADS=${MINER_THREADS:-2}
       - MINER_POW=${MINER_POW:-}
+      # Block-body pruning keep-depth. 0 = archival (never prune) so a far-behind
+      # follower can always backfill; override to e.g. 2000 to bound disk growth.
+      - SHADOWDAG_PRUNE_KEEP_DEPTH=${SHADOWDAG_PRUNE_KEEP_DEPTH:-0}
     ports:
       - "19333:19333"             # P2P — PUBLIC (peers connect here)
       - "127.0.0.1:19332:19332"   # RPC  — localhost only (keep private)
