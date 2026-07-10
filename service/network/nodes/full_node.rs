@@ -344,12 +344,21 @@ impl FullNode {
     }
 
     /// Prune block bodies far below the tip to bound disk growth. Deletes only
-    /// blocks whose height is more than PRUNE_KEEP_DEPTH below the best height —
+    /// blocks whose height is more than the keep-depth below the best height —
     /// well beyond MAX_REORG_DEPTH (1000) — so no reorg or DAG parent link can
     /// need them; the UTXO set and height/commit indexes are untouched.
-    /// Throttled to run at most once per PRUNE_INTERVAL of new height.
+    /// Keep-depth defaults to 2000 but is overridable via the env var
+    /// SHADOWDAG_PRUNE_KEEP_DEPTH; 0 disables pruning entirely (archival node, so
+    /// a far-behind peer can always backfill its missing bodies). Throttled to at
+    /// most once per PRUNE_INTERVAL of new height.
     fn maybe_prune(&self) {
-        const PRUNE_KEEP_DEPTH: u64 = 2_000;
+        let keep_depth: u64 = std::env::var("SHADOWDAG_PRUNE_KEEP_DEPTH")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(2_000);
+        if keep_depth == 0 {
+            return;
+        }
         const PRUNE_INTERVAL: u64 = 500;
         let best = match self
             .block_store
@@ -359,7 +368,7 @@ impl FullNode {
             Some(b) => b.header.height,
             None => return,
         };
-        if best <= PRUNE_KEEP_DEPTH {
+        if best <= keep_depth {
             return;
         }
         let last = self.last_prune_height.load(Ordering::Relaxed);
@@ -367,7 +376,7 @@ impl FullNode {
             return;
         }
         self.last_prune_height.store(best, Ordering::Relaxed);
-        let cutoff = best - PRUNE_KEEP_DEPTH;
+        let cutoff = best - keep_depth;
         let pruned = self.block_store.prune_blocks_below_height(cutoff);
         if pruned > 0 {
             slog_warn!("pruning", "pruned_old_block_bodies",
