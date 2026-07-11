@@ -71,11 +71,14 @@ static PEER_PENDING: Lazy<Arc<PlMutex<HashMap<String, (u32, u32)>>>> =
 
 /// Max pending TXs allowed from a single peer before dropping.
 const MAX_PENDING_TXS_PER_PEER: u32 = 500;
-/// Max pending blocks allowed from a single peer before dropping.
-const MAX_PENDING_BLOCKS_PER_PEER: u32 = 50;
+/// Max pending blocks allowed from a single peer before dropping. Sized to hold
+/// a full served header range (512) so a catching-up node can buffer a whole
+/// GetBlock burst from its sync peer without dropping (and re-requesting) most
+/// of it — the drop-and-refetch churn was the dominant IBD throughput limiter.
+const MAX_PENDING_BLOCKS_PER_PEER: u32 = 512;
 /// Global hard caps for pending inbound queues (all peers combined).
 const MAX_PENDING_TX_QUEUE: usize = 10_000;
-const MAX_PENDING_BLOCK_QUEUE: usize = 1_000;
+const MAX_PENDING_BLOCK_QUEUE: usize = 4_096;
 const MAX_OUTBOUND_LAG_SEQS: u64 = 5_000;
 /// Bytes per peer per minute — disconnect abusive peers (100MB/min).
 const MAX_BYTES_PER_PEER_PER_MIN: u64 = 100 * 1024 * 1024;

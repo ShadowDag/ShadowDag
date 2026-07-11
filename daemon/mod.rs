@@ -512,6 +512,10 @@ impl DaemonNode {
         let mut last_stats = Instant::now();
         let mut last_flush = Instant::now();
         let mut last_sync_req = Instant::now();
+        // While catching up, request the next header range every 500ms instead of
+        // the idle 6s cadence so the download pipeline stays full. Extended 5s on
+        // every tick that applies blocks; lapses back to 6s once caught up.
+        let mut fast_sync_until = Instant::now();
         let mut total_blocks_processed: u64 = 0;
         let mut total_txs_processed: u64 = 0;
         let mut total_blocks_rejected: u64 = 0;
@@ -529,7 +533,12 @@ impl DaemonNode {
             // GetBlock -> Block). If we forked, they don't have our best_hash and
             // serve from genesis, so we download their chain and GHOSTDAG adopts
             // the higher-blue-score one.
-            if last_sync_req.elapsed() >= std::time::Duration::from_secs(6) {
+            let sync_interval = if Instant::now() < fast_sync_until {
+                std::time::Duration::from_millis(500)
+            } else {
+                std::time::Duration::from_secs(6)
+            };
+            if last_sync_req.elapsed() >= sync_interval {
                 last_sync_req = Instant::now();
                 let from_hash = self.block_store.get_best_hash().unwrap_or_default();
                 slog_info!("daemon", "header_sync_request_sent",
@@ -563,6 +572,7 @@ impl DaemonNode {
             }
             if !blocks.is_empty() {
                 did_work = true;
+                fast_sync_until = Instant::now() + std::time::Duration::from_secs(5);
                 let batch_start = std::time::Instant::now();
                 let mut processed_count = 0usize;
                 let mut seen_hashes: std::collections::HashSet<String> =
