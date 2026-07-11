@@ -1164,8 +1164,13 @@ impl P2P {
         // IP-only key for ban scoring — ephemeral port changes on reconnect
         let peer_ip = peer_addr.ip().to_string();
         {
+            // Seed a new peer's outbound cursor at the CURRENT broadcast seq, not
+            // 0 — a fresh peer starting at 0 would pin min_ack at 0 and freeze the
+            // outbound-queue pruning (drain_outbound_since) until a restart. The
+            // historical backlog reaches a new peer via its own header-sync, never
+            // the broadcast queue, so skipping it here is correct.
             let mut acks = PEER_LAST_OUTBOUND.lock();
-            acks.entry(peer_str.clone()).or_insert(0);
+            acks.entry(peer_str.clone()).or_insert_with(current_outbound_seq);
         }
 
         let mut reader = BufReader::new(&stream);
@@ -1586,7 +1591,9 @@ impl P2P {
         let (outbound, _new_seq) = drain_outbound_since(session.last_outbound_seq);
         if let Some((last_seq, _)) = outbound.last() {
             let lag = last_seq.saturating_sub(session.last_outbound_seq);
-            if lag > MAX_OUTBOUND_LAG_SEQS {
+            if lag > MAX_OUTBOUND_LAG_SEQS
+                && !crate::service::network::dos_guard::is_whitelisted(peer_str)
+            {
                 let ip_key = extract_ban_ip(peer_str);
                 DOS_GUARD.add_ban_score_cat(
                     peer_str,

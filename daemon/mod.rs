@@ -572,6 +572,10 @@ impl DaemonNode {
             }
             if !blocks.is_empty() {
                 did_work = true;
+                // Were we already in catch-up before this batch? (Captured BEFORE
+                // extending the window below.) Used to suppress re-gossip of IBD
+                // backfill further down.
+                let was_catching_up = Instant::now() < fast_sync_until;
                 fast_sync_until = Instant::now() + std::time::Duration::from_secs(5);
                 let batch_start = std::time::Instant::now();
                 let mut processed_count = 0usize;
@@ -678,9 +682,16 @@ impl DaemonNode {
                                     .on_new_block(block.header.height, &confirmed);
                             }
 
-                            // Broadcast accepted block to peers (gossip propagation)
-                            if let Ok(block_bytes) = bincode::serialize(block) {
-                                push_outbound(P2PMessage::Block { data: block_bytes });
+                            // Broadcast accepted block to peers (gossip propagation).
+                            // Skip while catching up (IBD backfill): re-gossiping the
+                            // thousands of blocks we just pulled floods our own
+                            // OUTBOUND_MSGS queue, which starves GetHeaders and stalls
+                            // sync. Peers fetch the backlog via their own header-sync;
+                            // a caught-up node still relays genuinely new tips.
+                            if !was_catching_up {
+                                if let Ok(block_bytes) = bincode::serialize(block) {
+                                    push_outbound(P2PMessage::Block { data: block_bytes });
+                                }
                             }
 
                             // Chain sync: any orphan that was waiting on THIS block
