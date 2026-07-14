@@ -1095,13 +1095,24 @@ impl FullNode {
         let mut old_chain_set = HashSet::new();
         {
             let mut cursor = current_best.clone();
-            while !cursor.is_empty() {
+            // Bound the ancestry walk to the reorg window. A fork point deeper
+            // than MAX_REORG_DEPTH is rejected as a too-deep reorg below, so
+            // collecting the old chain past that depth is wasted I/O — and
+            // walking all the way to genesis made EVERY block apply
+            // O(chain-length) block reads, which is the IBD apply-rate ceiling
+            // (a follower at height H re-reads ~H blocks per block it applies).
+            // Bounding to MAX_REORG_DEPTH is semantics-preserving: the
+            // accept/reject/apply/rollback decision is unchanged because any
+            // reorg whose fork lies beyond this depth is rejected regardless.
+            let mut depth = 0u64;
+            while !cursor.is_empty() && depth <= MAX_REORG_DEPTH {
                 old_chain_set.insert(cursor.clone());
                 cursor = self
                     .block_store
                     .get_block(&cursor)
                     .and_then(|b| b.header.resolved_selected_parent())
                     .unwrap_or_default();
+                depth += 1;
             }
         }
 
@@ -1116,6 +1127,15 @@ impl FullNode {
                 break;
             }
             new_chain.push(cursor.clone());
+
+            // Bound symmetrically: if the new chain has not met the old chain
+            // within the reorg window, this is a too-deep reorg. Stop and let
+            // the MAX_REORG_DEPTH check below reject it, instead of walking to
+            // genesis (an O(chain-length) walk an attacker could otherwise
+            // force with a single deep side-chain block).
+            if new_chain.len() as u64 > MAX_REORG_DEPTH {
+                break;
+            }
 
             // Walk to selected parent
             match self.block_store.get_block(&cursor) {
