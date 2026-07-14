@@ -784,8 +784,20 @@ impl DaemonNode {
                     }
 
                     processed_count += 1;
-                    if batch_start.elapsed() > std::time::Duration::from_millis(500) {
-                        break; // Yield to process pending TXs
+                    // Each block apply is fsync-bound (~0.5s: several RocksDB
+                    // stores commit synchronously), so a 500ms budget clears just
+                    // ONE block per tick — the follower IBD ceiling. During
+                    // catch-up there are no user TXs to yield for, so give a much
+                    // larger budget to drain a long contiguous run per tick, still
+                    // bounded well under the pong timeout so keepalive/serving are
+                    // unaffected.
+                    let yield_budget = if was_catching_up {
+                        std::time::Duration::from_secs(4)
+                    } else {
+                        std::time::Duration::from_millis(500)
+                    };
+                    if batch_start.elapsed() > yield_budget {
+                        break;
                     }
                 }
                 // Re-queue any unprocessed blocks so they are not lost on timeout
