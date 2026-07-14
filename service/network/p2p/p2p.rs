@@ -1163,8 +1163,15 @@ impl P2P {
         magic: [u8; 4],
         known_peers: Vec<String>,
     ) -> Result<(), NetworkError> {
+        // 100ms (was 2s): this timeout is also the idle FLUSH interval — served
+        // block bodies sit in the targeted queue until the connection loop wakes
+        // (on inbound, or this timeout) and flush_outbound writes them. At 2s an
+        // idle sync link delivered only ~1 block per ~2.7s (the observed IBD
+        // ceiling) despite spare CPU and a peer ready to serve; 100ms lets a
+        // catching-up follower pull continuously. Keepalive/pong still fire on
+        // their own elapsed() intervals, so faster polling doesn't change them.
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_millis(100)))
             .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
         stream
             .set_write_timeout(Some(Duration::from_secs(10)))
