@@ -639,13 +639,17 @@ pub fn report_bad_peer_cat(peer_id: &str, score: u64, reason: &str, category: Ba
 /// Thread-safe: can be called from any thread (e.g. TxRelay, mempool).
 pub fn push_outbound(msg: P2PMessage) {
     let mut q = OUTBOUND_MSGS.lock();
-    if q.1.len() < 10_000 {
-        let seq = q.0 + 1;
-        q.0 = seq;
-        q.1.push((seq, msg));
-    } else {
+    if q.1.len() >= 10_000 {
+        // Newest-wins: drop the OLDEST queued message, never the new one.
+        // Stale gossip is worthless to live peers (laggards backfill via
+        // header-sync/IBD), while the new message may be a critical sync
+        // request (GetHeaders) — dropping those wedged IBD entirely.
+        q.1.remove(0);
         slog_warn!("p2p", "outbound_queue_full");
     }
+    let seq = q.0 + 1;
+    q.0 = seq;
+    q.1.push((seq, msg));
 }
 
 /// The current global broadcast sequence number. A freshly-connected peer must
@@ -691,15 +695,19 @@ fn drain_targeted_for(peer_id: &str) -> Vec<P2PMessage> {
 /// receive ALL broadcast messages (not just the first to drain).
 /// Also prunes old messages that all peers have had time to read.
 fn drain_outbound_since(since: u64) -> (Vec<(u64, P2PMessage)>, u64) {
+    // Oldest messages a flush hands one peer in one call. Bounds the per-flush
+    // clone cost (the cursor advances incrementally; the next flush continues),
+    // so one slow peer's flush can no longer scan-and-clone a huge backlog.
+    const OUTBOUND_FLUSH_BATCH: usize = 512;
     let mut q = OUTBOUND_MSGS.lock();
     let new_msgs: Vec<(u64, P2PMessage)> =
         q.1.iter()
             .filter(|(seq, _)| *seq > since)
+            .take(OUTBOUND_FLUSH_BATCH)
             .map(|(seq, msg)| (*seq, msg.clone()))
             .collect();
     let max_seq = q.0;
-    // Safe pruning: remove only messages with seq <= global minimum ack
-    // across currently connected peers.
+    // Ack-based pruning: remove messages every connected peer has consumed.
     let min_ack = {
         let acks = PEER_LAST_OUTBOUND.lock();
         acks.values().copied().min()
@@ -715,12 +723,17 @@ fn drain_outbound_since(since: u64) -> (Vec<(u64, P2PMessage)>, u64) {
                     min_ack_seq => min_seq);
             }
         }
-    } else if q.1.len() > 10_000 {
-        // No connected peers are tracking acks. In this case dropping old
-        // backlog is safe because no live receiver exists.
-        let drain_to = q.1.len() - 1_000;
-        q.1.drain(..drain_to);
-        slog_warn!("p2p", "outbound_queue_pruned_no_peers", dropped => drain_to);
+    }
+    // Hard-cap retention INDEPENDENT of acks: a pinned or stale ack cursor
+    // (a leaked entry after a peer-thread panic, or a retained whitelisted
+    // laggard) must never freeze pruning — the growing queue first slows
+    // every flush and finally wedges sync when it fills. Broadcast messages
+    // older than the newest HARD_RETAIN are stale gossip by definition;
+    // a peer that far behind backfills via header-sync/IBD instead.
+    const OUTBOUND_HARD_RETAIN: u64 = 4_096;
+    let cutoff = max_seq.saturating_sub(OUTBOUND_HARD_RETAIN);
+    if cutoff > 0 {
+        q.1.retain(|(seq, _)| *seq > cutoff);
     }
     (new_msgs, max_seq)
 }
@@ -1588,9 +1601,11 @@ impl P2P {
         session: &mut ConnectionSession,
         magic: [u8; 4],
     ) -> bool {
-        let (outbound, _new_seq) = drain_outbound_since(session.last_outbound_seq);
-        if let Some((last_seq, _)) = outbound.last() {
-            let lag = last_seq.saturating_sub(session.last_outbound_seq);
+        let (outbound, global_seq) = drain_outbound_since(session.last_outbound_seq);
+        if !outbound.is_empty() {
+            // Lag is measured against the GLOBAL newest seq, not the (batched)
+            // returned slice, so capping the flush batch doesn't mask real lag.
+            let lag = global_seq.saturating_sub(session.last_outbound_seq);
             if lag > MAX_OUTBOUND_LAG_SEQS
                 && !crate::service::network::dos_guard::is_whitelisted(peer_str)
             {
