@@ -14,6 +14,7 @@
 //! I and D). Ristretto removes cofactor/torsion handling. SECURITY: external
 //! cryptographic review is REQUIRED before mainnet.
 
+use crate::engine::privacy::ringct::ring_signature::MAX_RING_SIZE;
 use crate::errors::CryptoError;
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
@@ -227,7 +228,17 @@ pub fn from_bytes(b: &[u8]) -> Option<DualCLSAGSignature> {
     }
     let c0 = scalar_from(&b[0..32])?;
     let count = u32::from_le_bytes(b[32..36].try_into().ok()?) as usize;
-    let need = 36 + count * 32 + 64;
+    // Bound the ring size BEFORE any length arithmetic or allocation. An
+    // attacker-chosen `count` (e.g. 2^27) would overflow `count * 32` on a 32-bit
+    // target (wrap in release, panic in a checked build) and drive a massive
+    // Vec::with_capacity on any width — a pre-validation OOM/panic and a 32/64-bit
+    // divergence. Cap at MAX_RING_SIZE, then use checked arithmetic so a crafted
+    // count can never wrap the computed length.
+    if count > MAX_RING_SIZE {
+        return None;
+    }
+    let response_bytes = count.checked_mul(32)?;
+    let need = 36usize.checked_add(response_bytes)?.checked_add(64)?;
     if b.len() != need {
         return None;
     }
@@ -236,7 +247,7 @@ pub fn from_bytes(b: &[u8]) -> Option<DualCLSAGSignature> {
         let off = 36 + i * 32;
         s.push(scalar_from(&b[off..off + 32])?);
     }
-    let ki_off = 36 + count * 32;
+    let ki_off = 36 + response_bytes;
     let mut ki = [0u8; 32];
     ki.copy_from_slice(&b[ki_off..ki_off + 32]);
     let mut dd = [0u8; 32];
@@ -490,5 +501,16 @@ mod tests {
         let bytes = to_bytes(&sig);
         assert_eq!(bytes.len(), 32 + 4 + 11 * 32 + 64);
         assert!(verify(b"kat", &ring, &pseudo, &from_bytes(&bytes).unwrap()));
+    }
+
+    #[test]
+    fn from_bytes_rejects_absurd_ring_count() {
+        // P0-D: a crafted `count` far above MAX_RING_SIZE must be rejected BEFORE
+        // any `count * 32` arithmetic or Vec::with_capacity — no 32-bit overflow
+        // panic, no huge allocation, and identical (None) on 32- and 64-bit.
+        let mut b = vec![0u8; 36]; // c0(32) + count(4), no bodies
+        b[0..32].copy_from_slice(Scalar::ONE.as_bytes());
+        b[32..36].copy_from_slice(&(1u32 << 27).to_le_bytes());
+        assert!(from_bytes(&b).is_none());
     }
 }
