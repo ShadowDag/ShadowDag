@@ -172,6 +172,18 @@ impl PowValidator {
     /// `header.hash` to the header content (anti-spoof). NOTE: for UmbraHash this
     /// generates/uses the epoch cache (memoized) + one hashimoto_light.
     pub fn recompute_identity_hash(header: &BlockHeader) -> String {
+        // Activation floor (mirrors PowValidator::validate, external audit C5):
+        // once UmbraHash is mandatory at this height, a legacy
+        // (version < UMBRA_POW_VERSION) header must NOT be treated as valid on the
+        // cheap anti-spoof paths either (relay orphan admission, sync header
+        // verify, light-node validate). Without this, those header-only paths
+        // would keep accepting downgraded ShadowHash headers after the fork. The
+        // empty sentinel makes every `recomputed == header.hash` caller reject it.
+        if umbrahash::umbra_required_at(header.height)
+            && header.version < umbrahash::UMBRA_POW_VERSION
+        {
+            return String::new();
+        }
         if header.version >= umbrahash::UMBRA_POW_VERSION {
             // Height ceiling BEFORE the epoch cache: this cheap anti-spoof gate
             // runs on UNVALIDATED headers (orphan admission, sync, light node)
