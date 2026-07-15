@@ -294,11 +294,35 @@ impl FullNode {
             }
         };
 
-        // Initialize global DAG tips for getblocktemplate
-        let initial_tips = dag_manager.get_tips();
+        // Initialize DAG tips for getblocktemplate — canonical form (sorted,
+        // deduped, capped) so select_parent below anchors on the same set a
+        // template will use.
+        let mut initial_tips = dag_manager.get_tips();
+        initial_tips.retain(|h| !h.is_empty());
+        initial_tips.sort();
+        initial_tips.dedup();
+        initial_tips
+            .truncate(crate::config::consensus::consensus_params::ConsensusParams::MAX_PARENTS);
         if !initial_tips.is_empty() {
             set_dag_tips(initial_tips.clone());
         }
+
+        // Published next difficulty MUST be anchored on select_parent(the tips a
+        // template will use) so miner-stamped == validator-expected (external
+        // audit C4). `retarget.ema_difficulty()` is anchored on the single best
+        // tip, which differs for a multi-tip reconvergence block. Fall back to the
+        // best-tip EMA only when there are no tips yet.
+        let seeded_next_diff = {
+            let sp = ghostdag.select_parent(&initial_tips);
+            if sp.is_empty() {
+                retarget.ema_difficulty().max(1)
+            } else {
+                Self::build_retarget_from_canonical(&block_store, &ghostdag, &network, &sp)
+                    .1
+                    .max(1)
+            }
+        };
+        set_next_difficulty(seeded_next_diff);
 
         // ── Startup recovery: verify contract state_root ──────────
         if let Some(best_hash) = block_store.get_best_hash() {
@@ -311,14 +335,10 @@ impl FullNode {
             }
         }
 
-        // Build the per-instance mining template cell. We seed
-        // both it and the process-default cell so any legacy
-        // caller that still uses the `get_next_difficulty` /
-        // `get_dag_tips` free functions sees the same values.
+        // Build the per-instance mining template cell, seeded consistently with
+        // the process-default cell.
         let mining_state = Arc::new(MiningTemplateState::new());
-        // `retarget` is already seeded from the canonical chain (or fresh at
-        // genesis), so its EMA is the authoritative next difficulty.
-        mining_state.set_next_difficulty(retarget.ema_difficulty());
+        mining_state.set_next_difficulty(seeded_next_diff);
         if !initial_tips.is_empty() {
             mining_state.set_dag_tips(initial_tips.clone());
         }
@@ -541,61 +561,50 @@ impl FullNode {
             return Ok(block.header.difficulty.max(1));
         }
 
-        // Read current best height (if any).
-        let best_height = self
-            .block_store
-            .get_best_hash()
-            .and_then(|h| self.block_store.get_block(&h))
-            .map(|b| b.header.height)
-            .unwrap_or(0);
-
-        // For same/older heights, anchor to already-known blocks at that height.
-        if block.header.height <= best_height {
-            let hashes = self.block_store.get_block_hashes_at_height(block.header.height);
-            let mut fallback_anchor: Option<u64> = None;
-            let mut saw_different_anchor = false;
-            for h in hashes {
-                if let Some(existing) = self.block_store.get_block(&h) {
-                    let anchored = existing.header.difficulty.max(1);
-                    // DAG may contain parallel blocks at the same height.
-                    // Accept when the claimed difficulty matches ANY anchored
-                    // difficulty at that height (not just the first entry).
-                    if anchored == block.header.difficulty.max(1) {
-                        return Ok(anchored);
-                    }
-                    if let Some(a) = fallback_anchor {
-                        if a != anchored {
-                            saw_different_anchor = true;
-                        }
-                    } else {
-                        fallback_anchor = Some(anchored);
-                    }
-                }
-            }
-            if saw_different_anchor {
-                return Err(NodeError::BlockRejected(format!(
-                    "ambiguous difficulty anchors at height {}",
-                    block.header.height
-                )));
-            }
-            if let Some(anchor) = fallback_anchor {
-                return Ok(anchor);
-            }
-            // Fail closed: if we cannot anchor expected difficulty to known chain
-            // data at this height, reject instead of trusting attacker-supplied
-            // header difficulty.
+        // CONSENSUS-CRITICAL (external audit C4): the expected difficulty MUST be
+        // a PURE function of the CANDIDATE's own ancestry — never the local node's
+        // tip or its inventory of same-height side blocks. The previous code
+        // anchored on get_block_hashes_at_height (the LOCAL set of blocks at that
+        // height) for height <= best, and on the LOCAL tip's retarget EMA for a
+        // tip extension. Two nodes with different side-block inventories / tips
+        // could then accept vs reject the SAME block → a consensus split.
+        //
+        // Anchor instead on the CANONICAL selected parent — GHOSTDAG's
+        // deterministic pick among the block's committed parents (NOT the
+        // untrusted header.selected_parent, which like blue_score is not covered
+        // by PoW) — and rebuild the retarget from THAT ancestry window. The next
+        // difficulty after the selected parent is exactly what the miner stamped
+        // (get_next_difficulty == build_retarget_from_canonical of the tip it
+        // extended == this selected parent), so it is identical on every node and
+        // independent of local state.
+        let selected_parent = self.ghostdag.select_parent(&block.header.parents);
+        if selected_parent.is_empty() {
             return Err(NodeError::BlockRejected(format!(
-                "difficulty anchor missing at height {}",
+                "cannot compute expected difficulty at height {}: no canonical selected parent",
                 block.header.height
             )));
         }
+        Ok(self.expected_difficulty_for_selected_parent(&selected_parent))
+    }
 
-        // For tip extension (height = best + 1), use the current retarget EMA.
-        let retarget = self
-            .retarget
-            .lock()
-            .map_err(|e| NodeError::Other(format!("Retarget lock poisoned: {}", e)))?;
-        Ok(retarget.ema_difficulty().max(1))
+    /// The difficulty a block whose canonical selected parent is `selected_parent`
+    /// MUST carry — a pure function of that selected-parent chain (external audit
+    /// C4). This is the SINGLE source of truth shared by the validator
+    /// (`expected_difficulty_for_block`) and the miner-template publisher, so the
+    /// miner stamps EXACTLY what the validator recomputes. Both derive the anchor
+    /// via `ghostdag.select_parent` on their parent set (the block's committed
+    /// parents vs the current tips) — a previous version stamped from a DIFFERENT
+    /// anchor (`select_best_tip`: cumulative_work-first, opposite hash tie-break),
+    /// so a reconvergence block merging sibling tips was stamped f(A) but validated
+    /// against f(B) and universally rejected, halting production.
+    fn expected_difficulty_for_selected_parent(&self, selected_parent: &str) -> u64 {
+        let (_engine, expected) = Self::build_retarget_from_canonical(
+            &self.block_store,
+            &self.ghostdag,
+            &self.network,
+            selected_parent,
+        );
+        expected.max(1)
     }
 
     fn process_block_inner(&self, block: &Block, peer_id: &str) -> Result<(), NodeError> {
@@ -1744,29 +1753,43 @@ impl FullNode {
             )));
         }
 
-        // Update retarget from the CANONICAL selected-parent chain and publish
-        // next difficulty. Rebuilt deterministically (not fed incrementally) so
-        // the difficulty target is a pure function of the canonical chain and
-        // cannot diverge across nodes after a reorg.
-        if self.block_store.get_block(&best_tip).is_some() {
-            if let Ok(mut retarget) = self.retarget.lock() {
-                let (fresh, next_diff) =
-                    Self::build_retarget_from_canonical(&self.block_store, &self.ghostdag, &self.network, &best_tip);
-                *retarget = fresh;
-                // Publish for RPC getblocktemplate — write to both
-                // the per-instance cell (the canonical reader for
-                // RPC handlers that hold an `Arc<MiningTemplateState>`
-                // via `RpcState`) and the process-default cell
-                // (retained so the legacy free-function readers
-                // still observe the current value).
-                self.mining_state.set_next_difficulty(next_diff);
-                set_next_difficulty(next_diff);
-            }
-        }
-
-        // Update DAG tips for getblocktemplate — miners need current tips as parents
-        let tips = self.dag_manager.get_tips();
+        // Publish next difficulty + tips for getblocktemplate. CONSENSUS-CRITICAL
+        // (external audit C4 equivalence): the published difficulty is anchored on
+        // `select_parent` of the SAME canonical tip set the template will use —
+        // NOT the single `best_tip` (which is chosen by select_best_tip, a
+        // DIFFERENT function: cumulative_work-first with the opposite hash
+        // tie-break). Anchoring on best_tip made a reconvergence block merging
+        // sibling tips get stamped f(best_tip) but validated against
+        // f(select_parent(parents)) and universally rejected → production halt.
+        // Compute the tips in the same canonical form the RPC handler applies
+        // (non-empty, sorted, deduped, capped at MAX_PARENTS); backfilled
+        // min-parent ancestors the RPC may add are older (lower blue score) and
+        // never change select_parent, so they don't affect the anchor.
+        let mut tips = self.dag_manager.get_tips();
+        tips.retain(|h| !h.is_empty());
+        tips.sort();
+        tips.dedup();
+        tips.truncate(crate::config::consensus::consensus_params::ConsensusParams::MAX_PARENTS);
         if !tips.is_empty() {
+            // Keep the running retarget engine rebuilt from the canonical best
+            // tip. It is NON-authoritative now (validation recomputes per block);
+            // some RPC/stats read its EMA, so keep it fresh.
+            if self.block_store.get_block(&best_tip).is_some() {
+                if let Ok(mut retarget) = self.retarget.lock() {
+                    let (fresh, _) = Self::build_retarget_from_canonical(
+                        &self.block_store,
+                        &self.ghostdag,
+                        &self.network,
+                        &best_tip,
+                    );
+                    *retarget = fresh;
+                }
+            }
+            let sp = self.ghostdag.select_parent(&tips);
+            let anchor = if sp.is_empty() { best_tip.clone() } else { sp };
+            let diff = self.expected_difficulty_for_selected_parent(&anchor);
+            self.mining_state.set_next_difficulty(diff);
+            set_next_difficulty(diff);
             self.mining_state.set_dag_tips(tips.clone());
             set_dag_tips(tips);
         }
