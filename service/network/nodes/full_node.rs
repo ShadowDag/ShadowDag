@@ -280,7 +280,7 @@ impl FullNode {
         let retarget = match block_store.get_best_hash() {
             Some(best) if !best.is_empty() => {
                 let (engine, seeded_diff) =
-                    Self::build_retarget_from_canonical(&block_store, &network, &best);
+                    Self::build_retarget_from_canonical(&block_store, &ghostdag, &network, &best);
                 set_next_difficulty(seeded_diff);
                 slog_info!("node", "retarget_seeded", ema_difficulty => &seeded_diff.to_string());
                 engine
@@ -981,6 +981,7 @@ impl FullNode {
     /// turn into a chain split).
     fn build_retarget_from_canonical(
         block_store: &BlockStore,
+        ghostdag: &GhostDag,
         network: &NetworkMode,
         best_tip: &str,
     ) -> (RetargetEngine, u64) {
@@ -1020,12 +1021,21 @@ impl FullNode {
             // contributes W), preserving the DAG-rate correction while making it
             // deterministic across sync states.
             let dag_width = (b.header.parents.len() as u64).max(1);
+            // CONSENSUS-CRITICAL (external audit C3): use the GHOSTDAG-derived
+            // canonical blue score, NOT `b.header.blue_score`. The header
+            // blue_score field is NOT covered by the PoW pre-image (the miner
+            // stamps it but it is not hashed), so a peer can mutate it on the wire
+            // without re-mining; feeding it into the retarget would make two nodes
+            // compute DIFFERENT next-difficulties from the same block hash → a
+            // consensus split. GHOSTDAG recomputes the blue score deterministically
+            // from the block's committed ancestry, so it is identical on every node.
+            let canonical_blue = ghostdag.get_blue_score(&b.header.hash);
             next_diff = engine.on_new_block(BlockTimeRecord {
                 height: b.header.height,
                 timestamp: b.header.timestamp,
                 difficulty: b.header.difficulty,
                 dag_block_count: dag_width,
-                blue_score: b.header.blue_score,
+                blue_score: canonical_blue,
             });
         }
         (engine, next_diff)
@@ -1741,7 +1751,7 @@ impl FullNode {
         if self.block_store.get_block(&best_tip).is_some() {
             if let Ok(mut retarget) = self.retarget.lock() {
                 let (fresh, next_diff) =
-                    Self::build_retarget_from_canonical(&self.block_store, &self.network, &best_tip);
+                    Self::build_retarget_from_canonical(&self.block_store, &self.ghostdag, &self.network, &best_tip);
                 *retarget = fresh;
                 // Publish for RPC getblocktemplate — write to both
                 // the per-instance cell (the canonical reader for
@@ -3091,8 +3101,10 @@ mod tests {
         assert!(store.save_block(&mk("b2", 2, Some("b1"), 1020)));
 
         let net = NetworkMode::Regtest;
-        let (_e1, d1) = FullNode::build_retarget_from_canonical(&store, &net, "b2");
-        let (_e2, d2) = FullNode::build_retarget_from_canonical(&store, &net, "b2");
+        let gd = crate::engine::dag::ghostdag::ghostdag::GhostDag::new(&format!("{}_gd", path))
+            .unwrap();
+        let (_e1, d1) = FullNode::build_retarget_from_canonical(&store, &gd, &net, "b2");
+        let (_e2, d2) = FullNode::build_retarget_from_canonical(&store, &gd, &net, "b2");
         assert_eq!(d1, d2, "rebuild must be deterministic for the same canonical chain");
         assert!(d1 > 0, "difficulty must be positive");
     }
@@ -3193,8 +3205,10 @@ mod tests {
                 prev = hash;
             }
             let tip = format!("h{}", N);
+            let gd = crate::engine::dag::ghostdag::ghostdag::GhostDag::new(&format!("{}_gd", path))
+                .unwrap();
             let (_e, d) =
-                FullNode::build_retarget_from_canonical(&store, &NetworkMode::Regtest, &tip);
+                FullNode::build_retarget_from_canonical(&store, &gd, &NetworkMode::Regtest, &tip);
             d
         };
         let full_node_diff = build("full", true);
