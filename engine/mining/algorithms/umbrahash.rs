@@ -418,38 +418,100 @@ pub fn umbra_required_at_for(height: u64, network: &NetworkMode) -> bool {
 /// alternation no longer evicts. Cost: MAX_EPOCH_CACHES × 16 MiB resident.
 pub const MAX_EPOCH_CACHES: usize = 3;
 
-/// LRU core: return the cached bytes for `epoch`, building via `build` on a miss
-/// and evicting the least-recently-used slot past `max_slots`. A hit moves the
-/// entry to most-recently-used. Pure over `slots` so it is cheaply testable
-/// without the (heavy) real mkcache.
-fn epoch_cache_lru<F: FnOnce() -> Arc<Vec<u8>>>(
-    slots: &mut Vec<(u64, Arc<Vec<u8>>)>,
-    epoch: u64,
-    max_slots: usize,
-    build: F,
-) -> Arc<Vec<u8>> {
-    if let Some(pos) = slots.iter().position(|(e, _)| *e == epoch) {
-        let hit = slots.remove(pos);
-        let c = Arc::clone(&hit.1);
-        slots.push(hit); // move-to-most-recently-used
-        return c;
+/// LRU lookup: return the cached bytes for `epoch` and move it to
+/// most-recently-used, or `None` on a miss. Held only under the brief global
+/// lock — NEVER during a build. Pure over `slots` for cheap testing.
+fn lru_lookup(slots: &mut Vec<(u64, Arc<Vec<u8>>)>, epoch: u64) -> Option<Arc<Vec<u8>>> {
+    let pos = slots.iter().position(|(e, _)| *e == epoch)?;
+    let hit = slots.remove(pos);
+    let c = Arc::clone(&hit.1);
+    slots.push(hit); // most-recently-used
+    Some(c)
+}
+
+/// LRU store: insert `cache` for `epoch` (idempotent — a no-op if a concurrent
+/// builder already stored it) and evict least-recently-used entries past
+/// `max_slots`. Pure over `slots`.
+fn lru_store(slots: &mut Vec<(u64, Arc<Vec<u8>>)>, epoch: u64, cache: Arc<Vec<u8>>, max_slots: usize) {
+    if slots.iter().any(|(e, _)| *e == epoch) {
+        return;
     }
-    let cache = build();
-    slots.push((epoch, Arc::clone(&cache)));
+    slots.push((epoch, cache));
     while slots.len() > max_slots {
         slots.remove(0); // evict least-recently-used
     }
-    cache
 }
 
+/// Global LRU of completed epoch caches (Arc handles only).
+type EpochCacheLru = OnceLock<Mutex<Vec<(u64, Arc<Vec<u8>>)>>>;
+/// Global map of per-epoch build locks (single-flight coordination).
+type EpochBuildLocks = OnceLock<Mutex<Vec<(u64, Arc<Mutex<()>>)>>>;
+
+/// Distinct in-flight per-epoch build locks retained. The tip-relative orphan
+/// bound (P0-C, full_node) already caps how many distinct epochs an attacker can
+/// drive, so this stays small; pruning a lock only risks a rare redundant (still
+/// correct) rebuild of that epoch.
+const MAX_EPOCH_BUILD_LOCKS: usize = MAX_EPOCH_CACHES + 4;
+
+/// Get-or-create the per-epoch build lock. The map lock is held only briefly and
+/// is released before the returned lock is taken by the caller.
+fn epoch_build_lock(epoch: u64) -> Arc<Mutex<()>> {
+    static BUILDS: EpochBuildLocks = OnceLock::new();
+    let map = BUILDS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut g = map.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((_, l)) = g.iter().find(|(e, _)| *e == epoch) {
+        return Arc::clone(l);
+    }
+    let l = Arc::new(Mutex::new(()));
+    g.push((epoch, Arc::clone(&l)));
+    while g.len() > MAX_EPOCH_BUILD_LOCKS {
+        g.remove(0);
+    }
+    l
+}
+
+/// Return the 16 MiB verification cache for `epoch`, building it on a miss.
+///
+/// CONCURRENCY (P0-C DoS fix): the global LRU lock is held ONLY for O(1)
+/// lookups/inserts, NEVER during the heavy build (`epoch_seed` = O(epoch) SHA3 +
+/// `mkcache` = 16 MiB). A per-epoch build lock single-flights same-epoch builders
+/// while DIFFERENT epochs build concurrently — so one slow (or attacker-forced)
+/// build cannot serialize every other thread's PoW validation behind one global
+/// mutex, which was an amplification-DoS surface. The result bytes are identical
+/// to the old path, so consensus is unchanged.
 pub fn cache_for_epoch(epoch: u64) -> Arc<Vec<u8>> {
-    type EpochCacheLru = OnceLock<Mutex<Vec<(u64, Arc<Vec<u8>>)>>>;
     static CACHE: EpochCacheLru = OnceLock::new();
-    let cell = CACHE.get_or_init(|| Mutex::new(Vec::new()));
-    let mut guard = cell.lock().unwrap_or_else(|p| p.into_inner());
-    epoch_cache_lru(&mut guard, epoch, MAX_EPOCH_CACHES, || {
-        Arc::new(mkcache(CACHE_BYTES, &epoch_seed(epoch)))
-    })
+    let lru = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+
+    // A hit check that holds the global LRU lock ONLY inside this closure body:
+    // the guard `g` is a local, so it drops before the closure returns. This is
+    // deliberately NOT an `if let lru.lock()…` scrutinee (whose temporary lives
+    // until the end of the if-let) — the global lock must never span the build.
+    let lookup = |ep: u64| -> Option<Arc<Vec<u8>>> {
+        let mut g = lru.lock().unwrap_or_else(|p| p.into_inner());
+        lru_lookup(&mut g, ep)
+    };
+
+    // 1. Fast path: LRU hit.
+    if let Some(c) = lookup(epoch) {
+        return c;
+    }
+    // 2. Miss: single-flight THIS epoch's build. Acquire only the per-epoch lock
+    //    (different epochs proceed concurrently; the global lock is not held).
+    let build_lock = epoch_build_lock(epoch);
+    let _bg = build_lock.lock().unwrap_or_else(|p| p.into_inner());
+    // 3. Re-check under the build lock: a peer builder may have just finished.
+    if let Some(c) = lookup(epoch) {
+        return c;
+    }
+    // 4. Build with ONLY this epoch's build lock held (global lock free).
+    let cache = Arc::new(mkcache(CACHE_BYTES, &epoch_seed(epoch)));
+    // 5. Store under a brief global lock (guard dropped at the end of the block).
+    {
+        let mut g = lru.lock().unwrap_or_else(|p| p.into_inner());
+        lru_store(&mut g, epoch, Arc::clone(&cache), MAX_EPOCH_CACHES);
+    }
+    cache
 }
 
 /// The epoch a block height belongs to.
@@ -593,10 +655,13 @@ mod tests {
         let mut slots: Vec<(u64, Arc<Vec<u8>>)> = Vec::new();
         let builds = Cell::new(0u32);
         let get = |slots: &mut Vec<(u64, Arc<Vec<u8>>)>, e: u64| {
-            epoch_cache_lru(slots, e, 3, || {
-                builds.set(builds.get() + 1);
-                Arc::new(vec![e as u8])
-            })
+            if let Some(c) = lru_lookup(slots, e) {
+                return c;
+            }
+            builds.set(builds.get() + 1);
+            let c = Arc::new(vec![e as u8]);
+            lru_store(slots, e, Arc::clone(&c), 3);
+            c
         };
 
         let a0 = get(&mut slots, 0);
@@ -615,6 +680,35 @@ mod tests {
         assert!(!slots.iter().any(|(e, _)| *e == 1), "epoch 1 must be evicted as LRU");
         assert!(slots.iter().any(|(e, _)| *e == 0), "epoch 0 (recently used) must survive");
         assert!(slots.len() <= 3, "LRU never exceeds MAX_EPOCH_CACHES");
+    }
+
+    #[test]
+    fn cache_for_epoch_is_concurrent_and_consistent() {
+        use std::thread;
+        // P0-C: many threads hammering the SAME epoch must all return
+        // byte-identical caches WITHOUT deadlocking (per-epoch single-flight;
+        // the global lock is never held during mkcache), and two DIFFERENT
+        // epochs must both resolve (built concurrently, not serialized).
+        //
+        // Use two UNIQUE epochs no other test touches so this run ALWAYS drives
+        // the miss -> per-epoch-lock -> re-check -> build path (not a warm-cache
+        // fast-path hit). A self-deadlock (double-locking the global mutex on one
+        // thread) would hang here, so a green run proves deadlock-freedom.
+        const EA: u64 = 424_242;
+        const EB: u64 = 424_243;
+        let epoch_for = |i: u64| if i.is_multiple_of(2) { EA } else { EB };
+        let handles: Vec<_> = (0..8u64)
+            .map(|i| thread::spawn(move || cache_for_epoch(epoch_for(i))))
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let ea = cache_for_epoch(EA);
+        let eb = cache_for_epoch(EB);
+        for (i, r) in results.iter().enumerate() {
+            let expected = if i.is_multiple_of(2) { &ea } else { &eb };
+            assert_eq!(r.as_slice(), expected.as_slice(), "epoch {} cache mismatch", epoch_for(i as u64));
+        }
+        assert_ne!(ea.as_slice(), eb.as_slice(), "different epochs -> different caches");
+        assert_eq!(ea.len(), CACHE_BYTES, "cache is CACHE_BYTES");
     }
 
     #[test]

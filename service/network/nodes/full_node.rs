@@ -155,6 +155,18 @@ const MAX_TRACKED_PEERS: usize = 10_000;
 /// window. At 10 BPS, 120s = 1200 blocks (vs previous 6000 blocks).
 const ORPHAN_EXPIRY_SECS: u64 = 120;
 
+/// P0-C DoS bound: reject an ORPHAN whose UmbraHash epoch is more than this many
+/// epochs beyond our best tip's epoch, BEFORE running its PoW. `umbra_check` ->
+/// `cache_for_epoch` runs `epoch_seed` (O(epoch) SHA3) + a 16 MiB `mkcache` for
+/// the block's epoch; without this bound an attacker floods orphans at an absurd
+/// height (near UMBRA_MAX_HEIGHT ~ epoch 333k) to force that work per packet. A
+/// real ahead-of-tip relayed block is within a few epochs of the network tip;
+/// larger gaps are filled by header-sync (not the bounded orphan buffer), so this
+/// never impedes IBD. 1 epoch = EPOCH_BLOCKS (3M) blocks ~ 3.5 days at 10 BPS, so
+/// a margin of 2 is hugely generous for near-tip orphans while capping the
+/// epoch_seed input to the real chain's epoch, not the attacker's chosen height.
+const MAX_ORPHAN_FUTURE_EPOCHS: u64 = 2;
+
 /// Maximum reorg depth: reject reorgs deeper than this to prevent
 /// deep-reorg attacks. Blocks older than this are considered final.
 const MAX_REORG_DEPTH: u64 = crate::engine::consensus::reorg::FINALITY_DEPTH;
@@ -667,6 +679,19 @@ impl FullNode {
         match BlockValidator::validate_parents_exist(block, &self.block_store, &self.dag_manager) {
             Ok(()) => {}
             Err(e) if e.to_string().contains("not found") => {
+                // P0-C: cheap tip-relative epoch bound BEFORE running UmbraHash
+                // PoW on this UNVALIDATED orphan. validate_self_consistent ->
+                // umbra_check -> cache_for_epoch runs epoch_seed (O(epoch) SHA3)
+                // + a 16 MiB mkcache for the block's epoch; reject an absurd-
+                // height flood packet here without touching that work. Real
+                // ahead-of-tip blocks are within MAX_ORPHAN_FUTURE_EPOCHS of the
+                // tip; larger gaps are filled by header-sync, not this buffer.
+                if self.orphan_epoch_too_far(block.header.height) {
+                    return Err(NodeError::BlockRejected(format!(
+                        "ORPHAN height {} epoch too far beyond tip (umbra pre-cache DoS bound)",
+                        block.header.height
+                    )));
+                }
                 if let Err(reason) =
                     BlockValidator::validate_self_consistent(block, &self.network)
                 {
@@ -2698,6 +2723,25 @@ impl FullNode {
     // ORPHAN POOL
     // ═══════════════════════════════════════════════════════════════════
 
+    /// Highest chain-height among current tips (cheap; used by the P0-C orphan
+    /// pre-cache bound). 0 if there are no tips.
+    fn best_tip_height(&self) -> u64 {
+        self.ghostdag
+            .get_tips()
+            .iter()
+            .map(|t| self.ghostdag.get_chain_height(t))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// P0-C: true if `height`'s UmbraHash epoch is more than
+    /// MAX_ORPHAN_FUTURE_EPOCHS beyond our best tip's epoch — accepting it as an
+    /// orphan would force epoch_seed/mkcache work for an absurd, attacker-chosen
+    /// height. Cheap (no hashing).
+    fn orphan_epoch_too_far(&self, height: u64) -> bool {
+        orphan_epoch_out_of_bound(height, self.best_tip_height())
+    }
+
     /// Add a block to the orphan pool (parent not yet known).
     /// peer_id identifies the sender for per-peer DoS protection.
     fn add_orphan(&self, block: Block, peer_id: &str) {
@@ -3095,9 +3139,48 @@ fn verify_block_confidential_txs(
     Ok(())
 }
 
+/// Pure P0-C bound: true if `height`'s UmbraHash epoch is more than
+/// MAX_ORPHAN_FUTURE_EPOCHS beyond `best_height`'s epoch. Extracted from
+/// `FullNode::orphan_epoch_too_far` so the rule is testable without a live node.
+fn orphan_epoch_out_of_bound(height: u64, best_height: u64) -> bool {
+    use crate::engine::mining::algorithms::umbrahash::epoch_of;
+    epoch_of(height) > epoch_of(best_height).saturating_add(MAX_ORPHAN_FUTURE_EPOCHS)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{verify_block_confidential_txs, FullNode};
+    use super::{orphan_epoch_out_of_bound, verify_block_confidential_txs, FullNode};
+
+    #[test]
+    fn orphan_epoch_bound_rejects_absurd_height_but_allows_near_tip() {
+        // P0-C: the cheap tip-relative epoch bound must reject an absurd-height
+        // orphan (which would force epoch_seed/mkcache work) while allowing any
+        // legitimately near-tip block, and it must SCALE with the real tip.
+        use crate::engine::mining::algorithms::umbrahash::{epoch_of, EPOCH_BLOCKS, UMBRA_MAX_HEIGHT};
+        use super::MAX_ORPHAN_FUTURE_EPOCHS as MARGIN;
+
+        let tip = 1_500_000u64; // epoch 0 (below EPOCH_BLOCKS = 3M)
+        assert!(!orphan_epoch_out_of_bound(tip, tip), "same-epoch orphan allowed");
+        assert!(!orphan_epoch_out_of_bound(tip + 1, tip), "tip+1 allowed");
+        // Exactly MARGIN epochs ahead is allowed; one epoch past it is rejected.
+        let allowed = (epoch_of(tip) + MARGIN) * EPOCH_BLOCKS;
+        assert!(!orphan_epoch_out_of_bound(allowed, tip), "within-margin epoch allowed");
+        let rejected = (epoch_of(tip) + MARGIN + 1) * EPOCH_BLOCKS;
+        assert!(orphan_epoch_out_of_bound(rejected, tip), "past-margin epoch rejected");
+        // The near-ceiling flood height (epoch ~333k) is rejected outright.
+        assert!(
+            orphan_epoch_out_of_bound(UMBRA_MAX_HEIGHT - 1, tip),
+            "absurd 1e12-height flood rejected"
+        );
+        // Bound scales with the tip: a mature chain accepts correspondingly higher
+        // orphans but still rejects the absurd flood.
+        let mature = 100 * EPOCH_BLOCKS; // epoch 100
+        assert!(!orphan_epoch_out_of_bound(mature + 1, mature), "mature near-tip allowed");
+        assert!(
+            orphan_epoch_out_of_bound(UMBRA_MAX_HEIGHT - 1, mature),
+            "1e12 still rejected at epoch 100"
+        );
+    }
 
     #[test]
     fn block_rate_limit_exceeds_network_production_rate() {
