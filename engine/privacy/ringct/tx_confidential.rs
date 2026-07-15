@@ -12,6 +12,7 @@ use crate::engine::privacy::confidential::range_proof::RangeProof;
 use crate::engine::privacy::ringct::dual_clsag::{self, DualCLSAGSignature, RingMember};
 use crate::engine::privacy::ringct::serialization::{point_from_hex, range_proof_from_hex};
 use curve25519_dalek::ristretto::RistrettoPoint;
+use curve25519_dalek::traits::IsIdentity;
 
 /// Validated view of a confidential input.
 pub struct ConfidentialInputView {
@@ -63,6 +64,15 @@ pub fn parse_confidential_output(output: &TxOutput) -> Option<ConfidentialOutput
     let commitment = point_from_hex(output.commitment.as_ref()?)?;
     let one_time_pubkey = point_from_hex(output.one_time_pubkey.as_ref()?)?;
     let ephemeral_pubkey = point_from_hex(output.ephemeral_pubkey.as_ref()?)?;
+    // Reject a degenerate identity ephemeral R at consensus: with R = 0 the DH
+    // shared secret ss = v·R is the identity for EVERY view key, so the output's
+    // one-time key depends only on the recipient's published spend key and any
+    // observer holding (V,S) can link the output — a sender-chosen deanonymization.
+    // A well-formed sender never uses R = 0. This is the single choke point for
+    // both the shield and confidential consensus output loops.
+    if ephemeral_pubkey.is_identity() {
+        return None;
+    }
     let range_proof = range_proof_from_hex(output.range_proof.as_ref()?)?;
     Some(ConfidentialOutputView {
         commitment,

@@ -13,6 +13,7 @@ use crate::engine::privacy::ringct::serialization::point_from_hex;
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::traits::IsIdentity;
 
 /// A recovered confidential output the wallet owns.
 pub struct RecoveredOutput {
@@ -34,6 +35,13 @@ pub fn scan_confidential_output(
     let h = generator_h();
 
     let r_point = point_from_hex(output.ephemeral_pubkey.as_ref()?)?;
+    // Reject a degenerate identity ephemeral R: it makes the DH shared secret a
+    // public constant (ss = v·identity = identity for ANY view key), so the
+    // one-time key depends only on the recipient's published spend key and the
+    // output becomes publicly linkable. A well-formed sender never uses R=0.
+    if r_point.is_identity() {
+        return None;
+    }
     let commitment = point_from_hex(output.commitment.as_ref()?)?;
     let one_time_pubkey = point_from_hex(output.one_time_pubkey.as_ref()?)?;
     let enc = amount_encoding::enc_from_hex(output.encrypted_amount.as_ref()?)?;

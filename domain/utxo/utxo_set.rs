@@ -558,6 +558,22 @@ impl UtxoSet {
     ) -> Result<String, StorageError> {
         use sha2::{Digest, Sha256};
 
+        // GUARD (F-10): this apply path materializes every output as a TRANSPARENT
+        // UTXO and does NOT maintain the confidential/shield buckets (okey ->
+        // commitment, okeyidx, key-image set). It is reached only for genesis and
+        // full-block apply, which are coinbase/transparent in practice. Refuse a
+        // confidential/shield tx here rather than silently corrupting the
+        // confidential bucket (a latent reorg landmine); the live confidential
+        // path is apply_block_dag_ordered.
+        for tx in transactions {
+            if tx.is_confidential() || tx.is_shield() {
+                return Err(StorageError::Other(format!(
+                    "apply_block_write_with_commitment: confidential/shield tx {} unsupported on this path (use apply_block_dag_ordered)",
+                    tx.hash
+                )));
+            }
+        }
+
         let mut ops: Vec<BatchWrite> = Vec::new();
 
         // Undo data — collects everything needed to reverse this block

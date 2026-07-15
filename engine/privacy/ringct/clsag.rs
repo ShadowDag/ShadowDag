@@ -11,6 +11,7 @@ use crate::errors::CryptoError;
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::traits::IsIdentity;
 use sha2::{Digest, Sha512};
 
 /// A CLSAG ring signature.
@@ -146,6 +147,12 @@ pub fn verify(message: &[u8], ring: &[RistrettoPoint], sig: &CLSAGSignature) -> 
         Some(p) => p,
         None => return false,
     };
+    // Reject an identity key image: it decouples the image from the spend key
+    // (degenerate linkability) and must never be accepted. Mirrors the check in
+    // dual_clsag::verify.
+    if ki.is_identity() {
+        return false;
+    }
 
     let mut c = sig.c0;
 

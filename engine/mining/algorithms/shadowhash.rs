@@ -3,17 +3,23 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// ShadowHash — Custom ASIC-resistant proof-of-work algorithm.
+// ShadowHash — LEGACY (pre-fork) proof-of-work algorithm.
 //
-// Design:
-//   Round 1: SHA-256 on serialized header        (compute-bound)
-//   Round 2: Blake3 with memory-hard expansion    (memory-bound)
-//   Round 3: SHA3-256 on the combined result      (ASIC-breaking)
-//   Round 4: Anti-ASIC mixing with nonce rotation (dynamic)
+// Rounds: SHA-256 header -> BLAKE3 scratchpad mix -> SHA3-256 -> anti-ASIC mix.
 //
-// The multi-algorithm pipeline forces specialized hardware to implement
-// all three hash families, making ASIC development uneconomical.
-// GPU miners can efficiently pipeline the stages.
+// HONEST SECURITY NOTE (internal crypto pre-audit F-2, 2026-07-15): this
+// algorithm's "memory-hardness / ASIC-resistance" does NOT hold. The 256 KB
+// scratchpad is filled by independent SHA256(round1 || i) chunks and the mix
+// loop's addressing (idx, rot_idx) depends only on the header pre-hash and
+// constants — no scratchpad VALUE ever selects an address — so there is no
+// data-dependent memory-latency chain. An optimizer computes only the few
+// touched chunks and streams the final hash, reducing the whole thing to
+// SHA256 work, which mature SHA256 ASICs crush. It is retained ONLY to
+// validate pre-fork blocks. The chain's real memory-hard PoW is UmbraHash
+// (engine/mining/algorithms/umbrahash.rs, Ethash-DAG + mini-ProgPoW); once
+// UmbraHash is activated (UMBRA_ACTIVATION_HEIGHT), consensus must reject
+// this legacy algorithm so it can never be a cheaper co-valid path at the
+// same difficulty target.
 // ═══════════════════════════════════════════════════════════════════════════
 
 use sha2::{Digest as Sha2Digest, Sha256};
@@ -21,15 +27,13 @@ use sha3::Sha3_256;
 
 use crate::domain::block::block::Block;
 
-/// ShadowHash scratchpad size in bytes (256 KB — exceeds GPU L2 cache,
-/// forces memory bandwidth dependency for long-term ASIC resistance).
-/// 256KB ensures ASICs cannot gain >2x advantage over GPUs even after
-/// 10 years of chip advancement (L1 caches grow to ~512KB by 2036).
+/// ShadowHash scratchpad size in bytes (256 KB). NOTE: this provides no real
+/// memory-latency hardness — the access pattern is not value-dependent (see the
+/// F-2 note in the file header); the scratchpad is streamable/regenerable.
 pub const SCRATCHPAD_SIZE: usize = 262144;
 
-/// Number of mixing rounds for ASIC resistance.
-/// 16 rounds with 256KB scratchpad ensures data-dependent memory access
-/// patterns that defeat ASIC pipelining for at least 10 years.
+/// Number of mixing rounds. 16 rounds over a fixed (non-value-dependent) access
+/// pattern do not defeat ASIC pipelining; see the F-2 note in the file header.
 pub const MIX_ROUNDS: usize = 16;
 
 /// Hash a full block
