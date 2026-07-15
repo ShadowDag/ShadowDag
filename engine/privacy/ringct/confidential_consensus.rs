@@ -22,6 +22,7 @@ use curve25519_dalek::scalar::Scalar;
 use crate::engine::privacy::confidential::range_proof;
 use crate::engine::privacy::ringct::dual_clsag;
 use crate::engine::privacy::ringct::ring_signature::{MAX_RING_SIZE, MIN_RING_SIZE};
+use crate::engine::privacy::ringct::serialization::point_from_hex;
 use crate::engine::privacy::ringct::tx_confidential::{
     parse_confidential_input, parse_confidential_output,
 };
@@ -248,11 +249,35 @@ pub fn verify_confidential_tx(
             }
         }
 
-        // Key image: matches signature, unseen on-chain, unique within block.
-        let ki_hex = hex::encode(view.key_image.compress().as_bytes());
-        if ki_hex != hex::encode(view.signature.key_image.as_bytes()) {
-            return Err(err(format!("confidential tx {}: key image mismatch", tx.hash)));
+        // Bind the ADVERTISED key image (TxInput.key_image — the exact field the
+        // apply layer records into the spent-key-image set) to the VERIFIED key
+        // image embedded in the dual-CLSAG signature (which is what the uniqueness
+        // check below and CLSAG linkability actually enforce). Without this they
+        // are two independent sources of truth: an owner could advertise K1 while
+        // the signature carries I, pass the "I unspent" check, have apply record
+        // K1, then spend the SAME output again with a fresh advertised K2 (I still
+        // looks unspent) — a cross-block confidential double-spend. Canonical
+        // Ristretto decode also rejects a non-canonical advertised encoding, and a
+        // missing field is rejected outright.
+        let advertised = input
+            .key_image
+            .as_deref()
+            .and_then(point_from_hex)
+            .ok_or_else(|| {
+                err(format!(
+                    "confidential tx {}: missing or malformed key image",
+                    tx.hash
+                ))
+            })?;
+        if advertised != view.key_image {
+            return Err(err(format!(
+                "confidential tx {}: advertised key image does not match the signature",
+                tx.hash
+            )));
         }
+        // Uniqueness: unseen on-chain, unique within block. Uses the verified
+        // key image, which now provably equals the advertised (recorded) one.
+        let ki_hex = hex::encode(view.key_image.compress().as_bytes());
         if utxo_set.key_image_seen(&ki_hex) {
             return Err(err(format!(
                 "confidential tx {}: key image already spent",
@@ -440,6 +465,35 @@ mod tests {
         let tx = valid_conf_tx(&set, 100);
         let mut seen = HashSet::new();
         assert!(verify_confidential_tx(&tx, &set, &net(), &mut seen).is_ok());
+    }
+
+    #[test]
+    fn rejects_advertised_key_image_not_matching_signature() {
+        // CRITICAL (P0-A): the double-spend set is keyed on TxInput.key_image at
+        // apply time, but uniqueness + CLSAG linkability bind the key image
+        // EMBEDDED in the signature. If they can differ, an owner advertises K1,
+        // apply records K1, and a second spend with the same signature (image I)
+        // plus a fresh advertised K2 is not detected as a double-spend. The gate
+        // must reject any advertised KI that does not equal the signature's KI,
+        // and reject a missing one.
+        let set = UtxoSet::new_empty();
+        let mut tx = valid_conf_tx(&set, 100);
+        tx.inputs[0].key_image =
+            Some(hexp(&(Scalar::random(&mut OsRng) * RISTRETTO_BASEPOINT_POINT)));
+        let mut seen = HashSet::new();
+        assert!(
+            verify_confidential_tx(&tx, &set, &net(), &mut seen).is_err(),
+            "advertised key image != signature key image must be rejected"
+        );
+
+        let set2 = UtxoSet::new_empty();
+        let mut tx2 = valid_conf_tx(&set2, 100);
+        tx2.inputs[0].key_image = None;
+        let mut seen2 = HashSet::new();
+        assert!(
+            verify_confidential_tx(&tx2, &set2, &net(), &mut seen2).is_err(),
+            "missing advertised key image must be rejected"
+        );
     }
 
     #[test]
