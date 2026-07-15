@@ -181,18 +181,18 @@ static RECEIVED_ADDRS: Lazy<Arc<PlMutex<Vec<String>>>> =
 static INBOUND_CONN_PER_IP: Lazy<Arc<PlMutex<HashMap<String, u32>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(HashMap::new())));
 
-/// Try to register one more live inbound connection for `ip`. Returns `false`
-/// (without incrementing) if `ip` already has `MAX_PEERS_PER_IP` live inbound
-/// connections.
-fn try_register_inbound_ip(ip: &str) -> bool {
+/// Register one more inbound connection for `ip` and report whether the IP is
+/// still WITHIN `MAX_PEERS_PER_IP`. ALWAYS increments (pair with exactly one
+/// `release_inbound_ip`), so a caller that rejects on `false` can release
+/// immediately without desyncing the counter — and a whitelisted seed that
+/// bypasses the cap is still tracked and released symmetrically. This mirrors
+/// `register_inbound_subnet` so both anti-eclipse caps share one shape.
+fn register_inbound_ip(ip: &str) -> bool {
     use crate::service::network::p2p::peer_manager::MAX_PEERS_PER_IP;
     let mut map = INBOUND_CONN_PER_IP.lock();
     let entry = map.entry(ip.to_string()).or_insert(0);
-    if *entry >= MAX_PEERS_PER_IP {
-        return false;
-    }
     *entry += 1;
-    true
+    *entry <= MAX_PEERS_PER_IP
 }
 
 /// True if `addr` is a routable `host:port` SocketAddr suitable for the peer
@@ -209,7 +209,7 @@ fn is_routable_peer_addr(addr: &str) -> bool {
 }
 
 /// Release one live inbound connection for `ip` (call exactly once per
-/// successful `try_register_inbound_ip`).
+/// `register_inbound_ip`).
 fn release_inbound_ip(ip: &str) {
     let mut map = INBOUND_CONN_PER_IP.lock();
     if let Some(c) = map.get_mut(ip) {
@@ -1112,7 +1112,15 @@ impl P2P {
 
                     // ── Anti-eclipse: cap live inbound connections per IP ──
                     // Prevents a single host from monopolizing inbound slots.
-                    if !try_register_inbound_ip(&ban_key) {
+                    // Whitelisted trusted seeds bypass the cap (a node must
+                    // ALWAYS accept its seeds — otherwise a follower can be
+                    // isolated from its own seeds once stale/half-open slots
+                    // fill, stalling sync) but are still counted + released
+                    // symmetrically, exactly like the per-/16 cap below.
+                    if !register_inbound_ip(&ban_key)
+                        && !crate::service::network::dos_guard::is_whitelisted(&ban_key)
+                    {
+                        release_inbound_ip(&ban_key);
                         pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         slog_warn!("p2p", "rejected_too_many_per_ip", addr => &peer_addr);
                         drop(s);
@@ -2658,15 +2666,18 @@ mod tests {
     fn inbound_per_ip_cap_enforced_and_released() {
         // Unique IP so this test does not race the global map with others.
         let ip = "203.0.113.77";
-        // Up to the cap succeeds...
+        // Up to the cap: each registration is within-limit.
         for _ in 0..MAX_PEERS_PER_IP {
-            assert!(try_register_inbound_ip(ip), "within cap must register");
+            assert!(register_inbound_ip(ip), "within cap must be within-limit");
         }
-        // ...the next is rejected (anti-eclipse).
-        assert!(!try_register_inbound_ip(ip), "over cap must be rejected");
-        // Releasing one frees a slot.
+        // The next reports OVER the cap. It still incremented (always-increment
+        // semantics), so the rejecting caller releases it immediately — as the
+        // accept loop does for a non-whitelisted peer.
+        assert!(!register_inbound_ip(ip), "over cap must report over-limit");
         release_inbound_ip(ip);
-        assert!(try_register_inbound_ip(ip), "slot freed after release");
+        // Releasing a live slot lets a new connection register within the cap.
+        release_inbound_ip(ip);
+        assert!(register_inbound_ip(ip), "slot freed after release");
         // Clean up so the map does not leak this IP across the suite.
         for _ in 0..MAX_PEERS_PER_IP {
             release_inbound_ip(ip);

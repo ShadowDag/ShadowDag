@@ -50,6 +50,20 @@ kill_all_miners(){
   '
 }
 start_one(){ ensure_loop_script; docker exec -d "$CT" bash "$LOOP_PATH"; }
+count_miners(){
+  # Count real miner BINARY processes ("shadowdag-miner <args>"). The trailing
+  # space after "shadowdag-miner" excludes this scanner's own bash (whose
+  # cmdline carries the literal pattern "shadowdag-miner\ " — backslash, not a
+  # bare space — so it never matches "shadowdag-miner ").
+  docker exec -u root "$CT" bash -c '
+    n=0
+    for p in /proc/[0-9]*; do
+      c=$(tr "\0" " " < "$p/cmdline" 2>/dev/null)
+      case "$c" in *shadowdag-miner\ *) n=$((n+1));; esac
+    done
+    echo "$n"
+  ' 2>/dev/null
+}
 
 log "start: resetting to a single miner instance"
 kill_all_miners
@@ -57,6 +71,18 @@ start_one
 sleep "$INTERVAL"
 last=$(height); miss=0
 while true; do
+  # Enforce EXACTLY one miner every interval — not just at startup/stall.
+  # Redundant miners accumulate from container churn, kill/start races, or
+  # manual intervention; the height-stall path only fires when the chain is
+  # FLAT, so a HEALTHY (advancing) chain would otherwise run duplicate miners
+  # forever, wasting CPU (observed 3x on seed1). count!=1 covers both a dead
+  # miner (0) and drift (>1); reconcile to a single instance and refresh the
+  # stall baseline so the reconcile does not trip a false stall.
+  mc=$(count_miners)
+  if [ -n "$mc" ] && [ "$mc" != "1" ] 2>/dev/null; then
+    log "miner count=$mc (want 1) -> reconciling to a single instance"
+    kill_all_miners; start_one; sleep 5; last=$(height)
+  fi
   cur=$(height)
   if [ -z "$cur" ]; then
     log "height unavailable (node busy?) - skip sample"
