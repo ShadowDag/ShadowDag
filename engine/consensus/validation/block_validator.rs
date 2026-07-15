@@ -898,6 +898,22 @@ impl BlockValidator {
             }
         }
 
+        // CONSENSUS RULE (external audit C2): parents MUST be in canonical
+        // ascending order. The PoW pre-image SORTS parents before hashing, so
+        // [A,B] and [B,A] share ONE block hash — but GHOSTDAG
+        // (select_parent / compute_merge_set / classify_merge_set) and the MTP
+        // timestamp walk consume the RAW header.parents order. Two nodes that
+        // received different orderings of the same hash could then classify
+        // blue/red differently → a consensus split under one block identity.
+        // Requiring the stored order to equal the hashed (sorted) order makes the
+        // parent order part of the block's identity. Strictly-ascending also
+        // re-affirms uniqueness.
+        if !parents.windows(2).all(|w| w[0] < w[1]) {
+            return Err(ConsensusError::BlockValidation(
+                "parents not in canonical ascending order".into(),
+            ));
+        }
+
         // Validate selected_parent is a member of parents (if set).
         // The reorg path walks selected_parent to find fork points,
         // so an invalid selected_parent would cause incorrect chain

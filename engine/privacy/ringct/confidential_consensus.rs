@@ -259,25 +259,35 @@ pub fn verify_confidential_tx(
         // looks unspent) — a cross-block confidential double-spend. Canonical
         // Ristretto decode also rejects a non-canonical advertised encoding, and a
         // missing field is rejected outright.
-        let advertised = input
+        let advertised_hex = input
             .key_image
             .as_deref()
-            .and_then(point_from_hex)
-            .ok_or_else(|| {
-                err(format!(
-                    "confidential tx {}: missing or malformed key image",
-                    tx.hash
-                ))
-            })?;
+            .ok_or_else(|| err(format!("confidential tx {}: missing key image", tx.hash)))?;
+        let advertised = point_from_hex(advertised_hex)
+            .ok_or_else(|| err(format!("confidential tx {}: malformed key image", tx.hash)))?;
         if advertised != view.key_image {
             return Err(err(format!(
                 "confidential tx {}: advertised key image does not match the signature",
                 tx.hash
             )));
         }
-        // Uniqueness: unseen on-chain, unique within block. Uses the verified
-        // key image, which now provably equals the advertised (recorded) one.
+        // Uniqueness key = canonical lowercase encoding of the verified key image.
         let ki_hex = hex::encode(view.key_image.compress().as_bytes());
+        // Require the ADVERTISED encoding to be EXACTLY this canonical lowercase
+        // form. hex::decode (via point_from_hex) accepts both cases, so "ABCD.."
+        // and "abcd.." decode to the same point and pass the equality above — but
+        // the apply layer records the RAW input.key_image string, so a spend
+        // advertising uppercase is stored under "ki:ABCD.." while the uniqueness
+        // check looks up "ki:abcd..": the same output could then be spent again
+        // advertising lowercase (cross-block double-spend). Rejecting any
+        // non-canonical encoding makes the recorded string byte-identical to the
+        // checked key. (External audit re-open of P0-A: hex case-aliasing.)
+        if advertised_hex != ki_hex {
+            return Err(err(format!(
+                "confidential tx {}: key image must be canonical lowercase hex",
+                tx.hash
+            )));
+        }
         if utxo_set.key_image_seen(&ki_hex) {
             return Err(err(format!(
                 "confidential tx {}: key image already spent",
@@ -493,6 +503,21 @@ mod tests {
         assert!(
             verify_confidential_tx(&tx2, &set2, &net(), &mut seen2).is_err(),
             "missing advertised key image must be rejected"
+        );
+
+        // Hex CASE-ALIASING: the VALID key image, but uppercased. It decodes to
+        // the exact same point (passing point-equality) yet is not the canonical
+        // lowercase encoding the apply layer / uniqueness set key on — must reject,
+        // else the same output double-spends via "ki:ABCD.." vs "ki:abcd..".
+        let set3 = UtxoSet::new_empty();
+        let mut tx3 = valid_conf_tx(&set3, 100);
+        let canonical_ki = tx3.inputs[0].key_image.clone().unwrap();
+        assert_eq!(canonical_ki, canonical_ki.to_lowercase(), "baseline KI is lowercase");
+        tx3.inputs[0].key_image = Some(canonical_ki.to_uppercase());
+        let mut seen3 = HashSet::new();
+        assert!(
+            verify_confidential_tx(&tx3, &set3, &net(), &mut seen3).is_err(),
+            "uppercase (non-canonical) key image must be rejected (case-aliasing double-spend)"
         );
     }
 
