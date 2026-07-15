@@ -499,7 +499,7 @@ impl BlockValidator {
         // A single ShadowHash + target comparison is ~100μs, while verifying
         // N transaction signatures can take milliseconds. Rejecting invalid PoW
         // here prevents attackers from wasting CPU on fake-block signature checks.
-        if let Err(reason) = Self::validate_pow(block) {
+        if let Err(reason) = Self::validate_pow(block, network) {
             return BlockValidationResult::fail(&reason.to_string());
         }
 
@@ -836,8 +836,8 @@ impl BlockValidator {
     /// Validate PoW using the CANONICAL PowValidator (256-bit target comparison).
     /// There is ONE PoW validation rule in the entire codebase — PowValidator.
     /// BlockValidator delegates to it to prevent consensus rule divergence.
-    fn validate_pow(block: &Block) -> Result<(), ConsensusError> {
-        let result = PowValidator::validate(block);
+    fn validate_pow(block: &Block, network: &NetworkMode) -> Result<(), ConsensusError> {
+        let result = PowValidator::validate_for_network(block, network);
         if result.valid {
             Ok(())
         } else {
@@ -868,7 +868,7 @@ impl BlockValidator {
     ) -> Result<(), ConsensusError> {
         Self::validate_network_layer_for_network(block, network)?;
         if block.header.height != 0 {
-            Self::validate_pow(block)?;
+            Self::validate_pow(block, network)?;
         }
         Ok(())
     }

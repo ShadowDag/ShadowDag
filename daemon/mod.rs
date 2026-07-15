@@ -292,10 +292,28 @@ impl DaemonNode {
         finality_mgr = finality_mgr.with_db(db.clone());
         finality_mgr.load_checkpoints();
 
-        // Initialize Stratum pool server if enabled
+        // Initialize Stratum pool server if enabled.
+        // FORK GUARD (H2): the built-in Stratum pool hashes ShadowHash only and
+        // emits version-2 templates (build_stratum_template). On a network where
+        // UmbraHash is the mandatory PoW (umbra_activation_height().is_some() —
+        // i.e. mainnet), every pool-produced v2 block is rejected by the consensus
+        // floor (PowValidator::validate_for_network), a SILENT liveness halt for
+        // pool-based mining. Until a UmbraHash Stratum hashing path exists, refuse
+        // to run a dead pool: disable it (loud warning) rather than mine blocks the
+        // network will reject. The UmbraHash solo/docker miner (bin/miner.rs, which
+        // forces version 3) is the mining path on such networks.
         let stratum_server = if cfg.enable_stratum {
-            slog_info!("daemon", "stratum_init", port => cfg.stratum_port);
-            Some(Arc::new(StratumServer::with_rpc_port(cfg.stratum_port, cfg.rpc_port)))
+            if crate::engine::mining::algorithms::umbrahash::umbra_activation_height(&cfg.network)
+                .is_some()
+            {
+                slog_warn!("daemon", "stratum_disabled_umbra_fork",
+                    network => cfg.network.name(),
+                    reason => "built-in Stratum pool is ShadowHash-only; UmbraHash is mandatory on this network — use the UmbraHash solo/docker miner");
+                None
+            } else {
+                slog_info!("daemon", "stratum_init", port => cfg.stratum_port);
+                Some(Arc::new(StratumServer::with_rpc_port(cfg.stratum_port, cfg.rpc_port)))
+            }
         } else {
             None
         };
@@ -1149,6 +1167,10 @@ impl DaemonNode {
 
         Some(BlockTemplate {
             job_id,
+            // ShadowHash (v2) template. Only reached on NON-fork networks: the
+            // pool is disabled at construction where umbra_activation_height is
+            // Some (see the FORK GUARD in Daemon::new). A future UmbraHash Stratum
+            // path MUST network-gate this to UMBRA_POW_VERSION *and* hash UmbraHash.
             version: 2, // ms-timestamp era (matches GENESIS_VERSION)
             prev_hash: accepted.header.hash.clone(),
             parents,
@@ -1596,6 +1618,40 @@ mod tests {
     fn daemon_mainnet_is_default() {
         let d = daemon_with_temp_dir(NetworkMode::Mainnet);
         assert!(d.cfg.network.is_mainnet());
+    }
+
+    /// Build a DaemonNode with `enable_stratum = true` on the given network.
+    fn daemon_with_stratum(network: NetworkMode) -> DaemonNode {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut cfg = NodeConfig::for_network(network);
+        cfg.enable_stratum = true;
+        cfg.data_dir = std::path::PathBuf::from(format!(
+            "{}/shadowdag_test_stratum_{}_{}",
+            std::env::temp_dir().display(),
+            cfg.network.short_name(),
+            ts
+        ));
+        DaemonNode::new(cfg).expect("failed to create DaemonNode for stratum test")
+    }
+
+    #[test]
+    fn stratum_disabled_on_umbra_fork_network_but_enabled_elsewhere() {
+        // H2 FORK GUARD: the ShadowHash-only Stratum pool must NOT run on a network
+        // where UmbraHash is mandatory (mainnet) — it would silently mine v2 blocks
+        // the consensus floor rejects. It stays available on unscheduled networks.
+        let main = daemon_with_stratum(NetworkMode::Mainnet);
+        assert!(
+            main.stratum_server().is_none(),
+            "Stratum pool must be disabled on mainnet (UmbraHash fork scheduled)"
+        );
+        let test = daemon_with_stratum(NetworkMode::Testnet);
+        assert!(
+            test.stratum_server().is_some(),
+            "Stratum pool stays enabled on testnet (fork unscheduled)"
+        );
     }
 
     #[test]

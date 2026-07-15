@@ -21,6 +21,7 @@
 // consensus-compatible — intentional, and fine for a new chain.
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::config::node::node_config::NetworkMode;
 use sha3::{Digest, Sha3_256, Sha3_512};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -357,23 +358,52 @@ pub const UMBRA_POW_VERSION: u32 = 3;
 /// Height at/above which UmbraHash is MANDATORY (a block with a lower version is
 /// rejected instead of validated by the cheap legacy ShadowHash path).
 ///
-/// `None` = the fork is NOT scheduled yet, so both algorithms stay valid and
-/// behavior is unchanged (UmbraHash remains opt-in). Set this to `Some(height)`
-/// when the hard fork is scheduled — WITHOUT it, an attacker could keep mining
-/// cheap version-2 ShadowHash blocks at the same difficulty/target after the
-/// fork and bypass memory-hardness forever. The activation height is a
-/// governance/deployment decision.
+/// `None` = the NETWORK-AGNOSTIC default (no schedule). This is the fallback used
+/// ONLY by non-authoritative / network-blind early-admission paths (orphan-pool
+/// junk-filter, dead sync verifier, SPV header recompute) that do not carry a
+/// `NetworkMode`. The AUTHORITATIVE consensus gate and the miner use the
+/// network-aware `umbra_activation_height`/`umbra_required_at_for` below, so the
+/// mainnet fork is enforced there regardless of this value. Kept `None` so those
+/// blind paths preserve their current (pre-fork) behavior with zero regression.
 pub const UMBRA_ACTIVATION_HEIGHT: Option<u64> = None;
 
+/// Mainnet activates UmbraHash at height 1: genesis (height 0) is the sole legacy
+/// ShadowHash block (validated by checkpoint, never competitively mined), and
+/// every MINED block (height >= 1) MUST be UmbraHash. This retires ShadowHash for
+/// all competitive mining, so mainnet has exactly ONE PoW cost floor and ONE
+/// difficulty domain. A fresh mainnet launches directly on this rule (no genesis
+/// re-mine needed).
+pub const MAINNET_UMBRA_ACTIVATION_HEIGHT: Option<u64> = Some(1);
+
+/// Per-network UmbraHash activation schedule (the single source of truth for the
+/// hard fork). Testnet/Regtest stay unscheduled (`None`) so the live testnet and
+/// unit tests — which mine legacy v2 blocks — are unaffected; the fork is a
+/// MAINNET launch policy. If a mid-chain testnet activation is ever scheduled,
+/// set Testnet here AND make the miner switch versions per-height (see bin/miner).
+pub fn umbra_activation_height(network: &NetworkMode) -> Option<u64> {
+    match network {
+        NetworkMode::Mainnet => MAINNET_UMBRA_ACTIVATION_HEIGHT,
+        NetworkMode::Testnet | NetworkMode::Regtest => None,
+    }
+}
+
 /// Whether a block at `height` MUST use UmbraHash under the given schedule.
-/// Pure over `activation` so the rule is testable without mutating the const.
+/// Pure over `activation` so the rule is testable without mutating any const.
 pub fn umbra_required_at_with(height: u64, activation: Option<u64>) -> bool {
     matches!(activation, Some(a) if height >= a)
 }
 
-/// Whether a block at `height` MUST use UmbraHash under the live schedule.
+/// Whether a block at `height` MUST use UmbraHash under the network-agnostic
+/// default (blind paths only — see `UMBRA_ACTIVATION_HEIGHT`).
 pub fn umbra_required_at(height: u64) -> bool {
     umbra_required_at_with(height, UMBRA_ACTIVATION_HEIGHT)
+}
+
+/// Whether a block at `height` MUST use UmbraHash on `network`. This is the
+/// AUTHORITATIVE rule: the consensus validator and the miner both gate on it, so
+/// they agree on version/algorithm per block (miner<->verifier parity).
+pub fn umbra_required_at_for(height: u64, network: &NetworkMode) -> bool {
+    umbra_required_at_with(height, umbra_activation_height(network))
 }
 
 /// Process-wide memoized verification cache (holds the current epoch's 16 MiB
@@ -597,9 +627,26 @@ mod tests {
         assert!(!umbra_required_at_with(49, Some(50)));
         assert!(umbra_required_at_with(50, Some(50)));
         assert!(umbra_required_at_with(51, Some(50)));
-        // The live schedule is currently unscheduled (the fork is not yet set).
+        // The network-agnostic (blind-path) default is unscheduled.
         assert_eq!(UMBRA_ACTIVATION_HEIGHT, None);
         assert!(!umbra_required_at(u64::MAX));
+    }
+
+    #[test]
+    fn umbra_activation_is_network_aware() {
+        // Mainnet activates at height 1: genesis (h0) stays legacy, every mined
+        // block (h>=1) MUST be UmbraHash.
+        assert_eq!(umbra_activation_height(&NetworkMode::Mainnet), Some(1));
+        assert!(!umbra_required_at_for(0, &NetworkMode::Mainnet), "mainnet genesis (h0) is legacy");
+        assert!(umbra_required_at_for(1, &NetworkMode::Mainnet), "mainnet h1 MUST be UmbraHash");
+        assert!(umbra_required_at_for(u64::MAX, &NetworkMode::Mainnet));
+        // Testnet/Regtest are unscheduled → never required (live testnet + tests
+        // that mine legacy v2 are unaffected).
+        assert_eq!(umbra_activation_height(&NetworkMode::Testnet), None);
+        assert_eq!(umbra_activation_height(&NetworkMode::Regtest), None);
+        assert!(!umbra_required_at_for(1, &NetworkMode::Testnet));
+        assert!(!umbra_required_at_for(u64::MAX, &NetworkMode::Testnet));
+        assert!(!umbra_required_at_for(u64::MAX, &NetworkMode::Regtest));
     }
 
     #[test]

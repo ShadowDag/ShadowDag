@@ -112,12 +112,27 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
     // default stays ShadowHash so existing chains and tests are unaffected. In
     // this mode the miner produces version-UMBRA_POW_VERSION blocks and the node
     // validates them via the UmbraHash path.
-    let umbra_mode = parse_flag(args, "--pow", "shadow").eq_ignore_ascii_case("umbra");
+    let umbra_flag = parse_flag(args, "--pow", "shadow").eq_ignore_ascii_case("umbra");
+    // Miner<->verifier PARITY: on any network where the UmbraHash fork is
+    // scheduled (mainnet), UmbraHash is MANDATORY for every mined block. Force it
+    // regardless of --pow, else the miner would produce legacy v2 blocks that
+    // consensus rejects at height >= 1 (a liveness halt). Testnet/Regtest are
+    // unscheduled and keep the flag-based opt-in. This startup-time force is valid
+    // because mainnet activates at height 1 (ALL mined blocks are UmbraHash); a
+    // mid-chain testnet activation would instead require per-height version switching.
+    let umbra_forced = umbrahash::umbra_activation_height(&network).is_some();
+    let umbra_mode = umbra_flag || umbra_forced;
     let block_version: u32 = if umbra_mode {
         umbrahash::UMBRA_POW_VERSION
     } else {
         2 // ms-timestamp era (ShadowHash)
     };
+    if umbra_forced && !umbra_flag {
+        println!(
+            "[miner] network {:?} mandates UmbraHash (fork active) — forcing block version {}",
+            network, block_version
+        );
+    }
     if umbra_mode {
         println!(
             "[miner] PoW = UmbraHash (memory-hard, block version {}); CPU cache-verify mining",

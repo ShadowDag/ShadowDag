@@ -9,6 +9,7 @@
 // counting leading zeros. This gives finer-grained difficulty adjustment.
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::config::node::node_config::NetworkMode;
 use crate::domain::block::block::Block;
 use crate::domain::block::block_header::BlockHeader;
 use crate::engine::mining::algorithms::shadowhash::shadow_hash;
@@ -40,21 +41,56 @@ pub fn pow_algorithm_name(version: u32) -> &'static str {
 }
 
 impl PowValidator {
-    /// Full block PoW validation
+    /// Full block PoW validation using the NETWORK-AGNOSTIC default activation
+    /// floor (see `umbrahash::UMBRA_ACTIVATION_HEIGHT`). Used by network-blind
+    /// paths (the miner's own DAG insertion, tests). The AUTHORITATIVE consensus
+    /// gate uses `validate_for_network` so the mainnet fork is enforced per
+    /// network.
     pub fn validate(block: &Block) -> PowResult {
-        // Fork-activation floor: once UmbraHash is mandatory at this height, a
-        // legacy (cheaper ShadowHash) version must NOT be accepted — otherwise a
-        // miner downgrades to v2 at the same target and bypasses memory-hardness.
-        if umbrahash::umbra_required_at(block.header.height)
-            && block.header.version < umbrahash::UMBRA_POW_VERSION
+        if let Some(fail) =
+            Self::umbra_floor(block, umbrahash::umbra_required_at(block.header.height))
         {
-            return PowResult::fail(format!(
+            return fail;
+        }
+        Self::validate_body(block)
+    }
+
+    /// AUTHORITATIVE, network-aware full-block PoW validation. Applies the
+    /// per-network UmbraHash activation floor (mainnet: version >=
+    /// UMBRA_POW_VERSION required at height >= 1) then the version-gated PoW
+    /// check. Consensus MUST call this so the mainnet fork is enforced and the
+    /// miner and verifier stay in parity per network.
+    pub fn validate_for_network(block: &Block, network: &NetworkMode) -> PowResult {
+        if let Some(fail) = Self::umbra_floor(
+            block,
+            umbrahash::umbra_required_at_for(block.header.height, network),
+        ) {
+            return fail;
+        }
+        Self::validate_body(block)
+    }
+
+    /// Reject a legacy (version < UMBRA_POW_VERSION) block when UmbraHash is
+    /// mandatory at this height. `required` is the activation decision for the
+    /// relevant schedule (network-aware or blind). Returns `Some(fail)` to
+    /// reject, `None` to continue. Without this floor a miner could downgrade to
+    /// a cheaper v2 ShadowHash block at the same target and bypass
+    /// memory-hardness after the fork.
+    fn umbra_floor(block: &Block, required: bool) -> Option<PowResult> {
+        if required && block.header.version < umbrahash::UMBRA_POW_VERSION {
+            return Some(PowResult::fail(format!(
                 "version {} below UMBRA_POW_VERSION {} required at height {}",
                 block.header.version,
                 umbrahash::UMBRA_POW_VERSION,
                 block.header.height
-            ));
+            )));
         }
+        None
+    }
+
+    /// Version-gated PoW body (runs after the activation floor): UmbraHash for
+    /// version >= UMBRA_POW_VERSION, else legacy ShadowHash.
+    fn validate_body(block: &Block) -> PowResult {
         // Hard-fork gate: version >= UMBRA_POW_VERSION uses UmbraHash (memory-hard).
         if block.header.version >= umbrahash::UMBRA_POW_VERSION {
             return match Self::umbra_check(&block.header) {
@@ -555,5 +591,69 @@ mod tests {
         for &b in &target[1..] {
             assert_eq!(b, 0xFF);
         }
+    }
+
+    #[test]
+    fn validate_for_network_enforces_mainnet_umbra_floor() {
+        // H2: the AUTHORITATIVE, network-aware gate. Mainnet activates UmbraHash
+        // at height 1, so a legacy v2 (ShadowHash) block at height >= 1 is
+        // rejected on mainnet but accepted on testnet/regtest (unscheduled).
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::block::block::Block;
+        use crate::domain::block::block_body::BlockBody;
+        use crate::engine::mining::algorithms::shadowhash::shadow_hash;
+
+        // A fully-valid legacy v2 ShadowHash block at height 1 (difficulty 1 →
+        // target MAX → any hash meets it; identity hash recomputed to match).
+        let header = BlockHeader::new_with_defaults(
+            2,
+            String::new(),
+            vec!["p".repeat(64)],
+            "merkle".into(),
+            1_700_000_000_000,
+            0, // nonce
+            1, // difficulty
+            1, // height (non-genesis)
+        );
+        let mut block = Block { header, body: BlockBody { transactions: vec![] } };
+        block.header.hash = shadow_hash(&block);
+
+        // Blind default has no schedule → the v2 block is valid.
+        assert!(PowValidator::validate(&block).valid, "v2 block passes the blind default");
+        // Testnet/Regtest are unscheduled → floor does NOT fire → still valid.
+        assert!(
+            PowValidator::validate_for_network(&block, &NetworkMode::Testnet).valid,
+            "testnet does not enforce the umbra floor"
+        );
+        assert!(
+            PowValidator::validate_for_network(&block, &NetworkMode::Regtest).valid,
+            "regtest does not enforce the umbra floor"
+        );
+        // Mainnet activates at height 1 → the v2 block is REJECTED by the floor.
+        let r = PowValidator::validate_for_network(&block, &NetworkMode::Mainnet);
+        assert!(!r.valid, "mainnet rejects a v2 block at height >= 1");
+        assert!(
+            r.reason.as_deref().unwrap_or("").contains("below UMBRA_POW_VERSION"),
+            "rejection must be the umbra activation floor, got: {:?}",
+            r.reason
+        );
+
+        // Mainnet genesis (height 0) is EXEMPT: the floor does not fire at h0.
+        let g_header = BlockHeader::new_with_defaults(
+            2,
+            String::new(),
+            vec![],
+            "merkle".into(),
+            1_700_000_000_000,
+            0, // nonce
+            0, // difficulty (genesis)
+            0, // height 0
+        );
+        let mut g = Block { header: g_header, body: BlockBody { transactions: vec![] } };
+        g.header.hash = shadow_hash(&g);
+        assert!(
+            PowValidator::validate_for_network(&g, &NetworkMode::Mainnet).valid,
+            "mainnet genesis (h0) is exempt from the umbra floor"
+        );
     }
 }
