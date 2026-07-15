@@ -372,12 +372,27 @@ impl FullNode {
     /// a far-behind peer can always backfill its missing bodies). Throttled to at
     /// most once per PRUNE_INTERVAL of new height.
     fn maybe_prune(&self) {
-        let keep_depth: u64 = std::env::var("SHADOWDAG_PRUNE_KEEP_DEPTH")
+        let mut keep_depth: u64 = std::env::var("SHADOWDAG_PRUNE_KEEP_DEPTH")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(2_000);
         if keep_depth == 0 {
             return;
+        }
+        // CONSENSUS-CRITICAL GUARD (external audit M1): block BODIES within the
+        // reorg and difficulty windows below the tip MUST stay resident — the
+        // ancestry-pure difficulty walk (SHORT_WINDOW blocks) and the reorg
+        // fork-point walk (MAX_REORG_DEPTH) both read them via block_store.
+        // get_block. A too-small keep_depth prunes a body inside a window, so the
+        // walk stops early and this node computes a DIFFERENT next_diff / fork
+        // point than an un-pruned node — which the strict-equality difficulty
+        // check turns into a consensus split. Clamp any positive keep_depth up to
+        // that window floor (archival keep_depth=0 is untouched above).
+        let min_keep = (SHORT_WINDOW as u64).max(MAX_REORG_DEPTH);
+        if keep_depth < min_keep {
+            slog_warn!("pruning", "keep_depth_clamped_to_window_floor",
+                requested => keep_depth, floor => min_keep);
+            keep_depth = min_keep;
         }
         const PRUNE_INTERVAL: u64 = 500;
         let best = match self
@@ -1293,29 +1308,45 @@ impl FullNode {
                             let _ = self.utxo_set.rollback_block_undo(hash);
                             self.rollback_contract_block_best_effort(hash);
                         }
+                        let mut restore_failed = false;
                         for hash in rolled_back_old.iter().rev() {
                             if let Some(old_block) = self.block_store.get_block(hash) {
-                                let _ = self.utxo_set.apply_block_dag_ordered(
-                                    &old_block.body.transactions,
-                                    old_block.header.height,
-                                    hash,
-                                );
+                                if self
+                                    .utxo_set
+                                    .apply_block_dag_ordered(
+                                        &old_block.body.transactions,
+                                        old_block.header.height,
+                                        hash,
+                                    )
+                                    .is_err()
+                                {
+                                    restore_failed = true;
+                                }
                                 let (_, _, _, env) = self.execute_contract_transactions(
                                     &old_block,
                                     &self.contract_storage,
                                 );
-                                let _ = env.persist_with_undo(
-                                    &self.contract_storage,
-                                    hash,
-                                    None,
-                                    None,
-                                );
+                                if env
+                                    .persist_with_undo(&self.contract_storage, hash, None, None)
+                                    .is_err()
+                                {
+                                    restore_failed = true;
+                                }
+                            } else {
+                                restore_failed = true;
                             }
                         }
-                        // Best-effort: drop the offending block from the DAG +
-                        // store so it is not endlessly re-selected as a tip.
-                        // (ghostdag in-memory tip removal is a follow-up; the
-                        // safety guarantee — never APPLYING it — already holds.)
+                        if restore_failed {
+                            // FATAL (external audit M4): see the contract-persist path below —
+                            // a failed old-chain restore leaves committed state representing
+                            // neither chain; halt so a restart rebuilds from the durable store.
+                            slog_error!("node", "FATAL_reorg_restore_failed_halting",
+                                block => block_hash);
+                            std::process::exit(1);
+                        }
+                        // Drop the offending block from the DAG + store so it is not
+                        // endlessly re-selected as a tip. (ghostdag in-memory tip removal
+                        // is a follow-up; the safety guarantee — never APPLYING it — holds.)
                         let _ = self.dag_manager.remove_block_topology(block_hash);
                         let _ = self.block_store.delete_block(block_hash);
                         return Err(NodeError::BlockRejected(msg));
@@ -1368,28 +1399,48 @@ impl FullNode {
                             // previous consistent state. If this also fails, the
                             // node is in an unrecoverable state and should restart
                             // with full UTXO rebuild.
+                            let mut restore_failed = false;
                             for hash in rolled_back_old.iter().rev() {
                                 if let Some(old_block) = self.block_store.get_block(hash) {
-                                    let _ = self.utxo_set.apply_block_dag_ordered(
-                                        &old_block.body.transactions,
-                                        old_block.header.height,
-                                        hash,
-                                    );
+                                    if self
+                                        .utxo_set
+                                        .apply_block_dag_ordered(
+                                            &old_block.body.transactions,
+                                            old_block.header.height,
+                                            hash,
+                                        )
+                                        .is_err()
+                                    {
+                                        restore_failed = true;
+                                    }
                                     // Re-execute contracts for the old block to restore state
                                     let (_, _, _, env) = self.execute_contract_transactions(
                                         &old_block,
                                         &self.contract_storage,
                                     );
-                                    if let Err(pe) = env.persist_with_undo(
-                                        &self.contract_storage,
-                                        hash,
-                                        None,
-                                        None,
-                                    ) {
-                                        slog_error!("node", "CRITICAL_contract_restore_failed",
-                                            block => hash, error => &format!("{}", pe));
+                                    if env
+                                        .persist_with_undo(&self.contract_storage, hash, None, None)
+                                        .is_err()
+                                    {
+                                        restore_failed = true;
                                     }
+                                } else {
+                                    // Old block body gone (pruned/deleted) — cannot restore it.
+                                    restore_failed = true;
                                 }
+                            }
+                            if restore_failed {
+                                // FATAL (external audit M4): the reorg failed AND restoring the
+                                // previous chain also failed, so committed UTXO/contract state now
+                                // represents NEITHER the old nor the new chain. Continuing would
+                                // serve and relay corrupt consensus state (and diverge from the
+                                // network). Halt: a restart runs the verified rebuild/replay from
+                                // the durable BlockStore (daemon startup recompute is the net — it
+                                // either recovers cleanly or refuses to start with a --reindex
+                                // instruction), which is strictly safer than log-and-continue.
+                                slog_error!("node", "FATAL_reorg_restore_failed_halting",
+                                    block => block_hash);
+                                std::process::exit(1);
                             }
                             return Err(NodeError::Consensus(ConsensusError::BlockValidation(
                                 format!(

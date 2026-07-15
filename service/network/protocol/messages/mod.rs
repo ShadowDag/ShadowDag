@@ -14,7 +14,14 @@ pub const MAX_HEADERS_ITEMS: usize = 2_000;
 pub const MAX_ADDR_ITEMS: usize = 1_000;
 pub const MAX_HASH_TEXT_LEN: usize = 128;
 pub const MAX_ADDRESS_TEXT_LEN: usize = 256;
-pub const MAX_PARENTS_PER_HEADER: usize = 64;
+// Wire cap on a header's parent count MUST be >= the consensus parent cap
+// (ConsensusParams::MAX_PARENTS), else a consensus-valid block with 65..=80
+// parents is accepted by full-block relay but REJECTED by header
+// deserialization — header-syncing / late-joining nodes then strand on it
+// (propagation asymmetry / IBD stall). Tie it to the consensus constant so the
+// two caps can never drift (external audit M2).
+pub const MAX_PARENTS_PER_HEADER: usize =
+    crate::config::consensus::consensus_params::ConsensusParams::MAX_PARENTS;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InvType {
