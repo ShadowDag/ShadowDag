@@ -789,10 +789,16 @@ impl FullNode {
         // GHOSTDAG orders A before B, A's txs execute first.
         // ═══════════════════════════════════════════════════════════════
         if let Err(e) = self.recompute_virtual_chain() {
-            // Keep BlockStore aligned with DAG/GHOSTDAG.
-            // Deleting only from BlockStore creates stale topology.
+            // M3 (atomic acceptance): the just-added block is a CHILDLESS tip, and
+            // recompute_virtual_chain restores the UTXO set to the pre-insert
+            // (old-chain) state on a non-fatal Err. Remove the block from GHOSTDAG
+            // + DAG topology + BlockStore so acceptance is all-or-nothing —
+            // otherwise a phantom GHOSTDAG tip (metadata present, body deleted)
+            // could be re-selected as best_tip and roll back the real chain while
+            // applying nothing.
             slog_error!("node", "virtual_chain_recompute_failed_after_insert",
                 hash => &block.header.hash, error => &e.to_string());
+            self.drop_offending_block_if_leaf(&block.header.hash);
             return Err(e);
         }
 
@@ -874,10 +880,16 @@ impl FullNode {
         }
 
         if let Err(e) = self.recompute_virtual_chain() {
-            // Keep BlockStore aligned with DAG/GHOSTDAG.
-            // Deleting only from BlockStore creates stale topology.
+            // M3 (atomic acceptance): the just-added block is a CHILDLESS tip, and
+            // recompute_virtual_chain restores the UTXO set to the pre-insert
+            // (old-chain) state on a non-fatal Err. Remove the block from GHOSTDAG
+            // + DAG topology + BlockStore so acceptance is all-or-nothing —
+            // otherwise a phantom GHOSTDAG tip (metadata present, body deleted)
+            // could be re-selected as best_tip and roll back the real chain while
+            // applying nothing.
             slog_error!("node", "virtual_chain_recompute_failed_after_insert",
                 hash => &block.header.hash, error => &e.to_string());
+            self.drop_offending_block_if_leaf(&block.header.hash);
             return Err(e);
         }
         Ok(())
@@ -1094,6 +1106,31 @@ impl FullNode {
     ///
     /// If the selected chain changed (reorg), rolls back old blocks
     /// and applies new ones — all in GHOSTDAG order.
+    /// M3 (atomic acceptance): drop an offending block from GHOSTDAG + DAG
+    /// topology + BlockStore, but ONLY when it is a CHILDLESS leaf
+    /// (`ghostdag.remove_block` succeeds). A mid-reorg-chain non-leaf block is
+    /// left FULLY intact — deleting only its body (as an unconditional
+    /// `delete_block` would) leaves it un-resyncable (the dedup gate still sees
+    /// it in the DAG) and silently skipped on the next recompute (body gone),
+    /// which is strictly worse than keeping the re-appliable block. The
+    /// just-added-tip acceptance paths always hit the leaf case; the reorg-apply
+    /// failure paths may not, so this guard is what keeps store/DAG/ghostdag
+    /// mutually consistent. Returns true iff the block was removed.
+    fn drop_offending_block_if_leaf(&self, block_hash: &str) -> bool {
+        match self.ghostdag.remove_block(block_hash) {
+            Ok(()) => {
+                let _ = self.dag_manager.remove_block_topology(block_hash);
+                let _ = self.block_store.delete_block(block_hash);
+                true
+            }
+            Err(re) => {
+                slog_warn!("node", "offending_block_kept_non_leaf",
+                    block => block_hash, error => &re.to_string());
+                false
+            }
+        }
+    }
+
     pub fn recompute_virtual_chain(&self) -> Result<(), NodeError> {
         // Get the new best tip from GHOSTDAG
         let tips = self.ghostdag.get_tips();
@@ -1369,11 +1406,11 @@ impl FullNode {
                                 block => block_hash);
                             std::process::exit(1);
                         }
-                        // Drop the offending block from the DAG + store so it is not
-                        // endlessly re-selected as a tip. (ghostdag in-memory tip removal
-                        // is a follow-up; the safety guarantee — never APPLYING it — holds.)
-                        let _ = self.dag_manager.remove_block_topology(block_hash);
-                        let _ = self.block_store.delete_block(block_hash);
+                        // M3: drop the offending block ONLY if it is a childless
+                        // leaf; a mid-reorg-chain non-leaf is left fully intact (see
+                        // drop_offending_block_if_leaf). The safety guarantee (never
+                        // APPLYING it) holds regardless.
+                        self.drop_offending_block_if_leaf(block_hash);
                         return Err(NodeError::BlockRejected(msg));
                     }
                 }
@@ -1467,6 +1504,12 @@ impl FullNode {
                                     block => block_hash);
                                 std::process::exit(1);
                             }
+                            // M3: drop the offending block ONLY if it is a childless
+                            // leaf; a mid-reorg-chain non-leaf is left fully intact
+                            // (see drop_offending_block_if_leaf). Pre-M3 this path
+                            // deleted nothing, so keeping a non-leaf matches it while
+                            // now cleanly removing a childless-leaf offender.
+                            self.drop_offending_block_if_leaf(block_hash);
                             return Err(NodeError::Consensus(ConsensusError::BlockValidation(
                                 format!(
                                     "contract state persistence failed for block {}: {}",
