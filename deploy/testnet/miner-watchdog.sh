@@ -40,10 +40,25 @@ LOOP
 }
 kill_all_miners(){
   docker exec -u root "$CT" bash -c '
-    for sig in TERM KILL; do
+    self=$$
+    # CRITICAL: skip our own PID. This scanner bash carries the literal match
+    # patterns ("miner_loop.sh") in its cmdline, so without this it kills ITSELF
+    # mid-sweep (its PID often sorts before the miners) and aborts — leaving
+    # miners alive while the caller start_one keeps adding (unbounded growth).
+    # Kill the loop wrappers FIRST (so they stop respawning miners), then the
+    # miner binaries; repeat to catch a miner respawned during the gap. The
+    # miner is stateless so a hard KILL is safe; the node has a different cmdline
+    # and is never matched.
+    for pass in 1 2 3; do
       for p in /proc/[0-9]*; do
+        pid=${p##*/}; [ "$pid" = "$self" ] && continue
         c=$(tr "\0" " " < "$p/cmdline" 2>/dev/null)
-        case "$c" in *shadowdag-miner*|*miner_loop.sh*) kill -$sig "${p##*/}" 2>/dev/null;; esac
+        case "$c" in *miner_loop.sh*) kill -KILL "$pid" 2>/dev/null;; esac
+      done
+      for p in /proc/[0-9]*; do
+        pid=${p##*/}; [ "$pid" = "$self" ] && continue
+        c=$(tr "\0" " " < "$p/cmdline" 2>/dev/null)
+        case "$c" in *shadowdag-miner\ *) kill -KILL "$pid" 2>/dev/null;; esac
       done
       sleep 1
     done
