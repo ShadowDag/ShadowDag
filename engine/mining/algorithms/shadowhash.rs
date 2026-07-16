@@ -171,6 +171,53 @@ pub fn difficulty_to_target(difficulty: u64) -> String {
     crate::engine::mining::pow::pow_validator::PowValidator::difficulty_to_target(difficulty)
 }
 
+/// Canonical encoding of an optional root (hex string) for the M5 deferred state
+/// commitment: `0x00` for None, else `0x01 || u32-le len || utf8 bytes`.
+/// Distinguishes None from Some("") so the commitment is unambiguous.
+fn enc_opt_root(buf: &mut Vec<u8>, root: Option<&str>) {
+    match root {
+        None => buf.push(0x00),
+        Some(s) => {
+            buf.push(0x01);
+            let b = s.as_bytes();
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
+    }
+}
+
+/// M5 DEFERRED STATE COMMITMENT: SHA3-256 over the selected parent's identity and
+/// its post-execution roots. A block binds THIS value in its PoW preimage, so the
+/// block hash commits to the state it builds on (the parent's post-state). All
+/// nodes derive it identically from the parent's stored roots; a forged value
+/// fails BOTH the deferred verify (compare vs the parent's stored roots) and PoW
+/// (it is inside the preimage). Domain-separated + versioned to avoid ambiguity.
+pub fn compute_prev_state_commitment(
+    selected_parent: &str,
+    parent_utxo_commitment: Option<&str>,
+    parent_state_root: Option<&str>,
+    parent_receipt_root: Option<&str>,
+) -> String {
+    let mut buf: Vec<u8> = Vec::with_capacity(160);
+    buf.extend_from_slice(b"ShadowDAG_PrevState_v1");
+    let sp = selected_parent.as_bytes();
+    buf.extend_from_slice(&(sp.len() as u32).to_le_bytes());
+    buf.extend_from_slice(sp);
+    enc_opt_root(&mut buf, parent_utxo_commitment);
+    enc_opt_root(&mut buf, parent_state_root);
+    enc_opt_root(&mut buf, parent_receipt_root);
+    let mut h = Sha3_256::new();
+    h.update(&buf);
+    hex::encode(h.finalize())
+}
+
+/// The M5 deferred state commitment for GENESIS: no parent, empty initial state
+/// (selected_parent = "" and all parent roots None). A fixed constant every node
+/// agrees on.
+pub fn genesis_prev_state_commitment() -> String {
+    compute_prev_state_commitment("", None, None, None)
+}
+
 /// Serialize block header to bytes (uses same path as shadow_hash_raw_full)
 fn serialize_header(block: &Block) -> Vec<u8> {
     let mut buf = serialize_header_raw(
@@ -268,6 +315,41 @@ pub fn shadow_hash_str(data: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prev_state_commitment_is_deterministic_and_sensitive() {
+        // M5 KAT: the deferred commitment is a 64-hex SHA3-256, deterministic, and
+        // changes if ANY input byte changes (parent hash or any parent root).
+        let uc = "aa".repeat(32);
+        let sr = "bb".repeat(32);
+        let rr = "cc".repeat(32);
+        let base = compute_prev_state_commitment("parentA", Some(&uc), Some(&sr), None);
+        assert_eq!(base.len(), 64);
+        assert!(base.chars().all(|c| c.is_ascii_hexdigit()));
+        // Deterministic.
+        assert_eq!(base, compute_prev_state_commitment("parentA", Some(&uc), Some(&sr), None));
+        // Changing the selected parent -> different commitment.
+        assert_ne!(base, compute_prev_state_commitment("parentB", Some(&uc), Some(&sr), None));
+        // Changing utxo_commitment / state_root / adding receipt_root -> different.
+        let uc2 = "ac".repeat(32);
+        assert_ne!(base, compute_prev_state_commitment("parentA", Some(&uc2), Some(&sr), None));
+        let sr2 = "bc".repeat(32);
+        assert_ne!(base, compute_prev_state_commitment("parentA", Some(&uc), Some(&sr2), None));
+        assert_ne!(base, compute_prev_state_commitment("parentA", Some(&uc), Some(&sr), Some(&rr)));
+        // Canonical encoding: None is distinct from Some("").
+        assert_ne!(
+            compute_prev_state_commitment("p", None, None, None),
+            compute_prev_state_commitment("p", Some(""), None, None)
+        );
+        // Field boundaries are unambiguous: (Some,None) != (None,Some) shuffle.
+        assert_ne!(
+            compute_prev_state_commitment("p", Some(&uc), None, None),
+            compute_prev_state_commitment("p", None, Some(&uc), None)
+        );
+        // Genesis commitment = empty parent + all-None, stable.
+        assert_eq!(genesis_prev_state_commitment(), compute_prev_state_commitment("", None, None, None));
+        assert_eq!(genesis_prev_state_commitment().len(), 64);
+    }
 
     #[test]
     fn hash_str_is_64_chars() {
