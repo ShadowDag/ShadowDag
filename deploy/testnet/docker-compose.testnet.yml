@@ -15,6 +15,16 @@ services:
     image: shadowdag:latest
     container_name: shadowdag-testnet
     restart: unless-stopped
+    # Cap container logs: the mining node writes ~1.6 GB/hour of json log at
+    # ~8 BPS (measured 1.1 GB in ~40 min on 2026-07-18), which would fill the
+    # disk in days and already makes `docker logs --since` unusably slow.
+    # 100 MB x 5 files = 500 MB cap per node. Applying this requires a container
+    # RECREATE (plain `up -d`, NEVER `down -v` — that wipes the chain volume).
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
     environment:
       - NETWORK=testnet
       # Bind RPC to 0.0.0.0 INSIDE the container so the published port is
