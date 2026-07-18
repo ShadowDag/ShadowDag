@@ -49,6 +49,8 @@ pub struct BlockRelay {
     db: DB,
     _peer_manager: Arc<PeerManager>,
     block_store: Option<Arc<BlockStore>>,
+    /// Network whose UmbraHash activation schedule gates orphan admission.
+    network: crate::config::node::node_config::NetworkMode,
 }
 
 impl BlockRelay {
@@ -68,7 +70,15 @@ impl BlockRelay {
         k.starts_with(p)
     }
 
-    pub fn new(path: &str, peer_manager: Arc<PeerManager>) -> Result<Self, NetworkError> {
+    /// `network` is REQUIRED: the orphan-admission recompute must apply this
+    /// network's UmbraHash activation schedule, or a downgraded legacy header
+    /// past the mainnet fork is admitted to the pool under the network-blind
+    /// rule. Taking it by argument means a future wiring cannot omit it.
+    pub fn new(
+        path: &str,
+        peer_manager: Arc<PeerManager>,
+        network: crate::config::node::node_config::NetworkMode,
+    ) -> Result<Self, NetworkError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         let db = DB::open(&opts, Path::new(path)).map_err(|e| {
@@ -81,6 +91,7 @@ impl BlockRelay {
             db,
             _peer_manager: peer_manager,
             block_store: None,
+            network,
         })
     }
 
@@ -243,10 +254,11 @@ impl BlockRelay {
         // shadow_hash) binds header.hash to the header content (anti-spoof).
         // TIP-BOUNDED when a block store is wired: an orphan claiming a height
         // many epochs beyond the tip is refused without building its epoch cache.
-        let computed = match self.tip_height() {
-            Some(tip) => PowValidator::recompute_identity_hash_bounded(&block.header, tip),
-            None => PowValidator::recompute_identity_hash(&block.header),
-        };
+        let computed = PowValidator::recompute_identity_hash_checked(
+            &block.header,
+            self.tip_height().unwrap_or(0),
+            Some(&self.network),
+        );
         if computed != block.header.hash {
             slog_warn!("relay", "orphan_rejected_hash_mismatch",
                 claimed => &block.header.hash[..block.header.hash.len().min(16)],
@@ -659,7 +671,7 @@ mod tests {
         ));
         let path_str = path.to_string_lossy().to_string();
         let pm = Arc::new(PeerManager::new_temp());
-        BlockRelay::new(&path_str, pm).expect("BlockRelay::new failed")
+        BlockRelay::new(&path_str, pm, crate::config::node::node_config::NetworkMode::Testnet).expect("BlockRelay::new failed")
     }
 
     fn make_block(hash: &str, parents: Vec<&str>, height: u64) -> Block {

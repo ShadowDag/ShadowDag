@@ -76,13 +76,23 @@ pub struct Checkpoint {
 pub struct ChainVerifier {
     genesis_hash: String,
     checkpoints: Vec<Checkpoint>,
+    /// Network whose UmbraHash activation schedule this verifier enforces.
+    /// REQUIRED at construction: with the network-blind rule, a sync verifier
+    /// would accept a downgraded legacy header past the mainnet fork that the
+    /// authoritative validator rejects. Making it a constructor argument means a
+    /// future wiring cannot silently omit it.
+    network: crate::config::node::node_config::NetworkMode,
 }
 
 impl ChainVerifier {
-    pub fn new(genesis_hash: &str) -> Self {
+    pub fn new(
+        genesis_hash: &str,
+        network: crate::config::node::node_config::NetworkMode,
+    ) -> Self {
         Self {
             genesis_hash: genesis_hash.to_string(),
             checkpoints: Vec::new(),
+            network,
         }
     }
 
@@ -214,8 +224,11 @@ impl ChainVerifier {
             // else shadow_hash) and tip-bounded against the previous header.
             {
                 use crate::engine::mining::pow::pow_validator::PowValidator;
-                let recomputed =
-                    PowValidator::recompute_identity_hash_bounded(header, prev_height);
+                let recomputed = PowValidator::recompute_identity_hash_checked(
+                    header,
+                    prev_height,
+                    Some(&self.network),
+                );
                 if recomputed != header.hash {
                     return ChainVerifyResult::InvalidPoW {
                         height: header.height,
@@ -298,6 +311,7 @@ impl ChainVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::node::node_config::NetworkMode;
 
     #[test]
     fn short_hash_is_char_safe_on_multibyte() {
@@ -314,7 +328,7 @@ mod tests {
     fn verify_header_chain_does_not_panic_on_multibyte_hash() {
         // A header whose hash is non-ASCII will mismatch the recomputed PoW
         // hash and hit the short_hash formatting path — must return, not panic.
-        let cv = ChainVerifier::new("genesis");
+        let cv = ChainVerifier::new("genesis", NetworkMode::Testnet);
         let mut h = make_header(1, 1, 1_000, vec!["好".repeat(30)]);
         h.hash = "好".repeat(30);
         let _ = cv.verify_header_chain(&[h]); // no panic = pass
@@ -391,7 +405,7 @@ mod tests {
     #[test]
     fn valid_chain() {
         let genesis = make_header(0, 1, 1000, vec![]);
-        let cv = ChainVerifier::new(&genesis.hash);
+        let cv = ChainVerifier::new(&genesis.hash, NetworkMode::Testnet);
         // MIN_CUMULATIVE_WORK = 1000; difficulty 1 => work = 1 per block.
         // Need ~1000 blocks minimum.
         let mut headers = vec![genesis];
@@ -407,7 +421,7 @@ mod tests {
 
     #[test]
     fn invalid_genesis() {
-        let cv = ChainVerifier::new("0000real_genesis");
+        let cv = ChainVerifier::new("0000real_genesis", NetworkMode::Testnet);
         // Use a real-hash header (hash won't match "0000real_genesis")
         let headers = vec![make_header(0, 1, 1000, vec![])];
         assert!(matches!(
@@ -420,7 +434,7 @@ mod tests {
     fn invalid_pow() {
         // Header with a bad hash will fail the hash recomputation check
         let genesis = make_header(0, 1, 1000, vec![]);
-        let cv = ChainVerifier::new(&genesis.hash);
+        let cv = ChainVerifier::new(&genesis.hash, NetworkMode::Testnet);
         let headers = vec![
             genesis.clone(),
             make_header_bad_hash(1, "abcd_no_zeros", 1, 2000),
@@ -434,7 +448,7 @@ mod tests {
     #[test]
     fn checkpoint_mismatch() {
         let genesis = make_header(0, 1, 1000, vec![]);
-        let mut cv = ChainVerifier::new(&genesis.hash);
+        let mut cv = ChainVerifier::new(&genesis.hash, NetworkMode::Testnet);
         // Set a checkpoint that the real hash won't match
         let block1 = make_header(1, 1, 1100, vec![genesis.hash.clone()]);
         cv.add_checkpoint(1, "0000wrong_checkpoint_hash");
@@ -447,7 +461,7 @@ mod tests {
 
     #[test]
     fn empty_chain() {
-        let cv = ChainVerifier::new("0000genesis");
+        let cv = ChainVerifier::new("0000genesis", NetworkMode::Testnet);
         assert!(matches!(
             cv.verify_header_chain(&[]),
             ChainVerifyResult::EmptyChain
@@ -457,7 +471,7 @@ mod tests {
     #[test]
     fn backward_timestamp_rejected() {
         let genesis = make_header(0, 1, 5000, vec![]);
-        let cv = ChainVerifier::new(&genesis.hash);
+        let cv = ChainVerifier::new(&genesis.hash, NetworkMode::Testnet);
         // Block 1 has earlier timestamp — will fail recomputation then timestamp check
         // But since we need a real hash for block1, create it with earlier timestamp
         let block1 = make_header(1, 1, 4000, vec![genesis.hash.clone()]);
@@ -471,7 +485,7 @@ mod tests {
     #[test]
     fn equal_timestamp_rejected() {
         let genesis = make_header(0, 1, 5000, vec![]);
-        let cv = ChainVerifier::new(&genesis.hash);
+        let cv = ChainVerifier::new(&genesis.hash, NetworkMode::Testnet);
         let block1 = make_header(1, 1, 5000, vec![genesis.hash.clone()]);
         let headers = vec![genesis, block1];
         let res = cv.verify_header_chain(&headers);
@@ -485,7 +499,7 @@ mod tests {
     #[test]
     fn height_gap_rejected() {
         let genesis = make_header(0, 1, 5000, vec![]);
-        let cv = ChainVerifier::new(&genesis.hash);
+        let cv = ChainVerifier::new(&genesis.hash, NetworkMode::Testnet);
         // Skip from height 0 to height 5
         let block5 = make_header(5, 1, 6000, vec![genesis.hash.clone()]);
         let headers = vec![genesis, block5];
@@ -498,7 +512,7 @@ mod tests {
     #[test]
     fn no_checkpoints_mid_chain_rejected() {
         // Chain starting at height > 0 with no checkpoints configured
-        let cv = ChainVerifier::new("0000genesis");
+        let cv = ChainVerifier::new("0000genesis", NetworkMode::Testnet);
         let headers = vec![make_header(10, 4, 1000, vec![])];
         assert!(matches!(
             cv.verify_header_chain(&headers),
@@ -508,7 +522,7 @@ mod tests {
 
     #[test]
     fn genesis_verification() {
-        let cv = ChainVerifier::new("0000abc");
+        let cv = ChainVerifier::new("0000abc", NetworkMode::Testnet);
         assert!(cv.verify_genesis("0000abc"));
         assert!(!cv.verify_genesis("0000xyz"));
     }

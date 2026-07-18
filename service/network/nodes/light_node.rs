@@ -35,18 +35,26 @@ pub struct LightNode {
     best_height: u64,
     /// Network identifier
     network: String,
+    /// Parsed network, when `network` names a known one. `None` = the node could
+    /// not resolve its network, so it also has no genesis hash and is degraded /
+    /// NON-AUTHORITATIVE: it cannot enforce the UmbraHash activation schedule.
+    network_mode: Option<crate::config::node::node_config::NetworkMode>,
     /// Known genesis hash for this network
     genesis_hash: String,
 }
 
 impl LightNode {
     pub fn new(network: &str) -> Self {
-        // Resolve the known genesis hash for this network so we can
-        // verify the first header we receive in add_header().
-        let genesis_hash = network
+        // Resolve the network ONCE: it gives us both the known genesis hash (to
+        // verify the first header) and the UmbraHash activation schedule (so we
+        // reject a downgraded legacy header past the fork instead of recomputing
+        // it under the network-blind rule).
+        let network_mode = network
             .parse::<crate::config::node::node_config::NetworkMode>()
-            .ok()
-            .map(|mode| crate::config::genesis::genesis::genesis_hash_for(&mode))
+            .ok();
+        let genesis_hash = network_mode
+            .as_ref()
+            .map(crate::config::genesis::genesis::genesis_hash_for)
             .unwrap_or_default();
         Self {
             headers: Vec::with_capacity(MAX_HEADERS_CACHE),
@@ -54,6 +62,7 @@ impl LightNode {
             syncing: false,
             best_height: 0,
             network: network.to_string(),
+            network_mode,
             genesis_hash,
         }
     }
@@ -105,13 +114,21 @@ impl LightNode {
     /// target. Call ONLY after `validate_header_cheap` and the height/parent
     /// checks have passed, and pass the current tip so the recompute refuses to
     /// build an epoch cache for an implausibly-far-ahead height.
-    fn validate_header_pow(header: &BlockHeader, tip_height: u64) -> bool {
+    ///
+    /// Takes `&self` so it can apply THIS node's network activation schedule: on
+    /// mainnet a legacy v2 header at height >= 1 must be rejected, which the
+    /// network-blind rule would silently accept.
+    fn validate_header_pow(&self, header: &BlockHeader, tip_height: u64) -> bool {
         use crate::engine::mining::pow::pow_validator::PowValidator;
         // PoW: recompute hash from header fields, then check target. Without
         // recomputation, an attacker can send a fake hash that meets PoW but
-        // doesn't correspond to the header content. Tip-bounded so an absurd
-        // height cannot force epoch work.
-        let recomputed = PowValidator::recompute_identity_hash_bounded(header, tip_height);
+        // doesn't correspond to the header content. Network-aware (activation
+        // floor) and tip-bounded (no epoch work for an absurd height).
+        let recomputed = PowValidator::recompute_identity_hash_checked(
+            header,
+            tip_height,
+            self.network_mode.as_ref(),
+        );
         if recomputed != header.hash {
             return false;
         }
@@ -146,7 +163,7 @@ impl LightNode {
                 return false;
             }
             // Genesis screened → now pay for PoW (tip 0: genesis is epoch 0).
-            if !Self::validate_header_pow(&header, 0) {
+            if !self.validate_header_pow(&header, 0) {
                 return false;
             }
             self.best_height = 0;
@@ -173,7 +190,7 @@ impl LightNode {
         }
 
         // Fully screened and pinned to tip+1 → only now do the expensive PoW.
-        if !Self::validate_header_pow(&header, self.best_height) {
+        if !self.validate_header_pow(&header, self.best_height) {
             return false;
         }
 

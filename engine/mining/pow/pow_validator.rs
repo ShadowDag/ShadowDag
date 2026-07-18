@@ -284,6 +284,37 @@ impl PowValidator {
         Self::recompute_identity_hash(header)
     }
 
+    /// FULL-CONTEXT identity recompute: network-aware activation floor + the
+    /// tip-relative epoch bound. This is what every header-only admission path
+    /// should call once it knows its network (external audit H3 + the activation
+    /// parity gap).
+    ///
+    /// WHY: `recompute_identity_hash` gates on the NETWORK-BLIND
+    /// `umbra_required_at`, whose `UMBRA_ACTIVATION_HEIGHT` is `None`, so it
+    /// enforces no fork at all. On mainnet, UmbraHash is mandatory from height 1
+    /// — a header-only path using the blind rule would accept a downgraded v2
+    /// ShadowHash header that the authoritative `validate_for_network` rejects.
+    ///
+    /// `network = None` means the caller could not determine its network. Such a
+    /// caller is ALREADY degraded (it cannot check genesis either) and is
+    /// non-authoritative by construction, so it keeps the blind behaviour rather
+    /// than pretending to enforce a schedule it cannot know. Do not rely on a
+    /// `None` caller for any security decision.
+    pub fn recompute_identity_hash_checked(
+        header: &BlockHeader,
+        tip_height: u64,
+        network: Option<&NetworkMode>,
+    ) -> String {
+        let umbra_required = match network {
+            Some(n) => umbrahash::umbra_required_at_for(header.height, n),
+            None => umbrahash::umbra_required_at(header.height),
+        };
+        if umbra_required && header.version < umbrahash::UMBRA_POW_VERSION {
+            return String::new();
+        }
+        Self::recompute_identity_hash_bounded(header, tip_height)
+    }
+
     /// Validate a header independently (recompute hash from fields including extra_nonce)
     pub fn validate_header(header: &BlockHeader) -> bool {
         // Fork-activation floor (see validate): reject a legacy version once
@@ -616,6 +647,68 @@ mod tests {
         // The cheap anti-spoof recompute must return the empty sentinel (it did
         // NO cache work); a real hashimoto result is always 64 hex chars.
         assert_eq!(PowValidator::recompute_identity_hash(&header), "");
+    }
+
+    #[test]
+    fn checked_recompute_enforces_the_mainnet_fork_that_the_blind_rule_misses() {
+        use crate::config::node::node_config::NetworkMode;
+        use crate::engine::mining::algorithms::umbrahash;
+        // The activation-parity gap: UMBRA_ACTIVATION_HEIGHT is None, so the
+        // network-BLIND rule enforces no fork at all, while mainnet requires
+        // UmbraHash from height 1. A header-only path using the blind rule would
+        // therefore accept a downgraded legacy header that the authoritative
+        // validate_for_network rejects. The checked recompute must close that.
+        let legacy_version = umbrahash::UMBRA_POW_VERSION - 1;
+        let header = BlockHeader::new_with_defaults(
+            legacy_version,
+            String::new(),
+            vec!["p".repeat(64)],
+            "merkle".into(),
+            1_700_000_000_000,
+            0,
+            1,
+            1, // height 1 — past the mainnet activation
+        );
+
+        // Blind rule: no fork enforced, so it happily recomputes (the bug).
+        assert_ne!(
+            PowValidator::recompute_identity_hash(&header),
+            "",
+            "precondition: the blind rule does NOT enforce the fork"
+        );
+
+        // Mainnet: must refuse with the empty sentinel.
+        assert_eq!(
+            PowValidator::recompute_identity_hash_checked(
+                &header,
+                1,
+                Some(&NetworkMode::Mainnet)
+            ),
+            "",
+            "a legacy header at height 1 must be refused on mainnet"
+        );
+        // ...and that matches the authoritative gate's verdict on the same rule
+        // (umbra_floor), which is the parity we are restoring.
+        assert!(
+            umbrahash::umbra_required_at_for(header.height, &NetworkMode::Mainnet),
+            "mainnet must require UmbraHash at height 1"
+        );
+        assert!(
+            !umbrahash::umbra_required_at(header.height),
+            "the blind rule must NOT require it — this is the divergence"
+        );
+
+        // Testnet is unscheduled, so the same header is still recomputed there —
+        // proving the fix is per-network, not a blanket version ban.
+        assert_ne!(
+            PowValidator::recompute_identity_hash_checked(
+                &header,
+                1,
+                Some(&NetworkMode::Testnet)
+            ),
+            "",
+            "testnet is unscheduled — the legacy header must still recompute"
+        );
     }
 
     #[test]
