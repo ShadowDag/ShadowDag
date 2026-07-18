@@ -260,6 +260,30 @@ impl PowValidator {
         }
     }
 
+    /// TIP-BOUNDED identity recompute — prefer this over `recompute_identity_hash`
+    /// on every header-only admission path that knows a trusted tip height
+    /// (light node, sync header verify, relay orphan pool).
+    ///
+    /// SECURITY (external audit H3): the unbounded variant will build an epoch
+    /// cache for ANY height under the absolute `UMBRA_MAX_HEIGHT` ceiling, which
+    /// still permits ~333k-iteration `epoch_seed` + a 16 MiB `mkcache` for an
+    /// UNVALIDATED attacker-supplied header — and with only three resident caches,
+    /// alternating far epochs forces a rebuild every time. Refusing out-of-bound
+    /// epochs up front turns that into a comparison. Returns the same empty
+    /// sentinel as the other rejection paths, so `recomputed == header.hash`
+    /// callers reject the header unchanged.
+    ///
+    /// This does NOT replace ordering discipline: cheap structural, height and
+    /// parent checks should still run BEFORE any identity recompute.
+    pub fn recompute_identity_hash_bounded(header: &BlockHeader, tip_height: u64) -> String {
+        if header.version >= umbrahash::UMBRA_POW_VERSION
+            && umbrahash::epoch_out_of_bound(header.height, tip_height)
+        {
+            return String::new();
+        }
+        Self::recompute_identity_hash(header)
+    }
+
     /// Validate a header independently (recompute hash from fields including extra_nonce)
     pub fn validate_header(header: &BlockHeader) -> bool {
         // Fork-activation floor (see validate): reject a legacy version once
@@ -592,6 +616,51 @@ mod tests {
         // The cheap anti-spoof recompute must return the empty sentinel (it did
         // NO cache work); a real hashimoto result is always 64 hex chars.
         assert_eq!(PowValidator::recompute_identity_hash(&header), "");
+    }
+
+    #[test]
+    fn bounded_recompute_refuses_far_epoch_under_the_absolute_ceiling() {
+        use crate::engine::mining::algorithms::umbrahash;
+        // External audit H3: the absolute UMBRA_MAX_HEIGHT ceiling is NOT enough.
+        // A height just under it is "allowed" by the ceiling yet sits ~333k epochs
+        // out, so the unbounded recompute would chain epoch_seed and build a 16 MiB
+        // mkcache for an UNVALIDATED header. The tip-bounded variant must refuse it
+        // with the empty sentinel instead, while still serving a near-tip header.
+        let far = umbrahash::UMBRA_MAX_HEIGHT - 1;
+        let mut header = BlockHeader::new_with_defaults(
+            umbrahash::UMBRA_POW_VERSION,
+            String::new(),
+            vec!["p".repeat(64)],
+            "merkle".into(),
+            1_700_000_000_000,
+            0,
+            1,
+            far,
+        );
+        header.hash = "ab".repeat(32);
+        header.mix_hash = "cd".repeat(32);
+
+        // Node near genesis: the far header is refused WITHOUT cache work.
+        assert_eq!(
+            PowValidator::recompute_identity_hash_bounded(&header, 0),
+            "",
+            "far-epoch header must be refused by the tip bound"
+        );
+        // Same header once the chain has actually reached that height: allowed
+        // through to a real recompute (64 hex), proving the bound is tip-relative
+        // and not a second absolute ceiling.
+        let out = PowValidator::recompute_identity_hash_bounded(&header, far);
+        assert_eq!(out.len(), 64, "near-tip header must still be recomputed");
+
+        // A legacy (pre-UmbraHash) header does no epoch work, so the bound must
+        // not interfere with it.
+        let mut legacy = header.clone();
+        legacy.version = 2;
+        assert_eq!(
+            PowValidator::recompute_identity_hash_bounded(&legacy, 0),
+            PowValidator::recompute_identity_hash(&legacy),
+            "non-Umbra headers must be unaffected by the epoch bound"
+        );
     }
 
     #[test]

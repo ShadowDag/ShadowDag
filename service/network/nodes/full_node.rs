@@ -242,7 +242,10 @@ const ORPHAN_EXPIRY_SECS: u64 = 120;
 /// never impedes IBD. 1 epoch = EPOCH_BLOCKS (3M) blocks ~ 3.5 days at 10 BPS, so
 /// a margin of 2 is hugely generous for near-tip orphans while capping the
 /// epoch_seed input to the real chain's epoch, not the attacker's chosen height.
-const MAX_ORPHAN_FUTURE_EPOCHS: u64 = 2;
+/// Aliased to the single source of truth so the orphan bound and the header-only
+/// admission bound can never drift apart (external audit H3).
+const MAX_ORPHAN_FUTURE_EPOCHS: u64 =
+    crate::engine::mining::algorithms::umbrahash::MAX_FUTURE_EPOCHS;
 
 /// Maximum reorg depth: reject reorgs deeper than this to prevent
 /// deep-reorg attacks. Blocks older than this are considered final.

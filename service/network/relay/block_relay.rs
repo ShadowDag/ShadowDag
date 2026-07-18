@@ -214,7 +214,25 @@ impl BlockRelay {
         }
     }
 
+    /// Best-known tip height from the wired block store, if any. Used to bound
+    /// UmbraHash epoch work on UNVALIDATED orphan headers (external audit H3).
+    fn tip_height(&self) -> Option<u64> {
+        let store = self.block_store.as_ref()?;
+        let best = store.get_best_hash()?;
+        store.get_block(&best).map(|b| b.header.height)
+    }
+
     pub fn add_to_orphan_pool(&self, block: Block) {
+        // Cheapest possible screen first (external audit H3): a malformed hash
+        // can never match a recompute, so reject it before doing any hashing —
+        // for UmbraHash the recompute below builds a 16 MiB epoch cache.
+        if block.header.hash.len() != 64
+            || !block.header.hash.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            slog_warn!("relay", "orphan_rejected_malformed_hash",
+                claimed => &block.header.hash[..block.header.hash.len().min(16)]);
+            return;
+        }
         // Recompute the block hash from the header fields and require it to match
         // the claimed hash BEFORE the PoW check. Otherwise an attacker could set
         // header.hash to any low value that "meets target" without doing real
@@ -223,7 +241,12 @@ impl BlockRelay {
         use crate::engine::mining::pow::pow_validator::PowValidator;
         // Version-gated identity recompute (UmbraHash result for v>=3, else
         // shadow_hash) binds header.hash to the header content (anti-spoof).
-        let computed = PowValidator::recompute_identity_hash(&block.header);
+        // TIP-BOUNDED when a block store is wired: an orphan claiming a height
+        // many epochs beyond the tip is refused without building its epoch cache.
+        let computed = match self.tip_height() {
+            Some(tip) => PowValidator::recompute_identity_hash_bounded(&block.header, tip),
+            None => PowValidator::recompute_identity_hash(&block.header),
+        };
         if computed != block.header.hash {
             slog_warn!("relay", "orphan_rejected_hash_mismatch",
                 claimed => &block.header.hash[..block.header.hash.len().min(16)],

@@ -339,9 +339,30 @@ pub const EPOCH_BLOCKS: u64 = 3_000_000;
 // stall. Every UmbraHash entry point rejects `height > UMBRA_MAX_HEIGHT` up
 // front, capping the epoch (and thus epoch_seed) to a few-ms worst case. At
 // 10 BPS this ceiling is ~3170 years of blocks, far beyond any real chain.
-// TODO(external-review): a tip-relative height bound at the network/relay layer
-// is the tighter defense; this absolute ceiling is the cheap, context-free floor.
+// This absolute ceiling is the cheap, context-free FLOOR only — at 1e12 it still
+// admits epochs up to ~333k, i.e. a 333k-iteration epoch_seed plus a 16 MiB
+// mkcache, per header. The tighter defense is the tip-relative bound below;
+// callers holding a trusted tip height MUST use it (external audit H3).
 pub const UMBRA_MAX_HEIGHT: u64 = 1_000_000_000_000; // 1e12
+
+/// How many UmbraHash epochs beyond the known tip a header may claim before
+/// cheap admission paths refuse to build its epoch cache. A legitimate header is
+/// at most a block or two past the tip, so a couple of epochs is generous; beyond
+/// that the height is either nonsense or so far ahead that we cannot validate it
+/// anyway. Single source of truth for every tip-relative epoch bound.
+pub const MAX_FUTURE_EPOCHS: u64 = 2;
+
+/// True if `height`'s UmbraHash epoch is more than `MAX_FUTURE_EPOCHS` beyond the
+/// epoch of `tip_height`. Pure, so the rule is testable without a live node.
+///
+/// SECURITY (external audit H3): `epoch_seed` + `mkcache` run on UNVALIDATED,
+/// attacker-supplied heights on the header-only admission paths (light node, sync
+/// header verify, relay orphan pool) BEFORE any PoW/target check, and only three
+/// epoch caches stay resident — so alternating far epochs forces a fresh 16 MiB
+/// rebuild per header. Gate that work on this bound wherever a tip is known.
+pub fn epoch_out_of_bound(height: u64, tip_height: u64) -> bool {
+    epoch_of(height) > epoch_of(tip_height).saturating_add(MAX_FUTURE_EPOCHS)
+}
 // Fixed dataset size (light on cards: fits any 2GB+ GPU) and its verification
 // cache. Both are multiples of MIX_BYTES(128); dataset item-count is even so the
 // hashimoto `mixhashes=2` fetch never runs off the end.
@@ -633,6 +654,34 @@ mod tests {
 
     fn hh(nonce: u64) -> [u8; 32] {
         sha3_256_bytes(&nonce.to_le_bytes())
+    }
+
+    #[test]
+    fn epoch_bound_rejects_far_heights_but_allows_near_tip() {
+        // External audit H3: the absolute UMBRA_MAX_HEIGHT ceiling still admits
+        // epochs up to ~333k, so cheap admission paths need a TIP-RELATIVE bound
+        // before epoch_seed/mkcache. This pins that rule.
+        let tip = 10 * EPOCH_BLOCKS + 5; // mid-epoch 10
+        // Same epoch, next block, and the whole allowed margin: all admitted.
+        assert!(!epoch_out_of_bound(tip, tip));
+        assert!(!epoch_out_of_bound(tip + 1, tip));
+        assert!(!epoch_out_of_bound(
+            (epoch_of(tip) + MAX_FUTURE_EPOCHS) * EPOCH_BLOCKS,
+            tip
+        ));
+        // One epoch past the margin: refused.
+        assert!(epoch_out_of_bound(
+            (epoch_of(tip) + MAX_FUTURE_EPOCHS + 1) * EPOCH_BLOCKS,
+            tip
+        ));
+        // The attack shape — a height just under the absolute ceiling, which the
+        // ceiling alone would happily build a 16 MiB cache for.
+        assert!(epoch_out_of_bound(UMBRA_MAX_HEIGHT - 1, tip));
+        // Scales with the tip: the same far height is fine once the chain is there.
+        assert!(!epoch_out_of_bound(UMBRA_MAX_HEIGHT - 1, UMBRA_MAX_HEIGHT - 1));
+        // Genesis-era tip must not underflow.
+        assert!(!epoch_out_of_bound(0, 0));
+        assert!(epoch_out_of_bound(UMBRA_MAX_HEIGHT - 1, 0));
     }
 
     #[test]

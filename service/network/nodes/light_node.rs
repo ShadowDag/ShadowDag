@@ -75,31 +75,19 @@ impl LightNode {
         slog_info!("node", "light_node_stopped");
     }
 
-    /// Validate header hash and PoW before accepting.
-    fn validate_header_basic(header: &BlockHeader) -> bool {
-        // 1. Hash must be non-empty and valid hex (64 lowercase hex chars)
+    /// CHEAP header checks — no hashing, no epoch cache. Must pass before any
+    /// identity recompute (external audit H3: an unvalidated header must never be
+    /// able to trigger `epoch_seed`/`mkcache` work before it has been screened).
+    fn validate_header_cheap(header: &BlockHeader) -> bool {
+        // Hash must be non-empty and valid hex (64 lowercase hex chars)
         if header.hash.len() != 64 || !header.hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            return false;
-        }
-        // 2. PoW: recompute hash from header fields, then check target.
-        //    Without recomputation, an attacker can send a fake hash
-        //    that meets PoW but doesn't correspond to the header content.
-        use crate::engine::mining::pow::pow_validator::PowValidator;
-        // Version-gated identity recompute (UmbraHash result for v>=3, else shadow_hash).
-        let recomputed = PowValidator::recompute_identity_hash(header);
-        if recomputed != header.hash {
             return false;
         }
         // Reject difficulty=0 on non-genesis headers — it bypasses PoW entirely.
         if header.height > 0 && header.difficulty == 0 {
             return false;
         }
-        if header.difficulty > 0
-            && !PowValidator::hash_meets_target(&header.hash, header.difficulty)
-        {
-            return false;
-        }
-        // 3. Timestamp sanity: reject headers too far in the future
+        // Timestamp sanity: reject headers too far in the future.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -113,11 +101,38 @@ impl LightNode {
         true
     }
 
+    /// EXPENSIVE PoW verification — recompute the identity hash and check the
+    /// target. Call ONLY after `validate_header_cheap` and the height/parent
+    /// checks have passed, and pass the current tip so the recompute refuses to
+    /// build an epoch cache for an implausibly-far-ahead height.
+    fn validate_header_pow(header: &BlockHeader, tip_height: u64) -> bool {
+        use crate::engine::mining::pow::pow_validator::PowValidator;
+        // PoW: recompute hash from header fields, then check target. Without
+        // recomputation, an attacker can send a fake hash that meets PoW but
+        // doesn't correspond to the header content. Tip-bounded so an absurd
+        // height cannot force epoch work.
+        let recomputed = PowValidator::recompute_identity_hash_bounded(header, tip_height);
+        if recomputed != header.hash {
+            return false;
+        }
+        if header.difficulty > 0
+            && !PowValidator::hash_meets_target(&header.hash, header.difficulty)
+        {
+            return false;
+        }
+        true
+    }
+
     /// Add a block header to our chain.
     /// First header MUST be genesis (height 0) to establish root of trust.
     pub fn add_header(&mut self, header: BlockHeader) -> bool {
-        // Validate header hash and PoW BEFORE accepting
-        if !Self::validate_header_basic(&header) {
+        // ORDERING IS SECURITY (external audit H3): every cheap check runs FIRST,
+        // and the expensive identity recompute (which for UmbraHash builds a
+        // 16 MiB epoch cache) runs LAST — only once the header has been screened
+        // and pinned to tip+1. Previously PoW ran first, so an attacker could
+        // force epoch work with a far-height header that the height check would
+        // have rejected for free.
+        if !Self::validate_header_cheap(&header) {
             return false;
         }
 
@@ -128,6 +143,10 @@ impl LightNode {
             }
             // Verify genesis hash matches the network's known genesis
             if !self.genesis_hash.is_empty() && header.hash != self.genesis_hash {
+                return false;
+            }
+            // Genesis screened → now pay for PoW (tip 0: genesis is epoch 0).
+            if !Self::validate_header_pow(&header, 0) {
                 return false;
             }
             self.best_height = 0;
@@ -151,6 +170,11 @@ impl LightNode {
             if header.timestamp < prev.timestamp {
                 return false;
             }
+        }
+
+        // Fully screened and pinned to tip+1 → only now do the expensive PoW.
+        if !Self::validate_header_pow(&header, self.best_height) {
+            return false;
         }
 
         self.best_height = header.height;

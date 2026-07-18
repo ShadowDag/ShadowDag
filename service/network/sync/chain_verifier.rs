@@ -139,44 +139,14 @@ impl ChainVerifier {
         let mut prev_height: u64 = headers[0].height.saturating_sub(1);
 
         for header in headers {
-            // 2. PoW check — use PowValidator (numeric target comparison)
-            //    so sync verification matches consensus validation exactly.
-            //    The previous leading-zeros check silently skipped PoW for
-            //    difficulty > 64, and used a weaker difficulty metric than
-            //    the actual consensus rule.
-            // Recompute hash from header fields to prevent forgery.
-            // shadow_hash_raw_full computes from (version, height, timestamp,
-            // nonce, extra_nonce, difficulty, merkle_root, parents) — all
-            // available in the header without the block body.
-            {
-                // Version-gated: UmbraHash (v>=UMBRA_POW_VERSION) recomputes the
-                // hashimoto result; older recomputes shadow_hash — matching what
-                // a valid block's identity hash is in each era.
-                let recomputed =
-                    crate::engine::mining::pow::pow_validator::PowValidator::recompute_identity_hash(
-                        header,
-                    );
-                if recomputed != header.hash {
-                    return ChainVerifyResult::InvalidPoW {
-                        height: header.height,
-                        hash: format!(
-                            "hash mismatch: claimed {} != computed {}",
-                            short_hash(&header.hash),
-                            short_hash(&recomputed)
-                        ),
-                    };
-                }
-            }
-
-            if header.difficulty > 0 {
-                use crate::engine::mining::pow::pow_validator::PowValidator;
-                if !PowValidator::hash_meets_target(&header.hash, header.difficulty) {
-                    return ChainVerifyResult::InvalidPoW {
-                        height: header.height,
-                        hash: header.hash.clone(),
-                    };
-                }
-            } else if header.height > 0 {
+            // ORDERING IS SECURITY (external audit H3): the identity recompute
+            // below builds a 16 MiB UmbraHash epoch cache for the header's claimed
+            // height. It therefore runs AFTER the free checks — difficulty!=0,
+            // wall-clock, parent continuity and height continuity — so an
+            // attacker-chosen far height is rejected by a comparison instead of by
+            // hundreds of thousands of hashes. It is also tip-bounded against the
+            // previous header's height.
+            if header.difficulty == 0 && header.height > 0 {
                 // Non-genesis header with difficulty 0 is invalid — it would
                 // bypass PoW entirely.
                 return ChainVerifyResult::InvalidPoW {
@@ -232,6 +202,36 @@ impl ChainVerifier {
                             prev_height + 1,
                             header.height
                         ),
+                    };
+                }
+            }
+
+            // 2d. PoW — the EXPENSIVE step, deliberately last (see the ordering
+            // note at the top of the loop). Recompute the identity hash from the
+            // header fields to prevent forgery: an attacker can otherwise send a
+            // fake hash that meets the target but does not correspond to the
+            // header content. Version-gated (UmbraHash for v>=UMBRA_POW_VERSION,
+            // else shadow_hash) and tip-bounded against the previous header.
+            {
+                use crate::engine::mining::pow::pow_validator::PowValidator;
+                let recomputed =
+                    PowValidator::recompute_identity_hash_bounded(header, prev_height);
+                if recomputed != header.hash {
+                    return ChainVerifyResult::InvalidPoW {
+                        height: header.height,
+                        hash: format!(
+                            "hash mismatch: claimed {} != computed {}",
+                            short_hash(&header.hash),
+                            short_hash(&recomputed)
+                        ),
+                    };
+                }
+                if header.difficulty > 0
+                    && !PowValidator::hash_meets_target(&header.hash, header.difficulty)
+                {
+                    return ChainVerifyResult::InvalidPoW {
+                        height: header.height,
+                        hash: header.hash.clone(),
                     };
                 }
             }
