@@ -293,27 +293,23 @@ impl DaemonNode {
         finality_mgr.load_checkpoints();
 
         // Initialize Stratum pool server if enabled.
-        // FORK GUARD (H2): the built-in Stratum pool hashes ShadowHash only and
-        // emits version-2 templates (build_stratum_template). On a network where
-        // UmbraHash is the mandatory PoW (umbra_activation_height().is_some() —
-        // i.e. mainnet), every pool-produced v2 block is rejected by the consensus
-        // floor (PowValidator::validate_for_network), a SILENT liveness halt for
-        // pool-based mining. Until a UmbraHash Stratum hashing path exists, refuse
-        // to run a dead pool: disable it (loud warning) rather than mine blocks the
-        // network will reject. The UmbraHash solo/docker miner (bin/miner.rs, which
-        // forces version 3) is the mining path on such networks.
+        // FORK/M5 GUARD (H2 + M5): the built-in Stratum pool hashes ShadowHash only,
+        // emits version-2 templates (build_stratum_template), and stamps
+        // prev_state_commitment = None in every header it hashes and submits. Such a
+        // block is rejected TWICE: by the UmbraHash consensus floor on umbra-fork
+        // networks (mainnet: PowValidator::validate_for_network), and by the M5
+        // deferred-state-commitment verify on EVERY network (enforced for height>0,
+        // network-agnostic — the pool cannot supply the node-published commitment).
+        // Until a UmbraHash + M5-aware Stratum hashing path exists, refuse to run a
+        // dead pool: disable it (loud warning) rather than mine blocks the network
+        // will reject. The solo/docker miner (bin/miner.rs — forces version 3 and
+        // stamps the node-published prev_state_commitment) is the mining path on
+        // every network.
         let stratum_server = if cfg.enable_stratum {
-            if crate::engine::mining::algorithms::umbrahash::umbra_activation_height(&cfg.network)
-                .is_some()
-            {
-                slog_warn!("daemon", "stratum_disabled_umbra_fork",
-                    network => cfg.network.name(),
-                    reason => "built-in Stratum pool is ShadowHash-only; UmbraHash is mandatory on this network — use the UmbraHash solo/docker miner");
-                None
-            } else {
-                slog_info!("daemon", "stratum_init", port => cfg.stratum_port);
-                Some(Arc::new(StratumServer::with_rpc_port(cfg.stratum_port, cfg.rpc_port)))
-            }
+            slog_warn!("daemon", "stratum_disabled_incompatible",
+                network => cfg.network.name(),
+                reason => "built-in Stratum pool is ShadowHash-only and pre-M5 (None commitment); UmbraHash and the M5 state commitment are mandatory — use the UmbraHash solo/docker miner");
+            None
         } else {
             None
         };
@@ -408,6 +404,18 @@ impl DaemonNode {
                 ))
             })?;
         }
+
+        // M5 (restart halt fix): republish the mining template over the FINAL
+        // post-recovery canonical state, unconditionally, before RPC/P2P start.
+        // FullNode::new seeded the mining cells from the DAG at construction (BEFORE
+        // verify_and_recover possibly rebuilt a corrupt DAG), and
+        // recompute_virtual_chain early-returns without republishing when the
+        // recomputed best equals the persisted best (the normal restart case). Under
+        // M5 a stale commitment makes getblocktemplate serve a value the height>=1
+        // validator rejects — a block-production halt on this node. This one call
+        // guarantees the cells reflect the settled tips. Idempotent on the fresh
+        // path (process_genesis already published the same value).
+        self.full_node.republish_mining_template();
 
         // ── P2P ──────────────────────────────────────────────────
         let mut p2p = P2P::new_with_config_and_peers(&self.cfg, self.peer_manager.clone())?;
@@ -1638,19 +1646,121 @@ mod tests {
     }
 
     #[test]
-    fn stratum_disabled_on_umbra_fork_network_but_enabled_elsewhere() {
-        // H2 FORK GUARD: the ShadowHash-only Stratum pool must NOT run on a network
-        // where UmbraHash is mandatory (mainnet) — it would silently mine v2 blocks
-        // the consensus floor rejects. It stays available on unscheduled networks.
-        let main = daemon_with_stratum(NetworkMode::Mainnet);
-        assert!(
-            main.stratum_server().is_none(),
-            "Stratum pool must be disabled on mainnet (UmbraHash fork scheduled)"
+    fn stratum_disabled_on_all_networks_under_m5() {
+        // FORK/M5 GUARD: the ShadowHash-only, pre-M5 Stratum pool stamps
+        // prev_state_commitment = None, which the M5 deferred-state-commitment
+        // verify rejects for every height>0 block on EVERY network (in addition to
+        // the UmbraHash floor rejecting its v2 blocks on mainnet). The daemon must
+        // therefore refuse to start the dead pool regardless of network.
+        for network in [NetworkMode::Mainnet, NetworkMode::Testnet, NetworkMode::Regtest] {
+            let d = daemon_with_stratum(network.clone());
+            assert!(
+                d.stratum_server().is_none(),
+                "Stratum pool must be disabled under M5 on {:?} (pool stamps a None commitment the verify rejects)",
+                network
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_chain_genesis_publishes_height1_commitment() {
+        // M5 FRESH-CHAIN HALT REGRESSION. On a brand-new chain the daemon accepts
+        // genesis via FullNode::process_genesis and does NOT call
+        // recompute_virtual_chain (that only runs on the existing-chain restart
+        // branch). process_genesis MUST publish the mining template over the real
+        // tips ([genesis]) so the height-1 getblocktemplate serves
+        // compute_prev_state_commitment(genesis_hash) — the exact value the
+        // validator recomputes for parents=[genesis]. Before the fix, the published
+        // cell kept the empty-parent genesis commitment seeded in FullNode::new
+        // (store empty at construction), so every height-1 block was rejected on a
+        // mismatch => the chain deadlocked at genesis on every fresh bring-up. This
+        // asserts the per-instance cell (non-racy) directly.
+        use crate::engine::mining::algorithms::shadowhash::{
+            compute_prev_state_commitment, genesis_prev_state_commitment,
+        };
+        use crate::service::network::nodes::full_node::expected_prev_state_commitment;
+
+        let d = daemon_with_temp_dir(NetworkMode::Regtest);
+        let fnode = d.full_node();
+
+        // At construction the store is empty, so the seed is the empty-parent value
+        // — which is WRONG for a height-1 block whose selected parent is genesis.
+        let empty_parent = genesis_prev_state_commitment();
+        assert_eq!(
+            fnode.mining_state.prev_state_commitment(),
+            Some(empty_parent.clone()),
+            "pre-genesis seed should be the empty-parent genesis commitment"
         );
-        let test = daemon_with_stratum(NetworkMode::Testnet);
-        assert!(
-            test.stratum_server().is_some(),
-            "Stratum pool stays enabled on testnet (fork unscheduled)"
+
+        let genesis = create_genesis_block_for(&NetworkMode::Regtest);
+        fnode
+            .process_genesis(&genesis)
+            .expect("genesis processing must succeed");
+
+        let published = fnode.mining_state.prev_state_commitment();
+        let expected = expected_prev_state_commitment(
+            std::slice::from_ref(&genesis.header.hash),
+            &fnode.ghostdag,
+            &fnode.block_store,
+        );
+        let height1 = compute_prev_state_commitment(&genesis.header.hash, None, None, None);
+
+        assert_eq!(
+            published,
+            Some(expected),
+            "process_genesis must publish the commitment the validator recomputes for parents=[genesis]"
+        );
+        assert_eq!(
+            published,
+            Some(height1),
+            "published commitment must bind the genesis-hash selected parent (the height-1 value)"
+        );
+        assert_ne!(
+            published,
+            Some(empty_parent),
+            "published commitment must NOT remain the empty-parent genesis value (that halts height 1)"
+        );
+    }
+
+    #[test]
+    fn republish_mining_template_corrects_stale_seed() {
+        // M5 RESTART HALT REGRESSION. FullNode::new seeds the mining cells from the
+        // DAG at construction (BEFORE verify_and_recover may rebuild a corrupt DAG),
+        // and recompute_virtual_chain early-returns without republishing when the
+        // recomputed best equals the persisted best (the normal restart case). Under
+        // M5 a stale commitment makes getblocktemplate serve a value the height>=1
+        // validator rejects => block-production halt on that node.
+        // republish_mining_template (called by daemon start() after recovery) MUST
+        // overwrite any stale value with the commitment derived from the CURRENT
+        // tips. Simulate the stale construction seed by poisoning the cell, then
+        // assert republish restores the correct height-1 value. Non-racy
+        // (per-instance cell).
+        use crate::engine::mining::algorithms::shadowhash::compute_prev_state_commitment;
+
+        let d = daemon_with_temp_dir(NetworkMode::Regtest);
+        let fnode = d.full_node();
+        let genesis = create_genesis_block_for(&NetworkMode::Regtest);
+        fnode.process_genesis(&genesis).expect("genesis must succeed");
+
+        let correct = compute_prev_state_commitment(&genesis.header.hash, None, None, None);
+
+        // Poison the per-instance cell with a wrong (but valid-shaped) value, as a
+        // stale construction seed from a pre-rebuild DAG would leave it.
+        fnode
+            .mining_state
+            .set_prev_state_commitment(Some("00".repeat(32)));
+        assert_ne!(
+            fnode.mining_state.prev_state_commitment(),
+            Some(correct.clone()),
+            "precondition: the cell is poisoned with a stale value"
+        );
+
+        fnode.republish_mining_template();
+
+        assert_eq!(
+            fnode.mining_state.prev_state_commitment(),
+            Some(correct),
+            "republish must restore the commitment derived from the current tips ([genesis])"
         );
     }
 

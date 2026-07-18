@@ -55,6 +55,7 @@ impl BlockRules {
             block.header.difficulty,
             &block.header.merkle_root,
             &block.header.parents,
+            block.header.prev_state_commitment.as_deref(),
         );
         if computed != block.header.hash {
             return false; // Hash doesn't match header content

@@ -1971,6 +1971,16 @@ impl RpcServer {
                     .unwrap_or(0);
                 let min_timestamp = max_parent_ts.saturating_add(1);
 
+                // M5: the deferred state commitment the miner MUST stamp into
+                // header.prev_state_commitment and mine into the PoW preimage. The
+                // node published it (over select_parent(canonical tips)) alongside
+                // next_difficulty, so it equals what the validator recomputes from
+                // the block's parents (miner<->verifier parity). null pre-M5.
+                let prev_state_commitment = match &s.mining_state {
+                    Some(ms) => ms.prev_state_commitment(),
+                    None => crate::service::network::nodes::full_node::get_prev_state_commitment(),
+                };
+
                 RpcResponse::ok(
                     id,
                     json!({
@@ -1987,6 +1997,7 @@ impl RpcServer {
                         "max_tx":        ConsensusParams::MAX_BLOCK_TXS,
                         "max_size":      ConsensusParams::MAX_BLOCK_SIZE,
                         "min_timestamp": min_timestamp,
+                        "prev_state_commitment": prev_state_commitment,
                         // The exact tx set the miner must include (coinbase is
                         // added by the miner). Empty when the mempool is empty.
                         "transactions":  selected,
@@ -2096,6 +2107,14 @@ impl RpcServer {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+
+        // M5: the submitted deferred state commitment. It is in the PoW preimage,
+        // so it MUST be reconstructed exactly as mined (null/absent -> None); the
+        // validator re-derives the expected value and rejects a mismatch.
+        let submitted_prev_state_commitment: Option<String> = block_json
+            .get("prev_state_commitment")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         let parents: Vec<String> = block_json
             .get("parents")
@@ -2250,6 +2269,7 @@ impl RpcServer {
                 receipt_root: None,
                 state_root: None,
                 mix_hash,
+                prev_state_commitment: submitted_prev_state_commitment,
             },
             body: BlockBody { transactions },
         };
@@ -5451,6 +5471,7 @@ mod tests {
                 receipt_root: None,
                 state_root: None,
                 mix_hash: String::new(),
+                prev_state_commitment: None,
             },
             body: BlockBody {
                 transactions: vec![],

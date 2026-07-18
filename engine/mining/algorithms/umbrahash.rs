@@ -532,6 +532,7 @@ pub fn header_hash(
     difficulty: u64,
     merkle_root: &str,
     parents: &[String],
+    prev_state_commitment: Option<&str>,
 ) -> [u8; 32] {
     let bytes = crate::engine::mining::algorithms::shadowhash::serialize_header_template(
         version,
@@ -541,6 +542,7 @@ pub fn header_hash(
         difficulty,
         merkle_root,
         parents,
+        prev_state_commitment,
     );
     sha3_256_bytes(&bytes)
 }
@@ -836,10 +838,10 @@ mod tests {
     #[test]
     fn header_hash_is_deterministic_and_field_sensitive() {
         let parents = vec!["a".repeat(64)];
-        let a = header_hash(2, 100, 1_700_000_000_000, 0, 4096, "mr", &parents);
-        let b = header_hash(2, 100, 1_700_000_000_000, 0, 4096, "mr", &parents);
+        let a = header_hash(2, 100, 1_700_000_000_000, 0, 4096, "mr", &parents, None);
+        let b = header_hash(2, 100, 1_700_000_000_000, 0, 4096, "mr", &parents, None);
         assert_eq!(a, b, "same fields → same pre-image");
-        let c = header_hash(2, 101, 1_700_000_000_000, 0, 4096, "mr", &parents);
+        let c = header_hash(2, 101, 1_700_000_000_000, 0, 4096, "mr", &parents, None);
         assert_ne!(a, c, "different height → different pre-image");
     }
 

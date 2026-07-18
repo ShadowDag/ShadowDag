@@ -46,6 +46,7 @@ pub fn shadow_hash(block: &Block) -> String {
 /// Only valid for genesis blocks and tests. For mining/validation,
 /// use shadow_hash_raw_full() with explicit extra_nonce.
 #[deprecated(note = "Use shadow_hash_raw_full() with explicit extra_nonce")]
+#[allow(clippy::too_many_arguments)]
 pub fn shadow_hash_raw(
     version: u32,
     height: u64,
@@ -54,6 +55,7 @@ pub fn shadow_hash_raw(
     difficulty: u64,
     merkle_root: &str,
     parents: &[String],
+    prev_state_commitment: Option<&str>,
 ) -> String {
     shadow_hash_raw_full(
         version,
@@ -64,6 +66,7 @@ pub fn shadow_hash_raw(
         difficulty,
         merkle_root,
         parents,
+        prev_state_commitment,
     )
 }
 
@@ -79,6 +82,7 @@ pub fn shadow_hash_raw_full(
     difficulty: u64,
     merkle_root: &str,
     parents: &[String],
+    prev_state_commitment: Option<&str>,
 ) -> String {
     let mut bytes = serialize_header_raw(
         version,
@@ -88,6 +92,7 @@ pub fn shadow_hash_raw_full(
         difficulty,
         merkle_root,
         parents,
+        prev_state_commitment,
     );
     bytes.extend_from_slice(&extra_nonce.to_le_bytes());
     shadow_hash_bytes(&bytes)
@@ -228,12 +233,24 @@ fn serialize_header(block: &Block) -> Vec<u8> {
         block.header.difficulty,
         &block.header.merkle_root,
         &block.header.parents,
+        block.header.prev_state_commitment.as_deref(),
     );
     buf.extend_from_slice(&block.header.extra_nonce.to_le_bytes());
     buf
 }
 
-/// Serialize raw header fields to bytes (deterministic)
+/// Serialize raw header fields to bytes (deterministic). The single core
+/// preimage serializer: BOTH PoW preimages (ShadowHash via `shadow_hash_raw_full`
+/// and UmbraHash via `serialize_header_template`) build on it, so every field
+/// bound here is bound identically for both algorithms and for miner + validator
+/// + sync + light (the "one serializer, literally" requirement).
+///
+/// M5: the domain tag is bumped v1 -> v2 (same 18-byte length, so
+/// `HEADER_NONCE_OFFSET` is unchanged) and the deferred `prev_state_commitment`
+/// is appended AFTER the parents (never between the nonce and the domain, so the
+/// GPU nonce patch offset stays valid). `enc_opt_root` makes `None` vs `Some("")`
+/// unambiguous.
+#[allow(clippy::too_many_arguments)]
 fn serialize_header_raw(
     version: u32,
     height: u64,
@@ -242,11 +259,12 @@ fn serialize_header_raw(
     difficulty: u64,
     merkle_root: &str,
     parents: &[String],
+    prev_state_commitment: Option<&str>,
 ) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
 
-    // Domain separation
-    buf.extend_from_slice(b"ShadowDAG_Block_v1");
+    // Domain separation (v2: M5 deferred state commitment appended below).
+    buf.extend_from_slice(b"ShadowDAG_Block_v2");
 
     buf.extend_from_slice(&version.to_le_bytes());
     buf.extend_from_slice(&height.to_le_bytes());
@@ -268,6 +286,9 @@ fn serialize_header_raw(
         buf.extend_from_slice(&len);
         buf.extend_from_slice(p_bytes);
     }
+
+    // M5 deferred state commitment (appended last; canonical Option encoding).
+    enc_opt_root(&mut buf, prev_state_commitment);
     buf
 }
 
@@ -290,6 +311,7 @@ pub fn serialize_header_template(
     difficulty: u64,
     merkle_root: &str,
     parents: &[String],
+    prev_state_commitment: Option<&str>,
 ) -> Vec<u8> {
     let mut buf = serialize_header_raw(
         version,
@@ -299,6 +321,7 @@ pub fn serialize_header_template(
         difficulty,
         merkle_root,
         parents,
+        prev_state_commitment,
     );
     buf.extend_from_slice(&extra_nonce.to_le_bytes());
     buf
@@ -360,15 +383,15 @@ mod tests {
 
     #[test]
     fn hash_raw_is_deterministic() {
-        let h1 = shadow_hash_raw_full(1, 0, 1735689600, 42, 0, 4, "merkle", &[]);
-        let h2 = shadow_hash_raw_full(1, 0, 1735689600, 42, 0, 4, "merkle", &[]);
+        let h1 = shadow_hash_raw_full(1, 0, 1735689600, 42, 0, 4, "merkle", &[], None);
+        let h2 = shadow_hash_raw_full(1, 0, 1735689600, 42, 0, 4, "merkle", &[], None);
         assert_eq!(h1, h2);
     }
 
     #[test]
     fn different_nonce_different_hash() {
-        let h1 = shadow_hash_raw_full(1, 0, 1735689600, 1, 0, 4, "merkle", &[]);
-        let h2 = shadow_hash_raw_full(1, 0, 1735689600, 2, 0, 4, "merkle", &[]);
+        let h1 = shadow_hash_raw_full(1, 0, 1735689600, 1, 0, 4, "merkle", &[], None);
+        let h2 = shadow_hash_raw_full(1, 0, 1735689600, 2, 0, 4, "merkle", &[], None);
         assert_ne!(h1, h2);
     }
 
@@ -402,11 +425,11 @@ mod tests {
         let parents = vec!["a".repeat(64), "f".repeat(64)];
         let mr = "deadbeef".repeat(8);
         for &nonce in &[0u64, 1, 42, 9_999_999, u64::MAX] {
-            let mut tmpl = serialize_header_template(2, 123, 1_735_689_600_000, 7, 4096, &mr, &parents);
+            let mut tmpl = serialize_header_template(2, 123, 1_735_689_600_000, 7, 4096, &mr, &parents, None);
             tmpl[HEADER_NONCE_OFFSET..HEADER_NONCE_OFFSET + 8]
                 .copy_from_slice(&nonce.to_le_bytes());
             let via_template = shadow_hash_of_bytes(&tmpl);
-            let via_raw = shadow_hash_raw_full(2, 123, 1_735_689_600_000, nonce, 7, 4096, &mr, &parents);
+            let via_raw = shadow_hash_raw_full(2, 123, 1_735_689_600_000, nonce, 7, 4096, &mr, &parents, None);
             assert_eq!(via_template, via_raw, "template+nonce must equal raw_full (nonce={})", nonce);
         }
     }
@@ -414,13 +437,40 @@ mod tests {
     #[test]
     fn shadow_hash_includes_memory_hard_mixing() {
         // Verify that different data produces very different hashes
-        let h1 = shadow_hash_raw_full(1, 0, 0, 0, 0, 1, "a", &[]);
-        let h2 = shadow_hash_raw_full(1, 0, 0, 0, 0, 1, "b", &[]);
+        let h1 = shadow_hash_raw_full(1, 0, 0, 0, 0, 1, "a", &[], None);
+        let h2 = shadow_hash_raw_full(1, 0, 0, 0, 0, 1, "b", &[], None);
         assert_ne!(h1, h2);
 
         // And they look random (no obvious patterns)
         let chars: Vec<char> = h1.chars().collect();
         let unique: std::collections::HashSet<&char> = chars.iter().collect();
         assert!(unique.len() > 5, "Hash should use diverse hex chars");
+    }
+
+    #[test]
+    fn prev_state_commitment_binds_to_block_hash() {
+        // M5 stage-1b KAT: the deferred commitment is part of the PoW preimage, so
+        // a 1-byte change in prev_state_commitment (or None vs Some) yields a
+        // DIFFERENT ShadowHash AND a different UmbraHash header_hash — the block
+        // hash commits to the parent's post-state. BOTH preimages must react.
+        let parents = vec!["a".repeat(64)];
+        let mr = "cd".repeat(32);
+        let c1 = "11".repeat(32);
+        let c2 = "12".repeat(32); // exactly one byte different
+        // ShadowHash (shadow_hash_raw_full).
+        let s_none = shadow_hash_raw_full(2, 5, 1_700_000_000_000, 7, 0, 100, &mr, &parents, None);
+        let s_c1 = shadow_hash_raw_full(2, 5, 1_700_000_000_000, 7, 0, 100, &mr, &parents, Some(&c1));
+        let s_c2 = shadow_hash_raw_full(2, 5, 1_700_000_000_000, 7, 0, 100, &mr, &parents, Some(&c2));
+        assert_ne!(s_none, s_c1, "None vs Some commitment must change the ShadowHash");
+        assert_ne!(s_c1, s_c2, "a 1-byte commitment change must change the ShadowHash");
+        // UmbraHash preimage (header_hash) reacts too.
+        use crate::engine::mining::algorithms::umbrahash::header_hash;
+        let u_c1 = header_hash(3, 5, 1_700_000_000_000, 0, 100, &mr, &parents, Some(&c1));
+        let u_c2 = header_hash(3, 5, 1_700_000_000_000, 0, 100, &mr, &parents, Some(&c2));
+        let u_none = header_hash(3, 5, 1_700_000_000_000, 0, 100, &mr, &parents, None);
+        assert_ne!(u_c1, u_c2, "a 1-byte commitment change must change the UmbraHash preimage");
+        assert_ne!(u_none, u_c1, "None vs Some commitment must change the UmbraHash preimage");
+        // Domain bumped v1->v2 stays 18 bytes, so the GPU nonce patch offset holds.
+        assert_eq!(HEADER_NONCE_OFFSET, 18 + 4 + 8 + 8);
     }
 }

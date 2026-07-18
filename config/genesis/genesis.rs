@@ -19,7 +19,9 @@ use crate::domain::block::block::Block;
 use crate::domain::block::block_body::BlockBody;
 use crate::domain::block::block_header::BlockHeader;
 use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
-use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
+use crate::engine::mining::algorithms::shadowhash::{
+    genesis_prev_state_commitment, shadow_hash_raw_full,
+};
 use crate::engine::mining::pow::pow_validator::PowValidator;
 use crate::errors::ConsensusError;
 use crate::{slog_error, slog_warn};
@@ -65,21 +67,21 @@ pub const DEV_REWARD_PCT: u64 = 5;
 // Re-mined 2026-07-04 for the ms-timestamp / version-2 era (GENESIS_TIMESTAMP in
 // ms + GENESIS_VERSION=2 change the PoW preimage). Produced by the
 // mine_new_genesis_constants test.
-pub const MAINNET_GENESIS_NONCE: u64 = 6878;
+pub const MAINNET_GENESIS_NONCE: u64 = 31519;
 pub const MAINNET_GENESIS_HASH: &str =
-    "00011e7401f0e62cf48083ba9a5467247571f6ec6b9ba12b4e24f735cff9fcb5";
+    "0001aceb6c2b22373512f3640da4c2dc308c82347722b2fcc8ce1296b4dab018";
 pub const MAINNET_MERKLE_ROOT: &str =
     "7a56948a71e9460192d1c74d28ec559d7d9a6dd206f8a41155d23453aaabdca7";
 pub const MAINNET_COINBASE_HASH: &str =
     "7a56948a71e9460192d1c74d28ec559d7d9a6dd206f8a41155d23453aaabdca7";
 
-pub const TESTNET_GENESIS_NONCE: u64 = 1334;
+pub const TESTNET_GENESIS_NONCE: u64 = 345;
 pub const TESTNET_GENESIS_HASH: &str =
-    "000fd07e8dc114a97fd8cb89c81e4fb799b9d03a9e0ee4986a9a3ff740894226";
+    "00021fd83c77b4555326ea2c2bc2c8bf130cb4e0dcde5e675a454fe25cf38b6a";
 
 pub const REGTEST_GENESIS_NONCE: u64 = 0;
 pub const REGTEST_GENESIS_HASH: &str =
-    "d033fd44463ab76af878793fffbe74bc7300d11c308b05a586424892907491ae";
+    "3fc3e995e74deea38ff06b8ae8b55b0dd2d8b99806337f5917b3c1235b694579";
 
 // ═══════════════════════════════════════════════════════════════════════════
 //                      TESTNET GENESIS CONSTANTS
@@ -290,6 +292,7 @@ fn mine_genesis(p: &GenesisParams, merkle_root: &str) -> (u64, String) {
             p.difficulty,
             merkle_root,
             &[], // Genesis has no parents
+            Some(&genesis_prev_state_commitment()),
         );
 
         if PowValidator::hash_meets_target(&hash, p.difficulty) {
@@ -336,6 +339,7 @@ fn build_block(p: GenesisParams) -> Block {
                 p.difficulty,
                 &merkle_root,
                 &[],
+                Some(&genesis_prev_state_commitment()),
             );
             if hash == MAINNET_GENESIS_HASH {
                 (MAINNET_GENESIS_NONCE, hash)
@@ -363,6 +367,7 @@ fn build_block(p: GenesisParams) -> Block {
                 p.difficulty,
                 &merkle_root,
                 &[],
+                Some(&genesis_prev_state_commitment()),
             );
             if hash == TESTNET_GENESIS_HASH {
                 (TESTNET_GENESIS_NONCE, hash)
@@ -381,6 +386,7 @@ fn build_block(p: GenesisParams) -> Block {
                 p.difficulty,
                 &merkle_root,
                 &[],
+                Some(&genesis_prev_state_commitment()),
             );
             if hash == REGTEST_GENESIS_HASH {
                 (REGTEST_GENESIS_NONCE, hash)
@@ -409,6 +415,9 @@ fn build_block(p: GenesisParams) -> Block {
             receipt_root: None,
             state_root: None,
             mix_hash: String::new(),
+            // M5: genesis binds the empty-initial-state commitment (no parent);
+            // must match the value the mine sites hashed into the genesis PoW.
+            prev_state_commitment: Some(genesis_prev_state_commitment()),
         },
         body: BlockBody {
             transactions: vec![coinbase],
@@ -604,6 +613,7 @@ pub fn verify_genesis_detailed(block: &Block, network: &NetworkMode) -> Result<(
         block.header.difficulty,
         &block.header.merkle_root,
         &block.header.parents,
+        block.header.prev_state_commitment.as_deref(),
     );
     if recomputed_hash != block.header.hash {
         return Err(ConsensusError::InvalidPow(format!(
@@ -757,6 +767,7 @@ mod tests {
             g.header.difficulty,
             &g.header.merkle_root,
             &g.header.parents,
+            g.header.prev_state_commitment.as_deref(),
         );
         assert_eq!(
             g.header.hash, recomputed,

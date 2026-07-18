@@ -224,6 +224,7 @@ impl BlockTemplateBuilder {
             receipt_root: None,
             state_root: None,
             mix_hash: String::new(),
+            prev_state_commitment: None,
         };
 
         let mut all_txs = vec![coinbase];
@@ -302,6 +303,7 @@ impl BlockTemplateBuilder {
             receipt_root: None,
             state_root: None,
             mix_hash: String::new(),
+            prev_state_commitment: None,
         };
 
         let mut all_txs = vec![coinbase];

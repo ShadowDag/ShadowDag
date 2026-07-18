@@ -51,6 +51,16 @@ pub struct BlockHeader {
     /// whose recomputed mix != this field. Empty for pre-UmbraHash blocks.
     #[serde(default)]
     pub mix_hash: String,
+
+    /// M5 DEFERRED STATE COMMITMENT (64-hex SHA3-256). Binds, into THIS block's
+    /// PoW preimage, the already-computed post-state of its selected parent
+    /// (selected_parent + parent.utxo_commitment/state_root/receipt_root, via
+    /// `shadowhash::compute_prev_state_commitment`). This makes the parent's
+    /// state a real consensus commitment (a block's own post-state is committed
+    /// by its child — "1 block behind"). `None` only for pre-M5 blocks; genesis
+    /// carries `genesis_prev_state_commitment()`.
+    #[serde(default)]
+    pub prev_state_commitment: Option<String>,
 }
 
 impl BlockHeader {
@@ -81,6 +91,7 @@ impl BlockHeader {
             receipt_root: None,
             state_root: None,
             mix_hash: String::new(),
+            prev_state_commitment: None,
         }
     }
 

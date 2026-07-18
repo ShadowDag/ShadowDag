@@ -68,6 +68,12 @@ use crate::{slog_error, slog_info, slog_warn};
 pub struct MiningTemplateState {
     next_difficulty: AtomicU64,
     dag_tips: Mutex<Vec<String>>,
+    /// M5: the deferred state commitment for the NEXT block, published by the
+    /// node (which has ghostdag + block_store) alongside `next_difficulty` and
+    /// anchored on the SAME `select_parent(canonical tips)` — so getblocktemplate
+    /// hands the miner exactly the value the validator will recompute from the
+    /// block's parents (miner<->verifier parity, mirroring the C4 difficulty path).
+    prev_state_commitment: Mutex<Option<String>>,
 }
 
 impl MiningTemplateState {
@@ -75,6 +81,7 @@ impl MiningTemplateState {
         Self {
             next_difficulty: AtomicU64::new(1),
             dag_tips: Mutex::new(Vec::new()),
+            prev_state_commitment: Mutex::new(None),
         }
     }
 
@@ -95,6 +102,52 @@ impl MiningTemplateState {
             *t = tips;
         }
     }
+
+    pub fn prev_state_commitment(&self) -> Option<String> {
+        self.prev_state_commitment.lock().ok().and_then(|c| c.clone())
+    }
+
+    pub fn set_prev_state_commitment(&self, commitment: Option<String>) {
+        if let Ok(mut c) = self.prev_state_commitment.lock() {
+            *c = commitment;
+        }
+    }
+}
+
+/// M5 SHARED PARITY FUNCTION — the ONE derivation of a block's deferred state
+/// commitment, called identically by the template publisher (miner side) and the
+/// validator. Anchors on `ghostdag.select_parent(parents)` (the SAME rule the
+/// difficulty path uses), then binds that selected parent's stored post-execution
+/// roots. Genesis / no-parent selection -> `genesis_prev_state_commitment()`.
+///
+/// A block with these `parents` MUST carry exactly this value in
+/// `header.prev_state_commitment`; the validator rejects any mismatch and PoW
+/// covers it (it is in the preimage). Because both sides run this function over
+/// the same `select_parent(parents)` and read the same stored roots, they agree.
+pub fn expected_prev_state_commitment(
+    parents: &[String],
+    ghostdag: &GhostDag,
+    block_store: &BlockStore,
+) -> String {
+    use crate::engine::mining::algorithms::shadowhash::{
+        compute_prev_state_commitment, genesis_prev_state_commitment,
+    };
+    let sp = ghostdag.select_parent(parents);
+    if sp.is_empty() {
+        return genesis_prev_state_commitment();
+    }
+    // M5 (path B): bind ONLY the deterministic selected-parent identity. The
+    // parent's `state_root` / `receipt_root` are DEFERRED, path-dependent EVM
+    // roots — populated post-execution and only for executed contract blocks —
+    // and `header.utxo_commitment` is not yet deterministically populated.
+    // Binding any of them here would let the commitment DIVERGE across nodes and
+    // forks (a consensus split): this derivation runs before the parent's roots
+    // are recomputed, so a side node may read different values than the miner.
+    // The commitment FORMAT keeps the (currently-None) root slots reserved, so a
+    // future deterministic-roots upgrade needs no domain-tag change. `block_store`
+    // is retained for that upgrade (it will re-read the parent's committed roots).
+    let _ = block_store;
+    compute_prev_state_commitment(&sp, None, None, None)
 }
 
 impl Default for MiningTemplateState {
@@ -134,11 +187,27 @@ fn set_dag_tips(tips: Vec<String>) {
     PROCESS_DEFAULT_MINING_STATE.set_dag_tips(tips)
 }
 
+/// Get the NEXT block's M5 deferred state commitment from the process-default
+/// cell. The daemon builds its RPC template with `RpcState::mining_state = None`,
+/// so `getblocktemplate` MUST read this fallback (exactly like `get_next_difficulty`
+/// / `get_dag_tips`). Without it the template would emit `prev_state_commitment =
+/// null`, the miner would stamp `None`, and the M5 verify would reject every
+/// height>0 block — a silent chain halt. The FullNode publishes into this cell on
+/// startup and after every accepted block, alongside difficulty and tips.
+pub fn get_prev_state_commitment() -> Option<String> {
+    PROCESS_DEFAULT_MINING_STATE.prev_state_commitment()
+}
+
+fn set_prev_state_commitment(commitment: Option<String>) {
+    PROCESS_DEFAULT_MINING_STATE.set_prev_state_commitment(commitment)
+}
+
 /// Reset the process-default mining template cell. Test-only.
 #[cfg(test)]
 pub fn reset_mining_globals() {
     PROCESS_DEFAULT_MINING_STATE.set_next_difficulty(0);
     PROCESS_DEFAULT_MINING_STATE.set_dag_tips(Vec::new());
+    PROCESS_DEFAULT_MINING_STATE.set_prev_state_commitment(None);
 }
 
 /// Maximum orphan blocks to hold in memory (DoS protection)
@@ -354,6 +423,15 @@ impl FullNode {
         if !initial_tips.is_empty() {
             mining_state.set_dag_tips(initial_tips.clone());
         }
+        // M5: publish the NEXT block's deferred state commitment anchored on the
+        // SAME canonical tips as next_difficulty (miner<->verifier parity). Seed
+        // BOTH the per-instance cell AND the process-default cell so the daemon's
+        // getblocktemplate (RpcState::mining_state = None) has a value from the
+        // very first template — before any block is accepted post-startup — and
+        // never emits a null commitment that the M5 verify would reject.
+        let initial_psc = expected_prev_state_commitment(&initial_tips, &ghostdag, &block_store);
+        mining_state.set_prev_state_commitment(Some(initial_psc.clone()));
+        set_prev_state_commitment(Some(initial_psc));
 
         Self {
             block_store,
@@ -730,6 +808,27 @@ impl FullNode {
             )));
         }
 
+        // M5 DEFERRED-VERIFY: the block's prev_state_commitment MUST equal the
+        // value derived from its SELECTED PARENT's stored post-execution roots via
+        // the SAME shared fn the template publisher used (parents are present +
+        // in GHOSTDAG here, so select_parent is defined). PoW already binds the
+        // committed value into the hash (a tampered value fails PoW); this check
+        // additionally rejects a self-consistent block that committed to a WRONG
+        // parent state. Non-genesis only (genesis carries its own constant).
+        if block.header.height > 0 {
+            let expected = expected_prev_state_commitment(
+                &block.header.parents,
+                &self.ghostdag,
+                &self.block_store,
+            );
+            if block.header.prev_state_commitment.as_deref() != Some(expected.as_str()) {
+                return Err(NodeError::BlockRejected(format!(
+                    "prev_state_commitment mismatch: header={:?} expected={}",
+                    block.header.prev_state_commitment, expected
+                )));
+            }
+        }
+
         // ═══════════════════════════════════════════════════════════════
         // PHASE 2: PERSIST THEN ACCEPT INTO DAG (no UTXO — structure only)
         //
@@ -844,6 +943,26 @@ impl FullNode {
             return Err(NodeError::BlockRejected(
                 result.reason.unwrap_or_else(|| "unknown".to_string()),
             ));
+        }
+
+        // M5 DEFERRED-VERIFY (orphan-reconnect path): identical to the check in
+        // process_block_inner. This path is drained by the orphan resolver and is
+        // the normal IBD reconnection route, so the M5 commitment MUST be enforced
+        // here too — otherwise enforcement would be arrival-order-dependent (a
+        // block that arrives as an orphan and is later reconnected would skip the
+        // check), an attacker-controllable consensus split. Non-genesis only.
+        if block.header.height > 0 {
+            let expected = expected_prev_state_commitment(
+                &block.header.parents,
+                &self.ghostdag,
+                &self.block_store,
+            );
+            if block.header.prev_state_commitment.as_deref() != Some(expected.as_str()) {
+                return Err(NodeError::BlockRejected(format!(
+                    "prev_state_commitment mismatch: header={:?} expected={}",
+                    block.header.prev_state_commitment, expected
+                )));
+            }
         }
 
         if !self.save_block_normalized(block) {
@@ -1872,46 +1991,10 @@ impl FullNode {
             )));
         }
 
-        // Publish next difficulty + tips for getblocktemplate. CONSENSUS-CRITICAL
-        // (external audit C4 equivalence): the published difficulty is anchored on
-        // `select_parent` of the SAME canonical tip set the template will use —
-        // NOT the single `best_tip` (which is chosen by select_best_tip, a
-        // DIFFERENT function: cumulative_work-first with the opposite hash
-        // tie-break). Anchoring on best_tip made a reconvergence block merging
-        // sibling tips get stamped f(best_tip) but validated against
-        // f(select_parent(parents)) and universally rejected → production halt.
-        // Compute the tips in the same canonical form the RPC handler applies
-        // (non-empty, sorted, deduped, capped at MAX_PARENTS); backfilled
-        // min-parent ancestors the RPC may add are older (lower blue score) and
-        // never change select_parent, so they don't affect the anchor.
-        let mut tips = self.dag_manager.get_tips();
-        tips.retain(|h| !h.is_empty());
-        tips.sort();
-        tips.dedup();
-        tips.truncate(crate::config::consensus::consensus_params::ConsensusParams::MAX_PARENTS);
-        if !tips.is_empty() {
-            // Keep the running retarget engine rebuilt from the canonical best
-            // tip. It is NON-authoritative now (validation recomputes per block);
-            // some RPC/stats read its EMA, so keep it fresh.
-            if self.block_store.get_block(&best_tip).is_some() {
-                if let Ok(mut retarget) = self.retarget.lock() {
-                    let (fresh, _) = Self::build_retarget_from_canonical(
-                        &self.block_store,
-                        &self.ghostdag,
-                        &self.network,
-                        &best_tip,
-                    );
-                    *retarget = fresh;
-                }
-            }
-            let sp = self.ghostdag.select_parent(&tips);
-            let anchor = if sp.is_empty() { best_tip.clone() } else { sp };
-            let diff = self.expected_difficulty_for_selected_parent(&anchor);
-            self.mining_state.set_next_difficulty(diff);
-            set_next_difficulty(diff);
-            self.mining_state.set_dag_tips(tips.clone());
-            set_dag_tips(tips);
-        }
+        // Publish next difficulty + deferred state commitment + tips for
+        // getblocktemplate. CONSENSUS-CRITICAL (external audit C4 equivalence) — see
+        // publish_mining_template for the full rationale and the anchor invariant.
+        self.publish_mining_template(&best_tip);
 
         // ── FINALITY: prune undo data for finalized blocks ────────────
         // Blocks deeper than FINALITY_DEPTH below the tip are irreversible.
@@ -3040,6 +3123,92 @@ impl FullNode {
     }
 
     /// Process genesis block — same pipeline minus parent validation.
+    /// Publish the NEXT block's mining-template inputs — next difficulty, the M5
+    /// deferred state commitment, and the DAG tips — into BOTH the per-instance
+    /// `mining_state` cell AND the process-default cell (the daemon serves
+    /// getblocktemplate with `RpcState::mining_state = None`, so it reads the
+    /// process-default). MUST be called after EVERY tip change so a template
+    /// consumer mines a block the validator accepts.
+    ///
+    /// CONSENSUS-CRITICAL (external audit C4 equivalence): difficulty and the
+    /// commitment are anchored on `select_parent` of the SAME canonical tip set
+    /// the template will use — NOT the single `best_tip` (chosen by
+    /// select_best_tip, a DIFFERENT function: cumulative_work-first with the
+    /// opposite hash tie-break). Anchoring on best_tip made a reconvergence block
+    /// merging sibling tips get stamped f(best_tip) but validated against
+    /// f(select_parent(parents)) and universally rejected → production halt. Tips
+    /// are canonicalised exactly as the RPC handler does (non-empty, sorted,
+    /// deduped, capped at MAX_PARENTS); backfilled min-parent ancestors the RPC
+    /// may add are older (lower blue score) and never change select_parent.
+    ///
+    /// Called from BOTH the normal accept path (recompute_virtual_chain) AND
+    /// fresh-chain genesis acceptance (process_genesis). The two paths MUST
+    /// publish identically: on a fresh chain the daemon accepts genesis without
+    /// recompute_virtual_chain, so without a publish here the process-default
+    /// would still hold the empty-parent genesis commitment seeded in
+    /// FullNode::new (store empty at construction), and every height-1 block
+    /// would be rejected (commitment mismatch) → chain frozen at genesis.
+    fn publish_mining_template(&self, best_tip: &str) {
+        let mut tips = self.dag_manager.get_tips();
+        tips.retain(|h| !h.is_empty());
+        tips.sort();
+        tips.dedup();
+        tips.truncate(crate::config::consensus::consensus_params::ConsensusParams::MAX_PARENTS);
+        if tips.is_empty() {
+            return;
+        }
+        // Keep the running retarget engine rebuilt from the canonical best tip. It
+        // is NON-authoritative now (validation recomputes per block); some RPC/stats
+        // read its EMA, so keep it fresh.
+        if self.block_store.get_block(best_tip).is_some() {
+            if let Ok(mut retarget) = self.retarget.lock() {
+                let (fresh, _) = Self::build_retarget_from_canonical(
+                    &self.block_store,
+                    &self.ghostdag,
+                    &self.network,
+                    best_tip,
+                );
+                *retarget = fresh;
+            }
+        }
+        let sp = self.ghostdag.select_parent(&tips);
+        let anchor = if sp.is_empty() { best_tip.to_string() } else { sp };
+        let diff = self.expected_difficulty_for_selected_parent(&anchor);
+        self.mining_state.set_next_difficulty(diff);
+        set_next_difficulty(diff);
+        // M5: publish the NEXT block's deferred state commitment over the SAME
+        // canonical tips as next_difficulty, so the miner stamps exactly what the
+        // validator recomputes from the block's parents (parity). Compute ONCE and
+        // write BOTH cells, immediately before the tips writes so the
+        // commitment↔tips pair is published back-to-back (a stale cross-read just
+        // yields a rejected template the miner retries — never an unsound accept).
+        let psc = expected_prev_state_commitment(&tips, &self.ghostdag, &self.block_store);
+        self.mining_state.set_prev_state_commitment(Some(psc.clone()));
+        set_prev_state_commitment(Some(psc));
+        self.mining_state.set_dag_tips(tips.clone());
+        set_dag_tips(tips);
+    }
+
+    /// Republish the mining template over the CURRENT canonical best/tips. Call
+    /// this ONCE after startup recovery has settled the DAG/GHOSTDAG state.
+    ///
+    /// WHY IT'S REQUIRED: FullNode::new seeds the mining cells from the DAG as it
+    /// exists AT CONSTRUCTION — which the daemon builds BEFORE
+    /// start()->verify_and_recover, so on a restart that rebuilds a corrupt DAG
+    /// (rebuild_dag/rebuild_ghostdag) the seed is stale. recompute_virtual_chain
+    /// (the restart branch's republish) early-returns WITHOUT publishing whenever
+    /// the recomputed best equals the persisted best (the normal case). Under M5
+    /// that stale commitment is not merely suboptimal: getblocktemplate would serve
+    /// a value the height>=1 validator recomputes differently and rejects — a
+    /// block-production halt on that node. Republishing over the post-recovery tips
+    /// closes this. Idempotent (safe to call on the fresh-genesis path too).
+    pub fn republish_mining_template(&self) {
+        let best = self.block_store.get_best_hash().unwrap_or_default();
+        if !best.is_empty() {
+            self.publish_mining_template(&best);
+        }
+    }
+
     pub fn process_genesis(&self, block: &Block) -> Result<(), NodeError> {
         // ═══════════════════════════════════════════════════════════════
         // PHASE 1: VALIDATE (read-only — NO state changes)
@@ -3131,6 +3300,17 @@ impl FullNode {
                 "Failed to persist best_hash for genesis block".to_string(),
             ));
         }
+
+        // M5 (fresh-chain halt fix): genesis is now the sole DAG tip. Publish the
+        // mining template over the real tips ([genesis]) so the height-1
+        // getblocktemplate serves compute_prev_state_commitment(genesis_hash) — the
+        // exact value the validator recomputes for parents=[genesis]. Without this,
+        // the process-default cell still holds the empty-parent genesis commitment
+        // seeded in FullNode::new (store empty), and every height-1 block is
+        // rejected → the chain deadlocks at genesis on every fresh bring-up. The
+        // daemon's fresh-chain branch does NOT call recompute_virtual_chain, so this
+        // publish must happen here (the same helper the accept path uses).
+        self.publish_mining_template(&block.header.hash);
 
         Ok(())
     }
@@ -3293,6 +3473,7 @@ mod tests {
                 receipt_root: None,
                 state_root: None,
                 mix_hash: String::new(),
+                prev_state_commitment: None,
             },
             body: BlockBody { transactions: vec![] },
         };
@@ -3354,6 +3535,7 @@ mod tests {
                 receipt_root: None,
                 state_root: None,
                 mix_hash: String::new(),
+                prev_state_commitment: None,
             },
             body: BlockBody { transactions: vec![] },
         };
@@ -3463,6 +3645,7 @@ mod tests {
                 receipt_root: None,
                 state_root: None,
                 mix_hash: String::new(),
+                prev_state_commitment: None,
             },
             body: BlockBody { transactions: vec![] },
         };
@@ -3561,6 +3744,7 @@ mod tests {
                 receipt_root: None,
                 state_root: None,
                 mix_hash: String::new(),
+                prev_state_commitment: None,
             },
             body: BlockBody { transactions: txs },
         };

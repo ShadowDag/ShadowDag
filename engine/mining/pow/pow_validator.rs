@@ -180,6 +180,7 @@ impl PowValidator {
         }
         let hh = umbrahash::header_hash(
             h.version, h.height, h.timestamp, h.extra_nonce, h.difficulty, &h.merkle_root, &h.parents,
+            h.prev_state_commitment.as_deref(),
         );
         let cache = umbrahash::cache_for_epoch(umbrahash::epoch_of(h.height));
         let (mix, result) = umbrahash::hashimoto_light(
@@ -232,6 +233,7 @@ impl PowValidator {
             let hh = umbrahash::header_hash(
                 header.version, header.height, header.timestamp, header.extra_nonce,
                 header.difficulty, &header.merkle_root, &header.parents,
+                header.prev_state_commitment.as_deref(),
             );
             let cache = umbrahash::cache_for_epoch(umbrahash::epoch_of(header.height));
             let (_mix, result) = umbrahash::hashimoto_light(
@@ -247,6 +249,7 @@ impl PowValidator {
             shadow_hash_raw_full(
                 header.version, header.height, header.timestamp, header.nonce,
                 header.extra_nonce, header.difficulty, &header.merkle_root, &header.parents,
+                header.prev_state_commitment.as_deref(),
             )
         }
     }
@@ -273,6 +276,7 @@ impl PowValidator {
             header.difficulty,
             &header.merkle_root,
             &header.parents,
+            header.prev_state_commitment.as_deref(),
         );
 
         if recomputed != header.hash {
@@ -525,6 +529,7 @@ mod tests {
         let hh = umbrahash::header_hash(
             header.version, header.height, header.timestamp, header.extra_nonce,
             header.difficulty, &header.merkle_root, &header.parents,
+            header.prev_state_commitment.as_deref(),
         );
         let cache = umbrahash::cache_for_epoch(umbrahash::epoch_of(header.height));
         let (mix, result) = umbrahash::hashimoto_light(

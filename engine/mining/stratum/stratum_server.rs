@@ -1115,6 +1115,9 @@ impl StratumServer {
             template.difficulty,
             &template.merkle_root,
             &template.parents,
+            // M5: Stratum is disabled on UmbraHash-fork networks (see the daemon
+            // fork guard); on unscheduled nets it mines pre-M5 (None) preimages.
+            None,
         );
 
         // Check against the worker's current share difficulty target
@@ -1156,6 +1159,9 @@ impl StratumServer {
             template.difficulty,
             &template.merkle_root,
             &template.parents,
+            // M5: Stratum is disabled on UmbraHash-fork networks (see the daemon
+            // fork guard); on unscheduled nets it mines pre-M5 (None) preimages.
+            None,
         );
 
         // Check against the full network difficulty from the template
@@ -1211,6 +1217,7 @@ impl StratumServer {
             template.difficulty,
             &template.merkle_root,
             &template.parents,
+            None, // M5: Stratum disabled on fork nets; pre-M5 preimage otherwise.
         )
     }
 }

@@ -245,6 +245,7 @@ mod tests {
             difficulty,
             &merkle_root,
             &parents,
+            None,
         );
 
         BlockHeader {
@@ -263,6 +264,7 @@ mod tests {
             receipt_root: None,
             state_root: None,
             mix_hash: String::new(),
+            prev_state_commitment: None,
         }
     }
 

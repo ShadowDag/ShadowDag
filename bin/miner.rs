@@ -278,6 +278,8 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         let height = template.height;
         let prev_hash = template.prev_hash;
         let difficulty = template.difficulty;
+        // M5: the deferred state commitment to stamp + mine (parity with the node).
+        let prev_state_commitment = template.prev_state_commitment.clone();
 
         if total_mined == 0 {
             slog_info!("miner", "connected_to_node", height => height - 1, difficulty => difficulty);
@@ -407,6 +409,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         let umbra_result: Option<(u64, String, String)> = if umbra_mode {
             let hh = umbrahash::header_hash(
                 block_version, height, timestamp, 0, difficulty, &merkle_root, &parents,
+                prev_state_commitment.as_deref(),
             );
             let target = PowValidator::difficulty_to_target_bytes(difficulty);
             let cache = umbrahash::cache_for_epoch(umbrahash::epoch_of(height));
@@ -443,8 +446,8 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
         } else {
             gpu_miner.as_ref().map(|g| {
                 gpu_search(
-                    g, height, timestamp, difficulty, &merkle_root, &parents, &found, &hash_count,
-                    &start,
+                    g, height, timestamp, difficulty, &merkle_root, &parents,
+                    prev_state_commitment.as_deref(), &found, &hash_count, &start,
                 )
             })
         };
@@ -481,6 +484,7 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
                         t_difficulty,
                         &t_merkle,
                         &t_parents,
+                        prev_state_commitment.as_deref(),
                     );
 
                     t_hash_count.fetch_add(1, Ordering::Relaxed);
@@ -570,6 +574,10 @@ fn run_miner(args: &[String]) -> Result<(), NodeError> {
                 receipt_root: None,
                 state_root: None,
                 mix_hash, // hex(mix) for UmbraHash, empty for ShadowHash
+                // M5: the commitment the miner mined into the preimage (same value
+                // the validator recomputes from the parents); stamped so the
+                // submitted block's hash re-derives correctly.
+                prev_state_commitment,
             },
             body: BlockBody {
                 transactions: block_txs,
@@ -723,6 +731,11 @@ struct BlockTemplate {
     /// conflict-free). The miner includes them so user transactions confirm;
     /// the coinbase claims their fees. Empty when the mempool is empty.
     transactions: Vec<Transaction>,
+    /// M5 deferred state commitment the node computed for this template (over
+    /// select_parent(parent_hashes)). The miner stamps it into
+    /// header.prev_state_commitment and mines it into the PoW preimage; the
+    /// validator recomputes + rejects a mismatch. `None` on pre-M5 nodes.
+    prev_state_commitment: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -916,6 +929,12 @@ fn rpc_get_template(addr: &str, bearer_token: Option<&str>) -> Option<BlockTempl
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
+    // M5: deferred state commitment (null on pre-M5 nodes -> None).
+    let prev_state_commitment = result
+        .get("prev_state_commitment")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     // Transactions the node selected for inclusion. Absent/empty => coinbase-only
     // block. A tx that fails to deserialize is skipped (never included blindly).
     let transactions: Vec<Transaction> = result
@@ -936,6 +955,7 @@ fn rpc_get_template(addr: &str, bearer_token: Option<&str>) -> Option<BlockTempl
         total_fees,
         min_timestamp,
         transactions,
+        prev_state_commitment,
     })
 }
 
@@ -960,6 +980,9 @@ fn rpc_submit_block(addr: &str, block: &Block, bearer_token: Option<&str>) -> Su
         "parents":      block.header.parents,
         "version":      block.header.version,
         "mix_hash":     block.header.mix_hash, // UmbraHash PoW mix (empty for ShadowHash)
+        // M5: MUST transmit so the node reconstructs the exact header it mined —
+        // the commitment is in the PoW preimage, so omitting it => hash mismatch.
+        "prev_state_commitment": block.header.prev_state_commitment,
         "transactions": txs_json,
     });
 
@@ -1302,6 +1325,7 @@ fn gpu_search(
     difficulty: u64,
     merkle_root: &str,
     parents: &[String],
+    prev_state_commitment: Option<&str>,
     found: &Arc<AtomicBool>,
     hash_count: &Arc<AtomicU64>,
     start: &Instant,
@@ -1314,7 +1338,7 @@ fn gpu_search(
         return None; // genesis-only edge; let the CPU path handle it
     }
     let target = difficulty_target_bytes(difficulty)?;
-    let tmpl = serialize_header_template(2, height, timestamp, 0, difficulty, merkle_root, parents);
+    let tmpl = serialize_header_template(2, height, timestamp, 0, difficulty, merkle_root, parents, prev_state_commitment);
     if tmpl.len() > 512 {
         eprintln!("[gpu] header {}B exceeds kernel cap; using CPU", tmpl.len());
         return None;
@@ -1332,6 +1356,7 @@ fn gpu_search(
                 // Authoritative re-check on the consensus CPU hash.
                 let hash = shadow_hash_raw_full(
                     2, height, timestamp, nonce, 0, difficulty, merkle_root, parents,
+                    prev_state_commitment,
                 );
                 if meets_difficulty(&hash, difficulty) {
                     found.store(true, Ordering::Relaxed);
