@@ -1492,49 +1492,13 @@ impl FullNode {
                     {
                         slog_error!("node", "confidential_block_rejected",
                             block => block_hash, reason => &msg);
-                        // Roll back everything applied during this reorg, then
-                        // best-effort restore the previous chain (mirrors the
-                        // contract-persist-failure path below).
-                        for hash in applied_new.iter().rev() {
-                            let _ = self.utxo_set.rollback_block_undo(hash);
-                            self.rollback_contract_block_best_effort(hash);
-                        }
-                        let mut restore_failed = false;
-                        for hash in rolled_back_old.iter().rev() {
-                            if let Some(old_block) = self.block_store.get_block(hash) {
-                                if self
-                                    .utxo_set
-                                    .apply_block_dag_ordered(
-                                        &old_block.body.transactions,
-                                        old_block.header.height,
-                                        hash,
-                                    )
-                                    .is_err()
-                                {
-                                    restore_failed = true;
-                                }
-                                let (_, _, _, env) = self.execute_contract_transactions(
-                                    &old_block,
-                                    &self.contract_storage,
-                                );
-                                if env
-                                    .persist_with_undo(&self.contract_storage, hash, None, None)
-                                    .is_err()
-                                {
-                                    restore_failed = true;
-                                }
-                            } else {
-                                restore_failed = true;
-                            }
-                        }
-                        if restore_failed {
-                            // FATAL (external audit M4): see the contract-persist path below —
-                            // a failed old-chain restore leaves committed state representing
-                            // neither chain; halt so a restart rebuilds from the durable store.
-                            slog_error!("node", "FATAL_reorg_restore_failed_halting",
-                                block => block_hash);
-                            std::process::exit(1);
-                        }
+                        // Fail-atomic unwind: undo this reorg and restore the
+                        // previous chain, halting if any step fails.
+                        self.unwind_reorg_or_halt(
+                            &applied_new,
+                            &rolled_back_old,
+                            "confidential_block_rejected",
+                        );
                         // M3: drop the offending block ONLY if it is a childless
                         // leaf; a mid-reorg-chain non-leaf is left fully intact (see
                         // drop_offending_block_if_leaf). The safety guarantee (never
@@ -1582,57 +1546,11 @@ impl FullNode {
                         ) {
                             slog_error!("node", "contract_persist_with_undo_failed",
                                 block => block_hash, error => &format!("{}", e));
-                            for hash in applied_new.iter().rev() {
-                                let _ = self.utxo_set.rollback_block_undo(hash);
-                                self.rollback_contract_block_best_effort(hash);
-                            }
-                            // Best-effort: re-apply the old chain to restore the
-                            // previous consistent state. If this also fails, the
-                            // node is in an unrecoverable state and should restart
-                            // with full UTXO rebuild.
-                            let mut restore_failed = false;
-                            for hash in rolled_back_old.iter().rev() {
-                                if let Some(old_block) = self.block_store.get_block(hash) {
-                                    if self
-                                        .utxo_set
-                                        .apply_block_dag_ordered(
-                                            &old_block.body.transactions,
-                                            old_block.header.height,
-                                            hash,
-                                        )
-                                        .is_err()
-                                    {
-                                        restore_failed = true;
-                                    }
-                                    // Re-execute contracts for the old block to restore state
-                                    let (_, _, _, env) = self.execute_contract_transactions(
-                                        &old_block,
-                                        &self.contract_storage,
-                                    );
-                                    if env
-                                        .persist_with_undo(&self.contract_storage, hash, None, None)
-                                        .is_err()
-                                    {
-                                        restore_failed = true;
-                                    }
-                                } else {
-                                    // Old block body gone (pruned/deleted) — cannot restore it.
-                                    restore_failed = true;
-                                }
-                            }
-                            if restore_failed {
-                                // FATAL (external audit M4): the reorg failed AND restoring the
-                                // previous chain also failed, so committed UTXO/contract state now
-                                // represents NEITHER the old nor the new chain. Continuing would
-                                // serve and relay corrupt consensus state (and diverge from the
-                                // network). Halt: a restart runs the verified rebuild/replay from
-                                // the durable BlockStore (daemon startup recompute is the net — it
-                                // either recovers cleanly or refuses to start with a --reindex
-                                // instruction), which is strictly safer than log-and-continue.
-                                slog_error!("node", "FATAL_reorg_restore_failed_halting",
-                                    block => block_hash);
-                                std::process::exit(1);
-                            }
+                            self.unwind_reorg_or_halt(
+                                &applied_new,
+                                &rolled_back_old,
+                                "contract_persist_with_undo_failed",
+                            );
                             // M3: drop the offending block ONLY if it is a childless
                             // leaf; a mid-reorg-chain non-leaf is left fully intact
                             // (see drop_offending_block_if_leaf). Pre-M3 this path
@@ -1718,34 +1636,11 @@ impl FullNode {
                                     VM_METRICS.record_violation();
                                     // Invariant violation is a consensus-critical error.
                                     // Roll back this block and reject it.
-                                    for hash in applied_new.iter().rev() {
-                                        let _ = self.utxo_set.rollback_block_undo(hash);
-                                        self.rollback_contract_block_best_effort(hash);
-                                    }
-                                    // Re-apply old chain
-                                    for hash in rolled_back_old.iter().rev() {
-                                        if let Some(old_block) = self.block_store.get_block(hash) {
-                                            let _ = self.utxo_set.apply_block_dag_ordered(
-                                                &old_block.body.transactions,
-                                                old_block.header.height,
-                                                hash,
-                                            );
-                                            let (_, _, _, env) = self
-                                                .execute_contract_transactions(
-                                                    &old_block,
-                                                    &self.contract_storage,
-                                                );
-                                            if let Err(pe) = env.persist_with_undo(
-                                                &self.contract_storage,
-                                                hash,
-                                                None,
-                                                None,
-                                            ) {
-                                                slog_error!("node", "CRITICAL_contract_restore_failed",
-                                                    block => hash, error => &format!("{}", pe));
-                                            }
-                                        }
-                                    }
+                                    self.unwind_reorg_or_halt(
+                                        &applied_new,
+                                        &rolled_back_old,
+                                        "INVARIANT_VIOLATION",
+                                    );
                                     return Err(NodeError::Consensus(ConsensusError::BlockValidation(
                                         format!("INVARIANT_VIOLATION: receipt/state root mismatch in {}", block_hash)
                                     )));
@@ -1762,38 +1657,11 @@ impl FullNode {
                         let expected_reward = EmissionSchedule::block_reward(block.header.height);
                         let expected_total =
                             expected_reward.checked_add(applied_fees).ok_or_else(|| {
-                                // Rollback partially-applied new chain (UTXO + contract)
-                                for hash in applied_new.iter().rev() {
-                                    let _ = self.utxo_set.rollback_block_undo(hash);
-                                    self.rollback_contract_block_best_effort(hash);
-                                }
-                                // Best-effort: re-apply the old chain to restore the
-                                // previous consistent state. If this also fails, the
-                                // node is in an unrecoverable state and should restart
-                                // with full UTXO rebuild.
-                                for hash in rolled_back_old.iter().rev() {
-                                    if let Some(old_block) = self.block_store.get_block(hash) {
-                                        let _ = self.utxo_set.apply_block_dag_ordered(
-                                            &old_block.body.transactions,
-                                            old_block.header.height,
-                                            hash,
-                                        );
-                                        // Re-execute contracts for the old block to restore state
-                                        let (_, _, _, env) = self.execute_contract_transactions(
-                                            &old_block,
-                                            &self.contract_storage,
-                                        );
-                                        if let Err(pe) = env.persist_with_undo(
-                                            &self.contract_storage,
-                                            hash,
-                                            None,
-                                            None,
-                                        ) {
-                                            slog_error!("node", "CRITICAL_contract_restore_failed",
-                                        block => hash, error => &format!("{}", pe));
-                                        }
-                                    }
-                                }
+                                self.unwind_reorg_or_halt(
+                                    &applied_new,
+                                    &rolled_back_old,
+                                    "reward_plus_fees_overflow",
+                                );
                                 NodeError::Consensus(ConsensusError::BlockValidation(
                                     "reward + fees overflow".into(),
                                 ))
@@ -1809,41 +1677,11 @@ impl FullNode {
                                     Some(t) => t,
                                     None => {
                                         slog_error!("node", "coinbase_output_overflow", block => block_hash);
-                                        // Rollback partially-applied new chain (UTXO + contract)
-                                        for hash in applied_new.iter().rev() {
-                                            let _ = self.utxo_set.rollback_block_undo(hash);
-                                            self.rollback_contract_block_best_effort(hash);
-                                        }
-                                        // Best-effort: re-apply the old chain to restore the
-                                        // previous consistent state. If this also fails, the
-                                        // node is in an unrecoverable state and should restart
-                                        // with full UTXO rebuild.
-                                        for hash in rolled_back_old.iter().rev() {
-                                            if let Some(old_block) =
-                                                self.block_store.get_block(hash)
-                                            {
-                                                let _ = self.utxo_set.apply_block_dag_ordered(
-                                                    &old_block.body.transactions,
-                                                    old_block.header.height,
-                                                    hash,
-                                                );
-                                                // Re-execute contracts for the old block to restore state
-                                                let (_, _, _, env) = self
-                                                    .execute_contract_transactions(
-                                                        &old_block,
-                                                        &self.contract_storage,
-                                                    );
-                                                if let Err(pe) = env.persist_with_undo(
-                                                    &self.contract_storage,
-                                                    hash,
-                                                    None,
-                                                    None,
-                                                ) {
-                                                    slog_error!("node", "CRITICAL_contract_restore_failed",
-                                                        block => hash, error => &format!("{}", pe));
-                                                }
-                                            }
-                                        }
+                                        self.unwind_reorg_or_halt(
+                                            &applied_new,
+                                            &rolled_back_old,
+                                            "coinbase_output_overflow",
+                                        );
                                         return Err(NodeError::BlockRejected(format!(
                                             "coinbase output overflow in {}",
                                             block_hash
@@ -1852,39 +1690,11 @@ impl FullNode {
                                 };
                                 if actual_total != expected_total {
                                     slog_error!("node", "coinbase_mismatch", block => block_hash, actual => &actual_total.to_string(), expected => &expected_total.to_string());
-                                    // Rollback partially-applied new chain (UTXO + contract)
-                                    for hash in applied_new.iter().rev() {
-                                        let _ = self.utxo_set.rollback_block_undo(hash);
-                                        self.rollback_contract_block_best_effort(hash);
-                                    }
-                                    // Best-effort: re-apply the old chain to restore the
-                                    // previous consistent state. If this also fails, the
-                                    // node is in an unrecoverable state and should restart
-                                    // with full UTXO rebuild.
-                                    for hash in rolled_back_old.iter().rev() {
-                                        if let Some(old_block) = self.block_store.get_block(hash) {
-                                            let _ = self.utxo_set.apply_block_dag_ordered(
-                                                &old_block.body.transactions,
-                                                old_block.header.height,
-                                                hash,
-                                            );
-                                            // Re-execute contracts for the old block to restore state
-                                            let (_, _, _, env) = self
-                                                .execute_contract_transactions(
-                                                    &old_block,
-                                                    &self.contract_storage,
-                                                );
-                                            if let Err(pe) = env.persist_with_undo(
-                                                &self.contract_storage,
-                                                hash,
-                                                None,
-                                                None,
-                                            ) {
-                                                slog_error!("node", "CRITICAL_contract_restore_failed",
-                                                    block => hash, error => &format!("{}", pe));
-                                            }
-                                        }
-                                    }
+                                    self.unwind_reorg_or_halt(
+                                        &applied_new,
+                                        &rolled_back_old,
+                                        "coinbase_mismatch",
+                                    );
                                     return Err(NodeError::BlockRejected(format!(
                                         "coinbase mismatch in {}: actual={}, expected={}",
                                         block_hash, actual_total, expected_total
@@ -1897,35 +1707,11 @@ impl FullNode {
                         // UTXO failed → rollback contract state too
                         slog_error!("node", "utxo_apply_failed",
                             block => block_hash, error => &format!("{}", e));
-                        // Rollback partially-applied new chain (UTXO + contract)
-                        for hash in applied_new.iter().rev() {
-                            let _ = self.utxo_set.rollback_block_undo(hash);
-                            self.rollback_contract_block_best_effort(hash);
-                        }
-                        // Best-effort: re-apply the old chain to restore the
-                        // previous consistent state. If this also fails, the
-                        // node is in an unrecoverable state and should restart
-                        // with full UTXO rebuild.
-                        for hash in rolled_back_old.iter().rev() {
-                            if let Some(old_block) = self.block_store.get_block(hash) {
-                                let _ = self.utxo_set.apply_block_dag_ordered(
-                                    &old_block.body.transactions,
-                                    old_block.header.height,
-                                    hash,
-                                );
-                                // Re-execute contracts for the old block to restore state
-                                let (_, _, _, env) = self.execute_contract_transactions(
-                                    &old_block,
-                                    &self.contract_storage,
-                                );
-                                if let Err(pe) =
-                                    env.persist_with_undo(&self.contract_storage, hash, None, None)
-                                {
-                                    slog_error!("node", "CRITICAL_contract_restore_failed",
-                                        block => hash, error => &format!("{}", pe));
-                                }
-                            }
-                        }
+                        self.unwind_reorg_or_halt(
+                            &applied_new,
+                            &rolled_back_old,
+                            "utxo_apply_failed",
+                        );
                         return Err(NodeError::BlockRejected(format!(
                             "apply_block_dag_ordered failed for {}: {}",
                             block_hash, e
@@ -1933,33 +1719,12 @@ impl FullNode {
                     }
                 }
             } else {
-                // Missing block in store — rollback partially-applied new chain (UTXO + contract)
-                for hash in applied_new.iter().rev() {
-                    let _ = self.utxo_set.rollback_block_undo(hash);
-                    self.rollback_contract_block_best_effort(hash);
-                }
-                // Best-effort: re-apply the old chain to restore the
-                // previous consistent state. If this also fails, the
-                // node is in an unrecoverable state and should restart
-                // with full UTXO rebuild.
-                for hash in rolled_back_old.iter().rev() {
-                    if let Some(old_block) = self.block_store.get_block(hash) {
-                        let _ = self.utxo_set.apply_block_dag_ordered(
-                            &old_block.body.transactions,
-                            old_block.header.height,
-                            hash,
-                        );
-                        // Re-execute contracts for the old block to restore state
-                        let (_, _, _, env) =
-                            self.execute_contract_transactions(&old_block, &self.contract_storage);
-                        if let Err(pe) =
-                            env.persist_with_undo(&self.contract_storage, hash, None, None)
-                        {
-                            slog_error!("node", "CRITICAL_contract_restore_failed",
-                                block => hash, error => &format!("{}", pe));
-                        }
-                    }
-                }
+                // Missing block in store — unwind this reorg fail-atomically.
+                self.unwind_reorg_or_halt(
+                    &applied_new,
+                    &rolled_back_old,
+                    "block_missing_during_virtual_chain_apply",
+                );
                 return Err(NodeError::BlockRejected(format!(
                     "block {} missing from store during virtual chain apply",
                     block_hash
@@ -1971,31 +1736,11 @@ impl FullNode {
         if !self.block_store.update_best_hash(&best_tip) {
             // Rollback everything we just applied — the tip cannot be
             // authoritative without a persisted best_hash pointer.
-            for hash in applied_new.iter().rev() {
-                let _ = self.utxo_set.rollback_block_undo(hash);
-                self.rollback_contract_block_best_effort(hash);
-            }
-            // Best-effort: re-apply the old chain to restore the
-            // previous consistent state. If this also fails, the
-            // node is in an unrecoverable state and should restart
-            // with full UTXO rebuild.
-            for hash in rolled_back_old.iter().rev() {
-                if let Some(old_block) = self.block_store.get_block(hash) {
-                    let _ = self.utxo_set.apply_block_dag_ordered(
-                        &old_block.body.transactions,
-                        old_block.header.height,
-                        hash,
-                    );
-                    // Re-execute contracts for the old block to restore state
-                    let (_, _, _, env) =
-                        self.execute_contract_transactions(&old_block, &self.contract_storage);
-                    if let Err(pe) = env.persist_with_undo(&self.contract_storage, hash, None, None)
-                    {
-                        slog_error!("node", "CRITICAL_contract_restore_failed",
-                            block => hash, error => &format!("{}", pe));
-                    }
-                }
-            }
+            self.unwind_reorg_or_halt(
+                &applied_new,
+                &rolled_back_old,
+                "best_hash_persist_failed",
+            );
             return Err(NodeError::Consensus(ConsensusError::BlockValidation(
                 format!("failed to persist best_hash for tip {}", best_tip),
             )));
@@ -2125,10 +1870,86 @@ impl FullNode {
         Ok(())
     }
 
-    fn rollback_contract_block_best_effort(&self, block_hash: &str) {
+    /// Roll back a block's contract state, logging on failure. Returns `false`
+    /// if the rollback FAILED. Consensus-recovery callers MUST treat `false` as
+    /// a failed restore (see `unwind_reorg_or_halt`) — silently discarding it is
+    /// what let a failed rollback leave indeterminate state (external audit M4).
+    fn rollback_contract_block_best_effort(&self, block_hash: &str) -> bool {
         if let Err(e) = self.rollback_contract_block(block_hash) {
             slog_error!("node", "CRITICAL_contract_rollback_failed",
                 block => block_hash, error => &format!("{}", e));
+            return false;
+        }
+        true
+    }
+
+    /// FAIL-ATOMIC reorg unwind — the ONE recovery path for every reorg-failure
+    /// site in `recompute_virtual_chain` (external audit M4).
+    ///
+    /// Undoes every block this reorg applied, then restores the chain that was
+    /// rolled back to make room for it. If ANY step fails — a UTXO rollback, a
+    /// contract rollback, a MISSING old block body, an old-chain re-apply, or a
+    /// contract re-persist — then committed state represents NEITHER the old nor
+    /// the new chain. That is unrecoverable in-process, and continuing would
+    /// serve and relay corrupt consensus state, so we HALT. A restart runs the
+    /// verified rebuild/replay from the durable BlockStore.
+    ///
+    /// Do NOT hand-roll a best-effort variant of this: seven such copies existed,
+    /// each discarding results and returning `Err` without halting, which is
+    /// exactly the silent-corruption path this function exists to remove.
+    fn unwind_reorg_or_halt(&self, applied_new: &[String], rolled_back_old: &[String], reason: &str) {
+        let mut restore_failed = false;
+
+        // 1) Undo everything this reorg applied, newest first.
+        for hash in applied_new.iter().rev() {
+            if self.utxo_set.rollback_block_undo(hash).is_err() {
+                slog_error!("node", "reorg_unwind_utxo_rollback_failed", block => hash);
+                restore_failed = true;
+            }
+            if !self.rollback_contract_block_best_effort(hash) {
+                restore_failed = true;
+            }
+        }
+
+        // 2) Restore the previously-applied chain, oldest-first order preserved.
+        for hash in rolled_back_old.iter().rev() {
+            match self.block_store.get_block(hash) {
+                Some(old_block) => {
+                    if self
+                        .utxo_set
+                        .apply_block_dag_ordered(
+                            &old_block.body.transactions,
+                            old_block.header.height,
+                            hash,
+                        )
+                        .is_err()
+                    {
+                        slog_error!("node", "reorg_unwind_old_chain_reapply_failed", block => hash);
+                        restore_failed = true;
+                    }
+                    let (_, _, _, env) =
+                        self.execute_contract_transactions(&old_block, &self.contract_storage);
+                    if let Err(pe) =
+                        env.persist_with_undo(&self.contract_storage, hash, None, None)
+                    {
+                        slog_error!("node", "CRITICAL_contract_restore_failed",
+                            block => hash, error => &format!("{}", pe));
+                        restore_failed = true;
+                    }
+                }
+                None => {
+                    // These blocks were applied moments ago and sit far inside the
+                    // reorg window, so a missing body means real store corruption,
+                    // not pruning. The old chain cannot be reconstructed.
+                    slog_error!("node", "reorg_unwind_old_block_missing", block => hash);
+                    restore_failed = true;
+                }
+            }
+        }
+
+        if restore_failed {
+            slog_error!("node", "FATAL_reorg_restore_failed_halting", reason => reason);
+            std::process::exit(1);
         }
     }
 
