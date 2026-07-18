@@ -13,6 +13,17 @@ Testnet ports: **P2P 19333** (public), **RPC 19332** (localhost only), explorer
 
 ---
 
+> **KNOWN BLOCKER (verified live 2026-07-18 at RC1-AUDIT-FREEZE / `ad157eb`):**
+> this E2E currently **cannot pass Phase 6**. `shield` works and the A→B send is
+> accepted to the mempool, but the confidential tx is **never selected into a
+> block**, so the recipient never receives it. Cause:
+> `select_transactions_for_block` requires every input's outpoint to satisfy
+> `utxo_set.exists()`, while a confidential input carries the placeholder
+> `txid = "0".repeat(64)`. Making confidential txs minable is a **consensus
+> change on the RingCT path** — it is frozen and reserved for the mandatory
+> external review (question 14 in `docs/EXTERNAL_AUDIT_PACKAGE.md`). Expect
+> `FAIL: B did NOT detect the confidential output` until that lands.
+
 ## Phase 0 — Consensus warning & no DB wipe
 
 - **Coordinated upgrade is mandatory.** Enabling confidential txs on the
@@ -86,9 +97,13 @@ shadowdag-miner --network=testnet --address=<A_ST1_transparent> --threads=2 --rp
 
 ## Phase 4 — Bootstrap the confidential pool (decoys) via `shield`
 
-A confidential send needs at least `MIN_RING_SIZE` (4) on-chain confidential
-outputs as decoys. From wallet A, run several `shield` ops to A's own
-confidential address and wait for them to be mined.
+A confidential send needs **at least `DEFAULT_RING_SIZE` (11)** on-chain
+confidential outputs — the wallet builds rings of 11 and `select_decoys` needs
+10 decoys *distinct from* the real input. (`MIN_RING_SIZE` = 4 is only the
+consensus floor, **not** what the wallet asks for; targeting 4–8 fails with
+`[Wallet] not enough decoys on-chain yet`.) Aim for ~14 to keep a margin. From
+wallet A, run several `shield` ops to A's own confidential address and wait for
+them to be mined.
 
 ```bash
 export SHADOWDAG_RPC=127.0.0.1:19332

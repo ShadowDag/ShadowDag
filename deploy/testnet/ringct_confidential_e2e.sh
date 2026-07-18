@@ -40,8 +40,14 @@ DOCKER_CONTAINER="${DOCKER_CONTAINER:-}"            # `docker exec <c> cat /data
 
 SHIELD_AMOUNT="${SHIELD_AMOUNT:-50}"   # SDAG per shield (bootstrap)
 SEND_AMOUNT="${SEND_AMOUNT:-10}"       # SDAG for the A->B confidential send
-DECOY_TARGET="${DECOY_TARGET:-8}"      # min confidential outputs on-chain before sending (ring floor is 4)
-MAX_SHIELDS="${MAX_SHIELDS:-8}"        # cap on bootstrap shields
+# The wallet builds rings of CONF_RING_SIZE = DEFAULT_RING_SIZE = 11
+# (ring_signature.rs), and select_decoys needs RING_SIZE-1 = 10 decoys DISTINCT
+# from the real input — so the chain needs >= 11 confidential outputs before a
+# send can even be built, not the ring FLOOR of 4. A lower target makes the
+# script fail its own Phase 5 with "[Wallet] not enough decoys on-chain yet"
+# (this default was 8 and did exactly that). Keep a margin above 11.
+DECOY_TARGET="${DECOY_TARGET:-14}"     # min confidential outputs on-chain before sending (must exceed ring size 11)
+MAX_SHIELDS="${MAX_SHIELDS:-16}"       # cap on bootstrap shields (must allow reaching DECOY_TARGET)
 CONFIRM_BLOCKS="${CONFIRM_BLOCKS:-3}"  # blocks to wait for a tx to be mined
 POLL_TIMEOUT="${POLL_TIMEOUT:-240}"    # seconds to wait for an on-chain change
 POLL_INTERVAL="${POLL_INTERVAL:-5}"    # seconds between polls
