@@ -209,13 +209,19 @@ impl PowValidator {
     /// `header.hash` to the header content (anti-spoof). NOTE: for UmbraHash this
     /// generates/uses the epoch cache (memoized) + one hashimoto_light.
     pub fn recompute_identity_hash(header: &BlockHeader) -> String {
-        // Activation floor (mirrors PowValidator::validate, external audit C5):
-        // once UmbraHash is mandatory at this height, a legacy
-        // (version < UMBRA_POW_VERSION) header must NOT be treated as valid on the
-        // cheap anti-spoof paths either (relay orphan admission, sync header
-        // verify, light-node validate). Without this, those header-only paths
-        // would keep accepting downgraded ShadowHash headers after the fork. The
-        // empty sentinel makes every `recomputed == header.hash` caller reject it.
+        // Activation floor — ⚠️ CURRENTLY INERT ON EVERY NETWORK. It gates on the
+        // NETWORK-BLIND `umbra_required_at`, which reads `UMBRA_ACTIVATION_HEIGHT`
+        // = `None` (umbrahash.rs), so this branch NEVER fires. The authoritative
+        // per-network rule is `umbra_required_at_for` / `validate_for_network`,
+        // which this function does not have a `NetworkMode` to consult.
+        //
+        // CONSEQUENCE (open finding, disclosed to the external audit): the cheap
+        // anti-spoof paths — relay orphan admission, sync header verify, light-node
+        // validate — do NOT enforce the mainnet UmbraHash fork. After mainnet
+        // height 1 they may still accept a downgraded v2 ShadowHash header that
+        // `validate_for_network` rejects. Do NOT cite this as Full/Sync/Light
+        // parity. Fix = thread `NetworkMode` into the header-only paths.
+        // The empty sentinel makes every `recomputed == header.hash` caller reject.
         if umbrahash::umbra_required_at(header.height)
             && header.version < umbrahash::UMBRA_POW_VERSION
         {

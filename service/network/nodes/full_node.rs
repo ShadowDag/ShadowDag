@@ -117,13 +117,21 @@ impl MiningTemplateState {
 /// M5 SHARED PARITY FUNCTION — the ONE derivation of a block's deferred state
 /// commitment, called identically by the template publisher (miner side) and the
 /// validator. Anchors on `ghostdag.select_parent(parents)` (the SAME rule the
-/// difficulty path uses), then binds that selected parent's stored post-execution
-/// roots. Genesis / no-parent selection -> `genesis_prev_state_commitment()`.
+/// difficulty path uses) and binds that selected parent's IDENTITY ONLY.
+/// Genesis / no-parent selection -> `genesis_prev_state_commitment()`.
+///
+/// SCOPE — read this before citing M5 as a state commitment: the parent's
+/// `utxo_commitment` / `state_root` / `receipt_root` are NOT bound. They are
+/// passed as canonical `None` (reserved format slots) for the reason spelled out
+/// at the call below, so this does NOT yet make the parent's post-execution state
+/// a consensus commitment. `state_root` / `receipt_root` are still written into
+/// the stored block AFTER execution, outside the PoW hash. Binding them for real
+/// is future work and needs deterministic, pre-mine-populated roots.
 ///
 /// A block with these `parents` MUST carry exactly this value in
 /// `header.prev_state_commitment`; the validator rejects any mismatch and PoW
 /// covers it (it is in the preimage). Because both sides run this function over
-/// the same `select_parent(parents)` and read the same stored roots, they agree.
+/// the same `select_parent(parents)`, they agree.
 pub fn expected_prev_state_commitment(
     parents: &[String],
     ghostdag: &GhostDag,
@@ -809,12 +817,14 @@ impl FullNode {
         }
 
         // M5 DEFERRED-VERIFY: the block's prev_state_commitment MUST equal the
-        // value derived from its SELECTED PARENT's stored post-execution roots via
-        // the SAME shared fn the template publisher used (parents are present +
-        // in GHOSTDAG here, so select_parent is defined). PoW already binds the
-        // committed value into the hash (a tampered value fails PoW); this check
-        // additionally rejects a self-consistent block that committed to a WRONG
-        // parent state. Non-genesis only (genesis carries its own constant).
+        // value derived from its SELECTED PARENT's IDENTITY via the SAME shared fn
+        // the template publisher used (parents are present + in GHOSTDAG here, so
+        // select_parent is defined). NOTE: this does NOT verify the parent's
+        // post-execution roots — they are not bound; see
+        // expected_prev_state_commitment. PoW already binds the committed value
+        // into the hash (a tampered value fails PoW); this check additionally
+        // rejects a self-consistent block that committed to the WRONG parent.
+        // Non-genesis only (genesis carries its own constant).
         if block.header.height > 0 {
             let expected = expected_prev_state_commitment(
                 &block.header.parents,

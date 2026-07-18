@@ -1,6 +1,28 @@
-# M5 — Deferred State Commitment (bind parent post-state into the PoW preimage)
+# M5 — Deferred Prev-State Commitment (originally: bind parent post-state into the PoW preimage)
 
-**Status:** design approved (user chose BIND → Deferred mechanism, 2026-07-16). Pre-freeze, pre-genesis.
+**Status:** design approved 2026-07-16 — **but SHIPPED IN REDUCED FORM.** Read this before citing anything below.
+
+> ⚠️ **WHAT ACTUALLY SHIPPED (as of `ad157eb`) DIFFERS FROM THIS DESIGN.**
+> The implementation binds **only the GHOSTDAG selected parent's IDENTITY**. It passes canonical `None` for
+> `parent.utxo_commitment`, `parent.state_root` and `parent.receipt_root`
+> (`expected_prev_state_commitment` → `compute_prev_state_commitment(&sp, None, None, None)`).
+>
+> **Why the change:** binding those roots is unsafe today. `state_root` / `receipt_root` are populated
+> post-execution, only for executed contract blocks, and are written into the stored block after it is hashed —
+> so they are path-dependent. The deferred verify runs *before* the parent's roots are recomputed, so a side node
+> could read different values than the miner and reject a block the miner considers valid: a consensus split.
+> `utxo_commitment` is not deterministically populated either. The root slots remain in the commitment FORMAT so a
+> future upgrade can bind real roots without a domain-tag change.
+>
+> **Therefore the core goal of this document is NOT met.** Sections below that say a block commits to "the
+> already-computed post-state of its selected parent", that this-block roots become "TRANSITIVELY committed by the
+> CHILD", or that the miner computes the commitment "from the SELECTED PARENT's stored roots", describe the
+> DESIGN INTENT, not the shipped behaviour. A block's own post-execution state is still **not** committed by its
+> child. Closing that gap requires deterministic, pre-mine-populated roots and is future work.
+>
+> What the shipped change *does* deliver: the header field, the versioned `ShadowDAG_Block_v2` domain, the single
+> shared miner/validator derivation, the deferred verify on both accept paths, and the end-to-end wiring — i.e. the
+> mechanism, ready for real roots to be plugged in later.
 
 ## Problem
 `state_root` / `receipt_root` / `utxo_commitment` (and `selected_parent` / `blue_score`) live in the header but are NOT in

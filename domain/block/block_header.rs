@@ -52,12 +52,16 @@ pub struct BlockHeader {
     #[serde(default)]
     pub mix_hash: String,
 
-    /// M5 DEFERRED STATE COMMITMENT (64-hex SHA3-256). Binds, into THIS block's
-    /// PoW preimage, the already-computed post-state of its selected parent
-    /// (selected_parent + parent.utxo_commitment/state_root/receipt_root, via
-    /// `shadowhash::compute_prev_state_commitment`). This makes the parent's
-    /// state a real consensus commitment (a block's own post-state is committed
-    /// by its child — "1 block behind"). `None` only for pre-M5 blocks; genesis
+    /// M5 DEFERRED PREV-STATE COMMITMENT (64-hex SHA3-256). Binds, into THIS
+    /// block's PoW preimage, the IDENTITY of its GHOSTDAG selected parent, via
+    /// `shadowhash::compute_prev_state_commitment` (see
+    /// `expected_prev_state_commitment` for the single shared derivation).
+    ///
+    /// NOT a state commitment yet: the parent's `utxo_commitment` / `state_root` /
+    /// `receipt_root` are passed as canonical `None` (reserved slots), because
+    /// those roots are path-dependent and written post-execution, so binding them
+    /// would diverge across nodes. A block's post-execution state is therefore
+    /// still NOT committed by its child. `None` only for pre-M5 blocks; genesis
     /// carries `genesis_prev_state_commitment()`.
     #[serde(default)]
     pub prev_state_commitment: Option<String>,

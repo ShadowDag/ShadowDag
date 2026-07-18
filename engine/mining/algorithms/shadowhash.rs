@@ -191,12 +191,18 @@ fn enc_opt_root(buf: &mut Vec<u8>, root: Option<&str>) {
     }
 }
 
-/// M5 DEFERRED STATE COMMITMENT: SHA3-256 over the selected parent's identity and
-/// its post-execution roots. A block binds THIS value in its PoW preimage, so the
-/// block hash commits to the state it builds on (the parent's post-state). All
-/// nodes derive it identically from the parent's stored roots; a forged value
-/// fails BOTH the deferred verify (compare vs the parent's stored roots) and PoW
-/// (it is inside the preimage). Domain-separated + versioned to avoid ambiguity.
+/// M5 DEFERRED PREV-STATE COMMITMENT (encoding primitive): SHA3-256 over the
+/// selected parent's identity plus three OPTIONAL root slots, domain-separated and
+/// versioned. A block binds the resulting value in its PoW preimage, and the
+/// validator re-derives it, so a forged value fails both the deferred verify and
+/// PoW.
+///
+/// WHAT CALLERS ACTUALLY PASS TODAY: every production caller passes `None` for all
+/// three root slots (see `expected_prev_state_commitment`), so the committed value
+/// currently binds ONLY the selected-parent identity. The root parameters exist so
+/// a future upgrade can bind real, deterministic roots WITHOUT changing the domain
+/// tag — they are reserved, not in use. Do not describe this as committing to the
+/// parent's post-execution state until a caller actually supplies those roots.
 pub fn compute_prev_state_commitment(
     selected_parent: &str,
     parent_utxo_commitment: Option<&str>,
@@ -452,7 +458,9 @@ mod tests {
         // M5 stage-1b KAT: the deferred commitment is part of the PoW preimage, so
         // a 1-byte change in prev_state_commitment (or None vs Some) yields a
         // DIFFERENT ShadowHash AND a different UmbraHash header_hash — the block
-        // hash commits to the parent's post-state. BOTH preimages must react.
+        // hash commits to whatever the commitment encodes. BOTH preimages must
+        // react. (What it encodes today is the selected-parent identity only, not
+        // the parent's post-state — see compute_prev_state_commitment.)
         let parents = vec!["a".repeat(64)];
         let mr = "cd".repeat(32);
         let c1 = "11".repeat(32);
