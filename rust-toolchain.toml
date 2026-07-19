@@ -3,15 +3,22 @@
 # reviewer has to compile the same artifact that was tested and tagged, and
 # CI must not silently change compilers underneath a release candidate.
 #
-# Until 2026-07-20 CI tracked whatever "stable" happened to be that day, so a
-# tree that was clippy-clean on the developer toolchain failed the gate on a
-# newer one. That is a reproducibility defect, not a code defect: the 30 lints
-# it surfaced are all stylistic (sort_by_key, redundant & in format! args,
-# checked_div, byte-string literals, ? rewrites) with no semantic content.
-# They are tracked and land AFTER the external audit closes, together with the
-# cargo fmt pass, so the pre-audit diff stays readable.
+# Until 2026-07-20 CI tracked whatever "stable" happened to be that day — by
+# then 1.97.1 — so a tree that was clippy-clean on the developer toolchain
+# failed the gate on a compiler four minor versions newer. That is a
+# reproducibility defect, not a code defect: the 30 lints it surfaced are all
+# stylistic (sort_by_key, redundant & in format! args, checked_div, byte-string
+# literals, ? rewrites) with no semantic content.
 #
-# To move this pin: bump the version, run the full suite plus clippy locally,
-# and land the resulting lint fixes in the SAME commit.
+# 1.93.1 is chosen because it is the compiler that actually built the binaries
+# under test: the release artifacts live-verified on the 3-node testnet fleet
+# past 66k blocks were produced by it. Switching compilers before the external
+# audit would discard that evidence, so the pin stays and the gap is disclosed.
+# It is a real tradeoff — this toolchain is ~5 months behind and misses any
+# soundness or codegen fix landed since.
+#
+# AFTER the external audit closes: bump to current stable, run the full suite
+# plus clippy locally, and land the resulting lint fixes and the cargo fmt pass
+# in that same commit.
 channel = "1.93.1"
 components = ["clippy", "rustfmt"]

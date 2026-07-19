@@ -28,8 +28,9 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: "1.93.1"
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
@@ -39,7 +40,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.93.1"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
 
@@ -48,7 +51,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.93.1"
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --lib --bins
 
@@ -57,7 +62,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.93.1"
       - uses: Swatinem/rust-cache@v2
       # The integration suite lives in tests/suite/*.rs, wired into the crate via
       # `#[cfg(test)] pub mod tests` (root tests.rs), so it runs under --lib in
@@ -75,7 +82,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.93.1"
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --lib -- execution_env v1_spec contract_e2e receipt_index multi_node soak chaos invariant_checker observability
 
@@ -84,8 +93,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Must name the version explicitly. This action exports RUSTUP_TOOLCHAIN,
+      # and an env var outranks rust-toolchain.toml in rustup's precedence, so
+      # an @stable ref silently ran clippy under 1.97.1 while the toolchain file
+      # was installed but ignored.
+      - uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: "1.93.1"
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
@@ -95,7 +109,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.93.1"
       - uses: Swatinem/rust-cache@v2
       # Scan Cargo.lock against the RustSec advisory DB. A money-handling node
       # MUST NOT ship a dependency with a published vulnerability, so a real
@@ -119,7 +135,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.93.1"
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --bin shadowasm
       # printf (not echo) so the newline is interpreted into a real two-line
