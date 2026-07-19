@@ -1916,7 +1916,22 @@ impl FullNode {
 
         // 2) Restore the previously-applied chain, oldest-first order preserved.
         for hash in rolled_back_old.iter().rev() {
-            match self.block_store.get_block(hash) {
+            // STRICT read: `get_block` returns None for an absent key, a corrupt
+            // value AND a transient RocksDB read error alike. Treating all three
+            // as "body missing" would let a passing I/O blip trip the halt below.
+            // We still cannot restore without the body either way, but the
+            // distinction is recorded so an operator can tell a failing disk from
+            // real corruption.
+            let read = match self.block_store.get_block_strict(hash) {
+                Ok(v) => v,
+                Err(e) => {
+                    slog_error!("node", "reorg_unwind_old_block_read_failed",
+                        block => hash, error => &format!("{}", e));
+                    restore_failed = true;
+                    continue;
+                }
+            };
+            match read {
                 Some(old_block) => {
                     if self
                         .utxo_set
@@ -1952,6 +1967,14 @@ impl FullNode {
 
         if restore_failed {
             slog_error!("node", "FATAL_reorg_restore_failed_halting", reason => reason);
+            // FLUSH BEFORE DYING. `std::process::exit` runs no destructors, so it
+            // skips both the daemon's graceful-shutdown flush and its periodic
+            // checkpoint. Halting to protect the store while leaving memtables
+            // unflushed would make this an UNCLEAN stop — the documented cause of
+            // a previous empty-UTXO-on-restart crash loop — i.e. the halt would
+            // inflict the corruption it exists to prevent. Persist what is
+            // committed, THEN stop.
+            self.block_store.flush();
             std::process::exit(1);
         }
     }
