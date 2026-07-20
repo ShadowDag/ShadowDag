@@ -101,6 +101,11 @@ impl DiskMonitor {
             unsafe {
                 let mut stat: libc::statvfs = std::mem::zeroed();
                 if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+                    // Widths are target-dependent: both fields are u64 on
+                    // linux-x86_64, but 32-bit unix targets define them as u32,
+                    // where dropping the casts would multiply in 32-bit and
+                    // overflow on volumes past 4 GiB.
+                    #[allow(clippy::unnecessary_cast)]
                     return Some(stat.f_bavail as u64 * stat.f_frsize as u64);
                 }
             }
