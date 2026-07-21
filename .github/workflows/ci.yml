@@ -20,11 +20,11 @@ jobs:
     name: Rustfmt (advisory)
     runs-on: ubuntu-latest
     # NON-BLOCKING, deliberately. Because the workflow file was invalid for weeks
-    # this gate never ran, and the tree has since drifted to ~361 unformatted
-    # files. Reformatting them now would bury the pre-audit diff under whitespace
-    # across consensus code, which is exactly what an external reviewer must be
-    # able to read. The result is still reported; make it blocking and land the
-    # reformat AFTER the external audit closes.
+    # this gate never ran, and the tree has since drifted to 362 rustfmt hunks
+    # across 65 files. Reformatting them now would bury the pre-audit diff under
+    # whitespace across consensus code, which is exactly what an external
+    # reviewer must be able to read. The result is still reported; make it
+    # blocking and land the reformat AFTER the external audit closes.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -119,8 +119,9 @@ jobs:
       #
       # --deny warnings was removed on 2026-07-20. It also failed the build on
       # "unmaintained", which no code change here can clear: the tree carries
-      # eight gtk-rs GTK3 crates (wallet UI only, not consensus), fxhash, and —
-      # the one that matters — bincode, which is the consensus serialization.
+      # the gtk-rs GTK3 stack (8 distinct RUSTSEC advisories; these reach the
+      # released node too, since release.yml builds it with --features desktop),
+      # fxhash, and — the one that matters — bincode, the consensus serialization.
       # Bumping a serialization crate can move the wire format, so it is frozen
       # until the external audit closes and is disclosed in the audit package
       # instead. Warnings are still printed in full; they are just not a gate

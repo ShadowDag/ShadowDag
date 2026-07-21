@@ -10,12 +10,15 @@
 # stylistic (sort_by_key, redundant & in format! args, checked_div, byte-string
 # literals, ? rewrites) with no semantic content.
 #
-# 1.93.1 is chosen because it is the compiler that actually built the binaries
-# under test: the release artifacts live-verified on the 3-node testnet fleet
-# past 66k blocks were produced by it. Switching compilers before the external
-# audit would discard that evidence, so the pin stays and the gap is disclosed.
-# It is a real tradeoff — this toolchain is ~5 months behind and misses any
-# soundness or codegen fix landed since.
+# 1.93.1 is the developer/CI reference compiler: the toolchain the pre-audit
+# tree is known clippy- and test-clean on. It is NOT the compiler that built
+# the live fleet — the Docker builder uses `FROM rust:1-slim-bookworm` (an
+# unpinned 1.x) and predates this file, and release.yml likewise curl-installs
+# an unpinned stable. Pinning here makes CI reproducible going forward and gives
+# the auditor one named compiler to reproduce against; it does not retroactively
+# describe the binaries already running on the fleet. It is a real tradeoff —
+# this toolchain is ~5 months behind and misses any soundness or codegen fix
+# landed since; bumping it is a post-audit task.
 #
 # AFTER the external audit closes: bump to current stable, run the full suite
 # plus clippy locally, and land the resulting lint fixes and the cargo fmt pass
