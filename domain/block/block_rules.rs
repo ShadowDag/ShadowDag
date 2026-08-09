@@ -11,9 +11,10 @@ use crate::domain::block::merkle_tree::MerkleTree;
 use crate::domain::traits::pow_checker::PowChecker;
 use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
 
-/// Maximum future timestamp drift (consensus: 120 seconds).
-/// Canonical value defined in block_validator::MAX_FUTURE_SECS.
-const MAX_FUTURE_TIME_SECS: u64 = 120;
+/// Maximum future timestamp drift, in MILLISECONDS (consensus: 120 s of real
+/// time). Timestamps are unix epoch ms. Canonical value: ConsensusParams::MAX_FUTURE_MS.
+const MAX_FUTURE_TIME_MS: u64 =
+    crate::config::consensus::consensus_params::ConsensusParams::MAX_FUTURE_MS;
 
 pub struct BlockRules;
 
@@ -35,12 +36,12 @@ impl BlockRules {
         {
             return false;
         }
-        // Reject blocks with timestamps too far in the future
+        // Reject blocks with timestamps too far in the future (ms vs ms).
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
-        if block.header.timestamp > now + MAX_FUTURE_TIME_SECS {
+            .as_millis() as u64;
+        if block.header.timestamp > now + MAX_FUTURE_TIME_MS {
             return false;
         }
 
@@ -54,6 +55,7 @@ impl BlockRules {
             block.header.difficulty,
             &block.header.merkle_root,
             &block.header.parents,
+            block.header.prev_state_commitment.as_deref(),
         );
         if computed != block.header.hash {
             return false; // Hash doesn't match header content

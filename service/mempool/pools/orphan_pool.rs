@@ -4,7 +4,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::domain::transaction::transaction::Transaction;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const MAX_ORPHAN_AGE: u64 = 100;
 
@@ -106,6 +106,7 @@ impl OrphanPool {
             .filter(|(_, &age)| current_height.saturating_sub(age) > MAX_ORPHAN_AGE)
             .map(|(k, _)| k.clone())
             .collect();
+        let old_txid_set: HashSet<&str> = old_txids.iter().map(String::as_str).collect();
 
         for txid in &old_txids {
             self.age_map.remove(txid);
@@ -120,7 +121,7 @@ impl OrphanPool {
         }
 
         self.orphans.retain(|_, txs| {
-            txs.retain(|tx| !old_txids.contains(&tx.hash));
+            txs.retain(|tx| !old_txid_set.contains(tx.hash.as_str()));
             !txs.is_empty()
         });
     }
@@ -149,6 +150,10 @@ mod tests {
                     pub_key: String::new(),
                     key_image: None,
                     ring_members: None,
+                    ring_signature: None,
+                    ring_commitments: None,
+                    pseudo_commitment: None,
+                    shield_blinding: None,
                 })
                 .collect(),
             outputs: vec![TxOutput {
@@ -157,6 +162,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee: 10,
             timestamp: 1000,

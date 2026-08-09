@@ -3,6 +3,7 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use rand::rngs::OsRng;
 use rand::seq::SliceRandom;
 use rand::Rng;
 
@@ -46,7 +47,7 @@ pub struct Ring {
 
 impl Ring {
     pub fn generate(real_tx: Transaction, pool: &[Transaction], ring_size: usize) -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = OsRng;
 
         let actual_size = ring_size.max(1).min(pool.len() + 1);
         let mut members = Vec::with_capacity(actual_size);
@@ -107,6 +108,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee: 1,
             timestamp: 1735689600,

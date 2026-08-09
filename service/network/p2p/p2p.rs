@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -71,8 +71,14 @@ static PEER_PENDING: Lazy<Arc<PlMutex<HashMap<String, (u32, u32)>>>> =
 
 /// Max pending TXs allowed from a single peer before dropping.
 const MAX_PENDING_TXS_PER_PEER: u32 = 500;
-/// Max pending blocks allowed from a single peer before dropping.
-const MAX_PENDING_BLOCKS_PER_PEER: u32 = 50;
+/// Max pending blocks allowed from a single peer before dropping. Sized to hold
+/// a full served header range (512) so a catching-up node can buffer a whole
+/// GetBlock burst from its sync peer without dropping (and re-requesting) most
+/// of it — the drop-and-refetch churn was the dominant IBD throughput limiter.
+const MAX_PENDING_BLOCKS_PER_PEER: u32 = 512;
+/// Global hard caps for pending inbound queues (all peers combined).
+const MAX_PENDING_TX_QUEUE: usize = 10_000;
+const MAX_PENDING_BLOCK_QUEUE: usize = 4_096;
 const MAX_OUTBOUND_LAG_SEQS: u64 = 5_000;
 /// Bytes per peer per minute — disconnect abusive peers (100MB/min).
 const MAX_BYTES_PER_PEER_PER_MIN: u64 = 100 * 1024 * 1024;
@@ -95,6 +101,64 @@ static OUTBOUND_MSGS: Lazy<Arc<PlMutex<(u64, Vec<(u64, P2PMessage)>)>>> =
 static TARGETED_MSGS: Lazy<Arc<PlMutex<Vec<(String, P2PMessage)>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(64))));
 
+/// Block-serve requests from peers: (requesting_peer_id, block_hash). Filled by
+/// the GetBlock/GetData handlers (which lack block_store access) and drained by
+/// the daemon event loop, which looks the block up and replies to that peer.
+/// Without this, GetBlock is a no-op and peers can never download missing
+/// ancestors — so forked nodes never converge.
+#[allow(clippy::type_complexity)]
+static PENDING_BLOCK_REQUESTS: Lazy<Arc<PlMutex<Vec<(String, String)>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(256))));
+const MAX_BLOCK_REQUEST_QUEUE: usize = 5_000;
+
+/// Orphan blocks: received blocks whose parent is not yet known, buffered for
+/// reprocessing once the missing ancestor arrives. (peer_id, block). Bounded.
+#[allow(clippy::type_complexity)]
+static ORPHAN_BLOCKS: Lazy<Arc<PlMutex<Vec<(String, Block)>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(256))));
+const MAX_ORPHAN_BLOCKS: usize = 5_000;
+
+/// Header-serve requests: (peer_id, from_hash, count). The GetHeaders handler
+/// queues these; the daemon walks the chain FORWARD from from_hash and returns
+/// a batch of block hashes so a behind/forked peer can bulk-download and catch
+/// up (the sequential orphan-walk alone is too slow for a fast chain).
+#[allow(clippy::type_complexity)]
+static PENDING_HEADER_REQUESTS: Lazy<Arc<PlMutex<Vec<(String, String, u32)>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(64))));
+const MAX_HEADER_REQUEST_QUEUE: usize = 2_000;
+
+/// Target addresses (host:p2p_port) with a live OUTBOUND connection. Prevents
+/// duplicate dials and drives auto-reconnect: the maintenance loop re-dials any
+/// known peer not in this set, so a node recovers from restarts, timeouts, and
+/// network blips instead of staying isolated until its own restart.
+static CONNECTED_OUTBOUND: Lazy<Arc<PlMutex<HashSet<String>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(HashSet::new())));
+
+/// Last outbound dial time per target addr. The reconnect loop uses it to
+/// enforce a minimum interval between dials of the same peer, so a peer that
+/// keeps dropping (a banned peer, or the node's own IP self-connecting) is not
+/// hammered — which otherwise trips the DoS guard and bans everyone.
+static LAST_DIAL: Lazy<Arc<PlMutex<HashMap<String, Instant>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(HashMap::new())));
+const MIN_REDIAL_INTERVAL_SECS: u64 = 30;
+
+/// IPs discovered to be OURSELVES (a Version echoing our identity nonce). Once
+/// an address is here, the dial loop never targets it again — this stops a node
+/// from endlessly re-connecting to its own IP (which is in the seed list) and
+/// frees those attempts to reach real peers.
+static SELF_ADDRS: Lazy<Arc<PlMutex<HashSet<String>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(HashSet::new())));
+
+/// Record a peer address whose IP is ourselves, so we stop dialing it.
+fn mark_self_addr(addr: &str) {
+    SELF_ADDRS.lock().insert(extract_ban_ip(addr));
+}
+
+/// True if this address's IP was previously identified as our own.
+fn is_self_addr(addr: &str) -> bool {
+    SELF_ADDRS.lock().contains(&extract_ban_ip(addr))
+}
+
 /// Per-peer last acknowledged outbound broadcast sequence.
 /// Used to safely prune only messages that all currently connected peers
 /// have already consumed.
@@ -105,6 +169,134 @@ static PEER_LAST_OUTBOUND: Lazy<Arc<PlMutex<HashMap<String, u64>>>> =
 /// and fed to PeerManager.
 static RECEIVED_ADDRS: Lazy<Arc<PlMutex<Vec<String>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(Vec::new())));
+
+/// Live inbound connection count per remote IP (anti-eclipse).
+///
+/// `PeerManager::conn_count_for_ip` only counts *stored* peer records, so it
+/// does not bound how many live inbound sockets a single host may open — a
+/// single IP/subnet could otherwise monopolize all inbound slots and eclipse
+/// the node. This map tracks currently-open inbound connections per IP and is
+/// enforced in `accept_loop` (reject over the cap) + released when the
+/// connection ends.
+static INBOUND_CONN_PER_IP: Lazy<Arc<PlMutex<HashMap<String, u32>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(HashMap::new())));
+
+/// Register one more inbound connection for `ip` and report whether the IP is
+/// still WITHIN `MAX_PEERS_PER_IP`. ALWAYS increments (pair with exactly one
+/// `release_inbound_ip`), so a caller that rejects on `false` can release
+/// immediately without desyncing the counter — and a whitelisted seed that
+/// bypasses the cap is still tracked and released symmetrically. This mirrors
+/// `register_inbound_subnet` so both anti-eclipse caps share one shape.
+fn register_inbound_ip(ip: &str) -> bool {
+    use crate::service::network::p2p::peer_manager::MAX_PEERS_PER_IP;
+    let mut map = INBOUND_CONN_PER_IP.lock();
+    let entry = map.entry(ip.to_string()).or_insert(0);
+    *entry += 1;
+    *entry <= MAX_PEERS_PER_IP
+}
+
+/// True if `addr` is a routable `host:port` SocketAddr suitable for the peer
+/// store. Rejects unparseable/garbage strings (which would otherwise bloat the
+/// peer DB unbounded) and loopback/unspecified/multicast addresses.
+fn is_routable_peer_addr(addr: &str) -> bool {
+    match addr.parse::<std::net::SocketAddr>() {
+        Ok(sa) => {
+            let ip = sa.ip();
+            !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()
+        }
+        Err(_) => false,
+    }
+}
+
+/// Release one live inbound connection for `ip` (call exactly once per
+/// `register_inbound_ip`).
+fn release_inbound_ip(ip: &str) {
+    let mut map = INBOUND_CONN_PER_IP.lock();
+    if let Some(c) = map.get_mut(ip) {
+        *c = c.saturating_sub(1);
+        if *c == 0 {
+            map.remove(ip);
+        }
+    }
+}
+
+/// Max concurrent inbound connections from a single /16 subnet (anti-eclipse).
+///
+/// The per-IP cap (MAX_PEERS_PER_IP) is bypassed by an attacker who controls a
+/// whole /16 range: each distinct IP passes the per-IP check, so one subnet can
+/// still fill every inbound slot and eclipse the node. Capping per /16 closes
+/// that while leaving room for a handful of honest hosts behind one ISP block.
+const MAX_INBOUND_PER_SUBNET: u32 = 8;
+
+/// Live inbound connection count per /16 subnet (anti-eclipse). Parallel to
+/// INBOUND_CONN_PER_IP but keyed on `subnet_16` so a single subnet cannot
+/// monopolize inbound slots using many distinct IPs.
+static INBOUND_CONN_PER_SUBNET: Lazy<Arc<PlMutex<HashMap<String, u32>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(HashMap::new())));
+
+/// Register one inbound connection for `ip`'s /16 subnet and report whether the
+/// subnet is still WITHIN `MAX_INBOUND_PER_SUBNET`. ALWAYS increments (pair with
+/// exactly one `release_inbound_subnet`), so a caller that rejects on `false`
+/// can release immediately without desyncing the counter — and a whitelisted
+/// peer that bypasses the cap is still tracked and released symmetrically.
+fn register_inbound_subnet(ip: &str) -> bool {
+    use crate::service::network::p2p::peer_diversity::subnet_16;
+    let subnet = subnet_16(ip);
+    let mut map = INBOUND_CONN_PER_SUBNET.lock();
+    let entry = map.entry(subnet).or_insert(0);
+    *entry += 1;
+    *entry <= MAX_INBOUND_PER_SUBNET
+}
+
+/// Release one live inbound connection for `ip`'s /16 subnet (call exactly once
+/// per successful `try_register_inbound_subnet`).
+fn release_inbound_subnet(ip: &str) {
+    use crate::service::network::p2p::peer_diversity::subnet_16;
+    let subnet = subnet_16(ip);
+    let mut map = INBOUND_CONN_PER_SUBNET.lock();
+    if let Some(c) = map.get_mut(&subnet) {
+        *c = c.saturating_sub(1);
+        if *c == 0 {
+            map.remove(&subnet);
+        }
+    }
+}
+
+/// Whether dialing `addr` would exceed the outbound /16-subnet diversity limit
+/// (MAX_PEERS_PER_SUBNET) among currently-connected OUTBOUND peers. Stateless:
+/// derived from the live CONNECTED_OUTBOUND set, so it needs no register/release
+/// bookkeeping. Anti-eclipse: outbound links must span distinct subnets, or an
+/// attacker owning one /16 can occupy every outbound slot and control the
+/// node's view of the chain.
+fn outbound_subnet_would_saturate(addr: &str) -> bool {
+    let set = CONNECTED_OUTBOUND.lock();
+    subnet_saturated_among(addr, set.iter())
+}
+
+/// Pure core of `outbound_subnet_would_saturate`: whether `addr`'s /16 already
+/// holds `MAX_PEERS_PER_SUBNET` of the given connected addresses.
+fn subnet_saturated_among<'a>(addr: &str, connected: impl Iterator<Item = &'a String>) -> bool {
+    use crate::service::network::p2p::peer_diversity::{subnet_16, MAX_PEERS_PER_SUBNET};
+    let subnet = subnet_16(addr);
+    let count = connected.filter(|a| subnet_16(a) == subnet).count();
+    count >= MAX_PEERS_PER_SUBNET
+}
+
+/// Deserialize untrusted wire bytes with a byte limit equal to the input
+/// length. Plain `bincode::deserialize` reads an inner collection's length
+/// prefix and may pre-allocate `Vec::with_capacity(len)` from it — a single
+/// (already size-capped) message could declare a huge inner length and trigger
+/// an OOM abort. Capping the limit at the buffer's own size makes any inner
+/// length larger than the buffer fail cleanly, and is wire-compatible with
+/// `bincode::serialize` (fixint encoding, reject trailing) — proven by the
+/// `bounded_deserialize_wire_compatible` test.
+fn bounded_deserialize<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::Error> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(bytes.len() as u64)
+        .deserialize(bytes)
+}
 
 /// Drain all pending transactions received by P2P (call from node main loop).
 /// Returns (peer_id, transaction) tuples for ban attribution.
@@ -143,9 +335,41 @@ pub fn drain_pending_blocks() -> Vec<(String, Block)> {
 /// Clean up global state for a disconnected peer.
 /// Removes targeted messages and pending counts to prevent resource leaks.
 pub fn cleanup_peer_state(peer_id: &str) {
+    // Remove pending inbound work attributed to this peer so disconnected
+    // peers cannot keep stale queue pressure.
+    {
+        let mut q = PENDING_TXS.lock();
+        let before = q.len();
+        q.retain(|(peer, _)| peer != peer_id);
+        let dropped = before.saturating_sub(q.len());
+        if dropped > 0 {
+            slog_warn!("p2p", "cleanup_dropped_pending_txs", peer => peer_id, dropped => dropped);
+        }
+    }
+    {
+        let mut q = PENDING_BLOCKS.lock();
+        let before = q.len();
+        q.retain(|(peer, _)| peer != peer_id);
+        let dropped = before.saturating_sub(q.len());
+        if dropped > 0 {
+            slog_warn!("p2p", "cleanup_dropped_pending_blocks", peer => peer_id, dropped => dropped);
+        }
+    }
     {
         let mut q = TARGETED_MSGS.lock();
         q.retain(|(target, _)| target != peer_id);
+    }
+    {
+        let mut q = PENDING_BLOCK_REQUESTS.lock();
+        q.retain(|(target, _)| target != peer_id);
+    }
+    {
+        let mut q = ORPHAN_BLOCKS.lock();
+        q.retain(|(source, _)| source != peer_id);
+    }
+    {
+        let mut q = PENDING_HEADER_REQUESTS.lock();
+        q.retain(|(target, _, _)| target != peer_id);
     }
     {
         let mut p = PEER_PENDING.lock();
@@ -163,6 +387,64 @@ pub fn drain_received_addrs() -> Vec<String> {
     std::mem::take(&mut *RECEIVED_ADDRS.lock())
 }
 
+/// Queue a peer's block-serve request. The GetBlock/GetData handlers call this;
+/// the daemon event loop drains it and serves the block from the BlockStore.
+pub fn push_block_request(peer_id: &str, hash: &str) {
+    let mut q = PENDING_BLOCK_REQUESTS.lock();
+    if q.len() < MAX_BLOCK_REQUEST_QUEUE {
+        q.push((peer_id.to_string(), hash.to_string()));
+    }
+}
+
+/// Drain queued block-serve requests (call from the node main loop).
+pub fn drain_block_requests() -> Vec<(String, String)> {
+    std::mem::take(&mut *PENDING_BLOCK_REQUESTS.lock())
+}
+
+/// Buffer an orphan block (parent not yet known) for reprocessing once the
+/// missing ancestor arrives. Deduplicated by hash; bounded (drops oldest).
+pub fn buffer_orphan(peer_id: &str, block: Block) {
+    let mut q = ORPHAN_BLOCKS.lock();
+    if q.iter().any(|(_, b)| b.header.hash == block.header.hash) {
+        return;
+    }
+    if q.len() >= MAX_ORPHAN_BLOCKS {
+        q.remove(0);
+    }
+    q.push((peer_id.to_string(), block));
+}
+
+/// Remove and return buffered orphans that list `parent_hash` among their
+/// parents. Called after a block is accepted: those orphans may now be
+/// processable (re-queue them; still-missing parents re-buffer + re-request).
+pub fn take_orphans_for_parent(parent_hash: &str) -> Vec<(String, Block)> {
+    let mut q = ORPHAN_BLOCKS.lock();
+    let mut ready = Vec::new();
+    q.retain(|(peer, b)| {
+        if b.header.parents.iter().any(|p| p == parent_hash) {
+            ready.push((peer.clone(), b.clone()));
+            false
+        } else {
+            true
+        }
+    });
+    ready
+}
+
+/// Queue a peer's GetHeaders request. The daemon walks the chain forward from
+/// `from_hash` and replies with a batch of block hashes for bulk catch-up.
+pub fn push_header_request(peer_id: &str, from_hash: &str, count: u32) {
+    let mut q = PENDING_HEADER_REQUESTS.lock();
+    if q.len() < MAX_HEADER_REQUEST_QUEUE {
+        q.push((peer_id.to_string(), from_hash.to_string(), count));
+    }
+}
+
+/// Drain queued header-serve requests (call from the node main loop).
+pub fn drain_header_requests() -> Vec<(String, String, u32)> {
+    std::mem::take(&mut *PENDING_HEADER_REQUESTS.lock())
+}
+
 /// Requeue excess blocks that couldn't be processed in this tick.
 /// Prepends them to the front of the queue so they're processed first next tick.
 /// Re-increments PEER_PENDING block counts that were decremented during drain.
@@ -174,12 +456,31 @@ pub fn requeue_pending_blocks(items: Vec<(String, Block)>) {
     }
     let mut q = PENDING_BLOCKS.lock();
     let mut counts = PEER_PENDING.lock();
-    // Restore per-peer pending counts that were decremented during drain
-    for (peer_id, _) in &items {
+
+    // Keep queue bounded even during requeue. Under load, new incoming items
+    // can arrive between drain and requeue; without this cap, requeue could
+    // temporarily exceed the global queue limit.
+    let available = MAX_PENDING_BLOCK_QUEUE.saturating_sub(q.len());
+    let mut dropped = 0usize;
+    let mut requeued: Vec<(String, Block)> = Vec::with_capacity(items.len().min(available));
+    for (peer_id, block) in items {
+        if requeued.len() >= available {
+            dropped = dropped.saturating_add(1);
+            continue;
+        }
         let entry = counts.entry(peer_id.clone()).or_insert((0, 0));
+        if entry.1 >= MAX_PENDING_BLOCKS_PER_PEER {
+            dropped = dropped.saturating_add(1);
+            continue;
+        }
         entry.1 = entry.1.saturating_add(1);
+        requeued.push((peer_id, block));
     }
-    let mut combined = items;
+    if dropped > 0 {
+        slog_warn!("p2p", "pending_block_requeue_dropped", dropped => dropped);
+    }
+
+    let mut combined = requeued;
     combined.extend(q.drain(..));
     *q = combined;
 }
@@ -194,12 +495,29 @@ pub fn requeue_pending_txs(items: Vec<(String, Transaction)>) {
     }
     let mut q = PENDING_TXS.lock();
     let mut counts = PEER_PENDING.lock();
-    // Restore per-peer pending counts that were decremented during drain
-    for (peer_id, _) in &items {
+
+    // Keep queue bounded even during requeue.
+    let available = MAX_PENDING_TX_QUEUE.saturating_sub(q.len());
+    let mut dropped = 0usize;
+    let mut requeued: Vec<(String, Transaction)> = Vec::with_capacity(items.len().min(available));
+    for (peer_id, tx) in items {
+        if requeued.len() >= available {
+            dropped = dropped.saturating_add(1);
+            continue;
+        }
         let entry = counts.entry(peer_id.clone()).or_insert((0, 0));
+        if entry.0 >= MAX_PENDING_TXS_PER_PEER {
+            dropped = dropped.saturating_add(1);
+            continue;
+        }
         entry.0 = entry.0.saturating_add(1);
+        requeued.push((peer_id, tx));
     }
-    let mut combined = items;
+    if dropped > 0 {
+        slog_warn!("p2p", "pending_tx_requeue_dropped", dropped => dropped);
+    }
+
+    let mut combined = requeued;
     combined.extend(q.drain(..));
     *q = combined;
 }
@@ -215,7 +533,7 @@ pub fn push_pending_block(peer_id: &str, block: Block) -> bool {
     // Lock queue FIRST to match lock order in dispatch_message
     // (queue → PEER_PENDING), preventing deadlocks.
     let mut q = PENDING_BLOCKS.lock();
-    if q.len() >= 1_000 {
+    if q.len() >= MAX_PENDING_BLOCK_QUEUE {
         slog_warn!("p2p", "pending_block_queue_full");
         return false;
     }
@@ -244,7 +562,7 @@ pub fn push_pending_tx(peer_id: &str, tx: Transaction) -> bool {
     // Lock queue FIRST to match lock order in dispatch_message
     // (queue → PEER_PENDING), preventing deadlocks.
     let mut q = PENDING_TXS.lock();
-    if q.len() >= 10_000 {
+    if q.len() >= MAX_PENDING_TX_QUEUE {
         slog_warn!("p2p", "pending_tx_queue_full");
         return false;
     }
@@ -286,6 +604,16 @@ fn extract_ban_ip(addr: &str) -> String {
     addr.to_string()
 }
 
+/// One round of DoS-guard maintenance: decay every peer's ban score toward 0,
+/// then evict records that are fully cleared (score 0 and not banned). Composed
+/// (decay THEN evict) so a peer that has served out its penalty is dropped from
+/// the table the same tick. Takes the guard explicitly so it is unit-testable
+/// without the process-global `DOS_GUARD`.
+fn maintain_dos_guard(dos: &DosGuard) {
+    dos.tick_decay();
+    dos.evict_inactive();
+}
+
 /// Report a bad TX/block to the DoS guard (called by event loop on rejection).
 /// Closes the feedback loop: event_loop → ban_score → P2P disconnects peer.
 /// Bans both the full ip:port key AND the IP-only key so reconnecting with a
@@ -311,13 +639,28 @@ pub fn report_bad_peer_cat(peer_id: &str, score: u64, reason: &str, category: Ba
 /// Thread-safe: can be called from any thread (e.g. TxRelay, mempool).
 pub fn push_outbound(msg: P2PMessage) {
     let mut q = OUTBOUND_MSGS.lock();
-    if q.1.len() < 10_000 {
-        let seq = q.0 + 1;
-        q.0 = seq;
-        q.1.push((seq, msg));
-    } else {
+    if q.1.len() >= 10_000 {
+        // Newest-wins: drop the OLDEST queued message, never the new one.
+        // Stale gossip is worthless to live peers (laggards backfill via
+        // header-sync/IBD), while the new message may be a critical sync
+        // request (GetHeaders) — dropping those wedged IBD entirely.
+        q.1.remove(0);
         slog_warn!("p2p", "outbound_queue_full");
     }
+    let seq = q.0 + 1;
+    q.0 = seq;
+    q.1.push((seq, msg));
+}
+
+/// The current global broadcast sequence number. A freshly-connected peer must
+/// start its outbound cursor HERE (not at 0) so it only receives FUTURE
+/// broadcasts — the historical backlog is delivered via header-sync / IBD, never
+/// replayed through the broadcast queue. Without this, a new peer's cursor of 0
+/// against a high global counter is misread as thousands of seqs of "outbound
+/// lag" and the peer is wrongly disconnected as slow the instant it connects,
+/// which prevents a lagging node from ever catching up (chain never converges).
+fn current_outbound_seq() -> u64 {
+    OUTBOUND_MSGS.lock().0
 }
 
 /// Push a message targeted at a specific peer (Dandelion++ stem phase).
@@ -352,15 +695,19 @@ fn drain_targeted_for(peer_id: &str) -> Vec<P2PMessage> {
 /// receive ALL broadcast messages (not just the first to drain).
 /// Also prunes old messages that all peers have had time to read.
 fn drain_outbound_since(since: u64) -> (Vec<(u64, P2PMessage)>, u64) {
+    // Oldest messages a flush hands one peer in one call. Bounds the per-flush
+    // clone cost (the cursor advances incrementally; the next flush continues),
+    // so one slow peer's flush can no longer scan-and-clone a huge backlog.
+    const OUTBOUND_FLUSH_BATCH: usize = 512;
     let mut q = OUTBOUND_MSGS.lock();
     let new_msgs: Vec<(u64, P2PMessage)> =
         q.1.iter()
             .filter(|(seq, _)| *seq > since)
+            .take(OUTBOUND_FLUSH_BATCH)
             .map(|(seq, msg)| (*seq, msg.clone()))
             .collect();
     let max_seq = q.0;
-    // Safe pruning: remove only messages with seq <= global minimum ack
-    // across currently connected peers.
+    // Ack-based pruning: remove messages every connected peer has consumed.
     let min_ack = {
         let acks = PEER_LAST_OUTBOUND.lock();
         acks.values().copied().min()
@@ -376,12 +723,17 @@ fn drain_outbound_since(since: u64) -> (Vec<(u64, P2PMessage)>, u64) {
                     min_ack_seq => min_seq);
             }
         }
-    } else if q.1.len() > 10_000 {
-        // No connected peers are tracking acks. In this case dropping old
-        // backlog is safe because no live receiver exists.
-        let drain_to = q.1.len() - 1_000;
-        q.1.drain(..drain_to);
-        slog_warn!("p2p", "outbound_queue_pruned_no_peers", dropped => drain_to);
+    }
+    // Hard-cap retention INDEPENDENT of acks: a pinned or stale ack cursor
+    // (a leaked entry after a peer-thread panic, or a retained whitelisted
+    // laggard) must never freeze pruning — the growing queue first slows
+    // every flush and finally wedges sync when it fills. Broadcast messages
+    // older than the newest HARD_RETAIN are stale gossip by definition;
+    // a peer that far behind backfills via header-sync/IBD instead.
+    const OUTBOUND_HARD_RETAIN: u64 = 4_096;
+    let cutoff = max_seq.saturating_sub(OUTBOUND_HARD_RETAIN);
+    if cutoff > 0 {
+        q.1.retain(|(seq, _)| *seq > cutoff);
     }
     (new_msgs, max_seq)
 }
@@ -528,7 +880,12 @@ impl ConnectionSession {
             lifecycle_violations: 0,
             legacy_peer: false,
             unsupported_msg_violations: 0,
-            last_outbound_seq: 0,
+            // Start at the CURRENT global seq, not 0: a new peer only needs
+            // future broadcasts (backlog comes via sync). Starting at 0 makes
+            // the outbound-lag check see the whole global counter as "lag" and
+            // disconnect the peer as slow on its first flush — which stalled
+            // convergence for any node behind the broadcast counter.
+            last_outbound_seq: current_outbound_seq(),
         }
     }
 
@@ -653,11 +1010,34 @@ impl P2P {
         });
 
         self.peers.bootstrap_for_network(&self.network);
+
+        // Whitelist the trusted seeds so the operator's own nodes never DoS-ban
+        // each other: seeds must serve an unbounded IBD backlog to a lagging peer
+        // without tripping rate/lag heuristics (which otherwise stall convergence
+        // for an hour-long Resource ban). Resolve each seed (IP literal or DNS)
+        // to its IP(s); on resolution failure, whitelist the literal as fallback.
+        for seed in crate::config::network::bootstrap_nodes::BootstrapNodes::for_network(&self.network)
+        {
+            match seed.to_socket_addrs() {
+                Ok(addrs) => {
+                    for a in addrs {
+                        crate::service::network::dos_guard::whitelist_peer(&a.ip().to_string());
+                    }
+                }
+                Err(_) => crate::service::network::dos_guard::whitelist_peer(seed),
+            }
+        }
+
         let discovered = self.peers.discover_peers();
         if discovered.is_empty() {
             slog_warn!("p2p", "peer_discovery_found_none");
         }
         self.connect_to_peers();
+        // Keep connections alive across drops/restarts (auto-reconnect).
+        self.spawn_reconnect_loop();
+        // Decay DoS ban scores + evict cleared records so peers recover from
+        // transient bans and the ban/penalty tables stay bounded on a long node.
+        self.spawn_maintenance_loop();
 
         slog_info!("p2p", "peers_connected", count => self.peers.count());
 
@@ -730,14 +1110,50 @@ impl P2P {
                         continue;
                     }
 
+                    // ── Anti-eclipse: cap live inbound connections per IP ──
+                    // Prevents a single host from monopolizing inbound slots.
+                    // Whitelisted trusted seeds bypass the cap (a node must
+                    // ALWAYS accept its seeds — otherwise a follower can be
+                    // isolated from its own seeds once stale/half-open slots
+                    // fill, stalling sync) but are still counted + released
+                    // symmetrically, exactly like the per-/16 cap below.
+                    if !register_inbound_ip(&ban_key)
+                        && !crate::service::network::dos_guard::is_whitelisted(&ban_key)
+                    {
+                        release_inbound_ip(&ban_key);
+                        pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        slog_warn!("p2p", "rejected_too_many_per_ip", addr => &peer_addr);
+                        drop(s);
+                        continue;
+                    }
+
+                    // ── Anti-eclipse: cap live inbound connections per /16 ──
+                    // Closes the per-IP bypass where an attacker owning a whole
+                    // /16 opens many distinct IPs. Whitelisted trusted seeds
+                    // bypass the cap (a node must always accept its seeds); they
+                    // are still counted + released symmetrically.
+                    if !register_inbound_subnet(&ban_key)
+                        && !crate::service::network::dos_guard::is_whitelisted(&ban_key)
+                    {
+                        release_inbound_subnet(&ban_key);
+                        release_inbound_ip(&ban_key);
+                        pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        slog_warn!("p2p", "rejected_too_many_per_subnet", addr => &peer_addr);
+                        drop(s);
+                        continue;
+                    }
+
                     slog_info!("p2p", "inbound_connection", addr => &peer_addr);
                     // Query fresh peer list on each connection (fix stale snapshot)
                     let peers_snapshot = peer_manager.get_addr_list_limited(100);
                     let pending_clone = Arc::clone(&pending);
+                    let ip_key = ban_key.clone();
 
                     thread::spawn(move || {
                         let result = Self::handle_peer_connection(s, false, magic, peers_snapshot);
                         pending_clone.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        release_inbound_ip(&ip_key);
+                        release_inbound_subnet(&ip_key);
                         if let Err(e) = result {
                             slog_error!("p2p", "peer_connection_error", addr => &peer_addr, error => &e.to_string());
                         }
@@ -755,8 +1171,15 @@ impl P2P {
         magic: [u8; 4],
         known_peers: Vec<String>,
     ) -> Result<(), NetworkError> {
+        // 100ms (was 2s): this timeout is also the idle FLUSH interval — served
+        // block bodies sit in the targeted queue until the connection loop wakes
+        // (on inbound, or this timeout) and flush_outbound writes them. At 2s an
+        // idle sync link delivered only ~1 block per ~2.7s (the observed IBD
+        // ceiling) despite spare CPU and a peer ready to serve; 100ms lets a
+        // catching-up follower pull continuously. Keepalive/pong still fire on
+        // their own elapsed() intervals, so faster polling doesn't change them.
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_millis(100)))
             .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
         stream
             .set_write_timeout(Some(Duration::from_secs(10)))
@@ -769,8 +1192,13 @@ impl P2P {
         // IP-only key for ban scoring — ephemeral port changes on reconnect
         let peer_ip = peer_addr.ip().to_string();
         {
+            // Seed a new peer's outbound cursor at the CURRENT broadcast seq, not
+            // 0 — a fresh peer starting at 0 would pin min_ack at 0 and freeze the
+            // outbound-queue pruning (drain_outbound_since) until a restart. The
+            // historical backlog reaches a new peer via its own header-sync, never
+            // the broadcast queue, so skipping it here is correct.
             let mut acks = PEER_LAST_OUTBOUND.lock();
-            acks.entry(peer_str.clone()).or_insert(0);
+            acks.entry(peer_str.clone()).or_insert_with(current_outbound_seq);
         }
 
         let mut reader = BufReader::new(&stream);
@@ -1082,7 +1510,14 @@ impl P2P {
                         || msg.contains("wouldblock")
                         || msg.contains("temporarily unavailable")
                         || msg.contains("os error 11")
-                        || msg.contains("os error 10035");
+                        || msg.contains("os error 10035")
+                        // Windows returns WSAETIMEDOUT (10060) for an SO_RCVTIMEO
+                        // read-timeout expiry, not EWOULDBLOCK — without this a
+                        // Windows node drops every peer every 2s (the read poll
+                        // interval). Real dead connections are still caught by the
+                        // pong timeout below.
+                        || msg.contains("os error 10060")
+                        || msg.contains("did not properly respond");
 
                     if is_timeout {
                         // Keepalive ping
@@ -1181,10 +1616,14 @@ impl P2P {
         session: &mut ConnectionSession,
         magic: [u8; 4],
     ) -> bool {
-        let (outbound, _new_seq) = drain_outbound_since(session.last_outbound_seq);
-        if let Some((last_seq, _)) = outbound.last() {
-            let lag = last_seq.saturating_sub(session.last_outbound_seq);
-            if lag > MAX_OUTBOUND_LAG_SEQS {
+        let (outbound, global_seq) = drain_outbound_since(session.last_outbound_seq);
+        if !outbound.is_empty() {
+            // Lag is measured against the GLOBAL newest seq, not the (batched)
+            // returned slice, so capping the flush batch doesn't mask real lag.
+            let lag = global_seq.saturating_sub(session.last_outbound_seq);
+            if lag > MAX_OUTBOUND_LAG_SEQS
+                && !crate::service::network::dos_guard::is_whitelisted(peer_str)
+            {
                 let ip_key = extract_ban_ip(peer_str);
                 DOS_GUARD.add_ban_score_cat(
                     peer_str,
@@ -1369,8 +1808,8 @@ impl P2P {
         validate_payload_checksum(&payload, header.checksum)
             .map_err(|pe| NetworkError::Serialization(format!("[Protocol] {}", pe)))?;
 
-        // 8. Deserialize payload (bincode)
-        let msg: P2PMessage = bincode::deserialize(&payload).map_err(|e| {
+        // 8. Deserialize payload (bincode, allocation-bounded)
+        let msg: P2PMessage = bounded_deserialize(&payload).map_err(|e| {
             NetworkError::Serialization(format!("[Protocol] {} deserialize failed: {}", cmd, e))
         })?;
 
@@ -1512,6 +1951,20 @@ impl P2P {
                 services,
                 nonce,
             } => {
+                // Self-connection: the peer echoed OUR stable identity nonce, so
+                // this connection is to ourselves (our own IP is in the seed
+                // list). Record the IP so the dial/reconnect loop stops targeting
+                // it, and drop the connection (NO ban — it's us). Without this a
+                // node churns endlessly connecting to itself instead of to real
+                // peers, and never catches up.
+                if nonce == crate::service::network::p2p::protocol::local_identity_nonce() {
+                    mark_self_addr(peer);
+                    slog_info!("p2p", "self_connection_dropped", addr => peer);
+                    return Err(NetworkError::ConnectionFailed(format!(
+                        "self-connection to {} dropped",
+                        peer
+                    )));
+                }
                 // Build VersionPayload and validate through protocol state machine.
                 // Do NOT normalize zero values — reject them outright.
                 // Zero bps/services indicates a broken or malicious peer; silently
@@ -1580,9 +2033,14 @@ impl P2P {
                     return Ok(());
                 }
 
-                // Log peer identity
+                // Log peer identity. Use char-safe truncation: `id` derives from
+                // the attacker-controlled Version user_agent, so byte-slicing
+                // `&id[..16]` could land mid-UTF-8 and panic the peer thread
+                // (and leak its PEER_LAST_OUTBOUND entry since cleanup runs after
+                // the loop).
                 if let Some(id) = session.protocol.peer_identity() {
-                    slog_debug!("p2p", "peer_identity", addr => peer, identity => &id[..id.len().min(16)]);
+                    let short: String = id.chars().take(16).collect();
+                    slog_debug!("p2p", "peer_identity", addr => peer, identity => &short);
                 }
 
                 let bytes = Self::write_message(writer, &P2PMessage::VerAck, magic)?;
@@ -1634,13 +2092,34 @@ impl P2P {
                     );
                     return Ok(());
                 }
-                // Queue addresses for the daemon event loop to feed to PeerManager
+                // Queue addresses for the daemon event loop to feed to PeerManager.
+                // SECURITY: only enqueue entries that parse as a ROUTABLE
+                // SocketAddr. validate_addr_list checks list length only — without
+                // this per-entry check, arbitrary garbage strings get persisted as
+                // peer records (each distinct string is a unique "ip", so the
+                // per-IP cap never trips), letting a handshaked peer grow the peer
+                // DB without bound (disk exhaustion) and poison peer selection.
                 {
                     let mut q = RECEIVED_ADDRS.lock();
+                    let mut rejected = 0u32;
                     for addr in peers {
+                        if !is_routable_peer_addr(addr) {
+                            rejected = rejected.saturating_add(1);
+                            continue;
+                        }
                         if q.len() < 4096 {
                             q.push(addr.clone());
                         }
+                    }
+                    drop(q);
+                    if rejected > 0 {
+                        // Penalize peers that send invalid/garbage addresses.
+                        DOS_GUARD.add_ban_score_cat(
+                            peer,
+                            (rejected as u64).min(50),
+                            "invalid addr entries",
+                            BanCategory::Malformed,
+                        );
                     }
                 }
                 slog_debug!("p2p", "received_addresses", count => peers.len(), addr => peer);
@@ -1678,7 +2157,7 @@ impl P2P {
 
             // ── Tx: DagShield pre-validation + queue management ────��───
             P2PMessage::Tx { data } => {
-                match bincode::deserialize::<Transaction>(&data) {
+                match bounded_deserialize::<Transaction>(&data) {
                     Ok(tx) => {
                         match DagShield::pre_validate_tx(&tx) {
                             Ok(()) => {
@@ -1737,7 +2216,7 @@ impl P2P {
 
             // ── Block: DagShield pre-validation + queue management ──────
             P2PMessage::Block { data } => {
-                match bincode::deserialize::<Block>(&data) {
+                match bounded_deserialize::<Block>(&data) {
                     Ok(block) => {
                         match DagShield::pre_validate_block(&block) {
                             Ok(()) => {
@@ -1846,12 +2325,10 @@ impl P2P {
                 for item in items {
                     match item.kind.as_str() {
                         "block" => {
-                            // Block serving requires block_store access (not
-                            // available in dispatch_message). The daemon event
-                            // loop handles block serving for GetData requests.
-                            // Do NOT send GetBlock back — that creates a loop.
-                            slog_debug!("p2p", "getdata_block_serve_needed",
-                                hash => &item.hash, peer => peer);
+                            // Block serving needs block_store access (not
+                            // available here). Queue the request for the daemon
+                            // event loop, which serves it to this peer.
+                            push_block_request(peer, &item.hash);
                         }
                         "tx" => {
                             // TX serving requires mempool access which this layer
@@ -1865,7 +2342,7 @@ impl P2P {
                 }
             }
 
-            // ── GetHeaders: validate hash and respond with known headers ─
+            // ── GetHeaders: queue a forward-walk header response ─────────
             P2PMessage::GetHeaders { ref from_hash, .. } => {
                 if !from_hash.is_empty() {
                     if let Err(pe) = validate_hash_hex(from_hash) {
@@ -1878,29 +2355,19 @@ impl P2P {
                         return Ok(());
                     }
                 }
-                // Respond with block hashes the peer can use for sync.
-                // dispatch_message doesn't have direct block_store access,
-                // so we return DAG tips as our header set.
-                // TODO: When block_store access is available, walk from
-                // from_hash forward and return actual sequential headers.
-                let mut hashes = crate::service::network::nodes::full_node::get_dag_tips();
-                // Respect count parameter if provided (default: no limit → use protocol max)
                 let count = match msg {
-                    P2PMessage::GetHeaders { count, .. } => count as usize,
-                    _ => 2000,
+                    P2PMessage::GetHeaders { count, .. } => count,
+                    _ => 512,
                 };
-                // Cap at protocol limit to prevent oversized response
-                const MAX_HEADERS_RESPONSE: usize = 2_000;
-                hashes.truncate(count.min(MAX_HEADERS_RESPONSE));
-                if !hashes.is_empty() {
-                    let resp = P2PMessage::Headers { hashes };
-                    let bytes = Self::write_message(writer, &resp, magic)?;
-                    session.record_bytes_sent(bytes);
-                }
+                // Serving real sequential headers needs block_store access, which
+                // dispatch_message lacks. Queue for the daemon event loop, which
+                // walks the chain forward from from_hash and replies to this peer.
+                push_header_request(peer, from_hash, count);
             }
 
             // ── Headers: validate hash list and queue blocks for download ─
             P2PMessage::Headers { ref hashes } => {
+                slog_info!("p2p", "headers_received", from => peer, count => hashes.len());
                 if let Err(pe) = validate_headers_list(hashes) {
                     DOS_GUARD.add_ban_score_cat(
                         peer,
@@ -1914,7 +2381,14 @@ impl P2P {
                 // A malicious peer could send 2000 header hashes to trigger
                 // 2000 outbound GetBlock requests in one message.
                 let mut seen = std::collections::HashSet::new();
-                let max_requests = 64; // Max blocks to request per Headers message
+                // Max blocks to request per Headers message. Bounded to cap the
+                // outbound amplification a hostile peer can trigger, but large
+                // enough that IBD backfill isn't throttled to a crawl — a node
+                // catching up a tall chain needs to pull the served range (up to
+                // 512 hashes) in a few round-trips, not 64 at a time (W3). The
+                // GetBlock serve side is itself bounded (512/tick), so this is
+                // safe. (was 64 — too slow to close a large gap.)
+                let max_requests = 512; // one full served Headers range per round
                 let mut request_count = 0;
                 for hash in hashes {
                     if request_count >= max_requests {
@@ -1949,11 +2423,10 @@ impl P2P {
                     );
                     return Ok(());
                 }
-                // Block serving requires block_store access which dispatch_message
-                // doesn't have directly. The daemon event loop handles block data
-                // retrieval and sends Block responses via the targeted queue.
-                // Log the request so operators can track block request patterns.
-                slog_debug!("p2p", "getblock_requested", hash => hash, peer => peer);
+                // Block serving needs block_store access (not available here).
+                // Queue the request for the daemon event loop, which looks the
+                // block up and replies to this peer via push_outbound_to_peer.
+                push_block_request(peer, hash);
             }
 
             // ── Reject: validate reason length ──────────────────────────
@@ -2033,22 +2506,106 @@ impl P2P {
         slog_info!("p2p", "connecting_to_peers", count => count);
 
         for addr in peer_list.into_iter().take(count) {
-            let addr_clone = addr.clone();
-            let peers_snapshot = known_peers.clone();
-            thread::spawn(move || match TcpStream::connect(&addr_clone) {
+            Self::spawn_outbound(addr, magic, known_peers.clone());
+        }
+    }
+
+    /// Dial one peer in its own thread, tracking the live connection in
+    /// CONNECTED_OUTBOUND so it is neither double-dialed nor left un-redialed.
+    /// Skips peers already connected; frees the slot when the connection ends so
+    /// the reconnect loop can re-dial. This is the unit of auto-reconnect.
+    fn spawn_outbound(addr: String, magic: [u8; 4], peers_snapshot: Vec<String>) {
+        // Never dial our own IP (identified via the identity-nonce self-check).
+        // The seed list contains this node's own address; without this the node
+        // wastes every dial re-connecting to itself instead of to real peers.
+        if is_self_addr(&addr) {
+            return;
+        }
+        // Anti-eclipse: keep OUTBOUND links spread across /16 subnets so an
+        // attacker owning one subnet can't occupy every outbound slot and
+        // control our view of the chain. Whitelisted trusted seeds are exempt
+        // (a node must always be able to reach its configured seeds); the limit
+        // therefore constrains only untrusted peers.
+        if !crate::service::network::dos_guard::is_whitelisted(&addr)
+            && outbound_subnet_would_saturate(&addr)
+        {
+            slog_debug!("p2p", "outbound_subnet_diversity_skip", addr => &addr);
+            return;
+        }
+        // Reserve the slot up front (atomic check-and-insert) so two callers
+        // can't both dial the same peer.
+        {
+            let mut set = CONNECTED_OUTBOUND.lock();
+            if set.contains(&addr) {
+                return;
+            }
+            set.insert(addr.clone());
+        }
+        LAST_DIAL.lock().insert(addr.clone(), Instant::now());
+        thread::spawn(move || {
+            match TcpStream::connect(&addr) {
                 Ok(stream) => {
-                    slog_info!("p2p", "outbound_connected", addr => &addr_clone);
+                    slog_info!("p2p", "outbound_connected", addr => &addr);
                     if let Err(e) =
                         Self::handle_peer_connection(stream, true, magic, peers_snapshot)
                     {
-                        slog_error!("p2p", "peer_connection_error", addr => &addr_clone, error => &e.to_string());
+                        slog_info!("p2p", "peer_connection_ended", addr => &addr, reason => &e.to_string());
                     }
                 }
                 Err(e) => {
-                    slog_error!("p2p", "outbound_connect_failed", addr => &addr_clone, error => &e.to_string());
+                    slog_warn!("p2p", "outbound_connect_failed", addr => &addr, error => &e.to_string());
                 }
-            });
-        }
+            }
+            // Connection ended or failed — free the slot for re-dial.
+            CONNECTED_OUTBOUND.lock().remove(&addr);
+        });
+    }
+
+    /// Background maintenance: every 15s, re-dial any known peer that has no live
+    /// outbound connection. Without this a node stays isolated after a restart,
+    /// a dropped connection, or a transient refusal — which is exactly why forked
+    /// nodes never reconverged. Runs for the life of the process.
+    fn spawn_reconnect_loop(&self) {
+        let peers = Arc::clone(&self.peers);
+        let magic = self.network_magic;
+        thread::spawn(move || loop {
+            thread::sleep(std::time::Duration::from_secs(10));
+            let known_snapshot = peers.get_addr_list_limited(100);
+            for addr in peers.get_peers() {
+                // Already connected — leave it.
+                if CONNECTED_OUTBOUND.lock().contains(&addr) {
+                    continue;
+                }
+                // Never dial a banned peer (a stale ban or a real one): dialing
+                // it just gets rejected and re-bans via connection spam.
+                if peers.is_banned(&addr) {
+                    continue;
+                }
+                // Rate-limit re-dials of the same peer so a fast-failing target
+                // (banned, or our own IP self-connecting) doesn't churn.
+                if let Some(last) = LAST_DIAL.lock().get(&addr) {
+                    if last.elapsed() < std::time::Duration::from_secs(MIN_REDIAL_INTERVAL_SECS) {
+                        continue;
+                    }
+                }
+                Self::spawn_outbound(addr, magic, known_snapshot.clone());
+            }
+        });
+    }
+
+    /// Periodic network-health maintenance (every 60s): decay DoS ban scores +
+    /// evict cleared records (so a peer wrongly/transiently banned recovers and
+    /// the ban table stays bounded), and decay the peer-manager penalty scores +
+    /// bound the addr cache. These `tick_decay`/`evict_inactive`/`decay_penalties`
+    /// primitives existed but were never driven by any running loop.
+    fn spawn_maintenance_loop(&self) {
+        let peers = Arc::clone(&self.peers);
+        thread::spawn(move || loop {
+            thread::sleep(std::time::Duration::from_secs(60));
+            maintain_dos_guard(&DOS_GUARD);
+            peers.decay_penalties();
+            peers.evict_addr_cache_if_full();
+        });
     }
 
     /// Proactively request headers from all connected peers to initiate sync.
@@ -2097,5 +2654,177 @@ impl P2P {
     }
     pub fn fast_sync_blocks(&self) {
         slog_debug!("p2p", "fast_sync_blocks_deprecated");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::network::p2p::peer_manager::MAX_PEERS_PER_IP;
+
+    #[test]
+    fn inbound_per_ip_cap_enforced_and_released() {
+        // Unique IP so this test does not race the global map with others.
+        let ip = "203.0.113.77";
+        // Up to the cap: each registration is within-limit.
+        for _ in 0..MAX_PEERS_PER_IP {
+            assert!(register_inbound_ip(ip), "within cap must be within-limit");
+        }
+        // The next reports OVER the cap. It still incremented (always-increment
+        // semantics), so the rejecting caller releases it immediately — as the
+        // accept loop does for a non-whitelisted peer.
+        assert!(!register_inbound_ip(ip), "over cap must report over-limit");
+        release_inbound_ip(ip);
+        // Releasing a live slot lets a new connection register within the cap.
+        release_inbound_ip(ip);
+        assert!(register_inbound_ip(ip), "slot freed after release");
+        // Clean up so the map does not leak this IP across the suite.
+        for _ in 0..MAX_PEERS_PER_IP {
+            release_inbound_ip(ip);
+        }
+        // Over-release must not underflow/panic.
+        release_inbound_ip(ip);
+    }
+
+    #[test]
+    fn inbound_per_subnet_cap_enforced_and_released() {
+        // Distinct IPs in the SAME /16 (198.51.x) — the per-IP cap would let
+        // each in, but the per-subnet cap must bound the /16 total. Unique
+        // second octet keeps this test off other tests' subnets.
+        let ip = |h: u32| format!("198.51.{}.{}", h / 250, h % 250);
+        // Register up to the subnet cap: each returns "within cap" == true.
+        for i in 0..MAX_INBOUND_PER_SUBNET {
+            assert!(
+                register_inbound_subnet(&ip(i)),
+                "within subnet cap must be within-limit"
+            );
+        }
+        // The next distinct IP in the same /16 is OVER the cap.
+        assert!(
+            !register_inbound_subnet(&ip(999)),
+            "over subnet cap must report over-limit"
+        );
+        // That over-cap call still incremented (always-increment semantics), so
+        // release it to stay symmetric, then release the in-cap registrations.
+        release_inbound_subnet(&ip(999));
+        // Releasing one frees a subnet slot.
+        release_inbound_subnet(&ip(0));
+        assert!(
+            register_inbound_subnet(&ip(1000)),
+            "subnet slot freed after release"
+        );
+        // Clean up the whole subnet so it does not leak across the suite.
+        release_inbound_subnet(&ip(1000));
+        for i in 1..MAX_INBOUND_PER_SUBNET {
+            release_inbound_subnet(&ip(i));
+        }
+        release_inbound_subnet(&ip(0)); // idempotent / no underflow
+    }
+
+    #[test]
+    fn outbound_subnet_diversity_limits_same_16() {
+        use crate::service::network::p2p::peer_diversity::MAX_PEERS_PER_SUBNET;
+        // Two peers already connected from the same /16 (192.0.2.x) saturate it.
+        let connected: std::collections::HashSet<String> = (0..MAX_PEERS_PER_SUBNET)
+            .map(|i| format!("192.0.2.{}:19333", i + 1))
+            .collect();
+        assert!(
+            subnet_saturated_among("192.0.2.200:19333", connected.iter()),
+            "a third peer in the same /16 must be blocked"
+        );
+        // A peer in a DIFFERENT /16 is allowed (diversity, not a global cap).
+        assert!(
+            !subnet_saturated_among("198.51.100.9:19333", connected.iter()),
+            "a distinct /16 must still be dialable"
+        );
+        // Empty connected set never saturates.
+        assert!(!subnet_saturated_among("192.0.2.1:19333", std::iter::empty()));
+    }
+
+    #[test]
+    fn self_addr_marking_stops_dialing_own_ip() {
+        // A documentation-range IP unique to this test. Marking it as self must
+        // make it recognized as self on ANY port (so the dial loop skips it),
+        // while other IPs stay non-self.
+        assert!(!is_self_addr("203.0.113.211:19333"));
+        mark_self_addr("203.0.113.211:19333");
+        assert!(is_self_addr("203.0.113.211:19333"));
+        assert!(
+            is_self_addr("203.0.113.211:41122"),
+            "self is matched by IP, any port"
+        );
+        assert!(
+            !is_self_addr("198.51.100.211:19333"),
+            "a different IP must not be treated as self"
+        );
+    }
+
+    #[test]
+    fn maintenance_evicts_cleared_dos_records() {
+        // Two tracked-but-cleared peers (score 0, not banned) must be evicted by
+        // one maintenance round — the wiring that keeps the ban table bounded.
+        let g = DosGuard::new();
+        g.check("p_a", &MsgType::Ping, 10);
+        g.check("p_b", &MsgType::Ping, 10);
+        assert_eq!(g.stats().tracked_peers, 2);
+        maintain_dos_guard(&g);
+        assert_eq!(
+            g.stats().tracked_peers,
+            0,
+            "maintenance must decay + evict cleared DoS records"
+        );
+    }
+
+    #[test]
+    fn new_session_cursor_is_current_not_zero() {
+        // A fresh session must adopt the live broadcast counter, not 0. Starting
+        // at 0 made the outbound-lag check treat a newly-connected peer as
+        // thousands of seqs behind and disconnect it as "slow" — which stalled
+        // chain convergence for any node behind the counter (observed live:
+        // restarted peers could never catch up to the mining seed).
+        for _ in 0..3 {
+            push_outbound(P2PMessage::Ping { nonce: 7 });
+        }
+        let s = ConnectionSession::new("1.2.3.4:9333".parse().unwrap(), true);
+        assert!(
+            s.last_outbound_seq >= 3,
+            "new session cursor must track the global seq, got {}",
+            s.last_outbound_seq
+        );
+    }
+
+    #[test]
+    fn addr_routability_filter_rejects_garbage_and_unroutable() {
+        // Valid routable addresses are accepted.
+        assert!(is_routable_peer_addr("203.0.113.9:9333"));
+        assert!(is_routable_peer_addr("[2001:db8::1]:9333"));
+        // Garbage / unparseable strings are rejected (they would otherwise bloat
+        // the peer DB unbounded — each distinct string a unique "ip").
+        assert!(!is_routable_peer_addr("not-an-address"));
+        assert!(!is_routable_peer_addr(""));
+        assert!(!is_routable_peer_addr("AAAA".repeat(50).as_str()));
+        assert!(!is_routable_peer_addr("1.2.3.4")); // no port
+        // Loopback / unspecified / multicast are rejected.
+        assert!(!is_routable_peer_addr("127.0.0.1:9333"));
+        assert!(!is_routable_peer_addr("0.0.0.0:9333"));
+        assert!(!is_routable_peer_addr("224.0.0.1:9333"));
+    }
+
+    #[test]
+    fn bounded_deserialize_wire_compatible() {
+        // Proves bounded_deserialize round-trips data produced by the
+        // bincode::serialize used on the send side (same wire format).
+        let msg = P2PMessage::Ping { nonce: 0xdead_beef };
+        let bytes = bincode::serialize(&msg).expect("serialize");
+        let back: P2PMessage = bounded_deserialize(&bytes).expect("bounded deserialize");
+        assert!(matches!(back, P2PMessage::Ping { nonce } if nonce == 0xdead_beef));
+
+        // A buffer whose declared inner length exceeds the buffer must fail
+        // cleanly (not allocate). Vec<u8> with a fixint length prefix of
+        // u64::MAX followed by no data:
+        let mut evil = Vec::new();
+        evil.extend_from_slice(&u64::MAX.to_le_bytes()); // claimed length
+        let r: Result<Vec<u8>, _> = bounded_deserialize(&evil);
+        assert!(r.is_err(), "oversized inner length must be rejected, not allocated");
     }
 }

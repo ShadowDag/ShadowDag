@@ -49,15 +49,36 @@ pub struct BlockRelay {
     db: DB,
     _peer_manager: Arc<PeerManager>,
     block_store: Option<Arc<BlockStore>>,
+    /// Network whose UmbraHash activation schedule gates orphan admission.
+    network: crate::config::node::node_config::NetworkMode,
 }
 
 impl BlockRelay {
+    #[inline]
+    fn key_log_hint(key: &[u8]) -> String {
+        const MAX_KEY_LOG_BYTES: usize = 32;
+        let clipped = &key[..key.len().min(MAX_KEY_LOG_BYTES)];
+        let mut out = hex::encode(clipped);
+        if key.len() > MAX_KEY_LOG_BYTES {
+            out.push_str("...");
+        }
+        out
+    }
+
     #[inline]
     fn key_has_prefix(k: &[u8], p: &[u8]) -> bool {
         k.starts_with(p)
     }
 
-    pub fn new(path: &str, peer_manager: Arc<PeerManager>) -> Result<Self, NetworkError> {
+    /// `network` is REQUIRED: the orphan-admission recompute must apply this
+    /// network's UmbraHash activation schedule, or a downgraded legacy header
+    /// past the mainnet fork is admitted to the pool under the network-blind
+    /// rule. Taking it by argument means a future wiring cannot omit it.
+    pub fn new(
+        path: &str,
+        peer_manager: Arc<PeerManager>,
+        network: crate::config::node::node_config::NetworkMode,
+    ) -> Result<Self, NetworkError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         let db = DB::open(&opts, Path::new(path)).map_err(|e| {
@@ -70,6 +91,7 @@ impl BlockRelay {
             db,
             _peer_manager: peer_manager,
             block_store: None,
+            network,
         })
     }
 
@@ -120,7 +142,7 @@ impl BlockRelay {
 
         log::debug!(
             "[BlockRelay] Queued block {} (height {}) for broadcast",
-            &block.header.hash[..block.header.hash.len().min(8)],
+            crate::domain::types::hash::log_prefix(&block.header.hash, 8),
             block.header.height
         );
     }
@@ -154,7 +176,7 @@ impl BlockRelay {
 
         if block.header.height > 0 && block.header.parents.is_empty() {
             slog_warn!("relay", "block_no_parents_nongenesis",
-                hash => &block.header.hash[..block.header.hash.len().min(16)],
+                hash => crate::domain::types::hash::log_prefix(&block.header.hash, 16),
                 height => block.header.height);
             // Clean up the pending key — this block will never be valid,
             // and leaving it pending blocks future re-receipt permanently.
@@ -170,8 +192,8 @@ impl BlockRelay {
                 crate::config::consensus::consensus_params::ConsensusParams::genesis_hash();
             if !known_genesis.is_empty() && block.header.hash != known_genesis {
                 slog_warn!("relay", "fake_genesis_rejected",
-                    claimed => &block.header.hash[..block.header.hash.len().min(16)],
-                    expected => &known_genesis[..known_genesis.len().min(16)]);
+                    claimed => crate::domain::types::hash::log_prefix(&block.header.hash, 16),
+                    expected => crate::domain::types::hash::log_prefix(&known_genesis, 16));
                 let _ = self.db.delete(pending_key.as_bytes());
                 return false;
             }
@@ -203,15 +225,54 @@ impl BlockRelay {
         }
     }
 
+    /// Best-known tip height from the wired block store, if any. Used to bound
+    /// UmbraHash epoch work on UNVALIDATED orphan headers (external audit H3).
+    fn tip_height(&self) -> Option<u64> {
+        let store = self.block_store.as_ref()?;
+        let best = store.get_best_hash()?;
+        store.get_block(&best).map(|b| b.header.height)
+    }
+
     pub fn add_to_orphan_pool(&self, block: Block) {
-        // Basic PoW check before storing — prevents filling the orphan pool
-        // with blocks that can never pass consensus validation.
+        // Cheapest possible screen first (external audit H3): a malformed hash
+        // can never match a recompute, so reject it before doing any hashing —
+        // for UmbraHash the recompute below builds a 16 MiB epoch cache.
+        if block.header.hash.len() != 64
+            || !block.header.hash.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            slog_warn!("relay", "orphan_rejected_malformed_hash",
+                claimed => crate::domain::types::hash::log_prefix(&block.header.hash, 16));
+            return;
+        }
+        // Recompute the block hash from the header fields and require it to match
+        // the claimed hash BEFORE the PoW check. Otherwise an attacker could set
+        // header.hash to any low value that "meets target" without doing real
+        // work, defeating this admission gate and cheaply churning/evicting
+        // honest orphans (the pool is bounded + evicts oldest).
         use crate::engine::mining::pow::pow_validator::PowValidator;
+        // Version-gated identity recompute (UmbraHash result for v>=3, else
+        // shadow_hash) binds header.hash to the header content (anti-spoof).
+        // TIP-BOUNDED when a block store is wired: an orphan claiming a height
+        // many epochs beyond the tip is refused without building its epoch cache.
+        let computed = PowValidator::recompute_identity_hash_checked(
+            &block.header,
+            self.tip_height().unwrap_or(0),
+            Some(&self.network),
+        );
+        if computed != block.header.hash {
+            slog_warn!("relay", "orphan_rejected_hash_mismatch",
+                claimed => crate::domain::types::hash::log_prefix(&block.header.hash, 16),
+                computed => crate::domain::types::hash::log_prefix(&computed, 16));
+            return;
+        }
+        // Basic PoW check before storing — prevents filling the orphan pool
+        // with blocks that can never pass consensus validation. Now that the
+        // hash is verified to bind the header content, this requires real work.
         if block.header.difficulty > 0
             && !PowValidator::hash_meets_target(&block.header.hash, block.header.difficulty)
         {
             slog_warn!("relay", "orphan_rejected_pow",
-                hash => &block.header.hash[..block.header.hash.len().min(16)],
+                hash => crate::domain::types::hash::log_prefix(&block.header.hash, 16),
                 difficulty => block.header.difficulty);
             return;
         }
@@ -293,7 +354,7 @@ impl BlockRelay {
                             // Fix #7: Delete corrupt/undeserializable orphan entries
                             // instead of silently skipping them forever.
                             slog_warn!("relay", "orphan_corrupt_entry_deleted",
-                                key => String::from_utf8_lossy(&k), error => e);
+                                key => &Self::key_log_hint(k.as_ref()), error => e);
                             corrupt_keys.push(k.to_vec());
                         }
                     }
@@ -426,7 +487,7 @@ impl BlockRelay {
                             // Fix #7: corrupt entry — delete it instead of
                             // leaving it to accumulate forever.
                             slog_warn!("relay", "prune_orphan_corrupt_entry_deleted",
-                                key => String::from_utf8_lossy(&k), error => e);
+                                key => &Self::key_log_hint(k.as_ref()), error => e);
                             stale_keys.push(k.to_vec());
                         }
                     }
@@ -610,7 +671,7 @@ mod tests {
         ));
         let path_str = path.to_string_lossy().to_string();
         let pm = Arc::new(PeerManager::new_temp());
-        BlockRelay::new(&path_str, pm).expect("BlockRelay::new failed")
+        BlockRelay::new(&path_str, pm, crate::config::node::node_config::NetworkMode::Testnet).expect("BlockRelay::new failed")
     }
 
     fn make_block(hash: &str, parents: Vec<&str>, height: u64) -> Block {
@@ -630,6 +691,56 @@ mod tests {
                 extra_nonce: 0,
                 receipt_root: None,
                 state_root: None,
+                mix_hash: String::new(),
+                prev_state_commitment: None,
+            },
+            body: BlockBody {
+                transactions: vec![],
+            },
+        }
+    }
+
+    /// Build a block whose `hash` actually binds its header content (computed via
+    /// `shadow_hash_raw_full`), so it passes the orphan-pool hash-recompute gate.
+    /// `parents` are arbitrary reference strings (need not be valid hashes).
+    fn make_valid_block(parents: Vec<&str>, height: u64) -> Block {
+        use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
+        let parents: Vec<String> = parents.into_iter().map(|s| s.to_string()).collect();
+        let version: u32 = 1;
+        let timestamp: u64 = 1_735_689_600;
+        let nonce: u64 = 0;
+        let extra_nonce: u64 = 0;
+        let difficulty: u64 = 0;
+        let merkle_root = "root".to_string();
+        let hash = shadow_hash_raw_full(
+            version,
+            height,
+            timestamp,
+            nonce,
+            extra_nonce,
+            difficulty,
+            &merkle_root,
+            &parents,
+            None,
+        );
+        Block {
+            header: BlockHeader {
+                version,
+                hash,
+                parents,
+                merkle_root,
+                timestamp,
+                nonce,
+                difficulty,
+                height,
+                blue_score: 0,
+                selected_parent: None,
+                utxo_commitment: None,
+                extra_nonce,
+                receipt_root: None,
+                state_root: None,
+                mix_hash: String::new(),
+                prev_state_commitment: None,
             },
             body: BlockBody {
                 transactions: vec![],
@@ -642,12 +753,31 @@ mod tests {
         let relay = make_relay();
         relay.clear_orphan_pool();
 
-        let orphan = make_block("child_hash", vec!["unknown_parent"], 1);
+        let orphan = make_valid_block(vec!["unknown_parent"], 1);
+        let h = orphan.header.hash.clone();
         let result = relay.receive_block(orphan);
         assert!(!result, "Block with unknown parent must go to orphan pool");
+        assert!(relay.is_orphan(&h), "Block must be in orphan pool");
+    }
+
+    #[test]
+    fn orphan_rejected_when_hash_does_not_match_content() {
+        let relay = make_relay();
+        relay.clear_orphan_pool();
+        // A content-valid orphan is admitted...
+        let good = make_valid_block(vec!["unknown_p"], 1);
+        let hg = good.header.hash.clone();
+        relay.add_to_orphan_pool(good);
+        assert!(relay.is_orphan(&hg), "valid-hash orphan must be admitted");
+        // ...but a block whose claimed hash does NOT bind its header content
+        // (a forged low hash) must be rejected by the recompute gate.
+        let mut bad = make_valid_block(vec!["unknown_p2"], 1);
+        bad.header.hash = "00".repeat(32);
+        let hb = bad.header.hash.clone();
+        relay.add_to_orphan_pool(bad);
         assert!(
-            relay.is_orphan("child_hash"),
-            "Block must be in orphan pool"
+            !relay.is_orphan(&hb),
+            "forged-hash orphan must be rejected (hash does not bind content)"
         );
     }
 
@@ -659,14 +789,15 @@ mod tests {
         let parent_key = "relay:block:parent_a";
         let _ = relay.db.put(parent_key.as_bytes(), b"1");
 
-        let orphan = make_block("orphan_b", vec!["parent_a"], 1);
+        let orphan = make_valid_block(vec!["parent_a"], 1);
+        let h = orphan.header.hash.clone();
         relay.add_to_orphan_pool(orphan);
 
         let resolved = relay.resolve_orphans("parent_a");
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].header.hash, "orphan_b");
+        assert_eq!(resolved[0].header.hash, h);
         assert!(
-            !relay.is_orphan("orphan_b"),
+            !relay.is_orphan(&h),
             "Resolved block must be removed from pool"
         );
     }
@@ -681,23 +812,26 @@ mod tests {
 
         // child_a depends on root (known)
         // child_b depends on child_a (orphan until child_a resolves)
-        let child_a = make_block("child_a", vec!["root"], 1);
-        let child_b = make_block("child_b", vec!["child_a"], 2);
+        let child_a = make_valid_block(vec!["root"], 1);
+        let ha = child_a.header.hash.clone();
+        // child_b's parent is child_a's REAL hash, so the cascade resolves it.
+        let child_b = make_valid_block(vec![&ha], 2);
+        let hb = child_b.header.hash.clone();
         relay.add_to_orphan_pool(child_a);
         relay.add_to_orphan_pool(child_b);
 
         let resolved = relay.resolve_orphans("root");
-        let hashes: Vec<&str> = resolved.iter().map(|b| b.header.hash.as_str()).collect();
+        let hashes: Vec<String> = resolved.iter().map(|b| b.header.hash.clone()).collect();
         assert!(
-            hashes.contains(&"child_a"),
+            hashes.contains(&ha),
             "child_a should resolve (parent root is known)"
         );
         assert!(
-            hashes.contains(&"child_b"),
+            hashes.contains(&hb),
             "child_b should cascade-resolve (child_a now known)"
         );
-        assert!(!relay.is_orphan("child_a"));
-        assert!(!relay.is_orphan("child_b"));
+        assert!(!relay.is_orphan(&ha));
+        assert!(!relay.is_orphan(&hb));
     }
 
     #[test]
@@ -709,7 +843,8 @@ mod tests {
         let _ = relay.db.put(b"relay:block:parent_x", b"1");
 
         // Block requires both parents
-        let block = make_block("needs_both", vec!["parent_x", "parent_y"], 1);
+        let block = make_valid_block(vec!["parent_x", "parent_y"], 1);
+        let h = block.header.hash.clone();
         relay.add_to_orphan_pool(block);
 
         let resolved = relay.resolve_orphans("parent_x");
@@ -717,7 +852,7 @@ mod tests {
             resolved.is_empty(),
             "Block with a missing parent must stay orphaned"
         );
-        assert!(relay.is_orphan("needs_both"));
+        assert!(relay.is_orphan(&h));
     }
 
     #[test]

@@ -32,7 +32,9 @@ pub(crate) fn is_valid_metric_name(name: &str) -> bool {
         return false;
     }
     let mut chars = name.chars();
-    let first = chars.next().unwrap();
+    let Some(first) = chars.next() else {
+        return false;
+    };
     if !(first.is_ascii_alphabetic() || first == '_' || first == ':') {
         return false;
     }
@@ -171,6 +173,13 @@ impl PrometheusExporter {
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(
                     PROM_READ_TIMEOUT_SECS,
                 )));
+                // /debug exposes internal diagnostics; only serve it to loopback
+                // peers so it can't leak when SHADOWDAG_PROMETHEUS_BIND is set to
+                // a non-loopback address.
+                let peer_is_loopback = stream
+                    .peer_addr()
+                    .map(|a| a.ip().is_loopback())
+                    .unwrap_or(false);
                 let clone = match stream.try_clone() {
                     Ok(c) => c,
                     Err(e) => {
@@ -214,7 +223,11 @@ impl PrometheusExporter {
                 let route = parts[1];
 
                 let (status_line, content_type, body) = if route == "/debug" {
-                    ("200 OK", "application/json", crate::telemetry::diagnostics::collect())
+                    if peer_is_loopback {
+                        ("200 OK", "application/json", crate::telemetry::diagnostics::collect())
+                    } else {
+                        ("403 Forbidden", "text/plain; charset=utf-8", "Forbidden".to_string())
+                    }
                 } else if route == "/health" {
                     (
                         "200 OK",

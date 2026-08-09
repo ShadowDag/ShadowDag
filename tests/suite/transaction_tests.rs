@@ -22,6 +22,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee,
             timestamp: 1_735_689_600,
@@ -43,6 +45,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee,
             timestamp: 1_735_689_600,
@@ -159,6 +163,10 @@ mod tests {
                 pub_key: "aabbcc".repeat(5),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
+                shield_blinding: None,
             })
             .collect();
         let mut tx = Transaction {
@@ -170,6 +178,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee: MIN_TX_FEE,
             timestamp: 1_735_689_600,
@@ -195,6 +205,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             })
             .collect();
         let mut tx = Transaction {
@@ -234,6 +246,10 @@ mod tests {
                 pub_key: "pk".into(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput {
                 address: "addr".into(),
@@ -241,6 +257,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee: MIN_TX_FEE,
             timestamp: 1_735_689_600,
@@ -265,6 +283,8 @@ mod tests {
                     commitment: None,
                     range_proof: None,
                     ephemeral_pubkey: None,
+                    one_time_pubkey: None,
+                    encrypted_amount: None,
                 },
                 TxOutput {
                     address: "a2".into(),
@@ -272,6 +292,8 @@ mod tests {
                     commitment: None,
                     range_proof: None,
                     ephemeral_pubkey: None,
+                    one_time_pubkey: None,
+                    encrypted_amount: None,
                 },
             ],
             fee: 0,
@@ -297,6 +319,10 @@ mod tests {
             pub_key: "b".repeat(64),
             key_image: None,
             ring_members: None,
+            ring_signature: None,
+            ring_commitments: None,
+            pseudo_commitment: None,
+            shield_blinding: None,
         };
         let tx = Transaction {
             hash: "dup_input_tx".to_string(),
@@ -307,6 +333,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee: MIN_TX_FEE,
             timestamp: 1_735_689_600,
@@ -394,6 +422,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             })
             .collect();
         let tx = Transaction {

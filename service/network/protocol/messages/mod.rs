@@ -8,9 +8,20 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const NETWORK_MAGIC: [u8; 4] = [0x53, 0x44, 0x41, 0x47];
+pub const MAX_WIRE_FRAME_PAYLOAD: usize = 16 * 1024 * 1024; // 16 MiB safety cap
 pub const MAX_INV_ITEMS: usize = 50_000;
 pub const MAX_HEADERS_ITEMS: usize = 2_000;
 pub const MAX_ADDR_ITEMS: usize = 1_000;
+pub const MAX_HASH_TEXT_LEN: usize = 128;
+pub const MAX_ADDRESS_TEXT_LEN: usize = 256;
+// Wire cap on a header's parent count MUST be >= the consensus parent cap
+// (ConsensusParams::MAX_PARENTS), else a consensus-valid block with 65..=80
+// parents is accepted by full-block relay but REJECTED by header
+// deserialization — header-syncing / late-joining nodes then strand on it
+// (propagation asymmetry / IBD stall). Tie it to the consensus constant so the
+// two caps can never drift (external audit M2).
+pub const MAX_PARENTS_PER_HEADER: usize =
+    crate::config::consensus::consensus_params::ConsensusParams::MAX_PARENTS;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InvType {
@@ -108,6 +119,82 @@ pub enum NetworkMessage {
 }
 
 impl NetworkMessage {
+    fn validate_limits(&self) -> Result<(), NetworkError> {
+        match self {
+            NetworkMessage::Inv { items }
+            | NetworkMessage::GetData { items }
+            | NetworkMessage::NotFound { items } => {
+                if items.len() > MAX_INV_ITEMS {
+                    return Err(NetworkError::Serialization(format!(
+                        "Too many inventory items: {} > {}",
+                        items.len(),
+                        MAX_INV_ITEMS
+                    )));
+                }
+                if items.iter().any(|i| i.hash.len() > MAX_HASH_TEXT_LEN) {
+                    return Err(NetworkError::Serialization(format!(
+                        "Inventory hash too long (> {})",
+                        MAX_HASH_TEXT_LEN
+                    )));
+                }
+            }
+            NetworkMessage::Headers { headers } => {
+                if headers.len() > MAX_HEADERS_ITEMS {
+                    return Err(NetworkError::Serialization(format!(
+                        "Too many headers: {} > {}",
+                        headers.len(),
+                        MAX_HEADERS_ITEMS
+                    )));
+                }
+                if headers.iter().any(|h| {
+                    h.hash.len() > MAX_HASH_TEXT_LEN
+                        || h.merkle.len() > MAX_HASH_TEXT_LEN
+                        || h.parents.len() > MAX_PARENTS_PER_HEADER
+                        || h.parents.iter().any(|p| p.len() > MAX_HASH_TEXT_LEN)
+                }) {
+                    return Err(NetworkError::Serialization(
+                        "Header field exceeds limits (hash/merkle/parents)".to_string(),
+                    ));
+                }
+            }
+            NetworkMessage::Addr { entries } => {
+                if entries.len() > MAX_ADDR_ITEMS {
+                    return Err(NetworkError::Serialization(format!(
+                        "Too many address entries: {} > {}",
+                        entries.len(),
+                        MAX_ADDR_ITEMS
+                    )));
+                }
+                if entries.iter().any(|e| e.address.len() > MAX_ADDRESS_TEXT_LEN) {
+                    return Err(NetworkError::Serialization(format!(
+                        "Address entry too long (> {})",
+                        MAX_ADDRESS_TEXT_LEN
+                    )));
+                }
+            }
+            NetworkMessage::GetHeaders { locator, stop_hash }
+            | NetworkMessage::GetBlocks { locator, stop_hash } => {
+                if locator.len() > MAX_HEADERS_ITEMS {
+                    return Err(NetworkError::Serialization(format!(
+                        "Too many locator hashes: {} > {}",
+                        locator.len(),
+                        MAX_HEADERS_ITEMS
+                    )));
+                }
+                if locator.iter().any(|h| h.len() > MAX_HASH_TEXT_LEN)
+                    || stop_hash.len() > MAX_HASH_TEXT_LEN
+                {
+                    return Err(NetworkError::Serialization(format!(
+                        "Locator/stop_hash exceeds max text length ({})",
+                        MAX_HASH_TEXT_LEN
+                    )));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             NetworkMessage::Version { .. } => "version",
@@ -192,15 +279,25 @@ impl NetworkMessage {
     }
 
     pub fn serialize(&self) -> Result<Vec<u8>, NetworkError> {
+        self.validate_limits()?;
         serde_json::to_vec(self).map_err(|e| NetworkError::Serialization(e.to_string()))
     }
 
     pub fn deserialize(data: &[u8]) -> Result<Self, NetworkError> {
-        serde_json::from_slice(data).map_err(|e| NetworkError::Serialization(e.to_string()))
+        let msg: Self =
+            serde_json::from_slice(data).map_err(|e| NetworkError::Serialization(e.to_string()))?;
+        msg.validate_limits()?;
+        Ok(msg)
     }
 
     pub fn to_wire_frame(&self) -> Result<Vec<u8>, NetworkError> {
         let payload = self.serialize()?;
+        if payload.len() > u32::MAX as usize {
+            return Err(NetworkError::Serialization(format!(
+                "Payload too large to encode: {}",
+                payload.len()
+            )));
+        }
         let mut frame = Vec::with_capacity(8 + payload.len());
         frame.extend_from_slice(&NETWORK_MAGIC);
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -218,9 +315,22 @@ impl NetworkMessage {
             ));
         }
         let len = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        if len > MAX_WIRE_FRAME_PAYLOAD {
+            return Err(NetworkError::Serialization(format!(
+                "Frame too large: {} > {}",
+                len, MAX_WIRE_FRAME_PAYLOAD
+            )));
+        }
         if data.len() < 8 + len {
             return Err(NetworkError::Serialization(format!(
                 "Incomplete frame: need {} got {}",
+                8 + len,
+                data.len()
+            )));
+        }
+        if data.len() != 8 + len {
+            return Err(NetworkError::Serialization(format!(
+                "Trailing bytes in frame: expected {} got {}",
                 8 + len,
                 data.len()
             )));
@@ -265,8 +375,50 @@ mod tests {
     }
 
     #[test]
+    fn oversized_frame_returns_error() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&NETWORK_MAGIC);
+        frame.extend_from_slice(&((MAX_WIRE_FRAME_PAYLOAD as u32) + 1).to_be_bytes());
+        assert!(NetworkMessage::from_wire_frame(&frame).is_err());
+    }
+
+    #[test]
+    fn trailing_bytes_in_frame_returns_error() {
+        let msg = NetworkMessage::ping(7);
+        let mut frame = msg.to_wire_frame().expect("serialize");
+        frame.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        assert!(NetworkMessage::from_wire_frame(&frame).is_err());
+    }
+
+    #[test]
     fn data_message_detection() {
         assert!(NetworkMessage::Block { raw: "x".into() }.is_data_message());
         assert!(!NetworkMessage::VerAck.is_data_message());
+    }
+
+    #[test]
+    fn deserialize_rejects_oversized_inv() {
+        let items = (0..(MAX_INV_ITEMS + 1))
+            .map(|i| InvItem {
+                kind: InvType::Block,
+                hash: format!("{:064x}", i),
+            })
+            .collect::<Vec<_>>();
+        let msg = NetworkMessage::Inv { items };
+        let json = serde_json::to_vec(&msg).expect("serialize test message");
+        assert!(NetworkMessage::deserialize(&json).is_err());
+    }
+
+    #[test]
+    fn deserialize_rejects_oversized_locator() {
+        let locator = (0..(MAX_HEADERS_ITEMS + 1))
+            .map(|i| format!("{:064x}", i))
+            .collect::<Vec<_>>();
+        let msg = NetworkMessage::GetHeaders {
+            locator,
+            stop_hash: String::new(),
+        };
+        let json = serde_json::to_vec(&msg).expect("serialize test message");
+        assert!(NetworkMessage::deserialize(&json).is_err());
     }
 }

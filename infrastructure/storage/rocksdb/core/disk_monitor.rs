@@ -101,6 +101,11 @@ impl DiskMonitor {
             unsafe {
                 let mut stat: libc::statvfs = std::mem::zeroed();
                 if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+                    // Widths are target-dependent: both fields are u64 on
+                    // linux-x86_64, but 32-bit unix targets define them as u32,
+                    // where dropping the casts would multiply in 32-bit and
+                    // overflow on volumes past 4 GiB.
+                    #[allow(clippy::unnecessary_cast)]
                     return Some(stat.f_bavail as u64 * stat.f_frsize as u64);
                 }
             }
@@ -125,6 +130,8 @@ impl DiskMonitor {
             let mut free_available: u64 = 0;
             let mut total: u64 = 0;
             let mut total_free: u64 = 0;
+            // SAFETY: `wide` is NUL-terminated and lives for the call; all output
+            // pointers refer to valid writable `u64` locals.
             let ret = unsafe {
                 GetDiskFreeSpaceExW(
                     wide.as_ptr(),

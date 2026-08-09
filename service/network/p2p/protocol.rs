@@ -36,7 +36,20 @@
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Stable per-process identity nonce, used ONLY for self-connection detection.
+/// Every outbound Version is stamped with this value, so if we ever RECEIVE a
+/// Version carrying it we know the connection is to ourselves (our own IP is in
+/// the bootstrap/seed list) and can drop it + stop re-dialing that address —
+/// otherwise a node churns endlessly connecting to itself instead of to real
+/// peers. Generated once. NOT used for Ping/Pong replay nonces, which stay
+/// per-message random.
+pub fn local_identity_nonce() -> u64 {
+    static NONCE: OnceLock<u64> = OnceLock::new();
+    *NONCE.get_or_init(rand_nonce)
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //                         PROTOCOL CONSTANTS
@@ -610,7 +623,7 @@ pub fn payload_size_bounds(cmd: CommandId) -> (usize, usize) {
         CommandId::Inv => (BINCODE_TAG + 1, BINCODE_TAG + 512 * 1024),
         CommandId::GetData => (BINCODE_TAG + 1, BINCODE_TAG + 512 * 1024),
         // Block: up to 2 MiB (MAX_BLOCK_SIZE is 2 MB per consensus)
-        CommandId::Block => (BINCODE_TAG + 60, 2 * 1024 * 1024),
+        CommandId::Block => (BINCODE_TAG + 60, MAX_MESSAGE_SIZE),
         // Tx: max 256 KiB (prevents single giant TXs with millions of inputs)
         CommandId::Tx => (BINCODE_TAG + 12, 256 * 1024),
         CommandId::GetHeaders => (BINCODE_TAG + 1, BINCODE_TAG + 1024),
@@ -1392,7 +1405,9 @@ pub fn build_version_payload(node_id: &str, best_height: u64, bps: u32) -> Versi
         bps,
         chain_id: CHAIN_ID,
         services: DEFAULT_SERVICES,
-        nonce: rand_nonce(),
+        // Stable identity nonce (not per-message random) so the peer can detect
+        // a self-connection by matching it against its own.
+        nonce: local_identity_nonce(),
     }
 }
 
@@ -1928,6 +1943,19 @@ mod tests {
     }
 
     // ── Version payload builder test ────────────────────────────────────
+
+    #[test]
+    fn identity_nonce_is_stable_and_stamped_on_version() {
+        // The identity nonce must be constant within a process AND be the value
+        // stamped on every Version — that's what lets a peer detect a
+        // self-connection (its own nonce echoed back). A per-message random
+        // nonce (the old behaviour) makes self-detection impossible.
+        let a = local_identity_nonce();
+        let b = local_identity_nonce();
+        assert_eq!(a, b, "identity nonce must be stable within the process");
+        let vp = build_version_payload("id:node", 5, DEFAULT_BPS);
+        assert_eq!(vp.nonce, a, "Version must carry the stable identity nonce");
+    }
 
     #[test]
     fn build_version_payload_valid() {

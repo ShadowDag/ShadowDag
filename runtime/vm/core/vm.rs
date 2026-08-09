@@ -948,14 +948,16 @@ impl VM {
                         Ok(v) => v,
                         Err(e) => return e,
                     };
-                    stack.push(b.shl(a.as_u64() as u32));
+                    // Clamp the shift to 256 (a >= 256 yields ZERO); never
+                    // truncate the operand to u32 or large shifts wrap wrong.
+                    stack.push(b.shl(a.shift_count()));
                 }
                 OpCode::SHR => {
                     let (a, b) = match Self::pop2(&mut stack, &gas, &mut pending) {
                         Ok(v) => v,
                         Err(e) => return e,
                     };
-                    stack.push(b.shr(a.as_u64() as u32));
+                    stack.push(b.shr(a.shift_count()));
                 }
 
                 // -- STORAGE (buffered via PendingBatch) --

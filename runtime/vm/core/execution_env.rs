@@ -14,13 +14,14 @@
 
 macro_rules! pop1 {
     ($stack:expr, $gas:expr, $snapshot:expr, $self:expr) => {
-        if $stack.is_empty() {
-            $self.state.rollback($snapshot).ok();
-            return CallOutcome::Failure {
-                gas_used: $gas.gas_used(),
-            };
-        } else {
-            $stack.pop().unwrap()
+        match $stack.pop() {
+            Some(v) => v,
+            None => {
+                $self.state.rollback($snapshot).ok();
+                return CallOutcome::Failure {
+                    gas_used: $gas.gas_used(),
+                };
+            }
         }
     };
 }
@@ -33,7 +34,15 @@ macro_rules! pop2 {
                 gas_used: $gas.gas_used(),
             };
         } else {
-            ($stack.pop().unwrap(), $stack.pop().unwrap())
+            match ($stack.pop(), $stack.pop()) {
+                (Some(a), Some(b)) => (a, b),
+                _ => {
+                    $self.state.rollback($snapshot).ok();
+                    return CallOutcome::Failure {
+                        gas_used: $gas.gas_used(),
+                    };
+                }
+            }
         }
     };
 }
@@ -72,6 +81,10 @@ pub const NEW_ACCOUNT_GAS: u64 = 25_000;
 pub const CALL_STIPEND: u64 = 2_300;
 pub const CODE_DEPOSIT_GAS_PER_BYTE: u64 = 200;
 pub const CREATE2_WORD_GAS: u64 = 6;
+/// Per-byte gas for LOG data payload (EVM LOG schedule: 8 gas/byte).
+pub const LOG_DATA_GAS_PER_BYTE: u64 = 8;
+/// Per-exponent-byte gas for EXP (EVM schedule: 50 gas per byte of the exponent).
+pub const EXP_GAS_PER_BYTE: u64 = 50;
 
 /// Block-level context (immutable for a transaction)
 #[derive(Debug, Clone)]
@@ -184,6 +197,26 @@ pub struct ExecutionEnvironment {
     /// `None` — they allocate their own fresh state and don't
     /// want any disk access in the middle of a frame.
     pub lazy_load_storage: Option<Arc<ContractStorage>>,
+    /// Per-transaction cache of storage slots hydrated from disk.
+    ///
+    /// `load_contract_from_storage` only ever reads `account:` and `code:`,
+    /// so before this existed nothing in the VM read a `contract:{addr}:slot:*`
+    /// row back: `SLOAD` consulted `state.storage`, an in-memory map populated
+    /// only by SSTOREs earlier in the SAME block. Every contract therefore
+    /// observed its entire storage as zero at the start of every block while
+    /// its writes kept landing on disk — on-disk state looked correct and was
+    /// unreadable.
+    ///
+    /// This is kept SEPARATE from `state.storage` on purpose. Seeding loaded
+    /// values into the state map would enter them into the write set that
+    /// `iter_storage()` persists and would entangle them with the revert
+    /// journal, so a revert could erase a value that was merely READ. Here a
+    /// revert correctly leaves the pre-transaction on-disk value visible.
+    ///
+    /// A `None` entry is a negative cache: the slot is genuinely absent.
+    /// Cleared per transaction in `begin_tx`, which matches the EIP-2929 cold
+    /// (2100 gas) accounting — that charge is what pays for this disk read.
+    storage_read_cache: HashMap<(String, String), Option<String>>,
     /// Runtime address registry — maps 20-byte canonical address bodies
     /// to the full ShadowDAG address string they were derived from.
     ///
@@ -221,6 +254,7 @@ impl ExecutionEnvironment {
             warm_storage_slots: HashSet::new(),
             address_registry: HashMap::new(),
             lazy_load_storage: None,
+            storage_read_cache: HashMap::new(),
         }
     }
 
@@ -233,6 +267,54 @@ impl ExecutionEnvironment {
     /// contract TXs; stand-alone callers (executor, tests) do
     /// not set it and get the pre-refactor "in-memory only"
     /// behaviour.
+    /// Read a storage slot, hydrating it from disk when this block has not
+    /// written it yet.
+    ///
+    /// Resolution order, and each step matters:
+    ///   1. `state.storage` — values SSTOREd earlier in this block. These must
+    ///      shadow the disk, otherwise a write would be invisible to a later
+    ///      read in the same block.
+    ///   2. the per-transaction read cache, including negative entries.
+    ///   3. the on-disk row `contract:{addr}:{key}` — the same key
+    ///      `persist_to_storage` writes, via the same `contract:` prefixing
+    ///      that `commit_batch` and `get_state` both apply.
+    ///
+    /// FAIL-CLOSED. `get_state` swallows an I/O error and a UTF-8 error as
+    /// `None`; used here that would hand the contract a fabricated zero for a
+    /// slot that really holds a value, on one node and not another — a silent
+    /// consensus split from a transient disk fault. `get_state_strict`
+    /// separates "absent" from "could not read", and the caller turns the
+    /// latter into a frame failure. This mirrors the fail-closed discipline
+    /// the code lazy-loading path already uses.
+    ///
+    /// A destroyed contract is never hydrated: its rows are pending deletion
+    /// in this same batch, so resurrecting them would undo the SELFDESTRUCT.
+    fn storage_load_hydrated(
+        &mut self,
+        address: &str,
+        key: &str,
+    ) -> Result<Option<String>, crate::errors::StorageError> {
+        if let Some(v) = self.state.storage_load(address, key) {
+            return Ok(Some(v));
+        }
+        if self.destroyed_contracts.contains(address) {
+            return Ok(None);
+        }
+        let cache_key = (address.to_string(), key.to_string());
+        if let Some(cached) = self.storage_read_cache.get(&cache_key) {
+            return Ok(cached.clone());
+        }
+        let storage = match self.lazy_load_storage.clone() {
+            Some(s) => s,
+            // No storage handle (unit tests, and `Executor`'s standalone
+            // environments): in-memory state is the whole world.
+            None => return Ok(None),
+        };
+        let loaded = storage.get_state_strict(&format!("{}:{}", address, key))?;
+        self.storage_read_cache.insert(cache_key, loaded.clone());
+        Ok(loaded)
+    }
+
     pub fn with_lazy_load_storage(mut self, storage: Arc<ContractStorage>) -> Self {
         self.lazy_load_storage = Some(storage);
         self
@@ -293,6 +375,10 @@ impl ExecutionEnvironment {
         self.reentrant_guard.clear();
         self.warm_addresses.clear();
         self.warm_storage_slots.clear();
+        // Same lifetime as warm_storage_slots: the EIP-2929 cold charge is
+        // levied once per transaction, so the disk read it pays for must be
+        // repeated once per transaction too.
+        self.storage_read_cache.clear();
     }
 
     /// Register an address string in the runtime registry so that later
@@ -742,6 +828,17 @@ impl ExecutionEnvironment {
         })?;
         wb.put(undo_key.as_bytes(), &undo_bytes);
 
+        // Contract-applied marker, in the SAME atomic batch as the contract
+        // state. The block-apply path commits UTXO state (with its
+        // `utxo:commitment:` marker) to a SEPARATE RocksDB, then persists
+        // contracts here. A crash BETWEEN those two commits would leave the
+        // UTXO commitment present but contract state missing; recovery keys
+        // idempotency off this marker so such a block is RE-EXECUTED rather than
+        // skipped (otherwise the contract-state hole is permanent → state_root
+        // divergence on contract chains).
+        let applied_key = format!("contract:applied:{}", block_hash);
+        wb.put(applied_key.as_bytes(), [1u8]);
+
         // Commit state + undo atomically via the shared DB handle.
         storage.shared_db().write(wb).map_err(|e| {
             VmError::Other(format!(
@@ -1013,6 +1110,21 @@ impl ExecutionEnvironment {
         true
     }
 
+    /// Charge the per-word copy cost (EVM: 3 gas per 32-byte word) for the
+    /// *COPY opcodes, in ADDITION to the base + memory-expansion cost. Without
+    /// this, a tight loop copying into already-warm memory pays only the flat
+    /// base gas, letting an attacker amplify native copy work (hundreds of GB
+    /// per block-gas budget) far beyond what is charged — a CPU/bandwidth DoS
+    /// replayed by every validating node. Returns false on out-of-gas.
+    fn charge_copy_words(gas: &mut GasMeter, length: usize) -> bool {
+        let words = (length as u64).div_ceil(32);
+        let cost = words.saturating_mul(MEMORY_GAS_PER_WORD);
+        if cost == 0 {
+            return true;
+        }
+        !matches!(gas.consume(cost), GasResult::OutOfGas { .. })
+    }
+
     /// Read `len` bytes from `memory` starting at `offset`, zero-padded
     /// to exactly `len` bytes if the requested window extends past the
     /// current memory buffer.
@@ -1155,12 +1267,13 @@ impl ExecutionEnvironment {
             };
         }
 
-        // NOTE: Reentrancy guard is NOT checked here. It is checked and
-        // managed at each CALL/STATICCALL/CREATE site within the opcode
-        // handlers below. This ensures proper insert-before + remove-after
-        // semantics without modifying 121 return points in execute_frame.
-        // See the `reentrant_guard` insert/remove pairs at CALL, CALLCODE,
-        // DELEGATECALL, STATICCALL, CREATE, and CREATE2 handlers.
+        // NOTE: the reentrancy guard is NOT managed inside execute_frame. Both
+        // child frames (CALL/STATICCALL/CALLCODE/CREATE/CREATE2 opcode handlers)
+        // AND top-level entries (executor::deploy/call, FullNode Contract*) invoke
+        // `execute_frame_guarded`, which performs the single insert-before /
+        // remove-after of `ctx.address` for non-delegate frames. Routing the
+        // top-level entry through the guard is what protects the entry-point
+        // contract itself from A->B->A reentrancy.
 
         // Register the frame's caller, storage address, and code address
         // in the runtime address registry so that every later CALLER /
@@ -1459,7 +1572,12 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let top = *stack.last().unwrap();
+                    let Some(&top) = stack.last() else {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    };
                     stack.push(top);
                 }
                 OpCode::SWAP => {
@@ -1504,12 +1622,17 @@ impl ExecutionEnvironment {
                 }
                 OpCode::EXP => {
                     let (base, exp) = pop2!(stack, gas, snapshot, self);
-                    let exp_val = exp.as_u64().min(255);
-                    let mut result = U256::ONE;
-                    for _ in 0..exp_val {
-                        result = result.wrapping_mul(base);
+                    // Per-exponent-byte gas (EVM: 50 per byte of the exponent) on top of
+                    // the flat base, so heavy exponentiation is not undercharged relative
+                    // to the native square-and-multiply work (B5-L01).
+                    let exp_byte_cost =
+                        (exp.bit_len() as u64).div_ceil(8).saturating_mul(EXP_GAS_PER_BYTE);
+                    if let GasResult::OutOfGas { .. } = gas.consume(exp_byte_cost) {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure { gas_used: gas.gas_used() };
                     }
-                    stack.push(result);
+                    // Full 256-bit exponent via square-and-multiply (mod 2^256).
+                    stack.push(base.wrapping_pow(exp));
                 }
                 OpCode::ADDMOD => {
                     if stack.len() < 3 {
@@ -1518,14 +1641,11 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let a = stack.pop().unwrap();
-                    let b = stack.pop().unwrap();
-                    let n = stack.pop().unwrap();
-                    stack.push(if n.is_zero() {
-                        U256::ZERO
-                    } else {
-                        a.wrapping_add(b).checked_mod(n)
-                    });
+                    let a = pop1!(stack, gas, snapshot, self);
+                    let b = pop1!(stack, gas, snapshot, self);
+                    let n = pop1!(stack, gas, snapshot, self);
+                    // Carry-correct: (a+b) mod n computed over the full 257-bit sum.
+                    stack.push(a.add_mod(b, n));
                 }
                 OpCode::MULMOD => {
                     if stack.len() < 3 {
@@ -1534,14 +1654,11 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let a = stack.pop().unwrap();
-                    let b = stack.pop().unwrap();
-                    let n = stack.pop().unwrap();
-                    stack.push(if n.is_zero() {
-                        U256::ZERO
-                    } else {
-                        a.wrapping_mul(b).checked_mod(n)
-                    });
+                    let a = pop1!(stack, gas, snapshot, self);
+                    let b = pop1!(stack, gas, snapshot, self);
+                    let n = pop1!(stack, gas, snapshot, self);
+                    // Full-width: (a*b) mod n without truncating the 512-bit product.
+                    stack.push(a.mul_mod(b, n));
                 }
 
                 // ── Comparison ───────────────────────────────
@@ -1581,11 +1698,13 @@ impl ExecutionEnvironment {
                 }
                 OpCode::SHL => {
                     let (a, b) = pop2!(stack, gas, snapshot, self);
-                    stack.push(b.shl(a.as_u64() as u32));
+                    // Clamp the shift to 256 (a >= 256 yields ZERO); never
+                    // truncate the operand to u32 or large shifts wrap wrong.
+                    stack.push(b.shl(a.shift_count()));
                 }
                 OpCode::SHR => {
                     let (a, b) = pop2!(stack, gas, snapshot, self);
-                    stack.push(b.shr(a.as_u64() as u32));
+                    stack.push(b.shr(a.shift_count()));
                 }
 
                 // ── Storage ──────────────────────────────────
@@ -1610,7 +1729,24 @@ impl ExecutionEnvironment {
                         return CallOutcome::Failure { gas_used: gas.gas_used() };
                     }
 
-                    let val = match self.state.storage_load(&ctx.address, &key) {
+                    // Hydrates from disk on a miss. Before this, a slot written
+                    // in an earlier block read back as zero, so any one-shot
+                    // guard (`initialized`, `owner`, a reentrancy mutex) was
+                    // re-openable in the next block.
+                    let stored = match self.storage_load_hydrated(&ctx.address, &key) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            crate::slog_error!("vm", "sload_storage_read_failed_surfacing_as_failure",
+                                contract => &ctx.address,
+                                key => &key,
+                                error => &format!("{}", e));
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                    };
+                    let val = match stored {
                         None => U256::ZERO,
                         Some(raw) => match parse_storage_value_checked(&raw) {
                             Some(v) => v,
@@ -1768,7 +1904,7 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let requested = stack.pop().unwrap();
+                    let requested = pop1!(stack, gas, snapshot, self);
                     let mut hasher = <Sha256 as Digest>::new();
                     Digest::update(&mut hasher, b"ShadowDAG_BLOCKHASH_v2");
                     Digest::update(&mut hasher, self.block_ctx.block_hash.as_bytes());
@@ -1829,40 +1965,68 @@ impl ExecutionEnvironment {
 
                 // ── Memory ───────────────────────────────────
                 OpCode::MLOAD => {
-                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
-                    if offset + 32 > MAX_MEMORY_SIZE {
-                        self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure {
-                            gas_used: gas.gas_used(),
-                        };
-                    }
-                    if !Self::charge_and_expand_memory(&mut gas, &mut memory, offset + 32) {
+                    // to_mem_offset: reject offsets >= 2^64 BEFORE truncation.
+                    // `as_u64() as usize` would wrap such an offset to a small
+                    // in-bounds value (EVM faults instead), diverging from spec.
+                    let offset = match pop1!(stack, gas, snapshot, self).to_mem_offset() {
+                        Some(o) => o,
+                        None => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                    };
+                    // checked_add: offset is attacker-controlled (up to u64::MAX);
+                    // a raw `offset + 32` wraps in release and slips past the
+                    // MAX_MEMORY_SIZE guard, then panics on the slice.
+                    let end = match offset.checked_add(32) {
+                        Some(e) if e <= MAX_MEMORY_SIZE => e,
+                        _ => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                    };
+                    if !Self::charge_and_expand_memory(&mut gas, &mut memory, end) {
                         self.state.rollback(snapshot).ok();
                         return CallOutcome::Failure {
                             gas_used: gas.gas_used(),
                         };
                     }
                     let mut buf = [0u8; 32];
-                    buf.copy_from_slice(&memory[offset..offset + 32]);
+                    buf.copy_from_slice(&memory[offset..end]);
                     stack.push(U256::from_be_bytes(&buf));
                 }
                 OpCode::MSTORE => {
                     let (offset_val, val) = pop2!(stack, gas, snapshot, self);
-                    let offset = offset_val.as_u64() as usize;
-                    if offset + 32 > MAX_MEMORY_SIZE {
-                        self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure {
-                            gas_used: gas.gas_used(),
-                        };
-                    }
-                    if !Self::charge_and_expand_memory(&mut gas, &mut memory, offset + 32) {
+                    let offset = match offset_val.to_mem_offset() {
+                        Some(o) => o,
+                        None => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                    };
+                    let end = match offset.checked_add(32) {
+                        Some(e) if e <= MAX_MEMORY_SIZE => e,
+                        _ => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                    };
+                    if !Self::charge_and_expand_memory(&mut gas, &mut memory, end) {
                         self.state.rollback(snapshot).ok();
                         return CallOutcome::Failure {
                             gas_used: gas.gas_used(),
                         };
                     }
                     let bytes = val.to_be_bytes();
-                    memory[offset..offset + 32].copy_from_slice(&bytes);
+                    memory[offset..end].copy_from_slice(&bytes);
                 }
 
                 // ── Logging ──────────────────────────────────
@@ -1901,8 +2065,8 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let offset = stack.pop().unwrap().as_u64() as usize;
-                    let size = stack.pop().unwrap().as_u64() as usize;
+                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let size = pop1!(stack, gas, snapshot, self).as_u64() as usize;
                     // EVM semantics: RETURN's memory window is
                     // virtual — bytes past the end of the current
                     // memory buffer are zero, not "truncated to
@@ -1950,8 +2114,8 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let offset = stack.pop().unwrap().as_u64() as usize;
-                    let size = stack.pop().unwrap().as_u64() as usize;
+                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let size = pop1!(stack, gas, snapshot, self).as_u64() as usize;
                     // Same zero-padding / checked-add fix as RETURN.
                     // REVERT must still produce the exact `size`
                     // bytes the contract asked for, zero-filling any
@@ -1983,13 +2147,13 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let req_gas = stack.pop().unwrap().as_u64();
-                    let addr = stack.pop().unwrap();
-                    let call_value = stack.pop().unwrap().as_u64();
-                    let args_offset = stack.pop().unwrap().as_u64() as usize;
-                    let args_len = stack.pop().unwrap().as_u64() as usize;
-                    let ret_offset = stack.pop().unwrap().as_u64() as usize;
-                    let ret_len = stack.pop().unwrap().as_u64() as usize;
+                    let req_gas = pop1!(stack, gas, snapshot, self).as_u64();
+                    let addr = pop1!(stack, gas, snapshot, self);
+                    let call_value = pop1!(stack, gas, snapshot, self).as_u64();
+                    let args_offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let args_len = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let ret_offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let ret_len = pop1!(stack, gas, snapshot, self).as_u64() as usize;
 
                     // Static check: CALL with value > 0 inside STATICCALL is forbidden.
                     //
@@ -2253,12 +2417,12 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let req_gas = stack.pop().unwrap().as_u64();
-                    let addr = stack.pop().unwrap();
-                    let args_offset = stack.pop().unwrap().as_u64() as usize;
-                    let args_len = stack.pop().unwrap().as_u64() as usize;
-                    let ret_offset = stack.pop().unwrap().as_u64() as usize;
-                    let ret_len = stack.pop().unwrap().as_u64() as usize;
+                    let req_gas = pop1!(stack, gas, snapshot, self).as_u64();
+                    let addr = pop1!(stack, gas, snapshot, self);
+                    let args_offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let args_len = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let ret_offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let ret_len = pop1!(stack, gas, snapshot, self).as_u64() as usize;
 
                     let remaining = gas.gas_remaining();
                     let max_allowed = remaining - remaining / 64;
@@ -2400,12 +2564,12 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let req_gas = stack.pop().unwrap().as_u64();
-                    let code_addr = stack.pop().unwrap();
-                    let args_offset = stack.pop().unwrap().as_u64() as usize;
-                    let args_len = stack.pop().unwrap().as_u64() as usize;
-                    let ret_offset = stack.pop().unwrap().as_u64() as usize;
-                    let ret_len = stack.pop().unwrap().as_u64() as usize;
+                    let req_gas = pop1!(stack, gas, snapshot, self).as_u64();
+                    let code_addr = pop1!(stack, gas, snapshot, self);
+                    let args_offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let args_len = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let ret_offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let ret_len = pop1!(stack, gas, snapshot, self).as_u64() as usize;
 
                     let remaining = gas.gas_remaining();
                     let max_allowed = remaining - remaining / 64;
@@ -2523,13 +2687,13 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let req_gas = stack.pop().unwrap().as_u64();
-                    let code_addr = stack.pop().unwrap();
-                    let call_value = stack.pop().unwrap().as_u64();
-                    let args_offset = stack.pop().unwrap().as_u64() as usize;
-                    let args_len = stack.pop().unwrap().as_u64() as usize;
-                    let ret_offset = stack.pop().unwrap().as_u64() as usize;
-                    let ret_len = stack.pop().unwrap().as_u64() as usize;
+                    let req_gas = pop1!(stack, gas, snapshot, self).as_u64();
+                    let code_addr = pop1!(stack, gas, snapshot, self);
+                    let call_value = pop1!(stack, gas, snapshot, self).as_u64();
+                    let args_offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let args_len = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let ret_offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let ret_len = pop1!(stack, gas, snapshot, self).as_u64() as usize;
 
                     // Static check: CALLCODE with value > 0 is
                     // forbidden inside a static frame. Clear the
@@ -2691,9 +2855,9 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let create_value = stack.pop().unwrap().as_u64();
-                    let offset = stack.pop().unwrap().as_u64() as usize;
-                    let length = stack.pop().unwrap().as_u64() as usize;
+                    let create_value = pop1!(stack, gas, snapshot, self).as_u64();
+                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let length = pop1!(stack, gas, snapshot, self).as_u64() as usize;
 
                     // Read init code from memory with the
                     // zero-padding / checked-add helper. A window
@@ -2928,13 +3092,16 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let create_value = stack.pop().unwrap().as_u64();
-                    let offset = stack.pop().unwrap().as_u64() as usize;
-                    let length = stack.pop().unwrap().as_u64() as usize;
-                    let salt = stack.pop().unwrap();
+                    let create_value = pop1!(stack, gas, snapshot, self).as_u64();
+                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let length = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let salt = pop1!(stack, gas, snapshot, self);
 
-                    let init_code = if length > 0 && offset + length <= memory.len() {
-                        memory[offset..offset + length].to_vec()
+                    let init_code = if length > 0
+                        && offset.checked_add(length).is_some_and(|e| e <= memory.len())
+                    {
+                        let end = offset + length; // safe: checked above
+                        memory[offset..end].to_vec()
                     } else {
                         stack.push(U256::ZERO);
                         pc += 1;
@@ -3088,7 +3255,7 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let beneficiary_val = stack.pop().unwrap();
+                    let beneficiary_val = pop1!(stack, gas, snapshot, self);
                     // Resolve the beneficiary body back to its
                     // ShadowDAG string via the runtime registry. This
                     // is the same fix as BALANCE / CALL / etc. — a
@@ -3204,14 +3371,25 @@ impl ExecutionEnvironment {
                 // ── Memory (extended) ───────────────────────
                 OpCode::MSTORE8 => {
                     let (offset_val, val) = pop2!(stack, gas, snapshot, self);
-                    let offset = offset_val.as_u64() as usize;
-                    if offset + 1 > MAX_MEMORY_SIZE {
-                        self.state.rollback(snapshot).ok();
-                        return CallOutcome::Failure {
-                            gas_used: gas.gas_used(),
-                        };
-                    }
-                    if !Self::charge_and_expand_memory(&mut gas, &mut memory, offset + 1) {
+                    let offset = match offset_val.to_mem_offset() {
+                        Some(o) => o,
+                        None => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                    };
+                    let end = match offset.checked_add(1) {
+                        Some(e) if e <= MAX_MEMORY_SIZE => e,
+                        _ => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                    };
+                    if !Self::charge_and_expand_memory(&mut gas, &mut memory, end) {
                         self.state.rollback(snapshot).ok();
                         return CallOutcome::Failure {
                             gas_used: gas.gas_used(),
@@ -3244,7 +3422,12 @@ impl ExecutionEnvironment {
                         OpCode::LOG2 => 2,
                         OpCode::LOG3 => 3,
                         OpCode::LOG4 => 4,
-                        _ => unreachable!(),
+                        _ => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
                     };
                     // Need offset + length + num_topics items on stack
                     if stack.len() < 2 + num_topics {
@@ -3253,23 +3436,44 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let offset = stack.pop().unwrap().as_u64() as usize;
-                    let length = stack.pop().unwrap().as_u64() as usize;
+                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let length = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    // Per-byte log-data gas (EVM LOG: 8 gas/byte). The base opcode
+                    // gas covers 375 + 375*topics but NOT the payload; without this a
+                    // loop of LOG over warm memory forces every validating node to
+                    // materialize huge log payloads far below the intended cost (B5-M01).
+                    if let GasResult::OutOfGas { .. } =
+                        gas.consume((length as u64).saturating_mul(LOG_DATA_GAS_PER_BYTE))
+                    {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     let mut topics = Vec::with_capacity(num_topics);
                     for _ in 0..num_topics {
-                        topics.push(stack.pop().unwrap());
+                        topics.push(pop1!(stack, gas, snapshot, self));
                     }
                     // Read data from memory, charging for any expansion.
                     let data = if length == 0 {
                         Vec::new()
                     } else {
-                        if !Self::charge_and_expand_memory(&mut gas, &mut memory, offset + length) {
+                        let end = match offset.checked_add(length) {
+                            Some(e) => e,
+                            None => {
+                                self.state.rollback(snapshot).ok();
+                                return CallOutcome::Failure {
+                                    gas_used: gas.gas_used(),
+                                };
+                            }
+                        };
+                        if !Self::charge_and_expand_memory(&mut gas, &mut memory, end) {
                             self.state.rollback(snapshot).ok();
                             return CallOutcome::Failure {
                                 gas_used: gas.gas_used(),
                             };
                         }
-                        memory[offset..offset + length].to_vec()
+                        memory[offset..end].to_vec()
                     };
                     logs.push(LogEntry {
                         contract: ctx.address.clone(),
@@ -3280,7 +3484,9 @@ impl ExecutionEnvironment {
 
                 // ── Call data ───────────────────────────────
                 OpCode::CALLDATALOAD => {
-                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    // to_mem_offset is None for offsets >= 2^64, which are wholly
+                    // beyond calldata; EVM zero-pads (no fault), so leave buf zero.
+                    let offset_opt = pop1!(stack, gas, snapshot, self).to_mem_offset();
                     if stack.len() >= MAX_STACK_SIZE {
                         self.state.rollback(snapshot).ok();
                         return CallOutcome::Failure {
@@ -3288,9 +3494,15 @@ impl ExecutionEnvironment {
                         };
                     }
                     let mut buf = [0u8; 32];
-                    for (i, byte) in buf.iter_mut().enumerate() {
-                        if offset + i < ctx.calldata.len() {
-                            *byte = ctx.calldata[offset + i];
+                    if let Some(offset) = offset_opt {
+                        for (i, byte) in buf.iter_mut().enumerate() {
+                            // checked_add: offset is attacker-controlled; a raw
+                            // offset + i wraps in release and could index OOB.
+                            if let Some(idx) = offset.checked_add(i) {
+                                if idx < ctx.calldata.len() {
+                                    *byte = ctx.calldata[idx];
+                                }
+                            }
                         }
                     }
                     stack.push(U256::from_be_bytes(&buf));
@@ -3311,9 +3523,9 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let dest = stack.pop().unwrap().as_u64() as usize;
-                    let offset = stack.pop().unwrap().as_u64() as usize;
-                    let length = stack.pop().unwrap().as_u64() as usize;
+                    let dest = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let length = pop1!(stack, gas, snapshot, self).as_u64() as usize;
                     if length > 0 {
                         let dest_end = match dest.checked_add(length) {
                             Some(end) => end,
@@ -3331,6 +3543,14 @@ impl ExecutionEnvironment {
                             };
                         }
                         if !Self::charge_and_expand_memory(&mut gas, &mut memory, dest_end) {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                        // Per-word copy cost (anti-DoS): without it a warm-memory
+                        // copy loop costs only the flat base gas.
+                        if !Self::charge_copy_words(&mut gas, length) {
                             self.state.rollback(snapshot).ok();
                             return CallOutcome::Failure {
                                 gas_used: gas.gas_used(),
@@ -3366,9 +3586,9 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let dest = stack.pop().unwrap().as_u64() as usize;
-                    let offset = stack.pop().unwrap().as_u64() as usize;
-                    let length = stack.pop().unwrap().as_u64() as usize;
+                    let dest = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let length = pop1!(stack, gas, snapshot, self).as_u64() as usize;
                     if length > 0 {
                         let dest_end = match dest.checked_add(length) {
                             Some(end) => end,
@@ -3386,6 +3606,13 @@ impl ExecutionEnvironment {
                             };
                         }
                         if !Self::charge_and_expand_memory(&mut gas, &mut memory, dest_end) {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                        // Per-word copy cost (anti-DoS), as for CALLDATACOPY.
+                        if !Self::charge_copy_words(&mut gas, length) {
                             self.state.rollback(snapshot).ok();
                             return CallOutcome::Failure {
                                 gas_used: gas.gas_used(),
@@ -3432,9 +3659,9 @@ impl ExecutionEnvironment {
                             gas_used: gas.gas_used(),
                         };
                     }
-                    let dest = stack.pop().unwrap().as_u64() as usize;
-                    let offset = stack.pop().unwrap().as_u64() as usize;
-                    let length = stack.pop().unwrap().as_u64() as usize;
+                    let dest = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let offset = pop1!(stack, gas, snapshot, self).as_u64() as usize;
+                    let length = pop1!(stack, gas, snapshot, self).as_u64() as usize;
                     if length > 0 {
                         // Bounds check against return data (EIP-211).
                         // Use checked_add on both the source and
@@ -3479,6 +3706,13 @@ impl ExecutionEnvironment {
                                 gas_used: gas.gas_used(),
                             };
                         }
+                        // Per-word copy cost (anti-DoS), as for CALLDATACOPY.
+                        if !Self::charge_copy_words(&mut gas, length) {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
                         memory[dest..dest + length]
                             .copy_from_slice(&self.last_return_data[offset..offset + length]);
                     }
@@ -3500,7 +3734,12 @@ impl ExecutionEnvironment {
                         OpCode::DUP6 => 6,
                         OpCode::DUP7 => 7,
                         OpCode::DUP8 => 8,
-                        _ => unreachable!(),
+                        _ => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
                     };
                     if stack.len() < n {
                         self.state.rollback(snapshot).ok();
@@ -3523,7 +3762,12 @@ impl ExecutionEnvironment {
                         OpCode::SWAP2 => 3usize, // swap top with 3rd from top
                         OpCode::SWAP3 => 4,      // swap top with 4th from top
                         OpCode::SWAP4 => 5,      // swap top with 5th from top
-                        _ => unreachable!(),
+                        _ => {
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
                     };
                     if stack.len() < n {
                         self.state.rollback(snapshot).ok();
@@ -3796,6 +4040,73 @@ mod tests {
         };
         let result = env.execute_frame(&ctx);
         assert!(matches!(result, CallOutcome::Success { .. }));
+    }
+
+    #[test]
+    fn exp_charges_per_exponent_byte() {
+        // Regression (B5-L01): EXP charges EXP_GAS_PER_BYTE per byte of the exponent,
+        // so a 32-byte operand pair costs ~31*50 gas more than a 1-byte pair. Both
+        // operands are made equal-width so the test is independent of pop2! order.
+        fn run_exp(push: &[u8]) -> u64 {
+            let mut env = make_env();
+            let mut code: Vec<u8> = Vec::new();
+            code.extend_from_slice(push); // base
+            code.extend_from_slice(push); // exponent
+            code.push(0x25); // EXP (vm.rs OpCode encoding)
+            code.push(0x00); // STOP
+            env.state.set_code("c", code).unwrap();
+            let ctx = CallContext {
+                address: "c".into(),
+                code_address: "c".into(),
+                caller: "u".into(),
+                value: 0,
+                gas_limit: 1_000_000,
+                calldata: vec![],
+                is_static: false,
+                depth: 0,
+                is_delegate: false,
+            };
+            match env.execute_frame(&ctx) {
+                CallOutcome::Success { gas_used, .. } => gas_used,
+                _ => panic!("EXP execution did not succeed"),
+            }
+        }
+        let small = run_exp(&[0x10, 3]); // PUSH1 3  -> 1-byte exponent
+        let mut big_push = vec![0x15]; // PUSH32
+        big_push.extend_from_slice(&[0xFF; 32]); // 32-byte operand
+        let big = run_exp(&big_push);
+        assert!(
+            big >= small + 31 * EXP_GAS_PER_BYTE,
+            "big={big} small={small} expected diff >= {}",
+            31 * EXP_GAS_PER_BYTE
+        );
+    }
+
+    #[test]
+    fn mstore_huge_offset_fails_without_panic() {
+        // Regression (C1): a near-usize::MAX offset must NOT wrap past the
+        // MAX_MEMORY_SIZE guard and panic on the slice — it must fail cleanly.
+        let mut env = make_env();
+        // PUSH8 0xFFFF..FF (value), PUSH8 0xFFFF..FF (offset), MSTORE
+        let code: Vec<u8> = vec![
+            0x13, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // PUSH8 value
+            0x13, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // PUSH8 offset
+            0x91, // MSTORE
+        ];
+        env.state.set_code("c", code).unwrap();
+        let ctx = CallContext {
+            address: "c".into(),
+            code_address: "c".into(),
+            caller: "u".into(),
+            value: 0,
+            gas_limit: 1_000_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
+        };
+        let result = env.execute_frame(&ctx);
+        assert!(matches!(result, CallOutcome::Failure { .. }));
     }
 
     #[test]
@@ -5502,6 +5813,74 @@ mod tests {
     /// persist again. Afterwards the on-disk account, code, and
     /// every storage slot for the destroyed contract must be
     /// gone — not "still sitting on disk with pre-destroy state".
+    /// A slot written in one block MUST be readable by SLOAD in the next.
+    ///
+    /// Before the hydration fix, `load_contract_from_storage` read only
+    /// `account:` and `code:`, and SLOAD consulted an in-memory map populated
+    /// solely by SSTOREs in the current block — so every contract saw its whole
+    /// storage as zero at the start of every block. Any one-shot guard
+    /// (`initialized`, `owner`, a reentrancy mutex) was re-openable, and token
+    /// balances reset each block.
+    #[test]
+    fn sload_reads_back_a_slot_persisted_by_an_earlier_block() {
+        use std::sync::Arc;
+        let storage = Arc::new(tmp_contract_storage());
+
+        // ── Block 1: the contract stores a value and the block is persisted.
+        {
+            let mut env = make_env();
+            env.state.set_code("guarded", vec![0x00]).unwrap();
+            env.state.storage_store("guarded", "slot:0", "0x01");
+            env.persist_to_storage(&storage).expect("persist block 1");
+        }
+        assert!(
+            storage.get_state("guarded:slot:0").is_some(),
+            "precondition: the slot row must actually be on disk"
+        );
+
+        // ── Block 2: a brand-new environment, exactly as the block executor
+        // builds one. Nothing has SSTOREd in this block, so the value can only
+        // come from disk.
+        let mut env = make_env().with_lazy_load_storage(storage.clone());
+        env.begin_tx();
+        env.state.set_code("guarded", vec![0x00]).unwrap();
+
+        // PUSH1 0; SLOAD; PUSH1 0; MSTORE; PUSH1 32; PUSH1 0; RETURN
+        let code = vec![
+            0x10, 0x00, // PUSH1 0
+            0x50, // SLOAD
+            0x10, 0x00, // PUSH1 0
+            0x91, // MSTORE
+            0x10, 0x20, // PUSH1 32
+            0x10, 0x00, // PUSH1 0
+            0xB6, // RETURN
+        ];
+        env.state.set_code("guarded", code).unwrap();
+
+        let ctx = CallContext {
+            address: "guarded".to_string(),
+            code_address: "guarded".to_string(),
+            caller: "caller".to_string(),
+            value: 0,
+            calldata: Vec::new(),
+            gas_limit: 1_000_000,
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
+        };
+        match env.execute_frame_guarded(&ctx) {
+            CallOutcome::Success { return_data, .. } => {
+                let word = U256::from_be_bytes(&return_data[..32].try_into().unwrap());
+                assert_eq!(
+                    word,
+                    U256::from_u64(1),
+                    "SLOAD must return the value persisted by the earlier block, not zero"
+                );
+            }
+            other => panic!("frame must succeed, got {:?}", other),
+        }
+    }
+
     #[test]
     fn persist_to_storage_deletes_destroyed_contract_rows_and_slots() {
         let storage = tmp_contract_storage();
@@ -5817,6 +6196,42 @@ mod tests {
             }
             other => panic!("expected Success, got {:?}", other),
         }
+    }
+
+    // Reentrancy guard must protect the ENTRY-POINT contract, not just child
+    // frames. Top-level entries now run via execute_frame_guarded, which
+    // registers the address; a re-entry into a registered address is rejected.
+    #[test]
+    fn reentrancy_guard_blocks_reentry_to_registered_address() {
+        let mut env = make_env();
+        // Trivial program: PUSH1 0 (size), PUSH1 0 (offset), RETURN → Success.
+        env.state
+            .set_code("victim", vec![0x10, 0, 0x10, 0, 0xB6])
+            .unwrap();
+        let ctx = CallContext {
+            address: "victim".into(),
+            code_address: "victim".into(),
+            caller: "user".into(),
+            value: 0,
+            gas_limit: 100_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
+        };
+        // Fresh guarded entry succeeds and leaves the guard clean on exit.
+        assert!(matches!(
+            env.execute_frame_guarded(&ctx),
+            CallOutcome::Success { .. }
+        ));
+        assert!(!env.reentrant_guard.contains("victim"));
+        // With the entry address already registered (as a top-level entry now
+        // does for the duration of its frame), a re-entry MUST be rejected.
+        env.reentrant_guard.insert("victim".to_string());
+        assert!(matches!(
+            env.execute_frame_guarded(&ctx),
+            CallOutcome::Failure { .. }
+        ));
     }
 
     // M-P0-9 — DELEGATECALL to an empty-code target must NOT issue

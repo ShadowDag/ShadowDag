@@ -1,0 +1,20 @@
+# Prometheus scrape configuration for a ShadowDAG node.
+#
+# The node serves metrics at GET /metrics on its RPC port (default 9332).
+# Keep the RPC port OFF the public internet; let Prometheus reach it over the
+# private/docker network instead (see docker-compose.monitoring.yml).
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: shadowdag-node
+    metrics_path: /metrics
+    static_configs:
+      # When run via docker-compose.monitoring.yml, "node" resolves to the
+      # node container on the shared network. For a host node, use the node's
+      # host:rpc_port (e.g. 127.0.0.1:9332) and run Prometheus with host networking.
+      - targets: ["node:9332"]
+        labels:
+          instance: shadowdag-mainnet

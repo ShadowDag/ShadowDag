@@ -13,33 +13,35 @@ pub const MAX_VALID_NONCE: u64 = u64::MAX;
 pub const MIN_VALID_NONCE: u64 = 0;
 
 // حدود الوقت
-/// Canonical value: 120s (see block_validator::MAX_FUTURE_SECS).
-pub const MAX_FUTURE_SECS: u64 = 120;
-pub const MAX_PAST_SECS: u64 = 600;
+/// Canonical future-drift bound in MILLISECONDS (120 s of real time).
+/// Timestamps are unix epoch ms. Shares ConsensusParams::MAX_FUTURE_MS.
+pub const MAX_FUTURE_MS: u64 =
+    crate::config::consensus::consensus_params::ConsensusParams::MAX_FUTURE_MS;
 
 pub struct FloodProtection;
 
 impl FloodProtection {
     pub fn validate(block: &Block) -> bool {
-        // 1️⃣ Timestamp — wall-clock sanity only.
-        //    Full timestamp validation (MTP, causality, jump limits) is in
-        //    block_validator::validate_timestamp(). This is just a fast
-        //    pre-filter to reject obviously bogus timestamps at the P2P layer.
+        // Timestamp sanity — reject ONLY blocks dated too far in the FUTURE (a
+        // block cannot come from ahead of the wall clock). We deliberately do
+        // NOT reject blocks with OLD timestamps: during sync/IBD a node
+        // legitimately receives HISTORICAL blocks that are minutes/hours/days
+        // old. A wall-clock "too far in the past" reject here made catch-up
+        // IMPOSSIBLE — any node more than a few minutes behind rejected every
+        // backlog block at the P2P layer (and, being a consensus-layer reject,
+        // banned the peer serving the backlog), so the chain never converged.
+        // Past-timestamp causality (ts > parents, MTP, jump limits) is enforced
+        // against the block's ANCESTRY in block_validator::validate_timestamp(),
+        // which is the correct place — not against the wall clock.
         let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(t) => t.as_secs(),
+            Ok(t) => t.as_millis() as u64,
             Err(_) => return false,
         };
 
         let ts = block.header.timestamp;
 
-        // Block cannot be too far in the future
-        if ts > now.saturating_add(MAX_FUTURE_SECS) {
-            return false;
-        }
-
-        // Block cannot be too far in the past (relative to system clock)
-        // Generous: 1 hour. Tighter checks are in block_validator R2.
-        if ts < now.saturating_sub(MAX_PAST_SECS) {
+        // Block cannot be too far in the future (ms vs ms).
+        if ts > now.saturating_add(MAX_FUTURE_MS) {
             return false;
         }
 
@@ -82,11 +84,11 @@ mod tests {
     use crate::domain::block::block_body::BlockBody;
     use crate::domain::block::block_header::BlockHeader;
 
-    fn now_secs() -> u64 {
+    fn now_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs()
+            .as_millis() as u64
     }
 
     fn make_block_ts(nonce: u64, timestamp: u64, parents: Vec<&str>) -> Block {
@@ -106,6 +108,8 @@ mod tests {
                 extra_nonce: 0,
                 receipt_root: None,
                 state_root: None,
+                mix_hash: String::new(),
+                prev_state_commitment: None,
             },
             body: BlockBody {
                 transactions: vec![],
@@ -115,36 +119,42 @@ mod tests {
 
     #[test]
     fn valid_block_passes() {
-        let b = make_block_ts(42, now_secs(), vec!["aabbccdd"]);
+        let b = make_block_ts(42, now_ms(), vec!["aabbccdd"]);
         assert!(FloodProtection::validate(&b));
     }
 
     #[test]
     fn nonce_zero_valid() {
         // Nonce 0 is valid — miner divides full u64 range among threads
-        let b = make_block_ts(0, now_secs(), vec!["aabbccdd"]);
+        let b = make_block_ts(0, now_ms(), vec!["aabbccdd"]);
         assert!(FloodProtection::validate(&b));
     }
 
     #[test]
     fn large_nonce_valid() {
         // Large nonces are valid — threads start at u64::MAX / n
-        let b = make_block_ts(u64::MAX - 1, now_secs(), vec!["aabbccdd"]);
+        let b = make_block_ts(u64::MAX - 1, now_ms(), vec!["aabbccdd"]);
         assert!(FloodProtection::validate(&b));
     }
 
     #[test]
     fn timestamp_far_future_rejected() {
-        let ts = now_secs() + MAX_FUTURE_SECS + 100;
+        let ts = now_ms() + MAX_FUTURE_MS + 100;
         let b = make_block_ts(42, ts, vec!["aabbccdd"]);
         assert!(!FloodProtection::validate(&b));
     }
 
     #[test]
-    fn timestamp_far_past_rejected() {
-        let ts = now_secs().saturating_sub(MAX_PAST_SECS + 100);
+    fn timestamp_far_past_allowed_for_sync() {
+        // Historical blocks (hours/days old) MUST pass this pre-filter so a
+        // lagging node can sync the backlog. Rejecting them here made catch-up
+        // impossible. Causality vs. parents is checked in block_validator.
+        let ts = now_ms().saturating_sub(7 * 24 * 3600 * 1000); // a week old (ms)
         let b = make_block_ts(42, ts, vec!["aabbccdd"]);
-        assert!(!FloodProtection::validate(&b));
+        assert!(
+            FloodProtection::validate(&b),
+            "old historical blocks must pass the P2P flood pre-filter (sync)"
+        );
     }
 
     #[test]

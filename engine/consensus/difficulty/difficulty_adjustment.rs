@@ -23,7 +23,11 @@ pub const RETARGET_INTERVAL: u64 = 120;
 pub const RETARGET_BLOCK_INTERVAL: u64 = RETARGET_INTERVAL
     * crate::config::consensus::consensus_params::ConsensusParams::BLOCKS_PER_SECOND;
 pub const ADJUSTMENT_FACTOR_MAX: u64 = 4;
-pub const TARGET_BLOCK_TIME_SECS: u64 = 1;
+/// Target block time in MILLISECONDS (shares ConsensusParams; 100 ms at 10 BPS).
+/// NOTE: this DifficultyAdjustment engine is not on the live path (retarget.rs is);
+/// migrated for unit consistency.
+pub const TARGET_BLOCK_TIME_MS: u64 =
+    crate::config::consensus::consensus_params::ConsensusParams::TARGET_BLOCK_TIME_MS;
 
 // 🔥 EMA smoothing — must match retarget.rs (single source of truth)
 use crate::engine::consensus::difficulty::retarget::{EMA_ALPHA_DEN, EMA_ALPHA_NUM};
@@ -76,7 +80,7 @@ impl DifficultyAdjustment {
             db: Arc::new(db),
             write_opts,
             read_opts,
-            target_block_time: TARGET_BLOCK_TIME_SECS,
+            target_block_time: TARGET_BLOCK_TIME_MS,
         })
     }
 
@@ -182,7 +186,7 @@ impl DifficultyAdjustment {
         // max = expected*4 — prevents inflated windows from crashing difficulty
         //
         // The 4x factor matches Bitcoin's approach. Combined with the per-block
-        // timestamp jump limit in block_validator (MAX_TIMESTAMP_JUMP_SECS=30),
+        // timestamp jump limit in block_validator (MAX_TIMESTAMP_JUMP_MS=30_000),
         // an attacker's maximum influence per retarget is bounded:
         //   - Best case attack: shift window by ±30s per block
         //   - Over 120-block retarget interval: ±3600s drift
@@ -368,7 +372,7 @@ mod tests {
         // Height 1000 → sample_size = 120, expected = 120.
         // Timestamps spread over 1000 seconds — much larger than expected.
         let count = 20;
-        let ts: Vec<u64> = (0..count).map(|i| i as u64 * 100).collect();
+        let ts: Vec<u64> = (0..count).map(|i| i as u64 * 1000).collect(); // 1000 ms spacing >> 100 ms target = slow
         let d = da.recalculate_difficulty(1000, &ts);
         assert!(d < 1000, "should decrease when blocks are slow: got {}", d);
     }
@@ -461,7 +465,7 @@ mod tests {
         let da = temp_adjuster("legacy_floor");
         da.set_difficulty(Difficulty::MIN_DIFFICULTY).unwrap();
         // time_diff > target → wants to decrease, but already at min
-        let d = da.adjust_difficulty(0, 100);
+        let d = da.adjust_difficulty(0, 1000); // 1000 ms > 100 ms target -> wants decrease, floors at MIN
         assert_eq!(d, Difficulty::MIN_DIFFICULTY);
     }
 }

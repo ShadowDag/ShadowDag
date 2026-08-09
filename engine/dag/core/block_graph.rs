@@ -29,6 +29,7 @@ use crate::domain::block::block::Block;
 use crate::errors::{DagError, StorageError};
 use crate::infrastructure::storage::rocksdb::core::db::{open_shared_db, SharedDbSource};
 use crate::slog_info;
+use crate::slog_warn;
 use rocksdb::{IteratorMode, Options, WriteBatch, DB};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -84,6 +85,20 @@ fn key_tip(hash: &str) -> Vec<u8> {
 
 const META_GENESIS: &[u8] = b"bg:meta:genesis";
 const META_TOTAL_ADDED: &[u8] = b"bg:meta:total_added";
+
+#[inline]
+fn decode_hash_key_suffix(bytes: &[u8]) -> Option<String> {
+    // Accept canonical 64-hex hashes, but remain backward-compatible with
+    // older/test keys that used arbitrary ASCII IDs.
+    if bytes.is_empty() || bytes.len() > 256 {
+        return None;
+    }
+    let s = std::str::from_utf8(bytes).ok()?;
+    if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(s.to_ascii_lowercase());
+    }
+    Some(s.to_string())
+}
 
 // ── Orphan persistence keys ──────────────────────────────────────────
 // Orphan blocks are persisted to RocksDB so they survive restarts.
@@ -196,8 +211,11 @@ impl BlockGraph {
             if !k.starts_with(prefix) {
                 break;
             }
-            let hash = String::from_utf8_lossy(&k[prefix.len()..]).into_owned();
-            self.cache_tips.insert(hash);
+            if let Some(hash) = decode_hash_key_suffix(&k[prefix.len()..]) {
+                self.cache_tips.insert(hash);
+            } else {
+                slog_warn!("dag", "block_graph_recover_skip_invalid_tip_key");
+            }
         }
 
         // Recover the most recent blocks into the LRU cache.
@@ -272,7 +290,10 @@ impl BlockGraph {
             if !k.starts_with(orphan_prefix) {
                 break;
             }
-            let hash = String::from_utf8_lossy(&k[orphan_prefix.len()..]).into_owned();
+            let Some(hash) = decode_hash_key_suffix(&k[orphan_prefix.len()..]) else {
+                slog_warn!("dag", "block_graph_recover_skip_invalid_orphan_key");
+                continue;
+            };
             if let Ok(block) = bincode::deserialize::<Block>(&v) {
                 for parent in &block.header.parents {
                     self.orphan_index
@@ -331,7 +352,11 @@ impl BlockGraph {
             if !k.starts_with(prefix) {
                 break;
             }
-            result.push(String::from_utf8_lossy(&k[prefix.len()..]).into_owned());
+            if let Some(hash) = decode_hash_key_suffix(&k[prefix.len()..]) {
+                result.push(hash);
+            } else {
+                slog_warn!("dag", "block_graph_scan_skip_invalid_hash_key");
+            }
         }
         result
     }
@@ -596,60 +621,34 @@ impl BlockGraph {
     // ── Cycle detection (full DFS with visited + recursion stack) ────────
 
     /// Check if adding a block with the given hash would create a cycle.
-    /// Uses DFS with gray/black coloring (recursion_stack = gray, visited = black)
-    /// to detect back-edges. A cycle exists if any ancestor of block_hash
-    /// is block_hash itself. No depth limit -- traverses the entire ancestor chain.
+    ///
+    /// A cycle exists iff `block_hash` is reachable from any of its parents by
+    /// walking ancestor (parent) edges. Implemented as an **iterative** DFS with
+    /// an explicit work-stack so a maliciously deep ancestor chain cannot
+    /// overflow the native stack (the previous recursive version had "no depth
+    /// limit" and could abort the process — see audit finding C2).
     pub fn has_cycle(&self, block_hash: &str, parent_hashes: &[String]) -> bool {
-        // visited = fully explored (black), rec_stack = currently being explored (gray)
-        let mut visited = HashSet::new();
-        let mut rec_stack = HashSet::new();
-        rec_stack.insert(block_hash.to_string());
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = parent_hashes.to_vec();
 
-        for parent in parent_hashes {
-            if self.dfs_has_cycle(parent, block_hash, &mut visited, &mut rec_stack) {
-                return true;
+        while let Some(current) = stack.pop() {
+            if current == block_hash {
+                return true; // an ancestor reaches back to the block → cycle
+            }
+            if !visited.insert(current.clone()) {
+                continue; // already fully explored
+            }
+            let parents = if let Some(p) = self.cache_parents.get(&current) {
+                p.iter().cloned().collect::<Vec<_>>()
+            } else {
+                self.db_get_parents(&current)
+            };
+            for parent in parents {
+                if !visited.contains(&parent) {
+                    stack.push(parent);
+                }
             }
         }
-        false
-    }
-
-    /// DFS helper: returns true if `current` can reach `target` through ancestors.
-    /// `rec_stack` tracks nodes in the current DFS path (gray nodes).
-    /// `visited` tracks fully explored nodes (black nodes) -- safe to skip.
-    fn dfs_has_cycle(
-        &self,
-        current: &str,
-        target: &str,
-        visited: &mut HashSet<String>,
-        rec_stack: &mut HashSet<String>,
-    ) -> bool {
-        if current == target {
-            return true; // Back-edge found: ancestor is the block itself
-        }
-        if visited.contains(current) {
-            return false; // Already fully explored, no cycle through here
-        }
-        if rec_stack.contains(current) {
-            return false; // Already on the current path but not target, skip
-        }
-
-        rec_stack.insert(current.to_string());
-
-        // Get parents from cache or RocksDB
-        let parents = if let Some(p) = self.cache_parents.get(current) {
-            p.iter().cloned().collect::<Vec<_>>()
-        } else {
-            self.db_get_parents(current)
-        };
-
-        for parent in &parents {
-            if self.dfs_has_cycle(parent, target, visited, rec_stack) {
-                return true;
-            }
-        }
-
-        rec_stack.remove(current);
-        visited.insert(current.to_string());
         false
     }
 
@@ -789,6 +788,8 @@ mod tests {
                 extra_nonce: 0,
                 receipt_root: None,
                 state_root: None,
+                mix_hash: String::new(),
+                prev_state_commitment: None,
             },
             body: BlockBody {
                 transactions: vec![],
@@ -885,5 +886,40 @@ mod tests {
             g.get_block("genesis").is_some(),
             "Should fall back to RocksDB"
         );
+    }
+
+    #[test]
+    fn has_cycle_detects_reachable_and_rejects_unrelated() {
+        // Chain: genesis <- b1 <- b2. (iterative reachability, see C2)
+        let mut g = BlockGraph::new(tmp_path().as_str()).unwrap();
+        g.add_block(make_block("genesis", vec![])).unwrap();
+        g.add_block(make_block("b1", vec!["genesis"])).unwrap();
+        g.add_block(make_block("b2", vec!["b1"])).unwrap();
+
+        // "genesis" IS reachable from b2's ancestor walk → would-be cycle.
+        assert!(g.has_cycle("genesis", &["b2".to_string()]));
+        // A brand-new block not in any ancestor path → no cycle.
+        assert!(!g.has_cycle("newblock", &["b2".to_string()]));
+    }
+
+    #[test]
+    fn has_cycle_handles_deep_chain_without_stack_overflow() {
+        // Populate a very deep in-memory parent chain directly (avoids the
+        // per-block RocksDB write cost of add_block) and confirm has_cycle
+        // traverses it iteratively. The old recursive version would overflow
+        // the native stack at this depth (see audit C2).
+        let mut g = BlockGraph::new(tmp_path().as_str()).unwrap();
+        let depth = 200_000;
+        for i in 1..depth {
+            let mut parents = HashSet::new();
+            parents.insert(format!("h{}", i - 1));
+            g.cache_parents.insert(format!("h{}", i), parents);
+        }
+        let tip = format!("h{}", depth - 1);
+        // Deep ancestor traversal: tip eventually reaches h0 (not the target),
+        // so no cycle — but the walk is `depth` deep.
+        assert!(!g.has_cycle("not_in_chain", std::slice::from_ref(&tip)));
+        // And a real back-edge to h0 is detected across the full depth.
+        assert!(g.has_cycle("h0", &[tip]));
     }
 }

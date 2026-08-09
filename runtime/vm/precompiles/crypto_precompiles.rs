@@ -6,7 +6,7 @@
 // Cryptographic precompiles — signature verification, key recovery, commitments.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use super::precompile_registry::PrecompileResult;
@@ -16,70 +16,55 @@ const GAS_ECRECOVER: u64 = 3_000;
 const GAS_ED25519_VERIFY: u64 = 2_000;
 const GAS_PEDERSEN_COMMIT: u64 = 5_000;
 
-/// 0x01: Signature verification with address derivation (Ed25519).
+/// 0x01: ecrecover — standard Ethereum secp256k1 ECDSA public-key recovery.
 ///
-/// **WARNING: This is NOT standard Ethereum `ecrecover`.** Standard ecrecover
-/// recovers a secp256k1 public key from an ECDSA signature (v, r, s) without
-/// requiring the public key as input. This function instead takes the public
-/// key explicitly, verifies an Ed25519 signature, and derives an address via
-/// SHA-256(pubkey). It does NOT perform any key recovery.
-///
-/// The function name `ecrecover` is retained solely for EVM precompile slot
-/// compatibility at address 0x01. Callers must provide the public key -- the
-/// signature alone is not sufficient.
-///
-/// # TODO
-/// Implement real secp256k1 ECDSA recovery (using the `k256` or `secp256k1`
-/// crate) so that contracts ported from Ethereum get correct behavior at
-/// address 0x01.
-///
-/// Input format (128 bytes):
-///   [0..32]   message hash
-///   [32..64]  public key (32 bytes, Ed25519)
-///   [64..128] signature (64 bytes, Ed25519)
-///
-/// Output: 32-byte address derived from SHA-256(pubkey) (if valid), else 32 zero bytes
+/// Input (128 bytes, right-padded if short): hash[0..32] || v[32..64] ||
+/// r[64..96] || s[96..128], where v is 27 or 28 (big-endian in the last byte).
+/// Output: 32 bytes = 12 zero bytes || 20-byte Ethereum address
+/// (keccak256(uncompressed_pubkey[1..65])[12..32]). Any invalid input, v, or
+/// signature yields the 32-byte zero address, matching the EVM precompile.
 pub fn ecrecover(input: &[u8], _gas_limit: u64) -> PrecompileResult {
+    use k256::ecdsa::{RecoveryId, Signature as Secp256k1Sig, VerifyingKey as Secp256k1Vk};
+    use sha3::{Digest as Sha3Digest, Keccak256};
+
     let gas_used = GAS_ECRECOVER;
+    let zero = || PrecompileResult::ok(vec![0u8; 32], gas_used);
 
-    if input.len() < 128 {
-        return PrecompileResult::err("ecrecover: input must be 128 bytes", gas_used);
+    let mut buf = [0u8; 128];
+    let n = input.len().min(128);
+    buf[..n].copy_from_slice(&input[..n]);
+
+    let hash = &buf[0..32];
+    // v is a 32-byte big-endian value that must be exactly 27 or 28.
+    if buf[32..63].iter().any(|&b| b != 0) {
+        return zero();
     }
-
-    let message = &input[0..32];
-    let pubkey_bytes = &input[32..64];
-    let sig_bytes = &input[64..128];
-
-    // Parse public key
-    let pk_array: [u8; 32] = match pubkey_bytes.try_into() {
-        Ok(a) => a,
-        Err(_) => return PrecompileResult::err("ecrecover: invalid public key", gas_used),
+    let recovery_id = match buf[63] {
+        27 => RecoveryId::from_byte(0),
+        28 => RecoveryId::from_byte(1),
+        _ => return zero(),
     };
-
-    let verifying_key = match VerifyingKey::from_bytes(&pk_array) {
+    let recovery_id = match recovery_id {
+        Some(r) => r,
+        None => return zero(),
+    };
+    let signature = match Secp256k1Sig::from_slice(&buf[64..128]) {
+        Ok(s) => s,
+        Err(_) => return zero(),
+    };
+    let vk = match Secp256k1Vk::recover_from_prehash(hash, &signature, recovery_id) {
         Ok(k) => k,
-        Err(_) => return PrecompileResult::err("ecrecover: invalid public key point", gas_used),
+        Err(_) => return zero(),
     };
 
-    // Parse signature
-    let sig_array: [u8; 64] = match sig_bytes.try_into() {
-        Ok(a) => a,
-        Err(_) => return PrecompileResult::err("ecrecover: invalid signature", gas_used),
-    };
-
-    let signature = Signature::from_bytes(&sig_array);
-
-    // Verify
-    if verifying_key.verify(message, &signature).is_ok() {
-        // Derive address: SHA-256(pubkey)[0..32]
-        let mut h = <Sha256 as Digest>::new();
-        Digest::update(&mut h, pubkey_bytes);
-        let hash = Digest::finalize(h);
-        PrecompileResult::ok(hash.to_vec(), gas_used)
-    } else {
-        // Invalid signature — return 32 zero bytes (like Ethereum)
-        PrecompileResult::ok(vec![0u8; 32], gas_used)
-    }
+    let encoded = vk.to_encoded_point(false);
+    let pubkey = &encoded.as_bytes()[1..]; // strip 0x04 prefix -> 64 bytes (X||Y)
+    let mut kh = Keccak256::new();
+    Sha3Digest::update(&mut kh, pubkey);
+    let digest = kh.finalize();
+    let mut out = vec![0u8; 32];
+    out[12..32].copy_from_slice(&digest[12..32]);
+    PrecompileResult::ok(out, gas_used)
 }
 
 /// 0x08: ED25519_VERIFY — verify Ed25519 signature (return 1 or 0)
@@ -114,7 +99,11 @@ pub fn ed25519_verify(input: &[u8], _gas_limit: u64) -> PrecompileResult {
 
     let sig = Signature::from_bytes(&sig_bytes);
 
-    if vk.verify(message, &sig).is_ok() {
+    // verify_strict rejects malleable/non-canonical signatures (torsion / small-
+    // order points), matching the tx path (TxValidator uses verify_strict). Plain
+    // verify() let a contract-reachable 0x08 accept a second valid signature for
+    // one (key, message), defeating replay/uniqueness assumptions (B5-M02).
+    if vk.verify_strict(message, &sig).is_ok() {
         PrecompileResult::ok(vec![0x01], gas_used)
     } else {
         PrecompileResult::ok(vec![0x00], gas_used)
@@ -133,7 +122,7 @@ pub fn ed25519_verify(input: &[u8], _gas_limit: u64) -> PrecompileResult {
 /// The function name `pedersen_commit` is retained for registry/ABI
 /// compatibility at address 0x09. For actual Pedersen commitments with
 /// homomorphic properties, use the privacy layer
-/// (`engine/privacy/confidential/pedersen_commitment.rs`).
+/// (`engine/privacy/confidential/pedersen.rs`, `RealPedersenCommitment`).
 ///
 /// Input format (40 bytes):
 ///   [0..8]   value (u64 LE)
@@ -172,26 +161,30 @@ mod tests {
     use ed25519_dalek::SigningKey;
 
     #[test]
-    fn ecrecover_valid_signature() {
-        // Generate keypair
-        let sk = SigningKey::from_bytes(&[42u8; 32]);
+    fn ecrecover_recovers_signer_address() {
+        use k256::ecdsa::{RecoveryId, Signature as K256Sig, SigningKey};
+        use sha3::{Digest as Sha3Digest, Keccak256};
+
+        let sk = SigningKey::from_slice(&[7u8; 32]).unwrap();
         let vk = sk.verifying_key();
+        // Expected Ethereum address = keccak256(uncompressed_pubkey[1..])[12..].
+        let enc = vk.to_encoded_point(false);
+        let mut kh = Keccak256::new();
+        Sha3Digest::update(&mut kh, &enc.as_bytes()[1..]);
+        let d = kh.finalize();
+        let mut expected = vec![0u8; 32];
+        expected[12..32].copy_from_slice(&d[12..32]);
 
-        // Sign a message
-        let message = [0xABu8; 32];
-        let sig = sk.sign(&message);
-
-        // Build input: message(32) + pubkey(32) + sig(64)
-        let mut input = Vec::with_capacity(128);
-        input.extend_from_slice(&message);
-        input.extend_from_slice(vk.as_bytes());
-        input.extend_from_slice(&sig.to_bytes());
+        let hash = [0x11u8; 32];
+        let (sig, recid): (K256Sig, RecoveryId) = sk.sign_prehash_recoverable(&hash).unwrap();
+        let mut input = vec![0u8; 128];
+        input[0..32].copy_from_slice(&hash);
+        input[63] = 27 + recid.to_byte();
+        input[64..128].copy_from_slice(&sig.to_bytes());
 
         let result = ecrecover(&input, 100_000);
         assert!(result.success);
-        assert_eq!(result.output.len(), 32);
-        // Should be non-zero (recovered address)
-        assert!(result.output.iter().any(|&b| b != 0));
+        assert_eq!(result.output, expected, "recovered address must match the signer");
     }
 
     #[test]

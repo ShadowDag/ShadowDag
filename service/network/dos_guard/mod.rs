@@ -4,9 +4,56 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::errors::NetworkError;
-use std::collections::HashMap;
+use once_cell::sync::Lazy;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+// ── Trusted-peer whitelist ─────────────────────────────────────────────────
+/// Process-global set of trusted peer IPs (the operator's own seed / `--connect`
+/// nodes). Whitelisted peers are NEVER rate-limited or banned.
+///
+/// The seed nodes must be able to serve each other an unbounded IBD backlog when
+/// one falls behind. DoS heuristics (rate limits, outbound-lag scoring, etc.)
+/// otherwise ban the very peer helping a lagging node catch up — and a Resource
+/// ban lasts an hour — which permanently stalls convergence (observed live:
+/// followers stuck thousands of blocks behind the miner). This is the standard
+/// "whitelisted / trusted peer" model (cf. Bitcoin `-whitelist`): trust is
+/// operator-configured, so these peers bypass the DoS layer entirely.
+static WHITELIST: Lazy<RwLock<HashSet<String>>> = Lazy::new(|| RwLock::new(HashSet::new()));
+
+/// Extract the bare IP from a `ip:port` / `[ipv6]:port` / bare-ip peer key.
+fn peer_ip(peer: &str) -> &str {
+    if let Some(rest) = peer.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end]; // IPv6 literal inside brackets
+        }
+    }
+    match peer.rsplit_once(':') {
+        Some((ip, _port)) => ip,
+        None => peer,
+    }
+}
+
+/// Add a trusted peer IP to the whitelist. Accepts `ip` or `ip:port`.
+pub fn whitelist_peer(addr: &str) {
+    let ip = peer_ip(addr);
+    if !ip.is_empty() {
+        WHITELIST
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(ip.to_string());
+    }
+}
+
+/// True if the peer's IP is whitelisted (a trusted seed / `--connect` node).
+pub fn is_whitelisted(peer: &str) -> bool {
+    let ip = peer_ip(peer);
+    WHITELIST
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(ip)
+}
 
 // ── Token bucket tuning ────────────────────────────────────────────────
 // At 32 BPS: legitimate traffic ≈ 32 blocks/sec × 8 tok + TX relay + INV
@@ -365,6 +412,11 @@ impl DosGuard {
     }
 
     pub fn check(&self, peer: &str, msg_type: &MsgType, msg_size: usize) -> DosVerdict {
+        // Trusted seeds bypass the DoS layer entirely (see WHITELIST) so they can
+        // serve each other an unbounded IBD backlog without being throttled/banned.
+        if is_whitelisted(peer) {
+            return DosVerdict::Allow;
+        }
         if self.is_banned(peer) {
             return DosVerdict::BanActive;
         }
@@ -417,12 +469,16 @@ impl DosGuard {
             bucket.consume(cost)
         };
         if !allowed {
-            self.add_ban_score_cat(
-                peer,
-                BAN_SCORE_MINOR,
-                "rate exceeded",
-                BanCategory::Resource,
-            );
+            // Throttle only — do NOT accrue ban score on a token-bucket overflow.
+            // An overflow just means the peer sent VALID messages faster than our
+            // steady refill — exactly what happens when a peer serves us a block
+            // backlog during catch-up (sync). Dropping the excess message is
+            // sufficient flow control. Banning here banned the very peer helping
+            // us sync: 10 overflows × BAN_SCORE_MINOR = autoban, which stalled
+            // convergence permanently (a lagging node could never catch up to a
+            // busy/mining peer). Genuine abuse is still banned via the oversized /
+            // malformed / invalid-PoW / lifecycle paths, and the bandwidth cap +
+            // pong timeout bound a pure flooder whose messages are all dropped.
             return DosVerdict::RateLimited {
                 peer: peer.to_string(),
             };
@@ -444,6 +500,12 @@ impl DosGuard {
         reason: &str,
         category: BanCategory,
     ) -> bool {
+        // Never accrue ban score against a trusted seed — this is the single
+        // choke-point for ALL ban paths (block rejection, outbound lag,
+        // lifecycle, oversized, etc.), so one guard here exempts them everywhere.
+        if is_whitelisted(peer) {
+            return false;
+        }
         let mut bans = self.bans.write().unwrap_or_else(|e| e.into_inner());
         let rec = bans.entry(peer.to_string()).or_insert_with(BanRecord::new);
         let banned = rec.add_score(points, reason, category);
@@ -484,6 +546,12 @@ impl DosGuard {
     }
 
     pub fn is_banned(&self, peer: &str) -> bool {
+        // Trusted seeds are never considered banned (belt-and-suspenders: bans
+        // are already never accrued for them via add_ban_score_cat, but a stale
+        // pre-whitelist record must not linger as active).
+        if is_whitelisted(peer) {
+            return false;
+        }
         let mut bans = self.bans.write().unwrap_or_else(|e| e.into_inner());
         bans.entry(peer.to_string())
             .or_insert_with(BanRecord::new)
@@ -687,6 +755,27 @@ mod tests {
     }
 
     #[test]
+    fn per_peer_rate_limit_throttles_without_banning() {
+        // Exhausting the per-peer token bucket (e.g. a peer serving us a block
+        // backlog during catch-up) must THROTTLE (RateLimited) but NEVER ban:
+        // banning the peer that helps us sync stalls convergence. Use Inv (no
+        // global cap) so we hit the per-peer bucket path.
+        let g = DosGuard::new();
+        let peer = "203.0.113.50:19333";
+        let mut throttled = false;
+        for _ in 0..((BUCKET_CAPACITY as usize) + 3000) {
+            if matches!(g.check(peer, &MsgType::Inv, 100), DosVerdict::RateLimited { .. }) {
+                throttled = true;
+            }
+        }
+        assert!(throttled, "sustained high rate must eventually throttle");
+        assert!(
+            !g.is_banned(peer),
+            "throttling must NOT ban a peer (banning a sync peer stalls convergence)"
+        );
+    }
+
+    #[test]
     fn ban_score_accumulates() {
         let g = DosGuard::new();
         g.add_ban_score("badpeer", 30, "offense 1");
@@ -845,6 +934,47 @@ mod tests {
         assert!(MsgType::Block.token_cost() > MsgType::Tx.token_cost());
         assert!(MsgType::Tx.token_cost() > MsgType::Ping.token_cost());
         assert!(MsgType::Mempool.token_cost() > MsgType::Addr.token_cost());
+    }
+
+    #[test]
+    fn whitelisted_seed_is_never_rate_limited_or_banned() {
+        // A trusted seed must bypass the DoS layer so it can serve unbounded IBD
+        // backfill to a lagging peer without being throttled/banned (the live
+        // convergence failure). Uses a documentation-range IP unique to this test.
+        let g = DosGuard::new();
+        whitelist_peer("203.0.113.200"); // add by bare IP
+        // A flood of severe ban score is a no-op for a whitelisted IP...
+        for _ in 0..50 {
+            g.add_ban_score_cat(
+                "203.0.113.200:19333",
+                BAN_SCORE_AUTOBAN,
+                "flood",
+                BanCategory::Resource,
+            );
+        }
+        assert!(
+            !g.is_banned("203.0.113.200:19333"),
+            "whitelisted seed must never be banned"
+        );
+        // ...and the match is by IP, so an ephemeral inbound port is also exempt.
+        assert!(!g.is_banned("203.0.113.200:41122"));
+        assert!(matches!(
+            g.check("203.0.113.200:19333", &MsgType::Block, 100),
+            DosVerdict::Allow
+        ));
+        // A different, non-whitelisted peer still bans normally (guard is scoped).
+        for _ in 0..50 {
+            g.add_ban_score_cat(
+                "198.51.100.9:19333",
+                BAN_SCORE_AUTOBAN,
+                "flood",
+                BanCategory::Malicious,
+            );
+        }
+        assert!(
+            g.is_banned("198.51.100.9:19333"),
+            "non-whitelisted peer must still ban"
+        );
     }
 
     #[test]

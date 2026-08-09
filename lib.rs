@@ -7,6 +7,11 @@
 #![allow(clippy::module_inception)]
 #![warn(unused_variables, unused_imports, unused_mut)]
 
+#[cfg(all(feature = "ringct_bypass", not(any(test, debug_assertions))))]
+compile_error!(
+    "feature 'ringct_bypass' is testing-only and must not be enabled in non-test builds"
+);
+
 pub mod errors;
 
 pub mod daemon;
@@ -135,6 +140,7 @@ pub mod engine {
             pub mod entropy;
         }
         pub mod signatures {
+            #[cfg(feature = "pq-dilithium")]
             pub mod dilithium;
             pub mod ed25519;
             pub mod falcon;
@@ -187,11 +193,18 @@ pub mod engine {
             pub mod anti_asic;
             pub mod hash_mix;
             pub mod shadowhash;
+            pub mod umbrahash;
         }
         pub mod gpu {
-            pub mod cuda_miner;
-            pub mod gpu_miner;
-            pub mod opencl_miner;
+            // Real OpenCL GPU miner for ShadowHash. Feature-gated: the default
+            // build compiles NO GPU code and keeps zero OpenCL dependencies, so
+            // servers/CI are unaffected. Build with `--features gpu-opencl`.
+            // (The former cuda_miner/gpu_miner/opencl_miner modules were removed —
+            // they were CPU-rayon stubs with GPU-labeled logging, not real GPU.)
+            #[cfg(feature = "gpu-opencl")]
+            pub mod opencl;
+            #[cfg(feature = "gpu-opencl")]
+            pub mod umbra;
         }
         pub mod miner {
             pub mod block_template;
@@ -211,18 +224,27 @@ pub mod engine {
     }
     pub mod privacy {
         pub mod confidential {
-            pub mod bulletproofs;
-            pub mod confidential_tx;
+            // Real, consensus-wired primitives. The former `bulletproofs`,
+            // `confidential_tx`, and `pedersen_commitment` modules were
+            // placeholder/insecure implementations with no live consumers and
+            // were removed (audit XC1) so they can never be wired into consensus.
             pub mod pedersen;
-            pub mod pedersen_commitment;
             pub mod range_proof;
         }
         pub mod ringct {
             pub mod clsag;
+            pub mod dual_clsag;
             pub mod key_image;
             pub mod ring_builder;
             pub mod ring_signature;
+            pub mod amount_encoding;
+            pub mod builder;
+            pub mod confidential_consensus;
+            pub mod decoy;
             pub mod ring_validator;
+            pub mod scan;
+            pub mod serialization;
+            pub mod tx_confidential;
         }
         pub mod shadow_pool {
             pub mod mixer;
@@ -436,7 +458,9 @@ pub mod service {
             pub mod hardware_wallet;
             pub mod hd_wallet;
             pub mod key_manager;
+            pub mod mnemonic;
             pub mod multisig;
+            pub mod slip10;
         }
         pub mod storage {
             pub mod address_book;

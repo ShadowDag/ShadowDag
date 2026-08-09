@@ -5,6 +5,10 @@
 
 #[cfg(test)]
 mod tests {
+    /// Height the template block would occupy. Chosen well past every network's
+    /// coinbase maturity so these tests exercise ordering/limits, not maturity.
+    const TEMPLATE_HEIGHT: u64 = 10_000;
+
     use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
     use crate::service::mempool::core::mempool::{Mempool, MAX_MEMPOOL_SIZE, MAX_TX_BYTE_SIZE};
 
@@ -26,6 +30,10 @@ mod tests {
                 pub_key: "pk".to_string(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput {
                 address: "addr1".into(),
@@ -33,6 +41,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee,
             timestamp: std::time::SystemTime::now()
@@ -85,7 +95,7 @@ mod tests {
 
         // Create a dummy utxo_set for the method call
         let utxo_set = crate::domain::utxo::utxo_set::UtxoSet::new_empty();
-        let selected = mempool.select_transactions_for_block(&utxo_set, 3);
+        let selected = mempool.select_transactions_for_block(&utxo_set, 3, TEMPLATE_HEIGHT);
         assert!(selected.len() <= 3);
 
         for w in selected.windows(2) {

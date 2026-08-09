@@ -23,7 +23,21 @@ impl ConsensusParams {
     /// 21 billion SDAG in satoshis (1 SDAG = 100_000_000 satoshis)
     pub const MAX_SUPPLY: u64 = 21_000_000_000 * 100_000_000; // 2.1 * 10^18 satoshis
     pub const BLOCK_REWARD: u64 = GENESIS_REWARD; // 10 SDAG per block
-    pub const BLOCK_TIME: u64 = 1; // 1 second target
+    pub const BLOCK_TIME: u64 = 1; // 1 second target (legacy seconds view; see BLOCK_TIME_MS)
+    /// Target time between SELECTED-CHAIN blocks, in MILLISECONDS.
+    /// CONSENSUS-CRITICAL single source of truth: all three difficulty engines
+    /// (retarget, difficulty_adjustment, pow_difficulty) MUST key their target
+    /// off this value or they compute divergent difficulties = chain split.
+    /// Block AND transaction timestamps are unix epoch milliseconds. At 10 BPS
+    /// this is 1000/10 = 100 ms — the granularity that lets the selected chain
+    /// advance faster than one block per wall-second (R4 forces ts >= parent+1,
+    /// which at 1-second granularity capped throughput at ~1 block/sec).
+    pub const TARGET_BLOCK_TIME_MS: u64 = 1_000 / Self::BLOCKS_PER_SECOND; // 100 ms at 10 BPS
+    /// Canonical future-drift tolerance for block timestamps, in MILLISECONDS
+    /// (120 s of real-time clock-skew tolerance — unrelated to block spacing).
+    /// Every block-timestamp-vs-wall-clock future gate MUST use this exact value
+    /// (a half-migrated gate rejects every ms block as ~1000x in the future).
+    pub const MAX_FUTURE_MS: u64 = 120_000;
     pub const MINER_PERCENT: u64 = MINER_REWARD_PCT; // 95% to miners
     pub const DEVELOPER_PERCENT: u64 = DEV_REWARD_PCT; // 5% to developer
     /// Coinbase maturity in blocks. At DEFAULT_BPS this = 100 seconds.
@@ -54,6 +68,12 @@ impl ConsensusParams {
     // ── Block Limits ───────────────────────────────────────────────────────
     /// Maximum gas per block (sum of all tx gas_limits in one block)
     pub const MAX_BLOCK_GAS: u64 = 100_000_000; // 100M gas per block
+    /// Gas a contract tx is allowed to consume during block execution when it
+    /// declares no explicit `gas_limit`. CONSENSUS-CRITICAL: this is the single
+    /// source of truth for the implicit budget — the block-gas validator and
+    /// the executor MUST charge the same value, or a block that passes the
+    /// MAX_BLOCK_GAS check can still execute far beyond it (CPU DoS).
+    pub const DEFAULT_CONTRACT_GAS_LIMIT: u64 = 10_000_000; // 10M gas
     pub const MAX_BLOCK_SIZE: usize = 2 * 1024 * 1024; // 2 MB
     pub const MAX_BLOCK_TXS: usize = 10_000;
     pub const MAX_TX_SIZE: usize = 100 * 1024; // 100 KB

@@ -283,7 +283,7 @@ mod tests {
         for i in 0..1_000usize {
             let octet2 = (i / 256) as u8;
             let octet3 = (i % 256) as u8;
-            let addr = format!("10.{}.{}:8333", octet2, octet3);
+            let addr = format!("10.0.{}.{}:8333", octet2, octet3);
             pm.add_peer(&addr)
                 .unwrap_or_else(|e| panic!("failed adding peer {}: {}", addr, e));
             peers.push(addr);

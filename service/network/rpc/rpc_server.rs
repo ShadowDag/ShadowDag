@@ -32,7 +32,7 @@ use crate::runtime::vm::core::vm::ExecutionResult;
 use crate::runtime::vm::core::vm_context::VMContext;
 use crate::service::mempool::core::mempool::Mempool;
 use crate::service::network::p2p::peer_manager::PeerManager;
-use crate::service::rpc::auth::RpcAuthManager;
+use crate::service::rpc::auth::{AuthRole, RpcAuthManager};
 use crate::engine::mining::stratum::stratum_server::StratumServer;
 use crate::{slog_error, slog_info, slog_warn};
 
@@ -57,6 +57,11 @@ pub const MAX_REQUEST_SIZE: usize = MAX_BODY;
 
 pub const MAX_GETBLOCKS_RANGE: usize = 500;
 
+/// Max confidential outputs returned per `getconfidentialoutputs` page. Lets a
+/// wallet page the global okey→commitment index (for decoy selection) in bounded
+/// chunks instead of walking every block.
+pub const MAX_CONF_OUTPUTS_RANGE: usize = 2000;
+
 pub const MAX_MEMPOOL_RESPONSE: usize = 10_000;
 
 pub const RPC_READ_TIMEOUT_SECS: u64 = 10;
@@ -68,6 +73,9 @@ pub const RATE_LIMIT_RPM: u64 = 100;
 pub const RATE_BURST: u64 = 20;
 
 pub const RATE_CLEANUP_INTERVAL_SECS: u64 = 300;
+/// Hard cap for per-IP rate buckets to prevent unbounded memory growth
+/// under high-cardinality source-IP floods.
+pub const MAX_RATE_TABLE_ENTRIES: usize = 20_000;
 
 pub const ERR_INVALID_PARAMS: i32 = -32602;
 pub const ERR_METHOD_NOT_FOUND: i32 = -32601;
@@ -203,118 +211,155 @@ impl RpcState {
     /// This ensures the password survives restarts.
     ///
     /// `data_dir` — directory to write the `rpc_password` file into.
-    /// When `None`, falls back to the current working directory (legacy behaviour).
-    fn load_or_create_admin_password(
+    /// When `None`, no plaintext password file is written.
+    /// Build the RPC auth manager with RocksDB-persisted, PBKDF2-hashed users.
+    ///
+    /// Only the HASH is ever written to the database. Until 2026-07-22 the
+    /// generated admin password was ALSO stored in cleartext under
+    /// `rpc:admin_password` so a restart could reuse it, which handed the RPC
+    /// admin credential to anyone who could read the node's data directory —
+    /// a backup, a snapshot, or a stolen disk. It was redundant as well as
+    /// dangerous: hashed users already survive restart through
+    /// `recover_users_from_db`. Existing databases are migrated here — the
+    /// legacy value seeds the admin user so a live node keeps the password its
+    /// operator already holds, and is then deleted.
+    fn build_auth_manager(
         db: &Arc<DB>,
         data_dir: Option<&std::path::Path>,
-    ) -> Result<String, NetworkError> {
-        let key = b"rpc:admin_password";
-        // Try to load existing password — handle read errors explicitly
-        match db.get(key) {
-            Ok(Some(data)) => {
-                if let Ok(pw) = String::from_utf8(data.to_vec()) {
-                    if !pw.is_empty() {
-                        slog_info!("rpc", "admin_credentials_loaded");
-                        return Ok(pw);
-                    }
+    ) -> Result<RpcAuthManager, NetworkError> {
+        let mut mgr = RpcAuthManager::new_persistent(db.clone());
+        let legacy_key = b"rpc:admin_password";
+
+        match db.get(legacy_key) {
+            Ok(Some(raw)) => {
+                let legacy = String::from_utf8(raw.to_vec()).unwrap_or_default();
+                if !legacy.is_empty() && !mgr.user_exists("admin") {
+                    mgr.add_user("admin", &legacy, AuthRole::Admin);
                 }
-                // Stored value was empty or invalid UTF-8 — fall through to generate
+                // Drop the cleartext copy whether or not it was needed. A failure
+                // here is fatal: continuing would leave the credential on disk
+                // while reporting success.
+                db.delete(legacy_key).map_err(|e| {
+                    slog_error!("rpc", "legacy_cleartext_password_delete_failed", error => e);
+                    NetworkError::Other(format!(
+                        "could not remove the legacy cleartext admin password: {}",
+                        e
+                    ))
+                })?;
+                slog_warn!("rpc", "legacy_cleartext_admin_password_migrated",
+                    note => "cleartext copy removed from rocksdb; only the PBKDF2 hash remains");
             }
-            Ok(None) => {
-                // Genuinely first run — fall through to generate a new password
-            }
+            Ok(None) => {}
             Err(e) => {
                 slog_error!("rpc", "admin_password_read_failed", error => e);
-                // Do NOT generate a new password on read failure — the DB may
-                // already contain a valid password that we simply cannot read.
+                // Do NOT fall through to minting a new password on a read error:
+                // the database may hold a perfectly good credential we simply
+                // could not read, and replacing it would lock the operator out.
                 return Err(NetworkError::Other(format!(
-                    "Failed to read admin password from DB: {}",
+                    "Failed to read admin credential state from DB: {}",
                     e
                 )));
             }
         }
-        // First run: generate and persist
-        let password = Self::generate_admin_password();
-        db.put(key, password.as_bytes()).map_err(|e| {
-            slog_error!("rpc", "admin_password_persist_failed", error => e);
-            NetworkError::Other(format!("Failed to persist admin password to DB: {}", e))
-        })?;
-        let masked = format!("{}...", &password[..4.min(password.len())]);
-        slog_warn!("rpc", "first_run_admin_password_generated", hint => &masked);
-        // SECURITY: Never log the full password to stderr/stdout (captured by
-        // log aggregators, process monitors, shell history). Write to a
-        // restricted file instead, and print only a masked hint to console.
-        // Use the node's data_dir so the file lives next to the DB, not in
-        // whichever directory the process happened to start from.
-        let base_dir = data_dir
-            .map(|p| p.to_path_buf())
-            .or_else(|| std::env::current_dir().ok());
-        if let Some(base) = base_dir {
-            let pw_path = base.join("rpc_password");
-            match std::fs::write(&pw_path, password.as_bytes()) {
-                Ok(_) => {
-                    // Best-effort: restrict permissions on Unix
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(
-                            &pw_path,
-                            std::fs::Permissions::from_mode(0o600),
-                        );
-                    }
-                    let pw_display = pw_path.display().to_string();
-                    eprintln!("╔══════════════════════════════════════════════════════╗");
-                    eprintln!("║  RPC Admin Password generated (first run)           ║");
-                    eprintln!(
-                        "║  Hint: {}                                           ║",
-                        masked
-                    );
-                    eprintln!("║  Full password saved to:                            ║");
-                    eprintln!("║  {}  ║", pw_display);
-                    eprintln!("╚══════════════════════════════════════════════════════╝");
-                }
-                Err(e) => {
-                    slog_warn!("rpc", "rpc_password_file_write_failed",
-                        path => pw_path.display(), error => e);
-                    eprintln!("╔══════════════════════════════════════════════════════╗");
-                    eprintln!("║  RPC Admin Password generated (first run)           ║");
-                    eprintln!(
-                        "║  Hint: {}                                           ║",
-                        masked
-                    );
-                    eprintln!(
-                        "║  WARNING: Could not write password to: {}  ║",
-                        pw_path.display()
-                    );
-                    eprintln!("╚══════════════════════════════════════════════════════╝");
-                }
+
+        if !mgr.user_exists("admin") {
+            // Genuinely first run: mint a password, persist only its hash, and
+            // hand the cleartext to the operator exactly once — through a 0600
+            // file, never through the database.
+            let password = Self::generate_admin_password();
+            mgr.add_user("admin", &password, AuthRole::Admin);
+            if !mgr.user_exists("admin") {
+                return Err(NetworkError::Other(
+                    "failed to persist the generated admin user".to_string(),
+                ));
             }
-        } else {
-            eprintln!("╔══════════════════════════════════════════════════════╗");
-            eprintln!("║  RPC Admin Password generated (first run)           ║");
-            eprintln!(
-                "║  Hint: {}                                           ║",
-                masked
-            );
-            eprintln!("║  WARNING: Could not determine data dir for password ║");
-            eprintln!("╚══════════════════════════════════════════════════════╝");
+            Self::deliver_first_run_secret("admin", "rpc_password", &password, data_dir);
         }
-        Ok(password)
+
+        // Provision a least-privilege mining credential. Before this, `admin`
+        // was the ONLY user ever created, so an operator wiring up a miner had
+        // to hand it full admin rights — and a compromised miner could then
+        // stop the node or deploy contracts. This user reaches only
+        // getblocktemplate/getwork/submitblock (see is_mining_method).
+        if !mgr.user_exists("miner") {
+            let miner_password = Self::generate_admin_password();
+            mgr.add_user("miner", &miner_password, AuthRole::Miner);
+            if mgr.user_exists("miner") {
+                Self::deliver_first_run_secret("miner", "rpc_miner_password", &miner_password, data_dir);
+            } else {
+                // Non-fatal: the node still runs and admin can mine. Say so
+                // rather than implying least privilege is available.
+                slog_error!("rpc", "miner_user_provisioning_failed",
+                    note => "mining will require the admin credential");
+            }
+        }
+
+        Ok(mgr)
+    }
+
+    /// Hand a freshly generated credential to the operator: a 0600 file in the
+    /// data directory plus a masked hint on the console. Never logged in full —
+    /// log aggregators, process monitors and shell history all capture
+    /// stdout/stderr.
+    fn deliver_first_run_secret(
+        label: &str,
+        filename: &str,
+        password: &str,
+        data_dir: Option<&std::path::Path>,
+    ) {
+        let masked = format!(
+            "{}...",
+            crate::domain::types::hash::log_prefix(password, 4)
+        );
+        slog_warn!("rpc", "first_run_credential_generated", user => label, hint => &masked);
+
+        let pw_path = match data_dir {
+            Some(base) => base.join(filename),
+            None => {
+                eprintln!("RPC {} password generated (first run). Hint: {}", label, masked);
+                eprintln!("WARNING: no data dir available, so the password file was NOT written.");
+                eprintln!("Reset the credential if you cannot recover it.");
+                return;
+            }
+        };
+
+        match std::fs::write(&pw_path, password.as_bytes()) {
+            Ok(_) => {
+                // Best-effort: restrict permissions on Unix.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &pw_path,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
+                eprintln!("RPC {} password generated (first run). Hint: {}", label, masked);
+                eprintln!("Full password written to: {}", pw_path.display());
+            }
+            Err(e) => {
+                slog_warn!("rpc", "rpc_password_file_write_failed",
+                    user => label, path => pw_path.display(), error => e);
+                eprintln!("RPC {} password generated (first run). Hint: {}", label, masked);
+                eprintln!(
+                    "WARNING: could not write the password file to {}: {}",
+                    pw_path.display(),
+                    e
+                );
+            }
+        }
     }
 
     pub fn new(db: Arc<DB>) -> Result<Self, NetworkError> {
-        // Persistent admin password: stored in RocksDB under "rpc:admin_password"
-        // First run: generate + store. Subsequent runs: load from DB.
-        // NOTE: no data_dir available here — falls back to cwd for password file.
-        // SECURITY: CWD password-file fallback is disabled by default.
-        // Callers that truly need this legacy behavior must opt in explicitly.
-        if std::env::var("SHADOWDAG_ALLOW_CWD_PASSWORDS").is_err() {
-            return Err(NetworkError::Other(
-                "RpcState::new() refuses CWD password fallback by default; use new_for_network with explicit data_dir, or set SHADOWDAG_ALLOW_CWD_PASSWORDS=1 for legacy behavior".into()
-            ));
-        }
-        slog_warn!("rpc", "rpc_new_without_data_dir", note => "legacy mode enabled: admin password may use cwd");
-        let admin_password = Self::load_or_create_admin_password(&db, None)?;
+        // Admin credentials live in RocksDB as PBKDF2 hashes only; see
+        // build_auth_manager. Without a data_dir a first-run password cannot be
+        // handed to the operator through a file, so warn loudly.
+        slog_warn!(
+            "rpc",
+            "rpc_new_without_data_dir",
+            note => "no data_dir provided; rpc_password file will not be written"
+        );
+        let auth_manager = Self::build_auth_manager(&db, None)?;
         let block_store = BlockStore::new(db.clone()).map_err(NetworkError::Storage)?;
         // NO fallback — RPC MUST use the same UTXO state as the node.
         // If UTXO store fails, the RPC cannot serve correct data.
@@ -336,7 +381,7 @@ impl RpcState {
             utxo_store,
             mempool,
             peer_manager,
-            auth_manager: RpcAuthManager::with_default_admin(&admin_password),
+            auth_manager,
             best_height: 0,
             best_hash: String::new(),
             node_version: format!("ShadowDAG/{}", env!("CARGO_PKG_VERSION")),
@@ -369,7 +414,7 @@ impl RpcState {
         db: Arc<DB>,
         data_dir: Option<&std::path::Path>,
     ) -> Result<Self, NetworkError> {
-        let admin_password = Self::load_or_create_admin_password(&db, data_dir)?;
+        let auth_manager = Self::build_auth_manager(&db, data_dir)?;
         let block_store = BlockStore::new(db.clone()).map_err(NetworkError::Storage)?;
         let store = Arc::new(UtxoStore::new(db.clone()).map_err(|e| {
             slog_error!("rpc", "utxo_store_init_failed", error => e);
@@ -383,7 +428,7 @@ impl RpcState {
             utxo_store,
             mempool,
             peer_manager,
-            auth_manager: RpcAuthManager::with_default_admin(&admin_password),
+            auth_manager,
             best_height: 0,
             best_hash: String::new(),
             node_version: format!("ShadowDAG/{}", env!("CARGO_PKG_VERSION")),
@@ -433,6 +478,8 @@ fn requires_auth(method: &str) -> bool {
         method,
         "sendrawtransaction"
             | "submitblock"
+            | "getblocktemplate"
+            | "getwork"
             | "stop"
             | "deploy_contract"
             | "call_contract"
@@ -446,10 +493,16 @@ fn requires_auth(method: &str) -> bool {
     )
 }
 
-/// Methods that must only be callable by admin role.
-/// Miner/read-only tokens are insufficient even if authenticated.
-fn requires_admin(method: &str) -> bool {
-    matches!(method, "stop")
+/// The only methods a mining credential needs. Everything else behind
+/// `requires_auth` stays admin-only, so a compromised miner cannot deploy or
+/// call contracts, broadcast arbitrary transactions, or stop the node.
+///
+/// `AuthRole::can_write()` returns true for Miner as well as Admin, so routing
+/// every non-admin method through it would have handed a miner the contract
+/// surface. Nothing regresses by tightening this now: until the `miner` user
+/// was provisioned alongside the admin, no Miner token could exist at all.
+fn is_mining_method(method: &str) -> bool {
+    matches!(method, "getblocktemplate" | "getwork" | "submitblock")
 }
 
 pub struct RpcServer {
@@ -463,18 +516,31 @@ pub struct RpcServer {
 }
 
 impl RpcServer {
-    #[inline]
-    fn configured_min_dag_parents_for_height(height: u64) -> usize {
-        let max = ConsensusParams::MAX_PARENTS;
-        match height {
-            0 => 0,
-            1 => 1,
-            _ => std::env::var("SHADOWDAG_MIN_DAG_PARENTS")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(crate::engine::dag::security::selfish_mining_guard::MIN_DAG_PARENTS)
-                .clamp(1, max),
+    /// Map the stored network_name string to a `NetworkMode`.
+    fn network_mode_from_name(
+        network_name: &str,
+    ) -> crate::config::node::node_config::NetworkMode {
+        use crate::config::node::node_config::NetworkMode;
+        let n = network_name.to_ascii_lowercase();
+        if n.contains("testnet") {
+            NetworkMode::Testnet
+        } else if n.contains("regtest") {
+            NetworkMode::Regtest
+        } else {
+            NetworkMode::Mainnet
         }
+    }
+
+    /// Min DAG parents for `height` on the node's network. Testnet/regtest allow
+    /// linear (single-parent) chains so a fresh chain can bootstrap from one
+    /// genesis; mainnet keeps the 2-parent anti-selfish-mining rule. Used by
+    /// getblocktemplate so the template + the submitblock gate agree.
+    #[inline]
+    fn min_dag_parents_for_height(height: u64, network_name: &str) -> usize {
+        crate::engine::dag::security::selfish_mining_guard::SelfishMiningGuard::min_dag_parents_for(
+            height,
+            Self::network_mode_from_name(network_name),
+        )
     }
 
     pub fn new(db: Arc<DB>) -> Result<Self, NetworkError> {
@@ -551,6 +617,19 @@ impl RpcServer {
     pub fn set_network_name(&self, name: &str) {
         if let Ok(mut s) = self.state.lock() {
             s.network_name = name.to_string();
+        }
+    }
+
+    /// Wire the active `NetworkMode` into the consensus-affecting RPC state:
+    /// the UTXO set's coinbase-maturity window and the mempool's validation
+    /// rules. The daemon must call this after construction — without it the RPC
+    /// state defaults to Mainnet, which on a test network makes `listunspent`
+    /// misreport maturity and makes `sendrawtransaction` reject a testnet
+    /// coinbase spend (Mainnet maturity is 1000 blocks, testnet is 10).
+    pub fn set_network_mode(&self, network: crate::config::node::node_config::NetworkMode) {
+        if let Ok(mut s) = self.state.lock() {
+            s.utxo_store.set_network(network.clone());
+            s.mempool.set_network(network);
         }
     }
 
@@ -720,7 +799,11 @@ impl RpcServer {
                 return Ok(());
             }
         };
-        if !Self::check_rate_limit(&rate_table, ip) {
+        // Loopback (127.0.0.1 / ::1) is the operator's own traffic on a private
+        // RPC port — a co-located miner polls getblocktemplate faster than the
+        // per-IP cap and would otherwise be throttled (and exit). It is not a DoS
+        // vector, so exempt it; external IPs are still rate-limited.
+        if !ip.is_loopback() && !Self::check_rate_limit(&rate_table, ip) {
             let resp = RpcResponse::err(
                 Value::Null,
                 ERR_RATE_LIMITED,
@@ -752,6 +835,14 @@ impl RpcServer {
         let method = parts.next().unwrap_or_default();
         let path = parts.next().unwrap_or_default();
         let _version = parts.next().unwrap_or_default();
+        // Prometheus scrape endpoint: GET /metrics returns text exposition format.
+        // Unauthenticated by design (the metrics are non-sensitive chain stats,
+        // and operators keep the RPC port on a private network); still rate-limited.
+        if method == "GET" && path == "/metrics" {
+            let body = Self::prometheus_metrics(&state);
+            Self::write_http_text(&mut stream, 200, "text/plain; version=0.0.4", &body)?;
+            return Ok(());
+        }
         if method != "POST" || path != "/" {
             Self::write_http_response(&mut stream, 405, json!({"error": "Only POST is allowed"}))?;
             return Ok(());
@@ -800,7 +891,17 @@ impl RpcServer {
                     return Ok(());
                 }
                 content_length_seen = true;
-                let v = &trimmed["Content-Length:".len()..];
+                let v = match trimmed.split_once(':') {
+                    Some((_, rest)) => rest,
+                    None => {
+                        Self::write_http_response(
+                            &mut stream,
+                            400,
+                            json!({"error": "malformed Content-Length header"}),
+                        )?;
+                        return Ok(());
+                    }
+                };
                 content_length = match v.trim().parse::<usize>() {
                     Ok(n) => n,
                     Err(_) => {
@@ -829,18 +930,20 @@ impl RpcServer {
                     continue;
                 }
                 auth_header_seen = true;
-                let v = &trimmed["Authorization:".len()..];
-                let auth_value = v.trim();
-                if let Some(token) = auth_value
-                    .strip_prefix("Bearer ")
-                    .or_else(|| auth_value.strip_prefix("bearer "))
-                {
-                    let token = token.trim();
-                    if token.is_empty() {
+                let v = match trimmed.split_once(':') {
+                    Some((_, rest)) => rest,
+                    None => {
                         malformed_auth_header = true;
-                    } else {
-                        auth_token = Some(token.to_string());
+                        continue;
                     }
+                };
+                let auth_value = v.trim();
+                let mut parts = auth_value.split_whitespace();
+                let scheme = parts.next().unwrap_or_default();
+                let token = parts.next().unwrap_or_default();
+                let extra = parts.next().is_some();
+                if scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() && !extra {
+                    auth_token = Some(token.to_string());
                 } else {
                     malformed_auth_header = true;
                 }
@@ -920,19 +1023,23 @@ impl RpcServer {
                             let mut s = state
                                 .lock()
                                 .map_err(|_| NetworkError::Other("State lock error".to_string()))?;
-                            let allowed = if requires_admin(&req.method) {
-                                s.auth_manager.is_admin(token)
-                            } else {
+                            let allowed = if is_mining_method(&req.method) {
+                                // Admin OR Miner — the only place a mining
+                                // credential is accepted.
                                 s.auth_manager.can_write(token)
+                            } else {
+                                // Everything else behind requires_auth, `stop`
+                                // included, is admin-only.
+                                s.auth_manager.is_admin(token)
                             };
                             if allowed {
                                 drop(s);
                                 Self::dispatch(&req.method, req.params, id, &state)
                             } else {
-                                let msg = if requires_admin(&req.method) {
-                                    "Admin role required for this method"
-                                } else {
+                                let msg = if is_mining_method(&req.method) {
                                     "Invalid, expired, or insufficient-permission auth token"
+                                } else {
+                                    "Admin role required for this method"
                                 };
                                 RpcResponse::err(
                                     id,
@@ -962,23 +1069,33 @@ impl RpcServer {
     }
 
     fn check_rate_limit(rate_table: &RateTable, ip: IpAddr) -> bool {
-        match rate_table.lock() {
-            Ok(mut table) => {
-                if table.len() > 10_000 {
-                    let cutoff = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                        .saturating_sub(RATE_CLEANUP_INTERVAL_SECS);
-                    table.retain(|_, b| b.last_refill >= cutoff);
-                }
-
-                let bucket = table.entry(ip).or_insert_with(RateBucket::new);
-                bucket.try_consume()
+        fn consume_token(table: &mut HashMap<IpAddr, RateBucket>, ip: IpAddr) -> bool {
+            if table.len() >= MAX_RATE_TABLE_ENTRIES {
+                let cutoff = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .saturating_sub(RATE_CLEANUP_INTERVAL_SECS);
+                table.retain(|_, b| b.last_refill >= cutoff);
             }
+
+            // New-IP flood guard: if table is still at capacity, reject unseen
+            // IPs rather than allowing unbounded growth.
+            if !table.contains_key(&ip) && table.len() >= MAX_RATE_TABLE_ENTRIES {
+                return false;
+            }
+
+            let bucket = table.entry(ip).or_insert_with(RateBucket::new);
+            bucket.try_consume()
+        }
+
+        match rate_table.lock() {
+            Ok(mut table) => consume_token(&mut table, ip),
             Err(e) => {
-                slog_error!("rpc", "rate_limit_lock_poisoned", error => e);
-                false // fail-closed: deny on lock failure
+                slog_error!("rpc", "rate_limit_lock_poisoned_recovering", error => &e.to_string());
+                // Recover from poisoning to avoid permanent self-DoS.
+                let mut table = e.into_inner();
+                consume_token(&mut table, ip)
             }
         }
     }
@@ -1013,6 +1130,81 @@ impl RpcServer {
         stream
             .write_all(resp.as_bytes())
             .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))
+    }
+
+    /// Write a plain-text HTTP response (used by the Prometheus /metrics endpoint).
+    fn write_http_text(
+        stream: &mut TcpStream,
+        status: u16,
+        content_type: &str,
+        body: &str,
+    ) -> Result<(), NetworkError> {
+        let resp = format!(
+            "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status,
+            content_type,
+            body.len(),
+            body
+        );
+        stream
+            .write_all(resp.as_bytes())
+            .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))
+    }
+
+    /// Append one Prometheus gauge (HELP + TYPE + value lines).
+    fn prom_gauge(out: &mut String, name: &str, help: &str, value: u64) {
+        out.push_str("# HELP ");
+        out.push_str(name);
+        out.push(' ');
+        out.push_str(help);
+        out.push('\n');
+        out.push_str("# TYPE ");
+        out.push_str(name);
+        out.push_str(" gauge\n");
+        out.push_str(name);
+        out.push(' ');
+        out.push_str(&value.to_string());
+        out.push('\n');
+    }
+
+    /// Render node metrics in Prometheus text exposition format.
+    fn prometheus_metrics(state: &SharedState) -> String {
+        let s = match state.lock() {
+            Ok(s) => s,
+            Err(_) => return String::from("# shadowdag: state lock error\n"),
+        };
+        let mut out = String::with_capacity(512);
+        Self::prom_gauge(
+            &mut out,
+            "shadowdag_block_count",
+            "Total blocks stored",
+            s.block_store.count() as u64,
+        );
+        Self::prom_gauge(
+            &mut out,
+            "shadowdag_height",
+            "Current selected-chain height",
+            s.best_height,
+        );
+        Self::prom_gauge(
+            &mut out,
+            "shadowdag_mempool_size",
+            "Transactions currently in the mempool",
+            s.mempool.count() as u64,
+        );
+        Self::prom_gauge(
+            &mut out,
+            "shadowdag_peer_count",
+            "Known/connected peers",
+            s.peer_manager.get_peers().len() as u64,
+        );
+        Self::prom_gauge(
+            &mut out,
+            "shadowdag_utxo_count",
+            "Size of the UTXO set",
+            s.utxo_store.count_utxos() as u64,
+        );
+        out
     }
 
     #[cfg(test)]
@@ -1052,8 +1244,10 @@ impl RpcServer {
                 }
             }
             "getblock" => Self::cmd_getblock(params, id, state),
+            "getblockfull" => Self::cmd_getblockfull(params, id, state),
             "getblocks" => Self::cmd_getblocks(params, id, state),
             "getblockcount" => Self::cmd_getblockcount(id, state),
+            "getconfidentialoutputs" => Self::cmd_getconfidentialoutputs(params, id, state),
             "getbestblockhash" => Self::cmd_getbestblockhash(id, state),
             "sendrawtransaction" => Self::cmd_sendrawtransaction(params, id, state),
             "getbalance" => Self::cmd_getbalance(params, id, state),
@@ -1076,6 +1270,7 @@ impl RpcServer {
             // ── UTXO Methods ───────────────────────────────────────────
             "getutxobyaddress" => Self::cmd_getutxobyaddress(params, id, state),
             "getbalancebyaddress" => Self::cmd_getbalancebyaddress(params, id, state),
+            "listunspent" | "getutxos" => Self::cmd_listunspent(params, id, state),
 
             // ── Fee Methods ────────────────────────────────────────────
             "estimatefee" => Self::cmd_estimatefee(id, state),
@@ -1313,6 +1508,8 @@ impl RpcServer {
                 std::thread::spawn(|| {
                     std::thread::sleep(Duration::from_millis(500));
                     slog_info!("rpc", "sending_sigterm_for_graceful_shutdown");
+                    // SAFETY: raising SIGTERM targets the current process and
+                    // does not dereference raw pointers.
                     unsafe {
                         libc::raise(libc::SIGTERM);
                     }
@@ -1352,6 +1549,31 @@ impl RpcServer {
                 None => RpcResponse::err(id, ERR_NOT_FOUND, format!("Block {} not found", hash)),
             },
             Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        }
+    }
+
+    /// Return the FULL block (header + all transactions, including confidential
+    /// output fields) as JSON deserializable into `Block`. Unlike `getblock`
+    /// (header summary only), this exposes the data a wallet needs to scan for
+    /// confidential outputs. Read-only; the state lock is dropped before
+    /// serialization (a block can be large).
+    fn cmd_getblockfull(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
+        let hash = match params.first().and_then(|v| v.as_str()) {
+            Some(h) => h.to_string(),
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "Expected block hash"),
+        };
+        let block_opt = match state.lock() {
+            Ok(s) => s.block_store.get_block(&hash),
+            Err(_) => return RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        };
+        match block_opt {
+            Some(block) => match serde_json::to_value(&block) {
+                Ok(v) => RpcResponse::ok(id, v),
+                Err(e) => {
+                    RpcResponse::err(id, ERR_INTERNAL, format!("block serialize failed: {}", e))
+                }
+            },
+            None => RpcResponse::err(id, ERR_NOT_FOUND, format!("Block {} not found", hash)),
         }
     }
 
@@ -1400,6 +1622,59 @@ impl RpcServer {
                         "start_height": start_height,
                         "count":        blocks.len(),
                         "blocks":       blocks,
+                    }),
+                )
+            }
+            Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        }
+    }
+
+    /// Read-only: page the global confidential-output index (okey→commitment) so a
+    /// wallet can select decoys and look up real inputs WITHOUT walking every block
+    /// or opening the node's UTXO DB. Params: [start, count]. Outputs are returned
+    /// in global-index order; `total` is the full index size. Served from the live
+    /// node UtxoSet, so it reflects all indexed outputs (no external-DB staleness).
+    fn cmd_getconfidentialoutputs(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
+        let start = params.first().and_then(|v| v.as_u64()).unwrap_or(0);
+        let count_raw = params
+            .get(1)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(MAX_CONF_OUTPUTS_RANGE as u64) as usize;
+        if count_raw > MAX_CONF_OUTPUTS_RANGE {
+            return RpcResponse::err(
+                id,
+                ERR_INVALID_PARAMS,
+                format!(
+                    "Requested {} outputs exceeds MAX_CONF_OUTPUTS_RANGE ({})",
+                    count_raw, MAX_CONF_OUTPUTS_RANGE
+                ),
+            );
+        }
+        match state.lock() {
+            Ok(s) => {
+                let total = s.utxo_store.confidential_output_count();
+                let end = start.saturating_add(count_raw as u64).min(total);
+                let mut outputs: Vec<Value> = Vec::new();
+                let mut i = start;
+                while i < end {
+                    if let Some(okey) = s.utxo_store.confidential_output_at(i) {
+                        if let Some(commitment) = s.utxo_store.output_key_commitment(&okey) {
+                            outputs.push(json!({
+                                "index": i,
+                                "okey": okey,
+                                "commitment": commitment,
+                            }));
+                        }
+                    }
+                    i += 1;
+                }
+                RpcResponse::ok(
+                    id,
+                    json!({
+                        "total":   total,
+                        "start":   start,
+                        "count":   outputs.len(),
+                        "outputs": outputs,
                     }),
                 )
             }
@@ -1577,7 +1852,11 @@ impl RpcServer {
                         "block_reward": crate::config::consensus::emission_schedule::EmissionSchedule::block_reward(s.best_height),
                         "miner_pct":    ConsensusParams::MINER_PERCENT,
                         "network":      s.network_name,
-                        "algorithm":    "ShadowHash (SHA256+Blake3+SHA3-256+AntiASIC)",
+                        // Version-gated from the current tip: ShadowHash (v2) or
+                        // UmbraHash (v3) — reflects what is actually being mined.
+                        "algorithm":    crate::engine::mining::pow::pow_validator::pow_algorithm_name(
+                            s.block_store.get_block(&s.best_hash).map(|b| b.header.version).unwrap_or(0)
+                        ),
                     }),
                 )
             }
@@ -1639,11 +1918,28 @@ impl RpcServer {
                 // Always read fresh chain state so height/hash are up-to-date
                 s.update_from_chain();
 
-                let txs = s.mempool.get_all_transactions();
-                let count = txs.len().min(ConsensusParams::MAX_BLOCK_TXS);
-                let total_fees: u64 = txs
+                // Hoisted above the selection: maturity is judged at the height
+                // the template will occupy, so the selector needs it too.
+                let next_height = s.best_height + 1;
+
+                // Select a validated, conflict-free transaction set against the
+                // CURRENT UTXO state (reserving one slot for the coinbase), so
+                // the miner can include real mempool txs and user transactions
+                // actually confirm. total_fees is computed over THIS exact set,
+                // so the miner's coinbase (emission + these fees) equals what the
+                // node will apply — the post-execution check requires
+                // coinbase_total == emission + applied_fees exactly. Passing
+                // next_height is what keeps that equality true when an immature
+                // coinbase spend is in the pool: apply would skip it and drop its
+                // fee, so the selector must not hand it to the miner either.
+                let selected = s.mempool.select_transactions_for_block(
+                    &s.utxo_store,
+                    ConsensusParams::MAX_BLOCK_TXS.saturating_sub(1),
+                    next_height,
+                );
+                let count = selected.len();
+                let total_fees: u64 = selected
                     .iter()
-                    .take(count)
                     .map(|t| t.fee)
                     .fold(0u64, |a, f| a.saturating_add(f));
 
@@ -1657,7 +1953,6 @@ impl RpcServer {
                     None => get_next_difficulty(),
                 };
 
-                let next_height = s.best_height + 1;
                 let block_reward = EmissionSchedule::block_reward(next_height);
 
                 // DAG tips = blocks with no children (the real frontier).
@@ -1681,7 +1976,7 @@ impl RpcServer {
                 if parent_hashes.is_empty() {
                     return RpcResponse::err(id, ERR_INTERNAL, "No valid parent hashes available");
                 }
-                let min_parents = Self::configured_min_dag_parents_for_height(next_height);
+                let min_parents = Self::min_dag_parents_for_height(next_height, &s.network_name);
                 if parent_hashes.len() < min_parents {
                     let mut seen: HashSet<String> = parent_hashes.iter().cloned().collect();
                     let mut cursor = s.best_hash.clone();
@@ -1689,10 +1984,29 @@ impl RpcServer {
                         if seen.insert(cursor.clone()) {
                             parent_hashes.push(cursor.clone());
                         }
+                        // Walk toward genesis to backfill parents up to
+                        // min_parents. Prefer selected_parent, but fall back to
+                        // the first DAG parent: an early block mined while
+                        // best_hash was still empty can carry an empty
+                        // selected_parent, which previously stalled the walk and
+                        // left the template short of min_parents (deadlocking a
+                        // low-tip mainnet at height 1).
                         cursor = s
                             .block_store
                             .get_block(&cursor)
-                            .and_then(|b| b.header.selected_parent.clone())
+                            .and_then(|b| {
+                                b.header
+                                    .selected_parent
+                                    .clone()
+                                    .filter(|p| !p.is_empty())
+                                    .or_else(|| {
+                                        b.header
+                                            .parents
+                                            .iter()
+                                            .find(|p| !p.is_empty())
+                                            .cloned()
+                                    })
+                            })
                             .unwrap_or_default();
                     }
                 }
@@ -1700,6 +2014,30 @@ impl RpcServer {
                 parent_hashes.dedup();
                 // Limit to MAX_PARENTS
                 parent_hashes.truncate(ConsensusParams::MAX_PARENTS);
+
+                // Minimum valid block timestamp, in MILLISECONDS. R4 (monotonic
+                // DAG time) requires a block's timestamp to be STRICTLY greater
+                // than every parent's. Block timestamps are unix epoch ms, so the
+                // floor is max(parent ts) + 1 MS. Tell the miner that floor; it
+                // stamps max(now_ms, min_timestamp). Keeps R4 intact on every
+                // network. (max_parent_ts is already ms from the parent headers.)
+                let max_parent_ts = parent_hashes
+                    .iter()
+                    .filter_map(|h| s.block_store.get_block(h))
+                    .map(|b| b.header.timestamp)
+                    .max()
+                    .unwrap_or(0);
+                let min_timestamp = max_parent_ts.saturating_add(1);
+
+                // M5: the deferred state commitment the miner MUST stamp into
+                // header.prev_state_commitment and mine into the PoW preimage. The
+                // node published it (over select_parent(canonical tips)) alongside
+                // next_difficulty, so it equals what the validator recomputes from
+                // the block's parents (miner<->verifier parity). null pre-M5.
+                let prev_state_commitment = match &s.mining_state {
+                    Some(ms) => ms.prev_state_commitment(),
+                    None => crate::service::network::nodes::full_node::get_prev_state_commitment(),
+                };
 
                 RpcResponse::ok(
                     id,
@@ -1711,9 +2049,16 @@ impl RpcServer {
                         "block_reward":  block_reward,
                         "tx_count":      count,
                         "total_fees":    total_fees,
-                        "target_time":   ConsensusParams::BLOCK_TIME,
+                        // Target block spacing in MILLISECONDS (100 ms at 10 BPS).
+                        // Block/tx timestamps and min_timestamp are unix epoch ms.
+                        "target_time_ms": ConsensusParams::TARGET_BLOCK_TIME_MS,
                         "max_tx":        ConsensusParams::MAX_BLOCK_TXS,
                         "max_size":      ConsensusParams::MAX_BLOCK_SIZE,
+                        "min_timestamp": min_timestamp,
+                        "prev_state_commitment": prev_state_commitment,
+                        // The exact tx set the miner must include (coinbase is
+                        // added by the miner). Empty when the mempool is empty.
+                        "transactions":  selected,
                     }),
                 )
             }
@@ -1811,6 +2156,23 @@ impl RpcServer {
                 )
             }
         };
+        // mix_hash: present only for UmbraHash (v>=UMBRA_POW_VERSION) blocks;
+        // absent/empty for ShadowHash. Preserving it is REQUIRED — the UmbraHash
+        // PoW check recomputes the mix and rejects a block whose stored mix_hash
+        // doesn't match, so dropping it here fails every UmbraHash submission.
+        let mix_hash: String = block_json
+            .get("mix_hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // M5: the submitted deferred state commitment. It is in the PoW preimage,
+        // so it MUST be reconstructed exactly as mined (null/absent -> None); the
+        // validator re-derives the expected value and rejects a mismatch.
+        let submitted_prev_state_commitment: Option<String> = block_json
+            .get("prev_state_commitment")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         let parents: Vec<String> = block_json
             .get("parents")
@@ -1876,7 +2238,8 @@ impl RpcServer {
             );
         }
 
-        let (expected_height, expected_difficulty, current_tips) = match state.lock() {
+        let (expected_height, expected_difficulty, current_tips, network_name) = match state.lock()
+        {
             Ok(mut s) => {
                 s.update_from_chain();
                 let expected_height = s.best_height + 1;
@@ -1888,7 +2251,12 @@ impl RpcServer {
                     Some(ms) => ms.dag_tips(),
                     None => get_dag_tips(),
                 };
-                (expected_height, expected_difficulty.max(1), tips)
+                (
+                    expected_height,
+                    expected_difficulty.max(1),
+                    tips,
+                    s.network_name.clone(),
+                )
             }
             Err(_) => return RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
         };
@@ -1913,7 +2281,7 @@ impl RpcServer {
                 ),
             );
         }
-        let min_parents = Self::configured_min_dag_parents_for_height(height);
+        let min_parents = Self::min_dag_parents_for_height(height, &network_name);
         if parents.len() < min_parents {
             return RpcResponse::err(
                 id,
@@ -1935,11 +2303,12 @@ impl RpcServer {
             );
         }
 
-        // Do NOT set selected_parent from client input (parents[0]) —
-        // it must be determined by GHOSTDAG during consensus validation.
-        // Setting it here would let the submitter influence fork-choice
-        // traversal paths. The FullNode pipeline computes and stores
-        // the correct GHOSTDAG-selected parent on block acceptance.
+        // Do NOT set selected_parent from client input — a submitter-chosen
+        // value could steer fork-choice traversal. FullNode normalizes it at
+        // acceptance (save_block_normalized): the stored value becomes
+        // BlockHeader::resolved_selected_parent(), i.e. the first PoW-covered
+        // parent, so every persisted block is walkable by the cumulative-work
+        // and reorg walks regardless of what the client sent.
         let selected_parent = None;
         let block = Block {
             header: BlockHeader {
@@ -1957,6 +2326,8 @@ impl RpcServer {
                 extra_nonce,
                 receipt_root: None,
                 state_root: None,
+                mix_hash,
+                prev_state_commitment: submitted_prev_state_commitment,
             },
             body: BlockBody { transactions },
         };
@@ -1976,7 +2347,9 @@ impl RpcServer {
         }
 
         // ── GATE 2: DagShield full validation (anti-selfish, anti-flood, anti-spam) ──
-        if let Err(rej) = DagShield::validate_block(&block) {
+        if let Err(rej) =
+            DagShield::validate_block_for_network(&block, Self::network_mode_from_name(&network_name))
+        {
             return RpcResponse::err(
                 id,
                 ERR_INVALID_PARAMS,
@@ -2211,6 +2584,66 @@ impl RpcServer {
         }
     }
 
+    /// List unspent outputs for an address together with their outpoints —
+    /// the exact data an external signer (the SDK, an exchange backend) needs
+    /// to construct and sign a spend. Each entry is
+    /// `{txid, vout, amount, coinbase, mature}`; `mature` reflects the
+    /// network-specific coinbase maturity so callers can avoid building a
+    /// spend the node would reject.
+    fn cmd_listunspent(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
+        let address = match params.first().and_then(|v| v.as_str()) {
+            Some(a) => a.to_string(),
+            None => return RpcResponse::err(id, ERR_INVALID_PARAMS, "Expected address"),
+        };
+        match state.lock() {
+            Ok(mut s) => {
+                // Read a fresh tip height so maturity is computed correctly.
+                s.update_from_chain();
+                let height = s.best_height;
+                let maturity = s.utxo_store.coinbase_maturity();
+                let mut utxos = Vec::new();
+                let mut total: u64 = 0;
+                let mut spendable: u64 = 0;
+                for (key, utxo) in s.utxo_store.export_all() {
+                    if utxo.spent || utxo.address != address {
+                        continue;
+                    }
+                    // Coinbase outputs carry a recorded creation height; pure
+                    // transfers do not and are spendable immediately.
+                    let created = s.utxo_store.coinbase_created_height(&key);
+                    let is_coinbase = created.is_some();
+                    let mature = match created {
+                        Some(h) => height.saturating_sub(h) >= maturity,
+                        None => true,
+                    };
+                    total = total.saturating_add(utxo.amount);
+                    if mature {
+                        spendable = spendable.saturating_add(utxo.amount);
+                    }
+                    utxos.push(json!({
+                        "txid":     key.hash_hex(),
+                        "vout":     key.index(),
+                        "amount":   utxo.amount,
+                        "coinbase": is_coinbase,
+                        "mature":   mature,
+                    }));
+                }
+                RpcResponse::ok(
+                    id,
+                    json!({
+                        "address":   address,
+                        "height":    height,
+                        "count":     utxos.len(),
+                        "total":     total,
+                        "spendable": spendable,
+                        "utxos":     utxos,
+                    }),
+                )
+            }
+            Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        }
+    }
+
     fn cmd_estimatefee(id: Value, state: &SharedState) -> RpcResponse {
         match state.lock() {
             Ok(s) => {
@@ -2319,7 +2752,10 @@ impl RpcServer {
             json!({
                 "shadowdag_version": "1.0.0",
                 "consensus":         "GHOSTDAG",
-                "pow_algorithm":     "ShadowHash (SHA256 + 64KB Scratchpad + Anti-ASIC + SHA3-256)",
+                // The node validates BOTH: legacy ShadowHash (v2) and the
+                // memory-hard UmbraHash (v3, opt-in via --pow=umbra). The active
+                // algorithm on-chain is the tip's — see getmininginfo/getpowinfo.
+                "pow_algorithm":     "UmbraHash",
                 "asic_resistant":    true,
                 "privacy":           ConsensusParams::PRIVACY_ENABLED,
                 "smart_contracts":   ConsensusParams::SMART_CONTRACTS_ENABLED,
@@ -2344,6 +2780,7 @@ impl RpcServer {
                     {"name": "getblock",           "params": "[hash]",     "description": "Get full block by hash"},
                     {"name": "getblocks",          "params": "[start, count]", "description": "Get blocks by height range"},
                     {"name": "getblockcount",      "params": "[]",        "description": "Get current block count"},
+                    {"name": "getconfidentialoutputs", "params": "[start, count]", "description": "Page the confidential-output index (okey/commitment) for decoy selection"},
                     {"name": "getbestblockhash",   "params": "[]",        "description": "Get best block hash"},
                     {"name": "sendrawtransaction", "params": "[tx_json]", "description": "Submit a transaction"},
                     {"name": "getbalance",         "params": "[address]", "description": "Get address balance"},
@@ -2360,8 +2797,9 @@ impl RpcServer {
                     {"name": "gettips",            "params": "[]",        "description": "Get current DAG tips"},
                     {"name": "getblockheader",     "params": "[hash]",    "description": "Get block header only"},
                     {"name": "getblocksbyheight",  "params": "[height]",  "description": "Get all blocks at height"},
-                    {"name": "getutxobyaddress",   "params": "[address]", "description": "Get UTXOs for address"},
+                    {"name": "getutxobyaddress",   "params": "[address]", "description": "Get UTXO summary for address"},
                     {"name": "getbalancebyaddress","params": "[address]", "description": "Get detailed balance"},
+                    {"name": "listunspent",        "params": "[address]", "description": "List unspent outpoints (txid,vout,amount,mature) for an address"},
                     {"name": "estimatefee",        "params": "[]",        "description": "Estimate transaction fee"},
                     {"name": "getbpsinfo",         "params": "[]",        "description": "Get BPS engine profiles"},
                     {"name": "getemission",        "params": "[height]",  "description": "Get emission at height"},
@@ -2383,16 +2821,30 @@ impl RpcServer {
 
     fn cmd_getsyncstatus(id: Value, state: &SharedState) -> RpcResponse {
         match state.lock() {
-            Ok(s) => RpcResponse::ok(
-                id,
-                json!({
-                    "best_height":    s.best_height,
-                    "best_hash":      s.best_hash,
-                    "block_count":    s.block_store.count(),
-                    "sync_mode":      "header_first",
-                    "is_synced":      true,
-                }),
-            ),
+            Ok(s) => {
+                let peer_best = s
+                    .peer_manager
+                    .get_peer_records()
+                    .iter()
+                    .map(|p| p.best_height)
+                    .max()
+                    .unwrap_or(0);
+                // Synced when within a couple of blocks of the best peer (or when
+                // no peer advertises a higher height).
+                let is_synced = s.best_height.saturating_add(2) >= peer_best;
+                RpcResponse::ok(
+                    id,
+                    json!({
+                        "best_height":      s.best_height,
+                        "best_hash":        s.best_hash,
+                        "block_count":      s.block_store.count(),
+                        "peer_best_height": peer_best,
+                        "blocks_behind":    peer_best.saturating_sub(s.best_height),
+                        "sync_mode":        "header_first",
+                        "is_synced":        is_synced,
+                    }),
+                )
+            }
             Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
         }
     }
@@ -2462,16 +2914,17 @@ impl RpcServer {
     }
 
     fn cmd_getpowinfo(id: Value) -> RpcResponse {
-        use crate::engine::mining::algorithms::shadowhash::SCRATCHPAD_SIZE;
+        use crate::engine::mining::algorithms::umbrahash::{CACHE_BYTES, DATASET_BYTES};
         RpcResponse::ok(
             id,
             json!({
-                "algorithm":       "ShadowHash",
-                "pipeline":        ["SHA-256", "Memory-hard (64KB scratchpad)", "Anti-ASIC (16KB, 256 rounds)", "SHA3-256"],
-                "scratchpad_kb":   SCRATCHPAD_SIZE / 1024,
+                "algorithm":       "UmbraHash",
+                "dataset_mib":     DATASET_BYTES / (1024 * 1024),
+                "cache_mib":       CACHE_BYTES / (1024 * 1024),
+                "cheap_verify":    true,
                 "asic_resistant":  true,
                 "gpu_mining":      true,
-                "gpu_backends":    ["CUDA", "OpenCL", "Rayon (CPU multi-thread)"],
+                "gpu_backends":    ["OpenCL", "Rayon (CPU multi-thread)"],
                 "stratum_v1":      true,
                 "target_type":     "256-bit numeric (target = MAX_TARGET / difficulty)",
             }),
@@ -2615,7 +3068,7 @@ impl RpcServer {
                     id,
                     json!({
                         "difficulty":   difficulty,
-                        "target":       &target[..16],
+                        "target":       target.get(..16).unwrap_or(&target),
                         "height":       height,
                     }),
                 )
@@ -2963,12 +3416,36 @@ impl RpcServer {
         }
     }
 
-    fn cmd_gettxconfirmations(params: Vec<Value>, id: Value, _state: &SharedState) -> RpcResponse {
+    fn cmd_gettxconfirmations(params: Vec<Value>, id: Value, state: &SharedState) -> RpcResponse {
         let txid = params.first().and_then(|v| v.as_str()).unwrap_or("");
-        RpcResponse::ok(
-            id,
-            json!({"txid": txid, "confirmations": 0, "note": "requires tx index lookup"}),
-        )
+        match state.lock() {
+            Ok(s) => {
+                match s
+                    .utxo_store
+                    .tx_seen_block(txid)
+                    .and_then(|bh| s.block_store.get_block(&bh))
+                {
+                    Some(block) => {
+                        let h = block.header.height;
+                        let confirmations = s.best_height.saturating_sub(h).saturating_add(1);
+                        RpcResponse::ok(
+                            id,
+                            json!({
+                                "txid": txid,
+                                "confirmations": confirmations,
+                                "block_height": h,
+                                "status": "confirmed",
+                            }),
+                        )
+                    }
+                    None => RpcResponse::ok(
+                        id,
+                        json!({"txid": txid, "confirmations": 0, "status": "unconfirmed"}),
+                    ),
+                }
+            }
+            Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        }
     }
 
     fn cmd_decodetransaction(params: Vec<Value>, id: Value) -> RpcResponse {
@@ -3146,7 +3623,7 @@ impl RpcServer {
                     match s.block_store.get_block(&current) {
                         Some(b) => {
                             chain.push(json!({"hash": b.header.hash, "height": b.header.height}));
-                            current = b.header.selected_parent.unwrap_or_default();
+                            current = b.header.resolved_selected_parent().unwrap_or_default();
                             if current.is_empty() {
                                 break;
                             }
@@ -3279,7 +3756,7 @@ impl RpcServer {
     fn cmd_getringsize(id: Value) -> RpcResponse {
         RpcResponse::ok(
             id,
-            json!({"default_ring_size": 11, "min_ring_size": 3, "max_ring_size": 64, "algorithm": "CLSAG"}),
+            json!({"default_ring_size": 11, "min_ring_size": 4, "max_ring_size": 64, "algorithm": "CLSAG"}),
         )
     }
 
@@ -3365,13 +3842,15 @@ impl RpcServer {
 
     fn cmd_gethardwarewalletinfo(id: Value) -> RpcResponse {
         use crate::service::wallet::keys::hardware_wallet::HardwareWalletManager;
+        // Hardware-wallet signing (Ledger/Trezor over USB HID) is not implemented
+        // yet, so report the honest capability rather than a false "supported".
         RpcResponse::ok(
             id,
             json!({
-                "supported": true,
-                "devices": ["Ledger Nano S/X/S+", "Trezor Model T/One", "FIDO2/U2F"],
+                "supported": false,
+                "reason": "hardware-wallet signing (USB HID) is not yet implemented",
+                "planned_types": ["Ledger", "Trezor"],
                 "derivation_paths": HardwareWalletManager::derivation_paths(),
-                "signing": "Ed25519 + Schnorr",
                 "coin_type": 9999,
             }),
         )
@@ -3580,7 +4059,7 @@ impl RpcServer {
         match state.lock() {
             Ok(s) => {
                 let mut layers = Vec::new();
-                for h in from_height..from_height + count as u64 {
+                for h in from_height..from_height.saturating_add(count as u64) {
                     let hashes = s.block_store.get_block_hashes_at_height(h);
                     if !hashes.is_empty() {
                         layers.push(json!({"height": h, "blocks": hashes, "width": hashes.len()}));
@@ -3835,8 +4314,8 @@ impl RpcServer {
         let to = params
             .get(1)
             .and_then(|v| v.as_u64())
-            .unwrap_or(from + 10)
-            .min(from + 100);
+            .unwrap_or(from.saturating_add(10))
+            .min(from.saturating_add(100));
         match state.lock() {
             Ok(s) => {
                 let mut blocks = Vec::new();
@@ -4079,16 +4558,48 @@ impl RpcServer {
     }
 
     fn cmd_verifymerkleproof(params: Vec<Value>, id: Value) -> RpcResponse {
+        // params: [tx_hash, merkle_root, proof_hashes[hex], proof_directions[bool]]
         let tx_hash = params.first().and_then(|v| v.as_str()).unwrap_or("");
         let merkle_root = params.get(1).and_then(|v| v.as_str()).unwrap_or("");
-        // Simplified verification - full proof data would come from client
+        let (hashes, dirs) = match (
+            params.get(2).and_then(|v| v.as_array()),
+            params.get(3).and_then(|v| v.as_array()),
+        ) {
+            (Some(h), Some(d)) if h.len() == d.len() => (h, d),
+            _ => {
+                return RpcResponse::err(
+                    id,
+                    ERR_INVALID_PARAMS,
+                    "Expected [tx_hash, merkle_root, proof_hashes[], proof_directions[]] with equal-length arrays",
+                )
+            }
+        };
+        let mut proof: Vec<([u8; 32], bool)> = Vec::with_capacity(hashes.len());
+        for (h, dir) in hashes.iter().zip(dirs.iter()) {
+            let bytes = match h
+                .as_str()
+                .and_then(|s| hex::decode(s).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            {
+                Some(a) => a,
+                None => {
+                    return RpcResponse::err(
+                        id,
+                        ERR_INVALID_PARAMS,
+                        "each proof hash must be 32-byte hex",
+                    )
+                }
+            };
+            proof.push((bytes, dir.as_bool().unwrap_or(false)));
+        }
+        let valid = crate::domain::block::merkle_tree::MerkleTree::verify_proof(
+            tx_hash,
+            &proof,
+            merkle_root,
+        );
         RpcResponse::ok(
             id,
-            json!({
-                "tx_hash": tx_hash, "merkle_root": merkle_root,
-                "note": "Submit proof_hashes and proof_directions for full verification",
-                "algorithm": "BLAKE2b-256 with domain separation",
-            }),
+            json!({ "tx_hash": tx_hash, "merkle_root": merkle_root, "valid": valid }),
         )
     }
 
@@ -4188,8 +4699,26 @@ impl RpcServer {
         )
     }
 
-    fn cmd_getbannedpeers(id: Value, _state: &SharedState) -> RpcResponse {
-        RpcResponse::ok(id, json!({"banned_count": 0, "banned": []}))
+    fn cmd_getbannedpeers(id: Value, state: &SharedState) -> RpcResponse {
+        match state.lock() {
+            Ok(s) => {
+                let banned: Vec<Value> = s
+                    .peer_manager
+                    .get_peer_records()
+                    .into_iter()
+                    .filter(|p| s.peer_manager.is_banned(&p.addr))
+                    .map(|p| {
+                        json!({
+                            "addr":      p.addr,
+                            "ban_until": s.peer_manager.get_ban_expiry(&p.addr),
+                            "ban_score": p.ban_score,
+                        })
+                    })
+                    .collect();
+                RpcResponse::ok(id, json!({"banned_count": banned.len(), "banned": banned}))
+            }
+            Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
+        }
     }
 
     fn cmd_getpeerversions(id: Value, state: &SharedState) -> RpcResponse {
@@ -4220,9 +4749,18 @@ impl RpcServer {
     }
 
     fn cmd_getprometheusurl(id: Value) -> RpcResponse {
+        // Metrics are served as GET /metrics on this node's own RPC port
+        // (text exposition format), so a Prometheus job can scrape the node
+        // directly. Substitute the node's host:rpc_port for <rpc_host:port>.
         RpcResponse::ok(
             id,
-            json!({"url": "http://localhost:9090/metrics", "format": "prometheus_text", "scrape_interval": "15s"}),
+            json!({
+                "path": "/metrics",
+                "method": "GET",
+                "url_template": "http://<rpc_host:port>/metrics",
+                "format": "prometheus_text",
+                "scrape_interval": "15s"
+            }),
         )
     }
 
@@ -4305,6 +4843,12 @@ impl RpcServer {
         // the JSON-RPC handler thread — a remotely-triggerable
         // crash.
         let network_short = Self::network_short_from_name(&s.network_name);
+        // Release the global state lock BEFORE the VM simulation: simulate runs
+        // against a fresh ContractStorage built from the shared DB handle (cloned
+        // above) and does not need the lock. Holding it across simulate would let
+        // one client freeze every other RPC (including reads and login) for the
+        // duration of an expensive contract execution.
+        drop(s);
         let ctx = match ContractStorage::new(cs.shared_db()) {
             Ok(cs_clone) => VMContext::new(cs_clone),
             Err(e) => {
@@ -4390,6 +4934,8 @@ impl RpcServer {
         // the JSON-RPC handler thread — a remotely-triggerable
         // crash.
         let network_short = Self::network_short_from_name(&s.network_name);
+        // Release the global state lock before the VM simulation (see cmd_deploy_contract).
+        drop(s);
         let ctx = match ContractStorage::new(cs.shared_db()) {
             Ok(cs_clone) => VMContext::new(cs_clone),
             Err(e) => {
@@ -4477,6 +5023,10 @@ impl RpcServer {
                                                    // the JSON-RPC handler thread — a remotely-triggerable
                                                    // crash.
         let network_short = Self::network_short_from_name(&s.network_name);
+        // Release the global state lock before the VM simulation (see cmd_deploy_contract).
+        // estimate_gas runs with a 100M gas ceiling, so holding the lock here would
+        // freeze all other RPC traffic for the entire estimation.
+        drop(s);
         let ctx = match ContractStorage::new(cs.shared_db()) {
             Ok(cs_clone) => VMContext::new(cs_clone),
             Err(e) => {
@@ -4820,6 +5370,108 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn legacy_cleartext_admin_password_is_migrated_then_erased() {
+        let db_dir = temp_db_dir();
+        let node_db = NodeDB::new(db_dir.join("db").to_string_lossy().as_ref()).unwrap();
+        let db = node_db.shared();
+
+        // A node created before 2026-07-22: the admin password sitting in the
+        // clear under rpc:admin_password, with no hashed user record yet.
+        let legacy_pw = "legacy-operator-password-123";
+        db.put(b"rpc:admin_password", legacy_pw.as_bytes()).unwrap();
+
+        let mut mgr = RpcState::build_auth_manager(&db, Some(&db_dir)).unwrap();
+
+        // The operator must NOT be locked out of a running node.
+        assert!(
+            mgr.login("admin", legacy_pw).is_ok(),
+            "migration must keep the operator's existing password working"
+        );
+        // ...and the cleartext copy must be gone.
+        assert!(
+            db.get(b"rpc:admin_password").unwrap().is_none(),
+            "the cleartext admin password must be erased from rocksdb"
+        );
+
+        // Restart: the hashed user is recovered, with no cleartext anywhere.
+        let mut again = RpcState::build_auth_manager(&db, Some(&db_dir)).unwrap();
+        assert!(
+            again.login("admin", legacy_pw).is_ok(),
+            "the hashed user must survive restart without a cleartext copy"
+        );
+        assert!(again.login("admin", "not-the-password").is_err());
+    }
+
+    #[test]
+    fn first_run_writes_no_cleartext_password_to_the_database() {
+        let db_dir = temp_db_dir();
+        let node_db = NodeDB::new(db_dir.join("db").to_string_lossy().as_ref()).unwrap();
+        let db = node_db.shared();
+
+        let mut mgr = RpcState::build_auth_manager(&db, Some(&db_dir)).unwrap();
+        assert!(mgr.user_exists("admin"), "first run must provision an admin");
+
+        // The generated password reaches the operator through the 0600 file...
+        let pw = fs::read_to_string(db_dir.join("rpc_password")).unwrap();
+        assert!(!pw.is_empty());
+        assert!(mgr.login("admin", &pw).is_ok(), "the file must hold the live password");
+
+        // ...and NOWHERE in the database, under that key or any other.
+        assert!(db.get(b"rpc:admin_password").unwrap().is_none());
+        let leaked = db
+            .iterator(rocksdb::IteratorMode::Start)
+            .filter_map(|r| r.ok())
+            .any(|(_, v)| v.windows(pw.len()).any(|w| w == pw.as_bytes()));
+        assert!(
+            !leaked,
+            "the cleartext password must not appear in any database value"
+        );
+    }
+
+    #[test]
+    fn miner_credential_is_provisioned_and_reaches_only_mining_methods() {
+        let db_dir = temp_db_dir();
+        let node_db = NodeDB::new(db_dir.join("db").to_string_lossy().as_ref()).unwrap();
+        let db = node_db.shared();
+        let mut mgr = RpcState::build_auth_manager(&db, Some(&db_dir)).unwrap();
+
+        // A least-privilege mining credential now exists, so an operator no
+        // longer has to hand a miner the admin password.
+        assert!(mgr.user_exists("miner"), "a miner user must be provisioned");
+        let miner_pw = fs::read_to_string(db_dir.join("rpc_miner_password")).unwrap();
+        let admin_pw = fs::read_to_string(db_dir.join("rpc_password")).unwrap();
+        assert_ne!(miner_pw, admin_pw, "the miner must not share the admin secret");
+
+        let miner_token = mgr.login("miner", &miner_pw).unwrap();
+        let admin_token = mgr.login("admin", &admin_pw).unwrap();
+
+        // The miner reaches the mining surface...
+        for m in ["getblocktemplate", "getwork", "submitblock"] {
+            assert!(is_mining_method(m), "{} must be a mining method", m);
+            assert!(
+                mgr.can_write(&miner_token),
+                "the miner token must be accepted for {}",
+                m
+            );
+        }
+
+        // ...and nothing else behind requires_auth. These all route through
+        // is_admin, which a Miner token fails.
+        for m in ["stop", "deploy_contract", "call_contract", "sendrawtransaction"] {
+            assert!(requires_auth(m));
+            assert!(!is_mining_method(m), "{} must NOT be a mining method", m);
+        }
+        assert!(
+            !mgr.is_admin(&miner_token),
+            "a miner token must never satisfy the admin check"
+        );
+        assert!(
+            mgr.is_admin(&admin_token),
+            "admin must retain access to every method"
+        );
+    }
+
     fn call(server: &RpcServer, method: &str) -> Value {
         let req = format!(
             r#"{{"jsonrpc":"2.0","method":"{}","params":[],"id":1}}"#,
@@ -4867,6 +5519,52 @@ mod tests {
     }
 
     #[test]
+    fn rate_limiter_recovers_from_poisoned_lock() {
+        let rate_table: RateTable = Arc::new(Mutex::new(HashMap::new()));
+        let ip = IpAddr::from_str("127.0.0.2").unwrap();
+
+        let poisoned = Arc::clone(&rate_table);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison test mutex");
+        });
+
+        assert!(
+            RpcServer::check_rate_limit(&rate_table, ip),
+            "Rate limiter should recover from lock poisoning instead of denying all requests"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_caps_new_ip_cardinality() {
+        use std::net::Ipv4Addr;
+
+        let rate_table: RateTable = Arc::new(Mutex::new(HashMap::new()));
+
+        // Fill up the table with unique IPs (all should be admitted initially).
+        for i in 0..MAX_RATE_TABLE_ENTRIES {
+            let ip = IpAddr::V4(Ipv4Addr::new(
+                ((i / 256 / 256) % 256) as u8,
+                ((i / 256) % 256) as u8,
+                (i % 256) as u8,
+                1,
+            ));
+            assert!(
+                RpcServer::check_rate_limit(&rate_table, ip),
+                "existing capacity should accept new entry {}",
+                i
+            );
+        }
+
+        // Next unseen IP should be rejected by hard-cap guard.
+        let overflow_ip = IpAddr::V4(Ipv4Addr::new(250, 250, 250, 250));
+        assert!(
+            !RpcServer::check_rate_limit(&rate_table, overflow_ip),
+            "unseen IP beyond MAX_RATE_TABLE_ENTRIES must be rejected"
+        );
+    }
+
+    #[test]
     fn getblockcount_returns_zero() {
         let s = make_server();
         let r = call(&s, "getblockcount");
@@ -4896,10 +5594,123 @@ mod tests {
     }
 
     #[test]
+    fn getblockfull_without_params_returns_error() {
+        let s = make_server();
+        let r = call(&s, "getblockfull");
+        assert_eq!(r["error"]["code"], json!(ERR_INVALID_PARAMS));
+    }
+
+    #[test]
+    fn getblockfull_unknown_hash_returns_not_found() {
+        let s = make_server();
+        let r = call_params(&s, "getblockfull", json!(["deadbeef"]));
+        assert_eq!(r["error"]["code"], json!(ERR_NOT_FOUND));
+    }
+
+    #[test]
+    fn block_json_round_trips_for_wallet_scan() {
+        // The CLI scan deserializes getblockfull's JSON into `Block`. Prove the
+        // serde contract holds (Block -> serde_json::Value -> Block).
+        use crate::domain::block::block::Block;
+        use crate::domain::block::block_body::BlockBody;
+        use crate::domain::block::block_header::BlockHeader;
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                hash: "ab".repeat(32),
+                parents: vec!["cd".repeat(32)],
+                merkle_root: "mr".into(),
+                timestamp: 1000,
+                nonce: 7,
+                difficulty: 1,
+                height: 5,
+                blue_score: 0,
+                selected_parent: None,
+                utxo_commitment: None,
+                extra_nonce: 0,
+                receipt_root: None,
+                state_root: None,
+                mix_hash: String::new(),
+                prev_state_commitment: None,
+            },
+            body: BlockBody {
+                transactions: vec![],
+            },
+        };
+        let v = serde_json::to_value(&block).unwrap();
+        let back: Block = serde_json::from_value(v).unwrap();
+        assert_eq!(back.header.hash, block.header.hash);
+        assert_eq!(back.header.height, 5);
+    }
+
+    #[test]
     fn getbalance_without_params_returns_error() {
         let s = make_server();
         let r = call(&s, "getbalance");
         assert!(r["error"].is_object());
+    }
+
+    #[test]
+    fn listunspent_without_params_returns_error() {
+        let s = make_server();
+        let r = call(&s, "listunspent");
+        assert_eq!(r["error"]["code"], json!(ERR_INVALID_PARAMS));
+    }
+
+    #[test]
+    fn listunspent_returns_outpoints_and_maturity() {
+        use crate::domain::utxo::utxo_key::UtxoKey;
+        let s = make_server();
+        let addr = "ST1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        // Inject one regular transfer output (immediately spendable) and one
+        // coinbase output created at height 0 (not yet mature at tip 0).
+        {
+            let st = s.state.lock().unwrap();
+            let k_regular = UtxoKey::new(&"ab".repeat(32), 0);
+            st.utxo_store
+                .add_utxo(&k_regular, "owner".into(), 500, addr.into());
+            let k_coinbase = UtxoKey::new(&"cd".repeat(32), 1);
+            st.utxo_store
+                .add_utxo_coinbase(&k_coinbase, "owner".into(), 1000, addr.into(), 0);
+        }
+        let r = call_params(&s, "listunspent", json!([addr]));
+        let res = &r["result"];
+        assert_eq!(res["count"], json!(2));
+        assert_eq!(res["total"], json!(1500));
+        // The height-0 coinbase is immature at tip 0, so only the 500 transfer
+        // is spendable.
+        assert_eq!(res["spendable"], json!(500));
+        // Every entry must carry the outpoint a signer needs to build a spend.
+        for u in res["utxos"].as_array().unwrap() {
+            assert!(u["txid"].as_str().is_some_and(|t| t.len() == 64));
+            assert!(u["vout"].is_u64());
+            assert!(u["amount"].is_u64());
+            assert!(u["mature"].is_boolean());
+        }
+    }
+
+    #[test]
+    fn listunspent_uses_testnet_coinbase_maturity_after_set_network_mode() {
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::utxo::utxo_key::UtxoKey;
+        let s = make_server();
+        // The daemon calls this after construction; without it the RPC state is
+        // Mainnet (maturity 1000) and a testnet coinbase would never look mature.
+        s.set_network_mode(NetworkMode::Testnet);
+        let addr = "ST1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        {
+            let mut st = s.state.lock().unwrap();
+            // Coinbase created at height 0; advance the tip to 10 → 10 confirmations.
+            let k = UtxoKey::new(&"ef".repeat(32), 0);
+            st.utxo_store
+                .add_utxo_coinbase(&k, "owner".into(), 1000, addr.into(), 0);
+            st.best_height = 10; // no block store best-hash, so update_from_chain keeps this
+        }
+        let r = call_params(&s, "listunspent", json!([addr]));
+        let res = &r["result"];
+        // Testnet maturity is 10, so a height-0 coinbase is spendable at tip 10.
+        assert_eq!(res["spendable"], json!(1000));
+        assert_eq!(res["utxos"][0]["mature"], json!(true));
     }
 
     #[test]
@@ -4942,6 +5753,38 @@ mod tests {
     }
 
     #[test]
+    fn getconfidentialoutputs_pages_the_index() {
+        let s = make_server();
+        {
+            let st = s.shared_state();
+            let g = st.lock().unwrap();
+            g.utxo_store
+                .record_confidential_output_indexed("okey_a", "comm_a")
+                .unwrap();
+            g.utxo_store
+                .record_confidential_output_indexed("okey_b", "comm_b")
+                .unwrap();
+            g.utxo_store
+                .record_confidential_output_indexed("okey_c", "comm_c")
+                .unwrap();
+        }
+        // Full page returns all three in global-index order, with commitments.
+        let r = call_params(&s, "getconfidentialoutputs", json!([0, 100]));
+        assert_eq!(r["result"]["total"], json!(3));
+        let outs = r["result"]["outputs"].as_array().unwrap();
+        assert_eq!(outs.len(), 3);
+        assert_eq!(outs[0]["okey"], json!("okey_a"));
+        assert_eq!(outs[0]["commitment"], json!("comm_a"));
+        assert_eq!(outs[2]["okey"], json!("okey_c"));
+        // Paging window: start=1, count=1 → just the middle output.
+        let r2 = call_params(&s, "getconfidentialoutputs", json!([1, 1]));
+        assert_eq!(r2["result"]["total"], json!(3));
+        let outs2 = r2["result"]["outputs"].as_array().unwrap();
+        assert_eq!(outs2.len(), 1);
+        assert_eq!(outs2[0]["okey"], json!("okey_b"));
+    }
+
+    #[test]
     fn validateaddress_valid() {
         let s = make_server();
         let r = call_params(&s, "validateaddress", json!(["SD1abc123456789"]));
@@ -4956,19 +5799,60 @@ mod tests {
     }
 
     #[test]
+    fn prometheus_gauge_exposition_format() {
+        let mut out = String::new();
+        RpcServer::prom_gauge(&mut out, "shadowdag_height", "Current height", 42);
+        assert!(out.contains("# HELP shadowdag_height Current height\n"));
+        assert!(out.contains("# TYPE shadowdag_height gauge\n"));
+        assert!(out.contains("shadowdag_height 42\n"));
+    }
+
+    #[test]
+    fn prometheus_metrics_endpoint_renders_all_gauges() {
+        let s = make_server();
+        let body = RpcServer::prometheus_metrics(&s.state);
+        for g in [
+            "shadowdag_block_count",
+            "shadowdag_height",
+            "shadowdag_mempool_size",
+            "shadowdag_peer_count",
+            "shadowdag_utxo_count",
+        ] {
+            assert!(body.contains(g), "metrics missing gauge {g}");
+        }
+    }
+
+    #[test]
     fn auth_policy_write_methods_require_auth() {
         assert!(requires_auth("sendrawtransaction"));
         assert!(requires_auth("submitblock"));
+        assert!(requires_auth("getblocktemplate"));
+        assert!(requires_auth("getwork"));
         assert!(requires_auth("deploy_contract"));
         assert!(!requires_auth("getblockcount"));
     }
 
     #[test]
-    fn auth_policy_stop_requires_admin() {
+    fn auth_policy_confines_the_miner_role_to_mining_methods() {
+        // A mining credential reaches exactly these three.
+        assert!(is_mining_method("getblocktemplate"));
+        assert!(is_mining_method("getwork"));
+        assert!(is_mining_method("submitblock"));
+
+        // Everything else behind requires_auth is admin-only. Note
+        // sendrawtransaction and the contract surface: AuthRole::can_write()
+        // returns true for Miner, so before this policy a mining credential
+        // could broadcast transactions and deploy contracts.
         assert!(requires_auth("stop"));
-        assert!(requires_admin("stop"));
-        assert!(!requires_admin("submitblock"));
-        assert!(!requires_admin("sendrawtransaction"));
+        for m in [
+            "stop",
+            "sendrawtransaction",
+            "deploy_contract",
+            "call_contract",
+            "get_storage_at",
+        ] {
+            assert!(!is_mining_method(m), "{} must be admin-only", m);
+        }
     }
 
     #[test]
@@ -4977,7 +5861,7 @@ mod tests {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
         let block = json!({
             "hash": "a".repeat(64),
             "height": 1,
@@ -5021,7 +5905,7 @@ mod tests {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
         let block = json!({
             "hash": "not_hex_or_64",
             "height": 1,

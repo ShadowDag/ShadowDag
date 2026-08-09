@@ -194,6 +194,47 @@ impl BlockStore {
     /// `get_best_hash()`, because `Option<None>` from the non-strict version
     /// collapses corruption/read-failure into "no chain" and can wipe existing
     /// chain state on startup.
+    /// Like `get_block`, but does NOT collapse failure into `None`.
+    ///
+    /// `get_block` returns `None` for an absent key, a deserialization failure
+    /// AND a RocksDB read error alike, so a caller cannot tell "this block does
+    /// not exist" from "I could not read it". Consensus recovery must not treat
+    /// a transient I/O error as proof of corruption, so it uses this instead:
+    /// `Ok(None)` means genuinely absent, `Err` means the read itself failed.
+    pub fn get_block_strict(&self, hash: &str) -> Result<Option<Block>, crate::errors::StorageError> {
+        let key = format!("{}{}", BLK_PREFIX, hash);
+        match self.db.get(key.as_bytes()) {
+            Ok(Some(data)) => match bincode::deserialize(&data) {
+                Ok(block) => Ok(Some(block)),
+                Err(e) => {
+                    slog_error!("storage", "block_deserialization_error_strict", hash => hash, error => e);
+                    Err(crate::errors::StorageError::ReadFailed(format!(
+                        "block {} failed to deserialize: {}",
+                        hash, e
+                    )))
+                }
+            },
+            Ok(None) => Ok(None),
+            Err(e) => {
+                slog_error!("storage", "block_read_error_strict", hash => hash, error => e);
+                Err(crate::errors::StorageError::ReadFailed(e.to_string()))
+            }
+        }
+    }
+
+    /// Flush memtables and fsync the WAL. Call before any abrupt termination:
+    /// `std::process::exit` runs no destructors, so without this an emergency
+    /// halt is itself an UNCLEAN stop — the exact condition documented as the
+    /// cause of a previous empty-UTXO-on-restart crash loop.
+    pub fn flush(&self) {
+        if let Err(e) = self.db.flush() {
+            slog_error!("storage", "block_store_flush_failed", error => e);
+        }
+        if let Err(e) = self.db.flush_wal(true) {
+            slog_error!("storage", "block_store_wal_flush_failed", error => e);
+        }
+    }
+
     pub fn get_best_hash_strict(&self) -> Result<Option<String>, crate::errors::StorageError> {
         match self.db.get(BLK_BEST_HASH) {
             Ok(Some(data)) => match String::from_utf8(data.to_vec()) {
@@ -580,6 +621,8 @@ mod tests {
                 extra_nonce: 0,
                 receipt_root: None,
                 state_root: None,
+                mix_hash: String::new(),
+                prev_state_commitment: None,
             },
             body: BlockBody {
                 transactions: vec![],

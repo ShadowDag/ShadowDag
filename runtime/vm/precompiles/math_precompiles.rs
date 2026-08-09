@@ -82,7 +82,8 @@ pub fn modexp_precompile(input: &[u8], gas_limit: u64) -> PrecompileResult {
 
     // Convert to u128 for basic modexp (handles up to 16-byte values)
     if mod_len == 0 {
-        return PrecompileResult::ok(vec![0u8; mod_len.max(1)], gas_cost);
+        // EIP-198: a zero-length modulus yields a zero-length output, not one byte (B5-L02).
+        return PrecompileResult::ok(Vec::new(), gas_cost);
     }
 
     let modulus = bytes_to_u128(mod_bytes);
@@ -229,6 +230,21 @@ mod tests {
         let result = modexp_precompile(&input, 1_000_000);
         assert!(result.success);
         assert_eq!(result.output, vec![0]);
+    }
+
+    #[test]
+    fn modexp_zero_length_modulus_empty_output() {
+        // EIP-198: a zero-length modulus yields a zero-length output (B5-L02).
+        let mut input = vec![0u8; 24 + 1 + 1];
+        input[0..8].copy_from_slice(&1u64.to_le_bytes()); // base_len = 1
+        input[8..16].copy_from_slice(&1u64.to_le_bytes()); // exp_len = 1
+        // mod_len left at 0
+        input[24] = 2; // base
+        input[25] = 3; // exp
+
+        let result = modexp_precompile(&input, 1_000_000);
+        assert!(result.success);
+        assert!(result.output.is_empty());
     }
 
     #[test]

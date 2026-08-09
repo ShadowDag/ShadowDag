@@ -68,6 +68,12 @@ use crate::{slog_error, slog_info, slog_warn};
 pub struct MiningTemplateState {
     next_difficulty: AtomicU64,
     dag_tips: Mutex<Vec<String>>,
+    /// M5: the deferred state commitment for the NEXT block, published by the
+    /// node (which has ghostdag + block_store) alongside `next_difficulty` and
+    /// anchored on the SAME `select_parent(canonical tips)` — so getblocktemplate
+    /// hands the miner exactly the value the validator will recompute from the
+    /// block's parents (miner<->verifier parity, mirroring the C4 difficulty path).
+    prev_state_commitment: Mutex<Option<String>>,
 }
 
 impl MiningTemplateState {
@@ -75,6 +81,7 @@ impl MiningTemplateState {
         Self {
             next_difficulty: AtomicU64::new(1),
             dag_tips: Mutex::new(Vec::new()),
+            prev_state_commitment: Mutex::new(None),
         }
     }
 
@@ -95,6 +102,60 @@ impl MiningTemplateState {
             *t = tips;
         }
     }
+
+    pub fn prev_state_commitment(&self) -> Option<String> {
+        self.prev_state_commitment.lock().ok().and_then(|c| c.clone())
+    }
+
+    pub fn set_prev_state_commitment(&self, commitment: Option<String>) {
+        if let Ok(mut c) = self.prev_state_commitment.lock() {
+            *c = commitment;
+        }
+    }
+}
+
+/// M5 SHARED PARITY FUNCTION — the ONE derivation of a block's deferred state
+/// commitment, called identically by the template publisher (miner side) and the
+/// validator. Anchors on `ghostdag.select_parent(parents)` (the SAME rule the
+/// difficulty path uses) and binds that selected parent's IDENTITY ONLY.
+/// Genesis / no-parent selection -> `genesis_prev_state_commitment()`.
+///
+/// SCOPE — read this before citing M5 as a state commitment: the parent's
+/// `utxo_commitment` / `state_root` / `receipt_root` are NOT bound. They are
+/// passed as canonical `None` (reserved format slots) for the reason spelled out
+/// at the call below, so this does NOT yet make the parent's post-execution state
+/// a consensus commitment. `state_root` / `receipt_root` are still written into
+/// the stored block AFTER execution, outside the PoW hash. Binding them for real
+/// is future work and needs deterministic, pre-mine-populated roots.
+///
+/// A block with these `parents` MUST carry exactly this value in
+/// `header.prev_state_commitment`; the validator rejects any mismatch and PoW
+/// covers it (it is in the preimage). Because both sides run this function over
+/// the same `select_parent(parents)`, they agree.
+pub fn expected_prev_state_commitment(
+    parents: &[String],
+    ghostdag: &GhostDag,
+    block_store: &BlockStore,
+) -> String {
+    use crate::engine::mining::algorithms::shadowhash::{
+        compute_prev_state_commitment, genesis_prev_state_commitment,
+    };
+    let sp = ghostdag.select_parent(parents);
+    if sp.is_empty() {
+        return genesis_prev_state_commitment();
+    }
+    // M5 (path B): bind ONLY the deterministic selected-parent identity. The
+    // parent's `state_root` / `receipt_root` are DEFERRED, path-dependent EVM
+    // roots — populated post-execution and only for executed contract blocks —
+    // and `header.utxo_commitment` is not yet deterministically populated.
+    // Binding any of them here would let the commitment DIVERGE across nodes and
+    // forks (a consensus split): this derivation runs before the parent's roots
+    // are recomputed, so a side node may read different values than the miner.
+    // The commitment FORMAT keeps the (currently-None) root slots reserved, so a
+    // future deterministic-roots upgrade needs no domain-tag change. `block_store`
+    // is retained for that upgrade (it will re-read the parent's committed roots).
+    let _ = block_store;
+    compute_prev_state_commitment(&sp, None, None, None)
 }
 
 impl Default for MiningTemplateState {
@@ -134,11 +195,27 @@ fn set_dag_tips(tips: Vec<String>) {
     PROCESS_DEFAULT_MINING_STATE.set_dag_tips(tips)
 }
 
+/// Get the NEXT block's M5 deferred state commitment from the process-default
+/// cell. The daemon builds its RPC template with `RpcState::mining_state = None`,
+/// so `getblocktemplate` MUST read this fallback (exactly like `get_next_difficulty`
+/// / `get_dag_tips`). Without it the template would emit `prev_state_commitment =
+/// null`, the miner would stamp `None`, and the M5 verify would reject every
+/// height>0 block — a silent chain halt. The FullNode publishes into this cell on
+/// startup and after every accepted block, alongside difficulty and tips.
+pub fn get_prev_state_commitment() -> Option<String> {
+    PROCESS_DEFAULT_MINING_STATE.prev_state_commitment()
+}
+
+fn set_prev_state_commitment(commitment: Option<String>) {
+    PROCESS_DEFAULT_MINING_STATE.set_prev_state_commitment(commitment)
+}
+
 /// Reset the process-default mining template cell. Test-only.
 #[cfg(test)]
 pub fn reset_mining_globals() {
     PROCESS_DEFAULT_MINING_STATE.set_next_difficulty(0);
     PROCESS_DEFAULT_MINING_STATE.set_dag_tips(Vec::new());
+    PROCESS_DEFAULT_MINING_STATE.set_prev_state_commitment(None);
 }
 
 /// Maximum orphan blocks to hold in memory (DoS protection)
@@ -146,18 +223,51 @@ const MAX_ORPHAN_BLOCKS: usize = 500;
 
 /// Maximum orphan blocks per peer (prevents single-peer flood)
 const MAX_ORPHAN_PER_PEER: usize = 25;
+/// Bound on distinct peer_ids tracked in `peer_block_timestamps` before a stale
+/// sweep runs, so rotated peer identities can't grow that map without limit.
+const MAX_TRACKED_PEERS: usize = 10_000;
 
 /// Maximum age (seconds) before an orphan is evicted.
 /// Tightened from 600s to 120s to reduce the selfish mining withholding
 /// window. At 10 BPS, 120s = 1200 blocks (vs previous 6000 blocks).
 const ORPHAN_EXPIRY_SECS: u64 = 120;
 
+/// P0-C DoS bound: reject an ORPHAN whose UmbraHash epoch is more than this many
+/// epochs beyond our best tip's epoch, BEFORE running its PoW. `umbra_check` ->
+/// `cache_for_epoch` runs `epoch_seed` (O(epoch) SHA3) + a 16 MiB `mkcache` for
+/// the block's epoch; without this bound an attacker floods orphans at an absurd
+/// height (near UMBRA_MAX_HEIGHT ~ epoch 333k) to force that work per packet. A
+/// real ahead-of-tip relayed block is within a few epochs of the network tip;
+/// larger gaps are filled by header-sync (not the bounded orphan buffer), so this
+/// never impedes IBD. 1 epoch = EPOCH_BLOCKS (3M) blocks ~ 3.5 days at 10 BPS, so
+/// a margin of 2 is hugely generous for near-tip orphans while capping the
+/// epoch_seed input to the real chain's epoch, not the attacker's chosen height.
+/// Aliased to the single source of truth so the orphan bound and the header-only
+/// admission bound can never drift apart (external audit H3).
+const MAX_ORPHAN_FUTURE_EPOCHS: u64 =
+    crate::engine::mining::algorithms::umbrahash::MAX_FUTURE_EPOCHS;
+
 /// Maximum reorg depth: reject reorgs deeper than this to prevent
 /// deep-reorg attacks. Blocks older than this are considered final.
 const MAX_REORG_DEPTH: u64 = crate::engine::consensus::reorg::FINALITY_DEPTH;
 
-/// Maximum blocks accepted per peer per minute (rate limiting)
-const MAX_BLOCKS_PER_PEER_PER_MIN: usize = 60;
+/// Maximum blocks accepted per peer per minute — a COARSE backstop. DosGuard's
+/// per-peer token bucket (100 blk/s) + global cap (200 blk/s) are the real,
+/// fine-grained limiters; this only catches pathological cases above them.
+///
+/// It MUST scale with the block rate. At N BPS the chain itself produces N*60
+/// blocks/min, so a peer merely relaying the tip — let alone serving an IBD
+/// backfill of thousands of blocks — legitimately sends far more than any fixed
+/// small number. The old hardcoded 60/min was BELOW the 10-BPS network rate
+/// (600/min): every relaying peer was flagged "exceeds 60 blocks/min", banned,
+/// and the chain could never converge (lagging nodes stayed stuck thousands of
+/// blocks behind). Set to BPS*60*20 (12,000/min at 10 BPS) — comfortably above
+/// both the tip rate and DosGuard's per-peer ceiling, so this never trips on
+/// honest traffic while real floods are still bounded by DosGuard + PoW.
+const MAX_BLOCKS_PER_PEER_PER_MIN: usize =
+    crate::config::consensus::consensus_params::ConsensusParams::BLOCKS_PER_SECOND as usize
+        * 60
+        * 20;
 
 pub struct FullNode {
     pub block_store: Arc<BlockStore>,
@@ -188,14 +298,45 @@ pub struct FullNode {
     /// to after each accepted block — without going through a
     /// process-global that would leak between co-tenant nodes.
     pub mining_state: Arc<MiningTemplateState>,
+    /// Memoized cumulative proof-of-work per block hash, used for
+    /// heaviest-chain fork choice. `cwork(b) = cwork(selected_parent) +
+    /// b.header.difficulty`. This is a PURE function of the block's
+    /// (immutable) ancestry, so the cache never needs invalidation — a
+    /// block's cumulative work is fixed once it exists. Rebuilt lazily after
+    /// restart. See `cumulative_work`.
+    cwork_cache: Mutex<HashMap<String, u128>>,
+    /// Height at which block bodies were last pruned (throttle for maybe_prune).
+    last_prune_height: AtomicU64,
 }
 
 impl FullNode {
     #[inline]
+    fn decode_revert_reason(return_data: &[u8]) -> String {
+        const MAX_REVERT_REASON_BYTES: usize = 1024;
+        let limited = &return_data[..return_data.len().min(MAX_REVERT_REASON_BYTES)];
+        match std::str::from_utf8(limited) {
+            Ok(s) => s
+                .chars()
+                .map(|c| {
+                    if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
+                        '?'
+                    } else {
+                        c
+                    }
+                })
+                .collect(),
+            Err(_) => format!("0x{}", hex::encode(limited)),
+        }
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn should_keep_current_tip_on_tie(
         current_best: &str,
         best_tip: &str,
         current_is_tip: bool,
+        current_cwork: u128,
+        best_cwork: u128,
         current_score: u64,
         best_score: u64,
         current_height: u64,
@@ -204,6 +345,7 @@ impl FullNode {
         !current_best.is_empty()
             && best_tip != current_best
             && current_is_tip
+            && current_cwork == best_cwork
             && current_score == best_score
             && current_height == best_height
     }
@@ -220,41 +362,59 @@ impl FullNode {
         // NOT MIN_DIFFICULTY. This ensures the first blocks after genesis
         // are validated against a reasonable difficulty.
         let genesis_diff = crate::config::genesis::genesis::genesis_difficulty_for(&network);
-        let mut retarget = RetargetEngine::new_with_bps(
-            genesis_diff,
-            crate::config::consensus::consensus_params::ConsensusParams::BLOCKS_PER_SECOND,
-        );
 
-        // ── Seed retarget from chain history ──────────────────────
-        // On restart, load the last SHORT_WINDOW blocks from BlockStore
-        // and replay them through the retarget engine. This recovers
-        // the exact difficulty state without storing it separately.
-        let blocks = block_store.get_all_blocks_sorted_by_height();
-        let seed_count = blocks.len().min(SHORT_WINDOW);
-        if seed_count > 1 {
-            // Feed the last SHORT_WINDOW blocks (or all if fewer)
-            let start_idx = blocks.len().saturating_sub(SHORT_WINDOW);
-            for block in &blocks[start_idx..] {
-                retarget.on_new_block(BlockTimeRecord {
-                    height: block.header.height,
-                    timestamp: block.header.timestamp,
-                    difficulty: block.header.difficulty,
-                    dag_block_count: 1, // historical seed — no DAG width data
-                    blue_score: block.header.blue_score,
-                });
+        // ── Seed retarget from the CANONICAL selected-parent chain ──────────
+        // Rebuild deterministically from the best tip's selected-parent chain
+        // (the same method the runtime reorg path uses), so a freshly-restarted
+        // node and a long-running node compute the IDENTICAL difficulty target.
+        // (The previous seed replayed get_all_blocks_sorted_by_height — all DAG
+        // blocks by height, not the canonical chain — which could diverge.)
+        let retarget = match block_store.get_best_hash() {
+            Some(best) if !best.is_empty() => {
+                let (engine, seeded_diff) =
+                    Self::build_retarget_from_canonical(&block_store, &ghostdag, &network, &best);
+                set_next_difficulty(seeded_diff);
+                slog_info!("node", "retarget_seeded", ema_difficulty => &seeded_diff.to_string());
+                engine
             }
-            let seeded_diff = retarget.ema_difficulty();
-            set_next_difficulty(seeded_diff);
-            slog_info!("node", "retarget_seeded", blocks => &seed_count.to_string(), ema_difficulty => &seeded_diff.to_string());
-        } else {
-            set_next_difficulty(genesis_diff);
-        }
+            _ => {
+                set_next_difficulty(genesis_diff);
+                RetargetEngine::new_with_bps(
+                    genesis_diff,
+                    crate::config::consensus::consensus_params::ConsensusParams::BLOCKS_PER_SECOND,
+                )
+            }
+        };
 
-        // Initialize global DAG tips for getblocktemplate
-        let initial_tips = dag_manager.get_tips();
+        // Initialize DAG tips for getblocktemplate — canonical form (sorted,
+        // deduped, capped) so select_parent below anchors on the same set a
+        // template will use.
+        let mut initial_tips = dag_manager.get_tips();
+        initial_tips.retain(|h| !h.is_empty());
+        initial_tips.sort();
+        initial_tips.dedup();
+        initial_tips
+            .truncate(crate::config::consensus::consensus_params::ConsensusParams::MAX_PARENTS);
         if !initial_tips.is_empty() {
             set_dag_tips(initial_tips.clone());
         }
+
+        // Published next difficulty MUST be anchored on select_parent(the tips a
+        // template will use) so miner-stamped == validator-expected (external
+        // audit C4). `retarget.ema_difficulty()` is anchored on the single best
+        // tip, which differs for a multi-tip reconvergence block. Fall back to the
+        // best-tip EMA only when there are no tips yet.
+        let seeded_next_diff = {
+            let sp = ghostdag.select_parent(&initial_tips);
+            if sp.is_empty() {
+                retarget.ema_difficulty().max(1)
+            } else {
+                Self::build_retarget_from_canonical(&block_store, &ghostdag, &network, &sp)
+                    .1
+                    .max(1)
+            }
+        };
+        set_next_difficulty(seeded_next_diff);
 
         // ── Startup recovery: verify contract state_root ──────────
         if let Some(best_hash) = block_store.get_best_hash() {
@@ -267,19 +427,22 @@ impl FullNode {
             }
         }
 
-        // Build the per-instance mining template cell. We seed
-        // both it and the process-default cell so any legacy
-        // caller that still uses the `get_next_difficulty` /
-        // `get_dag_tips` free functions sees the same values.
+        // Build the per-instance mining template cell, seeded consistently with
+        // the process-default cell.
         let mining_state = Arc::new(MiningTemplateState::new());
-        mining_state.set_next_difficulty(if seed_count > 1 {
-            retarget.ema_difficulty()
-        } else {
-            genesis_diff
-        });
+        mining_state.set_next_difficulty(seeded_next_diff);
         if !initial_tips.is_empty() {
             mining_state.set_dag_tips(initial_tips.clone());
         }
+        // M5: publish the NEXT block's deferred state commitment anchored on the
+        // SAME canonical tips as next_difficulty (miner<->verifier parity). Seed
+        // BOTH the per-instance cell AND the process-default cell so the daemon's
+        // getblocktemplate (RpcState::mining_state = None) has a value from the
+        // very first template — before any block is accepted post-startup — and
+        // never emits a null commitment that the M5 verify would reject.
+        let initial_psc = expected_prev_state_commitment(&initial_tips, &ghostdag, &block_store);
+        mining_state.set_prev_state_commitment(Some(initial_psc.clone()));
+        set_prev_state_commitment(Some(initial_psc));
 
         Self {
             block_store,
@@ -296,6 +459,64 @@ impl FullNode {
             dos_guard: DosGuard::new(),
             receipt_store: ReceiptStore::new(100_000),
             mining_state,
+            cwork_cache: Mutex::new(HashMap::new()),
+            last_prune_height: AtomicU64::new(0),
+        }
+    }
+
+    /// Prune block bodies far below the tip to bound disk growth. Deletes only
+    /// blocks whose height is more than the keep-depth below the best height —
+    /// well beyond MAX_REORG_DEPTH (1000) — so no reorg or DAG parent link can
+    /// need them; the UTXO set and height/commit indexes are untouched.
+    /// Keep-depth defaults to 2000 but is overridable via the env var
+    /// SHADOWDAG_PRUNE_KEEP_DEPTH; 0 disables pruning entirely (archival node, so
+    /// a far-behind peer can always backfill its missing bodies). Throttled to at
+    /// most once per PRUNE_INTERVAL of new height.
+    fn maybe_prune(&self) {
+        let mut keep_depth: u64 = std::env::var("SHADOWDAG_PRUNE_KEEP_DEPTH")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(2_000);
+        if keep_depth == 0 {
+            return;
+        }
+        // CONSENSUS-CRITICAL GUARD (external audit M1): block BODIES within the
+        // reorg and difficulty windows below the tip MUST stay resident — the
+        // ancestry-pure difficulty walk (SHORT_WINDOW blocks) and the reorg
+        // fork-point walk (MAX_REORG_DEPTH) both read them via block_store.
+        // get_block. A too-small keep_depth prunes a body inside a window, so the
+        // walk stops early and this node computes a DIFFERENT next_diff / fork
+        // point than an un-pruned node — which the strict-equality difficulty
+        // check turns into a consensus split. Clamp any positive keep_depth up to
+        // that window floor (archival keep_depth=0 is untouched above).
+        let min_keep = (SHORT_WINDOW as u64).max(MAX_REORG_DEPTH);
+        if keep_depth < min_keep {
+            slog_warn!("pruning", "keep_depth_clamped_to_window_floor",
+                requested => keep_depth, floor => min_keep);
+            keep_depth = min_keep;
+        }
+        const PRUNE_INTERVAL: u64 = 500;
+        let best = match self
+            .block_store
+            .get_best_hash()
+            .and_then(|h| self.block_store.get_block(&h))
+        {
+            Some(b) => b.header.height,
+            None => return,
+        };
+        if best <= keep_depth {
+            return;
+        }
+        let last = self.last_prune_height.load(Ordering::Relaxed);
+        if best < last.saturating_add(PRUNE_INTERVAL) {
+            return;
+        }
+        self.last_prune_height.store(best, Ordering::Relaxed);
+        let cutoff = best - keep_depth;
+        let pruned = self.block_store.prune_blocks_below_height(cutoff);
+        if pruned > 0 {
+            slog_warn!("pruning", "pruned_old_block_bodies",
+                count => pruned, below_height => cutoff, best_height => best);
         }
     }
 
@@ -375,12 +596,20 @@ impl FullNode {
         }
 
         // ── L1 → L2 → L3 → DAG → L4 ────────────────────────────────
-        self.process_block_inner(block, peer_id)
+        let r = self.process_block_inner(block, peer_id);
+        if r.is_ok() {
+            self.maybe_prune();
+        }
+        r
     }
 
     /// Process a block (internal use, no peer tracking).
     pub fn process_block(&self, block: &Block) -> Result<(), NodeError> {
-        self.process_block_inner(block, "local")
+        let r = self.process_block_inner(block, "local");
+        if r.is_ok() {
+            self.maybe_prune();
+        }
+        r
     }
 
     /// Collect ancestor timestamps by walking the DAG deeply.
@@ -448,50 +677,50 @@ impl FullNode {
             return Ok(block.header.difficulty.max(1));
         }
 
-        // Read current best height (if any).
-        let best_height = self
-            .block_store
-            .get_best_hash()
-            .and_then(|h| self.block_store.get_block(&h))
-            .map(|b| b.header.height)
-            .unwrap_or(0);
-
-        // For same/older heights, anchor to already-known blocks at that height.
-        if block.header.height <= best_height {
-            let hashes = self.block_store.get_block_hashes_at_height(block.header.height);
-            let mut fallback_anchor: Option<u64> = None;
-            for h in hashes {
-                if let Some(existing) = self.block_store.get_block(&h) {
-                    let anchored = existing.header.difficulty.max(1);
-                    // DAG may contain parallel blocks at the same height.
-                    // Accept when the claimed difficulty matches ANY anchored
-                    // difficulty at that height (not just the first entry).
-                    if anchored == block.header.difficulty.max(1) {
-                        return Ok(anchored);
-                    }
-                    if fallback_anchor.is_none() {
-                        fallback_anchor = Some(anchored);
-                    }
-                }
-            }
-            if let Some(anchor) = fallback_anchor {
-                return Ok(anchor);
-            }
-            // Fail closed: if we cannot anchor expected difficulty to known chain
-            // data at this height, reject instead of trusting attacker-supplied
-            // header difficulty.
+        // CONSENSUS-CRITICAL (external audit C4): the expected difficulty MUST be
+        // a PURE function of the CANDIDATE's own ancestry — never the local node's
+        // tip or its inventory of same-height side blocks. The previous code
+        // anchored on get_block_hashes_at_height (the LOCAL set of blocks at that
+        // height) for height <= best, and on the LOCAL tip's retarget EMA for a
+        // tip extension. Two nodes with different side-block inventories / tips
+        // could then accept vs reject the SAME block → a consensus split.
+        //
+        // Anchor instead on the CANONICAL selected parent — GHOSTDAG's
+        // deterministic pick among the block's committed parents (NOT the
+        // untrusted header.selected_parent, which like blue_score is not covered
+        // by PoW) — and rebuild the retarget from THAT ancestry window. The next
+        // difficulty after the selected parent is exactly what the miner stamped
+        // (get_next_difficulty == build_retarget_from_canonical of the tip it
+        // extended == this selected parent), so it is identical on every node and
+        // independent of local state.
+        let selected_parent = self.ghostdag.select_parent(&block.header.parents);
+        if selected_parent.is_empty() {
             return Err(NodeError::BlockRejected(format!(
-                "difficulty anchor missing at height {}",
+                "cannot compute expected difficulty at height {}: no canonical selected parent",
                 block.header.height
             )));
         }
+        Ok(self.expected_difficulty_for_selected_parent(&selected_parent))
+    }
 
-        // For tip extension (height = best + 1), use the current retarget EMA.
-        let retarget = self
-            .retarget
-            .lock()
-            .map_err(|e| NodeError::Other(format!("Retarget lock poisoned: {}", e)))?;
-        Ok(retarget.ema_difficulty().max(1))
+    /// The difficulty a block whose canonical selected parent is `selected_parent`
+    /// MUST carry — a pure function of that selected-parent chain (external audit
+    /// C4). This is the SINGLE source of truth shared by the validator
+    /// (`expected_difficulty_for_block`) and the miner-template publisher, so the
+    /// miner stamps EXACTLY what the validator recomputes. Both derive the anchor
+    /// via `ghostdag.select_parent` on their parent set (the block's committed
+    /// parents vs the current tips) — a previous version stamped from a DIFFERENT
+    /// anchor (`select_best_tip`: cumulative_work-first, opposite hash tie-break),
+    /// so a reconvergence block merging sibling tips was stamped f(A) but validated
+    /// against f(B) and universally rejected, halting production.
+    fn expected_difficulty_for_selected_parent(&self, selected_parent: &str) -> u64 {
+        let (_engine, expected) = Self::build_retarget_from_canonical(
+            &self.block_store,
+            &self.ghostdag,
+            &self.network,
+            selected_parent,
+        );
+        expected.max(1)
     }
 
     fn process_block_inner(&self, block: &Block, peer_id: &str) -> Result<(), NodeError> {
@@ -505,40 +734,77 @@ impl FullNode {
         // ═══════════════════════════════════════════════════════════════
         // CONSENSUS-CRITICAL VALIDATION PIPELINE
         //
-        // Three strictly-separated phases. Ordering is a SAFETY INVARIANT:
+        //   0. PARENT EXISTENCE (cheap DB read). Decides orphan vs connectable.
+        //      An ORPHAN gets SELF-CONSISTENT validation only (L1 + PoW) and is
+        //      buffered — ancestry-dependent checks are DEFERRED (see W4 below).
+        //   1. FULL validation for a connectable block: L1 → PoW → L2 (merkle,
+        //      timestamps, signatures) → L3 (difficulty, checkpoints, coinbase).
+        //      Now safe because the parents (hence the difficulty window and MTP
+        //      ancestors) are present.
+        //   2. PERSIST + DAG/GHOSTDAG insertion (block_store, dag_manager).
+        //   3. UTXO EXECUTION in GHOSTDAG order (recompute_virtual_chain),
+        //      sequential, atomic rollback on failure.
         //
-        //   Phase 1 (STATELESS): L1→PoW→L2→L3 — NO DB/UTXO reads.
-        //     Inputs:  block header + body only (+ pre-collected ancestor timestamps)
-        //     Checks:  format, size, signatures, merkle root, PoW, difficulty
-        //     Merkle tree uses rayon par_iter — SAFE because deterministic
-        //     (same TX order → same hash, regardless of thread scheduling)
-        //
-        //   Phase 2 (DAG): Parent existence + DAG insertion — reads block_store
-        //     Only reached if Phase 1 passes. No UTXO changes.
-        //
-        //   Phase 3 (UTXO EXECUTION): Apply transactions in GHOSTDAG order
-        //     Only reached after Phase 2. Reads/writes UTXO set.
-        //     Sequential, single-threaded, atomic rollback on failure.
-        //
-        // INVARIANT: Phase 1 validation (PoW, merkle root, signatures)
-        // is stateless. The only DB read is collect_ancestor_timestamps
-        // for MTP/timestamp rules — this is a controlled exception that
-        // reads block_store headers (immutable after save) and does not
-        // affect consensus determinism (all nodes have the same ancestors).
+        // SECURITY: an orphan is buffered only after PoW passes (bounds the
+        // cost — no work-free orphan flood), and it is NEVER applied until it
+        // reconnects and passes the FULL validation. So every ancestry-
+        // dependent rule (difficulty, MTP) is still enforced before apply —
+        // only its timing moves to reconnect. This is what lets a far-behind
+        // node accept ahead-of-tip blocks instead of hard-rejecting valid ones
+        // on a difficulty computed from its own un-synced tip.
         // ═══════════════════════════════════════════════════════════════
 
-        // NOTE: ema_difficulty() returns the tip-chain's difficulty
-        // estimate. For side-chain blocks this may differ from the
-        // difficulty their parents imply, but ShadowDAG's GHOSTDAG
-        // reorg mechanism re-validates after insertion, so a block
-        // accepted on this path will be re-checked when (if) it
-        // becomes part of the selected chain. A per-parent-context
-        // retarget would be more precise but requires walking the
-        // parent chain for every incoming block — acceptable for now.
+        // ─── PARENT-EXISTENCE FIRST (W4) ─────────────────────────────────
+        // Ancestry-dependent validation (difficulty, MTP timestamps) requires
+        // the block's parents. For an ORPHAN (parents not yet present) we
+        // CANNOT compute the expected difficulty — computing it against our own
+        // un-synced tip spuriously mismatches and hard-rejects a perfectly
+        // valid ahead-of-tip block, which is exactly what stops a far-behind
+        // node from ever catching up. So: validate only the SELF-CONSISTENT
+        // checks (structure + PoW — enough to reject junk and bound cost), then
+        // buffer the orphan. Its FULL ancestry-dependent validation (difficulty
+        // etc.) runs when it reconnects — before it is ever applied — so the
+        // security guarantee is preserved, only deferred.
+        match BlockValidator::validate_parents_exist(block, &self.block_store, &self.dag_manager) {
+            Ok(()) => {}
+            Err(e) if e.to_string().contains("not found") => {
+                // P0-C: cheap tip-relative epoch bound BEFORE running UmbraHash
+                // PoW on this UNVALIDATED orphan. validate_self_consistent ->
+                // umbra_check -> cache_for_epoch runs epoch_seed (O(epoch) SHA3)
+                // + a 16 MiB mkcache for the block's epoch; reject an absurd-
+                // height flood packet here without touching that work. Real
+                // ahead-of-tip blocks are within MAX_ORPHAN_FUTURE_EPOCHS of the
+                // tip; larger gaps are filled by header-sync, not this buffer.
+                if self.orphan_epoch_too_far(block.header.height) {
+                    return Err(NodeError::BlockRejected(format!(
+                        "ORPHAN height {} epoch too far beyond tip (umbra pre-cache DoS bound)",
+                        block.header.height
+                    )));
+                }
+                if let Err(reason) =
+                    BlockValidator::validate_self_consistent(block, &self.network)
+                {
+                    return Err(NodeError::BlockRejected(format!(
+                        "Block validation failed: {}",
+                        reason
+                    )));
+                }
+                self.add_orphan(block.clone(), peer_id);
+                return Err(NodeError::BlockRejected(format!("ORPHAN: {}", e)));
+            }
+            Err(e) => {
+                return Err(NodeError::BlockRejected(format!(
+                    "Parent validation failed: {}",
+                    e
+                )))
+            }
+        }
+
+        // Parents are present → FULL validation, incl. ancestry-dependent
+        // difficulty (computed from the now-available parent window) and
+        // timestamps. A block that reaches here is fully connectable.
         let expected_diff = Some(self.expected_difficulty_for_block(block)?);
-
         let ancestor_ts = self.collect_ancestor_timestamps(block);
-
         let result = BlockValidator::validate_block_full_with_difficulty(
             block,
             &self.utxo_set,
@@ -553,20 +819,26 @@ impl FullNode {
             )));
         }
 
-        // ─── PHASE 1 END ─── (above: stateless only, no DB reads) ───
-
-        // ─── PHASE 2 START ─── (stateful: reads block_store, dag_manager) ───
-        match BlockValidator::validate_parents_exist(block, &self.block_store, &self.dag_manager) {
-            Ok(()) => {}
-            Err(e) if e.to_string().contains("not found") => {
-                self.add_orphan(block.clone(), peer_id);
-                return Err(NodeError::BlockRejected(format!("ORPHAN: {}", e)));
-            }
-            Err(e) => {
+        // M5 DEFERRED-VERIFY: the block's prev_state_commitment MUST equal the
+        // value derived from its SELECTED PARENT's IDENTITY via the SAME shared fn
+        // the template publisher used (parents are present + in GHOSTDAG here, so
+        // select_parent is defined). NOTE: this does NOT verify the parent's
+        // post-execution roots — they are not bound; see
+        // expected_prev_state_commitment. PoW already binds the committed value
+        // into the hash (a tampered value fails PoW); this check additionally
+        // rejects a self-consistent block that committed to the WRONG parent.
+        // Non-genesis only (genesis carries its own constant).
+        if block.header.height > 0 {
+            let expected = expected_prev_state_commitment(
+                &block.header.parents,
+                &self.ghostdag,
+                &self.block_store,
+            );
+            if block.header.prev_state_commitment.as_deref() != Some(expected.as_str()) {
                 return Err(NodeError::BlockRejected(format!(
-                    "Parent validation failed: {}",
-                    e
-                )))
+                    "prev_state_commitment mismatch: header={:?} expected={}",
+                    block.header.prev_state_commitment, expected
+                )));
             }
         }
 
@@ -579,7 +851,7 @@ impl FullNode {
         // NOT insert into the DAG (no topology without data).
         // ═══════════════════════════════════════════════════════════════
 
-        if !self.block_store.save_block(block) {
+        if !self.save_block_normalized(block) {
             return Err(NodeError::BlockRejected(format!(
                 "BlockStore save failed for {} — refusing to add to DAG without persistence",
                 &block.header.hash
@@ -629,10 +901,16 @@ impl FullNode {
         // GHOSTDAG orders A before B, A's txs execute first.
         // ═══════════════════════════════════════════════════════════════
         if let Err(e) = self.recompute_virtual_chain() {
-            // Keep BlockStore aligned with DAG/GHOSTDAG.
-            // Deleting only from BlockStore creates stale topology.
+            // M3 (atomic acceptance): the just-added block is a CHILDLESS tip, and
+            // recompute_virtual_chain restores the UTXO set to the pre-insert
+            // (old-chain) state on a non-fatal Err. Remove the block from GHOSTDAG
+            // + DAG topology + BlockStore so acceptance is all-or-nothing —
+            // otherwise a phantom GHOSTDAG tip (metadata present, body deleted)
+            // could be re-selected as best_tip and roll back the real chain while
+            // applying nothing.
             slog_error!("node", "virtual_chain_recompute_failed_after_insert",
                 hash => &block.header.hash, error => &e.to_string());
+            self.drop_offending_block_if_leaf(&block.header.hash);
             return Err(e);
         }
 
@@ -651,18 +929,22 @@ impl FullNode {
             return Err(NodeError::BlockRejected("already exists".to_string()));
         }
 
-        // NOTE: ema_difficulty() returns the tip-chain's difficulty
-        // estimate. For side-chain blocks this may differ from the
-        // difficulty their parents imply, but ShadowDAG's GHOSTDAG
-        // reorg mechanism re-validates after insertion, so a block
-        // accepted on this path will be re-checked when (if) it
-        // becomes part of the selected chain. A per-parent-context
-        // retarget would be more precise but requires walking the
-        // parent chain for every incoming block — acceptable for now.
+        // Parent-existence FIRST (W4): ancestry-dependent validation
+        // (difficulty, MTP) needs the parents. This is the orphan-REPROCESS
+        // path; if a parent is still missing (e.g. a deeper ancestor hasn't
+        // arrived), fail WITHOUT the spurious difficulty check and WITHOUT
+        // re-buffering (the caller manages the orphan pool; this variant must
+        // not recurse into orphan handling). Only self-consistent checks would
+        // apply to a still-orphan, and it's already buffered, so just return.
+        if let Err(e) =
+            BlockValidator::validate_parents_exist(block, &self.block_store, &self.dag_manager)
+        {
+            return Err(NodeError::BlockRejected(e.to_string()));
+        }
+
+        // Parents present → full ancestry-dependent validation.
         let expected_diff = Some(self.expected_difficulty_for_block(block)?);
-
         let ancestor_ts = self.collect_ancestor_timestamps(block);
-
         let result = BlockValidator::validate_block_full_with_difficulty(
             block,
             &self.utxo_set,
@@ -676,10 +958,27 @@ impl FullNode {
             ));
         }
 
-        BlockValidator::validate_parents_exist(block, &self.block_store, &self.dag_manager)
-            .map_err(|e| NodeError::BlockRejected(e.to_string()))?;
+        // M5 DEFERRED-VERIFY (orphan-reconnect path): identical to the check in
+        // process_block_inner. This path is drained by the orphan resolver and is
+        // the normal IBD reconnection route, so the M5 commitment MUST be enforced
+        // here too — otherwise enforcement would be arrival-order-dependent (a
+        // block that arrives as an orphan and is later reconnected would skip the
+        // check), an attacker-controllable consensus split. Non-genesis only.
+        if block.header.height > 0 {
+            let expected = expected_prev_state_commitment(
+                &block.header.parents,
+                &self.ghostdag,
+                &self.block_store,
+            );
+            if block.header.prev_state_commitment.as_deref() != Some(expected.as_str()) {
+                return Err(NodeError::BlockRejected(format!(
+                    "prev_state_commitment mismatch: header={:?} expected={}",
+                    block.header.prev_state_commitment, expected
+                )));
+            }
+        }
 
-        if !self.block_store.save_block(block) {
+        if !self.save_block_normalized(block) {
             return Err(NodeError::BlockRejected(format!(
                 "BlockStore save failed for {} — refusing to add to DAG without persistence",
                 &block.header.hash
@@ -713,10 +1012,16 @@ impl FullNode {
         }
 
         if let Err(e) = self.recompute_virtual_chain() {
-            // Keep BlockStore aligned with DAG/GHOSTDAG.
-            // Deleting only from BlockStore creates stale topology.
+            // M3 (atomic acceptance): the just-added block is a CHILDLESS tip, and
+            // recompute_virtual_chain restores the UTXO set to the pre-insert
+            // (old-chain) state on a non-fatal Err. Remove the block from GHOSTDAG
+            // + DAG topology + BlockStore so acceptance is all-or-nothing —
+            // otherwise a phantom GHOSTDAG tip (metadata present, body deleted)
+            // could be re-selected as best_tip and roll back the real chain while
+            // applying nothing.
             slog_error!("node", "virtual_chain_recompute_failed_after_insert",
                 hash => &block.header.hash, error => &e.to_string());
+            self.drop_offending_block_if_leaf(&block.header.hash);
             return Err(e);
         }
         Ok(())
@@ -727,12 +1032,126 @@ impl FullNode {
     ///
     /// This MUST be used everywhere a "best tip" is chosen (runtime AND recovery)
     /// to guarantee consistent fork-choice across restarts.
-    pub fn select_best_tip(tips: &[String], ghostdag: &GhostDag) -> Option<String> {
+    /// Cumulative proof-of-work for `hash`: the sum of `header.difficulty` over
+    /// the selected-parent chain back to genesis. Memoized in `cwork_cache`.
+    ///
+    /// This is a deterministic pure function of the block's immutable ancestry
+    /// (selected_parent + the consensus-enforced per-block difficulty), so the
+    /// memo is always valid and identical on every node — no invalidation on
+    /// reorg, and a restarted node rebuilds the same values. The walk is
+    /// iterative (no recursion) to stay safe on very long chains, and stops at
+    /// the first already-cached ancestor for amortized O(1) cost.
+    pub fn cumulative_work(&self, hash: &str) -> u128 {
+        if hash.is_empty() {
+            return 0;
+        }
+        let mut cache = self.cwork_cache.lock().unwrap_or_else(|e| e.into_inner());
+        Self::cumulative_work_inner(&self.block_store, &mut cache, hash)
+    }
+
+    /// Core of [`cumulative_work`], parameterized over the store + memo cache so
+    /// it can be unit-tested without a full node. Walks the selected-parent
+    /// chain (iteratively) to genesis or the first cached ancestor, then
+    /// accumulates `header.difficulty` upward. Pure function of the chain.
+    fn cumulative_work_inner(
+        block_store: &BlockStore,
+        cache: &mut HashMap<String, u128>,
+        hash: &str,
+    ) -> u128 {
+        if hash.is_empty() {
+            return 0;
+        }
+        if let Some(&w) = cache.get(hash) {
+            return w;
+        }
+        // Walk down to genesis or the first cached ancestor, collecting
+        // (hash, difficulty) so we can accumulate upward afterwards.
+        let mut pending: Vec<(String, u128)> = Vec::new();
+        let mut cursor = hash.to_string();
+        let mut base: u128 = 0;
+        loop {
+            if cursor.is_empty() {
+                break;
+            }
+            if let Some(&w) = cache.get(&cursor) {
+                base = w;
+                break;
+            }
+            match block_store.get_block(&cursor) {
+                Some(b) => {
+                    pending.push((cursor.clone(), b.header.difficulty as u128));
+                    // resolved_selected_parent: stored blocks may carry None
+                    // (submitblock), which would truncate the work sum to one
+                    // block and cripple fork choice.
+                    cursor = b.header.resolved_selected_parent().unwrap_or_default();
+                }
+                None => break, // missing ancestor: treat as chain base
+            }
+        }
+        // Accumulate from the oldest pending block (last pushed) upward.
+        let mut acc = base;
+        while let Some((h, diff)) = pending.pop() {
+            acc = acc.saturating_add(diff);
+            cache.insert(h, acc);
+        }
+        cache.get(hash).copied().unwrap_or(base)
+    }
+
+    /// Persist a block with its canonical GHOSTDAG selected parent filled in.
+    ///
+    /// submitblock stores blocks with `selected_parent=None` by design (client
+    /// input is untrusted) and gossiped blocks may carry a stale/foreign value,
+    /// so the node must set it. The CANONICAL value is GHOSTDAG's selected
+    /// parent — argmax over the parents of (blue_score, chain_height, hash) via
+    /// `GhostDag::select_parent` — NOT `parents[0]`. On a multi-parent block
+    /// those differ, and the header's selected parent feeds the consensus walks
+    /// (cumulative work / fork choice, difficulty retarget, reorg fork-point,
+    /// undo pruning, recovery replay). Storing GHOSTDAG's value makes the
+    /// header agree EXACTLY with what `ghostdag.add_block` computes and stores
+    /// internally for this block, so every walk follows the true blue chain.
+    ///
+    /// The parents' blue scores are already known here (parents were accepted
+    /// earlier), so this is computable before THIS block enters GHOSTDAG.
+    /// Hash-safe: the PoW preimage covers `parents`, not `selected_parent`.
+    /// Genesis (no parents) stores None, which terminates the walks.
+    fn save_block_normalized(&self, block: &Block) -> bool {
+        let canonical = if block.header.parents.is_empty() {
+            None
+        } else {
+            Some(self.ghostdag.select_parent(&block.header.parents))
+        };
+        if block.header.selected_parent == canonical {
+            return self.block_store.save_block(block);
+        }
+        let mut normalized = block.clone();
+        normalized.header.selected_parent = canonical;
+        self.block_store.save_block(&normalized)
+    }
+
+    /// Select the best tip by HEAVIEST CUMULATIVE WORK (Nakamoto/Kaspa rule),
+    /// then blue_score, then chain_height, then lowest hash as deterministic
+    /// tie-breaks. Ranking by total work — not by blue block COUNT — prevents a
+    /// competing chain with more blocks but less proof-of-work from displacing
+    /// the honest heaviest chain.
+    pub fn select_best_tip(&self, tips: &[String]) -> Option<String> {
+        let mut cache = self.cwork_cache.lock().unwrap_or_else(|e| e.into_inner());
+        Self::select_best_tip_inner(&self.block_store, &self.ghostdag, &mut cache, tips)
+    }
+
+    /// Static core of [`select_best_tip`], shared by the runtime path and the
+    /// crash-recovery path (daemon) so BOTH agree on fork choice exactly — a
+    /// mismatch would let a node pick a different canonical tip after restart.
+    pub fn select_best_tip_inner(
+        block_store: &BlockStore,
+        ghostdag: &GhostDag,
+        cache: &mut HashMap<String, u128>,
+        tips: &[String],
+    ) -> Option<String> {
         tips.iter()
             .max_by(|a, b| {
-                ghostdag
-                    .get_blue_score(a)
-                    .cmp(&ghostdag.get_blue_score(b))
+                Self::cumulative_work_inner(block_store, cache, a)
+                    .cmp(&Self::cumulative_work_inner(block_store, cache, b))
+                    .then_with(|| ghostdag.get_blue_score(a).cmp(&ghostdag.get_blue_score(b)))
                     .then_with(|| {
                         ghostdag
                             .get_chain_height(a)
@@ -746,10 +1165,104 @@ impl FullNode {
     /// Recompute the virtual selected parent chain after DAG changes.
     ///
     /// Walks the GHOSTDAG ordering to determine which blocks should
+    /// Build a fresh `RetargetEngine` purely from the CANONICAL selected-parent
+    /// chain ending at `best_tip` (last `SHORT_WINDOW` blocks, oldest→newest),
+    /// returning it with the resulting next difficulty. Difficulty is thus a pure
+    /// function of the canonical chain — NOT of reorg/arrival history — so every
+    /// node computes the same value (eliminates cross-node difficulty divergence
+    /// after reorgs, which the strict-equality difficulty check would otherwise
+    /// turn into a chain split).
+    fn build_retarget_from_canonical(
+        block_store: &BlockStore,
+        ghostdag: &GhostDag,
+        network: &NetworkMode,
+        best_tip: &str,
+    ) -> (RetargetEngine, u64) {
+        let genesis_diff = crate::config::genesis::genesis::genesis_difficulty_for(network);
+        let mut engine = RetargetEngine::new_with_bps(
+            genesis_diff,
+            crate::config::consensus::consensus_params::ConsensusParams::BLOCKS_PER_SECOND,
+        );
+        // Walk the canonical selected-parent chain newest→oldest (≤ SHORT_WINDOW).
+        let mut chain: Vec<crate::domain::block::block::Block> = Vec::new();
+        let mut cursor = best_tip.to_string();
+        while chain.len() < SHORT_WINDOW && !cursor.is_empty() {
+            match block_store.get_block(&cursor) {
+                Some(b) => {
+                    let parent = b.header.resolved_selected_parent().unwrap_or_default();
+                    chain.push(b);
+                    cursor = parent;
+                }
+                None => break,
+            }
+        }
+        chain.reverse(); // oldest → newest
+        let mut next_diff = genesis_diff;
+        for b in &chain {
+            // CONSENSUS-CRITICAL: the per-block DAG-rate weight MUST be a
+            // deterministic function of the block itself, identical on every
+            // node regardless of which side/red blocks it happens to hold.
+            // `blocks_at_height` counts blocks in the LOCAL store at this
+            // height, which differs between a full miner (holds all siblings)
+            // and a syncing follower (holds only the selected chain) — so the
+            // two computed DIFFERENT next-block difficulties for the same
+            // canonical tip and the follower rejected the miner's block forever
+            // ("difficulty mismatch"), stalling IBD. `parents.len()` is committed
+            // in the header and covered by PoW (see
+            // BlockHeader::resolved_selected_parent), so it is identical on all
+            // nodes and still scales with merge width (a block merging W tips
+            // contributes W), preserving the DAG-rate correction while making it
+            // deterministic across sync states.
+            let dag_width = (b.header.parents.len() as u64).max(1);
+            // CONSENSUS-CRITICAL (external audit C3): use the GHOSTDAG-derived
+            // canonical blue score, NOT `b.header.blue_score`. The header
+            // blue_score field is NOT covered by the PoW pre-image (the miner
+            // stamps it but it is not hashed), so a peer can mutate it on the wire
+            // without re-mining; feeding it into the retarget would make two nodes
+            // compute DIFFERENT next-difficulties from the same block hash → a
+            // consensus split. GHOSTDAG recomputes the blue score deterministically
+            // from the block's committed ancestry, so it is identical on every node.
+            let canonical_blue = ghostdag.get_blue_score(&b.header.hash);
+            next_diff = engine.on_new_block(BlockTimeRecord {
+                height: b.header.height,
+                timestamp: b.header.timestamp,
+                difficulty: b.header.difficulty,
+                dag_block_count: dag_width,
+                blue_score: canonical_blue,
+            });
+        }
+        (engine, next_diff)
+    }
+
     /// have their transactions executed, and in what order.
     ///
     /// If the selected chain changed (reorg), rolls back old blocks
     /// and applies new ones — all in GHOSTDAG order.
+    /// M3 (atomic acceptance): drop an offending block from GHOSTDAG + DAG
+    /// topology + BlockStore, but ONLY when it is a CHILDLESS leaf
+    /// (`ghostdag.remove_block` succeeds). A mid-reorg-chain non-leaf block is
+    /// left FULLY intact — deleting only its body (as an unconditional
+    /// `delete_block` would) leaves it un-resyncable (the dedup gate still sees
+    /// it in the DAG) and silently skipped on the next recompute (body gone),
+    /// which is strictly worse than keeping the re-appliable block. The
+    /// just-added-tip acceptance paths always hit the leaf case; the reorg-apply
+    /// failure paths may not, so this guard is what keeps store/DAG/ghostdag
+    /// mutually consistent. Returns true iff the block was removed.
+    fn drop_offending_block_if_leaf(&self, block_hash: &str) -> bool {
+        match self.ghostdag.remove_block(block_hash) {
+            Ok(()) => {
+                let _ = self.dag_manager.remove_block_topology(block_hash);
+                let _ = self.block_store.delete_block(block_hash);
+                true
+            }
+            Err(re) => {
+                slog_warn!("node", "offending_block_kept_non_leaf",
+                    block => block_hash, error => &re.to_string());
+                false
+            }
+        }
+    }
+
     pub fn recompute_virtual_chain(&self) -> Result<(), NodeError> {
         // Get the new best tip from GHOSTDAG
         let tips = self.ghostdag.get_tips();
@@ -757,8 +1270,8 @@ impl FullNode {
             return Ok(());
         }
 
-        // Use canonical tip selection: blue_score -> height -> hash
-        let mut best_tip = match Self::select_best_tip(&tips, &self.ghostdag) {
+        // Canonical tip selection: cumulative work -> blue_score -> height -> hash
+        let mut best_tip = match self.select_best_tip(&tips) {
             Some(tip) => tip,
             None => return Ok(()),
         };
@@ -766,11 +1279,14 @@ impl FullNode {
         let current_best = self.block_store.get_best_hash().unwrap_or_default();
 
         // Reorg stability guard:
-        // If the current best is still a DAG tip and has the same
-        // (blue_score, chain_height) quality as the newly selected tip,
+        // If the current best is still a DAG tip and has the SAME quality as the
+        // newly selected tip (equal cumulative work, blue_score AND chain_height),
         // keep the current best to avoid tie-flip oscillation and needless
-        // rollback/apply churn.
+        // rollback/apply churn. Cumulative work must match too, or a heavier
+        // competing tip could be wrongly held off by an equal-score lighter one.
         let current_is_tip = tips.iter().any(|t| t == &current_best);
+        let best_cwork = self.cumulative_work(&best_tip);
+        let current_cwork = self.cumulative_work(&current_best);
         let best_score = self.ghostdag.get_blue_score(&best_tip);
         let best_height = self.ghostdag.get_chain_height(&best_tip);
         let current_score = self.ghostdag.get_blue_score(&current_best);
@@ -779,6 +1295,8 @@ impl FullNode {
             &current_best,
             &best_tip,
             current_is_tip,
+            current_cwork,
+            best_cwork,
             current_score,
             best_score,
             current_height,
@@ -796,17 +1314,33 @@ impl FullNode {
         // back via selected_parent to find where they diverge.
         use std::collections::HashSet;
 
-        // First, collect the old chain's selected-parent ancestry
+        // First, collect the old chain's selected-parent ancestry.
+        // resolved_selected_parent throughout these walks: stored blocks may
+        // carry selected_parent=None (submitblock path), which made every walk
+        // stop after one hop — fork_point became the new tip itself, so EVERY
+        // insert rolled back the current tip and applied only the new block,
+        // leaving the UTXO set holding just the newest coinbases.
         let mut old_chain_set = HashSet::new();
         {
             let mut cursor = current_best.clone();
-            while !cursor.is_empty() {
+            // Bound the ancestry walk to the reorg window. A fork point deeper
+            // than MAX_REORG_DEPTH is rejected as a too-deep reorg below, so
+            // collecting the old chain past that depth is wasted I/O — and
+            // walking all the way to genesis made EVERY block apply
+            // O(chain-length) block reads, which is the IBD apply-rate ceiling
+            // (a follower at height H re-reads ~H blocks per block it applies).
+            // Bounding to MAX_REORG_DEPTH is semantics-preserving: the
+            // accept/reject/apply/rollback decision is unchanged because any
+            // reorg whose fork lies beyond this depth is rejected regardless.
+            let mut depth = 0u64;
+            while !cursor.is_empty() && depth <= MAX_REORG_DEPTH {
                 old_chain_set.insert(cursor.clone());
                 cursor = self
                     .block_store
                     .get_block(&cursor)
-                    .and_then(|b| b.header.selected_parent.clone())
+                    .and_then(|b| b.header.resolved_selected_parent())
                     .unwrap_or_default();
+                depth += 1;
             }
         }
 
@@ -822,11 +1356,20 @@ impl FullNode {
             }
             new_chain.push(cursor.clone());
 
+            // Bound symmetrically: if the new chain has not met the old chain
+            // within the reorg window, this is a too-deep reorg. Stop and let
+            // the MAX_REORG_DEPTH check below reject it, instead of walking to
+            // genesis (an O(chain-length) walk an attacker could otherwise
+            // force with a single deep side-chain block).
+            if new_chain.len() as u64 > MAX_REORG_DEPTH {
+                break;
+            }
+
             // Walk to selected parent
             match self.block_store.get_block(&cursor) {
                 Some(b) => {
-                    match b.header.selected_parent {
-                        Some(ref sp) => cursor = sp.clone(),
+                    match b.header.resolved_selected_parent() {
+                        Some(sp) => cursor = sp,
                         None => break, // Genesis
                     }
                 }
@@ -868,7 +1411,7 @@ impl FullNode {
                 cursor = self
                     .block_store
                     .get_block(&cursor)
-                    .and_then(|b| b.header.selected_parent.clone())
+                    .and_then(|b| b.header.resolved_selected_parent())
                     .unwrap_or_default();
             }
         }
@@ -891,7 +1434,7 @@ impl FullNode {
                 cursor = self
                     .block_store
                     .get_block(&cursor)
-                    .and_then(|b| b.header.selected_parent.clone())
+                    .and_then(|b| b.header.resolved_selected_parent())
                     .unwrap_or_default();
             }
             if rollback_count > 0 {
@@ -904,12 +1447,70 @@ impl FullNode {
         let mut applied_new: Vec<String> = Vec::new();
 
         for block_hash in &new_chain {
-            // Skip if already applied
-            if self.utxo_set.get_commitment(block_hash).is_some() {
+            // Skip only if BOTH the UTXO state (utxo:commitment) AND the contract
+            // state (contract:applied marker) for this block are persisted. UTXO
+            // and contract state live in SEPARATE RocksDBs committed in separate
+            // batches; a crash between them leaves the UTXO commitment present but
+            // the contract state missing. Keying the skip off UTXO commitment
+            // alone would permanently skip such a block, leaving a contract-state
+            // hole (state_root divergence). Requiring the contract marker too
+            // forces re-execution of a crash-interrupted block.
+            if self.utxo_set.get_commitment(block_hash).is_some()
+                && self.contract_storage.contract_block_applied(block_hash)
+            {
                 continue;
             }
 
+            // Partially-applied block (UTXO commitment present, contract marker
+            // missing — e.g. a crash between the two DBs, or a recovery replay
+            // that rewrote UTXO state without contract markers): re-execution
+            // MUST start from a clean slate. Otherwise apply_block_dag_ordered
+            // DUP-skips the block's OWN transactions (their tx_seen markers
+            // already exist), returning applied_fees=0 — and the post-execution
+            // coinbase check then rejects a perfectly valid block by exactly
+            // its fee sum, which at boot is fatal (permanent crash loop). The
+            // stored undo data (written by every apply path) makes the
+            // rollback+reapply sequence idempotent.
+            if self.utxo_set.get_commitment(block_hash).is_some() {
+                if let Err(e) = self.utxo_set.rollback_block_undo(block_hash) {
+                    slog_warn!("node", "partial_block_rollback_before_reapply_failed",
+                        block => block_hash, error => &format!("{}", e));
+                }
+            }
+
             if let Some(block) = self.block_store.get_block(block_hash) {
+                // ── CONFIDENTIAL (RingCT) CONSENSUS GATE ───────────────────
+                // CRITICAL: block_validator only runs the STRUCTURAL
+                // RingValidator check, and apply_block_dag_ordered records
+                // confidential key-images/outputs WITHOUT validating. So the
+                // full gate (CLSAG crypto + homomorphic balance + on-chain
+                // ring-member authenticity + range proofs + cross-block
+                // key-image uniqueness) MUST run here, against the state with
+                // all earlier new-chain blocks already applied, or a peer block
+                // could mint/double-spend confidential value. A block-wide
+                // seen-key-image set also catches duplicates within the block.
+                {
+                    if let Err(msg) =
+                        verify_block_confidential_txs(&block, &self.utxo_set, &self.network)
+                    {
+                        slog_error!("node", "confidential_block_rejected",
+                            block => block_hash, reason => &msg);
+                        // Fail-atomic unwind: undo this reorg and restore the
+                        // previous chain, halting if any step fails.
+                        self.unwind_reorg_or_halt(
+                            &applied_new,
+                            &rolled_back_old,
+                            "confidential_block_rejected",
+                        );
+                        // M3: drop the offending block ONLY if it is a childless
+                        // leaf; a mid-reorg-chain non-leaf is left fully intact (see
+                        // drop_offending_block_if_leaf). The safety guarantee (never
+                        // APPLYING it) holds regardless.
+                        self.drop_offending_block_if_leaf(block_hash);
+                        return Err(NodeError::BlockRejected(msg));
+                    }
+                }
+
                 // ── CONTRACT EXECUTION (before UTXO processing) ─────────
                 // Uses the persistent contract storage (not temp_dir).
                 // State is persisted with undo data after UTXO succeeds.
@@ -948,37 +1549,17 @@ impl FullNode {
                         ) {
                             slog_error!("node", "contract_persist_with_undo_failed",
                                 block => block_hash, error => &format!("{}", e));
-                            for hash in applied_new.iter().rev() {
-                                let _ = self.utxo_set.rollback_block_undo(hash);
-                                self.rollback_contract_block_best_effort(hash);
-                            }
-                            // Best-effort: re-apply the old chain to restore the
-                            // previous consistent state. If this also fails, the
-                            // node is in an unrecoverable state and should restart
-                            // with full UTXO rebuild.
-                            for hash in rolled_back_old.iter().rev() {
-                                if let Some(old_block) = self.block_store.get_block(hash) {
-                                    let _ = self.utxo_set.apply_block_dag_ordered(
-                                        &old_block.body.transactions,
-                                        old_block.header.height,
-                                        hash,
-                                    );
-                                    // Re-execute contracts for the old block to restore state
-                                    let (_, _, _, env) = self.execute_contract_transactions(
-                                        &old_block,
-                                        &self.contract_storage,
-                                    );
-                                    if let Err(pe) = env.persist_with_undo(
-                                        &self.contract_storage,
-                                        hash,
-                                        None,
-                                        None,
-                                    ) {
-                                        slog_error!("node", "CRITICAL_contract_restore_failed",
-                                            block => hash, error => &format!("{}", pe));
-                                    }
-                                }
-                            }
+                            self.unwind_reorg_or_halt(
+                                &applied_new,
+                                &rolled_back_old,
+                                "contract_persist_with_undo_failed",
+                            );
+                            // M3: drop the offending block ONLY if it is a childless
+                            // leaf; a mid-reorg-chain non-leaf is left fully intact
+                            // (see drop_offending_block_if_leaf). Pre-M3 this path
+                            // deleted nothing, so keeping a non-leaf matches it while
+                            // now cleanly removing a childless-leaf offender.
+                            self.drop_offending_block_if_leaf(block_hash);
                             return Err(NodeError::Consensus(ConsensusError::BlockValidation(
                                 format!(
                                     "contract state persistence failed for block {}: {}",
@@ -1058,34 +1639,11 @@ impl FullNode {
                                     VM_METRICS.record_violation();
                                     // Invariant violation is a consensus-critical error.
                                     // Roll back this block and reject it.
-                                    for hash in applied_new.iter().rev() {
-                                        let _ = self.utxo_set.rollback_block_undo(hash);
-                                        self.rollback_contract_block_best_effort(hash);
-                                    }
-                                    // Re-apply old chain
-                                    for hash in rolled_back_old.iter().rev() {
-                                        if let Some(old_block) = self.block_store.get_block(hash) {
-                                            let _ = self.utxo_set.apply_block_dag_ordered(
-                                                &old_block.body.transactions,
-                                                old_block.header.height,
-                                                hash,
-                                            );
-                                            let (_, _, _, env) = self
-                                                .execute_contract_transactions(
-                                                    &old_block,
-                                                    &self.contract_storage,
-                                                );
-                                            if let Err(pe) = env.persist_with_undo(
-                                                &self.contract_storage,
-                                                hash,
-                                                None,
-                                                None,
-                                            ) {
-                                                slog_error!("node", "CRITICAL_contract_restore_failed",
-                                                    block => hash, error => &format!("{}", pe));
-                                            }
-                                        }
-                                    }
+                                    self.unwind_reorg_or_halt(
+                                        &applied_new,
+                                        &rolled_back_old,
+                                        "INVARIANT_VIOLATION",
+                                    );
                                     return Err(NodeError::Consensus(ConsensusError::BlockValidation(
                                         format!("INVARIANT_VIOLATION: receipt/state root mismatch in {}", block_hash)
                                     )));
@@ -1102,38 +1660,11 @@ impl FullNode {
                         let expected_reward = EmissionSchedule::block_reward(block.header.height);
                         let expected_total =
                             expected_reward.checked_add(applied_fees).ok_or_else(|| {
-                                // Rollback partially-applied new chain (UTXO + contract)
-                                for hash in applied_new.iter().rev() {
-                                    let _ = self.utxo_set.rollback_block_undo(hash);
-                                    self.rollback_contract_block_best_effort(hash);
-                                }
-                                // Best-effort: re-apply the old chain to restore the
-                                // previous consistent state. If this also fails, the
-                                // node is in an unrecoverable state and should restart
-                                // with full UTXO rebuild.
-                                for hash in rolled_back_old.iter().rev() {
-                                    if let Some(old_block) = self.block_store.get_block(hash) {
-                                        let _ = self.utxo_set.apply_block_dag_ordered(
-                                            &old_block.body.transactions,
-                                            old_block.header.height,
-                                            hash,
-                                        );
-                                        // Re-execute contracts for the old block to restore state
-                                        let (_, _, _, env) = self.execute_contract_transactions(
-                                            &old_block,
-                                            &self.contract_storage,
-                                        );
-                                        if let Err(pe) = env.persist_with_undo(
-                                            &self.contract_storage,
-                                            hash,
-                                            None,
-                                            None,
-                                        ) {
-                                            slog_error!("node", "CRITICAL_contract_restore_failed",
-                                        block => hash, error => &format!("{}", pe));
-                                        }
-                                    }
-                                }
+                                self.unwind_reorg_or_halt(
+                                    &applied_new,
+                                    &rolled_back_old,
+                                    "reward_plus_fees_overflow",
+                                );
                                 NodeError::Consensus(ConsensusError::BlockValidation(
                                     "reward + fees overflow".into(),
                                 ))
@@ -1149,41 +1680,11 @@ impl FullNode {
                                     Some(t) => t,
                                     None => {
                                         slog_error!("node", "coinbase_output_overflow", block => block_hash);
-                                        // Rollback partially-applied new chain (UTXO + contract)
-                                        for hash in applied_new.iter().rev() {
-                                            let _ = self.utxo_set.rollback_block_undo(hash);
-                                            self.rollback_contract_block_best_effort(hash);
-                                        }
-                                        // Best-effort: re-apply the old chain to restore the
-                                        // previous consistent state. If this also fails, the
-                                        // node is in an unrecoverable state and should restart
-                                        // with full UTXO rebuild.
-                                        for hash in rolled_back_old.iter().rev() {
-                                            if let Some(old_block) =
-                                                self.block_store.get_block(hash)
-                                            {
-                                                let _ = self.utxo_set.apply_block_dag_ordered(
-                                                    &old_block.body.transactions,
-                                                    old_block.header.height,
-                                                    hash,
-                                                );
-                                                // Re-execute contracts for the old block to restore state
-                                                let (_, _, _, env) = self
-                                                    .execute_contract_transactions(
-                                                        &old_block,
-                                                        &self.contract_storage,
-                                                    );
-                                                if let Err(pe) = env.persist_with_undo(
-                                                    &self.contract_storage,
-                                                    hash,
-                                                    None,
-                                                    None,
-                                                ) {
-                                                    slog_error!("node", "CRITICAL_contract_restore_failed",
-                                                        block => hash, error => &format!("{}", pe));
-                                                }
-                                            }
-                                        }
+                                        self.unwind_reorg_or_halt(
+                                            &applied_new,
+                                            &rolled_back_old,
+                                            "coinbase_output_overflow",
+                                        );
                                         return Err(NodeError::BlockRejected(format!(
                                             "coinbase output overflow in {}",
                                             block_hash
@@ -1192,39 +1693,11 @@ impl FullNode {
                                 };
                                 if actual_total != expected_total {
                                     slog_error!("node", "coinbase_mismatch", block => block_hash, actual => &actual_total.to_string(), expected => &expected_total.to_string());
-                                    // Rollback partially-applied new chain (UTXO + contract)
-                                    for hash in applied_new.iter().rev() {
-                                        let _ = self.utxo_set.rollback_block_undo(hash);
-                                        self.rollback_contract_block_best_effort(hash);
-                                    }
-                                    // Best-effort: re-apply the old chain to restore the
-                                    // previous consistent state. If this also fails, the
-                                    // node is in an unrecoverable state and should restart
-                                    // with full UTXO rebuild.
-                                    for hash in rolled_back_old.iter().rev() {
-                                        if let Some(old_block) = self.block_store.get_block(hash) {
-                                            let _ = self.utxo_set.apply_block_dag_ordered(
-                                                &old_block.body.transactions,
-                                                old_block.header.height,
-                                                hash,
-                                            );
-                                            // Re-execute contracts for the old block to restore state
-                                            let (_, _, _, env) = self
-                                                .execute_contract_transactions(
-                                                    &old_block,
-                                                    &self.contract_storage,
-                                                );
-                                            if let Err(pe) = env.persist_with_undo(
-                                                &self.contract_storage,
-                                                hash,
-                                                None,
-                                                None,
-                                            ) {
-                                                slog_error!("node", "CRITICAL_contract_restore_failed",
-                                                    block => hash, error => &format!("{}", pe));
-                                            }
-                                        }
-                                    }
+                                    self.unwind_reorg_or_halt(
+                                        &applied_new,
+                                        &rolled_back_old,
+                                        "coinbase_mismatch",
+                                    );
                                     return Err(NodeError::BlockRejected(format!(
                                         "coinbase mismatch in {}: actual={}, expected={}",
                                         block_hash, actual_total, expected_total
@@ -1237,35 +1710,11 @@ impl FullNode {
                         // UTXO failed → rollback contract state too
                         slog_error!("node", "utxo_apply_failed",
                             block => block_hash, error => &format!("{}", e));
-                        // Rollback partially-applied new chain (UTXO + contract)
-                        for hash in applied_new.iter().rev() {
-                            let _ = self.utxo_set.rollback_block_undo(hash);
-                            self.rollback_contract_block_best_effort(hash);
-                        }
-                        // Best-effort: re-apply the old chain to restore the
-                        // previous consistent state. If this also fails, the
-                        // node is in an unrecoverable state and should restart
-                        // with full UTXO rebuild.
-                        for hash in rolled_back_old.iter().rev() {
-                            if let Some(old_block) = self.block_store.get_block(hash) {
-                                let _ = self.utxo_set.apply_block_dag_ordered(
-                                    &old_block.body.transactions,
-                                    old_block.header.height,
-                                    hash,
-                                );
-                                // Re-execute contracts for the old block to restore state
-                                let (_, _, _, env) = self.execute_contract_transactions(
-                                    &old_block,
-                                    &self.contract_storage,
-                                );
-                                if let Err(pe) =
-                                    env.persist_with_undo(&self.contract_storage, hash, None, None)
-                                {
-                                    slog_error!("node", "CRITICAL_contract_restore_failed",
-                                        block => hash, error => &format!("{}", pe));
-                                }
-                            }
-                        }
+                        self.unwind_reorg_or_halt(
+                            &applied_new,
+                            &rolled_back_old,
+                            "utxo_apply_failed",
+                        );
                         return Err(NodeError::BlockRejected(format!(
                             "apply_block_dag_ordered failed for {}: {}",
                             block_hash, e
@@ -1273,33 +1722,12 @@ impl FullNode {
                     }
                 }
             } else {
-                // Missing block in store — rollback partially-applied new chain (UTXO + contract)
-                for hash in applied_new.iter().rev() {
-                    let _ = self.utxo_set.rollback_block_undo(hash);
-                    self.rollback_contract_block_best_effort(hash);
-                }
-                // Best-effort: re-apply the old chain to restore the
-                // previous consistent state. If this also fails, the
-                // node is in an unrecoverable state and should restart
-                // with full UTXO rebuild.
-                for hash in rolled_back_old.iter().rev() {
-                    if let Some(old_block) = self.block_store.get_block(hash) {
-                        let _ = self.utxo_set.apply_block_dag_ordered(
-                            &old_block.body.transactions,
-                            old_block.header.height,
-                            hash,
-                        );
-                        // Re-execute contracts for the old block to restore state
-                        let (_, _, _, env) =
-                            self.execute_contract_transactions(&old_block, &self.contract_storage);
-                        if let Err(pe) =
-                            env.persist_with_undo(&self.contract_storage, hash, None, None)
-                        {
-                            slog_error!("node", "CRITICAL_contract_restore_failed",
-                                block => hash, error => &format!("{}", pe));
-                        }
-                    }
-                }
+                // Missing block in store — unwind this reorg fail-atomically.
+                self.unwind_reorg_or_halt(
+                    &applied_new,
+                    &rolled_back_old,
+                    "block_missing_during_virtual_chain_apply",
+                );
                 return Err(NodeError::BlockRejected(format!(
                     "block {} missing from store during virtual chain apply",
                     block_hash
@@ -1311,68 +1739,20 @@ impl FullNode {
         if !self.block_store.update_best_hash(&best_tip) {
             // Rollback everything we just applied — the tip cannot be
             // authoritative without a persisted best_hash pointer.
-            for hash in applied_new.iter().rev() {
-                let _ = self.utxo_set.rollback_block_undo(hash);
-                self.rollback_contract_block_best_effort(hash);
-            }
-            // Best-effort: re-apply the old chain to restore the
-            // previous consistent state. If this also fails, the
-            // node is in an unrecoverable state and should restart
-            // with full UTXO rebuild.
-            for hash in rolled_back_old.iter().rev() {
-                if let Some(old_block) = self.block_store.get_block(hash) {
-                    let _ = self.utxo_set.apply_block_dag_ordered(
-                        &old_block.body.transactions,
-                        old_block.header.height,
-                        hash,
-                    );
-                    // Re-execute contracts for the old block to restore state
-                    let (_, _, _, env) =
-                        self.execute_contract_transactions(&old_block, &self.contract_storage);
-                    if let Err(pe) = env.persist_with_undo(&self.contract_storage, hash, None, None)
-                    {
-                        slog_error!("node", "CRITICAL_contract_restore_failed",
-                            block => hash, error => &format!("{}", pe));
-                    }
-                }
-            }
+            self.unwind_reorg_or_halt(
+                &applied_new,
+                &rolled_back_old,
+                "best_hash_persist_failed",
+            );
             return Err(NodeError::Consensus(ConsensusError::BlockValidation(
                 format!("failed to persist best_hash for tip {}", best_tip),
             )));
         }
 
-        // Update retarget from selected chain and publish next difficulty
-        if let Some(best_block) = self.block_store.get_block(&best_tip) {
-            if let Ok(mut retarget) = self.retarget.lock() {
-                // Count total DAG blocks at this height for DAG-aware difficulty.
-                // This gives the retarget engine visibility into parallel blocks.
-                let dag_width =
-                    (self.block_store.blocks_at_height(best_block.header.height) as u64).max(1);
-
-                let next_diff = retarget.on_new_block(BlockTimeRecord {
-                    height: best_block.header.height,
-                    timestamp: best_block.header.timestamp,
-                    difficulty: best_block.header.difficulty,
-                    dag_block_count: dag_width,
-                    blue_score: best_block.header.blue_score,
-                });
-                // Publish for RPC getblocktemplate — write to both
-                // the per-instance cell (the canonical reader for
-                // RPC handlers that hold an `Arc<MiningTemplateState>`
-                // via `RpcState`) and the process-default cell
-                // (retained so the legacy free-function readers
-                // still observe the current value).
-                self.mining_state.set_next_difficulty(next_diff);
-                set_next_difficulty(next_diff);
-            }
-        }
-
-        // Update DAG tips for getblocktemplate — miners need current tips as parents
-        let tips = self.dag_manager.get_tips();
-        if !tips.is_empty() {
-            self.mining_state.set_dag_tips(tips.clone());
-            set_dag_tips(tips);
-        }
+        // Publish next difficulty + deferred state commitment + tips for
+        // getblocktemplate. CONSENSUS-CRITICAL (external audit C4 equivalence) — see
+        // publish_mining_template for the full rationale and the anchor invariant.
+        self.publish_mining_template(&best_tip);
 
         // ── FINALITY: prune undo data for finalized blocks ────────────
         // Blocks deeper than FINALITY_DEPTH below the tip are irreversible.
@@ -1411,7 +1791,7 @@ impl FullNode {
                                         break;
                                     }
                                 }
-                                cursor = b.header.selected_parent.clone().unwrap_or_default();
+                                cursor = b.header.resolved_selected_parent().unwrap_or_default();
                             } else {
                                 break;
                             }
@@ -1493,10 +1873,109 @@ impl FullNode {
         Ok(())
     }
 
-    fn rollback_contract_block_best_effort(&self, block_hash: &str) {
+    /// Roll back a block's contract state, logging on failure. Returns `false`
+    /// if the rollback FAILED. Consensus-recovery callers MUST treat `false` as
+    /// a failed restore (see `unwind_reorg_or_halt`) — silently discarding it is
+    /// what let a failed rollback leave indeterminate state (external audit M4).
+    fn rollback_contract_block_best_effort(&self, block_hash: &str) -> bool {
         if let Err(e) = self.rollback_contract_block(block_hash) {
             slog_error!("node", "CRITICAL_contract_rollback_failed",
                 block => block_hash, error => &format!("{}", e));
+            return false;
+        }
+        true
+    }
+
+    /// FAIL-ATOMIC reorg unwind — the ONE recovery path for every reorg-failure
+    /// site in `recompute_virtual_chain` (external audit M4).
+    ///
+    /// Undoes every block this reorg applied, then restores the chain that was
+    /// rolled back to make room for it. If ANY step fails — a UTXO rollback, a
+    /// contract rollback, a MISSING old block body, an old-chain re-apply, or a
+    /// contract re-persist — then committed state represents NEITHER the old nor
+    /// the new chain. That is unrecoverable in-process, and continuing would
+    /// serve and relay corrupt consensus state, so we HALT. A restart runs the
+    /// verified rebuild/replay from the durable BlockStore.
+    ///
+    /// Do NOT hand-roll a best-effort variant of this: seven such copies existed,
+    /// each discarding results and returning `Err` without halting, which is
+    /// exactly the silent-corruption path this function exists to remove.
+    fn unwind_reorg_or_halt(&self, applied_new: &[String], rolled_back_old: &[String], reason: &str) {
+        let mut restore_failed = false;
+
+        // 1) Undo everything this reorg applied, newest first.
+        for hash in applied_new.iter().rev() {
+            if self.utxo_set.rollback_block_undo(hash).is_err() {
+                slog_error!("node", "reorg_unwind_utxo_rollback_failed", block => hash);
+                restore_failed = true;
+            }
+            if !self.rollback_contract_block_best_effort(hash) {
+                restore_failed = true;
+            }
+        }
+
+        // 2) Restore the previously-applied chain, oldest-first order preserved.
+        for hash in rolled_back_old.iter().rev() {
+            // STRICT read: `get_block` returns None for an absent key, a corrupt
+            // value AND a transient RocksDB read error alike. Treating all three
+            // as "body missing" would let a passing I/O blip trip the halt below.
+            // We still cannot restore without the body either way, but the
+            // distinction is recorded so an operator can tell a failing disk from
+            // real corruption.
+            let read = match self.block_store.get_block_strict(hash) {
+                Ok(v) => v,
+                Err(e) => {
+                    slog_error!("node", "reorg_unwind_old_block_read_failed",
+                        block => hash, error => &format!("{}", e));
+                    restore_failed = true;
+                    continue;
+                }
+            };
+            match read {
+                Some(old_block) => {
+                    if self
+                        .utxo_set
+                        .apply_block_dag_ordered(
+                            &old_block.body.transactions,
+                            old_block.header.height,
+                            hash,
+                        )
+                        .is_err()
+                    {
+                        slog_error!("node", "reorg_unwind_old_chain_reapply_failed", block => hash);
+                        restore_failed = true;
+                    }
+                    let (_, _, _, env) =
+                        self.execute_contract_transactions(&old_block, &self.contract_storage);
+                    if let Err(pe) =
+                        env.persist_with_undo(&self.contract_storage, hash, None, None)
+                    {
+                        slog_error!("node", "CRITICAL_contract_restore_failed",
+                            block => hash, error => &format!("{}", pe));
+                        restore_failed = true;
+                    }
+                }
+                None => {
+                    // These blocks were applied moments ago and sit far inside the
+                    // reorg window, so a missing body means real store corruption,
+                    // not pruning. The old chain cannot be reconstructed.
+                    slog_error!("node", "reorg_unwind_old_block_missing", block => hash);
+                    restore_failed = true;
+                }
+            }
+        }
+
+        if restore_failed {
+            slog_error!("node", "FATAL_reorg_restore_failed_halting", reason => reason);
+            // FLUSH BEFORE DYING. `std::process::exit` runs no destructors, so it
+            // skips both the daemon's graceful-shutdown flush and its periodic
+            // checkpoint. Halting to protect the store while leaving memtables
+            // unflushed would make this an UNCLEAN stop — the documented cause of
+            // a previous empty-UTXO-on-restart crash loop — i.e. the halt would
+            // inflict the corruption it exists to prevent. Persist what is
+            // committed, THEN stop.
+            self.block_store.flush();
+            std::process::exit(1);
         }
     }
 
@@ -1739,7 +2218,9 @@ impl FullNode {
                         continue;
                     }
                     let value = tx.outputs.first().map(|o| o.amount).unwrap_or(0);
-                    let gas_limit = tx.gas_limit.unwrap_or(10_000_000u64);
+                    // effective_gas_limit: the exact amount the block-gas
+                    // validator charged for this tx (single source of truth).
+                    let gas_limit = tx.effective_gas_limit();
 
                     // Compute the contract address via the canonical
                     // `ContractDeployer::compute_create_address`
@@ -1828,7 +2309,10 @@ impl FullNode {
                     };
 
                     // Phase 2: Run the constructor.
-                    let outcome = env.execute_frame(&call_ctx);
+                    // Route the top-level entry through the reentrancy guard so the
+                    // entry contract is registered (closes the A->B->A entry-point
+                    // reentrancy gap; child frames already use the guarded path).
+                    let outcome = env.execute_frame_guarded(&call_ctx);
                     let exec_result = match outcome {
                         CallOutcome::Success {
                             gas_used,
@@ -1945,7 +2429,7 @@ impl FullNode {
                             env.state.rollback(deploy_snapshot).ok();
                             ExecutionResult::Revert {
                                 gas_used,
-                                reason: String::from_utf8_lossy(&return_data).to_string(),
+                                reason: Self::decode_revert_reason(&return_data),
                             }
                         }
                         CallOutcome::Failure { gas_used } => {
@@ -2070,7 +2554,9 @@ impl FullNode {
                         continue;
                     }
                     let value = tx.outputs.first().map(|o| o.amount).unwrap_or(0);
-                    let gas_limit = tx.gas_limit.unwrap_or(10_000_000u64);
+                    // effective_gas_limit: the exact amount the block-gas
+                    // validator charged for this tx (single source of truth).
+                    let gas_limit = tx.effective_gas_limit();
 
                     // Lazy-load the target's code from disk on
                     // first touch. `load_contract_from_storage`
@@ -2133,7 +2619,10 @@ impl FullNode {
                         is_delegate: false,
                     };
 
-                    let outcome = env.execute_frame(&call_ctx);
+                    // Route the top-level entry through the reentrancy guard so the
+                    // entry contract is registered (closes the A->B->A entry-point
+                    // reentrancy gap; child frames already use the guarded path).
+                    let outcome = env.execute_frame_guarded(&call_ctx);
                     let exec_result = match outcome {
                         CallOutcome::Success {
                             gas_used,
@@ -2149,7 +2638,7 @@ impl FullNode {
                             return_data,
                         } => ExecutionResult::Revert {
                             gas_used,
-                            reason: String::from_utf8_lossy(&return_data).to_string(),
+                            reason: Self::decode_revert_reason(&return_data),
                         },
                         CallOutcome::Failure { gas_used } => {
                             // See the ContractCreate branch above
@@ -2217,6 +2706,25 @@ impl FullNode {
     // ORPHAN POOL
     // ═══════════════════════════════════════════════════════════════════
 
+    /// Highest chain-height among current tips (cheap; used by the P0-C orphan
+    /// pre-cache bound). 0 if there are no tips.
+    fn best_tip_height(&self) -> u64 {
+        self.ghostdag
+            .get_tips()
+            .iter()
+            .map(|t| self.ghostdag.get_chain_height(t))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// P0-C: true if `height`'s UmbraHash epoch is more than
+    /// MAX_ORPHAN_FUTURE_EPOCHS beyond our best tip's epoch — accepting it as an
+    /// orphan would force epoch_seed/mkcache work for an absurd, attacker-chosen
+    /// height. Cheap (no hashing).
+    fn orphan_epoch_too_far(&self, height: u64) -> bool {
+        orphan_epoch_out_of_bound(height, self.best_tip_height())
+    }
+
     /// Add a block to the orphan pool (parent not yet known).
     /// peer_id identifies the sender for per-peer DoS protection.
     fn add_orphan(&self, block: Block, peer_id: &str) {
@@ -2281,12 +2789,24 @@ impl FullNode {
     /// Check if a peer exceeds block rate limit (DoS protection).
     /// Returns true if the peer should be throttled.
     fn is_peer_rate_limited(&self, peer_id: &str) -> bool {
+        // Trusted seeds are never rate-limited (they must serve unbounded IBD
+        // backfill to a lagging peer). This is the FullNode-local limiter,
+        // separate from DosGuard, so it needs its own whitelist check.
+        if crate::service::network::dos_guard::is_whitelisted(peer_id) {
+            return false;
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
         if let Ok(mut timestamps) = self.peer_block_timestamps.lock() {
+            // Bound the map: when it grows large, drop peers whose timestamps are ALL
+            // stale (they stopped submitting) — otherwise rotated peer_ids leak entries
+            // forever, since a peer's entry is only revisited when it submits again (B4-L01).
+            if timestamps.len() > MAX_TRACKED_PEERS {
+                timestamps.retain(|_, ts| ts.iter().any(|t| now.saturating_sub(*t) < 60));
+            }
             let entry = timestamps
                 .entry(peer_id.to_string())
                 .or_insert_with(Vec::new);
@@ -2348,6 +2868,23 @@ impl FullNode {
                                 *c = c.saturating_sub(1);
                                 if *c == 0 {
                                     counts.remove(&peer_id);
+                                }
+                            }
+                        }
+                        // Clean this orphan's dangling entries under its OTHER parents:
+                        // add_orphan registered it under EVERY parent, and it was only
+                        // drained from the parent that arrived, leaking hashes under the
+                        // rest (evict_expired can't reclaim them once pooled) — B4-L02.
+                        if let Ok(mut by_parent) = self.orphan_by_parent.lock() {
+                            for p in &block.header.parents {
+                                let now_empty = if let Some(list) = by_parent.get_mut(p) {
+                                    list.retain(|h| h != &hash);
+                                    list.is_empty()
+                                } else {
+                                    false
+                                };
+                                if now_empty {
+                                    by_parent.remove(p);
                                 }
                             }
                         }
@@ -2443,6 +2980,92 @@ impl FullNode {
     }
 
     /// Process genesis block — same pipeline minus parent validation.
+    /// Publish the NEXT block's mining-template inputs — next difficulty, the M5
+    /// deferred state commitment, and the DAG tips — into BOTH the per-instance
+    /// `mining_state` cell AND the process-default cell (the daemon serves
+    /// getblocktemplate with `RpcState::mining_state = None`, so it reads the
+    /// process-default). MUST be called after EVERY tip change so a template
+    /// consumer mines a block the validator accepts.
+    ///
+    /// CONSENSUS-CRITICAL (external audit C4 equivalence): difficulty and the
+    /// commitment are anchored on `select_parent` of the SAME canonical tip set
+    /// the template will use — NOT the single `best_tip` (chosen by
+    /// select_best_tip, a DIFFERENT function: cumulative_work-first with the
+    /// opposite hash tie-break). Anchoring on best_tip made a reconvergence block
+    /// merging sibling tips get stamped f(best_tip) but validated against
+    /// f(select_parent(parents)) and universally rejected → production halt. Tips
+    /// are canonicalised exactly as the RPC handler does (non-empty, sorted,
+    /// deduped, capped at MAX_PARENTS); backfilled min-parent ancestors the RPC
+    /// may add are older (lower blue score) and never change select_parent.
+    ///
+    /// Called from BOTH the normal accept path (recompute_virtual_chain) AND
+    /// fresh-chain genesis acceptance (process_genesis). The two paths MUST
+    /// publish identically: on a fresh chain the daemon accepts genesis without
+    /// recompute_virtual_chain, so without a publish here the process-default
+    /// would still hold the empty-parent genesis commitment seeded in
+    /// FullNode::new (store empty at construction), and every height-1 block
+    /// would be rejected (commitment mismatch) → chain frozen at genesis.
+    fn publish_mining_template(&self, best_tip: &str) {
+        let mut tips = self.dag_manager.get_tips();
+        tips.retain(|h| !h.is_empty());
+        tips.sort();
+        tips.dedup();
+        tips.truncate(crate::config::consensus::consensus_params::ConsensusParams::MAX_PARENTS);
+        if tips.is_empty() {
+            return;
+        }
+        // Keep the running retarget engine rebuilt from the canonical best tip. It
+        // is NON-authoritative now (validation recomputes per block); some RPC/stats
+        // read its EMA, so keep it fresh.
+        if self.block_store.get_block(best_tip).is_some() {
+            if let Ok(mut retarget) = self.retarget.lock() {
+                let (fresh, _) = Self::build_retarget_from_canonical(
+                    &self.block_store,
+                    &self.ghostdag,
+                    &self.network,
+                    best_tip,
+                );
+                *retarget = fresh;
+            }
+        }
+        let sp = self.ghostdag.select_parent(&tips);
+        let anchor = if sp.is_empty() { best_tip.to_string() } else { sp };
+        let diff = self.expected_difficulty_for_selected_parent(&anchor);
+        self.mining_state.set_next_difficulty(diff);
+        set_next_difficulty(diff);
+        // M5: publish the NEXT block's deferred state commitment over the SAME
+        // canonical tips as next_difficulty, so the miner stamps exactly what the
+        // validator recomputes from the block's parents (parity). Compute ONCE and
+        // write BOTH cells, immediately before the tips writes so the
+        // commitment↔tips pair is published back-to-back (a stale cross-read just
+        // yields a rejected template the miner retries — never an unsound accept).
+        let psc = expected_prev_state_commitment(&tips, &self.ghostdag, &self.block_store);
+        self.mining_state.set_prev_state_commitment(Some(psc.clone()));
+        set_prev_state_commitment(Some(psc));
+        self.mining_state.set_dag_tips(tips.clone());
+        set_dag_tips(tips);
+    }
+
+    /// Republish the mining template over the CURRENT canonical best/tips. Call
+    /// this ONCE after startup recovery has settled the DAG/GHOSTDAG state.
+    ///
+    /// WHY IT'S REQUIRED: FullNode::new seeds the mining cells from the DAG as it
+    /// exists AT CONSTRUCTION — which the daemon builds BEFORE
+    /// start()->verify_and_recover, so on a restart that rebuilds a corrupt DAG
+    /// (rebuild_dag/rebuild_ghostdag) the seed is stale. recompute_virtual_chain
+    /// (the restart branch's republish) early-returns WITHOUT publishing whenever
+    /// the recomputed best equals the persisted best (the normal case). Under M5
+    /// that stale commitment is not merely suboptimal: getblocktemplate would serve
+    /// a value the height>=1 validator recomputes differently and rejects — a
+    /// block-production halt on that node. Republishing over the post-recovery tips
+    /// closes this. Idempotent (safe to call on the fresh-genesis path too).
+    pub fn republish_mining_template(&self) {
+        let best = self.block_store.get_best_hash().unwrap_or_default();
+        if !best.is_empty() {
+            self.publish_mining_template(&best);
+        }
+    }
+
     pub fn process_genesis(&self, block: &Block) -> Result<(), NodeError> {
         // ═══════════════════════════════════════════════════════════════
         // PHASE 1: VALIDATE (read-only — NO state changes)
@@ -2535,6 +3158,17 @@ impl FullNode {
             ));
         }
 
+        // M5 (fresh-chain halt fix): genesis is now the sole DAG tip. Publish the
+        // mining template over the real tips ([genesis]) so the height-1
+        // getblocktemplate serves compute_prev_state_commitment(genesis_hash) — the
+        // exact value the validator recomputes for parents=[genesis]. Without this,
+        // the process-default cell still holds the empty-parent genesis commitment
+        // seeded in FullNode::new (store empty), and every height-1 block is
+        // rejected → the chain deadlocks at genesis on every fresh bring-up. The
+        // daemon's fresh-chain branch does NOT call recompute_virtual_chain, so this
+        // publish must happen here (the same helper the accept path uses).
+        self.publish_mining_template(&block.header.hash);
+
         Ok(())
     }
 
@@ -2553,64 +3187,470 @@ impl crate::domain::traits::block_processor::BlockProcessor for FullNode {
     }
 }
 
+/// Run the confidential (RingCT) consensus gate over every confidential tx in a
+/// block, against `utxo_set` (which MUST already reflect all earlier blocks in
+/// the chain being applied). Returns `Err(reason)` on the first failure. A
+/// block-wide seen-key-image set also catches duplicate key images within the
+/// same block. This is the gate that `apply_block_dag_ordered` relies on having
+/// run (it records confidential state without validating).
+fn verify_block_confidential_txs(
+    block: &Block,
+    utxo_set: &UtxoSet,
+    network: &NetworkMode,
+) -> Result<(), String> {
+    use std::collections::HashSet;
+    let mut seen_ki: HashSet<String> = HashSet::new();
+    for tx in &block.body.transactions {
+        if tx.is_confidential() {
+            crate::engine::privacy::ringct::confidential_consensus::verify_confidential_tx(
+                tx, utxo_set, network, &mut seen_ki,
+            )
+            .map_err(|e| format!("confidential tx {} failed consensus gate: {}", tx.hash, e))?;
+        } else if tx.is_shield() {
+            // Shield (transparent -> confidential): same shield gate as mempool +
+            // block-UTXO validation, so the reorg/apply path never records
+            // confidential shield state without the crypto/balance check.
+            crate::engine::privacy::ringct::confidential_consensus::verify_shield_tx(
+                tx, utxo_set, network,
+            )
+            .map_err(|e| format!("shield tx {} failed consensus gate: {}", tx.hash, e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Pure P0-C bound: true if `height`'s UmbraHash epoch is more than
+/// MAX_ORPHAN_FUTURE_EPOCHS beyond `best_height`'s epoch. Extracted from
+/// `FullNode::orphan_epoch_too_far` so the rule is testable without a live node.
+fn orphan_epoch_out_of_bound(height: u64, best_height: u64) -> bool {
+    use crate::engine::mining::algorithms::umbrahash::epoch_of;
+    epoch_of(height) > epoch_of(best_height).saturating_add(MAX_ORPHAN_FUTURE_EPOCHS)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::FullNode;
+    use super::{orphan_epoch_out_of_bound, verify_block_confidential_txs, FullNode};
 
     #[test]
+    fn orphan_epoch_bound_rejects_absurd_height_but_allows_near_tip() {
+        // P0-C: the cheap tip-relative epoch bound must reject an absurd-height
+        // orphan (which would force epoch_seed/mkcache work) while allowing any
+        // legitimately near-tip block, and it must SCALE with the real tip.
+        use crate::engine::mining::algorithms::umbrahash::{epoch_of, EPOCH_BLOCKS, UMBRA_MAX_HEIGHT};
+        use super::MAX_ORPHAN_FUTURE_EPOCHS as MARGIN;
+
+        let tip = 1_500_000u64; // epoch 0 (below EPOCH_BLOCKS = 3M)
+        assert!(!orphan_epoch_out_of_bound(tip, tip), "same-epoch orphan allowed");
+        assert!(!orphan_epoch_out_of_bound(tip + 1, tip), "tip+1 allowed");
+        // Exactly MARGIN epochs ahead is allowed; one epoch past it is rejected.
+        let allowed = (epoch_of(tip) + MARGIN) * EPOCH_BLOCKS;
+        assert!(!orphan_epoch_out_of_bound(allowed, tip), "within-margin epoch allowed");
+        let rejected = (epoch_of(tip) + MARGIN + 1) * EPOCH_BLOCKS;
+        assert!(orphan_epoch_out_of_bound(rejected, tip), "past-margin epoch rejected");
+        // The near-ceiling flood height (epoch ~333k) is rejected outright.
+        assert!(
+            orphan_epoch_out_of_bound(UMBRA_MAX_HEIGHT - 1, tip),
+            "absurd 1e12-height flood rejected"
+        );
+        // Bound scales with the tip: a mature chain accepts correspondingly higher
+        // orphans but still rejects the absurd flood.
+        let mature = 100 * EPOCH_BLOCKS; // epoch 100
+        assert!(!orphan_epoch_out_of_bound(mature + 1, mature), "mature near-tip allowed");
+        assert!(
+            orphan_epoch_out_of_bound(UMBRA_MAX_HEIGHT - 1, mature),
+            "1e12 still rejected at epoch 100"
+        );
+    }
+
+    #[test]
+    fn block_rate_limit_exceeds_network_production_rate() {
+        // A peer merely relaying the chain sends ~BPS*60 blocks/min; a peer
+        // serving an IBD backfill sends far more. The per-peer block rate limit
+        // MUST sit above the network's own production rate (with headroom) or
+        // every relaying peer is wrongly banned and lagging nodes can never
+        // converge. Regression guard for the old hardcoded 60/min, which was
+        // BELOW the 10-BPS network rate of 600/min.
+        use super::MAX_BLOCKS_PER_PEER_PER_MIN;
+        let net_rate_per_min =
+            crate::config::consensus::consensus_params::ConsensusParams::BLOCKS_PER_SECOND
+                as usize
+                * 60;
+        assert!(
+            MAX_BLOCKS_PER_PEER_PER_MIN >= net_rate_per_min * 2,
+            "per-peer block limit {} must exceed 2x the network rate {}/min so relaying peers are not banned",
+            MAX_BLOCKS_PER_PEER_PER_MIN,
+            net_rate_per_min
+        );
+    }
+
+    #[test]
+    fn retarget_rebuild_deterministic_from_canonical_chain() {
+        // The retarget engine must be a pure function of the canonical
+        // selected-parent chain (so all nodes agree on the next difficulty and
+        // a reorg cannot leave a divergent target). Same chain → same result.
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::block::block::Block;
+        use crate::domain::block::block_body::BlockBody;
+        use crate::domain::block::block_header::BlockHeader;
+        use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
+        use crate::infrastructure::storage::rocksdb::core::db::NodeDB;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let id = CTR.fetch_add(1, Ordering::Relaxed);
+        // Unique per RUN (not just per process) so a leftover temp dir from a
+        // prior run can't make save_block reject "g" as a duplicate.
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = format!(
+            "{}/rt_canon_{}_{}_{}",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            uniq,
+            id
+        );
+        let store = BlockStore::new(NodeDB::new(&path).unwrap().shared()).unwrap();
+
+        let mk = |hash: &str, height: u64, parent: Option<&str>, ts: u64| Block {
+            header: BlockHeader {
+                version: 1,
+                hash: hash.into(),
+                parents: parent.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                merkle_root: "m".into(),
+                timestamp: ts,
+                nonce: 0,
+                difficulty: 1000,
+                height,
+                blue_score: height,
+                selected_parent: parent.map(|p| p.to_string()),
+                utxo_commitment: None,
+                extra_nonce: 0,
+                receipt_root: None,
+                state_root: None,
+                mix_hash: String::new(),
+                prev_state_commitment: None,
+            },
+            body: BlockBody { transactions: vec![] },
+        };
+        assert!(store.save_block(&mk("g", 0, None, 1000)));
+        assert!(store.save_block(&mk("b1", 1, Some("g"), 1010)));
+        assert!(store.save_block(&mk("b2", 2, Some("b1"), 1020)));
+
+        let net = NetworkMode::Regtest;
+        let gd = crate::engine::dag::ghostdag::ghostdag::GhostDag::new(&format!("{}_gd", path))
+            .unwrap();
+        let (_e1, d1) = FullNode::build_retarget_from_canonical(&store, &gd, &net, "b2");
+        let (_e2, d2) = FullNode::build_retarget_from_canonical(&store, &gd, &net, "b2");
+        assert_eq!(d1, d2, "rebuild must be deterministic for the same canonical chain");
+        assert!(d1 > 0, "difficulty must be positive");
+    }
+
+    #[test]
+    fn retarget_is_independent_of_dag_width_the_node_happens_to_hold() {
+        // CONSENSUS-CRITICAL REGRESSION GUARD. Two nodes with the IDENTICAL
+        // selected chain but a DIFFERENT set of same-height side/red blocks MUST
+        // compute the SAME next difficulty. Before the fix, difficulty depended
+        // on `blocks_at_height` (the LOCAL DAG width a node happens to hold), so
+        // a full miner (holds all siblings) and a syncing follower (holds only
+        // the selected chain) diverged wildly — this exact test produced 242 vs
+        // 11 — and the follower rejected the miner's next block forever with
+        // "difficulty mismatch", stalling IBD past the tip. The fix keys the
+        // DAG-rate weight on the block's own PoW-committed `parents.len()`, which
+        // is identical on every node. This test asserts the two agree.
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::block::block::Block;
+        use crate::domain::block::block_body::BlockBody;
+        use crate::domain::block::block_header::BlockHeader;
+        use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
+        use crate::infrastructure::storage::rocksdb::core::db::NodeDB;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let id = CTR.fetch_add(1, Ordering::Relaxed);
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        // A block with an explicit parent list; `selected_parent` is the first
+        // entry, so the canonical walk still follows the linear selected chain.
+        let mk = |hash: &str, height: u64, parents: &[&str], ts: u64| Block {
+            header: BlockHeader {
+                version: 1,
+                hash: hash.into(),
+                parents: parents.iter().map(|p| p.to_string()).collect(),
+                merkle_root: "m".into(),
+                timestamp: ts,
+                nonce: 0,
+                difficulty: 1000,
+                height,
+                blue_score: height,
+                selected_parent: parents.first().map(|p| p.to_string()),
+                utxo_commitment: None,
+                extra_nonce: 0,
+                receipt_root: None,
+                state_root: None,
+                mix_hash: String::new(),
+                prev_state_commitment: None,
+            },
+            body: BlockBody { transactions: vec![] },
+        };
+        const N: u64 = 80;
+        // OFF-TARGET spacing (3s ≫ 1s target) so the retarget's DAG-rate
+        // correction (retarget.rs:199) is NOT floored to a no-op: with slower
+        // blocks blended_time is large, so dividing it by the DAG-to-chain
+        // ratio actually changes the computed difficulty. This is the regime the
+        // live chain runs in — an on-target chain would hide the bug.
+        const DT: u64 = 3;
+        // Extra red siblings per height on the "full" node only. Under the OLD
+        // (buggy) code these inflated its blocks_at_height and diverged it from
+        // the follower; under the fix they are irrelevant (never walked).
+        const SIBS: u64 = 2;
+        let build = |label: &str, with_siblings: bool| -> u64 {
+            let path = format!(
+                "{}/rt_width_{}_{}_{}_{}",
+                std::env::temp_dir().display(),
+                label,
+                std::process::id(),
+                uniq,
+                id
+            );
+            let store = BlockStore::new(NodeDB::new(&path).unwrap().shared()).unwrap();
+            assert!(store.save_block(&mk("h0", 0, &[], 1000)));
+            assert!(store.save_block(&mk("h1", 1, &["h0"], 1000 + DT)));
+            let mut prev = "h1".to_string();
+            let mut prev_prev = "h0".to_string();
+            for h in 2..=N {
+                let hash = format!("h{}", h);
+                // Each selected block MERGES its grandparent (both on the selected
+                // chain, present in BOTH stores) → parents.len()=2, so the DAG-rate
+                // path is ACTIVE and, being header-committed, deterministic.
+                assert!(store.save_block(&mk(
+                    &hash,
+                    h,
+                    &[prev.as_str(), prev_prev.as_str()],
+                    1000 + h * DT
+                )));
+                if with_siblings {
+                    for s in 0..SIBS {
+                        // Red siblings at this height (full node only). Same-height
+                        // as the selected block, so ONLY blocks_at_height sees them.
+                        let sib = format!("r{}_{}", h, s);
+                        assert!(store.save_block(&mk(&sib, h, &[prev.as_str()], 1000 + h * DT)));
+                    }
+                }
+                prev_prev = prev;
+                prev = hash;
+            }
+            let tip = format!("h{}", N);
+            let gd = crate::engine::dag::ghostdag::ghostdag::GhostDag::new(&format!("{}_gd", path))
+                .unwrap();
+            let (_e, d) =
+                FullNode::build_retarget_from_canonical(&store, &gd, &NetworkMode::Regtest, &tip);
+            d
+        };
+        let full_node_diff = build("full", true);
+        let syncing_diff = build("partial", false);
+        assert_eq!(
+            full_node_diff, syncing_diff,
+            "next difficulty must be a pure function of the SELECTED chain, not the \
+             set of same-height siblings a node happens to have downloaded — a \
+             syncing node otherwise rejects the miner's next block forever"
+        );
+    }
+
+    #[test]
+    fn cumulative_work_sums_difficulty_and_prefers_heavier_equal_height_tip() {
+        use crate::domain::block::block::Block;
+        use crate::domain::block::block_body::BlockBody;
+        use crate::domain::block::block_header::BlockHeader;
+        use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
+        use crate::infrastructure::storage::rocksdb::core::db::NodeDB;
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let id = CTR.fetch_add(1, Ordering::Relaxed);
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = format!(
+            "{}/cwork_{}_{}_{}",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            uniq,
+            id
+        );
+        let store = BlockStore::new(NodeDB::new(&path).unwrap().shared()).unwrap();
+
+        let mk = |hash: &str, height: u64, parent: Option<&str>, diff: u64| Block {
+            header: BlockHeader {
+                version: 1,
+                hash: hash.into(),
+                parents: parent.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                merkle_root: "m".into(),
+                timestamp: 1000 + height,
+                nonce: 0,
+                difficulty: diff,
+                height,
+                blue_score: height,
+                selected_parent: parent.map(|p| p.to_string()),
+                utxo_commitment: None,
+                extra_nonce: 0,
+                receipt_root: None,
+                state_root: None,
+                mix_hash: String::new(),
+                prev_state_commitment: None,
+            },
+            body: BlockBody { transactions: vec![] },
+        };
+        // Main chain g(1000) -> b1(2000) -> b2(500); competing tip b1 -> c2(5000).
+        assert!(store.save_block(&mk("g", 0, None, 1000)));
+        assert!(store.save_block(&mk("b1", 1, Some("g"), 2000)));
+        assert!(store.save_block(&mk("b2", 2, Some("b1"), 500)));
+        assert!(store.save_block(&mk("c2", 2, Some("b1"), 5000)));
+
+        let mut cache: HashMap<String, u128> = HashMap::new();
+        assert_eq!(FullNode::cumulative_work_inner(&store, &mut cache, "g"), 1000);
+        assert_eq!(FullNode::cumulative_work_inner(&store, &mut cache, "b1"), 3000);
+        assert_eq!(FullNode::cumulative_work_inner(&store, &mut cache, "b2"), 3500);
+        assert_eq!(FullNode::cumulative_work_inner(&store, &mut cache, "c2"), 8000);
+        // Heaviest-chain rule: equal height (2) but c2 carries far more PoW.
+        assert!(
+            FullNode::cumulative_work_inner(&store, &mut cache, "c2")
+                > FullNode::cumulative_work_inner(&store, &mut cache, "b2"),
+            "equal-height competing tip with more PoW must have greater cumulative work"
+        );
+        // Memoized values are stable and consistent.
+        assert_eq!(FullNode::cumulative_work_inner(&store, &mut cache, "b2"), 3500);
+        assert_eq!(*cache.get("c2").unwrap(), 8000u128);
+        assert_eq!(FullNode::cumulative_work_inner(&store, &mut cache, ""), 0);
+    }
+
+    #[test]
+    fn confidential_gate_accepts_valid_and_rejects_tampered_block() {
+        // Regression for the CRITICAL apply-path gap: recompute_virtual_chain
+        // must run the full confidential gate before applying a block. This
+        // tests the extracted gate function directly (no full-node harness):
+        // a valid confidential tx in a block passes; a tampered one is rejected.
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::block::block::Block;
+        use crate::domain::block::block_body::BlockBody;
+        use crate::domain::block::block_header::BlockHeader;
+        use crate::domain::utxo::utxo_set::UtxoSet;
+        use crate::engine::privacy::ringct::builder::{
+            build_confidential_transaction, ConfRecipient, OwnedInput,
+        };
+        use crate::engine::privacy::ringct::dual_clsag::RingMember;
+        use curve25519_dalek::{constants::RISTRETTO_BASEPOINT_POINT as G, scalar::Scalar};
+        use rand::rngs::OsRng;
+
+        let net = NetworkMode::Mainnet;
+        let h = crate::engine::privacy::confidential::pedersen::generator_h();
+        let set = UtxoSet::new_empty();
+        let recput = |pk: curve25519_dalek::ristretto::RistrettoPoint,
+                      c: curve25519_dalek::ristretto::RistrettoPoint| {
+            set.record_confidential_output_indexed(
+                &hex::encode(pk.compress().as_bytes()),
+                &hex::encode(c.compress().as_bytes()),
+            )
+            .unwrap();
+        };
+        for _ in 0..4 {
+            recput(Scalar::random(&mut OsRng) * G, Scalar::from(9u64) * h + Scalar::random(&mut OsRng) * G);
+        }
+        let spend = Scalar::random(&mut OsRng);
+        let bl = Scalar::random(&mut OsRng);
+        let real_pk = spend * G;
+        let real_c = Scalar::from(50u64) * h + bl * G;
+        recput(real_pk, real_c);
+        let mut ring = crate::engine::privacy::ringct::decoy::select_decoys(
+            &set,
+            4,
+            &[hex::encode(real_pk.compress().as_bytes())],
+        )
+        .unwrap();
+        ring.push(RingMember { public_key: real_pk, commitment: real_c });
+        let real_index = ring.len() - 1;
+        let vp = Scalar::random(&mut OsRng) * G;
+        let sp = Scalar::random(&mut OsRng) * G;
+        let tx = build_confidential_transaction(
+            vec![OwnedInput { spend_secret: spend, amount: 50, blinding: bl, ring, real_index }],
+            vec![ConfRecipient { view_pub: vp, spend_pub: sp, amount: 50 }],
+            0,
+            &net,
+        )
+        .unwrap();
+
+        let mk_block = |txs: Vec<_>| Block {
+            header: BlockHeader {
+                version: 1,
+                hash: "00".repeat(32),
+                parents: vec![],
+                merkle_root: String::new(),
+                timestamp: 1,
+                nonce: 0,
+                difficulty: 1,
+                height: 1,
+                blue_score: 0,
+                selected_parent: None,
+                utxo_commitment: None,
+                extra_nonce: 0,
+                receipt_root: None,
+                state_root: None,
+                mix_hash: String::new(),
+                prev_state_commitment: None,
+            },
+            body: BlockBody { transactions: txs },
+        };
+
+        // Valid confidential tx → gate passes.
+        let good = mk_block(vec![tx.clone()]);
+        assert!(verify_block_confidential_txs(&good, &set, &net).is_ok());
+
+        // Tamper the ring signature → gate must reject the block.
+        let mut bad_tx = tx.clone();
+        bad_tx.inputs[0].ring_signature = Some("00".repeat(160));
+        let bad = mk_block(vec![bad_tx]);
+        assert!(verify_block_confidential_txs(&bad, &set, &net).is_err());
+    }
+
+    // Signature: (current_best, best_tip, current_is_tip,
+    //             current_cwork, best_cwork, current_score, best_score,
+    //             current_height, best_height)
+    #[test]
     fn keep_current_tip_on_exact_tie_when_current_is_still_tip() {
+        // Equal cumulative work, blue_score AND height → keep current (no churn).
         assert!(FullNode::should_keep_current_tip_on_tie(
-            "curr",
-            "new",
-            true,
-            100,
-            100,
-            42,
-            42,
+            "curr", "new", true, 500, 500, 100, 100, 42, 42,
         ));
     }
 
     #[test]
     fn do_not_keep_current_tip_when_new_tip_is_stronger() {
+        // Heavier cumulative work on the new tip → must reorg (do NOT keep).
         assert!(!FullNode::should_keep_current_tip_on_tie(
-            "curr",
-            "new",
-            true,
-            100,
-            101,
-            42,
-            42,
+            "curr", "new", true, 500, 501, 100, 100, 42, 42,
         ));
+        // Higher blue_score → do not keep.
         assert!(!FullNode::should_keep_current_tip_on_tie(
-            "curr",
-            "new",
-            true,
-            100,
-            100,
-            42,
-            43,
+            "curr", "new", true, 500, 500, 100, 101, 42, 42,
+        ));
+        // Higher chain_height → do not keep.
+        assert!(!FullNode::should_keep_current_tip_on_tie(
+            "curr", "new", true, 500, 500, 100, 100, 42, 43,
         ));
     }
 
     #[test]
     fn do_not_keep_when_current_best_not_in_tip_set_or_same_tip() {
         assert!(!FullNode::should_keep_current_tip_on_tie(
-            "curr",
-            "new",
-            false,
-            100,
-            100,
-            42,
-            42,
+            "curr", "new", false, 500, 500, 100, 100, 42, 42,
         ));
         assert!(!FullNode::should_keep_current_tip_on_tie(
-            "curr",
-            "curr",
-            true,
-            100,
-            100,
-            42,
-            42,
+            "curr", "curr", true, 500, 500, 100, 100, 42, 42,
         ));
     }
 }

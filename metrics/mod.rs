@@ -77,9 +77,11 @@ impl RateMeter {
             return 0.0;
         }
         let total: f64 = self.samples.iter().map(|s| s.value).sum();
-        // Both .front() and .back() are Some because len >= 2.
-        let oldest = self.samples.front().unwrap().timestamp;
-        let newest = self.samples.back().unwrap().timestamp;
+        let (Some(oldest), Some(newest)) = (self.samples.front(), self.samples.back()) else {
+            return 0.0;
+        };
+        let oldest = oldest.timestamp;
+        let newest = newest.timestamp;
         let elapsed_secs = newest.saturating_sub(oldest) as f64;
         if elapsed_secs <= 0.0 {
             // Same-second samples — fall back to the nominal window

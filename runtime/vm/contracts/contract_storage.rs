@@ -395,6 +395,16 @@ impl ContractStorage {
         Arc::clone(&self.db)
     }
 
+    /// True if this block's contract state was fully persisted (the
+    /// `contract:applied:{block_hash}` marker written atomically with the state
+    /// by `persist_with_undo`). Used by recovery to detect a block whose UTXO
+    /// commitment landed but whose contract state did not (crash between the two
+    /// separate-DB commits), so it can be re-executed instead of skipped.
+    pub fn contract_block_applied(&self, block_hash: &str) -> bool {
+        let key = format!("contract:applied:{}", block_hash);
+        matches!(self.db.get(key.as_bytes()), Ok(Some(_)))
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // UNDO DATA — block-level rollback for reorg safety
     // ═══════════════════════════════════════════════════════════════════
@@ -612,6 +622,11 @@ impl ContractStorage {
         let undo_key = format!("contract:undo:{}", block_hash);
         batch.delete(undo_key.as_bytes());
 
+        // Clear the contract-applied marker so a re-applied / reorged-out block
+        // is treated as not-yet-persisted (re-executed when re-applied).
+        let applied_key = format!("contract:applied:{}", block_hash);
+        batch.delete(applied_key.as_bytes());
+
         self.db
             .write(batch)
             .map_err(|e| StorageError::WriteFailed(format!("contract rollback failed: {}", e)))
@@ -718,6 +733,26 @@ mod tests {
         s.save_undo("block_hash_1", &undo).unwrap();
         let loaded = s.load_undo("block_hash_1").unwrap();
         assert_eq!(loaded.created_accounts, vec!["SD1new".to_string()]);
+    }
+
+    #[test]
+    fn contract_applied_marker_detected_and_cleared_on_rollback() {
+        // The contract-applied marker (written atomically with contract state by
+        // persist_with_undo) lets recovery tell a fully-persisted block from one
+        // whose contract state was lost to a crash between the UTXO and contract
+        // commits. It must read true once set and be cleared on rollback.
+        let s = tmp_storage();
+        assert!(!s.contract_block_applied("blkX"));
+        // persist_with_undo writes this marker in the same batch as state; here
+        // we set it directly + a matching undo record, then verify rollback clears it.
+        s.shared_db().put(b"contract:applied:blkX", [1u8]).unwrap();
+        s.save_undo("blkX", &sample_undo()).unwrap();
+        assert!(s.contract_block_applied("blkX"));
+        s.rollback_block("blkX").unwrap();
+        assert!(
+            !s.contract_block_applied("blkX"),
+            "rollback must clear the contract-applied marker"
+        );
     }
 
     #[test]

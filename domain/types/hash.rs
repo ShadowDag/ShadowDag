@@ -124,6 +124,27 @@ pub fn is_valid_hash256(raw: &str) -> bool {
     parse_hash256(raw).is_ok()
 }
 
+/// Truncate a string to at most `max_bytes` for logging — never panics.
+///
+/// USE THIS INSTEAD OF `&s[..s.len().min(n)]`. Slicing a `str` panics when the
+/// index lands inside a multi-byte UTF-8 character, so that idiom is a remote
+/// crash vector anywhere the string arrived over the network: a peer puts one
+/// non-ASCII byte in a hash-shaped field and every node that logs it aborts.
+/// It is not enough that hashes are "supposed to be" ASCII hex — these log and
+/// error sites run on the REJECTION path, i.e. precisely when the input is
+/// malformed. Back off to the nearest character boundary instead.
+#[inline]
+pub fn log_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 //  Legacy helper (kept for backward compat)
 // ─────────────────────────────────────────────────────────────────────────
@@ -159,6 +180,26 @@ mod tests {
         let result = parse_hash256(&hex);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), [0xAA; 32]);
+    }
+
+    #[test]
+    fn log_prefix_never_splits_a_multibyte_char() {
+        // The exact remote-DoS shape: an attacker-supplied "hash" whose byte 16
+        // falls inside a 3-byte character. `&s[..16]` aborts the process here.
+        let hostile = "aaaaaaaaaaaaaaa\u{1F600}bbbb";
+        assert!(!hostile.is_char_boundary(16));
+        let out = log_prefix(hostile, 16);
+        assert_eq!(out, "aaaaaaaaaaaaaaa");
+        assert!(hostile.starts_with(out));
+
+        // A cut landing exactly on a boundary keeps the full budget.
+        assert_eq!(log_prefix("abcdefghijklmnop_tail", 16), "abcdefghijklmnop");
+        // Shorter than the budget is returned whole, including non-ASCII.
+        assert_eq!(log_prefix("\u{1F600}", 16), "\u{1F600}");
+        // Degenerate budgets must not panic either.
+        assert_eq!(log_prefix("\u{1F600}tail", 1), "");
+        assert_eq!(log_prefix("anything", 0), "");
+        assert_eq!(log_prefix("", 16), "");
     }
 
     #[test]

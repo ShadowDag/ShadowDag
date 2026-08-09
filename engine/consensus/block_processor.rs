@@ -109,8 +109,8 @@ impl BlockProcessor {
                 "new tip blue_score {} == old tip {} but hash {} >= {} — tie lost",
                 new_score,
                 old_score,
-                &new_tip[..16.min(new_tip.len())],
-                &old_tip[..16.min(old_tip.len())]
+                crate::domain::types::hash::log_prefix(new_tip, 16),
+                crate::domain::types::hash::log_prefix(old_tip, 16)
             )));
         }
 
@@ -118,8 +118,8 @@ impl BlockProcessor {
             Self::find_fork_point(old_tip, new_tip, ghostdag, max_depth).ok_or_else(|| {
                 ConsensusError::ReorgRejected(format!(
                     "[BlockProcessor] no fork between {} and {}",
-                    &old_tip[..old_tip.len().min(8)],
-                    &new_tip[..new_tip.len().min(8)],
+                    crate::domain::types::hash::log_prefix(old_tip, 8),
+                    crate::domain::types::hash::log_prefix(new_tip, 8),
                 ))
             })?;
 
@@ -139,8 +139,8 @@ impl BlockProcessor {
                     return Err(ConsensusError::ReorgRejected(format!(
                         "rollback chain truncated at depth {} (last block parent {} != fork {})",
                         rollback_chain.len(),
-                        &parent[..parent.len().min(8)],
-                        &fork[..fork.len().min(8)]
+                        crate::domain::types::hash::log_prefix(&parent, 8),
+                        crate::domain::types::hash::log_prefix(&fork, 8)
                     )));
                 }
             }
@@ -152,8 +152,8 @@ impl BlockProcessor {
                     return Err(ConsensusError::ReorgRejected(format!(
                         "apply chain truncated at depth {} (last block parent {} != fork {})",
                         apply_chain.len(),
-                        &parent[..parent.len().min(8)],
-                        &fork[..fork.len().min(8)]
+                        crate::domain::types::hash::log_prefix(&parent, 8),
+                        crate::domain::types::hash::log_prefix(&fork, 8)
                     )));
                 }
             }

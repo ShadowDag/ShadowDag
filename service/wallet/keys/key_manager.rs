@@ -119,9 +119,10 @@ impl KeyManager {
     }
 
     fn random_bytes<const N: usize>() -> [u8; N] {
+        use rand::rngs::OsRng;
         use rand::RngCore;
         let mut buf = [0u8; N];
-        rand::thread_rng().fill_bytes(&mut buf);
+        OsRng.fill_bytes(&mut buf);
         buf
     }
 
