@@ -155,7 +155,7 @@ impl<'a> MinerController<'a> {
             block.header.timestamp,
         )?;
 
-        slog_info!("mining", "block_submitted_to_dag", hash_prefix => &block.header.hash[..block.header.hash.len().min(16)], height => block.header.height, tips => self.tip_manager.tip_count());
+        slog_info!("mining", "block_submitted_to_dag", hash_prefix => crate::domain::types::hash::log_prefix(&block.header.hash, 16), height => block.header.height, tips => self.tip_manager.tip_count());
 
         Ok(())
     }

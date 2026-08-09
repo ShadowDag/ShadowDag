@@ -165,7 +165,7 @@ impl MerkleTree {
         match crate::domain::types::hash::parse_hash256(hex_str) {
             Ok(bytes) => bytes.to_vec(),
             Err(e) => {
-                slog_error!("block", "malformed_merkle_hash", hash_prefix => &hex_str[..hex_str.len().min(16)], error => &e.to_string());
+                slog_error!("block", "malformed_merkle_hash", hash_prefix => crate::domain::types::hash::log_prefix(hex_str, 16), error => &e.to_string());
                 vec![0xFF; 32] // deterministic poison — never matches real hashes
             }
         }

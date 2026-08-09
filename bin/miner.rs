@@ -1018,7 +1018,9 @@ fn rpc_submit_block(addr: &str, block: &Block, bearer_token: Option<&str>) -> Su
                 }
                 Err(_) => {
                     // Unparseable response -- treat as rejection
-                    SubmitResult::Rejected(response[..response.len().min(200)].to_string())
+                    SubmitResult::Rejected(
+                        shadowdag::domain::types::hash::log_prefix(&response, 200).to_string(),
+                    )
                 }
             }
         }

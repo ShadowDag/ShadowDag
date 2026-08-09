@@ -105,8 +105,8 @@ impl PowValidator {
         if computed_hash != block.header.hash {
             return PowResult::fail(format!(
                 "hash mismatch: computed={}... header={}...",
-                &computed_hash[..16.min(computed_hash.len())],
-                &block.header.hash[..16.min(block.header.hash.len())]
+                crate::domain::types::hash::log_prefix(&computed_hash, 16),
+                crate::domain::types::hash::log_prefix(&block.header.hash, 16)
             ));
         }
 

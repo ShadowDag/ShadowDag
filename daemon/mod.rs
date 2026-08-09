@@ -1412,7 +1412,7 @@ impl DaemonNode {
         if let Some(ref best_tip) = best_tip {
             if !self.block_store.update_best_hash(best_tip) {
                 slog_error!("daemon", "rebuild_ghostdag_best_hash_failed",
-                    tip => &best_tip[..best_tip.len().min(16)]);
+                    tip => crate::domain::types::hash::log_prefix(best_tip, 16));
                 return Err(NodeError::Init(
                     "failed to persist best_hash after GHOSTDAG rebuild".into(),
                 ));

@@ -376,7 +376,7 @@ impl BlockSyncManager {
                 log::warn!(
                     "header_chain_break: height={}, expected_parent={}",
                     window[1].height,
-                    &window[0].hash[..window[0].hash.len().min(16)]
+                    crate::domain::types::hash::log_prefix(&window[0].hash, 16)
                 );
                 return; // Reject entire batch — broken chain
             }

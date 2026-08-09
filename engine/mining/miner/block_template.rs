@@ -54,7 +54,7 @@ impl BlockTemplateBuilder {
         let mut validated_parents: Vec<String> = Vec::with_capacity(candidates.len());
         for parent_hash in &candidates {
             if !dag_manager.block_exists(parent_hash) {
-                slog_warn!("mining", "tip_not_found_in_dag", hash_prefix => &parent_hash[..parent_hash.len().min(16)]);
+                slog_warn!("mining", "tip_not_found_in_dag", hash_prefix => crate::domain::types::hash::log_prefix(parent_hash, 16));
                 continue;
             }
             validated_parents.push(parent_hash.clone());
@@ -100,7 +100,7 @@ impl BlockTemplateBuilder {
         let mut parents: Vec<String> = Vec::with_capacity(candidates.len());
         for parent_hash in &candidates {
             if !dag_manager.block_exists(parent_hash) {
-                slog_warn!("mining", "tip_not_found_in_dag", hash_prefix => &parent_hash[..parent_hash.len().min(16)]);
+                slog_warn!("mining", "tip_not_found_in_dag", hash_prefix => crate::domain::types::hash::log_prefix(parent_hash, 16));
                 continue;
             }
             parents.push(parent_hash.clone());
@@ -181,7 +181,7 @@ impl BlockTemplateBuilder {
             if let Some(ref best_hash) = best {
                 if tip_map_score.get(best_hash.as_str()).copied().unwrap_or(0) == 0 {
                     slog_warn!("mining", "selected_parent_not_in_tips",
-                        parent => &best_hash[..best_hash.len().min(16)],
+                        parent => crate::domain::types::hash::log_prefix(best_hash, 16),
                         note => "parent not found in tip_manager — using fallback ordering");
                 }
             }

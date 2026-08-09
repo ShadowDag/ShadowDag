@@ -245,7 +245,7 @@ pub fn compute_merkle_root(tx_hashes: &[String]) -> String {
             match crate::domain::types::hash::parse_hash256(h) {
                 Ok(bytes) => bytes.to_vec(),
                 Err(e) => {
-                    slog_error!("genesis", "malformed_merkle_hash", hash_prefix => &h[..h.len().min(16)], error => &e.to_string());
+                    slog_error!("genesis", "malformed_merkle_hash", hash_prefix => crate::domain::types::hash::log_prefix(h, 16), error => &e.to_string());
                     vec![0xFF; 32]
                 }
             }

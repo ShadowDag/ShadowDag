@@ -142,7 +142,7 @@ impl BlockRelay {
 
         log::debug!(
             "[BlockRelay] Queued block {} (height {}) for broadcast",
-            &block.header.hash[..block.header.hash.len().min(8)],
+            crate::domain::types::hash::log_prefix(&block.header.hash, 8),
             block.header.height
         );
     }
@@ -176,7 +176,7 @@ impl BlockRelay {
 
         if block.header.height > 0 && block.header.parents.is_empty() {
             slog_warn!("relay", "block_no_parents_nongenesis",
-                hash => &block.header.hash[..block.header.hash.len().min(16)],
+                hash => crate::domain::types::hash::log_prefix(&block.header.hash, 16),
                 height => block.header.height);
             // Clean up the pending key — this block will never be valid,
             // and leaving it pending blocks future re-receipt permanently.
@@ -192,8 +192,8 @@ impl BlockRelay {
                 crate::config::consensus::consensus_params::ConsensusParams::genesis_hash();
             if !known_genesis.is_empty() && block.header.hash != known_genesis {
                 slog_warn!("relay", "fake_genesis_rejected",
-                    claimed => &block.header.hash[..block.header.hash.len().min(16)],
-                    expected => &known_genesis[..known_genesis.len().min(16)]);
+                    claimed => crate::domain::types::hash::log_prefix(&block.header.hash, 16),
+                    expected => crate::domain::types::hash::log_prefix(&known_genesis, 16));
                 let _ = self.db.delete(pending_key.as_bytes());
                 return false;
             }
@@ -241,7 +241,7 @@ impl BlockRelay {
             || !block.header.hash.chars().all(|c| c.is_ascii_hexdigit())
         {
             slog_warn!("relay", "orphan_rejected_malformed_hash",
-                claimed => &block.header.hash[..block.header.hash.len().min(16)]);
+                claimed => crate::domain::types::hash::log_prefix(&block.header.hash, 16));
             return;
         }
         // Recompute the block hash from the header fields and require it to match
@@ -261,8 +261,8 @@ impl BlockRelay {
         );
         if computed != block.header.hash {
             slog_warn!("relay", "orphan_rejected_hash_mismatch",
-                claimed => &block.header.hash[..block.header.hash.len().min(16)],
-                computed => &computed[..computed.len().min(16)]);
+                claimed => crate::domain::types::hash::log_prefix(&block.header.hash, 16),
+                computed => crate::domain::types::hash::log_prefix(&computed, 16));
             return;
         }
         // Basic PoW check before storing — prevents filling the orphan pool
@@ -272,7 +272,7 @@ impl BlockRelay {
             && !PowValidator::hash_meets_target(&block.header.hash, block.header.difficulty)
         {
             slog_warn!("relay", "orphan_rejected_pow",
-                hash => &block.header.hash[..block.header.hash.len().min(16)],
+                hash => crate::domain::types::hash::log_prefix(&block.header.hash, 16),
                 difficulty => block.header.difficulty);
             return;
         }

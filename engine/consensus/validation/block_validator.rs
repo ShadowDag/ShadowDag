@@ -294,7 +294,7 @@ impl BlockValidator {
             if !seen.insert(&tx.hash) {
                 return Err(ConsensusError::BlockValidation(format!(
                     "duplicate tx {}",
-                    &tx.hash[..16.min(tx.hash.len())]
+                    crate::domain::types::hash::log_prefix(&tx.hash, 16)
                 )));
             }
         }
@@ -922,7 +922,7 @@ impl BlockValidator {
             if !block.header.parents.contains(sp) {
                 return Err(ConsensusError::BlockValidation(format!(
                     "selected_parent {} is not in parents list",
-                    &sp[..sp.len().min(16)]
+                    crate::domain::types::hash::log_prefix(sp, 16)
                 )));
             }
         }
