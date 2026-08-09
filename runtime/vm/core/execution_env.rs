@@ -197,6 +197,26 @@ pub struct ExecutionEnvironment {
     /// `None` — they allocate their own fresh state and don't
     /// want any disk access in the middle of a frame.
     pub lazy_load_storage: Option<Arc<ContractStorage>>,
+    /// Per-transaction cache of storage slots hydrated from disk.
+    ///
+    /// `load_contract_from_storage` only ever reads `account:` and `code:`,
+    /// so before this existed nothing in the VM read a `contract:{addr}:slot:*`
+    /// row back: `SLOAD` consulted `state.storage`, an in-memory map populated
+    /// only by SSTOREs earlier in the SAME block. Every contract therefore
+    /// observed its entire storage as zero at the start of every block while
+    /// its writes kept landing on disk — on-disk state looked correct and was
+    /// unreadable.
+    ///
+    /// This is kept SEPARATE from `state.storage` on purpose. Seeding loaded
+    /// values into the state map would enter them into the write set that
+    /// `iter_storage()` persists and would entangle them with the revert
+    /// journal, so a revert could erase a value that was merely READ. Here a
+    /// revert correctly leaves the pre-transaction on-disk value visible.
+    ///
+    /// A `None` entry is a negative cache: the slot is genuinely absent.
+    /// Cleared per transaction in `begin_tx`, which matches the EIP-2929 cold
+    /// (2100 gas) accounting — that charge is what pays for this disk read.
+    storage_read_cache: HashMap<(String, String), Option<String>>,
     /// Runtime address registry — maps 20-byte canonical address bodies
     /// to the full ShadowDAG address string they were derived from.
     ///
@@ -234,6 +254,7 @@ impl ExecutionEnvironment {
             warm_storage_slots: HashSet::new(),
             address_registry: HashMap::new(),
             lazy_load_storage: None,
+            storage_read_cache: HashMap::new(),
         }
     }
 
@@ -246,6 +267,54 @@ impl ExecutionEnvironment {
     /// contract TXs; stand-alone callers (executor, tests) do
     /// not set it and get the pre-refactor "in-memory only"
     /// behaviour.
+    /// Read a storage slot, hydrating it from disk when this block has not
+    /// written it yet.
+    ///
+    /// Resolution order, and each step matters:
+    ///   1. `state.storage` — values SSTOREd earlier in this block. These must
+    ///      shadow the disk, otherwise a write would be invisible to a later
+    ///      read in the same block.
+    ///   2. the per-transaction read cache, including negative entries.
+    ///   3. the on-disk row `contract:{addr}:{key}` — the same key
+    ///      `persist_to_storage` writes, via the same `contract:` prefixing
+    ///      that `commit_batch` and `get_state` both apply.
+    ///
+    /// FAIL-CLOSED. `get_state` swallows an I/O error and a UTF-8 error as
+    /// `None`; used here that would hand the contract a fabricated zero for a
+    /// slot that really holds a value, on one node and not another — a silent
+    /// consensus split from a transient disk fault. `get_state_strict`
+    /// separates "absent" from "could not read", and the caller turns the
+    /// latter into a frame failure. This mirrors the fail-closed discipline
+    /// the code lazy-loading path already uses.
+    ///
+    /// A destroyed contract is never hydrated: its rows are pending deletion
+    /// in this same batch, so resurrecting them would undo the SELFDESTRUCT.
+    fn storage_load_hydrated(
+        &mut self,
+        address: &str,
+        key: &str,
+    ) -> Result<Option<String>, crate::errors::StorageError> {
+        if let Some(v) = self.state.storage_load(address, key) {
+            return Ok(Some(v));
+        }
+        if self.destroyed_contracts.contains(address) {
+            return Ok(None);
+        }
+        let cache_key = (address.to_string(), key.to_string());
+        if let Some(cached) = self.storage_read_cache.get(&cache_key) {
+            return Ok(cached.clone());
+        }
+        let storage = match self.lazy_load_storage.clone() {
+            Some(s) => s,
+            // No storage handle (unit tests, and `Executor`'s standalone
+            // environments): in-memory state is the whole world.
+            None => return Ok(None),
+        };
+        let loaded = storage.get_state_strict(&format!("{}:{}", address, key))?;
+        self.storage_read_cache.insert(cache_key, loaded.clone());
+        Ok(loaded)
+    }
+
     pub fn with_lazy_load_storage(mut self, storage: Arc<ContractStorage>) -> Self {
         self.lazy_load_storage = Some(storage);
         self
@@ -306,6 +375,10 @@ impl ExecutionEnvironment {
         self.reentrant_guard.clear();
         self.warm_addresses.clear();
         self.warm_storage_slots.clear();
+        // Same lifetime as warm_storage_slots: the EIP-2929 cold charge is
+        // levied once per transaction, so the disk read it pays for must be
+        // repeated once per transaction too.
+        self.storage_read_cache.clear();
     }
 
     /// Register an address string in the runtime registry so that later
@@ -1656,7 +1729,24 @@ impl ExecutionEnvironment {
                         return CallOutcome::Failure { gas_used: gas.gas_used() };
                     }
 
-                    let val = match self.state.storage_load(&ctx.address, &key) {
+                    // Hydrates from disk on a miss. Before this, a slot written
+                    // in an earlier block read back as zero, so any one-shot
+                    // guard (`initialized`, `owner`, a reentrancy mutex) was
+                    // re-openable in the next block.
+                    let stored = match self.storage_load_hydrated(&ctx.address, &key) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            crate::slog_error!("vm", "sload_storage_read_failed_surfacing_as_failure",
+                                contract => &ctx.address,
+                                key => &key,
+                                error => &format!("{}", e));
+                            self.state.rollback(snapshot).ok();
+                            return CallOutcome::Failure {
+                                gas_used: gas.gas_used(),
+                            };
+                        }
+                    };
+                    let val = match stored {
                         None => U256::ZERO,
                         Some(raw) => match parse_storage_value_checked(&raw) {
                             Some(v) => v,
@@ -5723,6 +5813,74 @@ mod tests {
     /// persist again. Afterwards the on-disk account, code, and
     /// every storage slot for the destroyed contract must be
     /// gone — not "still sitting on disk with pre-destroy state".
+    /// A slot written in one block MUST be readable by SLOAD in the next.
+    ///
+    /// Before the hydration fix, `load_contract_from_storage` read only
+    /// `account:` and `code:`, and SLOAD consulted an in-memory map populated
+    /// solely by SSTOREs in the current block — so every contract saw its whole
+    /// storage as zero at the start of every block. Any one-shot guard
+    /// (`initialized`, `owner`, a reentrancy mutex) was re-openable, and token
+    /// balances reset each block.
+    #[test]
+    fn sload_reads_back_a_slot_persisted_by_an_earlier_block() {
+        use std::sync::Arc;
+        let storage = Arc::new(tmp_contract_storage());
+
+        // ── Block 1: the contract stores a value and the block is persisted.
+        {
+            let mut env = make_env();
+            env.state.set_code("guarded", vec![0x00]).unwrap();
+            env.state.storage_store("guarded", "slot:0", "0x01");
+            env.persist_to_storage(&storage).expect("persist block 1");
+        }
+        assert!(
+            storage.get_state("guarded:slot:0").is_some(),
+            "precondition: the slot row must actually be on disk"
+        );
+
+        // ── Block 2: a brand-new environment, exactly as the block executor
+        // builds one. Nothing has SSTOREd in this block, so the value can only
+        // come from disk.
+        let mut env = make_env().with_lazy_load_storage(storage.clone());
+        env.begin_tx();
+        env.state.set_code("guarded", vec![0x00]).unwrap();
+
+        // PUSH1 0; SLOAD; PUSH1 0; MSTORE; PUSH1 32; PUSH1 0; RETURN
+        let code = vec![
+            0x10, 0x00, // PUSH1 0
+            0x50, // SLOAD
+            0x10, 0x00, // PUSH1 0
+            0x91, // MSTORE
+            0x10, 0x20, // PUSH1 32
+            0x10, 0x00, // PUSH1 0
+            0xB6, // RETURN
+        ];
+        env.state.set_code("guarded", code).unwrap();
+
+        let ctx = CallContext {
+            address: "guarded".to_string(),
+            code_address: "guarded".to_string(),
+            caller: "caller".to_string(),
+            value: 0,
+            calldata: Vec::new(),
+            gas_limit: 1_000_000,
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
+        };
+        match env.execute_frame_guarded(&ctx) {
+            CallOutcome::Success { return_data, .. } => {
+                let word = U256::from_be_bytes(&return_data[..32].try_into().unwrap());
+                assert_eq!(
+                    word,
+                    U256::from_u64(1),
+                    "SLOAD must return the value persisted by the earlier block, not zero"
+                );
+            }
+            other => panic!("frame must succeed, got {:?}", other),
+        }
+    }
+
     #[test]
     fn persist_to_storage_deletes_destroyed_contract_rows_and_slots() {
         let storage = tmp_contract_storage();
