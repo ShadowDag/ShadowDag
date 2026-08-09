@@ -32,7 +32,7 @@ use crate::runtime::vm::core::vm::ExecutionResult;
 use crate::runtime::vm::core::vm_context::VMContext;
 use crate::service::mempool::core::mempool::Mempool;
 use crate::service::network::p2p::peer_manager::PeerManager;
-use crate::service::rpc::auth::RpcAuthManager;
+use crate::service::rpc::auth::{AuthRole, RpcAuthManager};
 use crate::engine::mining::stratum::stratum_server::StratumServer;
 use crate::{slog_error, slog_info, slog_warn};
 
@@ -212,113 +212,154 @@ impl RpcState {
     ///
     /// `data_dir` — directory to write the `rpc_password` file into.
     /// When `None`, no plaintext password file is written.
-    fn load_or_create_admin_password(
+    /// Build the RPC auth manager with RocksDB-persisted, PBKDF2-hashed users.
+    ///
+    /// Only the HASH is ever written to the database. Until 2026-07-22 the
+    /// generated admin password was ALSO stored in cleartext under
+    /// `rpc:admin_password` so a restart could reuse it, which handed the RPC
+    /// admin credential to anyone who could read the node's data directory —
+    /// a backup, a snapshot, or a stolen disk. It was redundant as well as
+    /// dangerous: hashed users already survive restart through
+    /// `recover_users_from_db`. Existing databases are migrated here — the
+    /// legacy value seeds the admin user so a live node keeps the password its
+    /// operator already holds, and is then deleted.
+    fn build_auth_manager(
         db: &Arc<DB>,
         data_dir: Option<&std::path::Path>,
-    ) -> Result<String, NetworkError> {
-        let key = b"rpc:admin_password";
-        // Try to load existing password — handle read errors explicitly
-        match db.get(key) {
-            Ok(Some(data)) => {
-                if let Ok(pw) = String::from_utf8(data.to_vec()) {
-                    if !pw.is_empty() {
-                        slog_info!("rpc", "admin_credentials_loaded");
-                        return Ok(pw);
-                    }
+    ) -> Result<RpcAuthManager, NetworkError> {
+        let mut mgr = RpcAuthManager::new_persistent(db.clone());
+        let legacy_key = b"rpc:admin_password";
+
+        match db.get(legacy_key) {
+            Ok(Some(raw)) => {
+                let legacy = String::from_utf8(raw.to_vec()).unwrap_or_default();
+                if !legacy.is_empty() && !mgr.user_exists("admin") {
+                    mgr.add_user("admin", &legacy, AuthRole::Admin);
                 }
-                // Stored value was empty or invalid UTF-8 — fall through to generate
+                // Drop the cleartext copy whether or not it was needed. A failure
+                // here is fatal: continuing would leave the credential on disk
+                // while reporting success.
+                db.delete(legacy_key).map_err(|e| {
+                    slog_error!("rpc", "legacy_cleartext_password_delete_failed", error => e);
+                    NetworkError::Other(format!(
+                        "could not remove the legacy cleartext admin password: {}",
+                        e
+                    ))
+                })?;
+                slog_warn!("rpc", "legacy_cleartext_admin_password_migrated",
+                    note => "cleartext copy removed from rocksdb; only the PBKDF2 hash remains");
             }
-            Ok(None) => {
-                // Genuinely first run — fall through to generate a new password
-            }
+            Ok(None) => {}
             Err(e) => {
                 slog_error!("rpc", "admin_password_read_failed", error => e);
-                // Do NOT generate a new password on read failure — the DB may
-                // already contain a valid password that we simply cannot read.
+                // Do NOT fall through to minting a new password on a read error:
+                // the database may hold a perfectly good credential we simply
+                // could not read, and replacing it would lock the operator out.
                 return Err(NetworkError::Other(format!(
-                    "Failed to read admin password from DB: {}",
+                    "Failed to read admin credential state from DB: {}",
                     e
                 )));
             }
         }
-        // First run: generate and persist
-        let password = Self::generate_admin_password();
-        db.put(key, password.as_bytes()).map_err(|e| {
-            slog_error!("rpc", "admin_password_persist_failed", error => e);
-            NetworkError::Other(format!("Failed to persist admin password to DB: {}", e))
-        })?;
-        let masked = format!("{}...", &password[..4.min(password.len())]);
-        slog_warn!("rpc", "first_run_admin_password_generated", hint => &masked);
-        // SECURITY: Never log the full password to stderr/stdout (captured by
-        // log aggregators, process monitors, shell history). Write to a
-        // restricted file instead, and print only a masked hint to console.
-        // Use the node's data_dir so the file lives next to the DB, not in
-        // whichever directory the process happened to start from.
-        let base_dir = data_dir.map(|p| p.to_path_buf());
-        if let Some(base) = base_dir {
-            let pw_path = base.join("rpc_password");
-            match std::fs::write(&pw_path, password.as_bytes()) {
-                Ok(_) => {
-                    // Best-effort: restrict permissions on Unix
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(
-                            &pw_path,
-                            std::fs::Permissions::from_mode(0o600),
-                        );
-                    }
-                    let pw_display = pw_path.display().to_string();
-                    eprintln!("╔══════════════════════════════════════════════════════╗");
-                    eprintln!("║  RPC Admin Password generated (first run)           ║");
-                    eprintln!(
-                        "║  Hint: {}                                           ║",
-                        masked
-                    );
-                    eprintln!("║  Full password saved to:                            ║");
-                    eprintln!("║  {}  ║", pw_display);
-                    eprintln!("╚══════════════════════════════════════════════════════╝");
-                }
-                Err(e) => {
-                    slog_warn!("rpc", "rpc_password_file_write_failed",
-                        path => pw_path.display(), error => e);
-                    eprintln!("╔══════════════════════════════════════════════════════╗");
-                    eprintln!("║  RPC Admin Password generated (first run)           ║");
-                    eprintln!(
-                        "║  Hint: {}                                           ║",
-                        masked
-                    );
-                    eprintln!(
-                        "║  WARNING: Could not write password to: {}  ║",
-                        pw_path.display()
-                    );
-                    eprintln!("╚══════════════════════════════════════════════════════╝");
-                }
+
+        if !mgr.user_exists("admin") {
+            // Genuinely first run: mint a password, persist only its hash, and
+            // hand the cleartext to the operator exactly once — through a 0600
+            // file, never through the database.
+            let password = Self::generate_admin_password();
+            mgr.add_user("admin", &password, AuthRole::Admin);
+            if !mgr.user_exists("admin") {
+                return Err(NetworkError::Other(
+                    "failed to persist the generated admin user".to_string(),
+                ));
             }
-        } else {
-            eprintln!("╔══════════════════════════════════════════════════════╗");
-            eprintln!("║  RPC Admin Password generated (first run)           ║");
-            eprintln!(
-                "║  Hint: {}                                           ║",
-                masked
-            );
-            eprintln!("║  WARNING: Could not determine data dir for password ║");
-            eprintln!("╚══════════════════════════════════════════════════════╝");
+            Self::deliver_first_run_secret("admin", "rpc_password", &password, data_dir);
         }
-        Ok(password)
+
+        // Provision a least-privilege mining credential. Before this, `admin`
+        // was the ONLY user ever created, so an operator wiring up a miner had
+        // to hand it full admin rights — and a compromised miner could then
+        // stop the node or deploy contracts. This user reaches only
+        // getblocktemplate/getwork/submitblock (see is_mining_method).
+        if !mgr.user_exists("miner") {
+            let miner_password = Self::generate_admin_password();
+            mgr.add_user("miner", &miner_password, AuthRole::Miner);
+            if mgr.user_exists("miner") {
+                Self::deliver_first_run_secret("miner", "rpc_miner_password", &miner_password, data_dir);
+            } else {
+                // Non-fatal: the node still runs and admin can mine. Say so
+                // rather than implying least privilege is available.
+                slog_error!("rpc", "miner_user_provisioning_failed",
+                    note => "mining will require the admin credential");
+            }
+        }
+
+        Ok(mgr)
+    }
+
+    /// Hand a freshly generated credential to the operator: a 0600 file in the
+    /// data directory plus a masked hint on the console. Never logged in full —
+    /// log aggregators, process monitors and shell history all capture
+    /// stdout/stderr.
+    fn deliver_first_run_secret(
+        label: &str,
+        filename: &str,
+        password: &str,
+        data_dir: Option<&std::path::Path>,
+    ) {
+        let masked = format!(
+            "{}...",
+            crate::domain::types::hash::log_prefix(password, 4)
+        );
+        slog_warn!("rpc", "first_run_credential_generated", user => label, hint => &masked);
+
+        let pw_path = match data_dir {
+            Some(base) => base.join(filename),
+            None => {
+                eprintln!("RPC {} password generated (first run). Hint: {}", label, masked);
+                eprintln!("WARNING: no data dir available, so the password file was NOT written.");
+                eprintln!("Reset the credential if you cannot recover it.");
+                return;
+            }
+        };
+
+        match std::fs::write(&pw_path, password.as_bytes()) {
+            Ok(_) => {
+                // Best-effort: restrict permissions on Unix.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &pw_path,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
+                eprintln!("RPC {} password generated (first run). Hint: {}", label, masked);
+                eprintln!("Full password written to: {}", pw_path.display());
+            }
+            Err(e) => {
+                slog_warn!("rpc", "rpc_password_file_write_failed",
+                    user => label, path => pw_path.display(), error => e);
+                eprintln!("RPC {} password generated (first run). Hint: {}", label, masked);
+                eprintln!(
+                    "WARNING: could not write the password file to {}: {}",
+                    pw_path.display(),
+                    e
+                );
+            }
+        }
     }
 
     pub fn new(db: Arc<DB>) -> Result<Self, NetworkError> {
-        // Persistent admin password: stored in RocksDB under "rpc:admin_password"
-        // First run: generate + store. Subsequent runs: load from DB.
-        // No data_dir here, so the generated admin password is persisted only in DB.
-        // We intentionally avoid writing credentials to the current working directory.
+        // Admin credentials live in RocksDB as PBKDF2 hashes only; see
+        // build_auth_manager. Without a data_dir a first-run password cannot be
+        // handed to the operator through a file, so warn loudly.
         slog_warn!(
             "rpc",
             "rpc_new_without_data_dir",
             note => "no data_dir provided; rpc_password file will not be written"
         );
-        let admin_password = Self::load_or_create_admin_password(&db, None)?;
+        let auth_manager = Self::build_auth_manager(&db, None)?;
         let block_store = BlockStore::new(db.clone()).map_err(NetworkError::Storage)?;
         // NO fallback — RPC MUST use the same UTXO state as the node.
         // If UTXO store fails, the RPC cannot serve correct data.
@@ -340,7 +381,7 @@ impl RpcState {
             utxo_store,
             mempool,
             peer_manager,
-            auth_manager: RpcAuthManager::with_default_admin(&admin_password),
+            auth_manager,
             best_height: 0,
             best_hash: String::new(),
             node_version: format!("ShadowDAG/{}", env!("CARGO_PKG_VERSION")),
@@ -373,7 +414,7 @@ impl RpcState {
         db: Arc<DB>,
         data_dir: Option<&std::path::Path>,
     ) -> Result<Self, NetworkError> {
-        let admin_password = Self::load_or_create_admin_password(&db, data_dir)?;
+        let auth_manager = Self::build_auth_manager(&db, data_dir)?;
         let block_store = BlockStore::new(db.clone()).map_err(NetworkError::Storage)?;
         let store = Arc::new(UtxoStore::new(db.clone()).map_err(|e| {
             slog_error!("rpc", "utxo_store_init_failed", error => e);
@@ -387,7 +428,7 @@ impl RpcState {
             utxo_store,
             mempool,
             peer_manager,
-            auth_manager: RpcAuthManager::with_default_admin(&admin_password),
+            auth_manager,
             best_height: 0,
             best_hash: String::new(),
             node_version: format!("ShadowDAG/{}", env!("CARGO_PKG_VERSION")),
@@ -452,10 +493,16 @@ fn requires_auth(method: &str) -> bool {
     )
 }
 
-/// Methods that must only be callable by admin role.
-/// Miner/read-only tokens are insufficient even if authenticated.
-fn requires_admin(method: &str) -> bool {
-    matches!(method, "stop")
+/// The only methods a mining credential needs. Everything else behind
+/// `requires_auth` stays admin-only, so a compromised miner cannot deploy or
+/// call contracts, broadcast arbitrary transactions, or stop the node.
+///
+/// `AuthRole::can_write()` returns true for Miner as well as Admin, so routing
+/// every non-admin method through it would have handed a miner the contract
+/// surface. Nothing regresses by tightening this now: until the `miner` user
+/// was provisioned alongside the admin, no Miner token could exist at all.
+fn is_mining_method(method: &str) -> bool {
+    matches!(method, "getblocktemplate" | "getwork" | "submitblock")
 }
 
 pub struct RpcServer {
@@ -976,19 +1023,23 @@ impl RpcServer {
                             let mut s = state
                                 .lock()
                                 .map_err(|_| NetworkError::Other("State lock error".to_string()))?;
-                            let allowed = if requires_admin(&req.method) {
-                                s.auth_manager.is_admin(token)
-                            } else {
+                            let allowed = if is_mining_method(&req.method) {
+                                // Admin OR Miner — the only place a mining
+                                // credential is accepted.
                                 s.auth_manager.can_write(token)
+                            } else {
+                                // Everything else behind requires_auth, `stop`
+                                // included, is admin-only.
+                                s.auth_manager.is_admin(token)
                             };
                             if allowed {
                                 drop(s);
                                 Self::dispatch(&req.method, req.params, id, &state)
                             } else {
-                                let msg = if requires_admin(&req.method) {
-                                    "Admin role required for this method"
-                                } else {
+                                let msg = if is_mining_method(&req.method) {
                                     "Invalid, expired, or insufficient-permission auth token"
+                                } else {
+                                    "Admin role required for this method"
                                 };
                                 RpcResponse::err(
                                     id,
@@ -5319,6 +5370,108 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn legacy_cleartext_admin_password_is_migrated_then_erased() {
+        let db_dir = temp_db_dir();
+        let node_db = NodeDB::new(db_dir.join("db").to_string_lossy().as_ref()).unwrap();
+        let db = node_db.shared();
+
+        // A node created before 2026-07-22: the admin password sitting in the
+        // clear under rpc:admin_password, with no hashed user record yet.
+        let legacy_pw = "legacy-operator-password-123";
+        db.put(b"rpc:admin_password", legacy_pw.as_bytes()).unwrap();
+
+        let mut mgr = RpcState::build_auth_manager(&db, Some(&db_dir)).unwrap();
+
+        // The operator must NOT be locked out of a running node.
+        assert!(
+            mgr.login("admin", legacy_pw).is_ok(),
+            "migration must keep the operator's existing password working"
+        );
+        // ...and the cleartext copy must be gone.
+        assert!(
+            db.get(b"rpc:admin_password").unwrap().is_none(),
+            "the cleartext admin password must be erased from rocksdb"
+        );
+
+        // Restart: the hashed user is recovered, with no cleartext anywhere.
+        let mut again = RpcState::build_auth_manager(&db, Some(&db_dir)).unwrap();
+        assert!(
+            again.login("admin", legacy_pw).is_ok(),
+            "the hashed user must survive restart without a cleartext copy"
+        );
+        assert!(again.login("admin", "not-the-password").is_err());
+    }
+
+    #[test]
+    fn first_run_writes_no_cleartext_password_to_the_database() {
+        let db_dir = temp_db_dir();
+        let node_db = NodeDB::new(db_dir.join("db").to_string_lossy().as_ref()).unwrap();
+        let db = node_db.shared();
+
+        let mut mgr = RpcState::build_auth_manager(&db, Some(&db_dir)).unwrap();
+        assert!(mgr.user_exists("admin"), "first run must provision an admin");
+
+        // The generated password reaches the operator through the 0600 file...
+        let pw = fs::read_to_string(db_dir.join("rpc_password")).unwrap();
+        assert!(!pw.is_empty());
+        assert!(mgr.login("admin", &pw).is_ok(), "the file must hold the live password");
+
+        // ...and NOWHERE in the database, under that key or any other.
+        assert!(db.get(b"rpc:admin_password").unwrap().is_none());
+        let leaked = db
+            .iterator(rocksdb::IteratorMode::Start)
+            .filter_map(|r| r.ok())
+            .any(|(_, v)| v.windows(pw.len()).any(|w| w == pw.as_bytes()));
+        assert!(
+            !leaked,
+            "the cleartext password must not appear in any database value"
+        );
+    }
+
+    #[test]
+    fn miner_credential_is_provisioned_and_reaches_only_mining_methods() {
+        let db_dir = temp_db_dir();
+        let node_db = NodeDB::new(db_dir.join("db").to_string_lossy().as_ref()).unwrap();
+        let db = node_db.shared();
+        let mut mgr = RpcState::build_auth_manager(&db, Some(&db_dir)).unwrap();
+
+        // A least-privilege mining credential now exists, so an operator no
+        // longer has to hand a miner the admin password.
+        assert!(mgr.user_exists("miner"), "a miner user must be provisioned");
+        let miner_pw = fs::read_to_string(db_dir.join("rpc_miner_password")).unwrap();
+        let admin_pw = fs::read_to_string(db_dir.join("rpc_password")).unwrap();
+        assert_ne!(miner_pw, admin_pw, "the miner must not share the admin secret");
+
+        let miner_token = mgr.login("miner", &miner_pw).unwrap();
+        let admin_token = mgr.login("admin", &admin_pw).unwrap();
+
+        // The miner reaches the mining surface...
+        for m in ["getblocktemplate", "getwork", "submitblock"] {
+            assert!(is_mining_method(m), "{} must be a mining method", m);
+            assert!(
+                mgr.can_write(&miner_token),
+                "the miner token must be accepted for {}",
+                m
+            );
+        }
+
+        // ...and nothing else behind requires_auth. These all route through
+        // is_admin, which a Miner token fails.
+        for m in ["stop", "deploy_contract", "call_contract", "sendrawtransaction"] {
+            assert!(requires_auth(m));
+            assert!(!is_mining_method(m), "{} must NOT be a mining method", m);
+        }
+        assert!(
+            !mgr.is_admin(&miner_token),
+            "a miner token must never satisfy the admin check"
+        );
+        assert!(
+            mgr.is_admin(&admin_token),
+            "admin must retain access to every method"
+        );
+    }
+
     fn call(server: &RpcServer, method: &str) -> Value {
         let req = format!(
             r#"{{"jsonrpc":"2.0","method":"{}","params":[],"id":1}}"#,
@@ -5680,11 +5833,26 @@ mod tests {
     }
 
     #[test]
-    fn auth_policy_stop_requires_admin() {
+    fn auth_policy_confines_the_miner_role_to_mining_methods() {
+        // A mining credential reaches exactly these three.
+        assert!(is_mining_method("getblocktemplate"));
+        assert!(is_mining_method("getwork"));
+        assert!(is_mining_method("submitblock"));
+
+        // Everything else behind requires_auth is admin-only. Note
+        // sendrawtransaction and the contract surface: AuthRole::can_write()
+        // returns true for Miner, so before this policy a mining credential
+        // could broadcast transactions and deploy contracts.
         assert!(requires_auth("stop"));
-        assert!(requires_admin("stop"));
-        assert!(!requires_admin("submitblock"));
-        assert!(!requires_admin("sendrawtransaction"));
+        for m in [
+            "stop",
+            "sendrawtransaction",
+            "deploy_contract",
+            "call_contract",
+            "get_storage_at",
+        ] {
+            assert!(!is_mining_method(m), "{} must be admin-only", m);
+        }
     }
 
     #[test]

@@ -207,6 +207,25 @@ impl Wallet {
                 mnemonic.len()
             )));
         }
+        // Reject any word that this wallet's generator could never have produced.
+        // The scheme carries NO checksum (see the note on entropy_to_mnemonic_simple),
+        // so without this a mistyped word silently derives a DIFFERENT wallet and the
+        // user sees an empty balance instead of an error. Membership is checked
+        // as-typed: the wordlist is all-lowercase, and normalising case here would
+        // still derive from the normalised sentence, so a case-mangled phrase is
+        // reported rather than silently mapped. This only rejects; every phrase this
+        // wallet ever emitted still restores to the identical seed.
+        let wordlist: std::collections::HashSet<String> =
+            generate_bip39_wordlist().into_iter().collect();
+        for (i, w) in mnemonic.iter().enumerate() {
+            if !wordlist.contains(w.as_str()) {
+                return Err(WalletError::Other(format!(
+                    "word {} of the recovery phrase is not in this wallet's wordlist \
+                     (words are lowercase and 3-7 letters); check that word and retry",
+                    i + 1
+                )));
+            }
+        }
         let seed = mnemonic_to_seed_simple(mnemonic, "");
         let enc = encrypt_bytes(&seed, password)?;
         self.session_key = Some(seed);
@@ -1966,6 +1985,40 @@ mod tests {
         let three_words: Vec<String> = vec!["abandon".into(), "ability".into(), "able".into()];
         assert!(Wallet::new("mainnet")
             .restore_from_mnemonic(&three_words, "pw-strong-123")
+            .is_err());
+    }
+
+    #[test]
+    fn restore_rejects_a_word_outside_the_wordlist() {
+        // The scheme carries no checksum, so before this guard a single mistyped
+        // word derived a DIFFERENT wallet and the user just saw an empty balance.
+        let mut a = Wallet::new("mainnet");
+        let (mnemonic, _enc) = a.create("pw-strong-123").unwrap();
+        assert_eq!(mnemonic.len(), 12);
+
+        // Baseline: the untouched phrase still restores to the same address, so
+        // the guard rejects nothing this wallet can legitimately produce.
+        let mut ok = Wallet::new("mainnet");
+        ok.restore_from_mnemonic(&mnemonic, "pw2").unwrap();
+        assert_eq!(ok.address(), a.address());
+
+        // A word that is not in the generated list — the common typo shape.
+        let mut typo = mnemonic.clone();
+        typo[6] = "zzzzzz".to_string();
+        let err = Wallet::new("mainnet")
+            .restore_from_mnemonic(&typo, "pw2")
+            .expect_err("an out-of-wordlist word must be rejected, not silently derived");
+        assert!(
+            format!("{}", err).contains("word 7"),
+            "the error must name the offending position, got: {}",
+            err
+        );
+
+        // Case mangling is reported too, rather than deriving a wrong seed.
+        let mut upper = mnemonic.clone();
+        upper[0] = upper[0].to_uppercase();
+        assert!(Wallet::new("mainnet")
+            .restore_from_mnemonic(&upper, "pw2")
             .is_err());
     }
 
