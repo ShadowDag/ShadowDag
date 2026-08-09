@@ -1021,10 +1021,15 @@ impl Mempool {
         total_evicted
     }
 
+    /// `block_height` is the height the template block will occupy (tip + 1),
+    /// NOT the current tip. Coinbase maturity is evaluated against it, so the
+    /// selection matches what `apply_block_dag_ordered` will accept at that
+    /// height rather than at the height we happen to be selecting from.
     pub fn select_transactions_for_block(
         &self,
         utxo_set: &UtxoSet,
         max_count: usize,
+        block_height: u64,
     ) -> Vec<Transaction> {
         let limit = max_count.min(MAX_BLOCK_TX_COUNT);
 
@@ -1148,10 +1153,24 @@ impl Mempool {
                     continue;
                 }
 
+                // CONSENSUS-CRITICAL, same failure shape as the tx_seen filter
+                // above: `exists` accepts an immature coinbase output, but
+                // `apply_block_dag_ordered` SKIPS a tx that spends one (maturity
+                // check D) and drops its fee. The coinbase would then claim a fee
+                // execution never applied, `actual_total != expected_total` fires
+                // on every validator, and the block is rejected network-wide —
+                // the miner re-mines the same doomed template and the chain
+                // stalls. `exists_spendable` applies the same maturity rule as
+                // apply, at the height this block will actually occupy.
+                // staged_outputs are outputs of earlier txs in THIS block, which
+                // are never coinbase, so maturity does not apply to them.
                 let all_ok = tx.is_coinbase()
                     || tx.inputs.iter().all(|inp| {
                         match crate::domain::utxo::utxo_set::utxo_key(&inp.txid, inp.index) {
-                            Ok(key) => utxo_set.exists(&key) || staged_outputs.contains(&key),
+                            Ok(key) => {
+                                utxo_set.exists_spendable(&key, block_height)
+                                    || staged_outputs.contains(&key)
+                            }
                             Err(_) => false,
                         }
                     });
@@ -1626,8 +1645,9 @@ impl crate::domain::traits::tx_pool::TxPool for Mempool {
         &self,
         utxo_set: &crate::domain::utxo::utxo_set::UtxoSet,
         max_count: usize,
+        block_height: u64,
     ) -> Vec<Transaction> {
-        self.select_transactions_for_block(utxo_set, max_count)
+        self.select_transactions_for_block(utxo_set, max_count, block_height)
     }
 }
 

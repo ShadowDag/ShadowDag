@@ -126,7 +126,12 @@ mod tests {
         fn get_prioritized_txs(&self, _limit: usize) -> Vec<Transaction> {
             vec![]
         }
-        fn get_transactions_for_block(&self, _utxo: &UtxoSet, _max: usize) -> Vec<Transaction> {
+        fn get_transactions_for_block(
+            &self,
+            _utxo: &UtxoSet,
+            _max: usize,
+            _height: u64,
+        ) -> Vec<Transaction> {
             vec![]
         }
     }

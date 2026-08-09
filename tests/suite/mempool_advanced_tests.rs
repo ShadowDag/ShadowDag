@@ -5,6 +5,10 @@
 
 #[cfg(test)]
 mod tests {
+    /// Height the template block would occupy. Chosen well past every network's
+    /// coinbase maturity so these tests exercise ordering/limits, not maturity.
+    const TEMPLATE_HEIGHT: u64 = 10_000;
+
     use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
     use crate::service::mempool::core::mempool::{
         Mempool, MAX_MEMPOOL_SIZE, MAX_TX_BYTE_SIZE, MIN_RELAY_FEE,
@@ -105,7 +109,7 @@ mod tests {
             }
         }
 
-        let selected = pool.select_transactions_for_block(&us, 4);
+        let selected = pool.select_transactions_for_block(&us, 4, TEMPLATE_HEIGHT);
         assert!(!selected.is_empty(), "At least one TX must be selected");
         for w in selected.windows(2) {
             assert!(
@@ -188,7 +192,7 @@ mod tests {
             pool.add_transaction_test(&make_tx(&format!("topn_tx_{:010}", i), i as u64 + 1, 1_000));
         }
         let us = dummy_utxo_set();
-        let selected = pool.select_transactions_for_block(&us, 10);
+        let selected = pool.select_transactions_for_block(&us, 10, TEMPLATE_HEIGHT);
         assert!(selected.len() <= 10, "Must return at most 10 transactions");
     }
 
@@ -219,7 +223,7 @@ mod tests {
         assert!(us.is_tx_seen(&seen_tx.hash));
         assert!(!us.is_tx_seen(&fresh_tx.hash));
 
-        let selected = pool.select_transactions_for_block(&us, 10);
+        let selected = pool.select_transactions_for_block(&us, 10, TEMPLATE_HEIGHT);
         assert!(
             selected.iter().any(|t| t.hash == fresh_tx.hash),
             "fresh mempool tx must still be selected"
@@ -227,6 +231,60 @@ mod tests {
         assert!(
             !selected.iter().any(|t| t.hash == seen_tx.hash),
             "a tx already applied on-chain must never enter a template"
+        );
+    }
+
+    // ── 8c. Immature-coinbase spends excluded from block templates ────────
+    #[test]
+    fn select_excludes_spends_of_immature_coinbase_outputs() {
+        // Same failure shape as 8b, different cause. `apply_block_dag_ordered`
+        // SKIPS a tx spending a coinbase output younger than COINBASE_MATURITY
+        // (maturity check D) and drops its fee. If the selector hands such a tx
+        // to the miner, the coinbase claims a fee execution never applies,
+        // actual_total != expected_total fires on every validator, and the
+        // block is rejected network-wide — the miner then re-mines the same
+        // doomed template and the chain stalls.
+        let pool = tmp_mempool("cb_maturity_filter");
+        let immature_spend = make_tx("spends_immature_cb_01", 5, 1_000);
+        let mature_spend = make_tx("spends_mature_cb_01", 5, 1_000);
+        pool.add_transaction_test(&immature_spend);
+        pool.add_transaction_test(&mature_spend);
+
+        let us = dummy_utxo_set();
+        let maturity = us.coinbase_maturity();
+        let tip = 10_000u64;
+        let template_height = tip + 1;
+
+        // Fund each tx's inputs from a COINBASE output. One is old enough to be
+        // spendable at template_height, the other was created one block too
+        // recently — the boundary case, not a wildly immature one.
+        for inp in &mature_spend.inputs {
+            us.add_utxo_coinbase_str(
+                &format!("{}:{}", inp.txid, inp.index),
+                "shadow1mempool".to_string(),
+                2_000,
+                "shadow1mempool".to_string(),
+                template_height - maturity,
+            );
+        }
+        for inp in &immature_spend.inputs {
+            us.add_utxo_coinbase_str(
+                &format!("{}:{}", inp.txid, inp.index),
+                "shadow1mempool".to_string(),
+                2_000,
+                "shadow1mempool".to_string(),
+                template_height - maturity + 1,
+            );
+        }
+
+        let selected = pool.select_transactions_for_block(&us, 10, template_height);
+        assert!(
+            selected.iter().any(|t| t.hash == mature_spend.hash),
+            "a spend of a matured coinbase output must still be selected"
+        );
+        assert!(
+            !selected.iter().any(|t| t.hash == immature_spend.hash),
+            "a spend of an immature coinbase output must never enter a template"
         );
     }
 

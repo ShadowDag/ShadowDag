@@ -133,7 +133,8 @@ impl MempoolManager {
     pub fn collect_for_block(&self, limit: usize) -> Vec<Transaction> {
         self.tx_pool
             .mempool
-            .select_transactions_for_block(&self.utxo_set, limit)
+            // The block being built sits one above the current tip.
+            .select_transactions_for_block(&self.utxo_set, limit, self.current_height + 1)
     }
 
     pub fn on_new_block(&mut self, height: u64, confirmed_txids: &[String]) {

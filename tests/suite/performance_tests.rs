@@ -5,6 +5,10 @@
 
 #[cfg(test)]
 mod tests {
+    /// Height the template block would occupy. Chosen well past every network's
+    /// coinbase maturity so these tests exercise ordering/limits, not maturity.
+    const TEMPLATE_HEIGHT: u64 = 10_000;
+
     use crate::config::consensus::consensus_params::ConsensusParams;
     use crate::domain::block::block::Block;
     use crate::domain::block::block_body::BlockBody;
@@ -305,7 +309,7 @@ mod tests {
         }
         let utxo_set = crate::domain::utxo::utxo_set::UtxoSet::new_empty();
         let start = Instant::now();
-        let selected = pool.select_transactions_for_block(&utxo_set, 500);
+        let selected = pool.select_transactions_for_block(&utxo_set, 500, TEMPLATE_HEIGHT);
         let elapsed = start.elapsed();
         println!(
             "[PERF] Select 500 from 1000: {} selected in {:.2}ms",

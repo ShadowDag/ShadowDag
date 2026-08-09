@@ -138,6 +138,7 @@ impl BlockTemplateBuilder {
         let candidates = mempool.get_transactions_for_block(
             utxo_set,
             MAX_BLOCK_TX_COUNT - 1, // reserve slot for coinbase
+            height,                 // maturity is judged at THIS block's height
         );
 
         let network = Self::network_from_miner_address(miner_address);
@@ -255,7 +256,7 @@ impl BlockTemplateBuilder {
         _prev_hash: &str,
     ) -> Block {
         // Select transactions BEFORE building coinbase so we know total fees
-        let candidates = mempool.get_transactions_for_block(utxo_set, MAX_BLOCK_TX_COUNT - 1);
+        let candidates = mempool.get_transactions_for_block(utxo_set, MAX_BLOCK_TX_COUNT - 1, height);
 
         let network = Self::network_from_miner_address(miner_address);
         let template = Self::select_valid_transactions(candidates, utxo_set, &network);
