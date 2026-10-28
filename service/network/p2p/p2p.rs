@@ -33,10 +33,30 @@ use crate::{slog_debug, slog_error, slog_info, slog_warn};
 /// Global DoS guard — shared across all peer threads.
 static DOS_GUARD: Lazy<DosGuard> = Lazy::new(DosGuard::new);
 
-/// Inbound connection throttle: max new connections per second.
+/// Inbound connection throttle: max new connections per second from ONE source
+/// IP. This used to be a single process-global budget, checked before the
+/// peer's address was even resolved — which made it the one accept gate with
+/// neither a trusted-seed bypass nor any per-source scoping. 11 completed TCP
+/// connects in a second from a single host, free to produce, then refused every
+/// other inbound connection for the rest of that second, the node's own seeds
+/// included.
 const MAX_INBOUND_PER_SEC: u32 = 10;
 /// Max pending (not-yet-handshaked) connections.
 const MAX_PENDING_CONNECTIONS: usize = 64;
+/// Max inbound arrivals per second from one /16 subnet. The per-IP budget alone
+/// is bypassed by an attacker who owns a whole /16 — every address passes its
+/// own budget — which is the same bypass that puts `MAX_INBOUND_PER_SUBNET`
+/// beside `MAX_PEERS_PER_IP` for live connections. Three attempts per second per
+/// live slot the subnet is allowed to hold.
+const MAX_INBOUND_PER_SEC_PER_SUBNET: u32 = MAX_INBOUND_PER_SUBNET * 3;
+/// Backstop on TOTAL inbound arrivals per second, so a flood spread across many
+/// subnets still cannot spin the accept thread without bound. Tied to
+/// `MAX_PENDING_CONNECTIONS`: the node may be asked to build at most one pending
+/// pool's worth of pre-handshake state per second.
+const MAX_INBOUND_GLOBAL_PER_SEC: u32 = MAX_PENDING_CONNECTIONS as u32;
+/// Distinct keys (source IPs, and separately /16s) tracked within one throttle
+/// window, bounding each per-window map against a flood that rolls addresses.
+const MAX_THROTTLE_TRACKED_IPS: usize = 4_096;
 
 pub const MAX_PEERS: usize = NetworkParams::MAX_PEERS;
 pub const MIN_PEERS: usize = NetworkParams::MIN_PEERS;
@@ -180,6 +200,45 @@ static RECEIVED_ADDRS: Lazy<Arc<PlMutex<Vec<String>>>> =
 /// connection ends.
 static INBOUND_CONN_PER_IP: Lazy<Arc<PlMutex<HashMap<String, u32>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(HashMap::new())));
+
+/// Whether the inbound arrival throttle must refuse this connection.
+///
+/// The three counts are arrivals in the current one-second window, this arrival
+/// included: from this IP, from its /16, and in total. A whitelisted seed is
+/// COUNTED but never refused — the same shape as the pending, per-IP and
+/// per-/16 caps, and the invariant the whitelist itself documents: trusted peers
+/// are never rate-limited or banned.
+///
+/// Refusing is the whole response; no ban score. Many honest hosts share one
+/// public IP behind a NAT, so a burst of connects from one address is not
+/// evidence of abuse, and a 6-24 h ban for it would be a false positive that the
+/// live per-IP cap (`MAX_PEERS_PER_IP`) already makes unnecessary.
+fn inbound_throttle_rejects(
+    whitelisted: bool,
+    per_ip: u32,
+    per_subnet: u32,
+    global: u32,
+) -> bool {
+    !whitelisted
+        && (per_ip > MAX_INBOUND_PER_SEC
+            || per_subnet > MAX_INBOUND_PER_SEC_PER_SUBNET
+            || global > MAX_INBOUND_GLOBAL_PER_SEC)
+}
+
+/// Count one arrival against `key`'s budget for the current throttle window and
+/// report its running count. `key` is a source IP or a /16, one map each.
+///
+/// Bounded: past `MAX_THROTTLE_TRACKED_IPS` distinct keys in one window the map
+/// stops growing and an untracked arrival reports 0, so it is judged by the
+/// wider budgets alone rather than refused for want of bookkeeping.
+fn count_arrival(arrivals: &mut HashMap<String, u32>, key: &str) -> u32 {
+    if arrivals.len() >= MAX_THROTTLE_TRACKED_IPS && !arrivals.contains_key(key) {
+        return 0;
+    }
+    let seen = arrivals.entry(key.to_string()).or_insert(0);
+    *seen = seen.saturating_add(1);
+    *seen
+}
 
 /// Whether the pending-connection cap must refuse this inbound connection.
 ///
@@ -1077,21 +1136,18 @@ impl P2P {
             ))
         })?;
 
-        let magic = self.network_magic;
-        let peers = Arc::clone(&self.peers);
-        thread::spawn(move || {
-            if let Err(e) = Self::accept_loop(listener, magic, &peers) {
-                slog_error!("p2p", "accept_loop_error", error => &e.to_string());
-            }
-        });
-
-        self.peers.bootstrap_for_network(&self.network);
-
         // Whitelist the trusted seeds so the operator's own nodes never DoS-ban
         // each other: seeds must serve an unbounded IBD backlog to a lagging peer
         // without tripping rate/lag heuristics (which otherwise stall convergence
         // for an hour-long Resource ban). Resolve each seed (IP literal or DNS)
         // to its IP(s); on resolution failure, whitelist the literal as fallback.
+        //
+        // This runs BEFORE the accept thread starts. Every inbound gate asks the
+        // whitelist whether the peer is a seed, so populating it afterwards left
+        // a startup window - as long as the blocking DNS resolution below - in
+        // which a seed dialling in was judged a stranger by all four gates. The
+        // listener is already bound, so arrivals wait in the kernel backlog
+        // instead of being mis-judged.
         for seed in crate::config::network::bootstrap_nodes::BootstrapNodes::for_network(&self.network)
         {
             match seed.to_socket_addrs() {
@@ -1103,6 +1159,16 @@ impl P2P {
                 Err(_) => crate::service::network::dos_guard::whitelist_peer(seed),
             }
         }
+
+        let magic = self.network_magic;
+        let peers = Arc::clone(&self.peers);
+        thread::spawn(move || {
+            if let Err(e) = Self::accept_loop(listener, magic, &peers) {
+                slog_error!("p2p", "accept_loop_error", error => &e.to_string());
+            }
+        });
+
+        self.peers.bootstrap_for_network(&self.network);
 
         let discovered = self.peers.discover_peers();
         if discovered.is_empty() {
@@ -1134,27 +1200,19 @@ impl P2P {
 
         // Connection throttle state
         let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut accept_count: u32 = 0;
-        let mut last_accept_sec = std::time::Instant::now();
+        let mut window_start = std::time::Instant::now();
+        let mut arrivals_total: u32 = 0;
+        let mut arrivals_per_ip: HashMap<String, u32> = HashMap::new();
+        let mut arrivals_per_subnet: HashMap<String, u32> = HashMap::new();
+        let mut throttle_logged = false;
 
         for stream in listener.incoming() {
             match stream {
                 Ok(s) => {
-                    // ── Rate limit: max N new connections per second ──
-                    if last_accept_sec.elapsed() >= Duration::from_secs(1) {
-                        accept_count = 0;
-                        last_accept_sec = std::time::Instant::now();
-                    }
-                    accept_count += 1;
-                    if accept_count > MAX_INBOUND_PER_SEC {
-                        slog_warn!("p2p", "inbound_throttle", max_per_sec => MAX_INBOUND_PER_SEC);
-                        drop(s);
-                        continue;
-                    }
-
-                    // Identity first: the pending cap below needs to know
-                    // whether this is a trusted seed before it can decide, so
-                    // the address has to be resolved ahead of the limit check.
+                    // Identity first: EVERY gate below needs to know whether
+                    // this is a trusted seed before it can decide — the arrival
+                    // throttle included, which is why the address is resolved
+                    // ahead of it.
                     let peer_addr = s
                         .peer_addr()
                         .map(|a| a.to_string())
@@ -1168,6 +1226,34 @@ impl P2P {
                     } else {
                         peer_addr.clone()
                     };
+                    // One lookup for all four gates below.
+                    let whitelisted =
+                        crate::service::network::dos_guard::is_whitelisted(&ban_key);
+
+                    // ── Arrival throttle: per source IP, global as a backstop ──
+                    if window_start.elapsed() >= Duration::from_secs(1) {
+                        window_start = std::time::Instant::now();
+                        arrivals_total = 0;
+                        arrivals_per_ip.clear();
+                        arrivals_per_subnet.clear();
+                        throttle_logged = false;
+                    }
+                    arrivals_total = arrivals_total.saturating_add(1);
+                    let per_ip = count_arrival(&mut arrivals_per_ip, &ban_key);
+                    let per_subnet = count_arrival(
+                        &mut arrivals_per_subnet,
+                        &crate::service::network::p2p::peer_diversity::subnet_16(&ban_key),
+                    );
+                    if inbound_throttle_rejects(whitelisted, per_ip, per_subnet, arrivals_total) {
+                        // One line per window: the flooder drives this path, so
+                        // logging every refusal hands it the log volume too.
+                        if !throttle_logged {
+                            throttle_logged = true;
+                            slog_warn!("p2p", "inbound_throttle", addr => &peer_addr, per_ip => per_ip, per_subnet => per_subnet, total => arrivals_total);
+                        }
+                        drop(s);
+                        continue;
+                    }
 
                     // ── Pending connection limit (atomic check+increment) ──
                     // fetch_add first so the TOCTOU race is closed (several
@@ -1184,10 +1270,7 @@ impl P2P {
                     // August to October 2026.
                     let prev_pending = pending.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     let mut slot = InboundSlot::new(&pending, ban_key.clone());
-                    if pending_cap_rejects(
-                        prev_pending,
-                        crate::service::network::dos_guard::is_whitelisted(&ban_key),
-                    ) {
+                    if pending_cap_rejects(prev_pending, whitelisted) {
                         slog_warn!("p2p", "too_many_pending_connections", pending => prev_pending);
                         drop(s);
                         continue;
@@ -1211,9 +1294,7 @@ impl P2P {
                     // register_* ALWAYS increments, so the guard owns the
                     // release from here on whichever way this goes.
                     slot.ip_registered = true;
-                    if !ip_within_cap
-                        && !crate::service::network::dos_guard::is_whitelisted(&ban_key)
-                    {
+                    if !ip_within_cap && !whitelisted {
                         slog_warn!("p2p", "rejected_too_many_per_ip", addr => &peer_addr);
                         drop(s);
                         continue;
@@ -1226,9 +1307,7 @@ impl P2P {
                     // are still counted + released symmetrically.
                     let subnet_within_cap = register_inbound_subnet(&ban_key);
                     slot.subnet_registered = true;
-                    if !subnet_within_cap
-                        && !crate::service::network::dos_guard::is_whitelisted(&ban_key)
-                    {
+                    if !subnet_within_cap && !whitelisted {
                         slog_warn!("p2p", "rejected_too_many_per_subnet", addr => &peer_addr);
                         drop(s);
                         continue;
@@ -2860,6 +2939,125 @@ mod tests {
         // left two followers unable to accept the miner for 76 days.
         assert!(!pending_cap_rejects(MAX_PENDING_CONNECTIONS, true));
         assert!(!pending_cap_rejects(usize::MAX, true));
+    }
+
+    #[test]
+    fn inbound_throttle_never_refuses_a_whitelisted_seed() {
+        // An ordinary peer is refused once its OWN arrivals pass the per-IP
+        // budget...
+        assert!(!inbound_throttle_rejects(false, MAX_INBOUND_PER_SEC, 1, 1));
+        assert!(inbound_throttle_rejects(false, MAX_INBOUND_PER_SEC + 1, 1, 1));
+        // ...or once its /16 does...
+        assert!(!inbound_throttle_rejects(
+            false,
+            1,
+            MAX_INBOUND_PER_SEC_PER_SUBNET,
+            1
+        ));
+        assert!(inbound_throttle_rejects(
+            false,
+            1,
+            MAX_INBOUND_PER_SEC_PER_SUBNET + 1,
+            1
+        ));
+        // ...or once total arrivals pass the global backstop.
+        assert!(!inbound_throttle_rejects(
+            false,
+            1,
+            1,
+            MAX_INBOUND_GLOBAL_PER_SEC
+        ));
+        assert!(inbound_throttle_rejects(
+            false,
+            1,
+            1,
+            MAX_INBOUND_GLOBAL_PER_SEC + 1
+        ));
+        // A trusted seed is refused by none of the three. This is the property
+        // whose absence let 11 connects/sec from one host lock a node out of
+        // its own seeds — the gate ran before the address was even resolved,
+        // so it could not tell a seed from a stranger.
+        assert!(!inbound_throttle_rejects(
+            true,
+            u32::MAX,
+            u32::MAX,
+            u32::MAX
+        ));
+        assert!(!inbound_throttle_rejects(
+            true,
+            MAX_INBOUND_PER_SEC + 1,
+            1,
+            1
+        ));
+    }
+
+    #[test]
+    fn one_source_cannot_spend_the_whole_inbound_budget() {
+        // The budgets must widen strictly outwards, or the narrower one is
+        // decorative and a single host (or /16) can starve every other peer.
+        const {
+            assert!(
+                MAX_INBOUND_PER_SEC < MAX_INBOUND_PER_SEC_PER_SUBNET
+                    && MAX_INBOUND_PER_SEC_PER_SUBNET < MAX_INBOUND_GLOBAL_PER_SEC,
+                "per-IP < per-/16 < global, or a single source can exhaust the budget above it"
+            )
+        };
+        // Walk one flooder's arrivals: it is cut off at its own budget, and
+        // nothing else in the window is.
+        for n in 1..=MAX_INBOUND_GLOBAL_PER_SEC {
+            assert_eq!(
+                inbound_throttle_rejects(false, n, n, n),
+                n > MAX_INBOUND_PER_SEC,
+                "arrival {} from a single source",
+                n
+            );
+        }
+        // An honest peer arriving in the same window has per_ip == 1 and is
+        // still accepted, even with the global budget fully spent by others.
+        // The old gate was one global counter, so the flooder's 11th arrival
+        // refused this peer too.
+        assert!(!inbound_throttle_rejects(
+            false,
+            1,
+            1,
+            MAX_INBOUND_GLOBAL_PER_SEC
+        ));
+        // And an attacker spread over one /16 is cut off by the subnet budget
+        // before it can spend the global one.
+        assert!(inbound_throttle_rejects(
+            false,
+            1,
+            MAX_INBOUND_PER_SEC_PER_SUBNET + 1,
+            MAX_INBOUND_PER_SEC_PER_SUBNET + 1
+        ));
+    }
+
+    #[test]
+    fn arrival_counting_is_per_source_and_bounded() {
+        let mut arrivals: HashMap<String, u32> = HashMap::new();
+        // Per source: each IP carries its own count, and the ephemeral port is
+        // not part of the key, so rolling ports shares one budget.
+        assert_eq!(count_arrival(&mut arrivals, "203.0.113.1"), 1);
+        assert_eq!(count_arrival(&mut arrivals, "203.0.113.1"), 2);
+        assert_eq!(count_arrival(&mut arrivals, "203.0.113.2"), 1);
+
+        // The map never grows past the tracking bound, however many distinct
+        // sources arrive in one window.
+        for i in 0..(MAX_THROTTLE_TRACKED_IPS as u32 + 500) {
+            count_arrival(&mut arrivals, &format!("198.51.{}.{}", i / 250, i % 250));
+        }
+        assert_eq!(
+            arrivals.len(),
+            MAX_THROTTLE_TRACKED_IPS,
+            "the per-window map must stay bounded under an IP-rolling flood"
+        );
+
+        // A source the full table cannot track reports 0, so the global
+        // backstop judges it. A full table must never be what locks an honest
+        // peer out.
+        let untracked = count_arrival(&mut arrivals, "192.0.2.254");
+        assert_eq!(untracked, 0);
+        assert!(!inbound_throttle_rejects(false, untracked, 1, 1));
     }
 
     #[test]
