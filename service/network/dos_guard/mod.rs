@@ -3,6 +3,7 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::domain::types::hash::log_prefix;
 use crate::errors::NetworkError;
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
@@ -83,6 +84,16 @@ pub const BAN_SCORE_MINOR: u64 = 10;
 pub const BAN_DURATION_SECS: u64 = 86_400;
 pub const BAN_DURATION_SEVERE: u64 = 604_800;
 pub const BAN_DECAY_PER_MINUTE: u64 = 1;
+
+/// Maximum bytes retained in a ban record's accumulated reason.
+///
+/// `reason` is only cleared when a ban EXPIRES, and a peer can offend
+/// indefinitely without ever being banned by staying under
+/// BAN_SCORE_AUTOBAN at a rate the category decay absorbs. An uncapped
+/// `push_str` therefore grows for the lifetime of the process, per peer key,
+/// and the string is cloned into `BanInfo` and logged. The newest evidence is
+/// the useful part, so the cap keeps the tail.
+pub const MAX_BAN_REASON_LEN: usize = 512;
 
 // ── Offense categories ─────────────────────────────────────────────────
 /// Categorise offenses so decay, ban duration, and repeat-offender
@@ -274,10 +285,7 @@ impl BanRecord {
         let effective = points.saturating_mul(multiplier);
 
         self.score = self.score.saturating_add(effective);
-        if !self.reason.is_empty() {
-            self.reason.push_str("; ");
-        }
-        self.reason.push_str(reason);
+        self.append_reason(reason);
 
         if self.score >= BAN_SCORE_AUTOBAN && !self.banned {
             self.banned = true;
@@ -286,6 +294,24 @@ impl BanRecord {
             return true;
         }
         false
+    }
+
+    /// Append an offense reason, keeping the newest evidence and bounding the
+    /// total at MAX_BAN_REASON_LEN. Truncation is done on a char boundary in
+    /// both directions, so a multi-byte reason can never panic here.
+    fn append_reason(&mut self, reason: &str) {
+        let piece = log_prefix(reason, MAX_BAN_REASON_LEN);
+        if !self.reason.is_empty() {
+            self.reason.push_str("; ");
+        }
+        self.reason.push_str(piece);
+        if self.reason.len() > MAX_BAN_REASON_LEN {
+            let mut cut = self.reason.len() - MAX_BAN_REASON_LEN;
+            while cut < self.reason.len() && !self.reason.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.reason.drain(..cut);
+        }
     }
 
     /// Compute ban duration based on category severity and repeat count.
@@ -531,7 +557,7 @@ impl DosGuard {
         let rec = bans.entry(peer.to_string()).or_insert_with(BanRecord::new);
         rec.banned = true;
         rec.ban_until = unix_now() + duration_secs;
-        rec.reason = reason.to_string();
+        rec.reason = log_prefix(reason, MAX_BAN_REASON_LEN).to_string();
     }
 
     pub fn unban_peer(&self, peer: &str) {
@@ -671,6 +697,60 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ban_reason_stays_bounded_under_sustained_offenses() {
+        // The leak: `reason` is cleared only when a ban EXPIRES, and a peer
+        // can offend forever without ever being banned by keeping its score
+        // under BAN_SCORE_AUTOBAN at a rate the decay absorbs. Before the cap
+        // this string grew for the lifetime of the process, per peer key.
+        let g = DosGuard::new();
+        for i in 0..5_000 {
+            g.add_ban_score_cat(
+                "noisy",
+                0,
+                &format!("offense number {}", i),
+                BanCategory::Resource,
+            );
+        }
+        let info = g.get_ban_info("noisy").expect("record exists");
+        assert!(
+            info.reason.len() <= MAX_BAN_REASON_LEN,
+            "reason grew to {} bytes, cap is {}",
+            info.reason.len(),
+            MAX_BAN_REASON_LEN
+        );
+        assert!(
+            info.reason.ends_with("offense number 4999"),
+            "the newest evidence must survive truncation: {:?}",
+            info.reason
+        );
+    }
+
+    #[test]
+    fn ban_reason_cap_is_char_boundary_safe() {
+        // Truncating a multi-byte reason by byte offset would panic on a
+        // char boundary; both directions go through the boundary walk.
+        let g = DosGuard::new();
+        for _ in 0..200 {
+            g.add_ban_score_cat("unicode", 0, "رسالة غير صالحة", BanCategory::Malformed);
+        }
+        g.add_ban_score_cat("unicode", 0, &"ع".repeat(600), BanCategory::Malformed);
+        let info = g.get_ban_info("unicode").expect("record exists");
+        assert!(info.reason.len() <= MAX_BAN_REASON_LEN);
+    }
+
+    #[test]
+    fn manual_ban_reason_is_bounded() {
+        let g = DosGuard::new();
+        g.ban_peer("evil", 9999, &"x".repeat(MAX_BAN_REASON_LEN * 4));
+        let info = g.get_ban_info("evil").expect("record exists");
+        assert!(
+            info.reason.len() <= MAX_BAN_REASON_LEN,
+            "ban_peer stored {} bytes",
+            info.reason.len()
+        );
+    }
 
     #[test]
     fn allow_normal_message() {
