@@ -1851,6 +1851,12 @@ impl ExecutionEnvironment {
 
                 // ── Context ──────────────────────────────────
                 OpCode::CALLER => {
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     // Push the caller's 20-byte canonical body,
                     // right-aligned in a 32-byte U256 word (EVM layout).
                     // The frame-entry pre-registration guarantees that a
@@ -1860,9 +1866,21 @@ impl ExecutionEnvironment {
                     stack.push(VmAddressBody::from_any(&ctx.caller).to_u256());
                 }
                 OpCode::CALLVALUE => {
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     stack.push(U256::from_u64(ctx.value));
                 }
                 OpCode::TIMESTAMP => {
+                    if stack.len() >= MAX_STACK_SIZE {
+                        self.state.rollback(snapshot).ok();
+                        return CallOutcome::Failure {
+                            gas_used: gas.gas_used(),
+                        };
+                    }
                     stack.push(U256::from_u64(self.block_ctx.timestamp));
                 }
                 OpCode::BLOCKHASH => {
@@ -6337,5 +6355,98 @@ mod tests {
             resolved, eoa_addr,
             "resolve_address must probe the 't' subtype for loaded EOAs"
         );
+    }
+
+    /// Build a frame that runs `byte` back to back `count` times and
+    /// return the outcome. `gas_limit` is generous so the only thing
+    /// that can stop the run is an opcode-level guard.
+    fn run_repeated_opcode(byte: u8, count: usize) -> CallOutcome {
+        let mut env = make_env();
+        let code: Vec<u8> = vec![byte; count];
+        env.state.set_code("c", code).unwrap();
+        let ctx = CallContext {
+            address: "c".into(),
+            code_address: "c".into(),
+            caller: "u".into(),
+            value: 0,
+            gas_limit: 1_000_000,
+            calldata: vec![],
+            is_static: false,
+            depth: 0,
+            is_delegate: false,
+        };
+        env.execute_frame(&ctx)
+    }
+
+    #[test]
+    fn every_zero_pop_push_opcode_is_stack_bounded() {
+        // DoS regression, derived from the spec table rather than a
+        // hand-written list so a newly added growth opcode cannot slip
+        // through unguarded. Any opcode that pops nothing and pushes one
+        // word grows the stack by one per execution and costs only its
+        // base gas, so without a MAX_STACK_SIZE guard a single contract
+        // call turns its whole gas budget into resident memory
+        // (10M gas / 2 gas per push x 32 bytes per U256 = ~160 MB, and a
+        // tx may declare up to MAX_BLOCK_GAS).
+        use crate::runtime::vm::core::v1_spec::V1_OPCODES;
+
+        let growth: Vec<(u8, &str)> = V1_OPCODES
+            .iter()
+            .filter(|(_, name, _, pop, push)| {
+                *pop == 0 && *push == 1 && !name.starts_with("PUSH")
+            })
+            .map(|(byte, name, _, _, _)| (*byte, *name))
+            .collect();
+
+        // Guard against the filter silently matching nothing.
+        let names: Vec<&str> = growth.iter().map(|(_, n)| *n).collect();
+        for required in ["CALLER", "CALLVALUE", "TIMESTAMP"] {
+            assert!(
+                names.contains(&required),
+                "spec filter must still cover {}: {:?}",
+                required,
+                names
+            );
+        }
+        assert!(
+            growth.len() >= 10,
+            "expected the zero-pop/one-push class to be non-trivial, got {:?}",
+            names
+        );
+
+        for (byte, name) in growth {
+            let outcome = run_repeated_opcode(byte, MAX_STACK_SIZE + 64);
+            assert!(
+                !matches!(outcome, CallOutcome::Success { .. }),
+                "{} (0x{:02X}) ran {} times to completion: unguarded stack growth",
+                name,
+                byte,
+                MAX_STACK_SIZE + 64
+            );
+        }
+    }
+
+    #[test]
+    fn caller_callvalue_timestamp_fail_at_the_stack_limit_not_earlier() {
+        // The companion to the class test above: prove the failure comes
+        // from the stack guard at the limit, not from some unrelated
+        // early error, by checking the frame actually paid for about
+        // MAX_STACK_SIZE opcodes before stopping.
+        for (byte, name) in [(0x70u8, "CALLER"), (0x71, "CALLVALUE"), (0x72, "TIMESTAMP")] {
+            let outcome = run_repeated_opcode(byte, MAX_STACK_SIZE + 64);
+            match outcome {
+                CallOutcome::Failure { gas_used } => {
+                    let floor = 2 * MAX_STACK_SIZE as u64;
+                    assert!(
+                        gas_used >= floor,
+                        "{} failed after only {} gas; expected >= {} (guard at the limit)",
+                        name,
+                        gas_used,
+                        floor
+                    );
+                }
+                other => panic!("{} must fail on stack overflow, got {:?}", name, other),
+            }
+        }
     }
 }
