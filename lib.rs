@@ -505,6 +505,7 @@ pub mod telemetry {
     pub mod tracing {
         pub mod tracing;
     }
+    pub mod deadlock_watch;
     pub mod diagnostics;
 }
 
