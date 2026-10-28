@@ -181,6 +181,67 @@ static RECEIVED_ADDRS: Lazy<Arc<PlMutex<Vec<String>>>> =
 static INBOUND_CONN_PER_IP: Lazy<Arc<PlMutex<HashMap<String, u32>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(HashMap::new())));
 
+/// Whether the pending-connection cap must refuse this inbound connection.
+///
+/// A whitelisted seed is COUNTED against the cap but never refused by it. The
+/// per-IP and per-/16 caps already work this way; this one did not, and it
+/// runs ahead of them, so a saturated counter used to lock a follower out of
+/// its own seeds permanently.
+fn pending_cap_rejects(prev_pending: usize, whitelisted: bool) -> bool {
+    prev_pending >= MAX_PENDING_CONNECTIONS && !whitelisted
+}
+
+/// Releases an accepted inbound connection's accounting on EVERY exit path,
+/// including an unwinding panic.
+///
+/// The three counters — the pending-connection slot, the per-IP cap and the
+/// per-/16 cap — used to be decremented by plain statements placed after
+/// `handle_peer_connection` returned. Any path that never returned skipped all
+/// three, and a leaked `pending` slot is unrecoverable: once
+/// `MAX_PENDING_CONNECTIONS` of them accumulate, the accept gate rejects every
+/// inbound connection for the rest of the process's life. That is not
+/// theoretical — on 2026-10-28 two testnet followers were found frozen since
+/// August with `pending` reading 64 while the kernel reported 2 live sockets,
+/// so neither could accept the miner and neither had synced in 76 days.
+///
+/// Honest scope: a guard runs on scope exit, so it fixes the panic path and
+/// any early return. It CANNOT release a thread that is parked forever (the
+/// followers above were blocked on a lock, not panicking). That is why the
+/// pending cap below must also let a whitelisted seed through — the guard
+/// protects the accounting, the whitelist protects liveness.
+struct InboundSlot {
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+    ip_key: String,
+    ip_registered: bool,
+    subnet_registered: bool,
+}
+
+impl InboundSlot {
+    /// Takes ownership of one already-incremented `pending` slot.
+    fn new(pending: &Arc<std::sync::atomic::AtomicUsize>, ip_key: String) -> Self {
+        Self {
+            pending: Arc::clone(pending),
+            ip_key,
+            ip_registered: false,
+            subnet_registered: false,
+        }
+    }
+}
+
+impl Drop for InboundSlot {
+    fn drop(&mut self) {
+        // Reverse registration order, then the slot itself.
+        if self.subnet_registered {
+            release_inbound_subnet(&self.ip_key);
+        }
+        if self.ip_registered {
+            release_inbound_ip(&self.ip_key);
+        }
+        self.pending
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Register one more inbound connection for `ip` and report whether the IP is
 /// still WITHIN `MAX_PEERS_PER_IP`. ALWAYS increments (pair with exactly one
 /// `release_inbound_ip`), so a caller that rejects on `false` can release
@@ -1076,18 +1137,9 @@ impl P2P {
                         continue;
                     }
 
-                    // ── Pending connection limit (atomic check+increment) ──
-                    // Use fetch_add to atomically increment, then rollback if over limit.
-                    // This closes the TOCTOU race where multiple threads pass the check
-                    // before any of them increment.
-                    let prev_pending = pending.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                    if prev_pending >= MAX_PENDING_CONNECTIONS {
-                        pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        slog_warn!("p2p", "too_many_pending_connections", pending => prev_pending);
-                        drop(s);
-                        continue;
-                    }
-
+                    // Identity first: the pending cap below needs to know
+                    // whether this is a trusted seed before it can decide, so
+                    // the address has to be resolved ahead of the limit check.
                     let peer_addr = s
                         .peer_addr()
                         .map(|a| a.to_string())
@@ -1102,9 +1154,32 @@ impl P2P {
                         peer_addr.clone()
                     };
 
+                    // ── Pending connection limit (atomic check+increment) ──
+                    // fetch_add first so the TOCTOU race is closed (several
+                    // threads can no longer all pass a bare check), then hand
+                    // the slot to an `InboundSlot` guard that releases it on
+                    // every exit path below, including an unwinding panic.
+                    //
+                    // A whitelisted seed is COUNTED but never REJECTED, exactly
+                    // like the per-IP and per-/16 caps further down. Without
+                    // this the cap was the one gate with no bypass, and it sits
+                    // ahead of the others — so once 64 slots were held a
+                    // follower stopped accepting its own seeds and could never
+                    // sync again. Two testnet followers sat that way from
+                    // August to October 2026.
+                    let prev_pending = pending.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let mut slot = InboundSlot::new(&pending, ban_key.clone());
+                    if pending_cap_rejects(
+                        prev_pending,
+                        crate::service::network::dos_guard::is_whitelisted(&ban_key),
+                    ) {
+                        slog_warn!("p2p", "too_many_pending_connections", pending => prev_pending);
+                        drop(s);
+                        continue;
+                    }
+
                     // ── Check if peer is banned ──
                     if DOS_GUARD.is_banned(&ban_key) {
-                        pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         slog_warn!("p2p", "rejected_banned_peer", addr => &peer_addr);
                         drop(s);
                         continue;
@@ -1117,11 +1192,13 @@ impl P2P {
                     // isolated from its own seeds once stale/half-open slots
                     // fill, stalling sync) but are still counted + released
                     // symmetrically, exactly like the per-/16 cap below.
-                    if !register_inbound_ip(&ban_key)
+                    let ip_within_cap = register_inbound_ip(&ban_key);
+                    // register_* ALWAYS increments, so the guard owns the
+                    // release from here on whichever way this goes.
+                    slot.ip_registered = true;
+                    if !ip_within_cap
                         && !crate::service::network::dos_guard::is_whitelisted(&ban_key)
                     {
-                        release_inbound_ip(&ban_key);
-                        pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         slog_warn!("p2p", "rejected_too_many_per_ip", addr => &peer_addr);
                         drop(s);
                         continue;
@@ -1132,12 +1209,11 @@ impl P2P {
                     // /16 opens many distinct IPs. Whitelisted trusted seeds
                     // bypass the cap (a node must always accept its seeds); they
                     // are still counted + released symmetrically.
-                    if !register_inbound_subnet(&ban_key)
+                    let subnet_within_cap = register_inbound_subnet(&ban_key);
+                    slot.subnet_registered = true;
+                    if !subnet_within_cap
                         && !crate::service::network::dos_guard::is_whitelisted(&ban_key)
                     {
-                        release_inbound_subnet(&ban_key);
-                        release_inbound_ip(&ban_key);
-                        pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         slog_warn!("p2p", "rejected_too_many_per_subnet", addr => &peer_addr);
                         drop(s);
                         continue;
@@ -1146,14 +1222,13 @@ impl P2P {
                     slog_info!("p2p", "inbound_connection", addr => &peer_addr);
                     // Query fresh peer list on each connection (fix stale snapshot)
                     let peers_snapshot = peer_manager.get_addr_list_limited(100);
-                    let pending_clone = Arc::clone(&pending);
-                    let ip_key = ban_key.clone();
 
                     thread::spawn(move || {
+                        // `slot` is moved in, so the pending slot and both
+                        // anti-eclipse registrations are released when this
+                        // closure unwinds as well as when it returns.
+                        let _slot = slot;
                         let result = Self::handle_peer_connection(s, false, magic, peers_snapshot);
-                        pending_clone.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        release_inbound_ip(&ip_key);
-                        release_inbound_subnet(&ip_key);
                         if let Err(e) = result {
                             slog_error!("p2p", "peer_connection_error", addr => &peer_addr, error => &e.to_string());
                         }
@@ -2659,6 +2734,57 @@ impl P2P {
 
 #[cfg(test)]
 mod tests {
+    // ── F12: the inbound accounting must survive every exit path ──────────
+    #[test]
+    fn inbound_slot_releases_the_pending_count_when_the_thread_panics() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // The real leak: the old code decremented with a plain statement placed
+        // AFTER handle_peer_connection returned, so an unwinding panic skipped
+        // it and the slot was lost for the life of the process.
+        let pending = Arc::new(AtomicUsize::new(0));
+        pending.fetch_add(1, Ordering::AcqRel);
+        let slot = InboundSlot::new(&pending, "203.0.113.7".to_string());
+        assert_eq!(pending.load(Ordering::SeqCst), 1);
+
+        let joined = thread::spawn(move || {
+            let _slot = slot;
+            panic!("connection handler blew up");
+        })
+        .join();
+        assert!(joined.is_err(), "the thread must actually have panicked");
+        assert_eq!(
+            pending.load(Ordering::SeqCst),
+            0,
+            "a panicking connection thread must still release its pending slot"
+        );
+    }
+
+    #[test]
+    fn inbound_slot_releases_on_an_ordinary_early_return() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pending = Arc::new(AtomicUsize::new(0));
+        pending.fetch_add(1, Ordering::AcqRel);
+        {
+            let _slot = InboundSlot::new(&pending, "203.0.113.8".to_string());
+            assert_eq!(pending.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(pending.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn pending_cap_never_refuses_a_whitelisted_seed() {
+        // Below the cap nobody is refused.
+        assert!(!pending_cap_rejects(0, false));
+        assert!(!pending_cap_rejects(MAX_PENDING_CONNECTIONS - 1, false));
+        // At and above it, an ordinary peer is refused...
+        assert!(pending_cap_rejects(MAX_PENDING_CONNECTIONS, false));
+        assert!(pending_cap_rejects(MAX_PENDING_CONNECTIONS + 10_000, false));
+        // ...but a trusted seed never is. This is the property whose absence
+        // left two followers unable to accept the miner for 76 days.
+        assert!(!pending_cap_rejects(MAX_PENDING_CONNECTIONS, true));
+        assert!(!pending_cap_rejects(usize::MAX, true));
+    }
+
     use super::*;
     use crate::service::network::p2p::peer_manager::MAX_PEERS_PER_IP;
 
