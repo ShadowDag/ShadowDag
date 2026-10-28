@@ -26,7 +26,7 @@ use crate::service::network::p2p::protocol::{
     build_version_payload, validate_addr_list, validate_hash_hex, validate_header,
     validate_headers_list, validate_inv_items, validate_payload_checksum, validate_payload_size,
     validate_reject, CommandId, ProtocolSession, VersionPayload, WireHeader, DEFAULT_BPS,
-    MAX_MESSAGE_SIZE, WIRE_HEADER_SIZE,
+    HANDSHAKE_TIMEOUT_SECS, MAX_MESSAGE_SIZE, PUZZLE_TIMEOUT_SECS, WIRE_HEADER_SIZE,
 };
 use crate::{slog_debug, slog_error, slog_info, slog_warn};
 
@@ -57,6 +57,27 @@ const MAX_INBOUND_GLOBAL_PER_SEC: u32 = MAX_PENDING_CONNECTIONS as u32;
 /// Distinct keys (source IPs, and separately /16s) tracked within one throttle
 /// window, bounding each per-window map against a flood that rolls addresses.
 const MAX_THROTTLE_TRACKED_IPS: usize = 4_096;
+/// TOTAL wall-clock budget, from the moment the connection is handled, for a
+/// peer to finish its handshake.
+///
+/// Every pre-handshake read was already bounded by the 100 ms `SO_RCVTIMEO`,
+/// but a per-recv timeout is not a deadline: `read_exact` fails only when ONE
+/// recv returns nothing, so a byte every 99 ms kept a stranger looping inside a
+/// single read indefinitely — holding an inbound slot, a `MAX_PEERS_PER_IP`
+/// registration, a `MAX_INBOUND_PER_SUBNET` registration and a blocked OS
+/// thread for about 10 B/s.
+///
+/// One second past the longest handshake the protocol itself permits: it
+/// measures `PUZZLE_TIMEOUT_SECS` and `HANDSHAKE_TIMEOUT_SECS` from
+/// `connected_at` in whole seconds and fires on `elapsed >`, so this deadline
+/// can never cut a handshake the state machine would still have allowed. The
+/// assert keeps that true if either protocol constant moves.
+const PRE_HANDSHAKE_DEADLINE_SECS: u64 = PUZZLE_TIMEOUT_SECS + 1;
+const _: () = assert!(
+    PRE_HANDSHAKE_DEADLINE_SECS > PUZZLE_TIMEOUT_SECS
+        && PRE_HANDSHAKE_DEADLINE_SECS > HANDSHAKE_TIMEOUT_SECS,
+    "the read deadline must outlast every handshake the protocol permits"
+);
 
 pub const MAX_PEERS: usize = NetworkParams::MAX_PEERS;
 pub const MIN_PEERS: usize = NetworkParams::MIN_PEERS;
@@ -258,6 +279,105 @@ fn pending_cap_rejects(prev_pending: usize, whitelisted: bool) -> bool {
 /// and only for a challenge of the exact shape `generate_challenge` emits.
 fn should_solve_puzzle(is_outbound: bool, puzzles_solved: u32, challenge: &str) -> bool {
     is_outbound && puzzles_solved == 0 && ConnectionPuzzle::is_well_formed(challenge)
+}
+
+/// Error text the deadline reader reports once the budget is spent.
+///
+/// Deliberately NOT one of the substrings `is_transient_read_timeout` matches:
+/// a spent deadline is terminal, while an `SO_RCVTIMEO` expiry is the ordinary
+/// idle poll that drives keepalive and the outbound flush. Classifying the
+/// deadline as transient would spin the connection loop on an error that can
+/// never clear instead of ending the connection.
+const DEADLINE_ERROR_TEXT: &str = "pre-handshake read deadline exceeded";
+
+/// A `Read` that refuses to make progress once a wall-clock deadline passes.
+///
+/// Returning an error from `read` (rather than, say, shutting the socket down
+/// from a reaper) unwinds `read_exact` -> `read_message` ->
+/// `handle_peer_connection` through the ordinary error path, so
+/// `InboundSlot::drop` releases the pending slot and both anti-eclipse
+/// registrations on the way out.
+///
+/// `disarm` drops the deadline once the handshake completes: an established
+/// peer has solved the puzzle and holds a live slot that `MAX_PEERS_PER_IP` and
+/// `MAX_INBOUND_PER_SUBNET` already bound, and a total deadline there would cut
+/// an honest follower's slow bulk transfer during IBD.
+struct DeadlineReader<R> {
+    inner: R,
+    deadline: Option<Instant>,
+}
+
+impl<R> DeadlineReader<R> {
+    fn new(inner: R, deadline: Instant) -> Self {
+        Self {
+            inner,
+            deadline: Some(deadline),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.deadline = None;
+    }
+}
+
+impl<R: Read> Read for DeadlineReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    DEADLINE_ERROR_TEXT,
+                ));
+            }
+        }
+        self.inner.read(buf)
+    }
+}
+
+/// Whether a read error is the ordinary idle poll expiring, rather than a
+/// condition that ends the connection.
+///
+/// One classifier for both read sites. They carried two hand-written copies of
+/// this list and the pre-handshake one was missing Windows' `WSAETIMEDOUT`
+/// (10060) — which that platform returns for an `SO_RCVTIMEO` expiry, as the
+/// main loop's own copy documents — so on Windows a peer that had not sent its
+/// puzzle challenge within 100 ms was dropped instead of treated as legacy.
+fn is_transient_read_timeout(msg_lowercase: &str) -> bool {
+    msg_lowercase.contains("timed out")
+        || msg_lowercase.contains("would block")
+        || msg_lowercase.contains("wouldblock")
+        || msg_lowercase.contains("temporarily unavailable")
+        || msg_lowercase.contains("os error 11")
+        || msg_lowercase.contains("os error 10035")
+        || msg_lowercase.contains("os error 10060")
+        || msg_lowercase.contains("did not properly respond")
+}
+
+/// The ban category a protocol ban score implies, as the post-read command
+/// check has always chosen it.
+fn category_for_score(ban_score: u64) -> BanCategory {
+    if ban_score >= 50 {
+        BanCategory::Malicious
+    } else {
+        BanCategory::Malformed
+    }
+}
+
+/// Why a read ended without yielding a message.
+enum ReadStop {
+    /// IO, framing, checksum or deserialization failure — the path every read
+    /// error took before, classified at the call site by
+    /// `is_transient_read_timeout`.
+    Failed(NetworkError),
+    /// The command DECLARED in the 13-byte header is not allowed in the
+    /// current handshake state, so its payload was never sized, allocated or
+    /// read. Carries the state machine's own ban score, which the call site
+    /// applies exactly as the post-read check did.
+    Premature {
+        cmd: CommandId,
+        reason: String,
+        ban_score: u64,
+    },
 }
 
 /// Releases an accepted inbound connection's accounting on EVERY exit path,
@@ -1370,7 +1490,12 @@ impl P2P {
             acks.entry(peer_str.clone()).or_insert_with(current_outbound_seq);
         }
 
-        let mut reader = BufReader::new(&stream);
+        // The read timeout above bounds one recv; this bounds the whole
+        // handshake. Disarmed in the main loop the moment it completes.
+        let mut reader = BufReader::new(DeadlineReader::new(
+            &stream,
+            Instant::now() + Duration::from_secs(PRE_HANDSHAKE_DEADLINE_SECS),
+        ));
         let mut writer = BufWriter::new(&stream);
 
         // Session state: ProtocolSession + connection-level fields
@@ -1395,7 +1520,10 @@ impl P2P {
             )?;
             session.record_bytes_sent(bytes);
 
-            match Self::read_message(&mut reader, magic) {
+            // Bound to a local first: the arms below mutate the session, so
+            // the state borrow must end here.
+            let first = Self::read_message(&mut reader, magic, &session.protocol);
+            match first {
                 Ok((
                     P2PMessage::PuzzleSolution {
                         challenge: c,
@@ -1452,7 +1580,33 @@ impl P2P {
                         peer_str, cmd
                     )));
                 }
-                Err(e) => {
+                Err(ReadStop::Premature {
+                    cmd,
+                    reason,
+                    ban_score,
+                }) => {
+                    // Refused on the 13-byte header. This is the point the
+                    // attack was cheapest: nothing has been solved or paid for
+                    // yet, and the old order read the payload first, so a
+                    // stranger could declare Block and have us allocate 4 MiB.
+                    DOS_GUARD.add_ban_score_cat(
+                        &peer_str,
+                        ban_score,
+                        &reason,
+                        category_for_score(ban_score),
+                    );
+                    DOS_GUARD.add_ban_score_cat(
+                        &peer_ip,
+                        ban_score,
+                        &reason,
+                        category_for_score(ban_score),
+                    );
+                    return Err(NetworkError::ConnectionFailed(format!(
+                        "{} not allowed before the handshake with {}: {}",
+                        cmd, peer_str, reason
+                    )));
+                }
+                Err(ReadStop::Failed(e)) => {
                     return Err(NetworkError::ConnectionFailed(format!(
                         "Puzzle exchange failed with {}: {}",
                         peer_str, e
@@ -1461,7 +1615,8 @@ impl P2P {
             }
         } else {
             // Outbound: wait for puzzle challenge, solve it, send solution
-            match Self::read_message(&mut reader, magic) {
+            let first = Self::read_message(&mut reader, magic, &session.protocol);
+            match first {
                 Ok((P2PMessage::PuzzleChallenge { challenge }, _, sz)) => {
                     session.record_bytes_received(sz as u64);
                     // Check the shape BEFORE `received_puzzle_challenge` stores
@@ -1555,15 +1710,30 @@ impl P2P {
                     // Dispatching before the handshake (Version/VerAck) completes
                     // violates the protocol state machine.
                 }
-                Err(e) => {
-                    let emsg = e.to_string().to_lowercase();
-                    if !emsg.contains("timed out")
-                        && !emsg.contains("would block")
-                        && !emsg.contains("wouldblock")
-                        && !emsg.contains("temporarily unavailable")
-                        && !emsg.contains("os error 11")
-                        && !emsg.contains("os error 10035")
-                    {
+                Err(ReadStop::Premature {
+                    cmd,
+                    reason,
+                    ban_score,
+                }) => {
+                    DOS_GUARD.add_ban_score_cat(
+                        &peer_str,
+                        ban_score,
+                        &reason,
+                        category_for_score(ban_score),
+                    );
+                    DOS_GUARD.add_ban_score_cat(
+                        &peer_ip,
+                        ban_score,
+                        &reason,
+                        category_for_score(ban_score),
+                    );
+                    return Err(NetworkError::ConnectionFailed(format!(
+                        "{} not allowed before the handshake with {}: {}",
+                        cmd, peer_str, reason
+                    )));
+                }
+                Err(ReadStop::Failed(e)) => {
+                    if !is_transient_read_timeout(&e.to_string().to_lowercase()) {
                         return Err(e);
                     }
                     // Timeout waiting for puzzle challenge — peer might be slow or legacy.
@@ -1585,7 +1755,8 @@ impl P2P {
 
         // ── Main message loop ──────────────────────────────────────────────
         loop {
-            match Self::read_message(&mut reader, magic) {
+            let next = Self::read_message(&mut reader, magic, &session.protocol);
+            match next {
                 Ok((msg, cmd, bytes_read)) => {
                     session.record_bytes_received(bytes_read as u64);
                     session.protocol.msgs_received += 1;
@@ -1609,34 +1780,9 @@ impl P2P {
                         break;
                     }
 
-                    // Protocol state machine: is this command allowed right now?
-                    if let Err(pe) = session.protocol.check_command_allowed(cmd) {
-                        DOS_GUARD.add_ban_score_cat(
-                            &peer_str,
-                            pe.ban_score as u64,
-                            &pe.message,
-                            if pe.ban_score >= 50 {
-                                BanCategory::Malicious
-                            } else {
-                                BanCategory::Malformed
-                            },
-                        );
-                        DOS_GUARD.add_ban_score_cat(
-                            &peer_ip,
-                            pe.ban_score as u64,
-                            &pe.message,
-                            if pe.ban_score >= 50 {
-                                BanCategory::Malicious
-                            } else {
-                                BanCategory::Malformed
-                            },
-                        );
-                        slog_warn!("p2p", "command_rejected", addr => &peer_str, command => &cmd.to_string(), state => &session.protocol.state.to_string(), ban_score => pe.ban_score);
-                        if pe.ban_score >= 50 {
-                            break;
-                        }
-                        continue;
-                    }
+                    // The protocol state machine vetted this command inside
+                    // read_message, on the header, before its payload was
+                    // allocated — see ReadStop::Premature below.
 
                     // Lifecycle filter: restricted peers limited to Ping/Pong/Reject
                     if let Err(pe) = session.protocol.check_lifecycle_allowed(cmd) {
@@ -1685,6 +1831,13 @@ impl P2P {
                         break;
                     }
 
+                    // The handshake ends inside dispatch, when VerAck lands.
+                    // Drop the deadline there so it can never cut an
+                    // established peer's slow bulk transfer.
+                    if session.is_established() {
+                        reader.get_mut().disarm();
+                    }
+
                     // Flush broadcast + targeted outbound messages
                     if !Self::flush_outbound(&mut writer, &peer_str, &mut session, magic) {
                         let _ = Self::write_message(
@@ -1698,21 +1851,33 @@ impl P2P {
                         break;
                     }
                 }
-                Err(e) => {
-                    let msg = e.to_string().to_lowercase();
-                    let is_timeout = msg.contains("timed out")
-                        || msg.contains("would block")
-                        || msg.contains("wouldblock")
-                        || msg.contains("temporarily unavailable")
-                        || msg.contains("os error 11")
-                        || msg.contains("os error 10035")
-                        // Windows returns WSAETIMEDOUT (10060) for an SO_RCVTIMEO
-                        // read-timeout expiry, not EWOULDBLOCK — without this a
-                        // Windows node drops every peer every 2s (the read poll
-                        // interval). Real dead connections are still caught by the
-                        // pong timeout below.
-                        || msg.contains("os error 10060")
-                        || msg.contains("did not properly respond");
+                Err(ReadStop::Premature {
+                    cmd,
+                    reason,
+                    ban_score,
+                }) => {
+                    // Same scoring the post-read check applied, now reached
+                    // without allocating the payload. We declined to consume
+                    // that payload, so the stream can no longer be framed and
+                    // the connection ends here — the only sub-50 rejection is
+                    // the Disconnecting state, which is already ending.
+                    DOS_GUARD.add_ban_score_cat(
+                        &peer_str,
+                        ban_score,
+                        &reason,
+                        category_for_score(ban_score),
+                    );
+                    DOS_GUARD.add_ban_score_cat(
+                        &peer_ip,
+                        ban_score,
+                        &reason,
+                        category_for_score(ban_score),
+                    );
+                    slog_warn!("p2p", "command_rejected", addr => &peer_str, command => &cmd.to_string(), state => &session.protocol.state.to_string(), ban_score => ban_score);
+                    break;
+                }
+                Err(ReadStop::Failed(e)) => {
+                    let is_timeout = is_transient_read_timeout(&e.to_string().to_lowercase());
 
                     if is_timeout {
                         // Keepalive ping
@@ -1965,47 +2130,72 @@ impl P2P {
     ///   2. Validate magic (wrong network → reject immediately)
     ///   3. Validate command_id (unknown → reject before reading payload)
     ///   4. Validate payload_len (oversize → reject before allocating)
-    ///   5. Read payload bytes
-    ///   6. Validate checksum (corrupted/tampered → reject before deserializing)
-    ///   7. Validate per-command payload size bounds
-    ///   8. Deserialize payload (only after all structural checks pass)
+    ///   5. Gate the DECLARED command against the handshake state
+    ///   6. Validate per-command payload size bounds
+    ///   7. Read payload bytes
+    ///   8. Validate checksum (corrupted/tampered → reject before deserializing)
+    ///   9. Deserialize payload (only after all structural checks pass)
     fn read_message(
-        reader: &mut BufReader<&TcpStream>,
+        reader: &mut BufReader<DeadlineReader<&TcpStream>>,
         magic: [u8; 4],
-    ) -> Result<(P2PMessage, CommandId, usize), NetworkError> {
+        protocol: &ProtocolSession,
+    ) -> Result<(P2PMessage, CommandId, usize), ReadStop> {
         // 1. Read wire header (13 bytes)
         let mut hdr_buf = [0u8; WIRE_HEADER_SIZE];
         reader
             .read_exact(&mut hdr_buf)
-            .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| ReadStop::Failed(NetworkError::ConnectionFailed(e.to_string())))?;
         let header = WireHeader::decode(&hdr_buf);
 
         // 2-4. Validate header: magic, command_id, payload_len
-        let cmd = validate_header(&header, magic)
-            .map_err(|pe| NetworkError::Serialization(format!("[Protocol] {}", pe)))?;
+        let cmd = validate_header(&header, magic).map_err(|pe| {
+            ReadStop::Failed(NetworkError::Serialization(format!("[Protocol] {}", pe)))
+        })?;
 
-        // 5. Validate per-command payload size bounds BEFORE allocation/read.
+        // 5. Gate the DECLARED command against the handshake state, BEFORE the
+        // payload is sized, allocated or read. This check used to run after
+        // the payload had been read, so a peer that had not solved the puzzle
+        // could declare Block and have us allocate and read MAX_MESSAGE_SIZE
+        // for free; the size bound below is per-command, so it bounded the
+        // claim, not what the state permits. Only Version, VerAck, Reject and
+        // the two puzzle commands pass here before the handshake, which caps a
+        // stranger's allocation at Version's 1 KiB.
+        if let Err(pe) = protocol.check_command_allowed(cmd) {
+            let ban_score = pe.ban_score as u64;
+            return Err(ReadStop::Premature {
+                cmd,
+                reason: pe.message,
+                ban_score,
+            });
+        }
+
+        // 6. Validate per-command payload size bounds BEFORE allocation/read.
         // This prevents adversaries from forcing large allocations for commands
         // that should have tiny payloads (e.g. Ping/Pong).
         let payload_len = header.payload_len as usize;
-        validate_payload_size(cmd, payload_len)
-            .map_err(|pe| NetworkError::Serialization(format!("[Protocol] {}", pe)))?;
+        validate_payload_size(cmd, payload_len).map_err(|pe| {
+            ReadStop::Failed(NetworkError::Serialization(format!("[Protocol] {}", pe)))
+        })?;
 
-        // 6. Read payload
+        // 7. Read payload
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
             reader
                 .read_exact(&mut payload)
-                .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+                .map_err(|e| ReadStop::Failed(NetworkError::ConnectionFailed(e.to_string())))?;
         }
 
-        // 7. Validate checksum (BEFORE deserialization — blocks tampered data)
-        validate_payload_checksum(&payload, header.checksum)
-            .map_err(|pe| NetworkError::Serialization(format!("[Protocol] {}", pe)))?;
+        // 8. Validate checksum (BEFORE deserialization — blocks tampered data)
+        validate_payload_checksum(&payload, header.checksum).map_err(|pe| {
+            ReadStop::Failed(NetworkError::Serialization(format!("[Protocol] {}", pe)))
+        })?;
 
-        // 8. Deserialize payload (bincode, allocation-bounded)
+        // 9. Deserialize payload (bincode, allocation-bounded)
         let msg: P2PMessage = bounded_deserialize(&payload).map_err(|e| {
-            NetworkError::Serialization(format!("[Protocol] {} deserialize failed: {}", cmd, e))
+            ReadStop::Failed(NetworkError::Serialization(format!(
+                "[Protocol] {} deserialize failed: {}",
+                cmd, e
+            )))
         })?;
 
         Ok((msg, cmd, WIRE_HEADER_SIZE + payload_len))
@@ -3253,5 +3443,152 @@ mod tests {
         evil.extend_from_slice(&u64::MAX.to_le_bytes()); // claimed length
         let r: Result<Vec<u8>, _> = bounded_deserialize(&evil);
         assert!(r.is_err(), "oversized inner length must be rejected, not allocated");
+    }
+
+    // ── Sweep-3 #1: no pre-handshake read may outlive its deadline ────────
+
+    /// A peer that hands over exactly one byte per recv, forever — the shape of
+    /// the slowloris. `SO_RCVTIMEO` never fires against it, because every recv
+    /// makes progress.
+    struct DripReader {
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Read for DripReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(1));
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            buf[0] = 0x42;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn a_drip_cannot_outlive_the_pre_handshake_deadline() {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Instant::now();
+        let mut reader = BufReader::new(DeadlineReader::new(
+            DripReader {
+                reads: Arc::clone(&reads),
+            },
+            started + Duration::from_millis(50),
+        ));
+
+        // 4 KiB at one byte per millisecond is over four seconds of looping,
+        // and the real drip can hold the loop for as long as it likes:
+        // read_exact fails only when ONE recv returns nothing.
+        let mut buf = [0u8; 4096];
+        let err = reader
+            .read_exact(&mut buf)
+            .expect_err("the deadline must end the read");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(err.to_string(), DEADLINE_ERROR_TEXT);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the read must end at the deadline, not after the whole 4 KiB: {:?}",
+            started.elapsed()
+        );
+        // The drip really was looping — the deadline stopped it, not a reader
+        // that failed on its first recv.
+        assert!(
+            reads.load(std::sync::atomic::Ordering::Relaxed) > 10,
+            "only {} recvs — the test did not exercise the loop",
+            reads.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn a_disarmed_reader_lets_a_slow_honest_read_finish() {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut reader = BufReader::new(DeadlineReader::new(
+            DripReader {
+                reads: Arc::clone(&reads),
+            },
+            Instant::now(), // already spent
+        ));
+        let mut one = [0u8; 1];
+        assert!(
+            reader.read_exact(&mut one).is_err(),
+            "a spent deadline must refuse to read at all"
+        );
+
+        // Disarmed, the same drip completes. This is what keeps an established
+        // follower's slow bulk transfer alive during IBD.
+        reader.get_mut().disarm();
+        let mut buf = [0u8; 16];
+        reader
+            .read_exact(&mut buf)
+            .expect("a disarmed reader must not time out");
+        assert!(buf.iter().all(|b| *b == 0x42));
+    }
+
+    #[test]
+    fn the_deadline_error_is_fatal_not_an_idle_poll() {
+        // The classifier decides whether the connection loop keeps waiting or
+        // ends. A spent deadline must land on "ends" — classified as transient
+        // it would spin the loop on an error that can never clear.
+        let deadline_err =
+            std::io::Error::new(std::io::ErrorKind::TimedOut, DEADLINE_ERROR_TEXT);
+        let wrapped = NetworkError::ConnectionFailed(deadline_err.to_string());
+        assert!(!is_transient_read_timeout(&wrapped.to_string().to_lowercase()));
+
+        // ...and every real idle-poll expiry must still be transient, or the
+        // node drops every peer every 100 ms. The last two are Windows'
+        // WSAETIMEDOUT text, which that platform returns for an SO_RCVTIMEO
+        // expiry instead of EWOULDBLOCK.
+        for m in [
+            "resource temporarily unavailable (os error 11)",
+            "operation timed out",
+            "a non-blocking socket operation could not be completed immediately (os error 10035)",
+            "the semaphore timeout period has expired. (os error 10060)",
+            "a connection attempt failed because the connected party did not properly respond",
+        ] {
+            assert!(is_transient_read_timeout(m), "must stay transient: {}", m);
+        }
+    }
+
+    #[test]
+    fn an_unhandshaked_peer_cannot_reach_the_bulk_payload_bound() {
+        use crate::service::network::p2p::protocol::payload_size_bounds;
+        // The widest payload any command allowed before the handshake may
+        // declare: Version, 1 KiB plus bincode's 4-byte enum tag.
+        const MAX_PRE_HANDSHAKE_PAYLOAD: usize = 1028;
+
+        let fresh = ProtocolSession::new(false, DEFAULT_BPS);
+        assert!(!fresh.is_established());
+
+        let mut refused = 0usize;
+        let mut widest = 0usize;
+        for b in 0u8..=u8::MAX {
+            let Some(cmd) = CommandId::from_byte(b) else {
+                continue;
+            };
+            if fresh.check_command_allowed(cmd).is_err() {
+                refused += 1;
+                continue;
+            }
+            widest = widest.max(payload_size_bounds(cmd).1);
+        }
+
+        assert_eq!(
+            widest, MAX_PRE_HANDSHAKE_PAYLOAD,
+            "a command allowed before the handshake moved the pre-handshake \
+             allocation ceiling"
+        );
+        // Not vacuous: the bulk commands are the ones refused, and the ceiling
+        // is three orders of magnitude under what one of them could declare.
+        assert!(fresh.check_command_allowed(CommandId::Block).is_err());
+        assert!(fresh.check_command_allowed(CommandId::Tx).is_err());
+        assert!(fresh.check_command_allowed(CommandId::ShadowTx).is_err());
+        assert!(refused >= 10, "only {} commands refused", refused);
+        assert!(widest * 1_000 < MAX_MESSAGE_SIZE);
+        // ...while the handshake's own commands still pass, so an honest peer
+        // can complete it.
+        assert!(fresh.check_command_allowed(CommandId::PuzzleSolution).is_ok());
+        assert!(fresh.check_command_allowed(CommandId::Version).is_ok());
     }
 }
