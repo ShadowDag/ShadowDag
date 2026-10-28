@@ -25,6 +25,13 @@ dev-mode = []
 # Optional post-quantum Dilithium support (disabled by default until migration
 # to a maintained backend is complete).
 pq-dilithium = ["pqcrypto-dilithium"]
+# Diagnostic: periodically ask parking_lot whether any set of threads is
+# deadlocked, and log the cycle with a backtrace per thread. OFF by default
+# because the detection bookkeeping costs on every lock acquisition. Turn it on
+# when a node wedges: two testnet followers sat deadlocked from August to
+# October 2026 and the stripped release binary gave gdb no Rust frames, so
+# there was no way to name the lock after the fact.
+deadlock-detect = ["parking_lot/deadlock_detection"]
 # TESTING ONLY: bypass CLSAG ring signature rejection gate in ring_validator.
 # DO NOT enable in production — allows structurally-valid but cryptographically
 # unverified privacy transactions.
@@ -138,6 +145,8 @@ zeroize            = { version = "1", features = ["derive"] }
 
 # ─── Concurrency ──────────────────────────────────────────────────────────────
 parking_lot        = "0.12"
+# `deadlock_detection` is pulled in only by the `deadlock-detect` feature; it
+# adds per-lock bookkeeping, so it must never be on in a normal build.
 dashmap            = "5"
 crossbeam-channel  = "0.5"
 

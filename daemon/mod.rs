@@ -343,6 +343,10 @@ impl DaemonNode {
     }
 
     pub fn start(&mut self) -> Result<(), NodeError> {
+        // No-op unless built with `deadlock-detect`. Present unconditionally so
+        // a diagnostic build needs no source change — only a feature flag.
+        crate::telemetry::deadlock_watch::spawn();
+
         Lifecycle::on_start();
         self.print_banner();
 
