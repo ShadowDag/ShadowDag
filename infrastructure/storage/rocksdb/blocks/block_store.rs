@@ -447,7 +447,14 @@ impl BlockStore {
     /// Read height from the dedicated `blk:h2h:{hash}` index.
     /// This key is written by `save_block` alongside the block data and
     /// is NOT deleted by `prune_block_body`, so it survives pruning.
-    fn get_block_height_from_index(&self, hash: &str) -> Option<u64> {
+    ///
+    /// Public because `get_block_height` tries the full block FIRST, which
+    /// costs a block read plus a bincode deserialize of up to MAX_BLOCK_SIZE.
+    /// A caller that only needs the height on a remote-triggered path wants
+    /// this one: it is a single keyed get. `get_block_height`'s own order is
+    /// left alone, because it is the one consensus callers use and the two
+    /// sources could only disagree if an index entry were wrong.
+    pub fn get_block_height_from_index(&self, hash: &str) -> Option<u64> {
         let key = format!("{}h2h:{}", BLK_PREFIX, hash);
         match self.db.get(key.as_bytes()) {
             Ok(Some(data)) if data.len() >= 8 => {

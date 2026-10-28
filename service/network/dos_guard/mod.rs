@@ -76,6 +76,13 @@ pub const COST_INV: f64 = 1.0;
 pub const COST_ADDR: f64 = 1.0;
 pub const COST_HEADERS: f64 = 3.0;
 pub const COST_GETBLOCKS: f64 = 5.0;
+/// GetHeaders is the costliest request per byte in the protocol: 29 bytes in
+/// (an empty from_hash is legitimate — a fresh node asks that way), up to 512
+/// `get_block_hashes_at_height` prefix iterators of walking, and 36,889 bytes
+/// out. It was not in the match below, so it fell to COST_MSG_DEFAULT and one
+/// peer could ask 800 times a second. Priced with GetBlocks, which serves
+/// strictly less work: one stored block, one lookup.
+pub const COST_GETHEADERS: f64 = 5.0;
 pub const COST_MEMPOOL: f64 = 10.0;
 
 pub const BAN_SCORE_AUTOBAN: u64 = 100;
@@ -195,6 +202,7 @@ impl MsgType {
             MsgType::Inv => COST_INV,
             MsgType::Addr => COST_ADDR,
             MsgType::Headers => COST_HEADERS,
+            MsgType::GetHeaders => COST_GETHEADERS,
             MsgType::GetBlocks => COST_GETBLOCKS,
             MsgType::Mempool => COST_MEMPOOL,
             _ => COST_MSG_DEFAULT,
@@ -1067,6 +1075,27 @@ mod tests {
         g.evict_inactive();
         let stats = g.stats();
         assert_eq!(stats.tracked_peers, 0);
+    }
+
+    #[test]
+    fn getheaders_costs_more_than_the_default_message() {
+        // GetHeaders was absent from token_cost, so it fell to the default and
+        // one peer could ask BUCKET_REFILL_RATE times a second — each ask
+        // costing up to 512 prefix iterators and a 36,889-byte reply for 29
+        // bytes in. It must cost at least as much as GetBlocks, which serves
+        // strictly less: one stored block.
+        let cost = MsgType::GetHeaders.token_cost();
+        assert!(
+            cost > COST_MSG_DEFAULT,
+            "GetHeaders must not be priced at the default: {}",
+            cost
+        );
+        assert!(cost >= COST_GETBLOCKS);
+        // The rate that price implies, against an honest peer that asks once
+        // per 6 s sync interval: still two orders of magnitude of headroom.
+        let per_sec = BUCKET_REFILL_RATE / cost;
+        assert!(per_sec <= 160.0, "{} GetHeaders/sec is still too cheap", per_sec);
+        assert!(per_sec >= 20.0, "{} GetHeaders/sec would throttle honest sync", per_sec);
     }
 
     #[test]

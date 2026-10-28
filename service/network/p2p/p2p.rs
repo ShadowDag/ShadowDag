@@ -168,6 +168,51 @@ static PENDING_HEADER_REQUESTS: Lazy<Arc<PlMutex<Vec<(String, String, u32)>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(64))));
 const MAX_HEADER_REQUEST_QUEUE: usize = 2_000;
 
+/// Header requests accepted per SOURCE IP since the last drain.
+///
+/// Keyed on the IP, not on `ip:port`: the share belongs to the host, and the
+/// accept gates and the whitelist key the same way — the port is the
+/// attacker's to choose, so a per-socket share would hand one host
+/// `MAX_PEERS_PER_IP` shares.
+///
+/// Cleared wholesale by `drain_header_requests`, which takes the queue in one
+/// piece — so there is nothing to decrement, and no counter can outlive the
+/// requests it counts. Needing a symmetric release is how the other per-peer
+/// maps grow stale entries; a per-window map cannot.
+static HEADER_REQUESTS_PER_IP: Lazy<Arc<PlMutex<HashMap<String, usize>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(HashMap::new())));
+
+/// Max header-serve requests ONE source IP may hold in the queue per drain
+/// window.
+///
+/// The queue had only the global cap, so one established peer could own all
+/// 2,000 entries: at the guard's 800 tok/s refill and the old
+/// COST_MSG_DEFAULT it can ask 800 times a second, and every entry costs us
+/// up to 512 RocksDB prefix iterators plus a 36,889-byte reply for a 29-byte
+/// request.
+///
+/// This bounds the BURST — how much of the queue one host may own at once. The
+/// RATE is bounded elsewhere: by the token bucket (COST_GETHEADERS against
+/// BUCKET_REFILL_RATE, keyed per socket) and by the daemon's paced per-pass
+/// serve budget. Fairness does not rest on this number either, because the
+/// serve order is round-robin by host.
+///
+/// Sized by the largest burst an honest peer can legitimately send:
+/// `request_headers_sync` asks once per DAG tip at startup, and the published
+/// tip list is truncated to `MAX_PARENTS`, so that sweep is at most
+/// MAX_PARENTS requests arriving together. Anything tighter silently dropped
+/// most of it, and that per-tip sweep exists precisely because asking from one
+/// tip alone "could miss entire DAG branches".
+const MAX_HEADER_REQUESTS_PER_IP: usize =
+    crate::config::consensus::consensus_params::ConsensusParams::MAX_PARENTS;
+
+/// How much of the header queue strangers may fill between drains. The
+/// remainder — five seeds' worth of full burst — is reachable only by a
+/// whitelisted peer, so a flood cannot squeeze the fleet's own seeds out of
+/// the queue at push time.
+const HEADER_QUEUE_STRANGER_CAP: usize =
+    MAX_HEADER_REQUEST_QUEUE - MAX_HEADER_REQUESTS_PER_IP * 5;
+
 /// Target addresses (host:p2p_port) with a live OUTBOUND connection. Prevents
 /// duplicate dials and drives auto-reconnect: the maintenance loop re-dials any
 /// known peer not in this set, so a node recovers from restarts, timeouts, and
@@ -681,18 +726,70 @@ pub fn take_orphans_for_parent(parent_hash: &str) -> Vec<(String, Block)> {
     ready
 }
 
+/// Whether the header-request queue must refuse this request.
+///
+/// Strangers share `HEADER_QUEUE_STRANGER_CAP`; the rest of the queue is
+/// reserved for whitelisted seeds.
+///
+/// One global cap for everyone looked safe because a refusal here only delays
+/// a peer's next sync round — but that reasoning holds for ONE refusal, not
+/// for a sustained flood. At `MAX_HEADER_REQUESTS_PER_IP` each, ~25 hosts fill
+/// a 2,000-entry queue, and a flooder refills it within milliseconds of every
+/// drain, so an honest peer arriving at an arbitrary phase keeps finding it
+/// full. The reservation is what the fleet's own seeds cannot be squeezed out
+/// of.
+///
+/// A seed is still bounded by the queue's hard ceiling, because it bypasses
+/// everything else: `DosGuard::check` returns Allow for a whitelisted peer, so
+/// a seed has no token bucket either, and this is the only limit left. At
+/// roughly 100 bytes an entry the whole queue is ~200 KB.
+fn header_request_rejects(
+    whitelisted: bool,
+    queued_for_ip: usize,
+    queued_total: usize,
+) -> bool {
+    if whitelisted {
+        return queued_total >= MAX_HEADER_REQUEST_QUEUE;
+    }
+    queued_total >= HEADER_QUEUE_STRANGER_CAP || queued_for_ip >= MAX_HEADER_REQUESTS_PER_IP
+}
+
 /// Queue a peer's GetHeaders request. The daemon walks the chain forward from
 /// `from_hash` and replies with a batch of block hashes for bulk catch-up.
+///
+/// LOCK ORDER: PENDING_HEADER_REQUESTS first, then HEADER_REQUESTS_PER_IP.
+/// This is the only site that holds both; `drain_header_requests` takes them
+/// one after the other, never nested, and nothing else touches either.
 pub fn push_header_request(peer_id: &str, from_hash: &str, count: u32) {
+    let ip = extract_ban_ip(peer_id);
+    let whitelisted = crate::service::network::dos_guard::is_whitelisted(&ip);
     let mut q = PENDING_HEADER_REQUESTS.lock();
-    if q.len() < MAX_HEADER_REQUEST_QUEUE {
-        q.push((peer_id.to_string(), from_hash.to_string(), count));
+    let mut per_ip = HEADER_REQUESTS_PER_IP.lock();
+    let queued_for_ip = per_ip.get(&ip).copied().unwrap_or(0);
+    if header_request_rejects(whitelisted, queued_for_ip, q.len()) {
+        return;
     }
+    q.push((peer_id.to_string(), from_hash.to_string(), count));
+    *per_ip.entry(ip).or_insert(0) += 1;
 }
 
 /// Drain queued header-serve requests (call from the node main loop).
+///
+/// Also opens the next per-IP quota window: the queue is taken whole, so every
+/// counter it tracked is spent. This is also what keeps the map bounded — its
+/// keys live at most one window.
+///
+/// LOCK ORDER: PENDING_HEADER_REQUESTS first, then HEADER_REQUESTS_PER_IP —
+/// the same order `push_header_request` takes them, and held across BOTH
+/// steps. Releasing the queue lock in between left a window in which a push
+/// saw an empty queue but a spent counter, and refused a peer that had nothing
+/// outstanding.
 pub fn drain_header_requests() -> Vec<(String, String, u32)> {
-    std::mem::take(&mut *PENDING_HEADER_REQUESTS.lock())
+    let mut q = PENDING_HEADER_REQUESTS.lock();
+    let mut per_ip = HEADER_REQUESTS_PER_IP.lock();
+    let taken = std::mem::take(&mut *q);
+    per_ip.clear();
+    taken
 }
 
 /// Requeue excess blocks that couldn't be processed in this tick.
@@ -834,7 +931,10 @@ pub fn push_pending_tx(peer_id: &str, tx: Transaction) -> bool {
 
 /// Extract IP from a peer address string (ip:port), handling IPv4 and IPv6.
 /// Formats: "1.2.3.4:9333", "[::1]:9333", "::1"
-fn extract_ban_ip(addr: &str) -> String {
+/// Public so the daemon's header-serve fairness can key on the same host
+/// identity the queue quota and the accept gates use, instead of
+/// reimplementing the IPv4/IPv6/bracketed forms.
+pub fn extract_ban_ip(addr: &str) -> String {
     // Try parsing as SocketAddr (handles all formats correctly)
     if let Ok(sa) = addr.parse::<SocketAddr>() {
         return sa.ip().to_string();
@@ -3467,6 +3567,109 @@ mod tests {
         }
     }
 
+    // ── Sweep-3 #2: one peer may not own the header-serve queue ──────────
+
+    #[test]
+    fn header_requests_are_quotaed_per_peer_but_never_for_a_seed() {
+        // Below the quota nobody is refused.
+        assert!(!header_request_rejects(false, 0, 0));
+        assert!(!header_request_rejects(
+            false,
+            MAX_HEADER_REQUESTS_PER_IP - 1,
+            0
+        ));
+        // At the quota an ordinary peer is refused...
+        assert!(header_request_rejects(false, MAX_HEADER_REQUESTS_PER_IP, 0));
+        assert!(header_request_rejects(false, usize::MAX, 0));
+        // ...but a trusted seed catching up is not.
+        assert!(!header_request_rejects(true, usize::MAX, 0));
+        // The global cap, however, binds EVERYONE including a seed: it bounds
+        // our own memory, and a refusal here only delays that peer's next sync
+        // round — it cannot lock anyone out the way an accept gate can.
+        assert!(header_request_rejects(true, 0, MAX_HEADER_REQUEST_QUEUE));
+        assert!(header_request_rejects(false, 0, MAX_HEADER_REQUEST_QUEUE));
+        assert!(!header_request_rejects(
+            true,
+            0,
+            MAX_HEADER_REQUEST_QUEUE - 1
+        ));
+        // Strangers are refused at the stranger cap, leaving the rest for
+        // seeds. One cap for everyone let a sustained flood refuse the fleet's
+        // own seeds at push time.
+        assert!(header_request_rejects(false, 0, HEADER_QUEUE_STRANGER_CAP));
+        assert!(!header_request_rejects(true, 0, HEADER_QUEUE_STRANGER_CAP));
+        const {
+            assert!(
+                HEADER_QUEUE_STRANGER_CAP < MAX_HEADER_REQUEST_QUEUE,
+                "no capacity is reserved for seeds"
+            )
+        };
+
+        // The quota must never clip an honest peer's startup tip sweep:
+        // request_headers_sync asks once per published DAG tip and that list is
+        // truncated to MAX_PARENTS, so a tighter quota drops most of a sweep
+        // whose whole purpose is not missing DAG branches. Compile-time, so
+        // lowering either constant fails the build rather than a test run.
+        const {
+            assert!(
+                MAX_HEADER_REQUESTS_PER_IP
+                    >= crate::config::consensus::consensus_params::ConsensusParams::MAX_PARENTS,
+                "the header-request quota would clip the per-tip sync sweep"
+            )
+        };
+    }
+
+    #[test]
+    fn one_peer_cannot_fill_the_header_queue_and_the_window_reopens() {
+        // Uses the real globals, so it owns the queue for its duration: it is
+        // the only test that touches PENDING_HEADER_REQUESTS.
+        let flooder = "203.0.113.41:40001";
+        // Same host, another socket: the quota is per IP, so this shares the
+        // flooder's share instead of doubling it.
+        let flooder_second_socket = "203.0.113.41:40002";
+        let honest = "198.51.100.42:40002";
+        let _ = drain_header_requests(); // start from a known-empty queue
+
+        // The flooder asks far past its quota. At the guard's 800 tok/s it can
+        // really do this; the old code accepted 2,000 of them.
+        for i in 0..(MAX_HEADER_REQUESTS_PER_IP * 4) {
+            push_header_request(flooder, &format!("{:064x}", i), 512);
+        }
+        // Opening a second connection from the same host must not buy a second
+        // share — the port is the attacker's to choose.
+        for i in 0..MAX_HEADER_REQUESTS_PER_IP {
+            push_header_request(flooder_second_socket, &format!("{:064x}", i), 512);
+        }
+        // An honest peer asking once afterwards must still be queued.
+        push_header_request(honest, &format!("{:064x}", 999), 512);
+
+        let queued = drain_header_requests();
+        let flooder_queued = queued
+            .iter()
+            .filter(|(p, _, _)| p == flooder || p == flooder_second_socket)
+            .count();
+        let honest_queued = queued.iter().filter(|(p, _, _)| p == honest).count();
+        assert_eq!(
+            flooder_queued, MAX_HEADER_REQUESTS_PER_IP,
+            "one HOST must hold at most its quota across all its sockets"
+        );
+        assert_eq!(
+            honest_queued, 1,
+            "the honest peer's request must survive the flood"
+        );
+
+        // The drain opened a new window: the same peer may ask again. Without
+        // the clear, a flooder would be locked out of header sync for the life
+        // of the process.
+        push_header_request(flooder, &format!("{:064x}", 1234), 512);
+        let after = drain_header_requests();
+        assert_eq!(
+            after.len(),
+            1,
+            "the per-peer window must reopen on every drain"
+        );
+    }
+
     #[test]
     fn a_drip_cannot_outlive_the_pre_handshake_deadline() {
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3487,17 +3690,28 @@ mod tests {
             .expect_err("the deadline must end the read");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(err.to_string(), DEADLINE_ERROR_TEXT);
+        // Evidence that the DEADLINE ended this, and not something else.
+        // Deliberately not a count of recvs per unit time: the drip sleeps 1 ms
+        // but Windows' timer granularity is ~15.6 ms, and under the full suite's
+        // parallelism a 50 ms budget fits as few as 8 recvs.
+        let recvs = reads.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            recvs >= 2,
+            "the loop must have iterated, not failed on its first recv"
+        );
+        assert!(
+            recvs < buf.len(),
+            "{} recvs for {} bytes — the read COMPLETED, so no deadline was needed",
+            recvs,
+            buf.len()
+        );
+        // Loose upper bound on wall clock: reading the whole buffer at one
+        // sleeping byte per recv takes seconds, so this also cannot have run to
+        // completion.
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
             "the read must end at the deadline, not after the whole 4 KiB: {:?}",
             started.elapsed()
-        );
-        // The drip really was looping — the deadline stopped it, not a reader
-        // that failed on its first recv.
-        assert!(
-            reads.load(std::sync::atomic::Ordering::Relaxed) > 10,
-            "only {} recvs — the test did not exercise the loop",
-            reads.load(std::sync::atomic::Ordering::Relaxed)
         );
     }
 
