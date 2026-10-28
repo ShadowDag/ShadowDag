@@ -191,6 +191,16 @@ fn pending_cap_rejects(prev_pending: usize, whitelisted: bool) -> bool {
     prev_pending >= MAX_PENDING_CONNECTIONS && !whitelisted
 }
 
+/// Whether we owe this peer a connection-puzzle solution.
+///
+/// Solving is work WE pay for, so it is allowed only where the protocol
+/// actually asks for it: a connection we dialled (on an inbound connection we
+/// are the challenger, never the solver), at most one puzzle per connection,
+/// and only for a challenge of the exact shape `generate_challenge` emits.
+fn should_solve_puzzle(is_outbound: bool, puzzles_solved: u32, challenge: &str) -> bool {
+    is_outbound && puzzles_solved == 0 && ConnectionPuzzle::is_well_formed(challenge)
+}
+
 /// Releases an accepted inbound connection's accounting on EVERY exit path,
 /// including an unwinding panic.
 ///
@@ -920,6 +930,10 @@ struct ConnectionSession {
     /// Last outbound broadcast sequence number sent to this peer.
     /// Used to ensure every peer gets every broadcast message.
     last_outbound_seq: u64,
+    /// How many connection puzzles we have solved for this peer. A connection
+    /// legitimately asks us to solve at most one, so anything beyond the first
+    /// is unpaid work for a stranger.
+    puzzles_solved: u32,
 }
 
 // dos_type_name removed — CommandId::name() used directly now
@@ -947,6 +961,7 @@ impl ConnectionSession {
             // disconnect the peer as slow on its first flush — which stalled
             // convergence for any node behind the broadcast counter.
             last_outbound_seq: current_outbound_seq(),
+            puzzles_solved: 0,
         }
     }
 
@@ -1370,13 +1385,39 @@ impl P2P {
             match Self::read_message(&mut reader, magic) {
                 Ok((P2PMessage::PuzzleChallenge { challenge }, _, sz)) => {
                     session.record_bytes_received(sz as u64);
+                    // Check the shape BEFORE `received_puzzle_challenge` stores
+                    // the string and before solving: the challenge arrives off
+                    // the wire and both retaining it and hashing it are sized
+                    // by whatever the peer sent. Every real challenge is 64 hex
+                    // characters, so no honest node fails this.
+                    if !ConnectionPuzzle::is_well_formed(&challenge) {
+                        DOS_GUARD.add_ban_score_cat(
+                            &peer_str,
+                            50,
+                            "malformed puzzle challenge",
+                            BanCategory::Malformed,
+                        );
+                        return Err(NetworkError::ConnectionFailed(format!(
+                            "malformed puzzle challenge from {}",
+                            peer_str
+                        )));
+                    }
                     session
                         .protocol
                         .received_puzzle_challenge(&challenge)
                         .map_err(|e| {
                             NetworkError::ConnectionFailed(format!("State error: {}", e))
                         })?;
-                    let sol = ConnectionPuzzle::solve(&challenge);
+                    let sol = match ConnectionPuzzle::solve(&challenge) {
+                        Some(s) => s,
+                        None => {
+                            return Err(NetworkError::ConnectionFailed(format!(
+                                "puzzle from {} exceeded the solver bound",
+                                peer_str
+                            )));
+                        }
+                    };
+                    session.puzzles_solved = session.puzzles_solved.saturating_add(1);
                     let sol_msg = P2PMessage::PuzzleSolution {
                         challenge: sol.challenge,
                         nonce: sol.nonce,
@@ -1994,8 +2035,44 @@ impl P2P {
 
         match msg {
             // ── Puzzle messages (edge case: received in main loop) ──────
+            //
+            // PuzzleChallenge is allowed before the handshake completes, so
+            // this arm runs for a stranger. Solving unconditionally inverted
+            // the puzzle's whole purpose — the peer that wants the connection
+            // is supposed to pay — and because `solve` hashes the challenge
+            // once per iteration it turned one 4 MiB message into ~16 GiB of
+            // SHA-256 at 800 messages/s per peer.
+            //
+            // We owe a solution in exactly one case: we dialled out, the
+            // challenge arrived too late for the handshake window (slow peer),
+            // and we have not already answered one on this connection.
             P2PMessage::PuzzleChallenge { challenge } => {
-                let sol = ConnectionPuzzle::solve(&challenge);
+                if !should_solve_puzzle(
+                    session.protocol.is_outbound,
+                    session.puzzles_solved,
+                    &challenge,
+                ) {
+                    DOS_GUARD.add_ban_score_cat(
+                        peer,
+                        10,
+                        "unexpected puzzle challenge",
+                        BanCategory::Malformed,
+                    );
+                    return Ok(());
+                }
+                let sol = match ConnectionPuzzle::solve(&challenge) {
+                    Some(s) => s,
+                    None => {
+                        DOS_GUARD.add_ban_score_cat(
+                            peer,
+                            10,
+                            "puzzle challenge exceeded the solver bound",
+                            BanCategory::Malformed,
+                        );
+                        return Ok(());
+                    }
+                };
+                session.puzzles_solved = session.puzzles_solved.saturating_add(1);
                 let sol_msg = P2PMessage::PuzzleSolution {
                     challenge: sol.challenge,
                     nonce: sol.nonce,
@@ -2783,6 +2860,32 @@ mod tests {
         // left two followers unable to accept the miner for 76 days.
         assert!(!pending_cap_rejects(MAX_PENDING_CONNECTIONS, true));
         assert!(!pending_cap_rejects(usize::MAX, true));
+    }
+
+    #[test]
+    fn puzzle_is_solved_only_where_the_protocol_asks_for_it() {
+        let good = ConnectionPuzzle::generate_challenge().challenge;
+
+        // The one legitimate case: we dialled out and have not answered yet.
+        assert!(should_solve_puzzle(true, 0, &good));
+
+        // Inbound: we are the challenger. A challenge from the peer that
+        // connected TO us inverts the puzzle — it would have us pay for a
+        // stranger's connection attempt.
+        assert!(!should_solve_puzzle(false, 0, &good));
+
+        // One puzzle per connection; repeats are free work for the peer.
+        assert!(!should_solve_puzzle(true, 1, &good));
+        assert!(!should_solve_puzzle(true, u32::MAX, &good));
+
+        // The amplifier: `solve` hashes the whole challenge once per
+        // iteration (~4096 iterations), so an oversized challenge turns one
+        // message into gigabytes of SHA-256. Shape is checked before solving.
+        assert!(!should_solve_puzzle(true, 0, &"a".repeat(4 * 1024 * 1024)));
+        assert!(!should_solve_puzzle(true, 0, ""));
+        assert!(!should_solve_puzzle(true, 0, &"0".repeat(63)));
+        assert!(!should_solve_puzzle(true, 0, &"0".repeat(65)));
+        assert!(!should_solve_puzzle(true, 0, &"z".repeat(64)));
     }
 
     use super::*;
