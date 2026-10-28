@@ -43,8 +43,9 @@ use crate::service::network::dos_guard::{BanCategory, MAX_TX_BYTES};
 use crate::service::network::nodes::full_node::FullNode;
 use crate::service::network::p2p::p2p::{
     buffer_orphan, drain_block_requests, drain_header_requests, drain_pending_blocks,
-    drain_pending_txs, push_outbound, push_outbound_to_peer, report_bad_peer, report_bad_peer_cat,
-    requeue_pending_blocks, requeue_pending_txs, take_orphans_for_parent, P2PMessage, P2P,
+    drain_pending_txs, extract_ban_ip, push_outbound, push_outbound_to_peer, report_bad_peer,
+    report_bad_peer_cat, requeue_pending_blocks, requeue_pending_txs, take_orphans_for_parent,
+    P2PMessage, P2P,
 };
 use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::service::network::contract_ide::ContractIdeServer;
@@ -151,7 +152,7 @@ fn collect_forward_headers(
     from_hash: &str,
     from_height: Option<u64>,
     count: u32,
-    at_height: impl Fn(u64) -> Vec<String>,
+    mut at_height: impl FnMut(u64) -> Vec<String>,
 ) -> Vec<String> {
     let start = from_height.unwrap_or(1);
     let want = (count as usize).clamp(1, 512);
@@ -174,6 +175,122 @@ fn collect_forward_headers(
         h += 1;
     }
     hashes
+}
+
+/// Event-loop idle sleep. At module scope because `HEADER_SERVE_INTERVAL` is
+/// defined in terms of it.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// One header-serve pass's budget, in the three dimensions a request can be
+/// expensive in: how many requests, how much chain walking, and how many
+/// hashes go back out.
+///
+/// The loop used to serve the WHOLE drained queue — up to
+/// `MAX_HEADER_REQUEST_QUEUE` = 2,000 entries, each walking up to 512
+/// `get_block_hashes_at_height` prefix iterators and replying with 36,889
+/// bytes. That is ~1.02M iterators and ~74 MB of outbound in one pass of this
+/// single-threaded loop, for ~58 KB of requests. The block-serve branch has
+/// had a per-tick bound all along.
+///
+/// All three are needed. A near-tip request walks one height and sends a few
+/// hashes; a from-genesis request walks 512 and sends 36,889 bytes; a request
+/// pointed past our tip walks one and sends nothing but still costs a lookup
+/// and a log line. And heights do not bound bytes: `collect_forward_headers`
+/// takes EVERY hash at a visited height, so a DAG w blocks wide yields w
+/// hashes per height.
+///
+/// Rate: `HEADER_SERVE_INTERVAL` below turns these per-pass numbers into
+/// per-second ones — 5,120 requests/s, 163,840 walked heights/s and 163,840
+/// hashes/s (~11.8 MB/s of egress). Honest demand for comparison: a peer asks
+/// once per `sync_interval` (6 s), or twice a second while catching up, so
+/// MAX_PEERS = 64 peers all catching up at once want ~128 requests/s and
+/// ~65,500 of both heights and hashes per second — 40% of either budget. The
+/// rate-ceiling test holds BOTH expensive dimensions to 2x that storm; heights
+/// used to sit at 1.25x, which is not headroom. Requests past the budget are
+/// dropped, not requeued: the requester re-asks on its next interval, and
+/// requeueing would let a flooder's backlog head-of-line block the peers
+/// behind it.
+const MAX_HEADER_SERVES_PER_TICK: usize = 256;
+const MAX_HEADER_HEIGHTS_PER_TICK: usize = 8_192;
+const MAX_HEADER_HASHES_PER_TICK: usize = 8_192;
+
+/// Minimum wall-clock gap between header-serve passes.
+///
+/// Without it the per-pass budget bounded nothing per second: the loop sleeps
+/// only `if !did_work`, and a non-empty header queue sets `did_work`, so a
+/// peer that keeps asking suppresses the sleep and every spin re-grants the
+/// full budget. The spin period was then set by how long the budget's own work
+/// took — which is the opposite of a rate limit. Same shape as
+/// `last_sync_req`/`sync_interval` in this loop.
+const HEADER_SERVE_INTERVAL: std::time::Duration = POLL_INTERVAL;
+
+/// Whether a header-serve pass is due.
+///
+/// Extracted so the pacing is checkable: it is the only thing that turns the
+/// per-pass budget below into a per-second bound, and the event loop it guards
+/// cannot be unit-tested.
+fn header_pass_due(since_last_pass: std::time::Duration) -> bool {
+    since_last_pass >= HEADER_SERVE_INTERVAL
+}
+
+/// Whether this pass's header-serve budget is spent.
+///
+/// `served` counts requests PROCESSED, not replies sent — a walk that found
+/// nothing still cost a store lookup and a log line.
+fn header_budget_spent(served: usize, walked_heights: usize, hashes: usize) -> bool {
+    served >= MAX_HEADER_SERVES_PER_TICK
+        || walked_heights >= MAX_HEADER_HEIGHTS_PER_TICK
+        || hashes >= MAX_HEADER_HASHES_PER_TICK
+}
+
+/// Order header-serve requests round-robin by key, starting the rotation at
+/// host `start_host`: every key's first request, then every key's second, and
+/// so on, stable within each round.
+///
+/// Round-robin alone equalises request COUNT, not COST, and the budget it
+/// feeds is shared: eight from-genesis walks spend a whole pass, so the hosts
+/// behind them are dropped. A flooder keeps a request queued at all times and
+/// would therefore lead every pass, which is the starvation class this
+/// ordering claims to prevent. `start_host` rotates the lead, so every host
+/// with a queued request is reached within ceil(hosts / served-per-pass)
+/// passes — about 100 ms for the numbers above.
+///
+/// The caller keys on the source IP, not on `ip:port`: the share belongs to
+/// the host, exactly as the queue quota does, or one host's
+/// `MAX_PEERS_PER_IP` sockets would take that many leading slots.
+fn round_robin_by_peer<T: AsRef<str>>(peers: &[T], start_host: usize) -> Vec<usize> {
+    let mut slot_of: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    let mut per_host: Vec<Vec<usize>> = Vec::new();
+    for (i, peer) in peers.iter().enumerate() {
+        let key = peer.as_ref();
+        let slot = match slot_of.get(key) {
+            Some(s) => *s,
+            None => {
+                per_host.push(Vec::new());
+                let s = per_host.len() - 1;
+                slot_of.insert(key, s);
+                s
+            }
+        };
+        per_host[slot].push(i);
+    }
+    let hosts = per_host.len();
+    if hosts == 0 {
+        return Vec::new();
+    }
+    let deepest = per_host.iter().map(|v| v.len()).max().unwrap_or(0);
+    let mut out = Vec::with_capacity(peers.len());
+    // Reduced first, so the sum below cannot overflow for a long-lived cursor.
+    let lead = start_host % hosts;
+    for round in 0..deepest {
+        for offset in 0..hosts {
+            if let Some(&i) = per_host[(lead + offset) % hosts].get(round) {
+                out.push(i);
+            }
+        }
+    }
+    out
 }
 
 /// Ban score for peers that send invalid blocks rejected by consensus.
@@ -523,7 +640,6 @@ impl DaemonNode {
     pub fn run_event_loop(&self) {
         use std::time::{Duration, Instant};
 
-        const POLL_INTERVAL: Duration = Duration::from_millis(50);
         const STATS_INTERVAL: Duration = Duration::from_secs(30);
         const FLUSH_INTERVAL: Duration = Duration::from_secs(15);
         const TX_BATCH_LIMIT: usize = 500; // Max TXs per tick (backpressure)
@@ -542,6 +658,10 @@ impl DaemonNode {
         let mut last_stats = Instant::now();
         let mut last_flush = Instant::now();
         let mut last_sync_req = Instant::now();
+        let mut last_header_serve = Instant::now();
+        // Which host leads the next header-serve pass. Advanced by what the
+        // pass served, so a flooder cannot lead every pass.
+        let mut header_rr_cursor = 0usize;
         // While catching up, request the next header range every 500ms instead of
         // the idle 6s cadence so the download pipeline stays full. Extended 5s on
         // every tick that applies blocks; lapses back to 6s once caught up.
@@ -880,26 +1000,72 @@ impl DaemonNode {
             // ── Serve header requests: walk the chain FORWARD from from_hash ──
             // and reply with a batch of hashes so a behind/forked peer can bulk-
             // download and catch up (far faster than the sequential orphan-walk).
-            let header_reqs = drain_header_requests();
+            // Rate-bounded: the per-pass budget below only limits work per
+            // second if the passes themselves are paced (did_work suppresses
+            // the loop's only sleep while requests keep arriving).
+            let header_reqs = if header_pass_due(last_header_serve.elapsed()) {
+                last_header_serve = Instant::now();
+                drain_header_requests()
+            } else {
+                Vec::new()
+            };
             if !header_reqs.is_empty() {
                 did_work = true;
-                for (req_peer, from_hash, count) in header_reqs {
+                let order = round_robin_by_peer(
+                    &header_reqs
+                        .iter()
+                        .map(|(peer, _, _)| extract_ban_ip(peer))
+                        .collect::<Vec<_>>(),
+                    header_rr_cursor,
+                );
+                let mut walked_total = 0usize;
+                let mut hashes_total = 0usize;
+                let mut processed = 0usize;
+                // `served` is the enumerate index, so at the break it is exactly
+                // the number of requests this pass processed.
+                for (served, i) in order.into_iter().enumerate() {
+                    if header_budget_spent(served, walked_total, hashes_total) {
+                        slog_warn!("daemon", "header_serve_budget_spent",
+                            queued => header_reqs.len(),
+                            requests_served => served,
+                            heights => walked_total,
+                            hashes => hashes_total,
+                            dropped => header_reqs.len().saturating_sub(served));
+                        break;
+                    }
+                    let (req_peer, from_hash, count) = &header_reqs[i];
+                    // Height from the h2h index, NOT get_block_height: that one
+                    // tries the full block first, which is a read plus a bincode
+                    // deserialize of up to MAX_BLOCK_SIZE on a path a remote peer
+                    // triggers. Fall back only when the index has no entry, where
+                    // the block read is a miss anyway.
+                    let from_height = self
+                        .block_store
+                        .get_block_height_from_index(from_hash)
+                        .or_else(|| self.block_store.get_block_height(from_hash));
                     // Walk forward from the requester's tip, INCLUDING same-height
                     // siblings, so a forked peer receives the canonical sibling it
                     // must adopt to heal (see collect_forward_headers).
-                    let from_height = self.block_store.get_block_height(&from_hash);
-                    let hashes = collect_forward_headers(&from_hash, from_height, count, |h| {
+                    let mut walked = 0usize;
+                    let hashes = collect_forward_headers(from_hash, from_height, *count, |h| {
+                        walked += 1;
                         self.block_store.get_block_hashes_at_height(h)
                     });
+                    walked_total += walked;
+                    hashes_total += hashes.len();
                     slog_info!("daemon", "header_serve",
-                        to => &req_peer,
-                        from => from_hash.get(..16).unwrap_or(&from_hash),
+                        to => req_peer.as_str(),
+                        from => from_hash.get(..16).unwrap_or(from_hash.as_str()),
                         from_height => &from_height.map(|h| h.to_string()).unwrap_or_else(|| "none".into()),
                         served => hashes.len());
                     if !hashes.is_empty() {
-                        push_outbound_to_peer(&req_peer, P2PMessage::Headers { hashes });
+                        push_outbound_to_peer(req_peer, P2PMessage::Headers { hashes });
                     }
+                    processed = served + 1;
                 }
+                // Move the lead on by what we got through, so the hosts this
+                // pass could not reach lead the next one.
+                header_rr_cursor = header_rr_cursor.wrapping_add(processed.max(1));
             }
 
             // ── Drain pending transactions (peer-tagged) ────────────
@@ -1875,6 +2041,260 @@ mod tests {
         let si = out.iter().position(|x| x == sibling).unwrap();
         let ni = out.iter().position(|x| x == next).unwrap();
         assert!(si < ni, "same-height sibling served before the next-height child");
+    }
+
+    #[test]
+    fn header_serve_budget_is_spent_round_robin_not_in_arrival_order() {
+        // A flooder's requests arrive first and fill the queue; two honest
+        // peers are behind them. Round-robin must reach both honest peers
+        // within the first few served slots, or the per-tick budget this
+        // commit adds would starve them — the F12 failure class.
+        let mut peers: Vec<&str> = (0..64).map(|_| "flooder").collect();
+        peers.push("seed1");
+        peers.push("seed2");
+
+        let order = round_robin_by_peer(&peers, 0);
+        assert_eq!(order.len(), peers.len(), "every request must be ordered");
+        // A real permutation of 0..n: the serve loop indexes header_reqs[i]
+        // with these, so a lost or repeated index would drop a request or
+        // panic.
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            (0..peers.len()).collect::<Vec<_>>(),
+            "the order must be a permutation of the request indices"
+        );
+
+        let first_three: Vec<&str> = order.iter().take(3).map(|i| peers[*i]).collect();
+        assert!(
+            first_three.contains(&"seed1") && first_three.contains(&"seed2"),
+            "both honest peers must be served in the first round, got {:?}",
+            first_three
+        );
+        // The flooder is not punished either: it keeps every request, just
+        // behind one per round.
+        assert_eq!(
+            order.iter().filter(|i| peers[**i] == "flooder").count(),
+            64
+        );
+        // Stable within a peer: a single peer's requests keep arrival order.
+        let flooder_positions: Vec<usize> = order
+            .iter()
+            .copied()
+            .filter(|i| peers[*i] == "flooder")
+            .collect();
+        assert!(
+            flooder_positions.windows(2).all(|w| w[0] < w[1]),
+            "a peer's own requests must stay in arrival order"
+        );
+    }
+
+    #[test]
+    fn the_header_serve_budget_binds_in_all_three_dimensions() {
+        // Fresh tick: nothing is spent.
+        assert!(!header_budget_spent(0, 0, 0));
+        // Egress binds on its own: a DAG w blocks wide yields w hashes per
+        // walked height, so heights alone never bounded reply bytes.
+        assert!(header_budget_spent(1, 1, MAX_HEADER_HASHES_PER_TICK));
+        // A flood of requests pointed past our tip returns nothing, so it must
+        // be bounded by the SERVED count: each one still costs a store lookup
+        // and a log line.
+        assert!(header_budget_spent(MAX_HEADER_SERVES_PER_TICK, 1, 0));
+        assert!(!header_budget_spent(
+            MAX_HEADER_SERVES_PER_TICK - 1,
+            MAX_HEADER_HEIGHTS_PER_TICK - 1,
+            MAX_HEADER_HASHES_PER_TICK - 1
+        ));
+        // Many cheap replies spend it...
+        assert!(header_budget_spent(MAX_HEADER_SERVES_PER_TICK, 0, 0));
+        // ...and so does a little walking that costs a lot: eight
+        // from-genesis walks of 512 heights, which is how the old loop could
+        // reach ~1.02M prefix iterators in one pass.
+        assert!(header_budget_spent(8, MAX_HEADER_HEIGHTS_PER_TICK, 0));
+        assert!(header_budget_spent(0, MAX_HEADER_HEIGHTS_PER_TICK, 0));
+        // The budget must leave honest sync untouched: one request per peer
+        // per 6 s sync_interval across the whole peer set is nowhere near it.
+        assert!(!header_budget_spent(
+            crate::service::network::p2p::p2p::MAX_PEERS,
+            512,
+            512,
+        ));
+    }
+
+    #[test]
+    fn the_header_serve_rate_ceiling_is_what_the_doc_claims() {
+        // A per-pass budget bounds nothing per second unless the passes are
+        // paced. This is the arithmetic the constants' doc comment states, so
+        // changing a constant without the doc fails here.
+        assert!(header_pass_due(HEADER_SERVE_INTERVAL));
+        assert!(!header_pass_due(
+            HEADER_SERVE_INTERVAL - std::time::Duration::from_millis(1)
+        ));
+        assert!(!header_pass_due(std::time::Duration::ZERO));
+
+        let passes_per_sec = 1_000 / HEADER_SERVE_INTERVAL.as_millis() as usize;
+        assert_eq!(passes_per_sec, 20);
+        assert_eq!(passes_per_sec * MAX_HEADER_SERVES_PER_TICK, 5_120);
+        assert_eq!(passes_per_sec * MAX_HEADER_HEIGHTS_PER_TICK, 163_840);
+        assert_eq!(passes_per_sec * MAX_HEADER_HASHES_PER_TICK, 163_840);
+
+        // The honest worst case must fit well inside it: every one of
+        // MAX_PEERS catching up at once asks twice a second (the fast-sync
+        // interval) and each reply is a full 512-hash batch.
+        let storm_requests = crate::service::network::p2p::p2p::MAX_PEERS * 2;
+        let storm_hashes = storm_requests * 512;
+        assert!(
+            storm_requests < passes_per_sec * MAX_HEADER_SERVES_PER_TICK,
+            "{} requests/s must fit the serve ceiling",
+            storm_requests
+        );
+        assert!(
+            storm_hashes * 2 < passes_per_sec * MAX_HEADER_HASHES_PER_TICK,
+            "{} hashes/s leaves less than 2x headroom",
+            storm_hashes
+        );
+        // Heights need the same check. They had 1.25x and nothing asserted it:
+        // a walk on a width-1 chain visits one height per hash returned.
+        let storm_heights = storm_hashes;
+        assert!(
+            storm_heights * 2 < passes_per_sec * MAX_HEADER_HEIGHTS_PER_TICK,
+            "{} heights/s leaves less than 2x headroom",
+            storm_heights
+        );
+    }
+
+    #[test]
+    fn header_serve_fairness_is_per_host_not_per_socket() {
+        // The composition the serve loop uses. Keying the rounds on the raw
+        // peer_id would hand one host MAX_PEERS_PER_IP first-round slots,
+        // which is the same mistake the queue quota already avoids.
+        let reqs = [
+            "203.0.113.9:40001",
+            "203.0.113.9:40002",
+            "203.0.113.9:40003",
+            "198.51.100.5:40004",
+        ];
+        let keys: Vec<String> = reqs.iter().map(|p| extract_ban_ip(p)).collect();
+        let order = round_robin_by_peer(&keys, 0);
+
+        // Round 0 is one slot per HOST, so it holds exactly two entries and
+        // the honest host is one of them.
+        let round0: Vec<&str> = order.iter().take(2).map(|i| keys[*i].as_str()).collect();
+        assert!(
+            round0.contains(&"198.51.100.5"),
+            "the honest host must be in the first round, got {:?}",
+            round0
+        );
+        assert_eq!(
+            round0.iter().collect::<std::collections::HashSet<_>>().len(),
+            2,
+            "the first round must hold one slot per host"
+        );
+        // Keyed on the socket instead, all three of the busy host's requests
+        // would precede the honest one.
+        let by_socket = round_robin_by_peer(&reqs, 0);
+        assert_eq!(
+            by_socket.iter().take(3).map(|i| reqs[*i]).filter(|p| p.starts_with("203.0.113.9")).count(),
+            3,
+            "this is what keying on the socket would have done"
+        );
+    }
+
+    #[test]
+    fn rotating_the_lead_reaches_every_host_within_a_few_passes() {
+        // The budget is SHARED, so ordering alone cannot stop eight expensive
+        // requests from spending a whole pass. What must not happen is the same
+        // hosts leading every pass: a flooder always has a request queued, so
+        // without rotation it would lead forever and the hosts behind it would
+        // never be served at all.
+        let hosts: Vec<String> = (0..10).map(|i| format!("host{}", i)).collect();
+        const SERVED_PER_PASS: usize = 3;
+
+        let mut cursor = 0usize;
+        let mut ever_served: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        for _ in 0..4 {
+            let order = round_robin_by_peer(&hosts, cursor);
+            let served: Vec<&str> = order
+                .iter()
+                .take(SERVED_PER_PASS)
+                .map(|i| hosts[*i].as_str())
+                .collect();
+            for h in &served {
+                ever_served.insert(h);
+            }
+            cursor = cursor.wrapping_add(served.len());
+        }
+        assert_eq!(
+            ever_served.len(),
+            hosts.len(),
+            "every host must be reached within ceil(hosts/served) passes, missed {:?}",
+            hosts
+                .iter()
+                .filter(|h| !ever_served.contains(h.as_str()))
+                .collect::<Vec<_>>()
+        );
+
+        // Without rotation the same three lead every pass, which is the
+        // starvation this exists to prevent.
+        let mut frozen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for _ in 0..4 {
+            for i in round_robin_by_peer(&hosts, 0).iter().take(SERVED_PER_PASS) {
+                frozen.insert(hosts[*i].as_str());
+            }
+        }
+        assert_eq!(frozen.len(), SERVED_PER_PASS);
+    }
+
+    #[test]
+    fn round_robin_handles_the_ordinary_shapes() {
+        // Empty, single, and one-each are the common cases — no reordering.
+        let empty: Vec<&str> = Vec::new();
+        assert!(round_robin_by_peer(&empty, 0).is_empty());
+        assert!(round_robin_by_peer(&empty, 7).is_empty());
+        assert_eq!(round_robin_by_peer(&["a"], 0), vec![0]);
+        // A cursor past the host count wraps, it does not panic.
+        assert_eq!(round_robin_by_peer(&["a"], 99), vec![0]);
+        assert_eq!(round_robin_by_peer(&["a", "b", "c"], 0), vec![0, 1, 2]);
+        // Rotated: the second host leads.
+        assert_eq!(round_robin_by_peer(&["a", "b", "c"], 1), vec![1, 2, 0]);
+        // Interleaved: round 1 takes a,b then round 2 takes a's second.
+        assert_eq!(round_robin_by_peer(&["a", "a", "b"], 0), vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn header_serve_walk_cost_is_counted_per_visited_height() {
+        // The per-tick height budget is only sound if a walk's cost is really
+        // the number of at_height calls. A from-genesis walk on a chain with
+        // one block per height visits one height per returned hash.
+        let mut walked = 0usize;
+        let out = collect_forward_headers("unknown", None, 512, |h| {
+            walked += 1;
+            if h <= 10 {
+                vec![format!("h{}", h)]
+            } else {
+                vec![]
+            }
+        });
+        assert_eq!(out.len(), 10);
+        assert_eq!(
+            walked, 11,
+            "ten populated heights plus the empty one that ends the walk"
+        );
+
+        // And a near-tip request is cheap — one height, which is why the
+        // budget counts heights and not just replies.
+        let mut walked_near = 0usize;
+        let _ = collect_forward_headers("tip", Some(100), 512, |h| {
+            walked_near += 1;
+            if h == 100 {
+                vec!["tip".to_string()]
+            } else {
+                vec![]
+            }
+        });
+        assert_eq!(walked_near, 2, "the tip height, then the empty one");
     }
 
     #[test]
