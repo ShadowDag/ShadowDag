@@ -316,6 +316,138 @@ fn pending_cap_rejects(prev_pending: usize, whitelisted: bool) -> bool {
     prev_pending >= MAX_PENDING_CONNECTIONS && !whitelisted
 }
 
+/// Wall-clock bound on ONE outbound dial.
+///
+/// `TcpStream::connect` has no timeout, so a blackholed address parks the dial
+/// thread for the OS SYN-retry window — about two minutes on Linux's default
+/// `tcp_syn_retries`. Kept under `MIN_REDIAL_INTERVAL_SECS` so a dial that
+/// times out is eligible again on a later reconnect cycle instead of being
+/// held off by the re-dial rate limit as well.
+const OUTBOUND_CONNECT_TIMEOUT_SECS: u64 = 10;
+const _: () = assert!(
+    OUTBOUND_CONNECT_TIMEOUT_SECS < MIN_REDIAL_INTERVAL_SECS,
+    "a dial must be able to time out and still be re-dialable on a later cycle"
+);
+
+/// Dial `addr`, bounding the connect at `timeout`.
+///
+/// Every address in the peer store parses as a `SocketAddr` —
+/// `is_routable_peer_addr` requires it before one is ever enqueued — so for
+/// those this resolves without touching DNS. A configured seed may still be a
+/// hostname, which `to_socket_addrs` resolves.
+///
+/// The timeout is a parameter so a test can observe that it reaches
+/// `connect_timeout`: plain `connect` would reject an unparseable address just
+/// the same, so nothing else distinguishes a bounded dial from an unbounded one
+/// without waiting out a real SYN-retry window.
+fn connect_within(addr: &str, timeout: Duration) -> std::io::Result<TcpStream> {
+    let target = addr
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "unresolvable peer address")
+        })?;
+    TcpStream::connect_timeout(&target, timeout)
+}
+
+/// Dial `addr` with the node's outbound connect bound.
+fn connect_with_timeout(addr: &str) -> std::io::Result<TcpStream> {
+    connect_within(addr, Duration::from_secs(OUTBOUND_CONNECT_TIMEOUT_SECS))
+}
+
+/// Whether the outbound slot budget is spent.
+///
+/// `in_use` counts live outbound connections AND dials still in flight, because
+/// a slot is reserved before the dial thread starts — which is what makes this
+/// bound the number of dial THREADS and not just the connection count.
+///
+/// Whitelisted seeds are exempt: a node must always be able to reach its
+/// configured seeds, the same rule every inbound gate follows.
+fn outbound_slots_full(in_use: usize, whitelisted: bool) -> bool {
+    !whitelisted && in_use >= MAX_PEERS
+}
+
+/// Releases an outbound dial's slot on EVERY exit path, including an unwinding
+/// panic.
+///
+/// The slot is taken before the dial thread starts and used to be released by
+/// a plain statement after `handle_peer_connection` returned, so any path that
+/// never returned kept the address marked "connected" for the life of the
+/// process. That was only a wasted re-dial while dials were unbounded. With
+/// `outbound_slots_full` above it would be a LOCKOUT: enough leaked slots and
+/// the node stops dialling anyone — exactly how the inbound pending cap left
+/// two testnet followers unable to accept their own seeds for 76 days. The
+/// guard therefore lands WITH the cap, not after it.
+struct OutboundSlot {
+    addr: String,
+}
+
+impl Drop for OutboundSlot {
+    fn drop(&mut self) {
+        CONNECTED_OUTBOUND.lock().remove(&self.addr);
+    }
+}
+
+/// Choose up to `deficit` dial candidates from a peer list of `len` entries,
+/// starting at `cursor`, and report where the next cycle should start.
+///
+/// The rotation is the point. `get_peers()` returns the store in lexicographic
+/// key order, so a budgeted loop that always started at the front would spend
+/// every cycle on whatever sorts first — and a peer that gossips addresses can
+/// choose that. Rotating means every stored address is reached within
+/// ceil(len / deficit) cycles: about 43 minutes for a full 16,384-entry store
+/// at MAX_PEERS per 10 s, and immediately for the seeds, which are dialled in
+/// their own earlier pass.
+///
+/// The walk stops after one full pass (`examined < len`) so a cycle in which
+/// nothing is due cannot spin.
+fn dial_window(
+    len: usize,
+    cursor: usize,
+    deficit: usize,
+    mut due: impl FnMut(usize) -> bool,
+) -> (Vec<usize>, usize) {
+    if len == 0 || deficit == 0 {
+        return (Vec::new(), cursor);
+    }
+    let start = cursor % len;
+    let mut picked = Vec::with_capacity(deficit.min(len));
+    let mut examined = 0usize;
+    while picked.len() < deficit && examined < len {
+        let i = (start + examined) % len;
+        examined += 1;
+        if due(i) {
+            picked.push(i);
+        }
+    }
+    (picked, (start + examined) % len)
+}
+
+/// Whether this stored peer is worth dialling on this reconnect cycle.
+///
+/// Extracted so the loop can run it over two passes — seeds, then everyone
+/// else — without repeating the conditions.
+fn reconnect_due(peers: &PeerManager, addr: &str) -> bool {
+    // Already connected, or a dial already in flight.
+    if CONNECTED_OUTBOUND.lock().contains(addr) {
+        return false;
+    }
+    // Never dial a banned peer (a stale ban or a real one): dialing it just
+    // gets rejected and re-bans via connection spam.
+    if peers.is_banned(addr) {
+        return false;
+    }
+    // Rate-limit re-dials of the same peer so a fast-failing target (banned,
+    // or our own IP self-connecting) doesn't churn.
+    if let Some(last) = LAST_DIAL.lock().get(addr) {
+        if last.elapsed() < Duration::from_secs(MIN_REDIAL_INTERVAL_SECS) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Whether we owe this peer a connection-puzzle solution.
 ///
 /// Solving is work WE pay for, so it is allowed only where the protocol
@@ -3027,7 +3159,9 @@ impl P2P {
         slog_info!("p2p", "connecting_to_peers", count => count);
 
         for addr in peer_list.into_iter().take(count) {
-            Self::spawn_outbound(addr, magic, known_peers.clone());
+            // The outbound cap lives inside spawn_outbound, so this startup
+            // pass needs no budget of its own.
+            let _ = Self::spawn_outbound(addr, magic, known_peers.clone());
         }
     }
 
@@ -3035,36 +3169,47 @@ impl P2P {
     /// CONNECTED_OUTBOUND so it is neither double-dialed nor left un-redialed.
     /// Skips peers already connected; frees the slot when the connection ends so
     /// the reconnect loop can re-dial. This is the unit of auto-reconnect.
-    fn spawn_outbound(addr: String, magic: [u8; 4], peers_snapshot: Vec<String>) {
+    ///
+    /// Reports whether a dial was actually started, so a caller can budget
+    /// DIALS rather than candidates. This is also the one choke point for the
+    /// outbound slot cap: enforcing it here covers every caller.
+    fn spawn_outbound(addr: String, magic: [u8; 4], peers_snapshot: Vec<String>) -> bool {
         // Never dial our own IP (identified via the identity-nonce self-check).
         // The seed list contains this node's own address; without this the node
         // wastes every dial re-connecting to itself instead of to real peers.
         if is_self_addr(&addr) {
-            return;
+            return false;
         }
         // Anti-eclipse: keep OUTBOUND links spread across /16 subnets so an
         // attacker owning one subnet can't occupy every outbound slot and
         // control our view of the chain. Whitelisted trusted seeds are exempt
         // (a node must always be able to reach its configured seeds); the limit
         // therefore constrains only untrusted peers.
-        if !crate::service::network::dos_guard::is_whitelisted(&addr)
-            && outbound_subnet_would_saturate(&addr)
-        {
+        let whitelisted = crate::service::network::dos_guard::is_whitelisted(&addr);
+        if !whitelisted && outbound_subnet_would_saturate(&addr) {
             slog_debug!("p2p", "outbound_subnet_diversity_skip", addr => &addr);
-            return;
+            return false;
         }
         // Reserve the slot up front (atomic check-and-insert) so two callers
-        // can't both dial the same peer.
+        // can't both dial the same peer, and refuse past the outbound budget in
+        // the same critical section so the count cannot be raced.
         {
             let mut set = CONNECTED_OUTBOUND.lock();
             if set.contains(&addr) {
-                return;
+                return false;
+            }
+            if outbound_slots_full(set.len(), whitelisted) {
+                slog_debug!("p2p", "outbound_slots_full", addr => &addr, in_use => set.len());
+                return false;
             }
             set.insert(addr.clone());
         }
         LAST_DIAL.lock().insert(addr.clone(), Instant::now());
         thread::spawn(move || {
-            match TcpStream::connect(&addr) {
+            // Owns the slot from here: released when this closure returns AND
+            // when it unwinds, which the statement at the end could not do.
+            let _slot = OutboundSlot { addr: addr.clone() };
+            match connect_with_timeout(&addr) {
                 Ok(stream) => {
                     slog_info!("p2p", "outbound_connected", addr => &addr);
                     if let Err(e) =
@@ -3077,39 +3222,56 @@ impl P2P {
                     slog_warn!("p2p", "outbound_connect_failed", addr => &addr, error => &e.to_string());
                 }
             }
-            // Connection ended or failed — free the slot for re-dial.
-            CONNECTED_OUTBOUND.lock().remove(&addr);
         });
+        true
     }
 
-    /// Background maintenance: every 15s, re-dial any known peer that has no live
+    /// Background maintenance: every 10s, re-dial any known peer that has no live
     /// outbound connection. Without this a node stays isolated after a restart,
     /// a dropped connection, or a transient refusal — which is exactly why forked
     /// nodes never reconverged. Runs for the life of the process.
+    ///
+    /// Dials are budgeted by the OUTBOUND DEFICIT, not by the size of the peer
+    /// store, and the budget is spent over a ROTATING window. This loop used to
+    /// call `spawn_outbound` for every stored peer on every tick — up to
+    /// `MAX_STORED_PEERS` = 16,384 of them, each an OS thread parked in an untimed
+    /// `connect` — while its sibling `connect_to_peers` had capped itself at
+    /// `MAX_PEERS` all along. A handshaked peer fills that store with
+    /// routable-looking dead addresses in about 17 `Addr` messages, and the store
+    /// is RocksDB-backed, so a restart did not clear it.
     fn spawn_reconnect_loop(&self) {
         let peers = Arc::clone(&self.peers);
         let magic = self.network_magic;
+        // Where the next cycle's dial window starts. Survives across cycles so
+        // the front of the store cannot monopolise the budget.
+        let mut cursor = 0usize;
         thread::spawn(move || loop {
-            thread::sleep(std::time::Duration::from_secs(10));
+            thread::sleep(Duration::from_secs(10));
             let known_snapshot = peers.get_addr_list_limited(100);
-            for addr in peers.get_peers() {
-                // Already connected — leave it.
-                if CONNECTED_OUTBOUND.lock().contains(&addr) {
-                    continue;
+            let known = peers.get_peers();
+
+            // Seeds first, and never gated by the deficit: they bypass the
+            // outbound cap, so a budget that stopped the scan before reaching
+            // one would be how a node loses contact with its own seeds.
+            for addr in known
+                .iter()
+                .filter(|a| crate::service::network::dos_guard::is_whitelisted(a))
+            {
+                if reconnect_due(&peers, addr) {
+                    let _ = Self::spawn_outbound(addr.clone(), magic, known_snapshot.clone());
                 }
-                // Never dial a banned peer (a stale ban or a real one): dialing
-                // it just gets rejected and re-bans via connection spam.
-                if peers.is_banned(&addr) {
-                    continue;
-                }
-                // Rate-limit re-dials of the same peer so a fast-failing target
-                // (banned, or our own IP self-connecting) doesn't churn.
-                if let Some(last) = LAST_DIAL.lock().get(&addr) {
-                    if last.elapsed() < std::time::Duration::from_secs(MIN_REDIAL_INTERVAL_SECS) {
-                        continue;
-                    }
-                }
-                Self::spawn_outbound(addr, magic, known_snapshot.clone());
+            }
+
+            // Then everyone else, up to the deficit. A slot is held from the
+            // moment a dial starts, so this bounds live connections plus dials
+            // in flight — and therefore dial threads — at MAX_PEERS.
+            let deficit = MAX_PEERS.saturating_sub(CONNECTED_OUTBOUND.lock().len());
+            let (picked, next) = dial_window(known.len(), cursor, deficit, |i| {
+                reconnect_due(&peers, &known[i])
+            });
+            cursor = next;
+            for i in picked {
+                let _ = Self::spawn_outbound(known[i].clone(), magic, known_snapshot.clone());
             }
         });
     }
@@ -3565,6 +3727,149 @@ mod tests {
             buf[0] = 0x42;
             Ok(1)
         }
+    }
+
+    // ── Sweep-3 #3: the reconnect loop may not dial the whole store ──────
+
+    #[test]
+    fn the_outbound_cap_holds_dials_at_max_peers_but_never_a_seed() {
+        // Below the cap nobody is refused.
+        assert!(!outbound_slots_full(0, false));
+        assert!(!outbound_slots_full(MAX_PEERS - 1, false));
+        // At and above it an ordinary peer is refused. `in_use` counts dials
+        // still in flight, so this is what bounds the THREAD count: the loop
+        // used to spawn one per stored peer, up to MAX_STORED_PEERS.
+        assert!(outbound_slots_full(MAX_PEERS, false));
+        assert!(outbound_slots_full(usize::MAX, false));
+        assert!(
+            MAX_PEERS * 100
+                < crate::service::network::p2p::peer_manager::MAX_STORED_PEERS as usize,
+            "the cap must be far below what the store can hold, or it bounds nothing"
+        );
+        // A trusted seed is never refused: a node must always be able to reach
+        // its configured seeds.
+        assert!(!outbound_slots_full(MAX_PEERS, true));
+        assert!(!outbound_slots_full(usize::MAX, true));
+    }
+
+    #[test]
+    fn the_dial_window_reaches_every_stored_peer_despite_a_flooder() {
+        // 300 stored addresses, 64 dials a cycle: a budgeted loop that always
+        // started at the front would spend every cycle on the first 64, which
+        // a peer that gossips addresses gets to choose (the store is returned
+        // in lexicographic key order).
+        const LEN: usize = 300;
+        const DEFICIT: usize = MAX_PEERS;
+        let mut cursor = 0usize;
+        let mut ever: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        // ceil(300/64) = 5 cycles must cover all of it.
+        for _ in 0..5 {
+            let (picked, next) = dial_window(LEN, cursor, DEFICIT, |_| true);
+            assert_eq!(picked.len(), DEFICIT);
+            for i in picked {
+                ever.insert(i);
+            }
+            cursor = next;
+        }
+        assert_eq!(
+            ever.len(),
+            LEN,
+            "every stored peer must be reached; missed {}",
+            LEN - ever.len()
+        );
+
+        // Frozen at the front, the same 64 are picked forever — the starvation
+        // the rotation exists to prevent.
+        let mut frozen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for _ in 0..5 {
+            for i in dial_window(LEN, 0, DEFICIT, |_| true).0 {
+                frozen.insert(i);
+            }
+        }
+        assert_eq!(frozen.len(), DEFICIT);
+    }
+
+    #[test]
+    fn the_dial_window_is_total_and_cannot_spin() {
+        // Nothing due: one pass, no picks, and the cursor still advances so the
+        // next cycle looks elsewhere.
+        let (picked, next) = dial_window(10, 0, 4, |_| false);
+        assert!(picked.is_empty());
+        assert_eq!(next, 0, "a full pass of 10 from 0 wraps back to 0");
+        // Only one entry due, repeatedly picked without exhausting the walk.
+        let (picked, _) = dial_window(10, 0, 4, |i| i == 7);
+        assert_eq!(picked, vec![7]);
+        // Degenerate inputs: an empty store, a zero budget, a cursor past the end.
+        assert_eq!(dial_window(0, 5, 4, |_| true), (Vec::new(), 5));
+        assert_eq!(dial_window(10, 3, 0, |_| true), (Vec::new(), 3));
+        let (picked, _) = dial_window(4, 99, 2, |_| true);
+        assert_eq!(picked, vec![3, 0], "a cursor past the end wraps, not panics");
+    }
+
+    #[test]
+    fn an_outbound_slot_is_released_even_when_the_dial_thread_panics() {
+        // The slot is reserved BEFORE the dial thread starts and used to be
+        // released by a plain statement at the end, so an unwinding panic kept
+        // the address marked connected forever. Harmless while dials were
+        // unbounded; with the cap above it is a lockout.
+        let addr = "203.0.113.151:19333".to_string();
+        CONNECTED_OUTBOUND.lock().insert(addr.clone());
+        assert!(CONNECTED_OUTBOUND.lock().contains(&addr));
+
+        let moved = addr.clone();
+        let joined = thread::spawn(move || {
+            let _slot = OutboundSlot { addr: moved };
+            panic!("connect blew up");
+        })
+        .join();
+        assert!(joined.is_err(), "the thread must actually have panicked");
+        assert!(
+            !CONNECTED_OUTBOUND.lock().contains(&addr),
+            "a panicking dial thread must still release its outbound slot"
+        );
+    }
+
+    #[test]
+    fn an_outbound_slot_is_released_on_an_ordinary_return() {
+        let addr = "203.0.113.152:19333".to_string();
+        CONNECTED_OUTBOUND.lock().insert(addr.clone());
+        {
+            let _slot = OutboundSlot { addr: addr.clone() };
+            assert!(CONNECTED_OUTBOUND.lock().contains(&addr));
+        }
+        assert!(!CONNECTED_OUTBOUND.lock().contains(&addr));
+    }
+
+    #[test]
+    fn a_bounded_dial_resolves_a_stored_address_and_rejects_garbage() {
+        // The happy path: every stored address is "ip:port" (is_routable_peer_addr
+        // requires it), so this resolves with no DNS and connects.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local listener");
+        let target = listener.local_addr().expect("local addr").to_string();
+        let stream = connect_with_timeout(&target).expect("a bounded dial must still connect");
+        assert_eq!(
+            stream.peer_addr().expect("peer addr").to_string(),
+            target
+        );
+
+        // An address that cannot even be parsed fails immediately, without a
+        // DNS lookup and without waiting out the connect timeout.
+        let err = connect_with_timeout("not-an-address").expect_err("must not resolve");
+        assert!(
+            !err.to_string().is_empty(),
+            "the unresolvable arm must report why"
+        );
+
+        // The timeout really does reach `connect_timeout`: it rejects a zero
+        // duration, so an unbounded `connect` would have SUCCEEDED here against
+        // the live listener above. This is the only thing that distinguishes a
+        // bounded dial from an unbounded one without waiting out a real
+        // SYN-retry window.
+        assert!(
+            connect_within(&target, Duration::ZERO).is_err(),
+            "the timeout must be passed through to connect_timeout"
+        );
     }
 
     // ── Sweep-3 #2: one peer may not own the header-serve queue ──────────
