@@ -1657,29 +1657,14 @@ pub fn push_pending_tx(peer_id: &str, tx: Transaction) -> bool {
     true
 }
 
-/// Extract IP from a peer address string (ip:port), handling IPv4 and IPv6.
-/// Formats: "1.2.3.4:9333", "[::1]:9333", "::1"
-/// Public so the daemon's header-serve fairness can key on the same host
-/// identity the queue quota and the accept gates use, instead of
-/// reimplementing the IPv4/IPv6/bracketed forms.
+/// The host a peer address belongs to: "1.2.3.4:9333", "[::1]:9333", "::1".
+///
+/// Delegates to `dos_guard::host_key` so the accept gates, the per-host queue
+/// quotas, the daemon's serve fairness and the ban records cannot disagree
+/// about what one host is. Three separate implementations of this existed and
+/// each handled a bare IPv6 literal differently.
 pub fn extract_ban_ip(addr: &str) -> String {
-    // Try parsing as SocketAddr (handles all formats correctly)
-    if let Ok(sa) = addr.parse::<SocketAddr>() {
-        return sa.ip().to_string();
-    }
-    // Bracketed IPv6: [::1]:9333
-    if addr.starts_with('[') {
-        if let Some(end) = addr.find(']') {
-            return addr[1..end].to_string();
-        }
-    }
-    // IPv4: 1.2.3.4:9333 — split on last ':'
-    if let Some(pos) = addr.rfind(':') {
-        if addr[pos + 1..].chars().all(|c| c.is_ascii_digit()) {
-            return addr[..pos].to_string();
-        }
-    }
-    addr.to_string()
+    crate::service::network::dos_guard::host_key(addr).to_string()
 }
 
 /// One round of DoS-guard maintenance: decay every peer's ban score toward 0,
@@ -1694,23 +1679,19 @@ fn maintain_dos_guard(dos: &DosGuard) {
 
 /// Report a bad TX/block to the DoS guard (called by event loop on rejection).
 /// Closes the feedback loop: event_loop → ban_score → P2P disconnects peer.
-/// Bans both the full ip:port key AND the IP-only key so reconnecting with a
-/// new ephemeral port does not bypass the ban.
+///
+/// One call, because the guard now keys reputation on the host itself. This
+/// used to score the ip:port key and then the IP separately so a reconnect on
+/// a fresh port could not start from zero; with the key normalised inside the
+/// guard, the second call is the same record again and would double every
+/// penalty.
 pub fn report_bad_peer(peer_id: &str, score: u64, reason: &str) {
     DOS_GUARD.add_ban_score(peer_id, score, reason);
-    let ip_key = extract_ban_ip(peer_id);
-    if ip_key != peer_id {
-        DOS_GUARD.add_ban_score(&ip_key, score, reason);
-    }
 }
 
 /// Categorized version of report_bad_peer for callers that know the offense type.
 pub fn report_bad_peer_cat(peer_id: &str, score: u64, reason: &str, category: BanCategory) {
     DOS_GUARD.add_ban_score_cat(peer_id, score, reason, category);
-    let ip_key = extract_ban_ip(peer_id);
-    if ip_key != peer_id {
-        DOS_GUARD.add_ban_score_cat(&ip_key, score, reason, category);
-    }
 }
 
 /// Push a message to be broadcast to all connected peers.
@@ -2410,8 +2391,6 @@ impl P2P {
             .peer_addr()
             .map_err(|e| NetworkError::ConnectionFailed(format!("No peer addr: {}", e)))?;
         let peer_str = peer_addr.to_string();
-        // IP-only key for ban scoring — ephemeral port changes on reconnect
-        let peer_ip = peer_addr.ip().to_string();
         // Held for the whole connection, so every exit path takes the cursor
         // with it — the sixteen early returns between here and the main loop
         // included, and a panic too. The sequence is read before the guard
@@ -2476,12 +2455,6 @@ impl P2P {
                             "invalid puzzle solution",
                             BanCategory::Malicious,
                         );
-                        DOS_GUARD.add_ban_score_cat(
-                            &peer_ip,
-                            100,
-                            "invalid puzzle solution",
-                            BanCategory::Malicious,
-                        );
                         return Err(NetworkError::ConnectionFailed(format!(
                             "Invalid puzzle solution from {}",
                             peer_str
@@ -2495,12 +2468,6 @@ impl P2P {
                 Ok((_, cmd, _)) => {
                     DOS_GUARD.add_ban_score_cat(
                         &peer_str,
-                        50,
-                        "expected puzzle solution",
-                        BanCategory::Malicious,
-                    );
-                    DOS_GUARD.add_ban_score_cat(
-                        &peer_ip,
                         50,
                         "expected puzzle solution",
                         BanCategory::Malicious,
@@ -2521,12 +2488,6 @@ impl P2P {
                     // stranger could declare Block and have us allocate 4 MiB.
                     DOS_GUARD.add_ban_score_cat(
                         &peer_str,
-                        ban_score,
-                        &reason,
-                        category_for_score(ban_score),
-                    );
-                    DOS_GUARD.add_ban_score_cat(
-                        &peer_ip,
                         ban_score,
                         &reason,
                         category_for_score(ban_score),
@@ -2612,15 +2573,6 @@ impl P2P {
                             ),
                             BanCategory::Malformed,
                         );
-                        DOS_GUARD.add_ban_score_cat(
-                            &peer_ip,
-                            20,
-                            &format!(
-                                "non-Version first message ({}), expected puzzle or Version",
-                                cmd
-                            ),
-                            BanCategory::Malformed,
-                        );
                     }
                     if cmd == CommandId::Version {
                         // Version is part of handshake — dispatch it
@@ -2647,12 +2599,6 @@ impl P2P {
                 }) => {
                     DOS_GUARD.add_ban_score_cat(
                         &peer_str,
-                        ban_score,
-                        &reason,
-                        category_for_score(ban_score),
-                    );
-                    DOS_GUARD.add_ban_score_cat(
-                        &peer_ip,
                         ban_score,
                         &reason,
                         category_for_score(ban_score),
@@ -2700,12 +2646,6 @@ impl P2P {
                             "bandwidth abuse (>100MB/min)",
                             BanCategory::Resource,
                         );
-                        DOS_GUARD.add_ban_score_cat(
-                            &peer_ip,
-                            50,
-                            "bandwidth abuse (>100MB/min)",
-                            BanCategory::Resource,
-                        );
                         slog_warn!("p2p", "bandwidth_abuse_disconnect", addr => &peer_str, bytes_per_min => session.bytes_this_window);
                         break;
                     }
@@ -2724,15 +2664,6 @@ impl P2P {
                         };
                         DOS_GUARD.add_ban_score_cat(
                             &peer_str,
-                            score,
-                            &format!(
-                                "lifecycle violation #{}: {}",
-                                session.lifecycle_violations, pe
-                            ),
-                            cat,
-                        );
-                        DOS_GUARD.add_ban_score_cat(
-                            &peer_ip,
                             score,
                             &format!(
                                 "lifecycle violation #{}: {}",
@@ -2804,12 +2735,6 @@ impl P2P {
                     // the Disconnecting state, which is already ending.
                     DOS_GUARD.add_ban_score_cat(
                         &peer_str,
-                        ban_score,
-                        &reason,
-                        category_for_score(ban_score),
-                    );
-                    DOS_GUARD.add_ban_score_cat(
-                        &peer_ip,
                         ban_score,
                         &reason,
                         category_for_score(ban_score),
@@ -2925,21 +2850,12 @@ impl P2P {
             if lag > MAX_OUTBOUND_LAG_SEQS
                 && !crate::service::network::dos_guard::is_whitelisted(peer_str)
             {
-                let ip_key = extract_ban_ip(peer_str);
                 DOS_GUARD.add_ban_score_cat(
                     peer_str,
                     25,
                     "excessive outbound lag; disconnecting slow peer",
                     BanCategory::Resource,
                 );
-                if ip_key != peer_str {
-                    DOS_GUARD.add_ban_score_cat(
-                        &ip_key,
-                        25,
-                        "excessive outbound lag; disconnecting slow peer",
-                        BanCategory::Resource,
-                    );
-                }
                 slog_warn!("p2p", "disconnecting_lagging_peer",
                     peer => peer_str,
                     lag_seqs => lag,
@@ -4359,18 +4275,33 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_evicts_cleared_dos_records() {
-        // Two tracked-but-cleared peers (score 0, not banned) must be evicted by
-        // one maintenance round — the wiring that keeps the ban table bounded.
+    fn maintenance_decays_then_evicts_in_one_round() {
+        // The pass is composed decay-THEN-evict so a peer that has served out
+        // its penalty is dropped from the table the same tick. It used to be
+        // handed two records that were ALREADY at score 0, created as a side
+        // effect of ASKING whether they were banned — so it never exercised the
+        // decay at all, and the moment asking stopped creating records it had
+        // nothing to evict and failed on its own setup.
         let g = DosGuard::new();
-        g.check("p_a", &MsgType::Ping, 10);
-        g.check("p_b", &MsgType::Ping, 10);
+        g.add_ban_score_cat("198.51.100.21", 10, "minor", BanCategory::Resource);
+        g.add_ban_score_cat("198.51.100.22", 10, "minor", BanCategory::Resource);
         assert_eq!(g.stats().tracked_peers, 2);
+
+        // Ten minutes of decay owed on one of them: Resource sheds 5 a minute,
+        // so its 10 points are gone and the evict half of the same round must
+        // see a cleared record.
+        assert!(g.backdate_decay("198.51.100.21", 600));
         maintain_dos_guard(&g);
+
         assert_eq!(
             g.stats().tracked_peers,
-            0,
-            "maintenance must decay + evict cleared DoS records"
+            1,
+            "a record whose score decayed to 0 must go in the same round"
+        );
+        assert!(g.get_ban_info("198.51.100.21").is_none());
+        assert!(
+            g.get_ban_info("198.51.100.22").is_some(),
+            "and one that still owes score must stay"
         );
     }
 
@@ -4525,6 +4456,34 @@ mod tests {
         assert_eq!(dial_window(10, 3, 0, |_| true), (Vec::new(), 3));
         let (picked, _) = dial_window(4, 99, 2, |_| true);
         assert_eq!(picked, vec![3, 0], "a cursor past the end wraps, not panics");
+    }
+
+    // ── the ban key is the host, so one offence must score once ───────────
+
+    #[test]
+    fn one_offence_scores_once_now_that_the_key_is_the_host() {
+        // report_bad_peer used to score the `ip:port` key and then the IP
+        // separately, so a reconnect on a fresh ephemeral port could not start
+        // from zero. With the key normalised inside the guard both calls land
+        // on the SAME record, and the second would double every penalty: a
+        // 50-point offence would autoban on the first strike instead of the
+        // second, and the eight pre-handshake arms scored 100 twice. Uses a
+        // documentation-range address of its own, because DOS_GUARD is global.
+        let peer = "192.0.2.50:51234";
+        report_bad_peer(peer, 40, "bad block");
+        assert_eq!(DOS_GUARD.get_ban_score(peer), 40, "40 points, scored once");
+
+        report_bad_peer_cat(peer, 40, "bad tx", BanCategory::Malformed);
+        assert_eq!(DOS_GUARD.get_ban_score(peer), 80);
+        assert!(
+            !DOS_GUARD.is_banned(peer),
+            "two 40-point strikes are still under the autoban threshold"
+        );
+
+        // And the record is the host's, so the ban the third strike earns
+        // cannot be shed by reconnecting from another port.
+        report_bad_peer(peer, 40, "bad block");
+        assert!(DOS_GUARD.is_banned("192.0.2.50:7777"));
     }
 
     // ── the targeted queue: bounded per peer, and nothing outlives its peer ──
