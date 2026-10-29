@@ -350,6 +350,46 @@ static PENDING_BLOCK_REQUESTS: Lazy<Arc<PlMutex<Vec<(String, String)>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(256))));
 const MAX_BLOCK_REQUEST_QUEUE: usize = 5_000;
 
+/// Block-serve requests accepted per SOURCE IP since the last drain.
+///
+/// Keyed on the IP for the same reason as `HEADER_REQUESTS_PER_IP`: the share
+/// belongs to the host, and the port is the attacker's to choose. Cleared
+/// wholesale by `drain_block_requests`, so there is nothing to decrement and no
+/// counter can outlive the requests it counts.
+static BLOCK_REQUESTS_PER_IP: Lazy<Arc<PlMutex<HashMap<String, usize>>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(HashMap::new())));
+
+/// Max block-serve requests ONE source IP may hold in the queue per drain
+/// window.
+///
+/// The queue had only the global cap, so one legal GetData of `MAX_INV_PER_MSG`
+/// block hashes filled all 5,000 entries by itself and every other peer's
+/// GetBlock was refused at the push until the next drain — the fleet's own
+/// seeds included. The sibling header queue was given this share in fab1e19;
+/// the block queue never got it.
+///
+/// Sized by the largest burst an honest peer can legitimately send: a peer
+/// catching up answers one of our Headers replies with at most
+/// `MAX_PENDING_BLOCKS_PER_PEER` individual GetBlock messages, because that is
+/// the bound our own Headers arm requests under.
+/// Public so the daemon's per-pass serve budget can be checked against it. A
+/// budget below this burst is the defect an adversarial review caught here, and
+/// a cross-module invariant with no check is how it got written in the first
+/// place.
+pub const MAX_BLOCK_REQUESTS_PER_IP: usize = MAX_PENDING_BLOCKS_PER_PEER as usize;
+
+/// How much of the block-request queue strangers may fill between drains. The
+/// remainder — two full bursts — is reachable only by a whitelisted peer, so a
+/// flood cannot squeeze the fleet's own seeds out of the queue at push time.
+/// Two rather than five because one burst is six times larger here than on the
+/// header path: a seed needs one burst in flight and one arriving.
+const BLOCK_QUEUE_STRANGER_CAP: usize =
+    MAX_BLOCK_REQUEST_QUEUE - MAX_BLOCK_REQUESTS_PER_IP * 2;
+const _: () = assert!(
+    BLOCK_QUEUE_STRANGER_CAP > MAX_BLOCK_REQUESTS_PER_IP,
+    "strangers must still be able to fill more than one burst between drains"
+);
+
 /// Orphan blocks: received blocks whose parent is not yet known, buffered for
 /// reprocessing once the missing ancestor arrives. (peer_id, block). Bounded.
 #[allow(clippy::type_complexity)]
@@ -1010,29 +1050,58 @@ pub fn drain_received_addrs() -> Vec<String> {
     std::mem::take(&mut *RECEIVED_ADDRS.lock())
 }
 
+/// Whether a block-serve request must be refused at the push.
+///
+/// A whitelisted seed is bounded only by the global cap: counted, but never
+/// refused while there is room at all. A stranger is bounded both by its own
+/// per-host share and by the stranger cap, which reserves the remainder so one
+/// flood cannot take the queue the seeds need.
+fn block_request_rejects(whitelisted: bool, queued_for_ip: usize, queued_total: usize) -> bool {
+    if whitelisted {
+        return queued_total >= MAX_BLOCK_REQUEST_QUEUE;
+    }
+    queued_total >= BLOCK_QUEUE_STRANGER_CAP || queued_for_ip >= MAX_BLOCK_REQUESTS_PER_IP
+}
+
 /// Queue a peer's block-serve request. The GetBlock/GetData handlers call this;
 /// the daemon event loop drains it and serves the block from the BlockStore.
 pub fn push_block_request(peer_id: &str, hash: &str) {
-    let mut q = PENDING_BLOCK_REQUESTS.lock();
-    if q.len() < MAX_BLOCK_REQUEST_QUEUE {
-        q.push((peer_id.to_string(), hash.to_string()));
-    }
+    push_block_requests(peer_id, vec![hash.to_string()]);
 }
 
 /// Queue a batch of block-serve requests under ONE lock.
 ///
 /// A GetData carries up to `MAX_INV_PER_MSG` hashes, and pushing them one at a
 /// time took the request queue's lock once per hash.
+///
+/// LOCK ORDER: PENDING_BLOCK_REQUESTS first, then BLOCK_REQUESTS_PER_IP. The
+/// whitelist is consulted BEFORE either, so neither guard is held across it.
 pub fn push_block_requests(peer_id: &str, hashes: Vec<String>) {
     if hashes.is_empty() {
         return;
     }
-    let mut q = PENDING_BLOCK_REQUESTS.lock();
-    for hash in hashes {
-        if q.len() >= MAX_BLOCK_REQUEST_QUEUE {
-            break;
+    let ip = extract_ban_ip(peer_id);
+    let whitelisted = crate::service::network::dos_guard::is_whitelisted(&ip);
+    let offered = hashes.len();
+    let mut queued = 0usize;
+    {
+        let mut q = PENDING_BLOCK_REQUESTS.lock();
+        let mut per_ip = BLOCK_REQUESTS_PER_IP.lock();
+        for hash in hashes {
+            let for_ip = per_ip.get(&ip).copied().unwrap_or(0);
+            if block_request_rejects(whitelisted, for_ip, q.len()) {
+                break;
+            }
+            q.push((peer_id.to_string(), hash));
+            *per_ip.entry(ip.clone()).or_insert(0) += 1;
+            queued += 1;
         }
-        q.push((peer_id.to_string(), hash));
+    }
+    if queued < offered {
+        slog_debug!("p2p", "block_requests_dropped",
+            peer => peer_id,
+            offered => offered,
+            queued => queued);
     }
 }
 
@@ -1087,9 +1156,55 @@ fn blocks_to_request<'a>(
     out
 }
 
+/// Put block-serve requests a pass could not reach back at the FRONT of the
+/// queue, so a per-pass budget defers work instead of destroying it.
+///
+/// Without this the remainder of a pass was simply dropped, and the requester
+/// has no in-flight ledger and no retry for an unanswered GetBlock: it re-asks
+/// only when its next GetHeaders round returns the same range. A budget that
+/// drops is a throughput ceiling of (budget / round interval); a budget that
+/// defers is a rate limit, which is what was wanted.
+///
+/// The per-IP shares are re-counted because the drain cleared them: these
+/// requests occupy queue space in the NEW window, so they must be charged to it
+/// or a host could hold more than its share by being deferred.
+///
+/// LOCK ORDER: PENDING_BLOCK_REQUESTS first, then BLOCK_REQUESTS_PER_IP.
+pub fn requeue_block_requests(items: Vec<(String, String)>) {
+    if items.is_empty() {
+        return;
+    }
+    let mut q = PENDING_BLOCK_REQUESTS.lock();
+    let mut per_ip = BLOCK_REQUESTS_PER_IP.lock();
+    let available = MAX_BLOCK_REQUEST_QUEUE.saturating_sub(q.len());
+    let mut kept: Vec<(String, String)> = Vec::with_capacity(items.len().min(available));
+    let mut dropped = 0usize;
+    for (peer_id, hash) in items {
+        if kept.len() >= available {
+            dropped = dropped.saturating_add(1);
+            continue;
+        }
+        *per_ip.entry(extract_ban_ip(&peer_id)).or_insert(0) += 1;
+        kept.push((peer_id, hash));
+    }
+    if dropped > 0 {
+        slog_warn!("p2p", "block_requests_requeue_dropped", dropped => dropped);
+    }
+    let mut combined = kept;
+    combined.append(&mut q);
+    *q = combined;
+}
+
 /// Drain queued block-serve requests (call from the node main loop).
+///
+/// LOCK ORDER: PENDING_BLOCK_REQUESTS first, then BLOCK_REQUESTS_PER_IP, which
+/// is cleared with the queue so a share cannot outlive the requests it counted.
 pub fn drain_block_requests() -> Vec<(String, String)> {
-    std::mem::take(&mut *PENDING_BLOCK_REQUESTS.lock())
+    let mut q = PENDING_BLOCK_REQUESTS.lock();
+    let mut per_ip = BLOCK_REQUESTS_PER_IP.lock();
+    let taken = std::mem::take(&mut *q);
+    per_ip.clear();
+    taken
 }
 
 /// Buffer an orphan block (parent not yet known) for reprocessing once the
@@ -2411,11 +2526,14 @@ impl P2P {
                     // established peer's slow bulk transfer.
                     if session.is_established() {
                         reader.get_mut().disarm();
-                        // Once per connection: the store has no other way to
-                        // learn that an address is real, and until it did, its
-                        // capacity eviction had to choose blindly and every
-                        // peer looked permanently inactive.
-                        if !marked_tried {
+                        // Once per OUTBOUND connection: peer_str is then the
+                        // address we dialled, which is the key the store holds
+                        // the record under. On an inbound connection it is the
+                        // peer's ephemeral source port instead, so the mark
+                        // would land on no record at all — an orphan key in a
+                        // prefix with no cap and no deleter, and a signal the
+                        // eviction ranking could not use.
+                        if outbound && !marked_tried {
                             marked_tried = true;
                             peers.mark_tried(&peer_str);
                         }
@@ -4714,6 +4832,140 @@ mod tests {
                 MAX_HEADER_REQUESTS_PER_IP
                     >= crate::config::consensus::consensus_params::ConsensusParams::MAX_PARENTS,
                 "the header-request quota would clip the per-tip sync sweep"
+            )
+        };
+    }
+
+    #[test]
+    fn one_peer_cannot_fill_the_block_queue_and_a_seed_keeps_its_room() {
+        // Uses the real globals, so it owns the block-request queue for its
+        // duration: it is the only test that touches PENDING_BLOCK_REQUESTS.
+        let flooder = "203.0.113.61:40001";
+        // Same host, another socket: the share is per IP, so this shares the
+        // flooder's rather than doubling it.
+        let flooder_second_socket = "203.0.113.61:40002";
+        let honest = "198.51.100.62:40002";
+        let _ = drain_block_requests(); // start from a known-empty queue
+
+        // One legal GetData carries up to MAX_INV_PER_MSG hashes, which used to
+        // fill all 5,000 entries by itself.
+        let flood: Vec<String> = (0..MAX_INV_PER_MSG).map(|i| format!("{:064x}", i)).collect();
+        push_block_requests(flooder, flood);
+        let more: Vec<String> = (0..MAX_BLOCK_REQUESTS_PER_IP)
+            .map(|i| format!("{:064x}", i + MAX_INV_PER_MSG))
+            .collect();
+        push_block_requests(flooder_second_socket, more);
+        // An honest peer asking afterwards must still be queued.
+        push_block_request(honest, &format!("{:064x}", 999_999));
+
+        let queued = drain_block_requests();
+        let flooder_queued = queued
+            .iter()
+            .filter(|(p, _)| p == flooder || p == flooder_second_socket)
+            .count();
+        let honest_queued = queued.iter().filter(|(p, _)| p == honest).count();
+        assert_eq!(
+            flooder_queued, MAX_BLOCK_REQUESTS_PER_IP,
+            "one HOST must hold at most its share across all of its sockets"
+        );
+        assert_eq!(
+            honest_queued, 1,
+            "and a peer asking after the flood must still get in"
+        );
+        assert!(
+            queued.len() < MAX_BLOCK_REQUEST_QUEUE,
+            "the queue must not have been filled at all"
+        );
+
+        // The share is per drain WINDOW, so the drain above must have reopened
+        // it: a counter that outlived the requests it counted would lock the
+        // flooder out for ever, which is the stale-counter failure the header
+        // queue avoids by clearing the map wholesale.
+        push_block_request(flooder, &format!("{:064x}", 1_000_000));
+        let after = drain_block_requests();
+        assert_eq!(
+            after.iter().filter(|(p, _)| p == flooder).count(),
+            1,
+            "the per-host share must reopen once the queue is drained"
+        );
+    }
+
+    #[test]
+    fn a_spent_block_serve_budget_defers_the_remainder_instead_of_dropping_it() {
+        // The defect this fixes: the un-served remainder of a pass was a local
+        // Vec that simply went out of scope. The requester has no in-flight
+        // ledger and no retry for an unanswered GetBlock, so a dropped request
+        // is only re-asked on its next GetHeaders round — which turned a
+        // per-pass budget into a hard ceiling on sync throughput.
+        let peer = "203.0.113.71:40001";
+        let _ = drain_block_requests();
+
+        push_block_requests(
+            peer,
+            (0..4).map(|i| format!("{:064x}", i)).collect::<Vec<_>>(),
+        );
+        let taken = drain_block_requests();
+        assert_eq!(taken.len(), 4);
+
+        // A pass serves the first two and defers the rest.
+        let deferred: Vec<(String, String)> = taken[2..].to_vec();
+        // New work arrives before the requeue, as it would in the live loop.
+        push_block_request(peer, &format!("{:064x}", 99));
+        requeue_block_requests(deferred);
+
+        let next = drain_block_requests();
+        assert_eq!(next.len(), 3, "nothing may be lost");
+        assert_eq!(
+            next[0].1,
+            format!("{:064x}", 2),
+            "deferred work must come back at the FRONT, or it starves behind \
+             whatever arrived while the pass was running"
+        );
+        assert_eq!(next[1].1, format!("{:064x}", 3));
+
+        // And the deferred requests are charged to the new window, so being
+        // deferred cannot let a host hold more than its share.
+        let _ = drain_block_requests();
+        push_block_requests(
+            peer,
+            (0..MAX_BLOCK_REQUESTS_PER_IP)
+                .map(|i| format!("{:064x}", i))
+                .collect::<Vec<_>>(),
+        );
+        let full = drain_block_requests();
+        requeue_block_requests(full);
+        push_block_request(peer, &format!("{:064x}", 123_456));
+        let after = drain_block_requests();
+        assert_eq!(
+            after.len(),
+            MAX_BLOCK_REQUESTS_PER_IP,
+            "a deferred host is still held to its share in the new window"
+        );
+    }
+
+    #[test]
+    fn the_block_queue_reserves_room_only_a_seed_can_reach() {
+        // A stranger is cut off at the stranger cap; a whitelisted seed is
+        // bounded only by the global cap. Counted, never refused.
+        assert!(!block_request_rejects(false, 0, 0));
+        assert!(block_request_rejects(
+            false,
+            MAX_BLOCK_REQUESTS_PER_IP,
+            0
+        ));
+        assert!(block_request_rejects(false, 0, BLOCK_QUEUE_STRANGER_CAP));
+        assert!(
+            !block_request_rejects(true, MAX_BLOCK_REQUESTS_PER_IP * 9, BLOCK_QUEUE_STRANGER_CAP),
+            "a seed is past both stranger bounds and must still be accepted"
+        );
+        assert!(
+            block_request_rejects(true, 0, MAX_BLOCK_REQUEST_QUEUE),
+            "but not past the global cap"
+        );
+        const {
+            assert!(
+                BLOCK_QUEUE_STRANGER_CAP < MAX_BLOCK_REQUEST_QUEUE,
+                "there must be room a stranger cannot take"
             )
         };
     }

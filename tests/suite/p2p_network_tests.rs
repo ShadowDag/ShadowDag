@@ -139,35 +139,43 @@ mod tests {
     // ── 11. addr_list — store and retrieve addresses ──────────────────────
     #[test]
     fn addr_list_store_and_retrieve() {
-        // The advertise list is served from the peer table, not from the
-        // parallel `addr:` table: the live Addr ingest calls add_peer, so
-        // `addr:` only ever held the configured seeds and we could advertise
-        // nothing we had learned.
+        // The advertise list holds the peers we have DIALLED and handshaked.
+        // Not the legacy `addr:` table, which only bootstrap wrote, and not
+        // every `peer:` record in key order, which let a peer gossiping
+        // low-sorting addresses choose what we advertise.
         let pm = tmp_pm("addr_list");
-        pm.add_peer("192.0.2.1:8333").unwrap();
-        pm.add_peer("192.0.2.2:8333").unwrap();
-        pm.add_peer("192.0.2.3:8333").unwrap();
+        for a in ["192.0.2.1:8333", "192.0.2.2:8333", "192.0.2.3:8333"] {
+            pm.add_peer(a).unwrap();
+            pm.mark_tried(a);
+        }
         let addrs = pm.get_addr_list();
         assert!(addrs.len() >= 3, "Must retrieve at least 3 addresses");
     }
 
-    // ── 12. every ingested address becomes advertisable ───────────────────
+    // ── 12. only addresses we reached ourselves are advertised ────────────
     #[test]
-    fn every_ingested_address_can_be_advertised() {
-        // What `add_addr_batch` used to be asserted on. It writes the legacy
-        // `addr:` table, which no longer has a reader; what matters is that an
-        // address taken in from a peer can be handed on to another peer, which
-        // is what makes topology healing possible at all.
+    fn only_addresses_we_dialled_are_advertised() {
+        // An address we have merely been TOLD about must not be passed on: that
+        // is what stopped a peer from choosing the contents of our Addr
+        // messages. One we dialled and handshaked is exactly what is worth
+        // telling other peers about, and what lets the topology heal.
         let pm = tmp_pm("batch_addr");
         let batch: Vec<String> = (0..10).map(|i| format!("10.7.0.{}:8333", i)).collect();
         for addr in &batch {
             pm.add_peer(addr).unwrap();
         }
+        assert!(
+            pm.get_addr_list().is_empty(),
+            "gossiped addresses must not be advertisable"
+        );
+        for addr in &batch {
+            pm.mark_tried(addr);
+        }
         let addrs = pm.get_addr_list();
         for addr in &batch {
             assert!(
                 addrs.contains(addr),
-                "ingested addr {} must be advertisable",
+                "a peer we dialled ({}) must be advertisable",
                 addr
             );
         }
