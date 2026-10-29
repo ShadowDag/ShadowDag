@@ -139,23 +139,37 @@ mod tests {
     // ── 11. addr_list — store and retrieve addresses ──────────────────────
     #[test]
     fn addr_list_store_and_retrieve() {
+        // The advertise list is served from the peer table, not from the
+        // parallel `addr:` table: the live Addr ingest calls add_peer, so
+        // `addr:` only ever held the configured seeds and we could advertise
+        // nothing we had learned.
         let pm = tmp_pm("addr_list");
-        pm.store_addr("192.0.2.1:8333");
-        pm.store_addr("192.0.2.2:8333");
-        pm.store_addr("192.0.2.3:8333");
+        pm.add_peer("192.0.2.1:8333").unwrap();
+        pm.add_peer("192.0.2.2:8333").unwrap();
+        pm.add_peer("192.0.2.3:8333").unwrap();
         let addrs = pm.get_addr_list();
         assert!(addrs.len() >= 3, "Must retrieve at least 3 addresses");
     }
 
-    // ── 12. add_addr_batch ────────────────────────────────────────────────
+    // ── 12. every ingested address becomes advertisable ───────────────────
     #[test]
-    fn add_addr_batch_stores_all() {
+    fn every_ingested_address_can_be_advertised() {
+        // What `add_addr_batch` used to be asserted on. It writes the legacy
+        // `addr:` table, which no longer has a reader; what matters is that an
+        // address taken in from a peer can be handed on to another peer, which
+        // is what makes topology healing possible at all.
         let pm = tmp_pm("batch_addr");
         let batch: Vec<String> = (0..10).map(|i| format!("10.7.0.{}:8333", i)).collect();
-        pm.add_addr_batch(&batch);
+        for addr in &batch {
+            pm.add_peer(addr).unwrap();
+        }
         let addrs = pm.get_addr_list();
         for addr in &batch {
-            assert!(addrs.contains(addr), "Batch addr {} must be stored", addr);
+            assert!(
+                addrs.contains(addr),
+                "ingested addr {} must be advertisable",
+                addr
+            );
         }
     }
 
