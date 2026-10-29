@@ -120,8 +120,20 @@ impl PeerRecord {
     }
 
     pub fn is_active(&self) -> bool {
+        // `now - self.last_seen` was an unsigned subtraction. `last_seen` is
+        // only ever written as `unix_now()`, so a remote peer cannot poison it,
+        // but a backwards clock step — an NTP correction, a restored VM
+        // snapshot — makes it exceed `now`: a panic in debug, and in release a
+        // wrap to a huge number, which read as inactive and silently dropped
+        // the peer.
+        //
+        // `is_banned` is a stored field that nothing ever sets to true, so that
+        // half of this predicate is inert. It is left alone deliberately: the
+        // record is bincode'd into RocksDB with a `version: 1`, so removing a
+        // field would stop existing peer stores deserialising. The live ban
+        // state is in the DoS guard, and the readers that matter ask it.
         let now = unix_now();
-        !self.is_banned && (now - self.last_seen) < PEER_HEALTH_TIMEOUT_SECS
+        !self.is_banned && now.saturating_sub(self.last_seen) < PEER_HEALTH_TIMEOUT_SECS
     }
 
     pub fn health_score(&self) -> i64 {
@@ -1191,6 +1203,27 @@ mod tests {
 
     fn tmp(label: &str) -> String {
         format!("/tmp/pm_test_{}", label)
+    }
+
+    #[test]
+    fn a_record_stamped_in_the_future_does_not_underflow() {
+        // `last_seen` is only ever written as unix_now(), so this needs a
+        // BACKWARDS clock step — an NTP correction or a restored VM snapshot —
+        // not a remote peer. The subtraction was unsigned: a panic in debug and
+        // in release a wrap to a huge number, which read as inactive and
+        // silently dropped the peer.
+        let mut rec = PeerRecord::new("198.51.100.30:9333", 9333);
+        rec.last_seen = unix_now() + 3_600;
+        assert!(
+            rec.is_active(),
+            "a record stamped in the future was seen very recently"
+        );
+
+        // And the ordinary paths still work either side of the timeout.
+        rec.last_seen = unix_now();
+        assert!(rec.is_active());
+        rec.last_seen = unix_now().saturating_sub(PEER_HEALTH_TIMEOUT_SECS + 1);
+        assert!(!rec.is_active(), "a stale record is not active");
     }
 
     #[test]

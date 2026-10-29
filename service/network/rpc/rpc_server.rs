@@ -31,6 +31,7 @@ use crate::runtime::vm::core::executor::Executor;
 use crate::runtime::vm::core::vm::ExecutionResult;
 use crate::runtime::vm::core::vm_context::VMContext;
 use crate::service::mempool::core::mempool::Mempool;
+use crate::service::network::p2p::p2p::{banned_peers, is_peer_banned, peer_ban_info};
 use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::service::rpc::auth::{AuthRole, RpcAuthManager};
 use crate::engine::mining::stratum::stratum_server::StratumServer;
@@ -1777,14 +1778,24 @@ impl RpcServer {
                 let peers: Vec<Value> = s.peer_manager.get_peers()
                     .into_iter()
                     .enumerate()
-                    .map(|(i, addr)| json!({
-                        "id":          i,
-                        "addr":        addr,
-                        "version":     crate::config::network::network_params::NetworkParams::PROTOCOL_VERSION,
-                        "banned":      s.peer_manager.is_banned(&addr),
-                        "penalty":     s.peer_manager.get_penalty(&addr),
-                        "ban_expiry":  s.peer_manager.get_ban_expiry(&addr),
-                    }))
+                    .map(|(i, addr)| {
+                        // The live guard is the system that actually bans; the
+                        // peer_manager store it used to read has no production
+                        // writer, so these three fields were always false/0.
+                        let live = peer_ban_info(&addr);
+                        json!({
+                            "id":          i,
+                            "addr":        addr,
+                            "version":     crate::config::network::network_params::NetworkParams::PROTOCOL_VERSION,
+                            "banned":      is_peer_banned(&addr) || s.peer_manager.is_banned(&addr),
+                            "penalty":     live.as_ref().map(|b| b.score)
+                                               .unwrap_or_else(|| s.peer_manager.get_penalty(&addr)),
+                            "ban_expiry":  live.as_ref().map(|b| b.ban_until)
+                                               .unwrap_or_else(|| s.peer_manager.get_ban_expiry(&addr)),
+                            "ban_reason":  live.as_ref().map(|b| b.reason.clone())
+                                               .unwrap_or_default(),
+                        })
+                    })
                     .collect();
                 RpcResponse::ok(id, json!(peers))
             }
@@ -4702,19 +4713,45 @@ impl RpcServer {
     fn cmd_getbannedpeers(id: Value, state: &SharedState) -> RpcResponse {
         match state.lock() {
             Ok(s) => {
-                let banned: Vec<Value> = s
-                    .peer_manager
-                    .get_peer_records()
+                // The live guard first: it is what bans, and a banned host
+                // need not be in the peer store at all. This used to filter the
+                // STORE by peer_manager's persistent ban prefix, which nothing
+                // in production writes, so it always answered with an empty
+                // list — and `p.ban_score` is a record field that is never
+                // raised above 0 either.
+                let mut banned: Vec<Value> = banned_peers()
                     .into_iter()
-                    .filter(|p| s.peer_manager.is_banned(&p.addr))
-                    .map(|p| {
+                    .map(|(host, info)| {
                         json!({
-                            "addr":      p.addr,
-                            "ban_until": s.peer_manager.get_ban_expiry(&p.addr),
-                            "ban_score": p.ban_score,
+                            "addr":       host,
+                            "ban_until":  info.ban_until,
+                            "ban_score":  info.score,
+                            "ban_count":  info.ban_count,
+                            "reason":     info.reason,
+                            "source":     "dos_guard",
                         })
                     })
                     .collect();
+                // Anything the persistent store holds as well, for an operator
+                // path that writes it.
+                let live: std::collections::HashSet<String> = banned
+                    .iter()
+                    .filter_map(|v| v.get("addr").and_then(|a| a.as_str()).map(String::from))
+                    .collect();
+                for p in s.peer_manager.get_peer_records() {
+                    if s.peer_manager.is_banned(&p.addr)
+                        && !live.contains(crate::service::network::dos_guard::host_key(&p.addr))
+                    {
+                        banned.push(json!({
+                            "addr":       p.addr.clone(),
+                            "ban_until":  s.peer_manager.get_ban_expiry(&p.addr),
+                            "ban_score":  p.ban_score,
+                            "ban_count":  0,
+                            "reason":     "",
+                            "source":     "peer_store",
+                        }));
+                    }
+                }
                 RpcResponse::ok(id, json!({"banned_count": banned.len(), "banned": banned}))
             }
             Err(_) => RpcResponse::err(id, ERR_INTERNAL, "State lock error"),
