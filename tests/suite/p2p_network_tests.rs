@@ -139,23 +139,45 @@ mod tests {
     // ── 11. addr_list — store and retrieve addresses ──────────────────────
     #[test]
     fn addr_list_store_and_retrieve() {
+        // The advertise list holds the peers we have DIALLED and handshaked.
+        // Not the legacy `addr:` table, which only bootstrap wrote, and not
+        // every `peer:` record in key order, which let a peer gossiping
+        // low-sorting addresses choose what we advertise.
         let pm = tmp_pm("addr_list");
-        pm.store_addr("192.0.2.1:8333");
-        pm.store_addr("192.0.2.2:8333");
-        pm.store_addr("192.0.2.3:8333");
+        for a in ["192.0.2.1:8333", "192.0.2.2:8333", "192.0.2.3:8333"] {
+            pm.add_peer(a).unwrap();
+            pm.mark_tried(a);
+        }
         let addrs = pm.get_addr_list();
         assert!(addrs.len() >= 3, "Must retrieve at least 3 addresses");
     }
 
-    // ── 12. add_addr_batch ────────────────────────────────────────────────
+    // ── 12. only addresses we reached ourselves are advertised ────────────
     #[test]
-    fn add_addr_batch_stores_all() {
+    fn only_addresses_we_dialled_are_advertised() {
+        // An address we have merely been TOLD about must not be passed on: that
+        // is what stopped a peer from choosing the contents of our Addr
+        // messages. One we dialled and handshaked is exactly what is worth
+        // telling other peers about, and what lets the topology heal.
         let pm = tmp_pm("batch_addr");
         let batch: Vec<String> = (0..10).map(|i| format!("10.7.0.{}:8333", i)).collect();
-        pm.add_addr_batch(&batch);
+        for addr in &batch {
+            pm.add_peer(addr).unwrap();
+        }
+        assert!(
+            pm.get_addr_list().is_empty(),
+            "gossiped addresses must not be advertisable"
+        );
+        for addr in &batch {
+            pm.mark_tried(addr);
+        }
         let addrs = pm.get_addr_list();
         for addr in &batch {
-            assert!(addrs.contains(addr), "Batch addr {} must be stored", addr);
+            assert!(
+                addrs.contains(addr),
+                "a peer we dialled ({}) must be advertisable",
+                addr
+            );
         }
     }
 
@@ -283,7 +305,7 @@ mod tests {
         for i in 0..1_000usize {
             let octet2 = (i / 256) as u8;
             let octet3 = (i % 256) as u8;
-            let addr = format!("10.{}.{}:8333", octet2, octet3);
+            let addr = format!("10.0.{}.{}:8333", octet2, octet3);
             pm.add_peer(&addr)
                 .unwrap_or_else(|e| panic!("failed adding peer {}: {}", addr, e));
             peers.push(addr);

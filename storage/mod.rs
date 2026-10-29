@@ -123,7 +123,9 @@ impl StorageManager {
     }
 
     pub fn memory() -> Self {
-        Self::new(StorageBackend::Memory).expect("MemoryStore creation cannot fail")
+        Self {
+            store: Arc::new(MemoryStore::new()),
+        }
     }
 
     pub fn rocksdb(path: &str) -> Result<Self, StorageError> {

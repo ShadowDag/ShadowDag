@@ -172,7 +172,10 @@ fn main() -> ExitCode {
             // Print only the first 4 hex chars and the length —
             // never the full secret.
             let hint = match std::str::from_utf8(&existing) {
-                Ok(s) if s.len() >= 4 => format!("{}... ({} bytes)", &s[..4], s.len()),
+                Ok(s) if !s.is_empty() => {
+                    let preview: String = s.chars().take(4).collect();
+                    format!("{}... ({} bytes)", preview, s.len())
+                }
                 Ok(s) => format!("({} bytes, ascii)", s.len()),
                 Err(_) => format!("({} bytes, non-ascii)", existing.len()),
             };

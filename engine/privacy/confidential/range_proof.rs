@@ -212,7 +212,11 @@ pub fn verify(commitment: &RistrettoPoint, proof: &RangeProof) -> bool {
 fn bit_challenge(bit_index: usize, point: &RistrettoPoint) -> Scalar {
     let mut hasher = Sha512::new();
     hasher.update(b"ShadowDAG_range_v1");
-    hasher.update(bit_index.to_le_bytes());
+    // Fixed-width encoding: `usize::to_le_bytes()` is platform-width (8 bytes on
+    // 64-bit, 4 on 32-bit), which would make the challenge — and thus the proof
+    // bytes and their verification — differ by architecture, a cross-arch
+    // consensus divergence. Indices are 0..63, so u32 is always sufficient.
+    hasher.update((bit_index as u32).to_le_bytes());
     hasher.update(point.compress().as_bytes());
     Scalar::from_hash(hasher)
 }

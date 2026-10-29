@@ -254,18 +254,41 @@ impl TipManager {
     /// Result: different miners include different lower-tier tips, creating
     /// a healthy wide DAG while still converging on the best chain.
     pub fn select_parents(&self, max_parents: usize) -> Vec<String> {
+        let sorted = self.sorted_tips_snapshot();
+        Self::select_parents_from_sorted(&sorted, max_parents)
+    }
+
+    /// Select parents AND return the SAME tip snapshot they were chosen from, in
+    /// a SINGLE lock acquisition. A caller that then computes per-parent height /
+    /// blue_score MUST use this instead of `select_parents` followed by a
+    /// separate `get_tips`: reading tips twice let a tip evicted between the two
+    /// reads drop a chosen parent from the height map, collapsing the computed
+    /// block height and wasting the miner's PoW on a rejected template (B2-L01).
+    pub fn select_parents_with_snapshot(&self, max_parents: usize) -> (Vec<String>, Vec<TipInfo>) {
+        let sorted = self.sorted_tips_snapshot();
+        let parents = Self::select_parents_from_sorted(&sorted, max_parents);
+        (parents, sorted)
+    }
+
+    /// One tip-lock read → tips cloned and sorted by blue_score desc, hash asc.
+    fn sorted_tips_snapshot(&self) -> Vec<TipInfo> {
         let tips = self.tips.read().unwrap_or_else(|e| e.into_inner());
-
-        if tips.is_empty() {
-            return Vec::new();
-        }
-
-        let mut sorted: Vec<&TipInfo> = tips.values().collect();
+        let mut sorted: Vec<TipInfo> = tips.values().cloned().collect();
         sorted.sort_by(|a, b| {
             b.blue_score
                 .cmp(&a.blue_score)
                 .then_with(|| a.hash.cmp(&b.hash))
         });
+        sorted
+    }
+
+    /// Parent-selection policy over a pre-sorted tip snapshot. Pure, so
+    /// `select_parents` and `select_parents_with_snapshot` apply the IDENTICAL
+    /// policy (Tier-1 mandatory top tips + Tier-2 deterministic weighted-random).
+    fn select_parents_from_sorted(sorted: &[TipInfo], max_parents: usize) -> Vec<String> {
+        if sorted.is_empty() {
+            return Vec::new();
+        }
 
         if sorted.len() <= max_parents {
             // Fewer tips than slots: include all (no selection needed)
@@ -533,6 +556,32 @@ mod tests {
         let parents = mgr.select_parents(2);
         assert_eq!(parents[0], "high");
         assert_eq!(parents[1], "mid");
+    }
+
+    #[test]
+    fn select_parents_with_snapshot_parents_all_in_snapshot() {
+        // Regression (B2-L01): every selected parent MUST appear in the same-lock
+        // snapshot returned alongside it, so build_from_dag reads each parent's
+        // height/blue_score without a missing-tip collapse.
+        let mgr = TipManager::new(tmp_path().as_str()).unwrap();
+        mgr.add_tip(tip("a", 5, 1)).unwrap();
+        mgr.add_tip(tip("b", 100, 10)).unwrap();
+        mgr.add_tip(tip("c", 50, 5)).unwrap();
+
+        let (parents, snap) = mgr.select_parents_with_snapshot(8);
+        let snap_hashes: std::collections::HashSet<&str> =
+            snap.iter().map(|t| t.hash.as_str()).collect();
+        assert!(!parents.is_empty());
+        for p in &parents {
+            assert!(
+                snap_hashes.contains(p.as_str()),
+                "selected parent {} missing from the returned snapshot",
+                p
+            );
+        }
+        // With fewer tips than slots, all are selected — parents ⊆ snapshot.
+        assert_eq!(parents.len(), 3);
+        assert_eq!(snap.len(), 3);
     }
 
     #[test]

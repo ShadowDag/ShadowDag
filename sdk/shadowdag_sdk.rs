@@ -35,7 +35,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
@@ -112,6 +112,10 @@ impl std::fmt::Display for SdkError {
 }
 
 impl ShadowDagSdk {
+    const MAX_HTTP_HEADER_LINES: usize = 64;
+    const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
+    const MAX_HTTP_BODY_BYTES: usize = 2 * 1024 * 1024;
+
     /// Create a new SDK client.
     pub fn new(rpc_url: &str) -> Self {
         Self {
@@ -314,8 +318,8 @@ impl ShadowDagSdk {
             .map_err(|e| SdkError::Other(format!("set_write_timeout: {}", e)))?;
 
         // Build the HTTP request. Header order is canonical; Connection:
-        // close lets us use `read_to_end` as the termination signal, which
-        // avoids having to parse chunked transfer encoding.
+        // close asks the server to close after response, while we still
+        // parse headers/body explicitly via Content-Length.
         let auth_line = match &self.auth_token {
             Some(token) => format!("Authorization: Bearer {}\r\n", token),
             None => String::new(),
@@ -342,40 +346,94 @@ impl ShadowDagSdk {
                 _ => SdkError::Other(format!("write failed: {}", e)),
             })?;
 
-        let mut raw_response = Vec::with_capacity(4096);
-        stream
-            .read_to_end(&mut raw_response)
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        reader
+            .read_line(&mut status_line)
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => SdkError::Timeout,
-                _ => SdkError::Other(format!("read failed: {}", e)),
+                _ => SdkError::Other(format!("read status line failed: {}", e)),
             })?;
-
-        // The response body can contain arbitrary bytes but a correctly
-        // formed JSON-RPC response is always UTF-8. We lose nothing by
-        // using `from_utf8_lossy` for the header search and then taking
-        // the exact byte slice for the body.
-        let header_end = raw_response
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .ok_or_else(|| {
-                SdkError::Other("malformed HTTP response: no header terminator".into())
-            })?;
-        let headers_bytes = &raw_response[..header_end];
-        let body_bytes = &raw_response[header_end + 4..];
-
-        let headers_str = std::str::from_utf8(headers_bytes)
-            .map_err(|e| SdkError::Other(format!("non-UTF8 HTTP headers: {}", e)))?;
-        let status_line = headers_str
-            .lines()
-            .next()
-            .ok_or_else(|| SdkError::Other("empty HTTP response".into()))?;
+        if status_line.trim().is_empty() {
+            return Err(SdkError::Other("empty HTTP response".into()));
+        }
         let status: u16 = status_line
             .split_whitespace()
             .nth(1)
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| SdkError::Other(format!("bad status line: {}", status_line)))?;
 
-        let body_str = std::str::from_utf8(body_bytes)
+        let mut content_length: usize = 0;
+        let mut content_length_seen = false;
+        let mut transfer_encoding_seen = false;
+        let mut header_lines = 0usize;
+        let mut header_bytes = 0usize;
+        loop {
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                        SdkError::Timeout
+                    }
+                    _ => SdkError::Other(format!("read headers failed: {}", e)),
+                })?;
+            header_lines += 1;
+            header_bytes += line.len();
+            if header_lines > Self::MAX_HTTP_HEADER_LINES
+                || header_bytes > Self::MAX_HTTP_HEADER_BYTES
+            {
+                return Err(SdkError::Other("HTTP headers too large".into()));
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                break;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.starts_with("content-length:") {
+                if content_length_seen {
+                    return Err(SdkError::Other(
+                        "duplicate Content-Length in HTTP response".into(),
+                    ));
+                }
+                content_length_seen = true;
+                let (_, value) = trimmed
+                    .split_once(':')
+                    .ok_or_else(|| SdkError::Other("malformed Content-Length header".into()))?;
+                content_length = value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| SdkError::Other("malformed Content-Length header".into()))?;
+            } else if lower.starts_with("transfer-encoding:") {
+                transfer_encoding_seen = true;
+            }
+        }
+        if transfer_encoding_seen {
+            return Err(SdkError::Other(
+                "Transfer-Encoding is not supported by SDK client".into(),
+            ));
+        }
+        if !content_length_seen {
+            return Err(SdkError::Other(
+                "Content-Length missing in HTTP response".into(),
+            ));
+        }
+        if content_length > Self::MAX_HTTP_BODY_BYTES {
+            return Err(SdkError::Other(format!(
+                "HTTP response body too large: {} bytes (max {})",
+                content_length,
+                Self::MAX_HTTP_BODY_BYTES
+            )));
+        }
+        let mut body_bytes = vec![0u8; content_length];
+        reader
+            .read_exact(&mut body_bytes)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => SdkError::Timeout,
+                _ => SdkError::Other(format!("read body failed: {}", e)),
+            })?;
+
+        let body_str = std::str::from_utf8(&body_bytes)
             .map_err(|e| SdkError::Other(format!("non-UTF8 response body: {}", e)))?;
 
         if status == 404 {

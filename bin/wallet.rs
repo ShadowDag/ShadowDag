@@ -45,10 +45,11 @@ static UNLOCK_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 use shadowdag::config::node::node_config::NetworkMode;
 use shadowdag::domain::address::invisible_wallet::InvisibleWallet;
+use shadowdag::domain::transaction::transaction::Transaction;
 use shadowdag::errors::WalletError;
 use shadowdag::infrastructure::storage::rocksdb::utxo::utxo_store::UtxoStore;
 use shadowdag::runtime::vm::contracts::contract_package::ContractPackage;
-use shadowdag::service::wallet::core::wallet::{EncryptedSeed, Wallet};
+use shadowdag::service::wallet::core::wallet::{EncryptedSeed, Wallet, Walletutxo};
 use shadowdag::service::wallet::storage::wallet_db::WalletDB;
 use shadowdag::slog_error;
 
@@ -219,6 +220,21 @@ fn load_encrypted_seed() -> Result<EncryptedSeed, WalletError> {
 ///
 /// Returns a Zeroizing<String> so the buffer is wiped on drop.
 fn prompt_password(prompt_msg: &str) -> Zeroizing<String> {
+    // Headless / scripted fallback. rpassword reads from the controlling TTY
+    // (/dev/tty), which does not exist under `docker exec -i`, cron, or CI —
+    // there it fails with "No such device or address". Allow the password via
+    // SHADOWDAG_WALLET_PASSWORD for automation and testnet exercising. SECURITY:
+    // an env var is visible to the process tree and shell history; use only for
+    // testing/automation, never for production key custody (prefer the TTY).
+    if let Ok(pw) = std::env::var("SHADOWDAG_WALLET_PASSWORD") {
+        let trimmed = Zeroizing::new(pw.trim().to_string());
+        if trimmed.len() < 8 {
+            slog_error!("wallet", "env_password_too_short", min_length => "8");
+            std::process::exit(1);
+        }
+        return trimmed;
+    }
+
     eprint!("{}", prompt_msg);
     io::stderr().flush().ok();
 
@@ -322,8 +338,8 @@ fn load_and_unlock_wallet() -> Result<Wallet, WalletError> {
 /// Known CLI subcommands — if the first arg matches one of these, run CLI mode.
 /// Anything else (no args, --gui, --rpc=, etc.) → GUI mode (if feature enabled).
 const CLI_COMMANDS: &[&str] = &[
-    "new", "create", "balance", "bal", "send", "transfer",
-    "info", "stealth", "invisible", "export",
+    "new", "create", "restore", "import", "balance", "bal", "send", "transfer",
+    "shield", "info", "stealth", "scan", "invisible", "export",
     "deploy", "deploy-package", "call", "receipt", "logs", "verify",
     "help", "--help", "-h", "version", "--version", "-v",
     "--cli",
@@ -365,10 +381,13 @@ fn main() {
 fn run_cli(args: &[String], command: &str) {
     match command {
         "new" | "create" => cmd_new(args),
+        "restore" | "import" => cmd_restore(args),
         "balance" | "bal" => cmd_balance(args),
         "send" | "transfer" => cmd_send(args),
+        "shield" => cmd_shield(args),
         "info" => cmd_info(),
         "stealth" => cmd_stealth(args),
+        "scan" => cmd_scan(args),
         "invisible" => cmd_invisible(args),
         "export" => cmd_export(),
         "deploy" => cmd_deploy(args),
@@ -406,11 +425,16 @@ fn run_gui(_args: &[String]) {
 // ---------------------------------------------------------------------------
 
 fn cmd_new(args: &[String]) {
-    let network = args.get(2).map(|s| s.as_str()).unwrap_or("mainnet");
-
-    // Warn if the specified network doesn't match the SHADOWDAG_NETWORK env var
+    // Network precedence: explicit positional arg > SHADOWDAG_NETWORK env >
+    // mainnet. Previously this defaulted straight to "mainnet", so `new` created
+    // a MAINNET (SD1) wallet even under SHADOWDAG_NETWORK=testnet, while every
+    // other command (stealth/send/balance) derives addresses from the env — the
+    // stored wallet could then not be found ("no wallet found for ST1…").
     let env_network = wallet_network();
-    if network != env_network {
+    let network = args.get(2).map(|s| s.as_str()).unwrap_or(&env_network);
+
+    // Warn only when an explicit arg disagrees with the env var.
+    if args.get(2).is_some() && network != env_network {
         eprintln!(
             "NOTE: Creating wallet for '{}' but SHADOWDAG_NETWORK='{}'",
             network, env_network
@@ -494,6 +518,81 @@ fn cmd_new(args: &[String]) {
     println!("  Wallet saved to: {}", seed_path().display());
 }
 
+fn cmd_restore(args: &[String]) {
+    let env_network = wallet_network();
+    // Default to SHADOWDAG_NETWORK (matching cmd_new). Hardcoding "mainnet" here
+    // persisted an SD1 wallet under a testnet env that later env-derived commands
+    // (ST1) could not find — the exact footgun cmd_new was fixed to avoid (B7-L02).
+    let network = args.get(2).map(|s| s.as_str()).unwrap_or(&env_network);
+
+    if network != env_network {
+        eprintln!(
+            "NOTE: Restoring wallet for '{}' but SHADOWDAG_NETWORK='{}'",
+            network, env_network
+        );
+    }
+
+    println!("======================================================");
+    println!("     S H A D O W D A G  --  Restore Wallet");
+    println!("======================================================");
+
+    // Read the recovery phrase from stdin (space-separated words). Read from a
+    // line rather than CLI args so the phrase does not land in shell history.
+    eprint!("Enter your recovery phrase (space-separated words): ");
+    io::stderr().flush().ok();
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).is_err() {
+        eprintln!("Error: could not read the recovery phrase.");
+        return;
+    }
+    let words: Vec<String> = line.split_whitespace().map(|s| s.to_string()).collect();
+    if words.is_empty() {
+        eprintln!("Error: empty recovery phrase.");
+        return;
+    }
+
+    let password = prompt_password("Choose a password to encrypt the restored wallet: ");
+    let confirm = prompt_password("Confirm password: ");
+    if *password != *confirm {
+        eprintln!("Error: passwords do not match.");
+        return;
+    }
+    drop(confirm);
+
+    let mut wallet = Wallet::new(network);
+    let enc_seed = match wallet.restore_from_mnemonic(&words, &password) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Error restoring wallet: {}", e);
+            return;
+        }
+    };
+
+    // Persist the encrypted seed. save_encrypted_seed uses create_new, so it
+    // refuses to clobber an existing wallet file — surface that clearly.
+    if let Err(e) = save_encrypted_seed(&enc_seed) {
+        eprintln!("Could not save the restored seed: {}", e);
+        eprintln!(
+            "If a wallet already exists at {}, move it aside first.",
+            seed_path().display()
+        );
+        return;
+    }
+    match WalletDB::new(&wallet_db_path()) {
+        Ok(db) => {
+            if let Err(e) = db.save_wallet(&wallet) {
+                eprintln!("Warning: wallet state not persisted: {}", e);
+            }
+        }
+        Err(e) => eprintln!("Warning: could not open wallet DB: {}", e),
+    }
+
+    println!();
+    println!("  Network : {}", network);
+    println!("  Address : {}", wallet.address());
+    println!("  Wallet restored and saved to: {}", seed_path().display());
+}
+
 fn cmd_balance(args: &[String]) {
     // Accept an explicit address, or use the wallet's primary address
     let address: String = match args.get(2) {
@@ -518,48 +617,55 @@ fn cmd_balance(args: &[String]) {
         }
     };
 
-    let db_path = utxo_db_path();
-    match UtxoStore::new(db_path.as_str()) {
-        Ok(store) => match store.get_balance(&address) {
-            Ok(balance) => {
-                let sdag = balance as f64 / 100_000_000.0;
-                println!("Address : {}", address);
-                println!("Balance : {:.8} SDAG ({} sats)", sdag, balance);
-            }
-            Err(e) => {
-                eprintln!("Error querying balance: {}", e);
-            }
-        },
-        Err(e) => {
-            slog_error!("wallet", "utxo_db_open_failed", path => &db_path, error => &e.to_string());
-            eprintln!("Make sure a ShadowDAG node has been run at least once,");
-            eprintln!("or set SHADOWDAG_DB to the correct path.");
+    let socket = cli_rpc_target();
+    match fetch_utxos_via_rpc(socket, &address) {
+        Some(utxos) => {
+            let balance: u64 = utxos.iter().map(|u| u.amount).sum();
+            let sdag = balance as f64 / 100_000_000.0;
+            println!("Address : {}", address);
+            println!("Balance : {:.8} SDAG ({} sats)", sdag, balance);
+        }
+        None => {
+            eprintln!("Could not reach a running node RPC to query the balance.");
+            eprintln!("Start a node, or set SHADOWDAG_RPC to host:port.");
         }
     }
 }
 
-/// Validate a ShadowDAG address format.
+/// Validate a ShadowDAG address format (canonical forms only).
 ///
-/// Address formats produced by `make_address()` (in wallet core):
-///   Standard:  prefix(2: "SD"/"ST"/"SR") + hex(version(1) + hash(32) + checksum(4))
-///              = 2-char prefix + 74 hex chars = 76 total
-///   Stealth:   4-char prefix ("SD1s"/"ST1s"/"SR1s") + 40 hex chars = 44 total
-///   Contract:  4-char prefix ("SD1c"/"ST1c"/"SR1c") + 40 hex chars = 44 total
-///   Multisig:  4-char prefix ("SD1m"/"ST1m"/"SR1m") + 40 hex chars = 44 total
+/// All addresses share a 3-char network prefix ("SD1"/"ST1"/"SR1"):
+///   Standard:     "SD1" + 40 hex (20-byte SHA-256 pubkey hash) — spendable P2PKH
+///   Typed s/k/h:  "SD1s"/"SD1k"/"SD1h" + 40 hex (stealth / Schnorr / P2SH)
+///   Confidential: "SD1p" + 136 hex (view_pub‖spend_pub + checksum)
 ///
-/// Both standard and typed address formats are accepted.
+/// `s`/`k`/`h`/`p` are not hex digits, so the subtype is unambiguous. This
+/// matches `domain::address::Address` and the WASM/Python SDKs exactly.
 fn validate_address(addr: &str) -> Result<(), String> {
-    // Check network prefix (2 chars)
-    let valid_net = addr.starts_with("SD") || addr.starts_with("ST") || addr.starts_with("SR");
+    let valid_net = addr.starts_with("SD1") || addr.starts_with("ST1") || addr.starts_with("SR1");
     if !valid_net {
-        return Err("Invalid address prefix (expected SD/ST/SR)".to_string());
+        return Err("Invalid address prefix (expected SD1/ST1/SR1)".to_string());
     }
 
-    let after_net = &addr[2..];
+    let after = &addr[3..];
 
-    // Typed addresses: "1s", "1c", "1m" after network prefix => 4-char prefix + 40 hex
-    if after_net.starts_with("1s") || after_net.starts_with("1c") || after_net.starts_with("1m") {
-        let hex_part = &after_net[2..];
+    // Confidential payment address: "p" + 136 hex (view_pub‖spend_pub + checksum).
+    if let Some(hex_part) = after.strip_prefix('p') {
+        if hex_part.len() != 136 {
+            return Err(format!(
+                "Confidential address hex part must be 136 characters, got {}",
+                hex_part.len()
+            ));
+        }
+        if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("Address contains invalid hex characters".into());
+        }
+        return Ok(());
+    }
+
+    // Typed addresses: subtype char (s/k/h) + 40 hex.
+    if matches!(after.as_bytes().first(), Some(b's' | b'k' | b'h')) {
+        let hex_part = &after[1..];
         if hex_part.len() != 40 {
             return Err(format!(
                 "Typed address hex part must be 40 characters, got {}",
@@ -572,17 +678,23 @@ fn validate_address(addr: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    // Standard addresses: 2-char prefix + 74 hex (version + hash + checksum)
-    if after_net.len() != 74 {
+    // Standard address: exactly 40 hex chars.
+    if after.len() != 40 {
         return Err(format!(
-            "Standard address hex part must be 74 characters, got {}",
-            after_net.len()
+            "Standard address hex part must be 40 characters, got {}",
+            after.len()
         ));
     }
-    if !after_net.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !after.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("Address contains invalid hex characters".into());
     }
     Ok(())
+}
+
+/// True if `addr` is a confidential payment address (`SD1p…`/`ST1p…`/`SR1p…`).
+fn is_confidential_addr(addr: &str) -> bool {
+    (addr.starts_with("SD1p") || addr.starts_with("ST1p") || addr.starts_with("SR1p"))
+        && addr.len() == 4 + 136
 }
 
 fn cmd_send(args: &[String]) {
@@ -631,23 +743,329 @@ fn cmd_send(args: &[String]) {
         return;
     }
 
-    // Build and sign transaction using the wallet's internal key derivation.
-    // The wallet selects UTXOs, derives signing keys from the encrypted seed,
-    // signs each input, and zeroizes key material — no raw keys exposed.
-    match wallet.build_tx(0, &to, amount, fee, "") {
-        Ok(built_tx) => {
-            println!("Transaction built and signed!");
-            println!("  TxID   : {}", built_tx.txid);
-            println!("  From   : {}", from_address);
-            println!("  To     : {}", to);
-            println!("  Amount : {} SDAG", amount_str);
-            println!("  Fee    : {:.8} SDAG", fee as f64 / 100_000_000.0);
-            println!("  Raw    : {}", built_tx.raw_hex);
-            println!();
-            println!("Broadcast this raw transaction to a running node to send it.");
+    // Confidential (RingCT) send: recipient is a confidential payment address.
+    // Builds a hidden-amount tx using the wallet's scanned confidential UTXOs and
+    // the node's confidential-output index — loaded over RPC (not by opening the
+    // node's live UTXO RocksDB) for decoy selection and real-input lookup.
+    if is_confidential_addr(&to) {
+        let socket = cli_rpc_target();
+        let utxo_set = match confidential_index_via_rpc() {
+            Some(s) => s,
+            None => {
+                eprintln!("Cannot reach node RPC to load the confidential-output index.");
+                eprintln!("Start your node, or set SHADOWDAG_RPC=host:port.");
+                return;
+            }
+        };
+
+        // Auto-size the fee: confidential txs are large (range proofs + rings), so
+        // build once at a floor to measure the canonical size, then rebuild with
+        // fee >= size (1 sat/byte) + margin so the relay floor is cleared. The
+        // amount balance is exact, so a larger fee simply shrinks the change.
+        let effective_fee = match wallet.build_confidential_send(&to, amount, fee.max(1000), &utxo_set)
+        {
+            Ok(probe) => fee
+                .max((probe.canonical_bytes().len() as u64).saturating_add(200))
+                .max(1000),
+            Err(e) => {
+                eprintln!("Error building confidential transaction: {}", e);
+                return;
+            }
+        };
+        let tx = match wallet.build_confidential_send(&to, amount, effective_fee, &utxo_set) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Error building confidential transaction: {}", e);
+                return;
+            }
+        };
+        let raw = match serde_json::to_string(&tx) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error serializing confidential transaction: {}", e);
+                return;
+            }
+        };
+        println!("Confidential transaction built and signed!");
+        println!("  TxID   : {}", tx.hash);
+        println!("  To     : {} (confidential)", to);
+        println!("  Amount : {} SDAG (hidden on-chain)", amount_str);
+        println!(
+            "  Fee    : {} sats ({:.8} SDAG)",
+            effective_fee,
+            effective_fee as f64 / 100_000_000.0
+        );
+
+        // Broadcast (needs write auth), falling back to the raw tx for manual submit.
+        match rpc_login(socket) {
+            Some(token) => match cli_rpc_call_auth(
+                socket,
+                "sendrawtransaction",
+                serde_json::json!([raw]),
+                Some(&token),
+            ) {
+                Some(res) => {
+                    let txid = res
+                        .as_str()
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            res.get("txid")
+                                .and_then(|t| t.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .unwrap_or_else(|| tx.hash.clone());
+                    println!();
+                    println!("Broadcast OK — accepted to mempool. TxID: {}", txid);
+                    println!("(On the receiving wallet, run 'scan' to detect the confidential funds.)");
+                }
+                None => {
+                    eprintln!();
+                    eprintln!("Broadcast failed (node rejected the tx or is unreachable).");
+                    eprintln!("Raw tx (submit manually via sendrawtransaction):");
+                    println!("{}", raw);
+                }
+            },
+            None => {
+                eprintln!();
+                eprintln!("Broadcast auth failed; raw tx (submit manually via sendrawtransaction):");
+                println!("{}", raw);
+            }
         }
+        return;
+    }
+
+    // Transparent send: pull the wallet's spendable UTXOs from a running node,
+    // build a real signed transaction, and broadcast it.
+    let socket = cli_rpc_target();
+    let utxos = match fetch_utxos_via_rpc(socket, &from_address) {
+        Some(u) if !u.is_empty() => u,
+        Some(_) => {
+            eprintln!("No spendable (mature) UTXOs for {}.", from_address);
+            eprintln!("Receive funds first, or wait for coinbase maturity.");
+            return;
+        }
+        None => {
+            eprintln!("Cannot reach node RPC at {} to fetch UTXOs.", socket);
+            eprintln!("Start your node, or set SHADOWDAG_RPC=host:port.");
+            return;
+        }
+    };
+    wallet.update_utxos(&from_address, utxos);
+
+    // Auto-size the fee to clear the relay floor: fee >= MIN_RELAY_FEE(100) AND
+    // fee / canonical_bytes().len() >= 1.0 sat/byte (the exact mempool basis).
+    // Build once to measure the canonical size, then rebuild with the floor.
+    let effective_fee = match wallet.build_tx(0, &to, amount, fee.max(100), "") {
+        Ok(probe) => match serde_json::from_str::<Transaction>(&probe.raw_hex) {
+            Ok(tx) => {
+                let size = tx.canonical_bytes().len() as u64;
+                // 1 sat/byte + a margin that also covers the tiny size change
+                // from larger fee digits on the rebuild.
+                fee.max(size.saturating_add(100)).max(100)
+            }
+            Err(_) => fee.max(100),
+        },
         Err(e) => {
             eprintln!("Error building transaction: {}", e);
+            return;
+        }
+    };
+
+    let built = match wallet.build_tx(0, &to, amount, effective_fee, "") {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Error building transaction: {}", e);
+            return;
+        }
+    };
+
+    println!("Transaction built and signed!");
+    println!("  TxID   : {}", built.txid);
+    println!("  From   : {}", from_address);
+    println!("  To     : {}", to);
+    println!("  Amount : {} SDAG", amount_str);
+    println!(
+        "  Fee    : {} sats ({:.8} SDAG)",
+        effective_fee,
+        effective_fee as f64 / 100_000_000.0
+    );
+
+    // Broadcast (needs write auth). Falls back to printing the raw tx so the
+    // user can submit it manually if no RPC password is configured.
+    match rpc_login(socket) {
+        Some(token) => match cli_rpc_call_auth(
+            socket,
+            "sendrawtransaction",
+            serde_json::json!([built.raw_hex]),
+            Some(&token),
+        ) {
+            Some(res) => {
+                let txid = res
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        res.get("txid")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| built.txid.clone());
+                println!();
+                println!("Broadcast OK — accepted to mempool. TxID: {}", txid);
+            }
+            None => {
+                eprintln!();
+                eprintln!("Broadcast failed (node rejected the tx or is unreachable).");
+                eprintln!("Raw tx (submit manually via sendrawtransaction):");
+                println!("{}", built.raw_hex);
+            }
+        },
+        None => {
+            println!();
+            println!("Not broadcast (no RPC auth). Set SHADOWDAG_RPC_PASSWORD (the node's");
+            println!("rpc_password) and re-run to auto-send, or submit this raw tx manually:");
+            println!("{}", built.raw_hex);
+        }
+    }
+}
+
+/// `shield <confidential_addr> <amount> [fee]` — move transparent funds into
+/// the confidential pool. The recipient MUST be a confidential (`…1p`) address;
+/// change returns to the wallet's own confidential address. This bootstraps the
+/// confidential pool so later `send` to a `…1p` address has funds + decoys.
+fn cmd_shield(args: &[String]) {
+    let to = match args.get(2) {
+        Some(addr) => addr.clone(),
+        None => {
+            eprintln!("Usage: shadowdag-wallet shield <confidential_1p_address> <amount> [fee]");
+            return;
+        }
+    };
+    if !is_confidential_addr(&to) {
+        eprintln!("Error: shield recipient must be a confidential address (…1p).");
+        eprintln!("Get one from `shadowdag-wallet stealth` on the receiving wallet.");
+        return;
+    }
+    let amount_str = match args.get(3) {
+        Some(s) => s.as_str(),
+        None => {
+            eprintln!("Usage: shadowdag-wallet shield <confidential_1p_address> <amount> [fee]");
+            return;
+        }
+    };
+    let amount = match safe_sdag_to_sats(amount_str) {
+        Some(a) => a,
+        None => {
+            eprintln!("Error: invalid amount (must be 0 < amount <= 21,000,000,000)");
+            return;
+        }
+    };
+    let req_fee: u64 = args.get(4).and_then(|s| safe_sdag_to_sats(s)).unwrap_or(1);
+
+    let mut wallet = match load_and_unlock_wallet() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("Cannot load wallet: {}", e);
+            return;
+        }
+    };
+    let from_address = wallet.address();
+    if from_address.is_empty() {
+        eprintln!("Error: wallet has no accounts. Create a wallet first.");
+        return;
+    }
+
+    // Pull the wallet's spendable transparent UTXOs from a running node.
+    let socket = cli_rpc_target();
+    let utxos = match fetch_utxos_via_rpc(socket, &from_address) {
+        Some(u) if !u.is_empty() => u,
+        Some(_) => {
+            eprintln!("No spendable (mature) transparent UTXOs for {}.", from_address);
+            eprintln!("Receive funds first, or wait for coinbase maturity.");
+            return;
+        }
+        None => {
+            eprintln!("Cannot reach node RPC at {} to fetch UTXOs.", socket);
+            eprintln!("Start your node, or set SHADOWDAG_RPC=host:port.");
+            return;
+        }
+    };
+    wallet.update_utxos(&from_address, utxos);
+
+    // Auto-size the fee to clear the relay floor. Shield txs are large (range
+    // proofs), so build once at a floor to measure canonical size, then rebuild
+    // with fee >= size sat (1 sat/byte) + margin. The amount balance is exact,
+    // so a larger fee simply shrinks the confidential change.
+    let effective_fee = match wallet.build_shield(0, &to, amount, req_fee.max(1000)) {
+        Ok(probe) => {
+            let size = probe.canonical_bytes().len() as u64;
+            req_fee.max(size.saturating_add(200)).max(1000)
+        }
+        Err(e) => {
+            eprintln!("Error building shield transaction: {}", e);
+            return;
+        }
+    };
+
+    let tx = match wallet.build_shield(0, &to, amount, effective_fee) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Error building shield transaction: {}", e);
+            return;
+        }
+    };
+    let raw = match serde_json::to_string(&tx) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error serializing shield transaction: {}", e);
+            return;
+        }
+    };
+
+    println!("Shield transaction built and signed!");
+    println!("  TxID   : {}", tx.hash);
+    println!("  From   : {} (transparent)", from_address);
+    println!("  To     : {} (confidential)", to);
+    println!("  Amount : {} SDAG (hidden after shielding)", amount_str);
+    println!(
+        "  Fee    : {} sats ({:.8} SDAG)",
+        effective_fee,
+        effective_fee as f64 / 100_000_000.0
+    );
+
+    // Broadcast (needs write auth), falling back to the raw tx for manual submit.
+    match rpc_login(socket) {
+        Some(token) => match cli_rpc_call_auth(
+            socket,
+            "sendrawtransaction",
+            serde_json::json!([raw]),
+            Some(&token),
+        ) {
+            Some(res) => {
+                let txid = res
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        res.get("txid")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| tx.hash.clone());
+                println!();
+                println!("Broadcast OK — accepted to mempool. TxID: {}", txid);
+                println!("(On the receiving wallet, run 'scan' to detect the confidential funds.)");
+            }
+            None => {
+                eprintln!();
+                eprintln!("Broadcast failed (node rejected the tx or is unreachable).");
+                eprintln!("Raw tx (submit manually via sendrawtransaction):");
+                println!("{}", raw);
+            }
+        },
+        None => {
+            println!();
+            println!("Not broadcast (no RPC auth). Set SHADOWDAG_RPC_PASSWORD and re-run to");
+            println!("auto-send, or submit this raw tx manually via sendrawtransaction:");
+            println!("{}", raw);
         }
     }
 }
@@ -704,15 +1122,349 @@ fn cmd_info() {
     }
 }
 
-fn cmd_stealth(args: &[String]) {
-    let base = args.get(2).map(|s| s.as_str()).unwrap_or("SD1default");
-    use shadowdag::domain::address::stealth_address::StealthAddress;
+fn cmd_stealth(_args: &[String]) {
+    // Print this wallet's reusable confidential payment address (SD1p…).
+    // Share it with senders so they can send you hidden-amount (RingCT) funds.
+    let wallet = match load_and_unlock_wallet() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("Cannot load wallet: {}", e);
+            return;
+        }
+    };
+    match wallet.confidential_receive_address() {
+        Some(addr) => {
+            println!("Confidential receive address (share this to receive private funds):");
+            println!("  {}", addr);
+            println!();
+            println!("Senders use: shadowdag-wallet send {} <amount>", addr);
+            println!("Run 'shadowdag-wallet scan' to detect funds sent to you.");
+        }
+        None => eprintln!("Wallet is locked; cannot derive confidential address."),
+    }
+}
 
-    println!("Generating stealth address...");
-    let stealth = StealthAddress::generate(base);
-    println!("  Base Address    : {}", base);
-    println!("  Stealth Address : {}", stealth);
-    println!("  (One-time address -- never reused)");
+/// Build a JSON-RPC 2.0 request body (pure; unit-tested).
+fn cli_rpc_request_body(method: &str, params: &serde_json::Value) -> String {
+    serde_json::json!({"jsonrpc": "2.0", "method": method, "params": params, "id": 1}).to_string()
+}
+
+/// Extract the `result` value from a JSON-RPC response string (pure; unit-tested).
+/// Returns None on parse error or if the response carries an `error`.
+fn cli_rpc_extract_result(response_json: &str) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(response_json).ok()?;
+    match v.get("error") {
+        Some(e) if !e.is_null() => return None,
+        _ => {}
+    }
+    v.get("result").cloned()
+}
+
+/// Resolve the RPC endpoint: `SHADOWDAG_RPC=host:port`, else loopback + the
+/// network's default RPC port.
+fn cli_rpc_target() -> std::net::SocketAddr {
+    if let Ok(s) = std::env::var("SHADOWDAG_RPC") {
+        if let Ok(sa) = s.trim().parse::<std::net::SocketAddr>() {
+            return sa;
+        }
+    }
+    let port: u16 = match wallet_network().as_str() {
+        "testnet" => 19332,
+        "regtest" => 29332,
+        _ => 9332,
+    };
+    std::net::SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+/// Minimal JSON-RPC-over-HTTP client for the CLI (the hardened client in the
+/// desktop-gated `mod gui` is unavailable here). Returns the `result` value, or
+/// None on any failure. NETWORK PATH: exercised only against a running node; the
+/// pure request/parse helpers above are unit-tested.
+fn cli_rpc_call(
+    socket: std::net::SocketAddr,
+    method: &str,
+    params: serde_json::Value,
+) -> Option<serde_json::Value> {
+    cli_rpc_call_auth(socket, method, params, None)
+}
+
+/// As [`cli_rpc_call`], but attaches `Authorization: Bearer {token}` when a
+/// token is supplied — required for write methods (e.g. `sendrawtransaction`).
+fn cli_rpc_call_auth(
+    socket: std::net::SocketAddr,
+    method: &str,
+    params: serde_json::Value,
+    token: Option<&str>,
+) -> Option<serde_json::Value> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let body = cli_rpc_request_body(method, &params);
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&socket, std::time::Duration::from_secs(5)).ok()?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(20)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(20)));
+    let auth_line = match token {
+        Some(t) if !t.is_empty() => format!("Authorization: Bearer {}\r\n", t),
+        _ => String::new(),
+    };
+    let req = format!(
+        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{}",
+        socket, body.len(), auth_line, body
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let _ = stream.flush();
+
+    let mut reader = BufReader::new(stream);
+    let mut content_length: usize = 0;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 {
+            break;
+        }
+        let t = line.trim();
+        if t.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = t.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().ok()?;
+            }
+        }
+    }
+    if content_length == 0 || content_length > 32 * 1024 * 1024 {
+        return None;
+    }
+    let mut buf = vec![0u8; content_length];
+    reader.read_exact(&mut buf).ok()?;
+    let s = String::from_utf8(buf).ok()?;
+    cli_rpc_extract_result(&s)
+}
+
+/// The RPC password for write auth. Read from `SHADOWDAG_RPC_PASSWORD`;
+/// None (skip auto-broadcast) when unset.
+fn rpc_password() -> Option<String> {
+    std::env::var("SHADOWDAG_RPC_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Log in to the node RPC and return a bearer token for write calls. Username
+/// defaults to "admin" (override via `SHADOWDAG_RPC_USER`). None if no password
+/// is configured or the login is rejected.
+fn rpc_login(socket: std::net::SocketAddr) -> Option<String> {
+    let password = rpc_password()?;
+    let username = std::env::var("SHADOWDAG_RPC_USER").unwrap_or_else(|_| "admin".to_string());
+    let resp = cli_rpc_call(
+        socket,
+        "login",
+        serde_json::json!([{ "username": username, "password": password }]),
+    )?;
+    resp.get("token")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Fetch this address's mature, spendable UTXOs from a running node via
+/// `listunspent` (open RPC). Immature coinbase outputs are skipped. None if the
+/// node is unreachable; `Some(empty)` if reachable but nothing is spendable.
+fn fetch_utxos_via_rpc(socket: std::net::SocketAddr, address: &str) -> Option<Vec<Walletutxo>> {
+    let resp = cli_rpc_call(socket, "listunspent", serde_json::json!([address]))?;
+    let arr = resp.get("utxos")?.as_array()?;
+    let mut out = Vec::new();
+    for u in arr {
+        if !u.get("mature").and_then(|m| m.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        let (txid, index, amount) = match (
+            u.get("txid").and_then(|v| v.as_str()),
+            u.get("vout").and_then(|v| v.as_u64()),
+            u.get("amount").and_then(|v| v.as_u64()),
+        ) {
+            (Some(t), Some(i), Some(a)) => (t.to_string(), i as u32, a),
+            _ => continue,
+        };
+        let is_coinbase = u.get("coinbase").and_then(|c| c.as_bool()).unwrap_or(false);
+        out.push(Walletutxo {
+            txid,
+            index,
+            amount,
+            address: address.to_string(),
+            height: 0,
+            confirmations: 0,
+            is_coinbase,
+            is_locked: false,
+        });
+    }
+    Some(out)
+}
+
+/// Build an in-memory `UtxoSet` holding the global confidential-output index
+/// (okey→commitment plus the sequential okeyidx) by PAGING the node's
+/// `getconfidentialoutputs` RPC. A confidential send uses this to look up each
+/// real input's commitment and to select decoys WITHOUT opening the node's live
+/// UTXO RocksDB (held under an exclusive lock, at a network-namespaced path — a
+/// direct open races the node and can corrupt it). This is O(pool size), not
+/// O(chain length): the node queries its okey index once per page rather than the
+/// wallet re-scanning every block. Returns None if the node is unreachable.
+fn confidential_index_via_rpc() -> Option<shadowdag::domain::utxo::utxo_set::UtxoSet> {
+    const PAGE: u64 = 2000; // must be <= server MAX_CONF_OUTPUTS_RANGE
+
+    let socket = cli_rpc_target();
+
+    // Build the index in a fresh THROWAWAY temp RocksDB (scratch — NOT the node's
+    // live UTXO store). Reused per run: clear any prior scratch dir first.
+    let tmp = std::env::temp_dir().join("shadowdag-wallet-conf-index");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let store = UtxoStore::new(tmp.to_str()?).ok()?;
+    let set = shadowdag::domain::utxo::utxo_set::UtxoSet::new(
+        std::sync::Arc::new(store)
+            as std::sync::Arc<dyn shadowdag::domain::traits::utxo_backend::UtxoBackend>,
+    );
+
+    // Page the node's confidential-output index in global-index order; recording
+    // in the same order reproduces the okeyidx the node exposes.
+    let mut start = 0u64;
+    loop {
+        let resp = cli_rpc_call(
+            socket,
+            "getconfidentialoutputs",
+            serde_json::json!([start, PAGE]),
+        )?;
+        let arr = match resp.get("outputs").and_then(|o| o.as_array()) {
+            Some(a) if !a.is_empty() => a,
+            _ => break,
+        };
+        for item in arr {
+            if let (Some(okey), Some(c)) = (
+                item.get("okey").and_then(|v| v.as_str()),
+                item.get("commitment").and_then(|v| v.as_str()),
+            ) {
+                let _ = set.record_confidential_output_indexed(okey, c);
+            }
+        }
+        let total = resp.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+        start = start.checked_add(arr.len() as u64)?;
+        if start >= total {
+            break;
+        }
+    }
+    Some(set)
+}
+
+/// Scan a running node's chain for confidential outputs via RPC (getblockcount →
+/// getblocks → getblockfull), STREAMING one page at a time so blocks are scanned
+/// and dropped rather than buffered (bounded memory). Returns the count of newly
+/// recorded confidential outputs, or None if the node is unreachable (caller
+/// falls back to the local DB). NETWORK PATH: live-node only.
+fn scan_via_rpc(wallet: &mut Wallet) -> Option<usize> {
+    use shadowdag::domain::block::block::Block;
+    // Sanity ceiling: the height comes from the node and could be hostile
+    // (SHADOWDAG_RPC). Bound the loop so a bogus huge height can't DoS the wallet.
+    const MAX_SCAN_HEIGHT: u64 = 100_000_000;
+    const PAGE: u64 = 500; // must be <= server MAX_GETBLOCKS_RANGE
+
+    let socket = cli_rpc_target();
+    let count_v = cli_rpc_call(socket, "getblockcount", serde_json::json!([]))?;
+    let height = count_v
+        .as_u64()
+        .or_else(|| count_v.get("best_height").and_then(|v| v.as_u64()))?
+        .min(MAX_SCAN_HEIGHT);
+
+    let mut found = 0usize;
+    let mut start = 0u64;
+    while start <= height {
+        let resp = cli_rpc_call(socket, "getblocks", serde_json::json!([start, PAGE]))?;
+        let arr = match resp.get("blocks").and_then(|b| b.as_array()) {
+            Some(a) if !a.is_empty() => a.clone(),
+            _ => break,
+        };
+        for item in &arr {
+            if let Some(hash) = item.get("hash").and_then(|h| h.as_str()) {
+                if let Some(full) = cli_rpc_call(socket, "getblockfull", serde_json::json!([hash])) {
+                    if let Ok(block) = serde_json::from_value::<Block>(full) {
+                        // Scan and drop immediately — no whole-chain buffering.
+                        found += wallet.scan_blocks(std::slice::from_ref(&block));
+                    }
+                }
+            }
+        }
+        // checked_add: never overflow/wrap into an infinite loop.
+        start = match start.checked_add(PAGE) {
+            Some(s) => s,
+            None => break,
+        };
+    }
+    Some(found)
+}
+
+fn cmd_scan(_args: &[String]) {
+    // Scan for confidential outputs owned by this wallet, record them, persist,
+    // and report the confidential balance. Prefers a RUNNING node over RPC
+    // (getblockfull); if the node is unreachable, falls back to opening the local
+    // block DB directly (run that variant with the node stopped — same DB-access
+    // pattern as `balance`).
+    let mut wallet = match load_and_unlock_wallet() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("Cannot load wallet: {}", e);
+            return;
+        }
+    };
+    let addr = wallet.address();
+
+    // 1) Try a running node over RPC (streams blocks; bounded memory).
+    let (found, source) = match scan_via_rpc(&mut wallet) {
+        Some(n) => (n, "node RPC"),
+        None => {
+            // 2) Fall back to the local block DB (node must be stopped).
+            let db_path = utxo_db_path();
+            let store = match shadowdag::infrastructure::storage::rocksdb::blocks::block_store::BlockStore::new(
+                db_path.as_str(),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Node not reachable over RPC and cannot open local block DB ({}): {}", db_path, e);
+                    eprintln!("Start the node, or run this while the node is stopped.");
+                    return;
+                }
+            };
+            let mut h = 0u64;
+            let mut found = 0usize;
+            loop {
+                let hashes = store.get_block_hashes_at_height(h);
+                if hashes.is_empty() {
+                    break;
+                }
+                for hash in hashes {
+                    if let Some(b) = store.get_block(&hash) {
+                        found += wallet.scan_blocks(std::slice::from_ref(&b));
+                    }
+                }
+                h = match h.checked_add(1) {
+                    Some(n) => n,
+                    None => break,
+                };
+            }
+            (found, "local DB")
+        }
+    };
+    println!("Scanned via {}.", source);
+
+    // Persist updated wallet state (confidential UTXOs) back to the wallet DB.
+    if !addr.is_empty() {
+        if let Ok(db) = WalletDB::new(&wallet_db_path()) {
+            if let Err(e) = db.save_wallet(&wallet) {
+                eprintln!("Warning: could not persist scan results: {}", e);
+            }
+        }
+    }
+
+    println!("New confidential outputs found this scan: {}", found);
+    println!(
+        "Confidential balance: {:.8} SDAG ({} sats) across {} output(s).",
+        wallet.confidential_balance() as f64 / 100_000_000.0,
+        wallet.confidential_balance(),
+        wallet.confidential_utxos().iter().filter(|u| !u.spent).count()
+    );
 }
 
 fn cmd_invisible(args: &[String]) {
@@ -966,7 +1718,10 @@ fn cmd_deploy_package(args: &[String]) {
     println!(
         "  Bytecode:    {} bytes (hash: {}...)",
         package.code_size(),
-        &package.bytecode_hash[..16]
+        package
+            .bytecode_hash
+            .get(..16)
+            .unwrap_or(&package.bytecode_hash)
     );
     println!("  VM version:  {}", package.vm_version);
     println!(
@@ -1029,7 +1784,13 @@ fn cmd_verify(args: &[String]) {
 
     println!("Verifying contract {} against {}...", address, package_path);
     println!("  Package name:     {}", package.name);
-    println!("  Package hash:     {}...", &package.bytecode_hash[..16]);
+    println!(
+        "  Package hash:     {}...",
+        package
+            .bytecode_hash
+            .get(..16)
+            .unwrap_or(&package.bytecode_hash)
+    );
     println!("  VM version:       {}", package.vm_version);
     println!(
         "\n  Use RPC: verify_contract {} '{}'",
@@ -1048,8 +1809,10 @@ fn print_help() {
     println!();
     println!("COMMANDS:");
     println!("  new [network]           Create a new wallet (mainnet/testnet/regtest)");
+    println!("  restore [network]       Restore a wallet from a recovery phrase (prompts for phrase)");
     println!("  balance [address]       Check address balance (uses wallet address if omitted)");
-    println!("  send <to> <amount>      Send SDAG to address");
+    println!("  send <to> <amount>      Send SDAG to address (…1p = confidential)");
+    println!("  shield <1p_addr> <amt>  Shield transparent funds into the confidential pool");
     println!("  stealth [base_addr]     Generate stealth address");
     println!("  invisible [network]     Create invisible wallet (ghost mode)");
     println!("  export                  Export wallet keys as JSON");
@@ -1165,6 +1928,7 @@ mod gui {
     const MAX_PATH_BYTES: usize = 512;
     const MAX_ADDR_BYTES: usize = 128; // longest plausible SDAG address
     const RPC_TIMEOUT_SECS: u64 = 5;
+    const MAX_RPC_RESPONSE_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
     const SEED_PROBE_TIMEOUT_SECS: u64 = 3;
 
     /// Official ShadowDAG seed RPC endpoints. The wallet picks the first one
@@ -1209,8 +1973,15 @@ mod gui {
                         "[wallet] no seed nodes reachable — falling back to 127.0.0.1:9332"
                     );
                     eprintln!("         (check internet; or run a local node)");
-                    parse_rpc_target("127.0.0.1:9332")
-                        .expect("hardcoded loopback should always parse")
+                    match parse_rpc_target("127.0.0.1:9332") {
+                        Some(target) => target,
+                        None => {
+                            eprintln!(
+                                "[wallet] internal error: failed to parse hardcoded fallback RPC"
+                            );
+                            return;
+                        }
+                    }
                 }
             },
         };
@@ -1373,13 +2144,13 @@ mod gui {
     /// Host / Origin validation — mitigate DNS rebinding and browser CSRF
     /// against the localhost wallet UI. Accept ONLY loopback hostnames.
     fn is_safe_local_request(host: Option<&str>, origin: Option<&str>) -> bool {
-        if let Some(h) = host {
-            let h = h.to_ascii_lowercase();
-            let host_only = h.split(':').next().unwrap_or("").trim();
-            if host_only != "127.0.0.1" && host_only != "localhost" && host_only != "[::1]"
-            {
-                return false;
-            }
+        let Some(h) = host else {
+            return false;
+        };
+        let h = h.to_ascii_lowercase();
+        let host_only = h.split(':').next().unwrap_or("").trim();
+        if host_only != "127.0.0.1" && host_only != "localhost" && host_only != "[::1]" {
+            return false;
         }
         if let Some(o) = origin {
             let o = o.to_ascii_lowercase();
@@ -1433,28 +2204,74 @@ mod gui {
         }
         let _ = stream.flush();
 
-        let mut response = String::new();
-        if stream.read_to_string(&mut response).is_err() {
-            return serde_json::json!({"error": "rpc read failed"});
+        let mut reader = BufReader::new(&stream);
+        let mut content_length: usize = 0;
+        let mut content_length_seen = false;
+        let mut unsupported_transfer_encoding = false;
+        let mut header_lines = 0usize;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    header_lines += 1;
+                    if header_lines > MAX_HEADER_LINES {
+                        return serde_json::json!({"error": "rpc headers too large"});
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = trimmed.split_once(':') {
+                        if name.trim().eq_ignore_ascii_case("content-length") {
+                            if content_length_seen {
+                                return serde_json::json!({"error": "invalid rpc response"});
+                            }
+                            content_length_seen = true;
+                            content_length = match value.trim().parse::<usize>() {
+                                Ok(n) => n,
+                                Err(_) => return serde_json::json!({"error": "invalid rpc response"}),
+                            };
+                        } else if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+                            unsupported_transfer_encoding = true;
+                        }
+                    }
+                }
+                Err(_) => return serde_json::json!({"error": "rpc read failed"}),
+            }
+        }
+        if unsupported_transfer_encoding || !content_length_seen {
+            return serde_json::json!({"error": "invalid rpc response"});
         }
 
-        if let Some(idx) = response.find("\r\n\r\n") {
-            let json_str = &response[idx + 4..];
-            match serde_json::from_str::<serde_json::Value>(json_str) {
-                Ok(val) => {
-                    if let Some(result) = val.get("result") {
-                        return result.clone();
-                    }
-                    if val.get("error").is_some() {
-                        // Don't echo node error back — just say it failed.
-                        return serde_json::json!({"error": "rpc returned error"});
-                    }
-                    val
-                }
-                Err(_) => serde_json::json!({"error": "invalid rpc response"}),
+        let response_body = if content_length > 0 {
+            if content_length > MAX_RPC_RESPONSE_BYTES {
+                return serde_json::json!({"error": "rpc response too large"});
+            }
+            let mut body = vec![0u8; content_length];
+            if reader.read_exact(&mut body).is_err() {
+                return serde_json::json!({"error": "rpc read failed"});
+            }
+            match String::from_utf8(body) {
+                Ok(s) => s,
+                Err(_) => return serde_json::json!({"error": "invalid rpc response"}),
             }
         } else {
-            serde_json::json!({"error": "malformed rpc response"})
+            String::new()
+        };
+
+        match serde_json::from_str::<serde_json::Value>(&response_body) {
+            Ok(val) => {
+                if let Some(result) = val.get("result") {
+                    return result.clone();
+                }
+                if val.get("error").is_some() {
+                    // Don't echo node error back - just say it failed.
+                    return serde_json::json!({"error": "rpc returned error"});
+                }
+                val
+            }
+            Err(_) => serde_json::json!({"error": "invalid rpc response"}),
         }
     }
 
@@ -1539,6 +2356,7 @@ mod gui {
         let mut content_length: usize = 0;
         let mut host_header: Option<String> = None;
         let mut origin_header: Option<String> = None;
+        let mut malformed_content_length = false;
         let mut header_line = String::new();
         let mut header_lines = 0usize;
         let mut header_bytes = 0usize;
@@ -1560,7 +2378,10 @@ mod gui {
                     let lower = trimmed.to_ascii_lowercase();
                     if lower.starts_with("content-length:") {
                         if let Some((_, val)) = trimmed.split_once(':') {
-                            content_length = val.trim().parse().unwrap_or(0);
+                            match val.trim().parse::<usize>() {
+                                Ok(v) => content_length = v,
+                                Err(_) => malformed_content_length = true,
+                            }
                         }
                     } else if lower.starts_with("host:") {
                         if let Some((_, val)) = trimmed.split_once(':') {
@@ -1582,6 +2403,10 @@ mod gui {
                     }
                 }
             }
+        }
+        if malformed_content_length {
+            send_response(&mut stream, 400, "text/plain", b"Malformed Content-Length");
+            return;
         }
 
         let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
@@ -2341,5 +3166,49 @@ mod gui {
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.write_all(body);
         let _ = stream.flush();
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{
+        cli_rpc_extract_result, cli_rpc_request_body, is_confidential_addr, validate_address,
+    };
+
+    #[test]
+    fn rpc_request_body_is_jsonrpc2() {
+        let body = cli_rpc_request_body("getblockcount", &serde_json::json!([]));
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["method"], "getblockcount");
+        assert_eq!(v["params"], serde_json::json!([]));
+        assert_eq!(v["id"], 1);
+    }
+
+    #[test]
+    fn rpc_extract_result_handles_ok_and_error() {
+        assert_eq!(
+            cli_rpc_extract_result(r#"{"jsonrpc":"2.0","result":42,"id":1}"#),
+            Some(serde_json::json!(42))
+        );
+        // Error response → None.
+        assert_eq!(
+            cli_rpc_extract_result(r#"{"jsonrpc":"2.0","error":{"code":-1,"message":"x"},"id":1}"#),
+            None
+        );
+        // Malformed → None.
+        assert_eq!(cli_rpc_extract_result("not json"), None);
+    }
+
+    #[test]
+    fn confidential_addr_routing_predicate() {
+        let conf = format!("SD1p{}", "0".repeat(136));
+        assert!(is_confidential_addr(&conf), "SD1p + 136 hex is confidential");
+        // Standard and stealth/one-time addresses must NOT route as confidential.
+        assert!(!is_confidential_addr(&format!("SD{}", "0".repeat(74))));
+        assert!(!is_confidential_addr(&format!("SD1s{}", "0".repeat(40))));
+        assert!(!is_confidential_addr("SD1p00")); // wrong length
+        // The confidential address must also pass validate_address.
+        assert!(validate_address(&conf).is_ok());
     }
 }

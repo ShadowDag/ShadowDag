@@ -81,7 +81,7 @@ impl ShadowNode {
         self.active = true;
 
         slog_info!("node", "shadow_node_starting", mode => &format!("{:?}", self.mode), network => &self.network);
-        slog_info!("node", "shadow_node_id", id => &self.node_id[..8]);
+        slog_info!("node", "shadow_node_id", id => self.node_id.get(..8).unwrap_or(&self.node_id));
 
         let peer_count = peers.count();
         slog_info!("node", "shadow_node_peers", count => &peer_count.to_string());
@@ -163,7 +163,7 @@ impl ShadowNode {
         &self.mode
     }
     pub fn node_id_short(&self) -> &str {
-        &self.node_id[..8]
+        self.node_id.get(..8).unwrap_or(&self.node_id)
     }
 }
 
@@ -182,6 +182,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee: 1,
             timestamp: 1735689600,

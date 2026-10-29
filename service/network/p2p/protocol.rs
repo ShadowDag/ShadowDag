@@ -36,7 +36,20 @@
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Stable per-process identity nonce, used ONLY for self-connection detection.
+/// Every outbound Version is stamped with this value, so if we ever RECEIVE a
+/// Version carrying it we know the connection is to ourselves (our own IP is in
+/// the bootstrap/seed list) and can drop it + stop re-dialing that address —
+/// otherwise a node churns endlessly connecting to itself instead of to real
+/// peers. Generated once. NOT used for Ping/Pong replay nonces, which stay
+/// per-message random.
+pub fn local_identity_nonce() -> u64 {
+    static NONCE: OnceLock<u64> = OnceLock::new();
+    *NONCE.get_or_init(rand_nonce)
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //                         PROTOCOL CONSTANTS
@@ -609,8 +622,15 @@ pub fn payload_size_bounds(cmd: CommandId) -> (usize, usize) {
         CommandId::Addr => (BINCODE_TAG, BINCODE_TAG + 256 * 1024),
         CommandId::Inv => (BINCODE_TAG + 1, BINCODE_TAG + 512 * 1024),
         CommandId::GetData => (BINCODE_TAG + 1, BINCODE_TAG + 512 * 1024),
-        // Block: up to 2 MiB (MAX_BLOCK_SIZE is 2 MB per consensus)
-        CommandId::Block => (BINCODE_TAG + 60, 2 * 1024 * 1024),
+        // Block: up to MAX_MESSAGE_SIZE, which is TWICE the 2 MB
+        // ConsensusParams::MAX_BLOCK_SIZE a block may actually be. The comment
+        // here used to claim the 2 MB figure the bound does not apply. Left as
+        // it is deliberately: narrowing what the wire accepts is a change to
+        // what we refuse from peers, which the audit freeze covers. Until then
+        // every consumer of a Block payload must bound its own memory rather
+        // than trust this to have done it — the orphan pool did not, and held
+        // 5,000 of them.
+        CommandId::Block => (BINCODE_TAG + 60, MAX_MESSAGE_SIZE),
         // Tx: max 256 KiB (prevents single giant TXs with millions of inputs)
         CommandId::Tx => (BINCODE_TAG + 12, 256 * 1024),
         CommandId::GetHeaders => (BINCODE_TAG + 1, BINCODE_TAG + 1024),
@@ -1249,41 +1269,58 @@ pub fn validate_payload_checksum(payload: &[u8], expected: [u8; 4]) -> Result<()
     Ok(())
 }
 
-/// Validate an Inv/GetData message's item list.
-pub fn validate_inv_items(items: &[(String, String)]) -> Result<(), ProtocolError> {
-    if items.len() > MAX_INV_PER_MSG {
+/// Validate an Inv/GetData message's item count against the wire limit.
+pub fn validate_inv_count(count: usize) -> Result<(), ProtocolError> {
+    if count > MAX_INV_PER_MSG {
         return Err(ProtocolError::new(
             ProtocolErrorKind::FieldViolation,
-            format!("inv items {} > max {}", items.len(), MAX_INV_PER_MSG),
+            format!("inv items {} > max {}", count, MAX_INV_PER_MSG),
             50,
         ));
     }
+    Ok(())
+}
+
+/// Validate ONE Inv/GetData item, in place.
+///
+/// The same checks, messages and ban scores as [`validate_inv_items`], which is
+/// now this function in a loop. The dispatcher calls this one because the slice
+/// form takes owned pairs: checking a 5,000-item announcement through it meant
+/// copying it into 10,000 freshly allocated strings first, every message.
+pub fn validate_inv_item(kind: &str, hash: &str) -> Result<(), ProtocolError> {
+    if kind != "block" && kind != "tx" {
+        return Err(ProtocolError::new(
+            ProtocolErrorKind::FieldViolation,
+            format!("unknown inv type '{}'", kind),
+            20,
+        ));
+    }
+    if hash.len() != MAX_HASH_HEX_LEN {
+        return Err(ProtocolError::new(
+            ProtocolErrorKind::FieldViolation,
+            format!(
+                "inv hash length {} != required {}",
+                hash.len(),
+                MAX_HASH_HEX_LEN
+            ),
+            50,
+        ));
+    }
+    if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ProtocolError::new(
+            ProtocolErrorKind::FieldViolation,
+            "inv hash contains non-hex characters".to_string(),
+            50,
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an Inv/GetData message's item list.
+pub fn validate_inv_items(items: &[(String, String)]) -> Result<(), ProtocolError> {
+    validate_inv_count(items.len())?;
     for (kind, hash) in items {
-        if kind != "block" && kind != "tx" {
-            return Err(ProtocolError::new(
-                ProtocolErrorKind::FieldViolation,
-                format!("unknown inv type '{}'", kind),
-                20,
-            ));
-        }
-        if hash.len() != MAX_HASH_HEX_LEN {
-            return Err(ProtocolError::new(
-                ProtocolErrorKind::FieldViolation,
-                format!(
-                    "inv hash length {} != required {}",
-                    hash.len(),
-                    MAX_HASH_HEX_LEN
-                ),
-                50,
-            ));
-        }
-        if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(ProtocolError::new(
-                ProtocolErrorKind::FieldViolation,
-                "inv hash contains non-hex characters".to_string(),
-                50,
-            ));
-        }
+        validate_inv_item(kind, hash)?;
     }
     Ok(())
 }
@@ -1392,7 +1429,9 @@ pub fn build_version_payload(node_id: &str, best_height: u64, bps: u32) -> Versi
         bps,
         chain_id: CHAIN_ID,
         services: DEFAULT_SERVICES,
-        nonce: rand_nonce(),
+        // Stable identity nonce (not per-message random) so the peer can detect
+        // a self-connection by matching it against its own.
+        nonce: local_identity_nonce(),
     }
 }
 
@@ -1881,6 +1920,53 @@ mod tests {
     }
 
     #[test]
+    fn the_item_validators_agree_with_the_slice_form() {
+        // The dispatcher validates items in place; the slice form must stay the
+        // same function in a loop, down to the message and the ban score.
+        let good = "a".repeat(MAX_HASH_HEX_LEN);
+        let bad_hex = "z".repeat(MAX_HASH_HEX_LEN);
+        let cases = [
+            ("block", good.as_str()),
+            ("tx", good.as_str()),
+            ("wat", good.as_str()),
+            ("block", "short"),
+            ("block", bad_hex.as_str()),
+        ];
+        for (kind, hash) in cases {
+            let slice = validate_inv_items(&[(kind.to_string(), hash.to_string())]);
+            let item = validate_inv_item(kind, hash);
+            match (slice, item) {
+                (Ok(()), Ok(())) => {}
+                (Err(a), Err(b)) => {
+                    assert_eq!(a.message, b.message, "message differs for {kind}/{hash}");
+                    assert_eq!(a.ban_score, b.ban_score, "score differs for {kind}/{hash}");
+                }
+                (a, b) => panic!("verdicts differ for {kind}/{hash}: {a:?} vs {b:?}"),
+            }
+        }
+        // The count check is the other half, and it is checked first: a list
+        // that is both too long AND holds a bad item must still report the
+        // length, the way it did when the items were copied up front.
+        assert!(validate_inv_count(MAX_INV_PER_MSG).is_ok());
+        let long_and_bad: Vec<(String, String)> = (0..=MAX_INV_PER_MSG)
+            .map(|_| ("wat".to_string(), "short".to_string()))
+            .collect();
+        let err = validate_inv_items(&long_and_bad).unwrap_err();
+        assert!(err.message.starts_with("inv items"), "got {}", err.message);
+
+        // And the scores the refactor promised not to move.
+        assert_eq!(
+            validate_inv_count(MAX_INV_PER_MSG + 1).unwrap_err().ban_score,
+            50
+        );
+        assert_eq!(validate_inv_item("wat", &good).unwrap_err().ban_score, 20);
+        assert_eq!(validate_inv_item("block", "short").unwrap_err().ban_score, 50);
+        let err = validate_inv_item("block", &bad_hex).unwrap_err();
+        assert_eq!(err.ban_score, 50);
+        assert_eq!(err.message, "inv hash contains non-hex characters");
+    }
+
+    #[test]
     fn inv_items_bad_type_rejected() {
         let items = vec![("unknown".to_string(), "aa".repeat(32))];
         let err = validate_inv_items(&items).unwrap_err();
@@ -1928,6 +2014,19 @@ mod tests {
     }
 
     // ── Version payload builder test ────────────────────────────────────
+
+    #[test]
+    fn identity_nonce_is_stable_and_stamped_on_version() {
+        // The identity nonce must be constant within a process AND be the value
+        // stamped on every Version — that's what lets a peer detect a
+        // self-connection (its own nonce echoed back). A per-message random
+        // nonce (the old behaviour) makes self-detection impossible.
+        let a = local_identity_nonce();
+        let b = local_identity_nonce();
+        assert_eq!(a, b, "identity nonce must be stable within the process");
+        let vp = build_version_payload("id:node", 5, DEFAULT_BPS);
+        assert_eq!(vp.nonce, a, "Version must carry the stable identity nonce");
+    }
 
     #[test]
     fn build_version_payload_valid() {

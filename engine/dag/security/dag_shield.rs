@@ -6,10 +6,11 @@
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config::node::node_config::NetworkMode;
 use crate::domain::block::block::Block;
 use crate::domain::transaction::transaction::Transaction;
 use crate::engine::dag::security::dos_protection::{
-    DosProtection, MAX_DAG_PARENTS, MAX_FUTURE_TIMESTAMP_SECS, MAX_OUTPUT_AMOUNT, MAX_TX_INPUTS,
+    DosProtection, MAX_DAG_PARENTS, MAX_FUTURE_TIMESTAMP_MS, MAX_OUTPUT_AMOUNT, MAX_TX_INPUTS,
     MAX_TX_OUTPUTS, MAX_TX_SIZE_BYTES, MIN_TX_SIZE_BYTES,
 };
 use crate::engine::dag::security::flood_protection::FloodProtection;
@@ -60,8 +61,18 @@ impl DagShield {
         Self::validate_block(block).is_ok()
     }
 
-    /// Full block shield with rejection reason + ban severity.
+    /// Full block shield with rejection reason + ban severity (mainnet rules).
     pub fn validate_block(block: &Block) -> Result<(), ShieldRejection> {
+        Self::validate_block_for_network(block, NetworkMode::Mainnet)
+    }
+
+    /// Network-aware full block shield. The consensus path passes the node's
+    /// `NetworkMode` so test networks accept linear (single-parent) chains while
+    /// mainnet keeps the 2-parent anti-selfish-mining rule.
+    pub fn validate_block_for_network(
+        block: &Block,
+        network: NetworkMode,
+    ) -> Result<(), ShieldRejection> {
         // ─────────────────────────────────────────
         // 0. Genesis (special rules)
         // ─────────────────────────────────────────
@@ -99,7 +110,7 @@ impl DagShield {
         // ─────────────────────────────────────────
         // 3. Selfish mining (O(1) — parent count)
         // ─────────────────────────────────────────
-        if !SelfishMiningGuard::validate(block) {
+        if !SelfishMiningGuard::validate_for_network(block, network) {
             return Err(ShieldRejection::moderate(
                 "selfish mining (too few parents)",
             ));
@@ -139,8 +150,12 @@ impl DagShield {
         if block.header.hash.is_empty() {
             return Err(ShieldRejection::severe("empty block hash"));
         }
-        if block.header.hash.len() != 64 {
-            return Err(ShieldRejection::severe("invalid block hash length"));
+        // Length AND hex: a 64-char hash containing a multibyte UTF-8 char would
+        // otherwise pass and later panic any code that byte-slices it.
+        if block.header.hash.len() != 64
+            || !block.header.hash.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(ShieldRejection::severe("invalid block hash (len/hex)"));
         }
         if block.body.transactions.is_empty() && block.header.height > 0 {
             return Err(ShieldRejection::moderate("empty block body"));
@@ -155,19 +170,19 @@ impl DagShield {
         if parents.len() > MAX_DAG_PARENTS {
             return Err(ShieldRejection::severe("too many parents"));
         }
-        // Reject far-future/far-past timestamps (wall clock only, cheap)
+        // Reject far-future/far-past timestamps (wall clock only, cheap; ms vs ms)
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
-        if block.header.timestamp > now + MAX_FUTURE_TIMESTAMP_SECS {
+            .as_millis() as u64;
+        if block.header.timestamp > now + MAX_FUTURE_TIMESTAMP_MS {
             return Err(ShieldRejection::minor("future timestamp"));
         }
         // NOTE: We intentionally do NOT reject old timestamps here.
         // During Initial Block Download (IBD), all historical blocks are
         // legitimately old. Timestamp validation for new blocks happens in
         // L2 (validate_structural_layer → validate_timestamp) which uses
-        // MAX_PAST_BLOCK_SECS relative to parent timestamps, not wall clock.
+        // MAX_PAST_BLOCK_MS relative to parent timestamps, not wall clock.
         // The future-timestamp check above is safe because future blocks
         // are never valid regardless of sync mode.
         Ok(())
@@ -188,8 +203,8 @@ impl DagShield {
         if tx.hash.is_empty() {
             return Err(ShieldRejection::severe("empty tx hash"));
         }
-        if tx.hash.len() != 64 {
-            return Err(ShieldRejection::moderate("invalid tx hash length"));
+        if tx.hash.len() != 64 || !tx.hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ShieldRejection::moderate("invalid tx hash (len/hex)"));
         }
 
         // Must have outputs
@@ -210,23 +225,26 @@ impl DagShield {
             return Err(ShieldRejection::severe("too many outputs"));
         }
 
-        // Timestamp: reject far-future or ancient TXs
+        // Timestamp: reject far-future or ancient TXs (ms vs ms)
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
-        if tx.timestamp > now + 120 {
+            .as_millis() as u64;
+        if tx.timestamp > now + 120_000 {
             return Err(ShieldRejection::minor("future TX timestamp"));
         }
-        // TX older than 24h is stale (MAX_TX_AGE_SECS from tx_validator)
-        if tx.timestamp + 86_400 < now {
+        // TX older than 24h is stale (MAX_TX_AGE_MS from tx_validator)
+        if tx.timestamp + 86_400_000 < now {
             return Err(ShieldRejection::minor("stale TX timestamp"));
         }
 
-        // Output amount sanity (cheap O(n))
+        // Output amount sanity (cheap O(n)). Confidential (RingCT) AND shield
+        // outputs carry amount=0 by design (value hidden in the commitment), so
+        // the zero-amount rejection applies to transparent outputs only.
+        let is_conf = tx.is_confidential() || tx.is_shield();
         let mut total: u128 = 0;
         for output in &tx.outputs {
-            if output.amount == 0 {
+            if output.amount == 0 && !is_conf {
                 return Err(ShieldRejection::moderate("zero output amount"));
             }
             if output.amount > MAX_OUTPUT_AMOUNT {
@@ -440,11 +458,11 @@ mod tests {
     use crate::domain::block::block_header::BlockHeader;
     use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
 
-    fn now_secs() -> u64 {
+    fn now_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs()
+            .as_millis() as u64
     }
 
     fn valid_hash() -> String {
@@ -462,6 +480,10 @@ mod tests {
                 pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput {
                 address: "bob".into(),
@@ -469,9 +491,11 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee,
-            timestamp: now_secs(),
+            timestamp: now_ms(),
             is_coinbase: false,
             tx_type: TxType::Transfer,
             payload_hash: None,
@@ -489,9 +513,11 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee: 0,
-            timestamp: now_secs(),
+            timestamp: now_ms(),
             is_coinbase: true,
             tx_type: TxType::Transfer,
             payload_hash: None,
@@ -510,6 +536,17 @@ mod tests {
     }
 
     #[test]
+    fn shield_tx_zero_amount_output_passes_pre_validate() {
+        let mut tx = make_tx(&valid_hash(), 10);
+        tx.tx_type = TxType::Shield;
+        tx.outputs[0].amount = 0;
+        assert!(
+            DagShield::pre_validate_tx(&tx).is_ok(),
+            "shield tx with a zero-amount confidential output must not be rejected"
+        );
+    }
+
+    #[test]
     fn empty_hash_rejected() {
         let mut tx = make_tx(&valid_hash(), 5);
         tx.hash = String::new();
@@ -524,7 +561,18 @@ mod tests {
         tx.hash = "abc123".into();
         let r = DagShield::pre_validate_tx(&tx);
         assert!(r.is_err());
-        assert_eq!(r.unwrap_err().reason, "invalid tx hash length");
+        assert_eq!(r.unwrap_err().reason, "invalid tx hash (len/hex)");
+    }
+
+    #[test]
+    fn non_hex_64_char_hash_rejected() {
+        // A 64-char hash containing a non-hex (here, multibyte) char must be
+        // rejected so downstream byte-slicing can't panic.
+        let mut tx = make_tx("a".repeat(64).as_str(), 5);
+        tx.hash = format!("{}é", "a".repeat(62)); // 62 ascii + 'é' (2 bytes) = 64 bytes
+        assert_eq!(tx.hash.len(), 64);
+        let r = DagShield::pre_validate_tx(&tx);
+        assert!(r.is_err(), "non-hex 64-byte hash must be rejected");
     }
 
     #[test]
@@ -547,7 +595,7 @@ mod tests {
     #[test]
     fn future_timestamp_rejected() {
         let mut tx = make_tx(&valid_hash(), 5);
-        tx.timestamp = now_secs() + 300; // 5 min future
+        tx.timestamp = now_ms() + 300_000; // 5 min future (ms)
         assert!(DagShield::pre_validate_tx(&tx).is_err());
     }
 
@@ -600,7 +648,7 @@ mod tests {
                 valid_hash(),
                 parents,
                 valid_hash(),
-                now_secs(),
+                now_ms(),
                 42,
                 1,
                 height,
@@ -634,7 +682,7 @@ mod tests {
     #[test]
     fn block_future_timestamp_rejected() {
         let mut block = make_block(5, 3);
-        block.header.timestamp = now_secs() + 1000;
+        block.header.timestamp = now_ms() + 200_000; // > MAX_FUTURE_MS
         assert!(DagShield::pre_validate_block(&block).is_err());
     }
 

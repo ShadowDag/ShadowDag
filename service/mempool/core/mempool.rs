@@ -27,7 +27,7 @@ pub const MAX_BLOCK_TX_COUNT: usize = MempoolConfig::MAX_BLOCK_TX_COUNT;
 pub const MIN_RELAY_FEE: u64 = MempoolConfig::MIN_RELAY_FEE;
 pub const MIN_FEE_RATE: f64 = MempoolConfig::MIN_FEE_RATE;
 const EVICT_BATCH_SIZE: usize = MempoolConfig::EVICTION_BATCH_SIZE;
-pub const MAX_MEMPOOL_TX_AGE_SECS: u64 = MempoolConfig::MAX_MEMPOOL_TX_AGE_SECS;
+pub const MAX_MEMPOOL_TX_AGE_MS: u64 = MempoolConfig::MAX_MEMPOOL_TX_AGE_MS;
 
 /// Maximum number of unconfirmed transactions from the same sender address.
 /// Prevents a single wallet from monopolizing the mempool with min-fee TXs.
@@ -37,7 +37,6 @@ const MAX_TXS_PER_SENDER: usize = 25;
 
 const PFX_TX: &[u8] = b"tx:";
 const PFX_FEE: &[u8] = b"fee:";
-const PFX_RDEP: &[u8] = b"rdep:";
 /// Metadata key for tracking total serialized bytes in the pool.
 const META_TOTAL_BYTES: &[u8] = b"_meta:total_bytes";
 /// Metadata key for tracking TX count without full scan.
@@ -54,6 +53,28 @@ pub struct Mempool {
 // Internal metadata helpers (atomic counters via RocksDB)
 // ─────────────────────────────────────────────────────────
 impl Mempool {
+    #[inline]
+    fn key_log_hint(key: &[u8]) -> String {
+        const MAX_KEY_LOG_BYTES: usize = 32;
+        let clipped = &key[..key.len().min(MAX_KEY_LOG_BYTES)];
+        match std::str::from_utf8(clipped) {
+            Ok(s) => {
+                if key.len() > MAX_KEY_LOG_BYTES {
+                    format!("{}...", s)
+                } else {
+                    s.to_string()
+                }
+            }
+            Err(_) => {
+                let mut out = hex::encode(clipped);
+                if key.len() > MAX_KEY_LOG_BYTES {
+                    out.push_str("...");
+                }
+                out
+            }
+        }
+    }
+
     /// Iterate the fee index backward (lowest fee_rate first) and return up to
     /// `limit` tx hashes. Uses RocksDB's reverse seek so only `limit` entries
     /// are read — O(limit) instead of O(n) for the full prefix scan + reverse.
@@ -82,9 +103,9 @@ impl Mempool {
             }
             Ok(_) => 0,
             Err(e) => {
-                let key_str = String::from_utf8_lossy(key);
+                let key_str = Self::key_log_hint(key);
                 slog_error!("mempool", "meta_get_u64_read_failed",
-                    key => &key_str.to_string(), error => &e.to_string());
+                    key => &key_str, error => &e.to_string());
                 0
             }
         }
@@ -93,9 +114,9 @@ impl Mempool {
     #[inline]
     fn meta_set_u64(&self, key: &[u8], val: u64) {
         if let Err(e) = self.db.put(key, val.to_le_bytes()) {
-            let key_str = String::from_utf8_lossy(key);
+            let key_str = Self::key_log_hint(key);
             slog_error!("mempool", "meta_set_u64_write_failed",
-                key => &key_str.to_string(), error => &e.to_string());
+                key => &key_str, error => &e.to_string());
         }
     }
 
@@ -205,6 +226,29 @@ impl Mempool {
     // ── RBF helper ─────────────────────────────────────────────────────
     /// Build RBF info for a conflicting mempool TX.
     fn build_rbf_info(&self, tx: &Transaction) -> MempoolTxInfo {
+        // Transitive dependent closure + their REAL summed fees. RBF eviction
+        // (remove_transaction) cascades through the whole closure, so the
+        // replacement must cover all of those fees — using actual fees (not a
+        // MIN_FEE_BUMP lower bound) prevents a replacement from reducing the
+        // mempool's total fee.
+        let mut dependents: Vec<String> = Vec::new();
+        let mut dependent_fees: u64 = 0;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack: Vec<String> = self.get_dependents(&tx.hash);
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur.clone()) {
+                continue;
+            }
+            if let Some(dep_tx) = self.get_transaction(&cur) {
+                dependent_fees = dependent_fees.saturating_add(dep_tx.fee);
+            }
+            for next in self.get_dependents(&cur) {
+                if !seen.contains(&next) {
+                    stack.push(next);
+                }
+            }
+            dependents.push(cur);
+        }
         MempoolTxInfo {
             hash: tx.hash.clone(),
             fee: tx.fee,
@@ -219,7 +263,8 @@ impl Mempool {
                         .map(|k| k.to_string())
                 })
                 .collect(),
-            dependents: self.get_dependents(&tx.hash),
+            dependents,
+            dependent_fees,
             replacement_depth: 0,
         }
     }
@@ -312,6 +357,18 @@ impl Mempool {
         Ok(m)
     }
 
+    #[inline]
+    pub fn network_mode(&self) -> &NetworkMode {
+        &self.network
+    }
+
+    /// Set the active network in place, for state wired after construction
+    /// (e.g. the RPC's mempool). See [`new_with_network`](Self::new_with_network).
+    #[inline]
+    pub fn set_network(&mut self, network: NetworkMode) {
+        self.network = network;
+    }
+
     /// Storage-only insertion. Does NOT validate UTXO/signatures.
     /// For production callers, use `add_transaction_validated()` instead.
     /// This method is public for tests and internal use only.
@@ -333,7 +390,11 @@ impl Mempool {
             Err(_) => return false,
         }
         let tx_size = tx.canonical_bytes().len().max(1) as u64;
-        let fee_rate = tx.fee / tx_size;
+        // Scale before dividing: a plain `fee / size` is integer-truncated to 0
+        // for every normal tx (fee in sat < size in bytes), collapsing all txs
+        // into one priority bucket and breaking fee-based eviction/template
+        // ordering. Use milli-sat-per-byte so the ordering key has resolution.
+        let fee_rate = tx.fee.saturating_mul(1000) / tx_size;
         let fee_key = format!("fee:{:020}:{}", u64::MAX - fee_rate, tx.hash);
         batch.put(fee_key.as_bytes(), tx.hash.as_bytes());
         // Build conflict + dependency indexes (same as production)
@@ -370,6 +431,15 @@ impl Mempool {
             return false;
         }
         if tx.hash.is_empty() || tx.outputs.is_empty() {
+            return false;
+        }
+
+        // ── L1.4 Integrity: tx.hash MUST commit to the tx content ────
+        // The relay + mempool dedup keys are keyed on tx.hash; without binding it
+        // to the content, an attacker can relay a tx carrying a VICTIM's predictable
+        // hash and poison those keys, censoring the victim's genuine tx (B4-M03).
+        // The block path already enforces this (validate_structure_for_network).
+        if !crate::domain::transaction::tx_hash::TxHash::verify_for_network(tx, &self.network) {
             return false;
         }
 
@@ -443,12 +513,10 @@ impl Mempool {
             }
         }
 
-        // ── L2 Structural: signature verification (prevents flood) ───
-        if !tx.is_coinbase() && !TxValidator::verify_signatures_for_network(tx, &self.network) {
-            return false;
-        }
-
-        // ── L4 Execution: fee + fee_rate check ──────────────────────
+        // ── L4 Execution: fee + fee_rate check (CHEAP — run before crypto) ──
+        // These run BEFORE signature verification so that flood traffic priced
+        // below the relay floor is rejected without spending CPU on an expensive
+        // signature check (DoS amplification otherwise).
         if tx.fee < MIN_RELAY_FEE {
             return false;
         }
@@ -460,7 +528,7 @@ impl Mempool {
             return false;
         }
 
-        // ── L5 Anti-spam: per-sender rate limit ─────────────────────
+        // ── L5 Anti-spam: per-sender rate limit (CHEAP — run before crypto) ──
         // Prevents a single wallet from monopolizing the pool with
         // cheap TXs. Legitimate batching (25 TXs) is still allowed.
         // Checks ALL unique owners across inputs to prevent bypass via
@@ -469,6 +537,13 @@ impl Mempool {
             if self.sender_tx_count(sender) >= MAX_TXS_PER_SENDER {
                 return false;
             }
+        }
+
+        // ── L2 Structural: signature verification (EXPENSIVE — last gate) ───
+        // Performed after the cheap fee/quota filters above so spam is dropped
+        // before any crypto work.
+        if !tx.is_coinbase() && !TxValidator::verify_signatures_for_network(tx, &self.network) {
+            return false;
         }
 
         // ── Serialize first to know exact byte size ────────────────
@@ -578,7 +653,11 @@ impl Mempool {
         batch.put(tx_key.as_bytes(), &data);
 
         let tx_size = tx.canonical_bytes().len().max(1) as u64;
-        let fee_rate = tx.fee / tx_size;
+        // Scale before dividing: a plain `fee / size` is integer-truncated to 0
+        // for every normal tx (fee in sat < size in bytes), collapsing all txs
+        // into one priority bucket and breaking fee-based eviction/template
+        // ordering. Use milli-sat-per-byte so the ordering key has resolution.
+        let fee_rate = tx.fee.saturating_mul(1000) / tx_size;
         let fee_key = format!("fee:{:020}:{}", u64::MAX - fee_rate, tx.hash);
         batch.put(fee_key.as_bytes(), tx.hash.as_bytes());
 
@@ -732,16 +811,44 @@ impl Mempool {
     }
 
     pub fn remove_transaction(&self, txid: &str) {
-        // BUG FIX: Cascade removal to dependent transactions (children that
-        // spend this TX's outputs). Without this, removing a parent leaves
-        // orphaned children in the pool whose inputs no longer exist,
-        // causing block template validation failures.
-        let dependents = self.get_dependents(txid);
-        for dep_txid in &dependents {
-            // Recursive call handles transitive dependents (grandchildren, etc.)
-            self.remove_transaction(dep_txid);
+        // Cascade removal to dependent transactions (children that spend this
+        // TX's outputs), transitively. Without this, removing a parent leaves
+        // orphaned children whose inputs no longer exist.
+        //
+        // DoS hardening: this was previously recursive, so a deep dependency
+        // chain (depth bounded only by pool capacity — tens of thousands) could
+        // overflow the stack. Collect the transitive closure ITERATIVELY with an
+        // explicit work stack, then delete each tx's own records.
+        let mut to_remove: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack: Vec<String> = vec![txid.to_string()];
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur.clone()) {
+                continue;
+            }
+            for dep in self.get_dependents(&cur) {
+                if !seen.contains(&dep) {
+                    stack.push(dep);
+                }
+            }
+            to_remove.push(cur);
         }
+        for id in &to_remove {
+            self.remove_single_tx(id);
+        }
+    }
 
+    /// Remove a transaction that was CONFIRMED on-chain, WITHOUT cascading to its
+    /// dependents. Unlike `remove_transaction` (eviction/RBF, where a removed
+    /// parent orphans its children), a confirmed parent's outputs now exist
+    /// on-chain, so its mempool children are still valid and must be kept.
+    pub fn remove_confirmed_tx(&self, txid: &str) {
+        self.remove_single_tx(txid);
+    }
+
+    /// Delete a single transaction's records from the pool (no cascade).
+    /// Callers that need cascade removal use `remove_transaction`.
+    fn remove_single_tx(&self, txid: &str) {
         if let Some(tx) = self.get_transaction(txid) {
             // Compute byte size for counter update
             let tx_bytes = bincode::serialize(&tx).map(|d| d.len() as u64).unwrap_or(0);
@@ -762,17 +869,12 @@ impl Mempool {
                 batch.delete(sender_key.as_bytes());
             }
 
-            let fee_keys: Vec<Vec<u8>> = self
-                .db
-                .prefix_iterator(PFX_FEE)
-                .filter_map(|r| r.ok())
-                .take_while(|(k, _)| k.starts_with(PFX_FEE))
-                .filter(|(_, v)| String::from_utf8(v.to_vec()).unwrap_or_default() == txid)
-                .map(|(k, _)| k.to_vec())
-                .collect();
-            for k in fee_keys {
-                batch.delete(&k);
-            }
+            // Reconstruct the fee key deterministically (same formula as insertion)
+            // instead of scanning EVERY fee: key and matching by value — that scan
+            // made each removal O(n), so a cascade/eviction was O(n^2).
+            let fee_size = tx.canonical_bytes().len().max(1) as u64;
+            let fee_rate = tx.fee.saturating_mul(1000) / fee_size;
+            batch.delete(format!("fee:{:020}:{}", u64::MAX - fee_rate, txid).as_bytes());
 
             let dep_prefix = format!("dep:{}:", txid);
             let dep_prefix_bytes = dep_prefix.as_bytes().to_vec();
@@ -787,20 +889,12 @@ impl Mempool {
                 batch.delete(k);
             }
 
-            let rdep_candidates: Vec<Vec<u8>> = self
-                .db
-                .prefix_iterator(PFX_RDEP)
-                .filter_map(|r| r.ok())
-                .take_while(|(k, _)| k.starts_with(PFX_RDEP))
-                .filter(|(k, _)| {
-                    String::from_utf8(k.to_vec())
-                        .map(|s| s.ends_with(&format!(":{}", txid)))
-                        .unwrap_or(false)
-                })
-                .map(|(k, _)| k.to_vec())
-                .collect();
-            for k in rdep_candidates {
-                batch.delete(&k);
+            // Reconstruct the rdep-as-child edges (rdep:{parent}:{index}:{this})
+            // from the tx's own inputs instead of scanning EVERY rdep: key by
+            // suffix. Insertion only writes the edge when the parent is pooled, but
+            // deleting a non-existent key is a no-op, so covering all inputs is safe.
+            for input in &tx.inputs {
+                batch.delete(format!("rdep:{}:{}:{}", input.txid, input.index, txid).as_bytes());
             }
 
             let rdep_prefix = format!("rdep:{}:", txid);
@@ -836,7 +930,7 @@ impl Mempool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
 
         // Collect hashes from fee index, then check timestamps individually
         let all_hashes: Vec<String> = self
@@ -850,7 +944,7 @@ impl Mempool {
         let mut expired = Vec::new();
         for hash in &all_hashes {
             if let Some(tx) = self.get_transaction(hash) {
-                if now.saturating_sub(tx.timestamp) > MAX_MEMPOOL_TX_AGE_SECS {
+                if now.saturating_sub(tx.timestamp) > MAX_MEMPOOL_TX_AGE_MS {
                     expired.push(hash.clone());
                 }
             }
@@ -927,10 +1021,15 @@ impl Mempool {
         total_evicted
     }
 
+    /// `block_height` is the height the template block will occupy (tip + 1),
+    /// NOT the current tip. Coinbase maturity is evaluated against it, so the
+    /// selection matches what `apply_block_dag_ordered` will accept at that
+    /// height rather than at the height we happen to be selecting from.
     pub fn select_transactions_for_block(
         &self,
         utxo_set: &UtxoSet,
         max_count: usize,
+        block_height: u64,
     ) -> Vec<Transaction> {
         let limit = max_count.min(MAX_BLOCK_TX_COUNT);
 
@@ -944,6 +1043,14 @@ impl Mempool {
                 let hash = String::from_utf8(hash_bytes.to_vec()).unwrap_or_default();
                 self.get_transaction(&hash)
             })
+            // CONSENSUS-CRITICAL: exclude txs already applied by ANY block
+            // in the DAG (tx_seen marker). Execution skips such a tx as a
+            // duplicate with ZERO fee contribution, so a template that
+            // re-includes it makes the coinbase claim fees that will never
+            // be applied — the mined block then fails the post-execution
+            // coinbase check on every full validator, and followers can
+            // never sync past it (this froze the testnet at height 1659).
+            .filter(|tx| !utxo_set.is_tx_seen(&tx.hash))
             .collect();
 
         let tx_hashes: HashSet<String> = candidates.iter().map(|t| t.hash.clone()).collect();
@@ -1046,10 +1153,24 @@ impl Mempool {
                     continue;
                 }
 
+                // CONSENSUS-CRITICAL, same failure shape as the tx_seen filter
+                // above: `exists` accepts an immature coinbase output, but
+                // `apply_block_dag_ordered` SKIPS a tx that spends one (maturity
+                // check D) and drops its fee. The coinbase would then claim a fee
+                // execution never applied, `actual_total != expected_total` fires
+                // on every validator, and the block is rejected network-wide —
+                // the miner re-mines the same doomed template and the chain
+                // stalls. `exists_spendable` applies the same maturity rule as
+                // apply, at the height this block will actually occupy.
+                // staged_outputs are outputs of earlier txs in THIS block, which
+                // are never coinbase, so maturity does not apply to them.
                 let all_ok = tx.is_coinbase()
                     || tx.inputs.iter().all(|inp| {
                         match crate::domain::utxo::utxo_set::utxo_key(&inp.txid, inp.index) {
-                            Ok(key) => utxo_set.exists(&key) || staged_outputs.contains(&key),
+                            Ok(key) => {
+                                utxo_set.exists_spendable(&key, block_height)
+                                    || staged_outputs.contains(&key)
+                            }
                             Err(_) => false,
                         }
                     });
@@ -1180,11 +1301,11 @@ impl Mempool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
 
         // Expired count: approximate from oldest timestamp instead of full scan.
         // If oldest TX is within the age limit, there are 0 expired.
-        let expired = if oldest_ts > 0 && now.saturating_sub(oldest_ts) > MAX_MEMPOOL_TX_AGE_SECS {
+        let expired = if oldest_ts > 0 && now.saturating_sub(oldest_ts) > MAX_MEMPOOL_TX_AGE_MS {
             // There are expired TXs; count them by scanning timestamps.
             // This only happens when pool has stale TXs (rare during normal operation).
             self.count_expired(now)
@@ -1255,7 +1376,7 @@ impl Mempool {
             .take_while(|(k, _)| k.starts_with(PFX_FEE))
             .filter_map(|(_, v)| String::from_utf8(v.to_vec()).ok())
             .filter_map(|hash| self.get_transaction(&hash))
-            .filter(|tx| now.saturating_sub(tx.timestamp) > MAX_MEMPOOL_TX_AGE_SECS)
+            .filter(|tx| now.saturating_sub(tx.timestamp) > MAX_MEMPOOL_TX_AGE_MS)
             .count()
     }
 
@@ -1353,8 +1474,11 @@ impl Mempool {
             }
         }
 
-        // Full UTXO + signature validation before accepting into mempool
-        if !tx.is_coinbase() && !TxValidator::validate_tx(tx, utxo_set) {
+        // Full UTXO + signature validation before accepting into mempool.
+        // Must be network-aware so address/payload/signing rules match
+        // the active chain (mainnet/testnet/regtest).
+        if !tx.is_coinbase() && !TxValidator::validate_tx_for_network(tx, utxo_set, &self.network)
+        {
             return Err(MempoolError::ValidationFailed(
                 "transaction failed UTXO/signature validation".to_string(),
             ));
@@ -1521,8 +1645,9 @@ impl crate::domain::traits::tx_pool::TxPool for Mempool {
         &self,
         utxo_set: &crate::domain::utxo::utxo_set::UtxoSet,
         max_count: usize,
+        block_height: u64,
     ) -> Vec<Transaction> {
-        self.select_transactions_for_block(utxo_set, max_count)
+        self.select_transactions_for_block(utxo_set, max_count, block_height)
     }
 }
 
@@ -1553,6 +1678,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee,
             timestamp: current_ts(),
@@ -1574,6 +1701,10 @@ mod tests {
                 pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput {
                 address: "bob".into(),
@@ -1581,6 +1712,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee,
             timestamp: current_ts(),
@@ -1595,7 +1728,7 @@ mod tests {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs()
+            .as_millis() as u64
     }
 
     #[test]
@@ -1630,6 +1763,73 @@ mod tests {
         assert!(
             mp.add_transaction_test(&tx2),
             "After removal, new TX should be accepted"
+        );
+    }
+
+    // Regression (B6-M01): confirming a parent must NOT cascade-evict its
+    // still-valid children (CPFP); only the cascading remove_transaction should.
+    #[test]
+    fn remove_confirmed_tx_keeps_valid_children_unlike_cascade() {
+        let mp = Mempool::try_new(format!(
+            "/tmp/test_mp_v9_cpfp_{}_{}",
+            std::process::id(),
+            line!()
+        ))
+        .expect("test mp");
+        mp.flush();
+
+        mp.add_transaction_test(&coinbase_tx("cpfp_parent", 10));
+        mp.add_transaction_test(&tx_with_input("cpfp_child", "cpfp_parent", 0, 5));
+        assert!(mp.get_transaction("cpfp_child").is_some(), "child pooled");
+
+        mp.remove_confirmed_tx("cpfp_parent");
+        assert!(
+            mp.get_transaction("cpfp_parent").is_none(),
+            "confirmed parent removed"
+        );
+        assert!(
+            mp.get_transaction("cpfp_child").is_some(),
+            "valid child must survive parent confirmation (no cascade)"
+        );
+
+        // Contrast: the cascading remove_transaction DOES evict the child.
+        mp.add_transaction_test(&coinbase_tx("cpfp_parent2", 10));
+        mp.add_transaction_test(&tx_with_input("cpfp_child2", "cpfp_parent2", 0, 5));
+        mp.remove_transaction("cpfp_parent2");
+        assert!(
+            mp.get_transaction("cpfp_child2").is_none(),
+            "cascade removal evicts the child"
+        );
+    }
+
+    // Regression (B6-M02): removal must delete the fee-index entry via a
+    // RECONSTRUCTED key (not an O(n) scan). A wrong reconstruction leaves the key.
+    #[test]
+    fn remove_deletes_reconstructed_fee_index_entry() {
+        let mp = Mempool::try_new(format!(
+            "/tmp/test_mp_v9_feeidx_{}_{}",
+            std::process::id(),
+            line!()
+        ))
+        .expect("test mp");
+        mp.flush();
+
+        let count_fee = |m: &Mempool| -> usize {
+            m.db
+                .prefix_iterator(PFX_FEE)
+                .filter_map(|r| r.ok())
+                .take_while(|(k, _)| k.starts_with(PFX_FEE))
+                .filter(|(_, v)| String::from_utf8(v.to_vec()).unwrap_or_default() == "feeidx_tx")
+                .count()
+        };
+
+        mp.add_transaction_test(&tx_with_input("feeidx_tx", "utxo_fee", 0, 7));
+        assert_eq!(count_fee(&mp), 1, "fee index has the tx after add");
+        mp.remove_transaction("feeidx_tx");
+        assert_eq!(
+            count_fee(&mp),
+            0,
+            "reconstructed fee key must delete the fee-index entry on removal"
         );
     }
 
@@ -1700,7 +1900,7 @@ mod tests {
             let _ = mp.db.put(format!("tx:{}", old_hash).as_bytes(), &data);
             // Also insert fee index entry (required by evict_expired scan)
             let tx_size = old_tx.canonical_bytes().len().max(1) as u64;
-            let fee_rate = old_tx.fee / tx_size;
+            let fee_rate = old_tx.fee.saturating_mul(1000) / tx_size; // milli-sat/byte (consistent with add)
             let fee_key = format!("fee:{:020}:{}", u64::MAX - fee_rate, old_hash);
             let _ = mp.db.put(fee_key.as_bytes(), old_hash.as_bytes());
         }
@@ -1737,7 +1937,7 @@ mod cpfp_tests {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs()
+            .as_millis() as u64
     }
 
     fn coinbase(hash: &str, fee: u64) -> Transaction {
@@ -1750,6 +1950,8 @@ mod cpfp_tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee,
             timestamp: ts(),
@@ -1771,6 +1973,10 @@ mod cpfp_tests {
                 pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput {
                 address: "bob".into(),
@@ -1778,6 +1984,8 @@ mod cpfp_tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee,
             timestamp: ts(),
@@ -1794,6 +2002,29 @@ mod cpfp_tests {
         let id = CTR.fetch_add(1, Ordering::Relaxed);
         let path = format!("/tmp/test_cpfp_{}_{}_{}", label, ts(), id);
         Mempool::try_new(path.as_str()).expect("test pool")
+    }
+
+    #[test]
+    fn remove_transaction_handles_deep_dependency_chain_iteratively() {
+        // Regression: remove_transaction was recursive, so a deep dependency
+        // chain would overflow the stack. The iterative closure must remove the
+        // whole chain (and not crash) regardless of depth.
+        let mp = pool("deep_chain");
+        let depth = 1500;
+        let root = coinbase("chain_0", 500);
+        assert!(mp.add_transaction_test(&root));
+        for i in 1..depth {
+            let tx = child_tx(&format!("chain_{}", i), &format!("chain_{}", i - 1), 0, 500);
+            assert!(mp.add_transaction_test(&tx));
+        }
+        mp.remove_transaction("chain_0");
+        for i in 0..depth {
+            assert!(
+                mp.get_transaction(&format!("chain_{}", i)).is_none(),
+                "tx chain_{} must be removed by cascade",
+                i
+            );
+        }
     }
 
     #[test]
@@ -1934,7 +2165,7 @@ mod policy_tests {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs()
+            .as_millis() as u64
     }
 
     fn coinbase(hash: &str, fee: u64) -> Transaction {
@@ -1947,6 +2178,8 @@ mod policy_tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee,
             timestamp: ts(),
@@ -2035,7 +2268,7 @@ mod policy_tests {
 const PFX_ORPHAN: &[u8] = b"orphan:";
 
 pub const MAX_ORPHAN_POOL_SIZE: usize = MempoolConfig::MAX_ORPHAN_POOL_SIZE;
-pub const MAX_ORPHAN_AGE_SECS: u64 = MempoolConfig::MAX_ORPHAN_AGE_SECS;
+pub const MAX_ORPHAN_AGE_MS: u64 = MempoolConfig::MAX_ORPHAN_AGE_MS;
 
 impl Mempool {
     pub fn add_orphan(&self, tx: &Transaction) -> bool {
@@ -2060,7 +2293,7 @@ impl Mempool {
                     let receive_time = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
-                        .as_secs();
+                        .as_millis() as u64;
                     let ts_key = format!("orphan_ts:{}", tx.hash);
                     let _ = self.db.put(ts_key.as_bytes(), receive_time.to_le_bytes());
                 }
@@ -2122,7 +2355,7 @@ impl Mempool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
 
         // BUG FIX: Use the receive-time metadata key (orphan_ts:{hash}) instead
         // of tx.timestamp.  tx.timestamp is set by the sender and can be
@@ -2154,7 +2387,7 @@ impl Mempool {
                         tx.timestamp
                     }
                 };
-                if now.saturating_sub(receive_time) > MAX_ORPHAN_AGE_SECS {
+                if now.saturating_sub(receive_time) > MAX_ORPHAN_AGE_MS {
                     Some(k.to_vec())
                 } else {
                     None
@@ -2163,9 +2396,9 @@ impl Mempool {
             .collect();
 
         for k in &stale_keys {
-            let label = String::from_utf8_lossy(k);
+            let label = Self::key_log_hint(k);
             if let Err(e) = self.db.delete(k) {
-                slog_warn!("mempool", "orphan_db_delete_failed", key => &label.to_string(), error => &e.to_string());
+                slog_warn!("mempool", "orphan_db_delete_failed", key => &label, error => &e.to_string());
             }
             // Clean up the receive-time metadata key
             if let Ok(key_str) = String::from_utf8(k.to_vec()) {
@@ -2206,7 +2439,7 @@ mod orphan_tests {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs()
+            .as_millis() as u64
     }
 
     fn orphan_tx(hash: &str, parent: &str) -> Transaction {
@@ -2220,6 +2453,10 @@ mod orphan_tests {
                 pub_key: String::new(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput {
                 address: "bob".into(),
@@ -2227,6 +2464,8 @@ mod orphan_tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee: 1,
             timestamp: ts(),

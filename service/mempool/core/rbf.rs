@@ -54,8 +54,13 @@ pub struct MempoolTxInfo {
     pub size: usize,
     /// Input keys this TX spends
     pub inputs: Vec<String>,
-    /// Other TX hashes that depend on this TX's outputs
+    /// Other TX hashes that depend on this TX's outputs (transitive closure —
+    /// these are all evicted along with this TX).
     pub dependents: Vec<String>,
+    /// Sum of the ACTUAL fees of every TX in `dependents`. Used so the
+    /// replacement must cover the real total evicted fee, not a lower-bound
+    /// estimate (which would let a replacement reduce the mempool's total fee).
+    pub dependent_fees: u64,
     /// How many replacements have been applied to this TX chain
     pub replacement_depth: usize,
 }
@@ -83,19 +88,14 @@ impl RbfEngine {
         // are also evicted (see evicted list below). The replacement must cover
         // ALL evicted fees to prevent net fee reduction in the mempool.
         //
-        // NOTE: Dependent fees are approximated from the MempoolTxInfo passed
-        // by the caller. For full accuracy the caller should populate
-        // `dependent_fees` or the engine should look up each dependent.
-        // As a pragmatic fix, we sum each conflict's fee plus a per-dependent
-        // estimate of MIN_FEE_BUMP (the minimum any valid TX must pay).
+        // The caller populates `dependent_fees` with the ACTUAL summed fees of
+        // every dependent that will be evicted, so the replacement must cover the
+        // true total evicted fee (no net mempool fee reduction).
         let total_evicted_fee: u64 = match conflicting.iter().try_fold(0u64, |acc, tx| {
             // Sum the conflict's own fee
             let with_own = acc.checked_add(tx.fee)?;
-            // Sum estimated fees for dependents that will also be evicted.
-            // Each dependent is a valid mempool TX, so it paid at least
-            // MIN_FEE_BUMP. This is a lower bound; the actual fee may be higher.
-            let dep_fees = (tx.dependents.len() as u64).checked_mul(MIN_FEE_BUMP)?;
-            with_own.checked_add(dep_fees)
+            // Plus the real summed fees of its (transitive) dependents.
+            with_own.checked_add(tx.dependent_fees)
         }) {
             Some(total) => total,
             None => {
@@ -190,8 +190,7 @@ impl RbfEngine {
             .iter()
             .try_fold(0u64, |acc, tx| {
                 let with_own = acc.checked_add(tx.fee)?;
-                let dep_fees = (tx.dependents.len() as u64).checked_mul(MIN_FEE_BUMP)?;
-                with_own.checked_add(dep_fees)
+                with_own.checked_add(tx.dependent_fees)
             })
             .unwrap_or(u64::MAX);
         total.saturating_add(MIN_FEE_BUMP)
@@ -231,6 +230,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee,
             timestamp: 1000,
@@ -261,6 +262,7 @@ mod tests {
             size: 200,
             inputs: vec![prev_key],
             dependents: vec![],
+            dependent_fees: 0,
             replacement_depth: 0,
         }
     }
@@ -358,6 +360,30 @@ mod tests {
     }
 
     #[test]
+    fn replacement_must_cover_real_dependent_fees() {
+        // A conflict with one dependent that paid a LARGE fee. The replacement
+        // must cover own(1000) + dependent(9000) + bump(1000) = 11000.
+        let existing = vec![MempoolTxInfo {
+            dependents: vec!["child".into()],
+            dependent_fees: 9_000,
+            ..make_mempool_tx("parent", 1_000)
+        }];
+        // 10_500 < 11_000 → rejected (old estimate would have required only
+        // 1000 + 1*MIN_FEE_BUMP + 1000 and wrongly accepted).
+        let low = make_tx("low", 10_500);
+        assert!(matches!(
+            RbfEngine::evaluate(&low, &existing, &confirmed_keys()),
+            RbfResult::FeeTooLow { .. }
+        ));
+        // 11_000 covers the real total → accepted.
+        let ok = make_tx("ok", 11_000);
+        assert!(matches!(
+            RbfEngine::evaluate(&ok, &existing, &confirmed_keys()),
+            RbfResult::Accepted { .. }
+        ));
+    }
+
+    #[test]
     fn rejects_new_unconfirmed_inputs() {
         // Build a TX that spends a different input than the conflicting TX
         let unconfirmed_input_txid = th("unconfirmed_parent");
@@ -379,6 +405,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee: 50_000,
             timestamp: 1000,
@@ -415,6 +443,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee: 50_000,
             timestamp: 1000,

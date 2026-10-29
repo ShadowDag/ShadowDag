@@ -39,15 +39,19 @@ impl UtxoStore {
         let data =
             bincode::serialize(utxo).map_err(|e| StorageError::Serialization(e.to_string()))?;
 
-        self.db.put(key.as_bytes(), &data)?;
-
         let mut addr_key = Vec::with_capacity(5 + utxo.address.len() + 1 + 36);
         addr_key.extend_from_slice(b"addr:");
         addr_key.extend_from_slice(utxo.address.as_bytes());
         addr_key.extend_from_slice(b":");
         addr_key.extend_from_slice(key.as_bytes());
 
-        self.db.put(&addr_key, key.as_bytes())?;
+        // Write the UTXO entry and its addr: index ATOMICALLY (one WriteBatch), so a
+        // power-loss between them can't leave a spendable-but-unindexed UTXO that
+        // under-counts get_balance until a rescan (B6-L03). Sibling paths already batch.
+        let mut batch = WriteBatch::default();
+        batch.put(key.as_bytes(), &data);
+        batch.put(&addr_key, key.as_bytes());
+        self.db.write(batch)?;
 
         Ok(())
     }

@@ -96,10 +96,11 @@ impl<'a> MinerController<'a> {
     /// 6. Mine the block (find valid nonce via PoW)
     /// 7. Return the mined block for submission to the DAG
     pub fn build_and_mine(&self, miner_address: &str) -> Result<Block, ConsensusError> {
+        // Unix epoch MILLISECONDS (block/coinbase timestamps are ms).
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
 
         // Avoid process-global difficulty state here. Controllers should use
         // the miner instance difficulty configured by the node that owns this
@@ -154,7 +155,7 @@ impl<'a> MinerController<'a> {
             block.header.timestamp,
         )?;
 
-        slog_info!("mining", "block_submitted_to_dag", hash_prefix => &block.header.hash[..block.header.hash.len().min(16)], height => block.header.height, tips => self.tip_manager.tip_count());
+        slog_info!("mining", "block_submitted_to_dag", hash_prefix => crate::domain::types::hash::log_prefix(&block.header.hash, 16), height => block.header.height, tips => self.tip_manager.tip_count());
 
         Ok(())
     }

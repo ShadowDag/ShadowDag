@@ -49,6 +49,30 @@ impl U256 {
         self.0[0] as usize
     }
 
+    /// Shift amount for SHL/SHR, clamped to 256. Any value >= 256 maps to 256,
+    /// for which `shl`/`shr` return ZERO — matching EVM semantics (a shift of
+    /// 256 or more yields 0). Must NOT be derived by truncating to u32/u64, or
+    /// large operands (e.g. 2^64, 2^32) would wrap to a small shift and produce
+    /// the wrong result.
+    pub fn shift_count(&self) -> u32 {
+        if self.0[1] != 0 || self.0[2] != 0 || self.0[3] != 0 || self.0[0] >= 256 {
+            256
+        } else {
+            self.0[0] as u32
+        }
+    }
+
+    /// Interpret the value as a memory/calldata byte offset. Returns `None` if it
+    /// does not fit the addressable range (any high limb set, i.e. value >= 2^64).
+    /// EVM faults (out-of-gas) on astronomically large offsets; ShadowVM callers
+    /// reject the frame on `None` instead of silently truncating the low bits.
+    pub fn to_mem_offset(&self) -> Option<usize> {
+        if self.0[1] != 0 || self.0[2] != 0 || self.0[3] != 0 {
+            return None;
+        }
+        usize::try_from(self.0[0]).ok()
+    }
+
     /// Check if zero
     pub fn is_zero(&self) -> bool {
         self.0[0] == 0 && self.0[1] == 0 && self.0[2] == 0 && self.0[3] == 0
@@ -186,6 +210,50 @@ impl U256 {
             }
             base = base.wrapping_mul(base);
             e = e.shr1();
+        }
+        result
+    }
+
+    /// `(self + rhs) mod n`, carry-correct over the full 257-bit sum.
+    ///
+    /// `wrapping_add` alone drops the 2^256 carry, giving the wrong result when
+    /// `self + rhs >= 2^256` (EVM ADDMOD requires the true sum first). We reduce
+    /// both operands mod `n` (so each is < n) and fold the carry back in.
+    pub fn add_mod(self, rhs: U256, n: U256) -> U256 {
+        if n.is_zero() {
+            return U256::ZERO;
+        }
+        let a = self.checked_mod(n); // a in [0, n)
+        let b = rhs.checked_mod(n); // b in [0, n)
+        let sum = a.wrapping_add(b);
+        // Carry iff a+b overflowed 2^256 (then sum < a). True sum is in [0, 2n).
+        let carried = sum < a;
+        if carried || sum >= n {
+            sum.wrapping_sub(n)
+        } else {
+            sum
+        }
+    }
+
+    /// `(self * rhs) mod n` without truncating the 512-bit product.
+    ///
+    /// `wrapping_mul` keeps only the low 256 bits, so `wrapping_mul.mod n` is
+    /// wrong once the true product reaches 2^256 (EVM MULMOD requires the full
+    /// product first). Computed via double-and-add using the carry-correct
+    /// `add_mod`, so every intermediate stays reduced mod `n` (O(256) steps).
+    pub fn mul_mod(self, rhs: U256, n: U256) -> U256 {
+        if n.is_zero() {
+            return U256::ZERO;
+        }
+        let mut a = self.checked_mod(n);
+        let mut b = rhs.checked_mod(n);
+        let mut result = U256::ZERO;
+        while !b.is_zero() {
+            if b.0[0] & 1 == 1 {
+                result = result.add_mod(a, n);
+            }
+            a = a.add_mod(a, n); // a = 2a mod n
+            b = b.shr1();
         }
         result
     }
@@ -519,6 +587,45 @@ mod tests {
     }
 
     #[test]
+    fn add_mod_small_and_carry() {
+        // (100 + 200) mod 7 = 6
+        assert_eq!(
+            U256::from_u64(100).add_mod(U256::from_u64(200), U256::from_u64(7)),
+            U256::from_u64(6)
+        );
+        // Carry case: 2^255 + 2^255 = 2^256; 2^256 mod 3 == 1 (since 2 ≡ -1 mod 3).
+        let p = U256::ONE.shl(255);
+        assert_eq!(p.add_mod(p, U256::from_u64(3)), U256::ONE);
+        // mod 0 → 0
+        assert_eq!(p.add_mod(p, U256::ZERO), U256::ZERO);
+    }
+
+    #[test]
+    fn mul_mod_small_and_fullwidth() {
+        // (100 * 200) mod 7 = 1
+        assert_eq!(
+            U256::from_u64(100).mul_mod(U256::from_u64(200), U256::from_u64(7)),
+            U256::ONE
+        );
+        // Full-width: 2^200 * 2^200 = 2^400; 2^400 mod 7 == 2 (2^3 ≡ 1 mod 7, 400 mod 3 = 1).
+        let x = U256::ONE.shl(200);
+        assert_eq!(x.mul_mod(x, U256::from_u64(7)), U256::from_u64(2));
+        // Truncating (wrong) impl would give wrapping_mul(2^200,2^200)=0 (2^400 mod 2^256=0) mod 7 = 0.
+        assert_ne!(x.mul_mod(x, U256::from_u64(7)), U256::ZERO);
+        assert_eq!(x.mul_mod(x, U256::ZERO), U256::ZERO);
+    }
+
+    #[test]
+    fn exp_full_exponent() {
+        assert_eq!(U256::from_u64(3).wrapping_pow(U256::from_u64(4)), U256::from_u64(81));
+        // 2^256 wraps to 0 mod 2^256 — the old capped-at-255 code returned 2^255.
+        assert_eq!(U256::from_u64(2).wrapping_pow(U256::from_u64(256)), U256::ZERO);
+        // 2^255 is the high bit set.
+        assert_eq!(U256::from_u64(2).wrapping_pow(U256::from_u64(255)), U256::ONE.shl(255));
+        assert_eq!(U256::from_u64(7).wrapping_pow(U256::ZERO), U256::ONE);
+    }
+
+    #[test]
     fn division() {
         assert_eq!(
             U256::from_u64(100).checked_div(U256::from_u64(3)).as_u64(),
@@ -671,5 +778,47 @@ mod tests {
         let n = U256::from_u64(10);
         let result = a.wrapping_mul(b).checked_mod(n);
         assert_eq!(result.as_u64(), 1); // (7*3) % 10 = 1
+    }
+
+    #[test]
+    fn shift_count_clamps_to_256_no_truncation() {
+        // Small shifts pass through.
+        assert_eq!(U256::from_u64(0).shift_count(), 0);
+        assert_eq!(U256::from_u64(5).shift_count(), 5);
+        assert_eq!(U256::from_u64(255).shift_count(), 255);
+        // Anything >= 256 clamps to 256 (so shl/shr return ZERO), NOT truncated.
+        assert_eq!(U256::from_u64(256).shift_count(), 256);
+        assert_eq!(U256::from_u64(1_000).shift_count(), 256);
+        // 2^32 — would truncate to 0 under `as u32`; must clamp to 256.
+        assert_eq!(U256::from_u64(1u64 << 32).shift_count(), 256);
+        // 2^32 + 5 — would shift by 5 under `as u32`; must clamp to 256.
+        assert_eq!(U256::from_u64((1u64 << 32) + 5).shift_count(), 256);
+        // 2^64 (limb[1]=1) — would be 0 under `as_u64() as u32`; must clamp.
+        assert_eq!(U256([0, 1, 0, 0]).shift_count(), 256);
+        // 2^192 (limb[3]=1) — must clamp.
+        assert_eq!(U256([0, 0, 0, 1]).shift_count(), 256);
+    }
+
+    #[test]
+    fn shl_shr_by_large_amount_yields_zero() {
+        let v = U256::from_u64(0xDEAD_BEEF);
+        // Shifts >= 256 (incl. the previously-truncating 2^64 / 2^32 cases)
+        // must yield ZERO, not the operand unchanged.
+        assert_eq!(v.shl(U256([0, 1, 0, 0]).shift_count()), U256::ZERO); // 2^64
+        assert_eq!(v.shr(U256([0, 1, 0, 0]).shift_count()), U256::ZERO);
+        assert_eq!(v.shl(U256::from_u64(1u64 << 32).shift_count()), U256::ZERO);
+        assert_eq!(v.shr(U256::from_u64(256).shift_count()), U256::ZERO);
+        // A genuine small shift still works.
+        assert_eq!(U256::from_u64(1).shl(U256::from_u64(4).shift_count()), U256::from_u64(16));
+    }
+
+    #[test]
+    fn to_mem_offset_rejects_huge_offsets() {
+        assert_eq!(U256::from_u64(0).to_mem_offset(), Some(0));
+        assert_eq!(U256::from_u64(1024).to_mem_offset(), Some(1024));
+        // >= 2^64 (any high limb set) is not addressable → None.
+        assert_eq!(U256([0, 1, 0, 0]).to_mem_offset(), None); // 2^64
+        assert_eq!(U256([5, 0, 1, 0]).to_mem_offset(), None); // 2^128 + 5
+        assert_eq!(U256([0, 0, 0, 1]).to_mem_offset(), None); // 2^192
     }
 }

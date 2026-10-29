@@ -9,9 +9,11 @@
 // counting leading zeros. This gives finer-grained difficulty adjustment.
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::config::node::node_config::NetworkMode;
 use crate::domain::block::block::Block;
 use crate::domain::block::block_header::BlockHeader;
 use crate::engine::mining::algorithms::shadowhash::shadow_hash;
+use crate::engine::mining::algorithms::umbrahash;
 
 /// Maximum target: 2^256 - 1, represented as 32 bytes (all 0xFF).
 /// In hex this is 64 'f' characters.
@@ -26,9 +28,76 @@ pub const MIN_DIFFICULTY: u64 = 1;
 
 pub struct PowValidator;
 
+/// Human-readable PoW algorithm name for a header version, for explorer/RPC
+/// display. Version-gated exactly like validation: >= UMBRA_POW_VERSION is the
+/// memory-hard UmbraHash, below is the legacy ShadowHash. Use the current tip's
+/// version so the label reflects the algorithm actually being mined.
+pub fn pow_algorithm_name(version: u32) -> &'static str {
+    if version >= umbrahash::UMBRA_POW_VERSION {
+        "UmbraHash"
+    } else {
+        "ShadowHash"
+    }
+}
+
 impl PowValidator {
-    /// Full block PoW validation
+    /// Full block PoW validation using the NETWORK-AGNOSTIC default activation
+    /// floor (see `umbrahash::UMBRA_ACTIVATION_HEIGHT`). Used by network-blind
+    /// paths (the miner's own DAG insertion, tests). The AUTHORITATIVE consensus
+    /// gate uses `validate_for_network` so the mainnet fork is enforced per
+    /// network.
     pub fn validate(block: &Block) -> PowResult {
+        if let Some(fail) =
+            Self::umbra_floor(block, umbrahash::umbra_required_at(block.header.height))
+        {
+            return fail;
+        }
+        Self::validate_body(block)
+    }
+
+    /// AUTHORITATIVE, network-aware full-block PoW validation. Applies the
+    /// per-network UmbraHash activation floor (mainnet: version >=
+    /// UMBRA_POW_VERSION required at height >= 1) then the version-gated PoW
+    /// check. Consensus MUST call this so the mainnet fork is enforced and the
+    /// miner and verifier stay in parity per network.
+    pub fn validate_for_network(block: &Block, network: &NetworkMode) -> PowResult {
+        if let Some(fail) = Self::umbra_floor(
+            block,
+            umbrahash::umbra_required_at_for(block.header.height, network),
+        ) {
+            return fail;
+        }
+        Self::validate_body(block)
+    }
+
+    /// Reject a legacy (version < UMBRA_POW_VERSION) block when UmbraHash is
+    /// mandatory at this height. `required` is the activation decision for the
+    /// relevant schedule (network-aware or blind). Returns `Some(fail)` to
+    /// reject, `None` to continue. Without this floor a miner could downgrade to
+    /// a cheaper v2 ShadowHash block at the same target and bypass
+    /// memory-hardness after the fork.
+    fn umbra_floor(block: &Block, required: bool) -> Option<PowResult> {
+        if required && block.header.version < umbrahash::UMBRA_POW_VERSION {
+            return Some(PowResult::fail(format!(
+                "version {} below UMBRA_POW_VERSION {} required at height {}",
+                block.header.version,
+                umbrahash::UMBRA_POW_VERSION,
+                block.header.height
+            )));
+        }
+        None
+    }
+
+    /// Version-gated PoW body (runs after the activation floor): UmbraHash for
+    /// version >= UMBRA_POW_VERSION, else legacy ShadowHash.
+    fn validate_body(block: &Block) -> PowResult {
+        // Hard-fork gate: version >= UMBRA_POW_VERSION uses UmbraHash (memory-hard).
+        if block.header.version >= umbrahash::UMBRA_POW_VERSION {
+            return match Self::umbra_check(&block.header) {
+                Ok(hash) => PowResult::ok(hash),
+                Err(e) => PowResult::fail(e),
+            };
+        }
         // 1. Recompute the hash using ShadowHash
         let computed_hash = shadow_hash(block);
 
@@ -36,8 +105,8 @@ impl PowValidator {
         if computed_hash != block.header.hash {
             return PowResult::fail(format!(
                 "hash mismatch: computed={}... header={}...",
-                &computed_hash[..16.min(computed_hash.len())],
-                &block.header.hash[..16.min(block.header.hash.len())]
+                crate::domain::types::hash::log_prefix(&computed_hash, 16),
+                crate::domain::types::hash::log_prefix(&block.header.hash, 16)
             ));
         }
 
@@ -77,7 +146,7 @@ impl PowValidator {
         {
             return PowResult::fail(format!(
                 "hash {} does not meet difficulty {} target",
-                &computed_hash[..16],
+                computed_hash.get(..16).unwrap_or(&computed_hash),
                 block.header.difficulty
             ));
         }
@@ -85,8 +154,179 @@ impl PowValidator {
         PowResult::ok(computed_hash)
     }
 
+    /// UmbraHash PoW check (version >= UMBRA_POW_VERSION). Recomputes
+    /// `(mix_hash, result)` from the epoch cache and requires: the header's
+    /// identity `hash` equals the hashimoto result, the committed `mix_hash`
+    /// matches, and `result <= target`. Genesis (difficulty 0 at height 0) passes.
+    /// Returns Ok(identity hash) or Err(reason).
+    fn umbra_check(h: &BlockHeader) -> Result<String, String> {
+        if h.difficulty == 0 && h.height > 0 {
+            return Err("difficulty 0 is not valid for non-genesis blocks".to_string());
+        }
+        if h.difficulty > MAX_DIFFICULTY {
+            return Err(format!("difficulty {} exceeds MAX_DIFFICULTY {}", h.difficulty, MAX_DIFFICULTY));
+        }
+        // Cheap height ceiling BEFORE any epoch/cache work: an unbounded
+        // attacker-chosen height would make epoch_seed chain SHA3 for hours
+        // (remote CPU-exhaustion) before the PoW check. Reject up front.
+        if h.height > umbrahash::UMBRA_MAX_HEIGHT {
+            return Err(format!(
+                "umbra: height {} exceeds UMBRA_MAX_HEIGHT {}",
+                h.height, umbrahash::UMBRA_MAX_HEIGHT
+            ));
+        }
+        if h.difficulty == 0 {
+            return Ok(h.hash.clone()); // genesis (height 0, checked above)
+        }
+        let hh = umbrahash::header_hash(
+            h.version, h.height, h.timestamp, h.extra_nonce, h.difficulty, &h.merkle_root, &h.parents,
+            h.prev_state_commitment.as_deref(),
+        );
+        let cache = umbrahash::cache_for_epoch(umbrahash::epoch_of(h.height));
+        let (mix, result) = umbrahash::hashimoto_light(
+            &cache,
+            umbrahash::DATASET_BYTES,
+            &hh,
+            h.nonce,
+            umbrahash::prog_seed_from_height(h.height),
+        );
+        let result_hex = hex::encode(result);
+        if result_hex != h.hash {
+            return Err("umbra: identity hash != hashimoto result".to_string());
+        }
+        if hex::encode(mix) != h.mix_hash {
+            return Err("umbra: mix_hash does not match recomputed mix".to_string());
+        }
+        if !Self::hash_meets_target(&result_hex, h.difficulty) {
+            return Err(format!("umbra: result does not meet difficulty {}", h.difficulty));
+        }
+        Ok(result_hex)
+    }
+
+    /// Recompute the identity hash a VALID block of this header would carry,
+    /// version-gated: UmbraHash (version >= UMBRA_POW_VERSION) → the hashimoto
+    /// result (hex); older → shadow_hash. Cheap admission gates use this to bind
+    /// `header.hash` to the header content (anti-spoof). NOTE: for UmbraHash this
+    /// generates/uses the epoch cache (memoized) + one hashimoto_light.
+    pub fn recompute_identity_hash(header: &BlockHeader) -> String {
+        // Activation floor — ⚠️ CURRENTLY INERT ON EVERY NETWORK. It gates on the
+        // NETWORK-BLIND `umbra_required_at`, which reads `UMBRA_ACTIVATION_HEIGHT`
+        // = `None` (umbrahash.rs), so this branch NEVER fires. The authoritative
+        // per-network rule is `umbra_required_at_for` / `validate_for_network`,
+        // which this function does not have a `NetworkMode` to consult.
+        //
+        // CONSEQUENCE (open finding, disclosed to the external audit): the cheap
+        // anti-spoof paths — relay orphan admission, sync header verify, light-node
+        // validate — do NOT enforce the mainnet UmbraHash fork. After mainnet
+        // height 1 they may still accept a downgraded v2 ShadowHash header that
+        // `validate_for_network` rejects. Do NOT cite this as Full/Sync/Light
+        // parity. Fix = thread `NetworkMode` into the header-only paths.
+        // The empty sentinel makes every `recomputed == header.hash` caller reject.
+        if umbrahash::umbra_required_at(header.height)
+            && header.version < umbrahash::UMBRA_POW_VERSION
+        {
+            return String::new();
+        }
+        if header.version >= umbrahash::UMBRA_POW_VERSION {
+            // Height ceiling BEFORE the epoch cache: this cheap anti-spoof gate
+            // runs on UNVALIDATED headers (orphan admission, sync, light node)
+            // ahead of the PoW check, so an absurd height must NOT be allowed to
+            // trigger epoch_seed/mkcache. Return a sentinel that cannot match a
+            // real hashimoto result; full validation then rejects the header.
+            if header.height > umbrahash::UMBRA_MAX_HEIGHT {
+                return String::new();
+            }
+            let hh = umbrahash::header_hash(
+                header.version, header.height, header.timestamp, header.extra_nonce,
+                header.difficulty, &header.merkle_root, &header.parents,
+                header.prev_state_commitment.as_deref(),
+            );
+            let cache = umbrahash::cache_for_epoch(umbrahash::epoch_of(header.height));
+            let (_mix, result) = umbrahash::hashimoto_light(
+                &cache,
+                umbrahash::DATASET_BYTES,
+                &hh,
+                header.nonce,
+                umbrahash::prog_seed_from_height(header.height),
+            );
+            hex::encode(result)
+        } else {
+            use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
+            shadow_hash_raw_full(
+                header.version, header.height, header.timestamp, header.nonce,
+                header.extra_nonce, header.difficulty, &header.merkle_root, &header.parents,
+                header.prev_state_commitment.as_deref(),
+            )
+        }
+    }
+
+    /// TIP-BOUNDED identity recompute — prefer this over `recompute_identity_hash`
+    /// on every header-only admission path that knows a trusted tip height
+    /// (light node, sync header verify, relay orphan pool).
+    ///
+    /// SECURITY (external audit H3): the unbounded variant will build an epoch
+    /// cache for ANY height under the absolute `UMBRA_MAX_HEIGHT` ceiling, which
+    /// still permits ~333k-iteration `epoch_seed` + a 16 MiB `mkcache` for an
+    /// UNVALIDATED attacker-supplied header — and with only three resident caches,
+    /// alternating far epochs forces a rebuild every time. Refusing out-of-bound
+    /// epochs up front turns that into a comparison. Returns the same empty
+    /// sentinel as the other rejection paths, so `recomputed == header.hash`
+    /// callers reject the header unchanged.
+    ///
+    /// This does NOT replace ordering discipline: cheap structural, height and
+    /// parent checks should still run BEFORE any identity recompute.
+    pub fn recompute_identity_hash_bounded(header: &BlockHeader, tip_height: u64) -> String {
+        if header.version >= umbrahash::UMBRA_POW_VERSION
+            && umbrahash::epoch_out_of_bound(header.height, tip_height)
+        {
+            return String::new();
+        }
+        Self::recompute_identity_hash(header)
+    }
+
+    /// FULL-CONTEXT identity recompute: network-aware activation floor + the
+    /// tip-relative epoch bound. This is what every header-only admission path
+    /// should call once it knows its network (external audit H3 + the activation
+    /// parity gap).
+    ///
+    /// WHY: `recompute_identity_hash` gates on the NETWORK-BLIND
+    /// `umbra_required_at`, whose `UMBRA_ACTIVATION_HEIGHT` is `None`, so it
+    /// enforces no fork at all. On mainnet, UmbraHash is mandatory from height 1
+    /// — a header-only path using the blind rule would accept a downgraded v2
+    /// ShadowHash header that the authoritative `validate_for_network` rejects.
+    ///
+    /// `network = None` means the caller could not determine its network. Such a
+    /// caller is ALREADY degraded (it cannot check genesis either) and is
+    /// non-authoritative by construction, so it keeps the blind behaviour rather
+    /// than pretending to enforce a schedule it cannot know. Do not rely on a
+    /// `None` caller for any security decision.
+    pub fn recompute_identity_hash_checked(
+        header: &BlockHeader,
+        tip_height: u64,
+        network: Option<&NetworkMode>,
+    ) -> String {
+        let umbra_required = match network {
+            Some(n) => umbrahash::umbra_required_at_for(header.height, n),
+            None => umbrahash::umbra_required_at(header.height),
+        };
+        if umbra_required && header.version < umbrahash::UMBRA_POW_VERSION {
+            return String::new();
+        }
+        Self::recompute_identity_hash_bounded(header, tip_height)
+    }
+
     /// Validate a header independently (recompute hash from fields including extra_nonce)
     pub fn validate_header(header: &BlockHeader) -> bool {
+        // Fork-activation floor (see validate): reject a legacy version once
+        // UmbraHash is mandatory at this height.
+        if umbrahash::umbra_required_at(header.height)
+            && header.version < umbrahash::UMBRA_POW_VERSION
+        {
+            return false;
+        }
+        if header.version >= umbrahash::UMBRA_POW_VERSION {
+            return Self::umbra_check(header).is_ok();
+        }
         use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
         let recomputed = shadow_hash_raw_full(
             header.version,
@@ -97,6 +337,7 @@ impl PowValidator {
             header.difficulty,
             &header.merkle_root,
             &header.parents,
+            header.prev_state_commitment.as_deref(),
         );
 
         if recomputed != header.hash {
@@ -156,7 +397,7 @@ impl PowValidator {
 
     /// Convert difficulty to a 256-bit target: target = MAX_TARGET / difficulty.
     /// Returns 32-byte big-endian representation.
-    fn difficulty_to_target_bytes(difficulty: u64) -> [u8; 32] {
+    pub fn difficulty_to_target_bytes(difficulty: u64) -> [u8; 32] {
         if difficulty == 0 {
             return [0xFF; 32]; // MAX_TARGET
         }
@@ -329,6 +570,193 @@ mod tests {
     }
 
     #[test]
+    fn umbra_version_block_validates_and_rejects_tampering() {
+        use crate::domain::block::block::Block;
+        use crate::domain::block::block_body::BlockBody;
+        use crate::engine::mining::algorithms::umbrahash;
+
+        // Difficulty 1 → target = MAX → any result meets it (no search needed).
+        let mut header = BlockHeader::new_with_defaults(
+            umbrahash::UMBRA_POW_VERSION,
+            String::new(),
+            vec!["p".repeat(64)],
+            "merkle".into(),
+            1_700_000_000_000,
+            0, // nonce
+            1, // difficulty
+            1, // height (non-genesis → PoW enforced)
+        );
+        // "Mine": compute UmbraHash for this header at nonce 0 and commit it.
+        let hh = umbrahash::header_hash(
+            header.version, header.height, header.timestamp, header.extra_nonce,
+            header.difficulty, &header.merkle_root, &header.parents,
+            header.prev_state_commitment.as_deref(),
+        );
+        let cache = umbrahash::cache_for_epoch(umbrahash::epoch_of(header.height));
+        let (mix, result) = umbrahash::hashimoto_light(
+            &cache,
+            umbrahash::DATASET_BYTES,
+            &hh,
+            header.nonce,
+            umbrahash::prog_seed_from_height(header.height),
+        );
+        header.hash = hex::encode(result);
+        header.mix_hash = hex::encode(mix);
+
+        assert!(PowValidator::validate_header(&header), "valid UmbraHash header must pass");
+        let block = Block { header: header.clone(), body: BlockBody { transactions: vec![] } };
+        assert!(PowValidator::validate(&block).valid, "valid UmbraHash block must pass");
+
+        // Tampering must fail closed.
+        let mut bad_mix = header.clone();
+        bad_mix.mix_hash = "00".repeat(32);
+        assert!(!PowValidator::validate_header(&bad_mix), "wrong mix_hash must fail");
+
+        let mut bad_hash = header.clone();
+        bad_hash.hash = "ab".repeat(32);
+        assert!(!PowValidator::validate_header(&bad_hash), "wrong identity hash must fail");
+
+        let mut bad_nonce = header.clone();
+        bad_nonce.nonce = 12_345;
+        assert!(!PowValidator::validate_header(&bad_nonce), "wrong nonce must fail");
+    }
+
+    #[test]
+    fn umbra_rejects_absurd_height_without_cache_work() {
+        use crate::engine::mining::algorithms::umbrahash;
+        // SECURITY (CRITICAL DoS): a v>=3 header with height above the consensus
+        // ceiling must be rejected by the CHEAP guard BEFORE epoch_seed/mkcache.
+        // With height = u64::MAX (epoch ~6.1e12), an unguarded path would chain
+        // SHA3-256 for hours; the guard makes both entry points return instantly.
+        let mut header = BlockHeader::new_with_defaults(
+            umbrahash::UMBRA_POW_VERSION,
+            String::new(),
+            vec!["p".repeat(64)],
+            "merkle".into(),
+            1_700_000_000_000,
+            0,        // nonce
+            1,        // difficulty (non-zero → PoW enforced)
+            u64::MAX, // height → epoch ~6.1e12 if unguarded
+        );
+        header.hash = "ab".repeat(32);
+        header.mix_hash = "cd".repeat(32);
+        assert!(
+            !PowValidator::validate_header(&header),
+            "height above UMBRA_MAX_HEIGHT must be rejected"
+        );
+        // The cheap anti-spoof recompute must return the empty sentinel (it did
+        // NO cache work); a real hashimoto result is always 64 hex chars.
+        assert_eq!(PowValidator::recompute_identity_hash(&header), "");
+    }
+
+    #[test]
+    fn checked_recompute_enforces_the_mainnet_fork_that_the_blind_rule_misses() {
+        use crate::config::node::node_config::NetworkMode;
+        use crate::engine::mining::algorithms::umbrahash;
+        // The activation-parity gap: UMBRA_ACTIVATION_HEIGHT is None, so the
+        // network-BLIND rule enforces no fork at all, while mainnet requires
+        // UmbraHash from height 1. A header-only path using the blind rule would
+        // therefore accept a downgraded legacy header that the authoritative
+        // validate_for_network rejects. The checked recompute must close that.
+        let legacy_version = umbrahash::UMBRA_POW_VERSION - 1;
+        let header = BlockHeader::new_with_defaults(
+            legacy_version,
+            String::new(),
+            vec!["p".repeat(64)],
+            "merkle".into(),
+            1_700_000_000_000,
+            0,
+            1,
+            1, // height 1 — past the mainnet activation
+        );
+
+        // Blind rule: no fork enforced, so it happily recomputes (the bug).
+        assert_ne!(
+            PowValidator::recompute_identity_hash(&header),
+            "",
+            "precondition: the blind rule does NOT enforce the fork"
+        );
+
+        // Mainnet: must refuse with the empty sentinel.
+        assert_eq!(
+            PowValidator::recompute_identity_hash_checked(
+                &header,
+                1,
+                Some(&NetworkMode::Mainnet)
+            ),
+            "",
+            "a legacy header at height 1 must be refused on mainnet"
+        );
+        // ...and that matches the authoritative gate's verdict on the same rule
+        // (umbra_floor), which is the parity we are restoring.
+        assert!(
+            umbrahash::umbra_required_at_for(header.height, &NetworkMode::Mainnet),
+            "mainnet must require UmbraHash at height 1"
+        );
+        assert!(
+            !umbrahash::umbra_required_at(header.height),
+            "the blind rule must NOT require it — this is the divergence"
+        );
+
+        // Testnet is unscheduled, so the same header is still recomputed there —
+        // proving the fix is per-network, not a blanket version ban.
+        assert_ne!(
+            PowValidator::recompute_identity_hash_checked(
+                &header,
+                1,
+                Some(&NetworkMode::Testnet)
+            ),
+            "",
+            "testnet is unscheduled — the legacy header must still recompute"
+        );
+    }
+
+    #[test]
+    fn bounded_recompute_refuses_far_epoch_under_the_absolute_ceiling() {
+        use crate::engine::mining::algorithms::umbrahash;
+        // External audit H3: the absolute UMBRA_MAX_HEIGHT ceiling is NOT enough.
+        // A height just under it is "allowed" by the ceiling yet sits ~333k epochs
+        // out, so the unbounded recompute would chain epoch_seed and build a 16 MiB
+        // mkcache for an UNVALIDATED header. The tip-bounded variant must refuse it
+        // with the empty sentinel instead, while still serving a near-tip header.
+        let far = umbrahash::UMBRA_MAX_HEIGHT - 1;
+        let mut header = BlockHeader::new_with_defaults(
+            umbrahash::UMBRA_POW_VERSION,
+            String::new(),
+            vec!["p".repeat(64)],
+            "merkle".into(),
+            1_700_000_000_000,
+            0,
+            1,
+            far,
+        );
+        header.hash = "ab".repeat(32);
+        header.mix_hash = "cd".repeat(32);
+
+        // Node near genesis: the far header is refused WITHOUT cache work.
+        assert_eq!(
+            PowValidator::recompute_identity_hash_bounded(&header, 0),
+            "",
+            "far-epoch header must be refused by the tip bound"
+        );
+        // Same header once the chain has actually reached that height: allowed
+        // through to a real recompute (64 hex), proving the bound is tip-relative
+        // and not a second absolute ceiling.
+        let out = PowValidator::recompute_identity_hash_bounded(&header, far);
+        assert_eq!(out.len(), 64, "near-tip header must still be recomputed");
+
+        // A legacy (pre-UmbraHash) header does no epoch work, so the bound must
+        // not interfere with it.
+        let mut legacy = header.clone();
+        legacy.version = 2;
+        assert_eq!(
+            PowValidator::recompute_identity_hash_bounded(&legacy, 0),
+            PowValidator::recompute_identity_hash(&legacy),
+            "non-Umbra headers must be unaffected by the epoch bound"
+        );
+    }
+
+    #[test]
     fn div_256bit_correctness() {
         // MAX_TARGET / 2 should give 7f...ff
         let target = PowValidator::difficulty_to_target_bytes(2);
@@ -336,5 +764,69 @@ mod tests {
         for &b in &target[1..] {
             assert_eq!(b, 0xFF);
         }
+    }
+
+    #[test]
+    fn validate_for_network_enforces_mainnet_umbra_floor() {
+        // H2: the AUTHORITATIVE, network-aware gate. Mainnet activates UmbraHash
+        // at height 1, so a legacy v2 (ShadowHash) block at height >= 1 is
+        // rejected on mainnet but accepted on testnet/regtest (unscheduled).
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::block::block::Block;
+        use crate::domain::block::block_body::BlockBody;
+        use crate::engine::mining::algorithms::shadowhash::shadow_hash;
+
+        // A fully-valid legacy v2 ShadowHash block at height 1 (difficulty 1 →
+        // target MAX → any hash meets it; identity hash recomputed to match).
+        let header = BlockHeader::new_with_defaults(
+            2,
+            String::new(),
+            vec!["p".repeat(64)],
+            "merkle".into(),
+            1_700_000_000_000,
+            0, // nonce
+            1, // difficulty
+            1, // height (non-genesis)
+        );
+        let mut block = Block { header, body: BlockBody { transactions: vec![] } };
+        block.header.hash = shadow_hash(&block);
+
+        // Blind default has no schedule → the v2 block is valid.
+        assert!(PowValidator::validate(&block).valid, "v2 block passes the blind default");
+        // Testnet/Regtest are unscheduled → floor does NOT fire → still valid.
+        assert!(
+            PowValidator::validate_for_network(&block, &NetworkMode::Testnet).valid,
+            "testnet does not enforce the umbra floor"
+        );
+        assert!(
+            PowValidator::validate_for_network(&block, &NetworkMode::Regtest).valid,
+            "regtest does not enforce the umbra floor"
+        );
+        // Mainnet activates at height 1 → the v2 block is REJECTED by the floor.
+        let r = PowValidator::validate_for_network(&block, &NetworkMode::Mainnet);
+        assert!(!r.valid, "mainnet rejects a v2 block at height >= 1");
+        assert!(
+            r.reason.as_deref().unwrap_or("").contains("below UMBRA_POW_VERSION"),
+            "rejection must be the umbra activation floor, got: {:?}",
+            r.reason
+        );
+
+        // Mainnet genesis (height 0) is EXEMPT: the floor does not fire at h0.
+        let g_header = BlockHeader::new_with_defaults(
+            2,
+            String::new(),
+            vec![],
+            "merkle".into(),
+            1_700_000_000_000,
+            0, // nonce
+            0, // difficulty (genesis)
+            0, // height 0
+        );
+        let mut g = Block { header: g_header, body: BlockBody { transactions: vec![] } };
+        g.header.hash = shadow_hash(&g);
+        assert!(
+            PowValidator::validate_for_network(&g, &NetworkMode::Mainnet).valid,
+            "mainnet genesis (h0) is exempt from the umbra floor"
+        );
     }
 }

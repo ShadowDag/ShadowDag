@@ -45,6 +45,26 @@ pub struct BlockHeader {
     /// None for blocks with no contract state changes.
     #[serde(default)]
     pub state_root: Option<String>,
+
+    /// UmbraHash PoW mix digest (32-byte hex). Committed alongside `nonce`:
+    /// the node recomputes it cheaply from the epoch cache and rejects a block
+    /// whose recomputed mix != this field. Empty for pre-UmbraHash blocks.
+    #[serde(default)]
+    pub mix_hash: String,
+
+    /// M5 DEFERRED PREV-STATE COMMITMENT (64-hex SHA3-256). Binds, into THIS
+    /// block's PoW preimage, the IDENTITY of its GHOSTDAG selected parent, via
+    /// `shadowhash::compute_prev_state_commitment` (see
+    /// `expected_prev_state_commitment` for the single shared derivation).
+    ///
+    /// NOT a state commitment yet: the parent's `utxo_commitment` / `state_root` /
+    /// `receipt_root` are passed as canonical `None` (reserved slots), because
+    /// those roots are path-dependent and written post-execution, so binding them
+    /// would diverge across nodes. A block's post-execution state is therefore
+    /// still NOT committed by its child. `None` only for pre-M5 blocks; genesis
+    /// carries `genesis_prev_state_commitment()`.
+    #[serde(default)]
+    pub prev_state_commitment: Option<String>,
 }
 
 impl BlockHeader {
@@ -74,6 +94,86 @@ impl BlockHeader {
             extra_nonce: 0,
             receipt_root: None,
             state_root: None,
+            mix_hash: String::new(),
+            prev_state_commitment: None,
         }
+    }
+
+    /// The canonical parent edge for selected-parent-chain walks.
+    ///
+    /// Returns `selected_parent` when it is set, non-empty, and a member of
+    /// `parents`; otherwise falls back to the FIRST listed parent. The
+    /// `parents` list (including its order) is covered by proof-of-work,
+    /// so the fallback is deterministic and unforgeable on every node.
+    ///
+    /// CONSENSUS-CRITICAL: cumulative work, difficulty retarget, reorg
+    /// fork-point discovery, and undo pruning all walk this edge. Blocks
+    /// accepted via `submitblock` are stored with `selected_parent=None`
+    /// (client input is untrusted), so walking the raw field made every
+    /// walk stop after one hop — the node treated each chain extension as
+    /// a disjoint chain, rolled back the tip on every insert, and retained
+    /// only the newest block's UTXOs (observed live: utxo_count=2 at
+    /// height 304 with one reorg rollback per block).
+    ///
+    /// Genesis (no parents) returns None, which terminates walks.
+    pub fn resolved_selected_parent(&self) -> Option<String> {
+        if let Some(sp) = &self.selected_parent {
+            if !sp.is_empty() && self.parents.iter().any(|p| p == sp) {
+                return Some(sp.clone());
+            }
+        }
+        self.parents.first().filter(|p| !p.is_empty()).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header_with(parents: Vec<&str>, selected: Option<&str>) -> BlockHeader {
+        let mut h = BlockHeader::new_with_defaults(
+            1,
+            "h".into(),
+            parents.into_iter().map(String::from).collect(),
+            "m".into(),
+            0,
+            0,
+            1,
+            1,
+        );
+        h.selected_parent = selected.map(String::from);
+        h
+    }
+
+    #[test]
+    fn resolved_prefers_valid_selected_parent() {
+        let h = header_with(vec!["a", "b"], Some("b"));
+        assert_eq!(h.resolved_selected_parent().as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn resolved_falls_back_to_first_parent_when_none() {
+        // The submitblock path stores None — the walkable edge must still exist.
+        let h = header_with(vec!["a", "b"], None);
+        assert_eq!(h.resolved_selected_parent().as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn resolved_rejects_selected_parent_not_in_parents() {
+        // A selected_parent outside the PoW-covered parents list is untrusted.
+        let h = header_with(vec!["a", "b"], Some("evil"));
+        assert_eq!(h.resolved_selected_parent().as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn resolved_genesis_has_no_parent() {
+        let h = header_with(vec![], None);
+        assert_eq!(h.resolved_selected_parent(), None);
+    }
+
+    #[test]
+    fn resolved_ignores_empty_strings() {
+        let h = header_with(vec![""], Some(""));
+        assert_eq!(h.resolved_selected_parent(), None);
     }
 }

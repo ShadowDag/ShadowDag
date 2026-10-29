@@ -230,6 +230,11 @@ pub struct NodeConfig {
     pub enable_stratum: bool,
     /// TCP port for the Stratum mining pool (default: 7779).
     pub stratum_port: u16,
+    /// Payout address for pool-mined coinbases (`--stratum-address`). Required
+    /// for Stratum to produce valid blocks; the coinbase pays this address (the
+    /// pool then distributes to workers off-chain). None disables template
+    /// production even when Stratum is enabled.
+    pub stratum_address: Option<String>,
     /// Enable the built-in blockchain explorer web UI.
     pub enable_explorer: bool,
     /// HTTP port for the blockchain explorer (default: 8080).
@@ -242,6 +247,10 @@ pub struct NodeConfig {
     pub enable_ide: bool,
     /// HTTP port for the contract IDE (default: 3000).
     pub ide_port: u16,
+    /// Explicit peers to connect to (host:port), from `--connect`. Added on top
+    /// of the hardcoded bootstrap set — used for local multi-node testing and
+    /// custom/private deployments.
+    pub connect_peers: Vec<String>,
 }
 
 impl NodeConfig {
@@ -262,12 +271,14 @@ impl NodeConfig {
             miner_addr: String::new(),
             enable_stratum: false,
             stratum_port: 7779,
+            stratum_address: None,
             enable_explorer: false,
             explorer_port: 8080,
             enable_wallet_ui: false,
             wallet_ui_port: 8081,
             enable_ide: false,
             ide_port: 3000,
+            connect_peers: Vec::new(),
         }
     }
 
@@ -278,6 +289,7 @@ impl NodeConfig {
         let mut rpc_override = None;
         let mut mining = false;
         let mut miner_addr = String::new();
+        let mut connect_peers: Vec<String> = Vec::new();
 
         let mut i = 1;
         while i < args.len() {
@@ -291,11 +303,14 @@ impl NodeConfig {
                 "--network" if i + 1 < args.len() => {
                     let val = &args[i + 1];
                     network = val.parse().unwrap_or_else(|_| {
+                        // Abort rather than fail open: silently defaulting an
+                        // unrecognized --network to Mainnet (mainnet magic/peers/data
+                        // dir) is the most dangerous outcome for a CLI typo (B7-L01).
                         eprintln!(
-                            "WARNING: Unknown --network '{}', falling back to mainnet",
+                            "Error: unknown --network '{}' (expected mainnet | testnet | regtest)",
                             val
                         );
-                        NetworkMode::Mainnet
+                        std::process::exit(1);
                     });
                     i += 1;
                 }
@@ -323,6 +338,10 @@ impl NodeConfig {
                     miner_addr = args[i + 1].clone();
                     i += 1;
                 }
+                "--connect" if i + 1 < args.len() => {
+                    connect_peers.push(args[i + 1].clone());
+                    i += 1;
+                }
                 _ => {}
             }
             i += 1;
@@ -337,6 +356,7 @@ impl NodeConfig {
         }
         cfg.enable_mining = mining;
         cfg.miner_addr = miner_addr;
+        cfg.connect_peers = connect_peers;
         cfg
     }
 

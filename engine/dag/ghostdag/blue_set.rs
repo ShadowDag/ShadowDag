@@ -238,12 +238,18 @@ impl BlueSetStore {
     ) -> HashSet<String> {
         let mut blue_set = ghostdag.build_blue_set_for_past(block_hash, parents, all_blocks);
 
-        // Size guard: truncate oversized blue sets to prevent CPU blowup
+        // Size guard: truncate oversized blue sets to prevent CPU blowup.
+        // DETERMINISM: a HashSet iterates in random (per-process) order, so
+        // truncating it directly would make different nodes keep DIFFERENT
+        // 10k-element subsets → divergent coloring/blue-scores → chain split.
+        // Sort first so every node keeps the same subset.
         if blue_set.len() > MAX_BLUE_SET_SIZE {
             slog_warn!("ghostdag", "blue_set_too_large",
                 size => blue_set.len(), max => MAX_BLUE_SET_SIZE);
-            let truncated: HashSet<String> = blue_set.into_iter().take(MAX_BLUE_SET_SIZE).collect();
-            blue_set = truncated;
+            let mut sorted: Vec<String> = blue_set.into_iter().collect();
+            sorted.sort_unstable();
+            sorted.truncate(MAX_BLUE_SET_SIZE);
+            blue_set = sorted.into_iter().collect();
         }
 
         let blue_cf = self.blue_cf();

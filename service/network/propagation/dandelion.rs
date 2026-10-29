@@ -39,6 +39,9 @@ pub const STEM_TIMEOUT_SECS: u64 = 30;
 /// Epoch duration — re-randomize stem peer selection
 pub const EPOCH_DURATION_SECS: u64 = 600; // 10 minutes
 
+/// Fixed key for this node's own per-epoch stem successor in `stem_peer_map`.
+const SELF_STEM_KEY: &str = "self";
+
 /// Max pending stem TXs
 pub const MAX_STEM_PENDING: usize = 5_000;
 
@@ -179,8 +182,9 @@ impl DandelionRelay {
         let now = now_secs();
         let mut to_fluff = Vec::new();
 
-        // Check epoch rotation
-        if now - self.epoch_start >= EPOCH_DURATION_SECS {
+        // Check epoch rotation (saturating_sub: a backward clock step must not
+        // panic in debug nor wrap to a huge value in release).
+        if now.saturating_sub(self.epoch_start) >= EPOCH_DURATION_SECS {
             self.epoch_start = now;
             self.stem_peer_map.clear(); // Re-randomize stem peers
         }
@@ -192,7 +196,7 @@ impl DandelionRelay {
             .filter(|(_, dtx)| match dtx.phase {
                 RelayPhase::Stem {
                     entered_at, hops, ..
-                } => now - entered_at >= STEM_TIMEOUT_SECS || hops >= MAX_STEM_HOPS,
+                } => now.saturating_sub(entered_at) >= STEM_TIMEOUT_SECS || hops >= MAX_STEM_HOPS,
                 RelayPhase::Fluff => true,
             })
             .map(|(h, _)| h.clone())
@@ -250,21 +254,34 @@ impl DandelionRelay {
         r < STEM_PROBABILITY as u64
     }
 
-    /// Select a random stem peer from the given connected peer list.
-    /// Returns None if no peers are connected — caller must fluff instead.
+    /// Select this node's stem successor. Dandelion++ requires a STABLE per-epoch
+    /// successor: routing every tx to a fresh random peer within one epoch lets an
+    /// adversary localize the source via graph-learning / intersection. The pinned
+    /// successor is stored in `stem_peer_map` and reset each epoch by `tick()`; it
+    /// is only re-picked if it disconnects. Returns None if no peers are connected.
     fn select_stem_peer_from(&mut self, peers: &[String]) -> Option<String> {
         if peers.is_empty() {
             log::warn!("[Dandelion] No connected peers for stem relay — will fluff instead");
             return None;
         }
+        // Reuse this epoch's pinned successor if it is still connected.
+        if let Some(existing) = self.stem_peer_map.get(SELF_STEM_KEY) {
+            if peers.iter().any(|p| p == existing) {
+                return Some(existing.clone());
+            }
+        }
+        // First tx of the epoch (or the pinned successor left) — pick and pin one.
         let r = self.next_rng() as usize;
-        Some(peers[r % peers.len()].clone())
+        let chosen = peers[r % peers.len()].clone();
+        self.stem_peer_map
+            .insert(SELF_STEM_KEY.to_string(), chosen.clone());
+        Some(chosen)
     }
 
     fn flush_expired(&mut self) {
         let now = now_secs();
         self.stem_pool.retain(|_, dtx| match dtx.phase {
-            RelayPhase::Stem { entered_at, .. } => now - entered_at < STEM_TIMEOUT_SECS,
+            RelayPhase::Stem { entered_at, .. } => now.saturating_sub(entered_at) < STEM_TIMEOUT_SECS,
             RelayPhase::Fluff => false,
         });
     }
@@ -318,6 +335,35 @@ mod tests {
         relay.on_new_tx_with_peers("tx_001", None, &peers);
         let action = relay.on_new_tx_with_peers("tx_001", None, &peers);
         assert!(matches!(action, RelayAction::Drop));
+    }
+
+    // Regression (B4-M02): Dandelion++ requires a STABLE per-epoch stem successor.
+    // Routing each tx to a fresh random peer within an epoch breaks source-hiding.
+    #[test]
+    fn stem_successor_is_stable_within_epoch_and_resets_on_rotation() {
+        let mut relay = DandelionRelay::new();
+        let peers: Vec<String> = (0..8).map(|i| format!("peer{}", i)).collect();
+
+        let mut pinned: Option<String> = None;
+        for i in 0..25 {
+            if let RelayAction::StemTo(p) =
+                relay.on_new_tx_with_peers(&format!("epoch1_tx{}", i), None, &peers)
+            {
+                let first = pinned.get_or_insert(p.clone());
+                assert_eq!(*first, p, "stem successor must be stable within an epoch");
+            } else {
+                panic!("a local tx must start in stem phase");
+            }
+        }
+        assert!(pinned.is_some(), "a per-epoch successor must have been pinned");
+
+        // Force an epoch boundary: rotation must clear the pinned successor.
+        relay.epoch_start = now_secs().saturating_sub(EPOCH_DURATION_SECS + 1);
+        relay.tick();
+        assert!(
+            relay.stem_peer_map.is_empty(),
+            "epoch rotation must clear the pinned per-epoch successor"
+        );
     }
 
     #[test]

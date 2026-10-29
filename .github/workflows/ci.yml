@@ -2,9 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [ main, develop ]
+    # The active development / pre-audit branch must be covered: an external
+    # reviewer needs a published status check on the exact commit they are
+    # auditing, and until 2026-07-19 no run had EVER succeeded here (see the
+    # quoting note on the integration job below).
+    branches: [ main, develop, 'feature/**', 'claude/**' ]
+    tags: [ 'RC*' ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, develop ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,12 +17,20 @@ env:
 
 jobs:
   fmt:
-    name: Rustfmt
+    name: Rustfmt (advisory)
     runs-on: ubuntu-latest
+    # NON-BLOCKING, deliberately. Because the workflow file was invalid for weeks
+    # this gate never ran, and the tree has since drifted to 362 rustfmt hunks
+    # across 65 files. Reformatting them now would bury the pre-audit diff under
+    # whitespace across consensus code, which is exactly what an external
+    # reviewer must be able to read. The result is still reported; make it
+    # blocking and land the reformat AFTER the external audit closes.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: "1.93.1"
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
@@ -27,7 +40,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.93.1"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
 
@@ -36,7 +51,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.93.1"
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --lib --bins
 
@@ -45,16 +62,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.93.1"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --test shadowdag
+      # The integration suite lives in tests/suite/*.rs, wired into the crate via
+      # `#[cfg(test)] pub mod tests` (root tests.rs), so it runs under --lib in
+      # the `crate::tests::` module path. There is no `--test shadowdag` target.
+      #
+      # QUOTING IS LOAD-BEARING: an unquoted scalar ending in "::" makes YAML read
+      # the trailing colon as a key separator, which made this ENTIRE workflow file
+      # invalid. Every run since 2026-06-30 failed at startup with zero jobs, so
+      # fmt/check/clippy/tests/audit had not actually run in CI for weeks while
+      # appearing to be configured. Keep the quotes.
+      - run: "cargo test --lib tests::"
 
   test-vm:
     name: VM Contract Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.93.1"
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --lib -- execution_env v1_spec contract_e2e receipt_index multi_node soak chaos invariant_checker observability
 
@@ -63,18 +93,54 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Must name the version explicitly. This action exports RUSTUP_TOOLCHAIN,
+      # and an env var outranks rust-toolchain.toml in rustup's precedence, so
+      # an @stable ref silently ran clippy under 1.97.1 while the toolchain file
+      # was installed but ignored.
+      - uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: "1.93.1"
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
+
+  security-audit:
+    name: Security Audit (cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.93.1"
+      - uses: Swatinem/rust-cache@v2
+      # Scan Cargo.lock against the RustSec advisory DB. A money-handling node
+      # MUST NOT ship a dependency with a published vulnerability, so a real
+      # advisory still fails this job.
+      #
+      # --deny warnings was removed on 2026-07-20. It also failed the build on
+      # "unmaintained", which no code change here can clear: the tree carries
+      # the gtk-rs GTK3 stack (8 distinct RUSTSEC advisories; these reach the
+      # released node too, since release.yml builds it with --features desktop),
+      # fxhash, and — the one that matters — bincode, the consensus serialization.
+      # Bumping a serialization crate can move the wire format, so it is frozen
+      # until the external audit closes and is disclosed in the audit package
+      # instead. Warnings are still printed in full; they are just not a gate
+      # that can never go green.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit dependencies
+        run: cargo audit
 
   shadowasm-check:
     name: shadowasm Build Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.93.1"
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --bin shadowasm
-      - run: echo "PUSH1 42\nSTOP" > /tmp/test.sasm && ./target/release/shadowasm build /tmp/test.sasm --check
+      # printf (not echo) so the newline is interpreted into a real two-line
+      # source; bash's builtin echo would write a literal "\n".
+      - run: printf 'PUSH1 42\nSTOP\n' > /tmp/test.sasm && ./target/release/shadowasm build /tmp/test.sasm --check

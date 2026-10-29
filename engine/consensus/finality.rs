@@ -374,7 +374,7 @@ impl FinalityManager {
 
         slog_info!("finality", "auto_checkpoint_created",
             height => height,
-            hash => &hash[..16.min(hash.len())]
+            hash => crate::domain::types::hash::log_prefix(hash, 16)
         );
 
         self.checkpoints.push(cp.clone());

@@ -18,12 +18,11 @@ impl BootstrapNodes {
 
     pub fn testnet() -> Vec<&'static str> {
         vec![
-            // DNS hostnames (resolved at startup; create A records pointing
-            // to your testnet servers for dynamic peer discovery)
-            "seed1-testnet.shadowdag.network:19333",
-            "seed2-testnet.shadowdag.network:19333",
-            "seed3-testnet.shadowdag.network:19333",
-            // Static IP fallbacks (always reachable even without DNS)
+            // DNS seeds disabled until the shadowdag.network domain + A records
+            // exist; re-enable when the domain is registered.
+            // "seed1-testnet.shadowdag.network:19333",
+            // "seed2-testnet.shadowdag.network:19333",
+            // "seed3-testnet.shadowdag.network:19333",
             "144.172.105.147:19333",
             "172.86.90.70:19333",
             "45.61.151.206:19333",

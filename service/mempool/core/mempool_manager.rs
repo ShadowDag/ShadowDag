@@ -95,7 +95,11 @@ impl MempoolManager {
                         if let Ok(tx_bytes) = bincode::serialize(&tx) {
                             push_outbound_to_peer(&stem_peer, P2PMessage::Tx { data: tx_bytes });
                         }
-                        log::debug!("[Dandelion] TX {} stem → {}", &tx.hash[..8], stem_peer);
+                        log::debug!(
+                            "[Dandelion] TX {} stem → {}",
+                            tx.hash.get(..8).unwrap_or(&tx.hash),
+                            stem_peer
+                        );
                     }
                     RelayAction::Fluff => {
                         // Fluff phase: broadcast to all peers
@@ -129,14 +133,17 @@ impl MempoolManager {
     pub fn collect_for_block(&self, limit: usize) -> Vec<Transaction> {
         self.tx_pool
             .mempool
-            .select_transactions_for_block(&self.utxo_set, limit)
+            // The block being built sits one above the current tip.
+            .select_transactions_for_block(&self.utxo_set, limit, self.current_height + 1)
     }
 
     pub fn on_new_block(&mut self, height: u64, confirmed_txids: &[String]) {
         self.current_height = height;
 
         for txid in confirmed_txids {
-            self.tx_pool.remove_with_dependents(txid);
+            // Confirmed txs leave the pool, but their still-valid children (CPFP)
+            // must NOT be cascade-evicted — the parent's outputs are now on-chain.
+            self.tx_pool.remove_confirmed(txid);
         }
 
         self.orphan_pool.evict_old(height);

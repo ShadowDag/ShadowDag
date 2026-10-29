@@ -20,6 +20,7 @@
 //   mining.subscribe → mining.authorize → mining.notify → mining.submit
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::domain::transaction::transaction::Transaction;
 use crate::errors::NetworkError;
 use crate::{slog_error, slog_info, slog_warn};
 use std::collections::{HashMap, HashSet};
@@ -55,6 +56,123 @@ const MAX_CONNECTIONS: usize = 1_024;
 
 /// Maximum JSON-RPC line length in bytes (DoS protection)
 const MAX_LINE_LENGTH: usize = 8_192;
+const MAX_RPC_HEADER_LINES: usize = 64;
+const MAX_RPC_HEADER_BYTES: usize = 16 * 1024;
+const MAX_RPC_BODY_BYTES: usize = 1_000_000;
+
+fn submit_block_to_local_rpc(rpc_port: u16, rpc_body: &str) -> Result<(), String> {
+    let addr = format!("127.0.0.1:{}", rpc_port);
+    let socket: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| format!("bad rpc socket address {}: {}", addr, e))?;
+    let mut stream = std::net::TcpStream::connect_timeout(&socket, Duration::from_secs(5))
+        .map_err(|e| format!("rpc connect {} failed: {}", addr, e))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| format!("rpc set_read_timeout: {}", e))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| format!("rpc set_write_timeout: {}", e))?;
+
+    let auth_header = std::env::var("SHADOWDAG_STRATUM_RPC_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(|token| format!("Authorization: Bearer {}\r\n", token))
+        .unwrap_or_default();
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        auth_header,
+        rpc_body.len(),
+        rpc_body
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("rpc write failed: {}", e))?;
+    stream
+        .flush()
+        .map_err(|e| format!("rpc flush failed: {}", e))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .map_err(|e| format!("rpc read status failed: {}", e))?;
+    if status_line.trim().is_empty() {
+        return Err("rpc empty status line".to_string());
+    }
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| format!("rpc malformed status line: {}", status_line.trim()))?;
+
+    let mut content_length: usize = 0;
+    let mut content_length_seen = false;
+    let mut transfer_encoding_seen = false;
+    let mut header_lines = 0usize;
+    let mut header_bytes = 0usize;
+    loop {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .map_err(|e| format!("rpc read header failed: {}", e))?;
+        header_lines += 1;
+        header_bytes += line.len();
+        if header_lines > MAX_RPC_HEADER_LINES || header_bytes > MAX_RPC_HEADER_BYTES {
+            return Err("rpc response headers too large".to_string());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("content-length:") {
+            if content_length_seen {
+                return Err("rpc duplicate Content-Length".to_string());
+            }
+            content_length_seen = true;
+            let (_, value) = trimmed
+                .split_once(':')
+                .ok_or_else(|| "rpc malformed Content-Length".to_string())?;
+            content_length = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| "rpc malformed Content-Length".to_string())?;
+        } else if lower.starts_with("transfer-encoding:") {
+            transfer_encoding_seen = true;
+        }
+    }
+    if transfer_encoding_seen || !content_length_seen {
+        return Err("rpc unsupported response framing".to_string());
+    }
+    if content_length > MAX_RPC_BODY_BYTES {
+        return Err(format!(
+            "rpc response too large: {} > {}",
+            content_length, MAX_RPC_BODY_BYTES
+        ));
+    }
+
+    let mut body = vec![0u8; content_length];
+    reader
+        .read_exact(&mut body)
+        .map_err(|e| format!("rpc read body failed: {}", e))?;
+    let body_str =
+        String::from_utf8(body).map_err(|e| format!("rpc non-utf8 response body: {}", e))?;
+
+    if !(200..300).contains(&status) {
+        return Err(format!("rpc HTTP {}: {}", status, body_str));
+    }
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body_str).map_err(|e| format!("rpc invalid json: {}", e))?;
+    if let Some(err) = parsed.get("error") {
+        if !err.is_null() {
+            return Err(format!("submitblock rejected: {}", err));
+        }
+    }
+    Ok(())
+}
 
 /// Stratum method types
 #[derive(Debug, Clone, PartialEq)]
@@ -249,6 +367,10 @@ pub struct BlockTemplate {
     pub height: u64,
     pub extra_nonce: u64,
     pub clean_jobs: bool, // True = discard previous work
+    /// Full block body (coinbase first, then any mempool txs) that the merkle
+    /// root commits to. Sent to the node on a found block so it can reconstruct
+    /// and validate the block. Miners never see this — they mine the header.
+    pub transactions: Vec<Transaction>,
 }
 
 impl BlockTemplate {
@@ -526,21 +648,26 @@ impl StratumServer {
             }
         };
 
-        // Find the submitting worker by name AND validate peer_addr matches
-        let mut workers = self.workers.write().unwrap_or_else(|e| e.into_inner());
-        let worker = match workers.values_mut().find(|w| w.name == *worker_name) {
-            Some(w) => {
-                // Verify the submit comes from the same connection that authorized
-                if w.peer_addr != peer_addr {
-                    return StratumResponse::err(req.id, "Worker peer address mismatch");
+        // Find the worker, validate its connection, and SNAPSHOT the fields needed
+        // for hashing — then DROP the workers lock BEFORE the expensive ShadowHash.
+        // Holding the global write lock across the hash serialized every worker's
+        // submit/authorize/disconnect behind one CPU-heavy op (B2-M01).
+        let (worker_id, worker_difficulty, worker_extra_nonce) = {
+            let mut workers = self.workers.write().unwrap_or_else(|e| e.into_inner());
+            match workers.values_mut().find(|w| w.name == *worker_name) {
+                Some(w) => {
+                    // Verify the submit comes from the same connection that authorized.
+                    if w.peer_addr != peer_addr {
+                        return StratumResponse::err(req.id, "Worker peer address mismatch");
+                    }
+                    (w.id, w.difficulty, w.extra_nonce)
                 }
-                w
+                None => return StratumResponse::err(req.id, "Worker not authorized"),
             }
-            None => return StratumResponse::err(req.id, "Worker not authorized"),
         };
 
         // Share replay prevention key for this worker/job/nonce.
-        let share_key = (job_id.clone(), nonce_hex.to_lowercase(), worker.id);
+        let share_key = (job_id.clone(), nonce_hex.to_lowercase(), worker_id);
         // Fast duplicate check before expensive hashing.
         if self
             .seen_shares
@@ -551,11 +678,8 @@ impl StratumServer {
             return StratumResponse::err(req.id, "Duplicate share");
         }
 
-        let worker_difficulty = worker.difficulty;
-        let worker_extra_nonce = worker.extra_nonce;
-
-        // Validate share against the worker's current vardiff difficulty,
-        // using the template snapshot captured above (avoids TOCTOU).
+        // Validate share against the worker's snapshotted vardiff difficulty and the
+        // template snapshot — the heavy ShadowHash runs with NO lock held.
         let share_valid = self.validate_share(
             nonce_hex,
             worker_difficulty,
@@ -588,56 +712,51 @@ impl StratumServer {
                 seen.insert(share_key);
             }
 
-            worker.accept_share();
-
-            // Adjust difficulty when enough shares have accumulated in
-            // the current window. The old approach (elapsed % 60 == 0)
-            // was fragile — it could miss the exact second or fire
-            // multiple times. Checking shares_in_window is deterministic.
-            if worker.shares_in_window >= TARGET_SHARES_PER_MIN && worker.vardiff_adjust() {
-                // Flag the worker so the connection handler sends
-                // mining.set_difficulty after writing the submit response.
-                // We cannot write to the TCP stream here because
-                // handle_submit has no access to the writer.
-                worker.pending_difficulty_update = true;
+            // Re-acquire the workers lock ONLY to record the accepted share +
+            // vardiff (cheap). The worker may have disconnected meanwhile — if so,
+            // nothing to update. The share result stands on the snapshot above.
+            {
+                let mut workers = self.workers.write().unwrap_or_else(|e| e.into_inner());
+                if let Some(worker) = workers.values_mut().find(|w| w.id == worker_id) {
+                    worker.accept_share();
+                    // Deterministic vardiff: adjust once enough shares accumulate in
+                    // the window; the connection handler sends mining.set_difficulty.
+                    if worker.shares_in_window >= TARGET_SHARES_PER_MIN && worker.vardiff_adjust()
+                    {
+                        worker.pending_difficulty_update = true;
+                    }
+                }
             }
 
-            // Check if share also meets network difficulty (block found!)
+            // Check if share also meets network difficulty (block found!) — this
+            // hash also runs with NO workers lock held.
             if self.meets_network_difficulty(nonce_hex, worker_extra_nonce, &template_snapshot) {
                 self.blocks_found.fetch_add(1, Ordering::Relaxed);
 
-                // Submit the found block to the node via RPC.
-                // Parse the nonce and submit via localhost JSON-RPC.
+                // Submit the FULL found block to the node: the ShadowHash block
+                // hash + the whole body (coinbase + txs) that the merkle root
+                // commits to. Without the hash and transactions, cmd_submitblock
+                // rejects the block (empty hash/merkle_root or empty body).
                 if let Ok(nonce) = u64::from_str_radix(nonce_hex, 16) {
                     let combined_en = combine_extra_nonce(template_snapshot.extra_nonce, worker_extra_nonce);
+                    let block_hash =
+                        self.share_block_hash(nonce, worker_extra_nonce, &template_snapshot);
+                    let params =
+                        Self::submitblock_params(&block_hash, nonce, combined_en, &template_snapshot);
                     let rpc_body = serde_json::json!({
                         "jsonrpc": "2.0",
                         "method": "submitblock",
-                        "params": [{
-                            "height": template_snapshot.height,
-                            "nonce": nonce,
-                            "extra_nonce": combined_en,
-                            "prev_hash": template_snapshot.prev_hash,
-                            "merkle_root": template_snapshot.merkle_root,
-                            "timestamp": template_snapshot.timestamp,
-                            "difficulty": template_snapshot.difficulty,
-                            "version": template_snapshot.version,
-                            "parents": template_snapshot.parents,
-                        }],
+                        "params": [params],
                         "id": 1
-                    }).to_string();
+                    })
+                    .to_string();
 
                     // Non-blocking submit — spawn a thread so we don't
                     // delay the stratum response to the miner.
                     let rpc_port = self.rpc_port;
                     std::thread::spawn(move || {
-                        let addr = format!("127.0.0.1:{}", rpc_port);
-                        if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
-                            let request = format!(
-                                "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                rpc_body.len(), rpc_body
-                            );
-                            let _ = std::io::Write::write_all(&mut stream, request.as_bytes());
+                        if let Err(e) = submit_block_to_local_rpc(rpc_port, &rpc_body) {
+                            slog_warn!("stratum", "submitblock_rpc_failed", error => e);
                         }
                     });
                 }
@@ -645,7 +764,11 @@ impl StratumServer {
 
             StratumResponse::ok(req.id, "true")
         } else {
-            worker.reject_share();
+            // Re-acquire the lock only to record the rejection (worker may be gone).
+            let mut workers = self.workers.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(worker) = workers.values_mut().find(|w| w.id == worker_id) {
+                worker.reject_share();
+            }
             StratumResponse::err(req.id, "Low difficulty share")
         }
     }
@@ -992,6 +1115,9 @@ impl StratumServer {
             template.difficulty,
             &template.merkle_root,
             &template.parents,
+            // M5: Stratum is disabled on UmbraHash-fork networks (see the daemon
+            // fork guard); on unscheduled nets it mines pre-M5 (None) preimages.
+            None,
         );
 
         // Check against the worker's current share difficulty target
@@ -1033,12 +1159,65 @@ impl StratumServer {
             template.difficulty,
             &template.merkle_root,
             &template.parents,
+            // M5: Stratum is disabled on UmbraHash-fork networks (see the daemon
+            // fork guard); on unscheduled nets it mines pre-M5 (None) preimages.
+            None,
         );
 
         // Check against the full network difficulty from the template
         crate::engine::mining::pow::pow_validator::PowValidator::hash_meets_target(
             &hash,
             template.difficulty,
+        )
+    }
+
+    /// Build the submitblock params for a found block: the ShadowHash block
+    /// hash, the solved header fields, and the FULL body (coinbase + txs) the
+    /// merkle root commits to — everything cmd_submitblock needs to reconstruct
+    /// and validate the block. (The old code sent no hash, no transactions, and
+    /// an empty merkle_root, so every pool block was rejected.)
+    fn submitblock_params(
+        block_hash: &str,
+        nonce: u64,
+        extra_nonce: u64,
+        template: &BlockTemplate,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "hash":         block_hash,
+            "height":       template.height,
+            "nonce":        nonce,
+            "extra_nonce":  extra_nonce,
+            "prev_hash":    template.prev_hash,
+            "merkle_root":  template.merkle_root,
+            "timestamp":    template.timestamp,
+            "difficulty":   template.difficulty,
+            "version":      template.version,
+            "parents":      template.parents,
+            "transactions": template.transactions,
+        })
+    }
+
+    /// Recompute the block hash for a solved share — ShadowHash over the header
+    /// (incl. merkle_root + combined extra_nonce). This is the EXACT value the
+    /// node recomputes and validates on submitblock, so the pool submits the
+    /// same hash it mined.
+    fn share_block_hash(
+        &self,
+        nonce: u64,
+        worker_extra_nonce: u64,
+        template: &BlockTemplate,
+    ) -> String {
+        let combined_extra_nonce = combine_extra_nonce(template.extra_nonce, worker_extra_nonce);
+        crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full(
+            template.version,
+            template.height,
+            template.timestamp,
+            nonce,
+            combined_extra_nonce,
+            template.difficulty,
+            &template.merkle_root,
+            &template.parents,
+            None, // M5: Stratum disabled on fork nets; pre-M5 preimage otherwise.
         )
     }
 }
@@ -1074,8 +1253,11 @@ impl PayoutCalculator {
         block_reward: u64,
         pool_fee_pct: u64,
     ) -> HashMap<String, u64> {
-        let pool_fee = block_reward * pool_fee_pct / 100;
-        let distributable = block_reward - pool_fee;
+        // u128 + clamp + saturating: avoid overflow on the multiply and
+        // underflow if a misconfigured pool_fee_pct exceeds 100.
+        let pct = pool_fee_pct.min(100);
+        let pool_fee = ((block_reward as u128 * pct as u128) / 100) as u64;
+        let distributable = block_reward.saturating_sub(pool_fee);
         let total_shares: u64 = match workers
             .values()
             .try_fold(0u64, |acc, w| acc.checked_add(w.shares_accepted))
@@ -1111,8 +1293,11 @@ impl PayoutCalculator {
         pool_fee_pct: u64,
         window_size: u64,
     ) -> HashMap<String, u64> {
-        let pool_fee = block_reward * pool_fee_pct / 100;
-        let distributable = block_reward - pool_fee;
+        // u128 + clamp + saturating: avoid overflow on the multiply and
+        // underflow if a misconfigured pool_fee_pct exceeds 100.
+        let pct = pool_fee_pct.min(100);
+        let pool_fee = ((block_reward as u128 * pct as u128) / 100) as u64;
+        let distributable = block_reward.saturating_sub(pool_fee);
 
         let total_shares: u64 = match workers
             .values()
@@ -1189,6 +1374,7 @@ mod tests {
             height: 1,
             extra_nonce: 0,
             clean_jobs: true,
+            transactions: vec![],
         });
     }
 
@@ -1301,6 +1487,48 @@ mod tests {
         assert!((w.acceptance_rate() - 0.6666).abs() < 0.01);
     }
 
+    /// A found-block submit MUST carry the block hash, the REAL merkle root, and
+    /// the FULL body (coinbase + txs). The old code sent none of these, so every
+    /// pool block was rejected (empty hash/merkle_root / empty body). Guards the
+    /// exact fix.
+    #[test]
+    fn submitblock_params_include_hash_and_full_body() {
+        use crate::domain::transaction::transaction::{Transaction, TxOutput};
+        let coinbase = Transaction::new_coinbase(
+            "cbhash".into(),
+            vec![TxOutput::new("SD1miner".into(), 1_000_000_000)],
+            0,
+            100,
+        );
+        let tpl = BlockTemplate {
+            job_id: "j".into(),
+            version: 1,
+            prev_hash: "p".repeat(64),
+            parents: vec!["a".repeat(64)],
+            merkle_root: "b".repeat(64),
+            timestamp: 100,
+            difficulty: 4,
+            height: 5,
+            extra_nonce: 0,
+            clean_jobs: true,
+            transactions: vec![coinbase],
+        };
+        let params = StratumServer::submitblock_params(&"c".repeat(64), 42, 7, &tpl);
+
+        assert_eq!(params["hash"], "c".repeat(64));
+        assert_eq!(params["merkle_root"], "b".repeat(64));
+        assert!(params["merkle_root"].as_str().unwrap() != "", "merkle must not be empty");
+        assert_eq!(params["nonce"], 42);
+        assert_eq!(params["extra_nonce"], 7);
+        assert_eq!(params["height"], 5);
+        // The full block body (coinbase) is included so the node can reconstruct
+        // and validate the block.
+        let txs = params["transactions"].as_array().unwrap();
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0]["hash"], "cbhash");
+        assert_eq!(txs[0]["is_coinbase"], true);
+    }
+
     #[test]
     fn block_template_json() {
         let tpl = BlockTemplate {
@@ -1314,6 +1542,7 @@ mod tests {
             height: 1,
             extra_nonce: 0,
             clean_jobs: true,
+            transactions: vec![],
         };
         let json = tpl.to_notify_json();
         assert!(json.contains("mining.notify"));

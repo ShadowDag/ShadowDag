@@ -158,6 +158,10 @@ Smooth exponential decay (no hard halvings):
 - Target: `MAX_TARGET / difficulty` (256-bit division)
 - NOT leading zeros — proper numeric comparison
 
+> **GPU status:** `engine/mining/gpu/cuda_miner.rs` and `opencl_miner.rs`
+> currently parallelize on CPU via Rayon. There are no CUDA/OpenCL kernels or
+> device bindings yet, so they provide no GPU speedup.
+
 ---
 
 ## 5. ShadowVM (`runtime/vm/`)
@@ -165,7 +169,9 @@ Smooth exponential decay (no hard halvings):
 ### Architecture
 
 - Stack-based (256-bit U256 elements)
-- 90+ opcodes in 16 categories
+- 52 opcodes in 16 categories (v1 consensus set; `runtime/vm/core/opcodes.rs`
+  contains a larger 119-entry reference enum that is explicitly NOT the consensus
+  set — see its file header)
 - Deterministic execution (10 invariants enforced)
 - Gas-first: every opcode checked BEFORE execution
 - Atomic state: WriteBatch commits only on STOP/RETURN
@@ -320,6 +326,23 @@ Multiplier = 2^(utilization x 6), capped at 64x
 | Stealth Addresses | `stealth/stealth_address.rs` | One-time receive addresses |
 | Shadow Pool | `shadow_pool/` | Privacy-first TX aggregation |
 | Dandelion++ | `service/network/propagation/` | Network-layer anonymity |
+
+> **Status (RingCT — sender privacy + hidden amounts): ENFORCED on all consensus
+> paths, EXTERNAL-REVIEW-GATED (not mainnet-final).**
+> The dual-key CLSAG gate `verify_confidential_tx` (dual-key CLSAG + `ki:`
+> key-image uniqueness + on-chain `okey:` ring-member authenticity binding P AND C
+> + per-output range proofs + homomorphic balance `Σ C'_in == Σ C_out + fee·H`) is
+> wired into every path: **mempool** (`TxValidator::validate_confidential`),
+> **block validation** (`UtxoValidator::validate_block_utxos`), and **reorg/apply**
+> (`verify_block_confidential_txs`, run before `apply_block_dag_ordered`, which
+> records `ki:`/`okey:` atomically with rollback undo). The transparent Ed25519
+> gate (`TxValidator::verify_signatures_for_network`) skips confidential ring
+> inputs (empty `signature`/`pub_key`) so confidential sends reach the CLSAG gate;
+> shield txs keep the Ed25519 check (their inputs are transparent). Amounts are
+> hidden (plaintext output `amount` forced to 0; value lives in the commitment).
+> **This CHANGES BLOCK VALIDITY and is inflation-risk: it requires MANDATORY
+> external cryptographic + consensus review before mainnet. Do not rely on it for
+> privacy on mainnet yet.**
 
 ---
 

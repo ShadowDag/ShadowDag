@@ -199,7 +199,9 @@ impl EmissionSchedule {
             let mut table = Vec::with_capacity(MAX_STEPS as usize + 1);
             table.push(PRECISION);
             for _ in 0..MAX_STEPS {
-                let prev = *table.last().unwrap();
+                let Some(prev) = table.last().copied() else {
+                    break;
+                };
                 let next = prev * DECAY_NUM as u128 / DECAY_DEN as u128;
                 table.push(next);
             }

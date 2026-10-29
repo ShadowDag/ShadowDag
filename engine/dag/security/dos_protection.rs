@@ -31,12 +31,12 @@ pub const MIN_RELAY_FEE: u64 =
     crate::config::consensus::mempool_config::MempoolConfig::MIN_RELAY_FEE;
 pub const MIN_FEE_PER_BYTE: u64 = 1;
 
-pub const MAX_NONCE: u64 = u64::MAX;
 pub const MAX_OUTPUT_AMOUNT: u64 = u64::MAX / 2;
 
-/// Canonical value: 120s (see block_validator::MAX_FUTURE_SECS).
-pub const MAX_FUTURE_TIMESTAMP_SECS: u64 = 120;
-pub const MAX_PAST_TIMESTAMP_DRIFT: u64 = 600;
+/// Canonical future-drift bound in MILLISECONDS (120 s of real time).
+/// Timestamps are unix epoch ms. Shares ConsensusParams::MAX_FUTURE_MS.
+pub const MAX_FUTURE_TIMESTAMP_MS: u64 =
+    crate::config::consensus::consensus_params::ConsensusParams::MAX_FUTURE_MS;
 
 pub struct DosProtection;
 
@@ -100,28 +100,28 @@ impl DosProtection {
             }
         }
 
-        // Nonce — only reject the MAX_NONCE sentinel value.
-        // nonce==0 is rare but valid: a miner can solve PoW on the first try.
-        if block.header.nonce == MAX_NONCE {
-            return DosCheckResult::fail("Invalid nonce (MAX_NONCE sentinel)".to_string());
-        }
+        // Nonce: any u64 is valid (the nonce is validated by PoW). The old sentinel
+        // reject dropped a legitimately-mined block whose PoW happened to land on
+        // u64::MAX, and disagreed with flood_protection which accepts it (B1-L02).
 
-        // Timestamp
+        // Timestamp (ms vs ms)
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
 
-        let future_limit = now.saturating_add(MAX_FUTURE_TIMESTAMP_SECS);
-        let past_limit = now.saturating_sub(MAX_PAST_TIMESTAMP_DRIFT);
+        let future_limit = now.saturating_add(MAX_FUTURE_TIMESTAMP_MS);
 
         if block.header.timestamp > future_limit {
             return DosCheckResult::fail("Future timestamp".to_string());
         }
 
-        if block.header.timestamp < past_limit {
-            return DosCheckResult::fail("Old timestamp".to_string());
-        }
+        // NOTE: no wall-clock "too far in the past" reject. Blocks are historical
+        // by nature — during sync/IBD a lagging node receives blocks that are
+        // minutes/hours/days old, and rejecting them here (a consensus-layer
+        // reject that also bans the sender) made catch-up impossible. Past-time
+        // causality (ts > parents, MTP, jump limits) is enforced against the
+        // block's ancestry in block_validator::validate_timestamp().
 
         // Size (آخر خطوة)
         let bytes = match bincode::serialize(block) {
@@ -188,11 +188,14 @@ impl DosProtection {
             }
         }
 
-        // Outputs
+        // Outputs. Confidential (RingCT) AND shield outputs carry amount=0 by
+        // design (value in the commitment); the zero-amount rejection is
+        // transparent-only.
+        let is_conf = tx.is_confidential() || tx.is_shield();
         let mut total: u128 = 0;
 
         for output in &tx.outputs {
-            if output.amount == 0 {
+            if output.amount == 0 && !is_conf {
                 return DosCheckResult::fail("Zero output".to_string());
             }
 

@@ -58,9 +58,11 @@ impl Miner {
                 u64::MAX
             }
         };
-        let miner_reward = (reward
-            * crate::config::consensus::consensus_params::ConsensusParams::MINER_PERCENT)
-            / 100;
+        // u128 intermediate: `reward` may be u64::MAX (capped above on overflow),
+        // so `reward * MINER_PERCENT` would itself overflow in u64.
+        let miner_reward = ((reward as u128
+            * crate::config::consensus::consensus_params::ConsensusParams::MINER_PERCENT as u128)
+            / 100) as u64;
         let owner_reward = reward - miner_reward;
 
         let hash = Self::coinbase_hash(
@@ -82,6 +84,8 @@ impl Miner {
                     commitment: None,
                     range_proof: None,
                     ephemeral_pubkey: None,
+                    one_time_pubkey: None,
+                    encrypted_amount: None,
                 },
                 TxOutput {
                     address: self.owner_reward_address.clone(),
@@ -89,6 +93,8 @@ impl Miner {
                     commitment: None,
                     range_proof: None,
                     ephemeral_pubkey: None,
+                    one_time_pubkey: None,
+                    encrypted_amount: None,
                 },
             ],
             fee: 0,
@@ -156,7 +162,7 @@ impl Miner {
             if !dag_manager.block_exists(parent_hash) {
                 return Err(ConsensusError::Other(format!(
                     "Parent block {} not found in DAG",
-                    &parent_hash[..parent_hash.len().min(16)]
+                    parent_hash.chars().take(16).collect::<String>()
                 )));
             }
         }
@@ -206,7 +212,11 @@ impl Miner {
 
             if PowValidator::hash_meets_target(&hash, block.header.difficulty) {
                 block.header.hash = hash.clone();
-                slog_info!("mining", "block_found", nonce => nonce, hash_prefix => &hash[..8], height => block.header.height, parents => block.header.parents.len());
+                slog_info!("mining", "block_found",
+                    nonce => nonce,
+                    hash_prefix => hash.get(..8).unwrap_or(&hash),
+                    height => block.header.height,
+                    parents => block.header.parents.len());
                 return block;
             }
 
@@ -242,7 +252,9 @@ impl Miner {
     pub fn verify_pow(block: &Block) -> bool {
         let computed = shadow_hash(block);
         if computed != block.header.hash {
-            slog_warn!("mining", "pow_mismatch", computed => &computed[..8], stored => block.header.hash.get(..8).unwrap_or("?"));
+            slog_warn!("mining", "pow_mismatch",
+                computed => computed.get(..8).unwrap_or(&computed),
+                stored => block.header.hash.get(..8).unwrap_or("?"));
             return false;
         }
         PowValidator::hash_meets_target(&computed, block.header.difficulty)

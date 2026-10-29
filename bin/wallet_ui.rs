@@ -28,7 +28,9 @@ const MAX_HEADER_LINES: usize = 64;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_HOST_HEADER_BYTES: usize = 256;
+const MAX_ADDR_BYTES: usize = 128;
 const RPC_TIMEOUT_SECS: u64 = 5;
+const MAX_RPC_RESPONSE_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HTML (embedded)
@@ -53,8 +55,10 @@ fn rpc_call(rpc_addr: &str, method: &str, params: &[serde_json::Value]) -> serde
     });
     let body_str = body.to_string();
 
-    let fallback_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 9332));
-    let rpc_socket = rpc_addr.parse::<std::net::SocketAddr>().unwrap_or(fallback_addr);
+    let rpc_socket = match rpc_addr.parse::<std::net::SocketAddr>() {
+        Ok(s) => s,
+        Err(_) => return serde_json::json!({"error": "Invalid RPC endpoint"}),
+    };
     let stream = match TcpStream::connect_timeout(
         &rpc_socket,
         Duration::from_secs(RPC_TIMEOUT_SECS),
@@ -76,7 +80,7 @@ fn rpc_call(rpc_addr: &str, method: &str, params: &[serde_json::Value]) -> serde
          Connection: close\r\n\
          \r\n\
          {}",
-        rpc_addr,
+        rpc_socket,
         body_str.len(),
         body_str
     );
@@ -86,28 +90,73 @@ fn rpc_call(rpc_addr: &str, method: &str, params: &[serde_json::Value]) -> serde
     }
     let _ = stream.flush();
 
-    let mut response = String::new();
-    if stream.read_to_string(&mut response).is_err() {
-        return serde_json::json!({"error": "Failed to read RPC response"});
+    let mut reader = BufReader::new(&stream);
+    let mut content_length: usize = 0;
+    let mut content_length_seen = false;
+    let mut unsupported_transfer_encoding = false;
+    let mut header_lines = 0usize;
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                header_lines += 1;
+                if header_lines > MAX_HEADER_LINES {
+                    return serde_json::json!({"error": "RPC headers too large"});
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = trimmed.split_once(':') {
+                    if name.trim().eq_ignore_ascii_case("content-length") {
+                        if content_length_seen {
+                            return serde_json::json!({"error": "Invalid RPC response"});
+                        }
+                        content_length_seen = true;
+                        content_length = match value.trim().parse::<usize>() {
+                            Ok(n) => n,
+                            Err(_) => return serde_json::json!({"error": "Invalid RPC Content-Length"}),
+                        };
+                    } else if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+                        unsupported_transfer_encoding = true;
+                    }
+                }
+            }
+            Err(_) => return serde_json::json!({"error": "Failed to read RPC headers"}),
+        }
+    }
+    if unsupported_transfer_encoding || !content_length_seen {
+        return serde_json::json!({"error": "Invalid RPC response"});
     }
 
-    // Extract JSON body from HTTP response
-    if let Some(idx) = response.find("\r\n\r\n") {
-        let json_str = &response[idx + 4..];
-        match serde_json::from_str::<serde_json::Value>(json_str) {
-            Ok(val) => {
-                if let Some(result) = val.get("result") {
-                    return result.clone();
-                }
-                if let Some(error) = val.get("error") {
-                    return serde_json::json!({"error": error});
-                }
-                val
-            }
-            Err(_) => serde_json::json!({"error": "Invalid JSON from RPC"}),
+    let response_body = if content_length > 0 {
+        if content_length > MAX_RPC_RESPONSE_BYTES {
+            return serde_json::json!({"error": "RPC response too large"});
+        }
+        let mut body = vec![0u8; content_length];
+        if reader.read_exact(&mut body).is_err() {
+            return serde_json::json!({"error": "Failed to read RPC response"});
+        }
+        match String::from_utf8(body) {
+            Ok(s) => s,
+            Err(_) => return serde_json::json!({"error": "Invalid UTF-8 from RPC"}),
         }
     } else {
-        serde_json::json!({"error": "Malformed HTTP response from RPC"})
+        String::new()
+    };
+
+    match serde_json::from_str::<serde_json::Value>(&response_body) {
+        Ok(val) => {
+            if let Some(result) = val.get("result") {
+                return result.clone();
+            }
+            if let Some(error) = val.get("error") {
+                return serde_json::json!({"error": error});
+            }
+            val
+        }
+        Err(_) => serde_json::json!({"error": "Invalid JSON from RPC"}),
     }
 }
 
@@ -141,6 +190,7 @@ fn handle_connection(mut stream: TcpStream, rpc_addr: &str, network: &str) {
     let mut content_length: usize = 0;
     let mut host_header: Option<String> = None;
     let mut origin_header: Option<String> = None;
+    let mut malformed_content_length = false;
     let mut header_line = String::new();
     let mut header_lines = 0usize;
     let mut header_bytes = 0usize;
@@ -158,7 +208,10 @@ fn handle_connection(mut stream: TcpStream, rpc_addr: &str, network: &str) {
                 let lower = header_line.trim().to_ascii_lowercase();
                 if lower.starts_with("content-length:") {
                     if let Some((_, val)) = header_line.trim().split_once(':') {
-                        content_length = val.trim().parse().unwrap_or(0);
+                        match val.trim().parse::<usize>() {
+                            Ok(v) => content_length = v,
+                            Err(_) => malformed_content_length = true,
+                        }
                     }
                 } else if lower.starts_with("host:") {
                     if let Some((_, val)) = header_line.trim().split_once(':') {
@@ -181,8 +234,12 @@ fn handle_connection(mut stream: TcpStream, rpc_addr: &str, network: &str) {
             }
         }
     }
+    if malformed_content_length {
+        send_response(&mut stream, 400, "text/plain", b"Malformed Content-Length");
+        return;
+    }
 
-    let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
         return;
     }
@@ -216,7 +273,13 @@ fn handle_connection(mut stream: TcpStream, rpc_addr: &str, network: &str) {
             send_response(&mut stream, 400, "text/plain", b"Bad request body");
             return;
         }
-        String::from_utf8_lossy(&buf).to_string()
+        match String::from_utf8(buf) {
+            Ok(s) => s,
+            Err(_) => {
+                send_response(&mut stream, 400, "text/plain", b"Invalid UTF-8 body");
+                return;
+            }
+        }
     } else {
         String::new()
     };
@@ -234,6 +297,17 @@ fn handle_connection(mut stream: TcpStream, rpc_addr: &str, network: &str) {
         }
         ("GET", p) if p.starts_with("/api/wallet/balance/") => {
             let addr = &p["/api/wallet/balance/".len()..];
+            if addr.is_empty() || addr.len() > MAX_ADDR_BYTES {
+                send_response(&mut stream, 400, "text/plain", b"Invalid address");
+                return;
+            }
+            if !addr
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                send_response(&mut stream, 400, "text/plain", b"Invalid address");
+                return;
+            }
             api_balance(&mut stream, rpc_addr, addr);
         }
         ("POST", "/api/wallet/send") => {
@@ -324,14 +398,40 @@ fn api_balance(stream: &mut TcpStream, rpc_addr: &str, addr: &str) {
 }
 
 fn api_send(stream: &mut TcpStream, rpc_addr: &str, body: &str) {
+    fn is_valid_amount_text(s: &str) -> bool {
+        if s.is_empty() || s.len() > 32 || s.starts_with('-') {
+            return false;
+        }
+        let (whole, frac) = match s.split_once('.') {
+            Some((w, f)) => (w, Some(f)),
+            None => (s, None),
+        };
+        if whole.is_empty() || !whole.chars().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
+        if let Some(f) = frac {
+            if f.is_empty() || f.len() > 8 || !f.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+        }
+        true
+    }
+
     let parsed: Result<serde_json::Value, _> = serde_json::from_str(body);
     let data = match parsed {
         Ok(req) => {
             let to = req.get("to").and_then(|v| v.as_str()).unwrap_or("");
             let amount = req.get("amount").and_then(|v| v.as_str()).unwrap_or("0");
 
-            if to.is_empty() || amount == "0" {
-                serde_json::json!({"error": "Missing 'to' address or 'amount'"})
+            let valid_to = !to.is_empty()
+                && to.len() <= MAX_ADDR_BYTES
+                && to
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            let valid_amount = is_valid_amount_text(amount) && amount != "0";
+
+            if !valid_to || !valid_amount {
+                serde_json::json!({"error": "Invalid 'to' address or 'amount'"})
             } else {
                 serde_json::json!({
                     "status": "prepared",
@@ -386,12 +486,13 @@ fn send_response(stream: &mut TcpStream, status: u16, content_type: &str, body: 
 }
 
 fn is_safe_local(host: Option<&str>, origin: Option<&str>) -> bool {
-    if let Some(h) = host {
-        let h = h.to_ascii_lowercase();
-        let host_only = h.split(':').next().unwrap_or("").trim();
-        if host_only != "127.0.0.1" && host_only != "localhost" && host_only != "[::1]" {
-            return false;
-        }
+    let Some(h) = host else {
+        return false;
+    };
+    let h = h.to_ascii_lowercase();
+    let host_only = h.split(':').next().unwrap_or("").trim();
+    if host_only != "127.0.0.1" && host_only != "localhost" && host_only != "[::1]" {
+        return false;
     }
     if let Some(o) = origin {
         let o = o.to_ascii_lowercase();
@@ -424,13 +525,14 @@ fn main() {
     let port: u16 = parse_flag(&args, "--port").unwrap_or(8081);
     let rpc_addr = parse_flag_str(&args, "--rpc").unwrap_or_else(|| "127.0.0.1:9332".to_string());
     let network = parse_flag_str(&args, "--network").unwrap_or_else(|| {
-        // Auto-detect from RPC port
-        if rpc_addr.contains("19332") {
-            "testnet".to_string()
-        } else if rpc_addr.contains("29332") {
-            "regtest".to_string()
-        } else {
-            "mainnet".to_string()
+        // Auto-detect from parsed RPC port (no substring matching on raw input)
+        match rpc_addr.parse::<std::net::SocketAddr>() {
+            Ok(sock) => match sock.port() {
+                19332 => "testnet".to_string(),
+                29332 => "regtest".to_string(),
+                _ => "mainnet".to_string(),
+            },
+            Err(_) => "mainnet".to_string(),
         }
     });
     let auto_open = args.iter().any(|a| a == "--open");

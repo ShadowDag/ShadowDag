@@ -15,6 +15,14 @@ pub const MAX_FAILED_LOGINS: u32 = 5;
 pub const LOCKOUT_SECS: u64 = 900;
 pub const MAX_ACTIVE_TOKENS: usize = 10_000;
 pub const MAX_ACTIVE_TOKENS_PER_USER: usize = 16;
+pub const MAX_LOGIN_ATTEMPTS_TRACKED: usize = 10_000;
+/// Hard limits to prevent authentication CPU-DoS via very large credentials.
+/// PBKDF2 cost scales with password length, so we reject oversized inputs
+/// before any expensive verification path.
+pub const MAX_USERNAME_LEN: usize = 64;
+pub const MAX_PASSWORD_LEN: usize = 256;
+pub const MAX_PASSWORD_HASH_LEN: usize = 512;
+pub const MAX_TOKEN_LEN: usize = 512;
 const PBKDF2_ITERATIONS: u32 = 210_000;
 const PBKDF2_PREFIX: &str = "pbkdf2-sha256";
 
@@ -75,6 +83,22 @@ impl Default for RpcAuthManager {
 }
 
 impl RpcAuthManager {
+    fn prune_login_attempts(&mut self) {
+        let now = now_secs();
+        if self.attempts.len() <= MAX_LOGIN_ATTEMPTS_TRACKED {
+            return;
+        }
+        // Drop fully-reset and expired lockout entries first.
+        self.attempts
+            .retain(|_, a| a.failed > 0 || a.locked_until > now);
+        if self.attempts.len() <= MAX_LOGIN_ATTEMPTS_TRACKED {
+            return;
+        }
+        // Fail-closed memory guard: keep only currently-locked entries when
+        // the table still exceeds cap.
+        self.attempts.retain(|_, a| a.locked_until > now);
+    }
+
     pub fn new() -> Self {
         Self {
             users: HashMap::new(),
@@ -155,12 +179,37 @@ impl RpcAuthManager {
                     continue;
                 }
             };
-            let key_str = String::from_utf8_lossy(&k);
+            let key_str = match std::str::from_utf8(&k) {
+                Ok(s) => s,
+                Err(_) => {
+                    slog_warn!("rpc", "recover_user_invalid_key_utf8");
+                    continue;
+                }
+            };
             if !key_str.starts_with("rpc:user:") {
                 break;
             }
             let username = key_str.trim_start_matches("rpc:user:").to_string();
-            let value_str = String::from_utf8_lossy(&v);
+            if username.is_empty() || username.len() > MAX_USERNAME_LEN {
+                slog_warn!("rpc", "recover_user_invalid_username_len", len => username.len());
+                continue;
+            }
+            let value_str = match std::str::from_utf8(&v) {
+                Ok(s) => s,
+                Err(_) => {
+                    slog_warn!("rpc", "recover_user_invalid_value_utf8", user => &username);
+                    continue;
+                }
+            };
+            if value_str.len() > (MAX_PASSWORD_HASH_LEN + 16) {
+                slog_warn!(
+                    "rpc",
+                    "recover_user_invalid_value_len",
+                    user => &username,
+                    len => value_str.len()
+                );
+                continue;
+            }
             let parts: Vec<&str> = value_str.splitn(2, ':').collect();
             if parts.len() == 2 {
                 let role = match parts[0] {
@@ -172,6 +221,15 @@ impl RpcAuthManager {
                         continue; // Skip corrupt entries instead of granting access
                     }
                 };
+                if parts[1].is_empty() || parts[1].len() > MAX_PASSWORD_HASH_LEN {
+                    slog_warn!(
+                        "rpc",
+                        "recover_user_invalid_hash_len",
+                        user => &username,
+                        len => parts[1].len()
+                    );
+                    continue;
+                }
                 self.users.insert(
                     username.clone(),
                     AuthUser {
@@ -185,6 +243,20 @@ impl RpcAuthManager {
     }
 
     pub fn add_user(&mut self, username: &str, password: &str, role: AuthRole) {
+        if username.is_empty()
+            || username.len() > MAX_USERNAME_LEN
+            || password.is_empty()
+            || password.len() > MAX_PASSWORD_LEN
+        {
+            slog_warn!(
+                "rpc",
+                "add_user_rejected_invalid_input",
+                username_len => username.len(),
+                password_len => password.len()
+            );
+            return;
+        }
+
         let salt = generate_salt();
         let hash = salted_hash(password, &salt);
         // Role/password rotation for an existing user must invalidate all
@@ -201,6 +273,9 @@ impl RpcAuthManager {
     }
 
     pub fn remove_user(&mut self, username: &str) -> bool {
+        if username.is_empty() || username.len() > MAX_USERNAME_LEN {
+            return false;
+        }
         self.revoke_user_tokens(username);
         if let Some(db) = &self.db {
             let key = format!("rpc:user:{}", username);
@@ -217,6 +292,16 @@ impl RpcAuthManager {
     }
 
     pub fn login(&mut self, username: &str, password: &str) -> Result<String, NetworkError> {
+        // Reject oversized credentials early to avoid expensive hash checks
+        // on attacker-controlled megabyte inputs.
+        if username.is_empty()
+            || username.len() > MAX_USERNAME_LEN
+            || password.is_empty()
+            || password.len() > MAX_PASSWORD_LEN
+        {
+            return Err(NetworkError::Other("Invalid credentials".to_string()));
+        }
+
         // Resolve user once without creating attempts entries for unknown names.
         // Unknown-username path still performs one password verification with a
         // decoy hash to reduce username-enumeration timing side channels.
@@ -235,6 +320,13 @@ impl RpcAuthManager {
                 return Err(NetworkError::Other("Invalid credentials".to_string()));
             }
         };
+
+        self.prune_login_attempts();
+        if !self.attempts.contains_key(username)
+            && self.attempts.len() >= MAX_LOGIN_ATTEMPTS_TRACKED
+        {
+            return Err(NetworkError::Other("Invalid credentials".to_string()));
+        }
 
         let attempts = self.attempts.entry(username.to_string()).or_default();
         if attempts.locked_until > now_secs() {
@@ -300,6 +392,9 @@ impl RpcAuthManager {
     }
 
     pub fn verify(&mut self, token: &str) -> Option<&AuthToken> {
+        if token.is_empty() || token.len() > MAX_TOKEN_LEN {
+            return None;
+        }
         // Auto-prune expired tokens when map grows large (prevents memory leak)
         if self.tokens.len() > 1_000 {
             self.prune_expired_tokens();
@@ -339,6 +434,9 @@ impl RpcAuthManager {
     }
 
     pub fn logout(&mut self, token: &str) -> bool {
+        if token.is_empty() || token.len() > MAX_TOKEN_LEN {
+            return false;
+        }
         self.tokens.remove(token).is_some()
     }
 
@@ -603,5 +701,62 @@ mod tests {
         // Rotate role to admin; old token must be revoked.
         auth.add_user("bob", "pw", AuthRole::Admin);
         assert!(!auth.is_authorized(&token));
+    }
+
+    #[test]
+    fn login_rejects_overlong_username_and_password() {
+        let mut auth = RpcAuthManager::with_default_admin("secret");
+        let long_user = "u".repeat(MAX_USERNAME_LEN + 1);
+        let long_pass = "p".repeat(MAX_PASSWORD_LEN + 1);
+
+        assert!(auth.login(&long_user, "secret").is_err());
+        assert!(auth.login("admin", &long_pass).is_err());
+    }
+
+    #[test]
+    fn add_user_rejects_invalid_lengths() {
+        let mut auth = RpcAuthManager::new();
+        let long_user = "u".repeat(MAX_USERNAME_LEN + 1);
+        let long_pass = "p".repeat(MAX_PASSWORD_LEN + 1);
+
+        auth.add_user("", "pw", AuthRole::ReadOnly);
+        auth.add_user(&long_user, "pw", AuthRole::ReadOnly);
+        auth.add_user("ok", "", AuthRole::ReadOnly);
+        auth.add_user("ok2", &long_pass, AuthRole::ReadOnly);
+
+        assert!(!auth.user_exists(""));
+        assert!(!auth.user_exists(&long_user));
+        assert!(!auth.user_exists("ok"));
+        assert!(!auth.user_exists("ok2"));
+    }
+
+    #[test]
+    fn verify_rejects_overlong_token() {
+        let mut auth = RpcAuthManager::with_default_admin("pass");
+        let token = auth.login("admin", "pass").expect("login should succeed");
+        assert!(auth.is_authorized(&token));
+
+        let oversized = "t".repeat(MAX_TOKEN_LEN + 1);
+        assert!(!auth.is_authorized(&oversized));
+        assert!(!auth.logout(&oversized));
+    }
+
+    #[test]
+    fn login_attempts_tracking_is_bounded() {
+        let mut auth = RpcAuthManager::new();
+        auth.add_user("alice", "pw", AuthRole::Admin);
+        // Simulate attacker-inflated attempts table from previous traffic.
+        let now = now_secs();
+        for i in 0..(MAX_LOGIN_ATTEMPTS_TRACKED + 64) {
+            auth.attempts.insert(
+                format!("u{i}"),
+                LoginAttempts {
+                    failed: 0,
+                    locked_until: now.saturating_sub(1),
+                },
+            );
+        }
+        let _ = auth.login("alice", "pw");
+        assert!(auth.attempts.len() <= MAX_LOGIN_ATTEMPTS_TRACKED);
     }
 }

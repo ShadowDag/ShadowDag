@@ -7,7 +7,9 @@ use parking_lot::RwLock;
 use std::collections::HashMap; // 🔥 ADD
 use std::sync::Arc; // 🔥 ADD
 
+use crate::config::node::node_config::NetworkMode;
 use crate::domain::block::block::Block;
+use crate::engine::crypto::hash::muhash::MuHash;
 use crate::domain::traits::utxo_backend::{BatchWrite, UtxoBackend};
 use crate::domain::transaction::transaction::Transaction;
 use crate::domain::transaction::tx_hash::TxHash;
@@ -37,9 +39,12 @@ pub const COINBASE_MATURITY: u64 =
 #[inline]
 pub fn utxo_key(tx_hash: &str, index: u32) -> Result<UtxoKey, StorageError> {
     UtxoKey::try_new(tx_hash, index).ok_or_else(|| {
+        // Char-boundary-safe preview: byte-slicing `tx_hash[..24]` panics when a
+        // multibyte codepoint straddles byte 24, and tx_hash is attacker-supplied.
+        let preview: String = tx_hash.chars().take(24).collect();
         StorageError::Other(format!(
             "invalid tx hash for UtxoKey (must be 64 hex chars, got '{}...')",
-            &tx_hash[..tx_hash.len().min(24)]
+            preview
         ))
     })
 }
@@ -80,6 +85,23 @@ pub struct BlockUndoData {
     /// by a different chain during reorg.
     #[serde(default)]
     pub applied_tx_ids: Vec<String>,
+    /// Confidential (RingCT) key images recorded by this block (`ki:` keys).
+    /// On rollback: delete them so the inputs are spendable on the new chain
+    /// (otherwise the key image is seen-forever → frozen funds + consensus split).
+    #[serde(default)]
+    pub created_key_images: Vec<String>,
+    /// Confidential one-time output pubkeys recorded by this block (`okey:` keys).
+    /// On rollback: delete them (otherwise orphaned outputs stay citable as ring
+    /// members and the global output index desyncs across nodes).
+    #[serde(default)]
+    pub created_output_keys: Vec<String>,
+    /// Confidential-output global-index span [start, end) appended by this block.
+    /// On rollback: delete `okeyidx:{n}` for n in the range and restore
+    /// `okeyidx:count` to `start`.
+    #[serde(default)]
+    pub conf_index_start: Option<u64>,
+    #[serde(default)]
+    pub conf_index_end: Option<u64>,
 }
 
 /// Maximum UTXO cache entries (prevents unbounded memory growth)
@@ -98,14 +120,161 @@ pub const UTXO_SET_WARNING_THRESHOLD: usize = 50_000_000;
 pub struct UtxoSet {
     store: Arc<dyn UtxoBackend>,
     cache: RwLock<HashMap<UtxoKey, Utxo>>,
+    /// Node network. Only affects the coinbase-maturity window: test networks
+    /// mature fast so transactions can be tested without a long wait; mainnet
+    /// uses the full `COINBASE_MATURITY`. Defaults to Mainnet (see `with_network`).
+    network: NetworkMode,
+    /// Rolling MuHash accumulator over the TRANSPARENT unspent set — a LOCAL,
+    /// non-consensus integrity aid for crash recovery. Maintained incrementally
+    /// on apply (add created / remove spent) and its commitment persisted
+    /// atomically per block; on rollback it is recomputed from the set. On
+    /// startup, recovery recomputes it from the set and compares to the
+    /// persisted value to detect corruption (replaces the ±1% count heuristic).
+    /// NOT validated across nodes — see MuHash's field-size note.
+    muhash: RwLock<MuHash>,
 }
 
 impl UtxoSet {
+    #[inline]
+    fn network_from_address_prefix(address: &str) -> NetworkMode {
+        if address.starts_with("ST1") {
+            NetworkMode::Testnet
+        } else if address.starts_with("SR1") {
+            NetworkMode::Regtest
+        } else {
+            NetworkMode::Mainnet
+        }
+    }
+
     pub fn new(store: Arc<dyn UtxoBackend>) -> Self {
         Self {
             store,
             cache: RwLock::new(HashMap::with_capacity(MAX_CACHE_SIZE / 4)),
+            network: NetworkMode::Mainnet,
+            muhash: RwLock::new(MuHash::new()),
         }
+    }
+
+    /// Builder: set the node network (the daemon passes `cfg.network`). Only the
+    /// coinbase-maturity window depends on it.
+    pub fn with_network(mut self, network: NetworkMode) -> Self {
+        self.network = network;
+        self
+    }
+
+    /// In-place form of [`with_network`], for state that learns its network
+    /// after construction (e.g. the RPC's UTXO set, wired by the daemon).
+    #[inline]
+    pub fn set_network(&mut self, network: NetworkMode) {
+        self.network = network;
+    }
+
+    /// Coinbase maturity (blocks) for this node's network. Test networks mature
+    /// fast (so a freshly-mined reward is spendable quickly for testing); mainnet
+    /// uses the full window.
+    #[inline]
+    pub fn coinbase_maturity(&self) -> u64 {
+        match self.network {
+            NetworkMode::Mainnet => COINBASE_MATURITY,
+            NetworkMode::Testnet | NetworkMode::Regtest => 10,
+        }
+    }
+
+    // ── RingCT phase 1: key-image store + output-key index ──────────────
+    //
+    // `ki:`   = set of spent key images (double-spend prevention for
+    //           confidential inputs — replaces the `spent` flag, since the real
+    //           input is hidden in a ring).
+    // `okey:` = set of on-chain one-time output pubkeys (ring members must
+    //           reference real outputs, preventing forgery with fake keys).
+
+    fn ki_key(ki_hex: &str) -> Vec<u8> {
+        let mut v = Vec::with_capacity(3 + ki_hex.len());
+        v.extend_from_slice(b"ki:");
+        v.extend_from_slice(ki_hex.as_bytes());
+        v
+    }
+    fn okey_key(pk_hex: &str) -> Vec<u8> {
+        let mut v = Vec::with_capacity(5 + pk_hex.len());
+        v.extend_from_slice(b"okey:");
+        v.extend_from_slice(pk_hex.as_bytes());
+        v
+    }
+
+    /// Returns true if this key image has already been spent on-chain.
+    pub fn key_image_seen(&self, ki_hex: &str) -> bool {
+        self.store.get_raw(&Self::ki_key(ki_hex)).is_some()
+    }
+    /// Record a key image as spent (use within an atomic block apply).
+    pub fn record_key_image(&self, ki_hex: &str) -> Result<(), StorageError> {
+        self.store.put_raw(&Self::ki_key(ki_hex), &[1u8])
+    }
+    /// Returns true if this one-time output pubkey exists on-chain.
+    pub fn output_key_exists(&self, pk_hex: &str) -> bool {
+        self.store.get_raw(&Self::okey_key(pk_hex)).is_some()
+    }
+    /// Record a confidential output's one-time pubkey → its commitment, so ring
+    /// members can be checked for both existence AND commitment authenticity.
+    pub fn record_output_key(&self, pk_hex: &str, commitment_hex: &str) -> Result<(), StorageError> {
+        self.store
+            .put_raw(&Self::okey_key(pk_hex), commitment_hex.as_bytes())
+    }
+    /// The recorded commitment for a one-time output pubkey, if it exists on-chain.
+    pub fn output_key_commitment(&self, pk_hex: &str) -> Option<String> {
+        self.store
+            .get_raw(&Self::okey_key(pk_hex))
+            .and_then(|v| String::from_utf8(v).ok())
+    }
+
+    // ── Sequential confidential-output index (for decoy selection) ──────
+    //
+    // `okeyidx:count` -> u64 LE, `okeyidx:{N}` -> one-time pubkey hex. Lets a
+    // wallet sample random real outputs to form privacy rings (Monero-style
+    // global output index).
+
+    fn okeyidx_count_key() -> Vec<u8> {
+        b"okeyidx:count".to_vec()
+    }
+    fn okeyidx_at_key(n: u64) -> Vec<u8> {
+        let mut v = Vec::with_capacity(8 + 20);
+        v.extend_from_slice(b"okeyidx:");
+        v.extend_from_slice(n.to_string().as_bytes());
+        v
+    }
+
+    /// Number of confidential outputs recorded in the global index.
+    pub fn confidential_output_count(&self) -> u64 {
+        match self.store.get_raw(&Self::okeyidx_count_key()) {
+            Some(v) if v.len() == 8 => {
+                let mut a = [0u8; 8];
+                a.copy_from_slice(&v);
+                u64::from_le_bytes(a)
+            }
+            _ => 0,
+        }
+    }
+
+    /// One-time pubkey (hex) at global index `n`, if present.
+    pub fn confidential_output_at(&self, n: u64) -> Option<String> {
+        self.store
+            .get_raw(&Self::okeyidx_at_key(n))
+            .and_then(|v| String::from_utf8(v).ok())
+    }
+
+    /// Record a confidential output into BOTH the okey P->C map and the global
+    /// sequential index. Non-atomic convenience used by tests; the live apply
+    /// path inlines the equivalent writes into its WriteBatch.
+    pub fn record_confidential_output_indexed(
+        &self,
+        pk_hex: &str,
+        commitment_hex: &str,
+    ) -> Result<(), StorageError> {
+        self.record_output_key(pk_hex, commitment_hex)?;
+        let n = self.confidential_output_count();
+        self.store
+            .put_raw(&Self::okeyidx_at_key(n), pk_hex.as_bytes())?;
+        self.store
+            .put_raw(&Self::okeyidx_count_key(), &(n + 1).to_le_bytes())
     }
 
     pub fn add_utxo(&self, key: &UtxoKey, owner: String, amount: u64, address: String) {
@@ -227,10 +396,11 @@ impl UtxoSet {
 
         if let Some(created_height) = self.coinbase_created_height(key) {
             let confirmations = current_height.saturating_sub(created_height);
-            if confirmations < COINBASE_MATURITY {
+            let maturity = self.coinbase_maturity();
+            if confirmations < maturity {
                 return Err(StorageError::Other(format!(
                     "coinbase utxo {} immature: {} confirmations < required {}",
-                    key, confirmations, COINBASE_MATURITY
+                    key, confirmations, maturity
                 )));
             }
         }
@@ -242,7 +412,7 @@ impl UtxoSet {
         match self.get_utxo(key) {
             Some(utxo) if !utxo.spent => {
                 if let Some(created_height) = self.coinbase_created_height(key) {
-                    current_height.saturating_sub(created_height) >= COINBASE_MATURITY
+                    current_height.saturating_sub(created_height) >= self.coinbase_maturity()
                 } else {
                     true
                 }
@@ -253,6 +423,28 @@ impl UtxoSet {
 
     pub fn exists(&self, key: &UtxoKey) -> bool {
         matches!(self.get_utxo(key), Some(utxo) if !utxo.spent)
+    }
+
+    /// Whether a transaction has already been applied by ANY block in the
+    /// active DAG (the `tx_seen:` marker written by the apply paths).
+    ///
+    /// CONSENSUS-CRITICAL for block templates: execution skips an
+    /// already-seen tx as a duplicate with ZERO fee contribution, so a
+    /// template that re-includes it makes the coinbase claim fees that
+    /// will never be applied — every such block fails the post-execution
+    /// coinbase check on full validators and is permanently un-syncable.
+    pub fn is_tx_seen(&self, tx_hash: &str) -> bool {
+        let seen_key = format!("tx_seen:{}", tx_hash);
+        self.store.get_raw(seen_key.as_bytes()).is_some()
+    }
+
+    /// The block hash that included `tx_hash` on-chain (the `tx_seen:` value),
+    /// or None if the tx is not on the active DAG. Used for confirmations.
+    pub fn tx_seen_block(&self, tx_hash: &str) -> Option<String> {
+        let seen_key = format!("tx_seen:{}", tx_hash);
+        self.store
+            .get_raw(seen_key.as_bytes())
+            .and_then(|v| String::from_utf8(v).ok())
     }
 
     pub fn get_balance(&self, address: &str) -> u64 {
@@ -297,6 +489,9 @@ impl UtxoSet {
     pub fn clear_all(&self) {
         // Clear in-memory cache
         self.cache.write().clear();
+        // Reset the MuHash accumulator — the set is now empty, so a subsequent
+        // replay rebuilds it incrementally from the identity.
+        *self.muhash.write() = MuHash::new();
         // Clear DB via store
         self.store.clear_all();
     }
@@ -334,6 +529,8 @@ impl UtxoSet {
                 extra_nonce: 0,
                 receipt_root: None,
                 state_root: None,
+                mix_hash: String::new(),
+                prev_state_commitment: None,
             },
             body: crate::domain::block::block_body::BlockBody {
                 transactions: transactions.to_vec(),
@@ -362,6 +559,22 @@ impl UtxoSet {
     ) -> Result<String, StorageError> {
         use sha2::{Digest, Sha256};
 
+        // GUARD (F-10): this apply path materializes every output as a TRANSPARENT
+        // UTXO and does NOT maintain the confidential/shield buckets (okey ->
+        // commitment, okeyidx, key-image set). It is reached only for genesis and
+        // full-block apply, which are coinbase/transparent in practice. Refuse a
+        // confidential/shield tx here rather than silently corrupting the
+        // confidential bucket (a latent reorg landmine); the live confidential
+        // path is apply_block_dag_ordered.
+        for tx in transactions {
+            if tx.is_confidential() || tx.is_shield() {
+                return Err(StorageError::Other(format!(
+                    "apply_block_write_with_commitment: confidential/shield tx {} unsupported on this path (use apply_block_dag_ordered)",
+                    tx.hash
+                )));
+            }
+        }
+
         let mut ops: Vec<BatchWrite> = Vec::new();
 
         // Undo data — collects everything needed to reverse this block
@@ -372,6 +585,10 @@ impl UtxoSet {
             deleted_addr_indexes: Vec::new(),
             created_cb_heights: Vec::new(),
             applied_tx_ids: Vec::new(),
+            created_key_images: Vec::new(),
+            created_output_keys: Vec::new(),
+            conf_index_start: None,
+            conf_index_end: None,
         };
 
         // Incremental commitment hash chain
@@ -382,6 +599,11 @@ impl UtxoSet {
         }
         commitment_hasher.update(block_hash.as_bytes());
         commitment_hasher.update(block_height.to_le_bytes());
+
+        // Working copy of the rolling MuHash integrity accumulator (see
+        // apply_block_dag_ordered for the rationale). This apply path builds
+        // genesis and full blocks; both must feed the accumulator.
+        let mut mh = self.muhash.read().clone();
 
         for tx in transactions {
             if tx.is_coinbase() {
@@ -425,6 +647,7 @@ impl UtxoSet {
                     commitment_hasher.update(key.as_ref());
                     commitment_hasher.update(output.address.as_bytes());
                     commitment_hasher.update(output.amount.to_le_bytes());
+                    mh.add_by_key(key.as_ref(), output.amount, &output.address);
                 }
             } else {
                 for input in &tx.inputs {
@@ -465,6 +688,7 @@ impl UtxoSet {
                     commitment_hasher.update(b"S");
                     commitment_hasher.update(key.as_ref());
                     commitment_hasher.update(utxo.amount.to_le_bytes());
+                    mh.remove_by_key(key.as_ref(), utxo.amount, &utxo.address);
 
                     utxo.spent = true;
                     let data = bincode::serialize(&utxo).map_err(|e| {
@@ -506,6 +730,27 @@ impl UtxoSet {
                     commitment_hasher.update(key.as_ref());
                     commitment_hasher.update(output.address.as_bytes());
                     commitment_hasher.update(output.amount.to_le_bytes());
+                    mh.add_by_key(key.as_ref(), output.amount, &output.address);
+                }
+            }
+
+            // RingCT phase 1: record confidential key images (double-spend
+            // prevention) and one-time output pubkeys (ring-member authenticity)
+            // atomically with this block's UTXO writes.
+            for input in &tx.inputs {
+                if let Some(ki) = &input.key_image {
+                    ops.push(BatchWrite::Put {
+                        key: Self::ki_key(ki),
+                        value: vec![1u8],
+                    });
+                }
+            }
+            for output in &tx.outputs {
+                if let Some(pk) = &output.ephemeral_pubkey {
+                    ops.push(BatchWrite::Put {
+                        key: Self::okey_key(pk),
+                        value: vec![1u8],
+                    });
                 }
             }
         }
@@ -531,10 +776,18 @@ impl UtxoSet {
             value: undo_data,
         });
 
+        // Persist the MuHash accumulator in this SAME atomic batch.
+        if let Some(w) = Self::muhash_state_write(&mh) {
+            ops.push(w);
+        }
+
         // ATOMIC COMMIT — UTXO + commitment + undo = all or nothing
         self.store
             .write_batch(ops)
             .map_err(|e| StorageError::WriteFailed(format!("apply_block atomic write: {}", e)))?;
+
+        // Batch committed — publish the accumulator update (matches on-disk state).
+        *self.muhash.write() = mh;
 
         // Update cache after successful DB write
         for tx in transactions {
@@ -593,6 +846,10 @@ impl UtxoSet {
             deleted_addr_indexes: Vec::new(),
             created_cb_heights: Vec::new(),
             applied_tx_ids: Vec::new(),
+            created_key_images: Vec::new(),
+            created_output_keys: Vec::new(),
+            conf_index_start: None,
+            conf_index_end: None,
         };
 
         let mut commitment_hasher = Sha256::new();
@@ -602,6 +859,13 @@ impl UtxoSet {
         }
         commitment_hasher.update(block_hash.as_bytes());
         commitment_hasher.update(block_height.to_le_bytes());
+
+        // Working copy of the rolling MuHash integrity accumulator. Updated
+        // alongside each transparent create/spend below (observational — it
+        // reads the same UTXOs the apply already handles and cannot alter which
+        // UTXOs are written), then persisted in this same atomic batch and
+        // committed to `self.muhash` only after the batch write succeeds.
+        let mut mh = self.muhash.read().clone();
 
         let mut applied = 0usize;
         let mut skipped = 0usize;
@@ -616,6 +880,17 @@ impl UtxoSet {
         // This ensures tx3 can see tx1's output even though it's only in the batch.
         let mut staged_outputs: HashMap<UtxoKey, crate::domain::utxo::utxo::Utxo> = HashMap::new();
         let mut staged_spent: std::collections::HashSet<UtxoKey> = std::collections::HashSet::new();
+        // Coinbase outputs created earlier in THIS block. They CANNOT be spent in
+        // the same block (need COINBASE_MATURITY confirmations). The maturity
+        // check (D, below) only sees committed `cb_height:` markers via get_raw,
+        // so an intra-block coinbase would otherwise slip through — diverging from
+        // validate_block_utxos (which rejects it) and bypassing maturity.
+        let mut staged_coinbase: std::collections::HashSet<UtxoKey> = std::collections::HashSet::new();
+
+        // RingCT global confidential-output index: read the counter once, advance
+        // it locally per confidential output, and flush it once into this batch.
+        let conf_out_index_start = self.confidential_output_count();
+        let mut conf_out_index = conf_out_index_start;
 
         for tx in transactions {
             // ───────────────────────────────────────────────────────────
@@ -638,6 +913,170 @@ impl UtxoSet {
                     commitment_hasher.update(tx.hash.as_bytes());
                     continue;
                 }
+            }
+
+            // RingCT confidential tx: record key images (double-spend) and
+            // one-time output pubkeys → commitment (ring-member authenticity)
+            // in the SAME atomic batch. No transparent UTXO spend/create.
+            // SECURITY: this records WITHOUT validating — every caller MUST run
+            // the confidential gate (verify_confidential_tx) first. Callers:
+            // validate_block_utxos (apply_block_full / genesis) and
+            // FullNode::recompute_virtual_chain (peer-block / reorg path).
+            if tx.is_confidential() {
+                for input in &tx.inputs {
+                    if let Some(ki) = &input.key_image {
+                        ops.push(BatchWrite::Put {
+                            key: Self::ki_key(ki),
+                            value: vec![1u8],
+                        });
+                        // Record for rollback: a reorg MUST delete this ki marker,
+                        // else the input is frozen forever + nodes diverge.
+                        undo.created_key_images.push(ki.clone());
+                    }
+                }
+                for output in &tx.outputs {
+                    if let (Some(otk), Some(c)) = (&output.one_time_pubkey, &output.commitment) {
+                        ops.push(BatchWrite::Put {
+                            key: Self::okey_key(otk),
+                            value: c.as_bytes().to_vec(),
+                        });
+                        // Append to the global confidential-output index.
+                        ops.push(BatchWrite::Put {
+                            key: Self::okeyidx_at_key(conf_out_index),
+                            value: otk.as_bytes().to_vec(),
+                        });
+                        // Record for rollback (delete okey + okeyidx span on reorg).
+                        undo.created_output_keys.push(otk.clone());
+                        conf_out_index += 1;
+                    }
+                }
+                let seen_key = format!("tx_seen:{}", tx.hash);
+                ops.push(BatchWrite::Put {
+                    key: seen_key.as_bytes().to_vec(),
+                    value: block_hash.as_bytes().to_vec(),
+                });
+                undo.applied_tx_ids.push(tx.hash.clone());
+                commitment_hasher.update(b"CONF");
+                commitment_hasher.update(tx.hash.as_bytes());
+                applied += 1;
+                applied_fees = applied_fees.saturating_add(tx.fee);
+                continue;
+            }
+
+            // ── SHIELD: transparent inputs SPENT + confidential outputs RECORDED ──
+            // The crypto + homomorphic balance were validated by verify_shield_tx
+            // at the gate (mempool/block/reorg — see the shield routing). Here we
+            // (1) enforce the TRANSPARENT-input rules — exists, unspent, mature,
+            // no intra-block conflict — and mark them spent in the SAME namespace
+            // as ordinary transparent spends (spent-flag + staged_spent + undo),
+            // and (2) record the CONFIDENTIAL outputs (okey/okeyidx). Both go in
+            // ONE atomic batch; if ANY input is invalid the WHOLE tx is skipped so
+            // no confidential output is ever minted without its inputs being spent.
+            if tx.is_shield() {
+                let mut ok = true;
+                let mut spend_set: Vec<(UtxoKey, crate::domain::utxo::utxo::Utxo)> =
+                    Vec::with_capacity(tx.inputs.len());
+                for input in &tx.inputs {
+                    let key = utxo_key(&input.txid, input.index)?;
+                    if staged_spent.contains(&key) {
+                        ok = false;
+                        break;
+                    }
+                    let utxo = if let Some(u) = staged_outputs.get(&key) {
+                        // A coinbase created in THIS block is immature.
+                        if staged_coinbase.contains(&key) {
+                            ok = false;
+                            break;
+                        }
+                        u.clone()
+                    } else if let Some(raw) = self.store.get_raw(key.as_ref()) {
+                        match bincode::deserialize::<crate::domain::utxo::utxo::Utxo>(&raw) {
+                            Ok(u) if !u.spent => u,
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    } else {
+                        ok = false;
+                        break;
+                    };
+                    // Coinbase maturity (has block_height here; verify_shield_tx cannot).
+                    let mut meta_key = Vec::with_capacity(10 + 36);
+                    meta_key.extend_from_slice(b"cb_height:");
+                    meta_key.extend_from_slice(key.as_ref());
+                    if let Some(raw) = self.store.get_raw(&meta_key) {
+                        if raw.len() >= 8 {
+                            let cb_h = u64::from_le_bytes(raw[..8].try_into().unwrap_or([0; 8]));
+                            if block_height < cb_h + self.coinbase_maturity() {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    spend_set.push((key, utxo));
+                }
+                if !ok {
+                    skipped += 1;
+                    commitment_hasher.update(b"SKIP");
+                    commitment_hasher.update(tx.hash.as_bytes());
+                    continue;
+                }
+                // Spend the transparent inputs (same namespace as a normal spend).
+                for (key, utxo) in &spend_set {
+                    let key_str = key.to_string();
+                    undo.spent_utxos.push((key_str.clone(), utxo.clone()));
+                    let addr_key = format!("addr:{}:{}", utxo.address, key_str);
+                    ops.push(BatchWrite::Delete {
+                        key: addr_key.as_bytes().to_vec(),
+                    });
+                    undo.deleted_addr_indexes.push((addr_key, key_str));
+                    let mut spent_utxo = utxo.clone();
+                    spent_utxo.spent = true;
+                    let data = bincode::serialize(&spent_utxo).map_err(|e| {
+                        StorageError::Serialization(format!("shield spent UTXO {}: {}", key, e))
+                    })?;
+                    ops.push(BatchWrite::Put {
+                        key: key.as_ref().to_vec(),
+                        value: data,
+                    });
+                    staged_spent.insert(*key);
+                    staged_outputs.remove(key);
+                    mh.remove_by_key(key.as_ref(), utxo.amount, &utxo.address);
+                    commitment_hasher.update(b"S");
+                    commitment_hasher.update(key.as_ref());
+                    commitment_hasher.update(utxo.amount.to_le_bytes());
+                }
+                // Record the confidential outputs (okey/okeyidx). These are NOT
+                // transparent UTXOs, so they do not enter staged_outputs or the
+                // transparent MuHash accumulator.
+                for output in &tx.outputs {
+                    if let (Some(otk), Some(c)) = (&output.one_time_pubkey, &output.commitment) {
+                        ops.push(BatchWrite::Put {
+                            key: Self::okey_key(otk),
+                            value: c.as_bytes().to_vec(),
+                        });
+                        ops.push(BatchWrite::Put {
+                            key: Self::okeyidx_at_key(conf_out_index),
+                            value: otk.as_bytes().to_vec(),
+                        });
+                        undo.created_output_keys.push(otk.clone());
+                        conf_out_index += 1;
+                        commitment_hasher.update(b"C");
+                        commitment_hasher.update(otk.as_bytes());
+                    }
+                }
+                let seen_key = format!("tx_seen:{}", tx.hash);
+                ops.push(BatchWrite::Put {
+                    key: seen_key.as_bytes().to_vec(),
+                    value: block_hash.as_bytes().to_vec(),
+                });
+                undo.applied_tx_ids.push(tx.hash.clone());
+                commitment_hasher.update(b"SHIELD");
+                commitment_hasher.update(tx.hash.as_bytes());
+                applied += 1;
+                applied_fees = applied_fees.saturating_add(tx.fee);
+                continue;
             }
 
             if tx.is_coinbase() {
@@ -673,11 +1112,13 @@ impl UtxoSet {
                     undo.created_cb_heights.push(meta_key_string);
 
                     staged_outputs.insert(key, utxo);
+                    staged_coinbase.insert(key);
 
                     commitment_hasher.update(b"C");
                     commitment_hasher.update(key.as_ref());
                     commitment_hasher.update(output.address.as_bytes());
                     commitment_hasher.update(output.amount.to_le_bytes());
+                    mh.add_by_key(key.as_ref(), output.amount, &output.address);
                 }
                 applied += 1;
                 continue;
@@ -713,6 +1154,15 @@ impl UtxoSet {
 
                 // 2. Created by earlier tx in this block? (intra-block spend)
                 if let Some(utxo) = staged_outputs.get(&key) {
+                    // A coinbase output created in THIS block is immature
+                    // (needs COINBASE_MATURITY confirmations) — spending it in
+                    // the same block is a conflict. Mirrors validate_block_utxos
+                    // (utxo_validator.rs is_cb rejection) so both validation
+                    // paths agree and the maturity invariant holds.
+                    if staged_coinbase.contains(&key) {
+                        conflict = true;
+                        break;
+                    }
                     tx_inputs.push((key, utxo.clone()));
                     continue;
                 }
@@ -752,8 +1202,14 @@ impl UtxoSet {
             // or wrong ownership could be applied to the UTXO set.
             // ───────────────────────────────────────────────────────
 
-            // A) Signature verification — every input must have a valid Ed25519 signature
-            if !TxValidator::verify_signatures(tx) {
+            // A) Signature verification — every input must have a valid Ed25519 signature.
+            // Use the UTXO address prefix as network anchor to avoid cross-network
+            // signature-message mismatches (mainnet/testnet/regtest).
+            let tx_network = tx_inputs
+                .first()
+                .map(|(_, utxo)| Self::network_from_address_prefix(&utxo.address))
+                .unwrap_or(NetworkMode::Mainnet);
+            if !TxValidator::verify_signatures_for_network(tx, &tx_network) {
                 skipped += 1;
                 commitment_hasher.update(b"SKIP");
                 commitment_hasher.update(tx.hash.as_bytes());
@@ -762,7 +1218,7 @@ impl UtxoSet {
 
             // B) Ownership verification — input.owner must match UTXO address
             {
-                let signing_msg = TxHash::signing_message(tx);
+                let signing_msg = TxHash::signing_message_for_network(tx, &tx_network);
                 let mut ownership_ok = true;
                 for (i, input) in tx.inputs.iter().enumerate() {
                     let (ref _key, ref utxo) = tx_inputs[i];
@@ -840,7 +1296,7 @@ impl UtxoSet {
                     if let Some(raw) = self.store.get_raw(&meta_key) {
                         if raw.len() >= 8 {
                             let cb_h = u64::from_le_bytes(raw[..8].try_into().unwrap_or([0; 8]));
-                            if block_height < cb_h + COINBASE_MATURITY {
+                            if block_height < cb_h + self.coinbase_maturity() {
                                 // consensus maturity check
                                 maturity_ok = false;
                                 break;
@@ -883,6 +1339,7 @@ impl UtxoSet {
                 commitment_hasher.update(b"S");
                 commitment_hasher.update(key.as_ref());
                 commitment_hasher.update(utxo.amount.to_le_bytes());
+                mh.remove_by_key(key.as_ref(), utxo.amount, &utxo.address);
             }
 
             for (idx, output) in tx.outputs.iter().enumerate() {
@@ -913,6 +1370,7 @@ impl UtxoSet {
                 commitment_hasher.update(key.as_ref());
                 commitment_hasher.update(output.address.as_bytes());
                 commitment_hasher.update(output.amount.to_le_bytes());
+                mh.add_by_key(key.as_ref(), output.amount, &output.address);
             }
 
             // Mark tx as seen (uniqueness) + record for undo
@@ -941,6 +1399,11 @@ impl UtxoSet {
             value: commitment.as_bytes().to_vec(),
         });
 
+        // Record the confidential-output index span so rollback can delete the
+        // okeyidx:{n} entries and restore the counter.
+        undo.conf_index_start = Some(conf_out_index_start);
+        undo.conf_index_end = Some(conf_out_index);
+
         let undo_key = format!("utxo:undo:{}", block_hash);
         let undo_data = bincode::serialize(&undo)
             .map_err(|e| StorageError::Serialization(format!("undo data: {}", e)))?;
@@ -949,10 +1412,29 @@ impl UtxoSet {
             value: undo_data,
         });
 
+        // Flush the advanced confidential-output index counter (once), in this
+        // same atomic batch, only if any confidential output was recorded.
+        if conf_out_index != conf_out_index_start {
+            ops.push(BatchWrite::Put {
+                key: Self::okeyidx_count_key(),
+                value: conf_out_index.to_le_bytes().to_vec(),
+            });
+        }
+
+        // Persist the updated MuHash accumulator IN THIS SAME BATCH so its
+        // commitment is crash-atomic with the UTXO set it commits to (recovery
+        // recomputes it from the set and compares — see verify_muhash_integrity).
+        if let Some(w) = Self::muhash_state_write(&mh) {
+            ops.push(w);
+        }
+
         // ATOMIC COMMIT
         self.store.write_batch(ops).map_err(|e| {
             StorageError::WriteFailed(format!("apply_block_dag atomic write: {}", e))
         })?;
+
+        // Batch committed — publish the accumulator update (matches on-disk state).
+        *self.muhash.write() = mh;
 
         // Update cache
         for (key_str, _) in &undo.spent_utxos {
@@ -1062,6 +1544,35 @@ impl UtxoSet {
             });
         }
 
+        // 6b. Reverse confidential (RingCT) mutations this block recorded.
+        //     CRITICAL: without this, key-image markers persist after a reorg —
+        //     freezing the input forever and splitting consensus — and the
+        //     global confidential-output index (okey:/okeyidx:) desyncs.
+        for ki in &undo.created_key_images {
+            ops.push(BatchWrite::Delete {
+                key: Self::ki_key(ki),
+            });
+        }
+        for otk in &undo.created_output_keys {
+            ops.push(BatchWrite::Delete {
+                key: Self::okey_key(otk),
+            });
+        }
+        if let (Some(start), Some(end)) = (undo.conf_index_start, undo.conf_index_end) {
+            for n in start..end {
+                ops.push(BatchWrite::Delete {
+                    key: Self::okeyidx_at_key(n),
+                });
+            }
+            if end != start {
+                // Restore the global confidential-output counter to its pre-block value.
+                ops.push(BatchWrite::Put {
+                    key: Self::okeyidx_count_key(),
+                    value: start.to_le_bytes().to_vec(),
+                });
+            }
+        }
+
         // 7. Clean up undo data and commitment
         ops.push(BatchWrite::Delete {
             key: undo_key.as_bytes().to_vec(),
@@ -1096,6 +1607,15 @@ impl UtxoSet {
                 }
             }
         }
+        drop(cache);
+
+        // Recompute the MuHash from the restored set. The undo record lists
+        // created UTXOs by KEY only (no amount/address), so the incremental
+        // inverse is not available here; a full recompute (O(n)) is acceptable
+        // because reorgs are rare and depth-bounded (MAX_REORG_DEPTH). A crash
+        // between the rollback write above and this persist only causes a
+        // (safe) false-mismatch replay on the next recovery, never corruption.
+        self.rebuild_and_persist_muhash();
 
         Ok(())
     }
@@ -1296,6 +1816,80 @@ impl UtxoSet {
         format!("{:x}", master_hasher.finalize())
     }
 
+    // ── MuHash integrity (local crash-recovery aid; NOT a consensus commitment) ──
+
+    /// RocksDB key holding the persisted MuHash accumulator state (bincode).
+    const MUHASH_STATE_KEY: &'static [u8] = b"utxo:muhash_state";
+
+    /// Recompute the MuHash of the current transparent unspent set from scratch
+    /// (O(n) full scan). Used at startup/recovery and after a rollback. Equal to
+    /// what the incremental accumulator converges to (product over unspent
+    /// UTXOs), so the two can be compared for integrity.
+    pub fn compute_muhash_from_set(&self) -> MuHash {
+        let mut mh = MuHash::new();
+        for (key, utxo) in self.export_all() {
+            // export_all already returns only unspent transparent UTXOs; the
+            // guard is defensive.
+            if utxo.spent {
+                continue;
+            }
+            mh.add_by_key(key.as_ref(), utxo.amount, &utxo.address);
+        }
+        mh
+    }
+
+    /// Current in-memory MuHash commitment (64-char hex).
+    pub fn muhash_commitment(&self) -> String {
+        self.muhash.read().finalize()
+    }
+
+    /// The persisted MuHash accumulator, if present and well-formed.
+    fn load_persisted_muhash(&self) -> Option<MuHash> {
+        let raw = self.store.get_raw(Self::MUHASH_STATE_KEY)?;
+        bincode::deserialize(&raw).ok()
+    }
+
+    /// A `BatchWrite` persisting the accumulator state — pushed into the SAME
+    /// atomic batch as a block's UTXO mutations so the persisted commitment can
+    /// never be a block ahead of / behind the set it commits to.
+    fn muhash_state_write(mh: &MuHash) -> Option<BatchWrite> {
+        bincode::serialize(mh).ok().map(|bytes| BatchWrite::Put {
+            key: Self::MUHASH_STATE_KEY.to_vec(),
+            value: bytes,
+        })
+    }
+
+    /// Recompute the accumulator from the current set, store it in memory, and
+    /// persist it. Called at startup and after a rollback (where the incremental
+    /// delta is not recoverable from undo data, which omits created amounts).
+    pub fn rebuild_and_persist_muhash(&self) -> String {
+        let mh = self.compute_muhash_from_set();
+        let commit = mh.finalize();
+        if let Ok(bytes) = bincode::serialize(&mh) {
+            let _ = self.store.put_raw(Self::MUHASH_STATE_KEY, &bytes);
+        }
+        *self.muhash.write() = mh;
+        commit
+    }
+
+    /// Crash-recovery integrity check. Recomputes the accumulator from the
+    /// persisted set and compares it to the persisted accumulator. Returns
+    /// `Some(true)` when the set matches its committed accumulator (integrity
+    /// OK), `Some(false)` when the set diverges from the persisted commitment
+    /// (disk corruption or an apply/rollback bug — the caller should replay), or
+    /// `None` when no persisted baseline exists yet (fresh/upgraded chain — the
+    /// caller falls back to the count heuristic). Side effect: the in-memory
+    /// accumulator is (re)initialised from the live set so subsequent
+    /// incremental apply updates start from a correct base.
+    pub fn verify_muhash_integrity(&self) -> Option<bool> {
+        let computed = self.compute_muhash_from_set();
+        let result = self
+            .load_persisted_muhash()
+            .map(|persisted| persisted.finalize() == computed.finalize());
+        *self.muhash.write() = computed;
+        result
+    }
+
     // ── test helpers ────────────────────────────────────────────────────
     // Everything below until coinbase_created_height() is test-only.
     // Gated behind #[cfg(test)] so none of this compiles into production.
@@ -1315,6 +1909,8 @@ impl UtxoSet {
         Ok(Self {
             store: Arc::new(store) as Arc<dyn UtxoBackend>,
             cache: RwLock::new(HM::with_capacity(64)),
+            network: NetworkMode::Mainnet,
+            muhash: RwLock::new(MuHash::new()),
         })
     }
 
@@ -1340,6 +1936,18 @@ impl UtxoSet {
     #[cfg(test)]
     pub fn add_utxo_str(&self, key: &str, owner: String, amount: u64, address: String) {
         self.add_utxo(&Self::parse_utxo_key(key), owner, amount, address);
+    }
+
+    /// Mark a tx as applied on-chain (`tx_seen:` marker) — convenience for
+    /// tests. The production writers are the block-apply paths, which
+    /// require fully-signed transactions.
+    #[cfg(test)]
+    pub fn mark_tx_seen_test(&self, tx_hash: &str) {
+        let seen_key = format!("tx_seen:{}", tx_hash);
+        let _ = self.store.write_batch(vec![BatchWrite::Put {
+            key: seen_key.as_bytes().to_vec(),
+            value: b"test".to_vec(),
+        }]);
     }
 
     /// add_utxo_coinbase by string key — convenience for tests.
@@ -1452,5 +2060,363 @@ impl UtxoSet {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod ringct_phase1_store_tests {
+    use super::*;
+
+    #[test]
+    fn coinbase_maturity_is_network_aware() {
+        use crate::config::node::node_config::NetworkMode;
+        // Mainnet (default) keeps the full window; test networks mature fast.
+        assert_eq!(UtxoSet::new_empty().coinbase_maturity(), COINBASE_MATURITY);
+        assert_eq!(
+            UtxoSet::new_empty()
+                .with_network(NetworkMode::Testnet)
+                .coinbase_maturity(),
+            10
+        );
+        assert_eq!(
+            UtxoSet::new_empty()
+                .with_network(NetworkMode::Regtest)
+                .coinbase_maturity(),
+            10
+        );
+    }
+
+    #[test]
+    fn key_image_recorded_and_detected() {
+        let set = UtxoSet::new_empty();
+        let ki = "ab".repeat(32);
+        assert!(!set.key_image_seen(&ki));
+        set.record_key_image(&ki).unwrap();
+        assert!(set.key_image_seen(&ki));
+    }
+
+    #[test]
+    fn output_key_membership() {
+        let set = UtxoSet::new_empty();
+        let pk = "cd".repeat(32);
+        assert!(!set.output_key_exists(&pk));
+        set.record_output_key(&pk, &"00".repeat(32)).unwrap();
+        assert!(set.output_key_exists(&pk));
+    }
+
+    #[test]
+    fn okey_binds_pubkey_to_commitment() {
+        let set = UtxoSet::new_empty();
+        let pk = "ab".repeat(32);
+        let c = "cd".repeat(32);
+        assert!(set.output_key_commitment(&pk).is_none());
+        set.record_output_key(&pk, &c).unwrap();
+        assert_eq!(set.output_key_commitment(&pk), Some(c.clone()));
+        assert!(set.output_key_exists(&pk));
+    }
+
+    #[test]
+    fn confidential_output_index_counts_and_indexes() {
+        let set = UtxoSet::new_empty();
+        assert_eq!(set.confidential_output_count(), 0);
+        assert!(set.confidential_output_at(0).is_none());
+
+        set.record_confidential_output_indexed(&"aa".repeat(32), &"11".repeat(32))
+            .unwrap();
+        set.record_confidential_output_indexed(&"bb".repeat(32), &"22".repeat(32))
+            .unwrap();
+
+        assert_eq!(set.confidential_output_count(), 2);
+        assert_eq!(set.confidential_output_at(0), Some("aa".repeat(32)));
+        assert_eq!(set.confidential_output_at(1), Some("bb".repeat(32)));
+        assert!(set.confidential_output_at(2).is_none());
+        assert_eq!(set.output_key_commitment(&"aa".repeat(32)), Some("11".repeat(32)));
+    }
+
+    #[test]
+    fn reorg_rollback_reverses_confidential_state() {
+        // Regression for the CRITICAL: apply_block_dag_ordered records ki:/okey:/
+        // okeyidx: for confidential txs; rollback_block_undo MUST reverse them on
+        // reorg, else key images are seen-forever (frozen funds + consensus split)
+        // and the confidential output index desyncs.
+        use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
+        let set = UtxoSet::new_empty();
+        let ki = "11".repeat(32);
+        let otk = "22".repeat(32);
+        let commit = "33".repeat(32);
+
+        let mut inp = TxInput::new("00".repeat(32), 0, String::new(), String::new(), String::new());
+        inp.key_image = Some(ki.clone());
+        let mut out = TxOutput::new("conf".into(), 0);
+        out.one_time_pubkey = Some(otk.clone());
+        out.commitment = Some(commit.clone());
+        let mut tx = Transaction::new("cf".repeat(32), vec![inp], vec![out], 0, 1000);
+        tx.tx_type = TxType::Confidential;
+        tx.hash = "cf".repeat(32);
+        assert!(tx.is_confidential());
+
+        assert_eq!(set.confidential_output_count(), 0);
+        let block_hash = "bb".repeat(32);
+        set.apply_block_dag_ordered(std::slice::from_ref(&tx), 1, &block_hash)
+            .unwrap();
+        // Recorded by apply.
+        assert!(set.key_image_seen(&ki));
+        assert!(set.output_key_exists(&otk));
+        assert_eq!(set.confidential_output_count(), 1);
+
+        // Reorg rollback must reverse ALL confidential state.
+        set.rollback_block_undo(&block_hash).unwrap();
+        assert!(!set.key_image_seen(&ki), "ki: must be deleted on rollback");
+        assert!(!set.output_key_exists(&otk), "okey: must be deleted on rollback");
+        assert_eq!(
+            set.confidential_output_count(),
+            0,
+            "okeyidx:count must be restored to pre-block value"
+        );
+    }
+
+    #[test]
+    fn same_block_coinbase_spend_is_skipped() {
+        // Regression: a tx that spends a coinbase output created in the SAME
+        // block must NOT be applied by apply_block_dag_ordered (coinbase needs
+        // COINBASE_MATURITY confirmations). Previously the maturity check read
+        // cb_height only from committed DB, so an intra-block coinbase slipped
+        // through — bypassing maturity and diverging from validate_block_utxos.
+        use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput};
+        let set = UtxoSet::new_empty();
+        let cb_hash = "cb".repeat(32);
+        let mut coinbase = Transaction::new_coinbase(
+            cb_hash.clone(),
+            vec![TxOutput::new("miner_addr".into(), 5000)],
+            0,
+            1000,
+        );
+        coinbase.hash = cb_hash.clone();
+        let mut spend = Transaction::new(
+            "ee".repeat(32),
+            vec![TxInput::new(
+                cb_hash.clone(),
+                0,
+                "miner_addr".into(),
+                "sig".into(),
+                "pk".into(),
+            )],
+            vec![TxOutput::new("dest_addr".into(), 4000)],
+            1,
+            1000,
+        );
+        spend.hash = "ee".repeat(32);
+
+        let (applied, skipped, _fees) = set
+            .apply_block_dag_ordered(&[coinbase, spend], 1, &"bb".repeat(32))
+            .unwrap();
+        assert_eq!(applied, 1, "only the coinbase should apply");
+        assert!(skipped >= 1, "same-block coinbase spend must be skipped");
+
+        // The coinbase output must remain UNSPENT.
+        let key = utxo_key(&cb_hash, 0).unwrap();
+        let raw = set
+            .store
+            .get_raw(key.as_ref())
+            .expect("coinbase utxo must exist");
+        let utxo: crate::domain::utxo::utxo::Utxo = bincode::deserialize(&raw).unwrap();
+        assert!(!utxo.spent, "coinbase output must remain unspent");
+    }
+
+    #[test]
+    fn muhash_incremental_matches_recompute_and_detects_corruption() {
+        use crate::domain::transaction::transaction::{Transaction, TxOutput};
+        let set = UtxoSet::new_empty();
+
+        // Apply two coinbase blocks (each creates a transparent output).
+        for (h, tag) in [(0u64, "aa"), (1u64, "bb")] {
+            let cbh = tag.repeat(32);
+            let mut cb = Transaction::new_coinbase(
+                cbh.clone(),
+                vec![TxOutput::new(format!("addr_{}", tag), 5000 + h)],
+                0,
+                1000,
+            );
+            cb.hash = cbh;
+            set.apply_block_dag_ordered(std::slice::from_ref(&cb), h, &format!("blk_{}", tag))
+                .unwrap();
+        }
+
+        // INVARIANT: the incrementally-maintained accumulator equals a fresh
+        // recompute over the whole set. This is what makes recovery sound.
+        assert_eq!(
+            set.muhash_commitment(),
+            set.compute_muhash_from_set().finalize(),
+            "incremental MuHash must equal recompute-from-set"
+        );
+        // A baseline was persisted atomically by apply, and it matches.
+        assert_eq!(
+            set.verify_muhash_integrity(),
+            Some(true),
+            "integrity must hold after clean applies"
+        );
+
+        // Corrupt the set OUT OF BAND: inject a UTXO straight into the store,
+        // bypassing apply (so the persisted accumulator does NOT know about it).
+        let rogue_key = utxo_key(&"cc".repeat(32), 0).unwrap();
+        let rogue = crate::domain::utxo::utxo::Utxo::new("evil".into(), "evil".into(), 999);
+        set.store
+            .put_raw(rogue_key.as_ref(), &bincode::serialize(&rogue).unwrap())
+            .unwrap();
+
+        // The live set now diverges from the persisted commitment → detected.
+        assert_eq!(
+            set.verify_muhash_integrity(),
+            Some(false),
+            "an out-of-band UTXO must be detected as a MuHash mismatch"
+        );
+    }
+
+    #[test]
+    fn muhash_restored_by_rollback() {
+        use crate::domain::transaction::transaction::{Transaction, TxOutput};
+        let set = UtxoSet::new_empty();
+
+        let mut cb_a =
+            Transaction::new_coinbase("aa".repeat(32), vec![TxOutput::new("addr_a".into(), 5000)], 0, 1000);
+        cb_a.hash = "aa".repeat(32);
+        set.apply_block_dag_ordered(std::slice::from_ref(&cb_a), 0, "blkA").unwrap();
+        let after_a = set.muhash_commitment();
+
+        let mut cb_b =
+            Transaction::new_coinbase("bb".repeat(32), vec![TxOutput::new("addr_b".into(), 6000)], 0, 1000);
+        cb_b.hash = "bb".repeat(32);
+        set.apply_block_dag_ordered(std::slice::from_ref(&cb_b), 1, "blkB").unwrap();
+        assert_ne!(set.muhash_commitment(), after_a, "applying B must change the commitment");
+
+        // Rolling back B must restore the accumulator to its post-A value, and
+        // the recomputed-from-set value must agree (rollback recomputes it).
+        set.rollback_block_undo("blkB").unwrap();
+        assert_eq!(set.muhash_commitment(), after_a, "rollback must restore the accumulator");
+        assert_eq!(set.muhash_commitment(), set.compute_muhash_from_set().finalize());
+        assert_eq!(set.verify_muhash_integrity(), Some(true));
+    }
+
+    // ── Shield apply/rollback (P4) ──────────────────────────────────────────
+    // These exercise apply_block_dag_ordered directly (the crypto/balance is the
+    // gate's job, verified separately); here we prove the MUTATION half: a shield
+    // spends its transparent input AND records its confidential output atomically,
+    // rollback reverses BOTH, and a spent input cannot be re-shielded.
+
+    fn shield_tx(hash: &str, in_txid: &str, otk: &str) -> crate::domain::transaction::transaction::Transaction {
+        use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
+        let mut inp = TxInput::new(in_txid.into(), 0, "ST1miner".into(), "sig".into(), "pk".into());
+        inp.shield_blinding = Some("00".repeat(32));
+        let mut out = TxOutput::new("SD1p".into(), 0);
+        out.one_time_pubkey = Some(otk.to_string());
+        out.commitment = Some("dd".repeat(32));
+        let mut tx = Transaction::new(hash.into(), vec![inp], vec![out], 0, 1);
+        tx.hash = hash.into();
+        tx.tx_type = TxType::Shield;
+        tx
+    }
+
+    fn seed_coinbase(set: &UtxoSet, cb_hash: &str) {
+        use crate::domain::transaction::transaction::{Transaction, TxOutput};
+        let mut cb = Transaction::new_coinbase(cb_hash.into(), vec![TxOutput::new("ST1miner".into(), 5000)], 0, 1);
+        cb.hash = cb_hash.into();
+        set.apply_block_dag_ordered(std::slice::from_ref(&cb), 0, "cbblk").unwrap();
+    }
+
+    #[test]
+    fn shield_apply_spends_input_and_records_confidential_output() {
+        let set = UtxoSet::new_empty();
+        let cb_hash = "aa".repeat(32);
+        seed_coinbase(&set, &cb_hash);
+        let in_key = utxo_key(&cb_hash, 0).unwrap();
+        assert!(!set.get_utxo(&in_key).unwrap().spent);
+
+        let otk = "cc".repeat(32);
+        let tx = shield_tx(&"ee".repeat(32), &cb_hash, &otk);
+        // Height 2000 > coinbase maturity (Mainnet default 1000).
+        let (applied, skipped, _) = set
+            .apply_block_dag_ordered(std::slice::from_ref(&tx), 2000, "shblk")
+            .unwrap();
+        assert_eq!((applied, skipped), (1, 0), "shield must apply");
+        assert!(set.get_utxo(&in_key).unwrap().spent, "shield must SPEND its transparent input");
+        assert!(set.output_key_exists(&otk), "shield must RECORD its confidential output");
+    }
+
+    #[test]
+    fn shield_rollback_restores_input_and_deletes_output() {
+        let set = UtxoSet::new_empty();
+        let cb_hash = "aa".repeat(32);
+        seed_coinbase(&set, &cb_hash);
+        let in_key = utxo_key(&cb_hash, 0).unwrap();
+        let otk = "cc".repeat(32);
+        let tx = shield_tx(&"ee".repeat(32), &cb_hash, &otk);
+        set.apply_block_dag_ordered(std::slice::from_ref(&tx), 2000, "shblk").unwrap();
+        assert!(set.get_utxo(&in_key).unwrap().spent);
+        assert!(set.output_key_exists(&otk));
+
+        set.rollback_block_undo("shblk").unwrap();
+        assert!(!set.get_utxo(&in_key).unwrap().spent, "rollback must RESTORE the transparent input");
+        assert!(!set.output_key_exists(&otk), "rollback must DELETE the confidential output");
+    }
+
+    #[test]
+    fn shield_cannot_re_spend_a_spent_input() {
+        // Double-spend: a shield input marked spent cannot be shielded again (a
+        // second shield referencing the same outpoint, different tx hash, skips).
+        let set = UtxoSet::new_empty();
+        let cb_hash = "aa".repeat(32);
+        seed_coinbase(&set, &cb_hash);
+        let tx1 = shield_tx(&"e1".repeat(32), &cb_hash, &"c1".repeat(32));
+        let tx2 = shield_tx(&"e2".repeat(32), &cb_hash, &"c2".repeat(32));
+        let (a1, _, _) = set.apply_block_dag_ordered(std::slice::from_ref(&tx1), 2000, "b1").unwrap();
+        assert_eq!(a1, 1);
+        let (a2, s2, _) = set.apply_block_dag_ordered(std::slice::from_ref(&tx2), 2001, "b2").unwrap();
+        assert_eq!(a2, 0, "re-shielding a spent input must NOT apply");
+        assert_eq!(s2, 1, "the second shield must be skipped");
+        assert!(!set.output_key_exists(&"c2".repeat(32)), "skipped shield must record NO confidential output");
+    }
+
+    #[test]
+    fn shield_same_block_double_spend_applies_once() {
+        // DOUBLE-SPEND (V8, same block): two shields referencing the SAME outpoint
+        // inside ONE block — the first spends it (staged_spent), the second must
+        // be skipped so the input is never consumed twice within a block.
+        let set = UtxoSet::new_empty();
+        let cb_hash = "aa".repeat(32);
+        seed_coinbase(&set, &cb_hash);
+        let tx1 = shield_tx(&"e1".repeat(32), &cb_hash, &"c1".repeat(32));
+        let tx2 = shield_tx(&"e2".repeat(32), &cb_hash, &"c2".repeat(32));
+        let block = [tx1, tx2];
+        let (applied, skipped, _) = set
+            .apply_block_dag_ordered(&block, 2000, "sameblk")
+            .unwrap();
+        assert_eq!(applied, 1, "exactly one shield may spend the outpoint");
+        assert_eq!(skipped, 1, "the same-block re-spend must be skipped");
+        assert!(set.output_key_exists(&"c1".repeat(32)), "the applied shield records its output");
+        assert!(!set.output_key_exists(&"c2".repeat(32)), "the skipped shield records no output");
+    }
+
+    #[test]
+    fn shield_then_transparent_spend_same_outpoint_rejected() {
+        // CROSS-WORLD DOUBLE-SPEND (V8): once a shield spends a transparent
+        // outpoint, a later transparent tx spending the SAME outpoint must find it
+        // already spent (no shield→transparent double dip across blocks).
+        let set = UtxoSet::new_empty();
+        let cb_hash = "aa".repeat(32);
+        seed_coinbase(&set, &cb_hash);
+        let sh = shield_tx(&"e1".repeat(32), &cb_hash, &"c1".repeat(32));
+        set.apply_block_dag_ordered(std::slice::from_ref(&sh), 2000, "shblk").unwrap();
+        let in_key = utxo_key(&cb_hash, 0).unwrap();
+        assert!(set.get_utxo(&in_key).unwrap().spent, "shield spent the outpoint");
+
+        // A transparent tx spending the same coinbase output must not re-consume it.
+        use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput};
+        let inp = TxInput::new(cb_hash.clone(), 0, "ST1miner".into(), "sig".into(), "pk".into());
+        let mut ttx = Transaction::new("f0".repeat(32), vec![inp], vec![TxOutput::new("ST1dest".into(), 4999)], 1, 1);
+        ttx.hash = "f0".repeat(32);
+        let (applied, skipped, _) = set
+            .apply_block_dag_ordered(std::slice::from_ref(&ttx), 2001, "tblk")
+            .unwrap();
+        assert_eq!((applied, skipped), (0, 1), "transparent re-spend of a shielded outpoint must be skipped");
     }
 }

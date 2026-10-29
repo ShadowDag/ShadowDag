@@ -90,8 +90,8 @@ mod tests {
             difficulty in 1u64..100,
         ) {
             use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
-            let h1 = shadow_hash_raw_full(version, height, timestamp, nonce, 0, difficulty, "merkle", &[]);
-            let h2 = shadow_hash_raw_full(version, height, timestamp, nonce, 0, difficulty, "merkle", &[]);
+            let h1 = shadow_hash_raw_full(version, height, timestamp, nonce, 0, difficulty, "merkle", &[], None);
+            let h2 = shadow_hash_raw_full(version, height, timestamp, nonce, 0, difficulty, "merkle", &[], None);
             prop_assert_eq!(h1.len(), 64);
             prop_assert_eq!(h1, h2);
         }

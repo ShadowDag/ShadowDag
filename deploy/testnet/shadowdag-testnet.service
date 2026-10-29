@@ -1,0 +1,36 @@
+# systemd unit for a bare-metal (non-Docker) ShadowDAG testnet node.
+#
+# Install:
+#   sudo cp shadowdag-testnet.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now shadowdag-testnet
+#   journalctl -u shadowdag-testnet -f      # follow logs
+#
+# Assumes the binary is at /usr/local/bin/shadowdag-node and a 'shadowdag'
+# system user exists (see deploy.sh).
+
+[Unit]
+Description=ShadowDAG Testnet Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shadowdag
+Group=shadowdag
+ExecStart=/usr/local/bin/shadowdag-node \
+    --network=testnet \
+    --data-dir=/var/lib/shadowdag-testnet \
+    --enable-explorer
+Restart=on-failure
+RestartSec=5
+# Crypto node touches many sockets/files; raise the fd limit.
+LimitNOFILE=65536
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

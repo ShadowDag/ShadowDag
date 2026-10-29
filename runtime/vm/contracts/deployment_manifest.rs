@@ -67,6 +67,15 @@ fn canonical_network(network: &str) -> Option<&'static str> {
     }
 }
 
+fn network_meta(canonical: &str) -> Option<(u32, &'static str)> {
+    match canonical {
+        "mainnet" => Some((0xDA0C_0001, "http://localhost:9332")),
+        "testnet" => Some((0xDA0C_0002, "http://localhost:19332")),
+        "regtest" => Some((0xDA0C_0003, "http://localhost:29332")),
+        _ => None,
+    }
+}
+
 impl DeploymentManifest {
     /// Create an empty deployment manifest for the given network.
     ///
@@ -91,27 +100,19 @@ impl DeploymentManifest {
             ))
         })?;
 
-        let chain_id = match canonical {
-            "mainnet" => 0xDA0C_0001,
-            "testnet" => 0xDA0C_0002,
-            "regtest" => 0xDA0C_0003,
-            // Unreachable: canonical_network only returns the three
-            // strings above.
-            _ => unreachable!("canonical_network returned unknown value"),
-        };
-        let rpc_url = match canonical {
-            "mainnet" => "http://localhost:9332".into(),
-            "testnet" => "http://localhost:19332".into(),
-            "regtest" => "http://localhost:29332".into(),
-            _ => unreachable!(),
-        };
+        let (chain_id, rpc_url) = network_meta(canonical).ok_or_else(|| {
+            VmError::ContractError(format!(
+                "internal manifest error: unknown canonical network '{}'",
+                canonical
+            ))
+        })?;
 
         Ok(Self {
             network: canonical.to_string(),
             contracts: BTreeMap::new(),
             version: 1,
             chain_id,
-            rpc_url,
+            rpc_url: rpc_url.to_string(),
             migration_version: 0,
         })
     }
@@ -245,12 +246,12 @@ impl DeploymentManifest {
         //     network. A mismatched chain_id would let a file claim
         //     to be on one network while using another network's
         //     chain_id.
-        let expected_chain_id = match canonical {
-            "mainnet" => 0xDA0C_0001,
-            "testnet" => 0xDA0C_0002,
-            "regtest" => 0xDA0C_0003,
-            _ => unreachable!("canonical_network returned unknown value"),
-        };
+        let (expected_chain_id, _expected_rpc_url) = network_meta(canonical).ok_or_else(|| {
+            format!(
+                "internal manifest error: unknown canonical network '{}'",
+                canonical
+            )
+        })?;
         if self.chain_id != expected_chain_id {
             return Err(format!(
                 "manifest chain_id mismatch: network '{}' expects chain_id \

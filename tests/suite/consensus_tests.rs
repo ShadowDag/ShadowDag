@@ -32,6 +32,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee: 0,
             timestamp: now_ts(),
@@ -100,6 +102,34 @@ mod tests {
             result.is_ok(),
             "Valid child block must be accepted: {:?}",
             result
+        );
+    }
+
+    // ── Regression (B1-C01 / B1-H01): a growing chain must never be rejected as
+    //    a false cycle. The old add path ran an unbounded ancestor walk per parent
+    //    and treated exceeding its 50k node limit as "cycle → reject", which halted
+    //    the DAG on any mature chain. A new block referencing only pre-existing
+    //    parents is reachable from no block and cannot create a cycle.
+    #[test]
+    fn deep_chain_keeps_accepting_new_blocks() {
+        let dag = tmp_dag("deep_chain_no_false_cycle");
+        let genesis = genesis_block();
+        dag.add_block_validated(&genesis, true).unwrap();
+
+        let mut parent = genesis.header.hash.clone();
+        for h in 1..=1000u64 {
+            let hash = format!("blk_{:064x}", h);
+            let blk = make_block(&hash, vec![parent.clone()], h);
+            dag.add_block_validated(&blk, true)
+                .unwrap_or_else(|e| panic!("block at height {} rejected: {:?}", h, e));
+            parent = hash;
+        }
+
+        assert!(dag.block_exists(&parent));
+        assert_eq!(
+            dag.get_tips(),
+            vec![parent],
+            "a deep linear chain must have exactly one tip (its head)"
         );
     }
 

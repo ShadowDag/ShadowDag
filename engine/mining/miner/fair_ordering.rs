@@ -46,8 +46,10 @@ impl FairOrdering {
         let mut ordered: Vec<OrderedTx> = txs
             .iter()
             .map(|tx| {
-                let age_secs = current_time.saturating_sub(tx.timestamp);
-                let age_bonus = (age_secs * AGE_BONUS_PER_SEC).min(MAX_AGE_BONUS);
+                // current_time and tx.timestamp are MILLISECONDS; convert the
+                // age to seconds for the per-second bonus.
+                let age_ms = current_time.saturating_sub(tx.timestamp);
+                let age_bonus = ((age_ms / 1_000) * AGE_BONUS_PER_SEC).min(MAX_AGE_BONUS);
                 let effective_fee = tx.fee.saturating_add(age_bonus);
 
                 // Deterministic order key: H(effective_fee || tx_hash)
@@ -133,6 +135,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee,
             timestamp,
@@ -158,12 +162,13 @@ mod tests {
 
     #[test]
     fn age_bonus_helps_old_txs() {
+        // Timestamps are MILLISECONDS. now = 1_000_000 ms (1000 s).
         let txs = vec![
-            make_tx("new_high", 100, 1000), // New, high fee
-            make_tx("old_low", 50, 0),      // Old (1000s), low fee + age bonus
+            make_tx("new_high", 100, 1_000_000), // New (age 0), high fee
+            make_tx("old_low", 50, 0),           // Old (1000 s), low fee + age bonus
         ];
-        let ordered = FairOrdering::order_for_block(&txs, 1000);
-        // old_low gets +1000 age bonus → effective_fee = 1050 > 100
+        let ordered = FairOrdering::order_for_block(&txs, 1_000_000);
+        // old_low: age 1000 s → +1000 bonus → effective 1050 > 100
         assert_eq!(ordered[0].tx_hash, "old_low");
     }
 

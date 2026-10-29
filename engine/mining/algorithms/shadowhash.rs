@@ -3,17 +3,23 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// ShadowHash — Custom ASIC-resistant proof-of-work algorithm.
+// ShadowHash — LEGACY (pre-fork) proof-of-work algorithm.
 //
-// Design:
-//   Round 1: SHA-256 on serialized header        (compute-bound)
-//   Round 2: Blake3 with memory-hard expansion    (memory-bound)
-//   Round 3: SHA3-256 on the combined result      (ASIC-breaking)
-//   Round 4: Anti-ASIC mixing with nonce rotation (dynamic)
+// Rounds: SHA-256 header -> BLAKE3 scratchpad mix -> SHA3-256 -> anti-ASIC mix.
 //
-// The multi-algorithm pipeline forces specialized hardware to implement
-// all three hash families, making ASIC development uneconomical.
-// GPU miners can efficiently pipeline the stages.
+// HONEST SECURITY NOTE (internal crypto pre-audit F-2, 2026-07-15): this
+// algorithm's "memory-hardness / ASIC-resistance" does NOT hold. The 256 KB
+// scratchpad is filled by independent SHA256(round1 || i) chunks and the mix
+// loop's addressing (idx, rot_idx) depends only on the header pre-hash and
+// constants — no scratchpad VALUE ever selects an address — so there is no
+// data-dependent memory-latency chain. An optimizer computes only the few
+// touched chunks and streams the final hash, reducing the whole thing to
+// SHA256 work, which mature SHA256 ASICs crush. It is retained ONLY to
+// validate pre-fork blocks. The chain's real memory-hard PoW is UmbraHash
+// (engine/mining/algorithms/umbrahash.rs, Ethash-DAG + mini-ProgPoW); once
+// UmbraHash is activated (UMBRA_ACTIVATION_HEIGHT), consensus must reject
+// this legacy algorithm so it can never be a cheaper co-valid path at the
+// same difficulty target.
 // ═══════════════════════════════════════════════════════════════════════════
 
 use sha2::{Digest as Sha2Digest, Sha256};
@@ -21,15 +27,13 @@ use sha3::Sha3_256;
 
 use crate::domain::block::block::Block;
 
-/// ShadowHash scratchpad size in bytes (256 KB — exceeds GPU L2 cache,
-/// forces memory bandwidth dependency for long-term ASIC resistance).
-/// 256KB ensures ASICs cannot gain >2x advantage over GPUs even after
-/// 10 years of chip advancement (L1 caches grow to ~512KB by 2036).
+/// ShadowHash scratchpad size in bytes (256 KB). NOTE: this provides no real
+/// memory-latency hardness — the access pattern is not value-dependent (see the
+/// F-2 note in the file header); the scratchpad is streamable/regenerable.
 pub const SCRATCHPAD_SIZE: usize = 262144;
 
-/// Number of mixing rounds for ASIC resistance.
-/// 16 rounds with 256KB scratchpad ensures data-dependent memory access
-/// patterns that defeat ASIC pipelining for at least 10 years.
+/// Number of mixing rounds. 16 rounds over a fixed (non-value-dependent) access
+/// pattern do not defeat ASIC pipelining; see the F-2 note in the file header.
 pub const MIX_ROUNDS: usize = 16;
 
 /// Hash a full block
@@ -42,6 +46,7 @@ pub fn shadow_hash(block: &Block) -> String {
 /// Only valid for genesis blocks and tests. For mining/validation,
 /// use shadow_hash_raw_full() with explicit extra_nonce.
 #[deprecated(note = "Use shadow_hash_raw_full() with explicit extra_nonce")]
+#[allow(clippy::too_many_arguments)]
 pub fn shadow_hash_raw(
     version: u32,
     height: u64,
@@ -50,6 +55,7 @@ pub fn shadow_hash_raw(
     difficulty: u64,
     merkle_root: &str,
     parents: &[String],
+    prev_state_commitment: Option<&str>,
 ) -> String {
     shadow_hash_raw_full(
         version,
@@ -60,6 +66,7 @@ pub fn shadow_hash_raw(
         difficulty,
         merkle_root,
         parents,
+        prev_state_commitment,
     )
 }
 
@@ -75,6 +82,7 @@ pub fn shadow_hash_raw_full(
     difficulty: u64,
     merkle_root: &str,
     parents: &[String],
+    prev_state_commitment: Option<&str>,
 ) -> String {
     let mut bytes = serialize_header_raw(
         version,
@@ -84,6 +92,7 @@ pub fn shadow_hash_raw_full(
         difficulty,
         merkle_root,
         parents,
+        prev_state_commitment,
     );
     bytes.extend_from_slice(&extra_nonce.to_le_bytes());
     shadow_hash_bytes(&bytes)
@@ -148,6 +157,13 @@ fn shadow_hash_bytes(data: &[u8]) -> String {
     hex::encode(round3)
 }
 
+/// Hash arbitrary bytes with the ShadowHash pipeline. This is the exact
+/// transform a GPU kernel reproduces; exposing it lets the miner/tests verify a
+/// GPU-found nonce against the canonical CPU hash.
+pub fn shadow_hash_of_bytes(data: &[u8]) -> String {
+    shadow_hash_bytes(data)
+}
+
 /// Check if a hash meets the target difficulty.
 /// Unified: delegates to the canonical 256-bit target comparison.
 pub fn meets_difficulty(hash: &str, difficulty: u64) -> bool {
@@ -160,6 +176,59 @@ pub fn difficulty_to_target(difficulty: u64) -> String {
     crate::engine::mining::pow::pow_validator::PowValidator::difficulty_to_target(difficulty)
 }
 
+/// Canonical encoding of an optional root (hex string) for the M5 deferred state
+/// commitment: `0x00` for None, else `0x01 || u32-le len || utf8 bytes`.
+/// Distinguishes None from Some("") so the commitment is unambiguous.
+fn enc_opt_root(buf: &mut Vec<u8>, root: Option<&str>) {
+    match root {
+        None => buf.push(0x00),
+        Some(s) => {
+            buf.push(0x01);
+            let b = s.as_bytes();
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
+    }
+}
+
+/// M5 DEFERRED PREV-STATE COMMITMENT (encoding primitive): SHA3-256 over the
+/// selected parent's identity plus three OPTIONAL root slots, domain-separated and
+/// versioned. A block binds the resulting value in its PoW preimage, and the
+/// validator re-derives it, so a forged value fails both the deferred verify and
+/// PoW.
+///
+/// WHAT CALLERS ACTUALLY PASS TODAY: every production caller passes `None` for all
+/// three root slots (see `expected_prev_state_commitment`), so the committed value
+/// currently binds ONLY the selected-parent identity. The root parameters exist so
+/// a future upgrade can bind real, deterministic roots WITHOUT changing the domain
+/// tag — they are reserved, not in use. Do not describe this as committing to the
+/// parent's post-execution state until a caller actually supplies those roots.
+pub fn compute_prev_state_commitment(
+    selected_parent: &str,
+    parent_utxo_commitment: Option<&str>,
+    parent_state_root: Option<&str>,
+    parent_receipt_root: Option<&str>,
+) -> String {
+    let mut buf: Vec<u8> = Vec::with_capacity(160);
+    buf.extend_from_slice(b"ShadowDAG_PrevState_v1");
+    let sp = selected_parent.as_bytes();
+    buf.extend_from_slice(&(sp.len() as u32).to_le_bytes());
+    buf.extend_from_slice(sp);
+    enc_opt_root(&mut buf, parent_utxo_commitment);
+    enc_opt_root(&mut buf, parent_state_root);
+    enc_opt_root(&mut buf, parent_receipt_root);
+    let mut h = Sha3_256::new();
+    h.update(&buf);
+    hex::encode(h.finalize())
+}
+
+/// The M5 deferred state commitment for GENESIS: no parent, empty initial state
+/// (selected_parent = "" and all parent roots None). A fixed constant every node
+/// agrees on.
+pub fn genesis_prev_state_commitment() -> String {
+    compute_prev_state_commitment("", None, None, None)
+}
+
 /// Serialize block header to bytes (uses same path as shadow_hash_raw_full)
 fn serialize_header(block: &Block) -> Vec<u8> {
     let mut buf = serialize_header_raw(
@@ -170,12 +239,24 @@ fn serialize_header(block: &Block) -> Vec<u8> {
         block.header.difficulty,
         &block.header.merkle_root,
         &block.header.parents,
+        block.header.prev_state_commitment.as_deref(),
     );
     buf.extend_from_slice(&block.header.extra_nonce.to_le_bytes());
     buf
 }
 
-/// Serialize raw header fields to bytes (deterministic)
+/// Serialize raw header fields to bytes (deterministic). The single core
+/// preimage serializer: BOTH PoW preimages (ShadowHash via `shadow_hash_raw_full`
+/// and UmbraHash via `serialize_header_template`) build on it, so every field
+/// bound here is bound identically for both algorithms and for miner + validator
+/// + sync + light (the "one serializer, literally" requirement).
+///
+/// M5: the domain tag is bumped v1 -> v2 (same 18-byte length, so
+/// `HEADER_NONCE_OFFSET` is unchanged) and the deferred `prev_state_commitment`
+/// is appended AFTER the parents (never between the nonce and the domain, so the
+/// GPU nonce patch offset stays valid). `enc_opt_root` makes `None` vs `Some("")`
+/// unambiguous.
+#[allow(clippy::too_many_arguments)]
 fn serialize_header_raw(
     version: u32,
     height: u64,
@@ -184,11 +265,12 @@ fn serialize_header_raw(
     difficulty: u64,
     merkle_root: &str,
     parents: &[String],
+    prev_state_commitment: Option<&str>,
 ) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
 
-    // Domain separation
-    buf.extend_from_slice(b"ShadowDAG_Block_v1");
+    // Domain separation (v2: M5 deferred state commitment appended below).
+    buf.extend_from_slice(b"ShadowDAG_Block_v2");
 
     buf.extend_from_slice(&version.to_le_bytes());
     buf.extend_from_slice(&height.to_le_bytes());
@@ -210,6 +292,44 @@ fn serialize_header_raw(
         buf.extend_from_slice(&len);
         buf.extend_from_slice(p_bytes);
     }
+
+    // M5 deferred state commitment (appended last; canonical Option encoding).
+    enc_opt_root(&mut buf, prev_state_commitment);
+    buf
+}
+
+/// Byte offset of the 8-byte little-endian `nonce` field inside the serialized
+/// header, i.e. after the 18-byte domain tag + version(4) + height(8) +
+/// timestamp(8). A GPU miner patches these 8 bytes per work-item, so this MUST
+/// stay in sync with `serialize_header_raw`.
+pub const HEADER_NONCE_OFFSET: usize = 18 + 4 + 8 + 8;
+
+/// Serialize the exact bytes `shadow_hash_raw_full` hashes, with the `nonce`
+/// field left as zero. A GPU miner hashes this template while overwriting the 8
+/// bytes at `HEADER_NONCE_OFFSET` with each candidate nonce — producing the
+/// identical input the CPU path would for that nonce.
+#[allow(clippy::too_many_arguments)]
+pub fn serialize_header_template(
+    version: u32,
+    height: u64,
+    timestamp: u64,
+    extra_nonce: u64,
+    difficulty: u64,
+    merkle_root: &str,
+    parents: &[String],
+    prev_state_commitment: Option<&str>,
+) -> Vec<u8> {
+    let mut buf = serialize_header_raw(
+        version,
+        height,
+        timestamp,
+        0, // nonce placeholder — the GPU overwrites HEADER_NONCE_OFFSET..+8
+        difficulty,
+        merkle_root,
+        parents,
+        prev_state_commitment,
+    );
+    buf.extend_from_slice(&extra_nonce.to_le_bytes());
     buf
 }
 
@@ -226,6 +346,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prev_state_commitment_is_deterministic_and_sensitive() {
+        // M5 KAT: the deferred commitment is a 64-hex SHA3-256, deterministic, and
+        // changes if ANY input byte changes (parent hash or any parent root).
+        let uc = "aa".repeat(32);
+        let sr = "bb".repeat(32);
+        let rr = "cc".repeat(32);
+        let base = compute_prev_state_commitment("parentA", Some(&uc), Some(&sr), None);
+        assert_eq!(base.len(), 64);
+        assert!(base.chars().all(|c| c.is_ascii_hexdigit()));
+        // Deterministic.
+        assert_eq!(base, compute_prev_state_commitment("parentA", Some(&uc), Some(&sr), None));
+        // Changing the selected parent -> different commitment.
+        assert_ne!(base, compute_prev_state_commitment("parentB", Some(&uc), Some(&sr), None));
+        // Changing utxo_commitment / state_root / adding receipt_root -> different.
+        let uc2 = "ac".repeat(32);
+        assert_ne!(base, compute_prev_state_commitment("parentA", Some(&uc2), Some(&sr), None));
+        let sr2 = "bc".repeat(32);
+        assert_ne!(base, compute_prev_state_commitment("parentA", Some(&uc), Some(&sr2), None));
+        assert_ne!(base, compute_prev_state_commitment("parentA", Some(&uc), Some(&sr), Some(&rr)));
+        // Canonical encoding: None is distinct from Some("").
+        assert_ne!(
+            compute_prev_state_commitment("p", None, None, None),
+            compute_prev_state_commitment("p", Some(""), None, None)
+        );
+        // Field boundaries are unambiguous: (Some,None) != (None,Some) shuffle.
+        assert_ne!(
+            compute_prev_state_commitment("p", Some(&uc), None, None),
+            compute_prev_state_commitment("p", None, Some(&uc), None)
+        );
+        // Genesis commitment = empty parent + all-None, stable.
+        assert_eq!(genesis_prev_state_commitment(), compute_prev_state_commitment("", None, None, None));
+        assert_eq!(genesis_prev_state_commitment().len(), 64);
+    }
+
+    #[test]
     fn hash_str_is_64_chars() {
         let h = shadow_hash_str("test");
         assert_eq!(h.len(), 64);
@@ -234,15 +389,15 @@ mod tests {
 
     #[test]
     fn hash_raw_is_deterministic() {
-        let h1 = shadow_hash_raw_full(1, 0, 1735689600, 42, 0, 4, "merkle", &[]);
-        let h2 = shadow_hash_raw_full(1, 0, 1735689600, 42, 0, 4, "merkle", &[]);
+        let h1 = shadow_hash_raw_full(1, 0, 1735689600, 42, 0, 4, "merkle", &[], None);
+        let h2 = shadow_hash_raw_full(1, 0, 1735689600, 42, 0, 4, "merkle", &[], None);
         assert_eq!(h1, h2);
     }
 
     #[test]
     fn different_nonce_different_hash() {
-        let h1 = shadow_hash_raw_full(1, 0, 1735689600, 1, 0, 4, "merkle", &[]);
-        let h2 = shadow_hash_raw_full(1, 0, 1735689600, 2, 0, 4, "merkle", &[]);
+        let h1 = shadow_hash_raw_full(1, 0, 1735689600, 1, 0, 4, "merkle", &[], None);
+        let h2 = shadow_hash_raw_full(1, 0, 1735689600, 2, 0, 4, "merkle", &[], None);
         assert_ne!(h1, h2);
     }
 
@@ -268,15 +423,62 @@ mod tests {
     }
 
     #[test]
+    fn gpu_template_plus_nonce_matches_raw_full() {
+        // The GPU miner hashes serialize_header_template(...) after overwriting 8
+        // bytes at HEADER_NONCE_OFFSET with the candidate nonce. That MUST equal
+        // the canonical shadow_hash_raw_full for the same nonce, or GPU-mined
+        // blocks would be rejected by consensus.
+        let parents = vec!["a".repeat(64), "f".repeat(64)];
+        let mr = "deadbeef".repeat(8);
+        for &nonce in &[0u64, 1, 42, 9_999_999, u64::MAX] {
+            let mut tmpl = serialize_header_template(2, 123, 1_735_689_600_000, 7, 4096, &mr, &parents, None);
+            tmpl[HEADER_NONCE_OFFSET..HEADER_NONCE_OFFSET + 8]
+                .copy_from_slice(&nonce.to_le_bytes());
+            let via_template = shadow_hash_of_bytes(&tmpl);
+            let via_raw = shadow_hash_raw_full(2, 123, 1_735_689_600_000, nonce, 7, 4096, &mr, &parents, None);
+            assert_eq!(via_template, via_raw, "template+nonce must equal raw_full (nonce={})", nonce);
+        }
+    }
+
+    #[test]
     fn shadow_hash_includes_memory_hard_mixing() {
         // Verify that different data produces very different hashes
-        let h1 = shadow_hash_raw_full(1, 0, 0, 0, 0, 1, "a", &[]);
-        let h2 = shadow_hash_raw_full(1, 0, 0, 0, 0, 1, "b", &[]);
+        let h1 = shadow_hash_raw_full(1, 0, 0, 0, 0, 1, "a", &[], None);
+        let h2 = shadow_hash_raw_full(1, 0, 0, 0, 0, 1, "b", &[], None);
         assert_ne!(h1, h2);
 
         // And they look random (no obvious patterns)
         let chars: Vec<char> = h1.chars().collect();
         let unique: std::collections::HashSet<&char> = chars.iter().collect();
         assert!(unique.len() > 5, "Hash should use diverse hex chars");
+    }
+
+    #[test]
+    fn prev_state_commitment_binds_to_block_hash() {
+        // M5 stage-1b KAT: the deferred commitment is part of the PoW preimage, so
+        // a 1-byte change in prev_state_commitment (or None vs Some) yields a
+        // DIFFERENT ShadowHash AND a different UmbraHash header_hash — the block
+        // hash commits to whatever the commitment encodes. BOTH preimages must
+        // react. (What it encodes today is the selected-parent identity only, not
+        // the parent's post-state — see compute_prev_state_commitment.)
+        let parents = vec!["a".repeat(64)];
+        let mr = "cd".repeat(32);
+        let c1 = "11".repeat(32);
+        let c2 = "12".repeat(32); // exactly one byte different
+        // ShadowHash (shadow_hash_raw_full).
+        let s_none = shadow_hash_raw_full(2, 5, 1_700_000_000_000, 7, 0, 100, &mr, &parents, None);
+        let s_c1 = shadow_hash_raw_full(2, 5, 1_700_000_000_000, 7, 0, 100, &mr, &parents, Some(&c1));
+        let s_c2 = shadow_hash_raw_full(2, 5, 1_700_000_000_000, 7, 0, 100, &mr, &parents, Some(&c2));
+        assert_ne!(s_none, s_c1, "None vs Some commitment must change the ShadowHash");
+        assert_ne!(s_c1, s_c2, "a 1-byte commitment change must change the ShadowHash");
+        // UmbraHash preimage (header_hash) reacts too.
+        use crate::engine::mining::algorithms::umbrahash::header_hash;
+        let u_c1 = header_hash(3, 5, 1_700_000_000_000, 0, 100, &mr, &parents, Some(&c1));
+        let u_c2 = header_hash(3, 5, 1_700_000_000_000, 0, 100, &mr, &parents, Some(&c2));
+        let u_none = header_hash(3, 5, 1_700_000_000_000, 0, 100, &mr, &parents, None);
+        assert_ne!(u_c1, u_c2, "a 1-byte commitment change must change the UmbraHash preimage");
+        assert_ne!(u_none, u_c1, "None vs Some commitment must change the UmbraHash preimage");
+        // Domain bumped v1->v2 stays 18 bytes, so the GPU nonce patch offset holds.
+        assert_eq!(HEADER_NONCE_OFFSET, 18 + 4 + 8 + 8);
     }
 }
