@@ -6,7 +6,7 @@
 use crate::errors::NetworkError;
 use crate::service::network::dos_guard::BanCategory;
 use crate::{slog_error, slog_warn};
-use rocksdb::{IteratorMode, Options, WriteBatch, DB};
+use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -28,9 +28,30 @@ pub const MAX_STORED_PEERS: u64 = 16_384;
 /// Meta key holding the live count of `peer:` records. Deliberately outside the
 /// `peer:` prefix so it is never counted/iterated as a peer.
 const PEER_COUNT_KEY: &[u8] = b"meta:peer_count";
+/// Records examined while looking for one to evict, per admitted address once
+/// the store is at capacity.
+///
+/// Small on purpose. An eviction happens once per admitted address once the
+/// store is saturated, and at `MAX_ADDR_PER_MSG` = 1,000 addresses per Addr
+/// message, a sample of k is k thousand record reads per message — a scoring
+/// sample large enough to choose a GOOD victim would cost more than the full
+/// scan this same change removes. So the victim is the next record in a
+/// rotating walk: O(1) in the normal case, whole-store coverage over time, and
+/// impossible to starve or to target by gossiping low-sorting addresses.
+///
+/// Not one, though: the budget has to absorb a run of whitelisted records at
+/// the cursor without failing an insert that thousands of evictable records
+/// could have satisfied.
+const EVICT_SCAN_LIMIT: usize = 8;
 
 const PFX_BAN: &str = "ban:";
 const PFX_PENALTY: &str = "penalty:";
+/// Legacy parallel address table. NOTHING READS IT any more: the advertise
+/// and discovery paths were moved onto `peer:`, which is the table the live
+/// Addr ingest actually fills. Its writers (`store_addr`, `add_addr_batch`) are
+/// still called by `bootstrap_for_network` and by the never-constructed
+/// `PeerDiscovery`, so removing the prefix means gutting that module too —
+/// left for its own change rather than done halfway here.
 const PFX_ADDR: &str = "addr:";
 const PFX_PEER: &str = "peer:";
 const PFX_LAST_SEEN: &str = "seen:";
@@ -94,6 +115,12 @@ static PEER_MANAGER_INSTANCE: OnceLock<Arc<PeerManager>> = OnceLock::new();
 pub struct PeerManager {
     db: Arc<Mutex<DB>>,
     addr_cache: Arc<Mutex<Vec<String>>>,
+    /// Where the next capacity eviction resumes its walk of `peer:`.
+    ///
+    /// A fixed start would evict the same lexicographically-first records over
+    /// and over while the rest of the store sat untouched, and whoever gossips
+    /// low-sorting addresses gets to choose which records those are.
+    evict_cursor: Arc<Mutex<Vec<u8>>>,
     _network_path: String,
     network: crate::config::node::node_config::NetworkMode,
 }
@@ -169,6 +196,7 @@ impl PeerManager {
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
             addr_cache: Arc::new(Mutex::new(Vec::new())),
+            evict_cursor: Arc::new(Mutex::new(Vec::new())),
             _network_path: path.to_string(),
             network,
         })
@@ -244,6 +272,41 @@ impl PeerManager {
         self.db.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Iterate exactly one key prefix: seek to it, stop at its end.
+    ///
+    /// Every reader here used `IteratorMode::Start` with a `starts_with` filter,
+    /// which walks the WHOLE database and discards what does not match — while
+    /// holding the process-global DB mutex. `addr:` sorts first of the ten
+    /// prefixes, so the one reader that had a `take` limit never reached it
+    /// (only the configured seeds are ever written there) and scanned
+    /// everything, once per inbound TCP connection.
+    fn prefix_iter<'a>(
+        db: &'a DB,
+        prefix: &'a [u8],
+    ) -> impl Iterator<Item = (Box<[u8]>, Box<[u8]>)> + 'a {
+        db.iterator(IteratorMode::From(prefix, Direction::Forward))
+            .filter_map(|r| r.ok())
+            .take_while(move |(k, _)| k.starts_with(prefix))
+    }
+
+    /// Ban check against an ALREADY-LOCKED db, read-only.
+    ///
+    /// `is_banned` also deletes an expired record, which cannot be done from
+    /// inside a read loop over the same database.
+    fn is_banned_inner(db: &DB, addr: &str) -> bool {
+        match db.get(format!("{}{}", PFX_BAN, addr).as_bytes()) {
+            Ok(Some(data)) if data.len() == 8 => {
+                let until = <[u8; 8]>::try_from(&data[..8])
+                    .map(u64::from_le_bytes)
+                    .unwrap_or(0);
+                unix_now() < until
+            }
+            // Corrupted record: fail CLOSED, exactly as `is_banned` does.
+            Ok(Some(_)) => true,
+            _ => false,
+        }
+    }
+
     pub fn add_peer(&self, addr: &str) -> Result<(), NetworkError> {
         let port = addr
             .rsplit(':')
@@ -263,12 +326,7 @@ impl PeerManager {
             }
         }
         // Lazy init: count existing peer records once, then persist the count.
-        let prefix = PFX_PEER.as_bytes();
-        let n = db
-            .iterator(IteratorMode::Start)
-            .filter_map(|r| r.ok())
-            .filter(|(k, _)| k.starts_with(prefix))
-            .count() as u64;
+        let n = Self::prefix_iter(db, PFX_PEER.as_bytes()).count() as u64;
         let _ = db.put(PEER_COUNT_KEY, n.to_le_bytes());
         n
     }
@@ -312,15 +370,34 @@ impl PeerManager {
 
         // Anti-DoS: bound the total number of persisted peer records. Only NEW
         // peers grow the store, so the cap is checked for those only.
+        //
+        // The cap used to be a REFUSAL, and nothing in the process ever removes
+        // a `peer:` record — `remove_peer` has no production caller, nothing
+        // ages a record out, and the store is RocksDB-backed. So the first
+        // peer to claim all MAX_STORED_PEERS slots froze the store for the life
+        // of the data directory: every later address was refused, including the
+        // configured seeds, since `bootstrap_for_network` admits them through
+        // this same function. At MAX_ADDR_PER_MSG = 1,000 that cost one peer
+        // about 17 messages.
+        let whitelisted = crate::service::network::dos_guard::is_whitelisted(ip);
         let stored = Self::stored_peer_count_inner(&db);
-        if !already_exists && stored >= MAX_STORED_PEERS {
-            return Err(NetworkError::ConnectionFailed(format!(
-                "peer store at capacity ({} records)",
-                MAX_STORED_PEERS
-            )));
+        let mut batch = WriteBatch::default();
+        let mut evicted = false;
+        if !already_exists && stored >= MAX_STORED_PEERS && !whitelisted {
+            match Self::evict_candidate_inner(&db, &self.evict_cursor) {
+                Some(victim) => {
+                    Self::stage_peer_delete(&db, &mut batch, &victim);
+                    evicted = true;
+                }
+                None => {
+                    return Err(NetworkError::ConnectionFailed(format!(
+                        "peer store at capacity ({} records) and nothing evictable",
+                        MAX_STORED_PEERS
+                    )));
+                }
+            }
         }
 
-        let mut batch = WriteBatch::default();
         let key = format!("{}{}", PFX_PEER, record.addr);
         batch.put(key.as_bytes(), &data);
         batch.put(
@@ -333,11 +410,81 @@ impl PeerManager {
                 format!("{}{}", PFX_CONN_COUNT, ip).as_bytes(),
                 (count + 1).to_le_bytes(),
             );
-            batch.put(PEER_COUNT_KEY, stored.saturating_add(1).to_le_bytes());
+            // One in, one out leaves the count where it was. A whitelisted
+            // address admitted over the cap raises it: counted, never refused,
+            // and bounded by how many addresses are whitelisted.
+            if !evicted {
+                batch.put(PEER_COUNT_KEY, stored.saturating_add(1).to_le_bytes());
+            }
         }
         db.write(batch).map_err(|e| {
             NetworkError::Storage(crate::errors::StorageError::WriteFailed(e.to_string()))
         })
+    }
+
+    /// Stage the deletion of one peer record and its satellite keys.
+    ///
+    /// Shares the key list with `remove_peer` so an eviction cannot leave a
+    /// `seen:`/`height:`/`latency:` key orphaned behind a deleted `peer:`.
+    fn stage_peer_delete(db: &DB, batch: &mut WriteBatch, addr: &str) {
+        batch.delete(format!("{}{}", PFX_PEER, addr).as_bytes());
+        batch.delete(format!("{}{}", PFX_LAST_SEEN, addr).as_bytes());
+        batch.delete(format!("{}{}", PFX_HEIGHT, addr).as_bytes());
+        batch.delete(format!("{}{}", PFX_LATENCY, addr).as_bytes());
+        let vip = Self::extract_ip(addr);
+        let vcount = Self::conn_count_for_ip_inner(db, vip);
+        if vcount > 0 {
+            batch.put(
+                format!("{}{}", PFX_CONN_COUNT, vip).as_bytes(),
+                (vcount - 1).to_le_bytes(),
+            );
+        }
+    }
+
+    /// The next evictable `peer:` record, walking the prefix from a rotating
+    /// cursor so coverage is eventual and no key can be starved or targeted.
+    ///
+    /// Whitelisted addresses are skipped: the one thing an eviction must never
+    /// do is remove a configured seed, which is the lockout this whole change
+    /// exists to undo.
+    fn evict_candidate_inner(db: &DB, cursor: &Arc<Mutex<Vec<u8>>>) -> Option<String> {
+        let prefix = PFX_PEER.as_bytes();
+        let mut cur = cursor.lock().unwrap_or_else(|e| e.into_inner());
+        // Two passes at most: from the cursor to the end of the prefix, then
+        // from the start of the prefix back round to it.
+        for pass in 0..2 {
+            let from: Vec<u8> = if pass == 0 && cur.starts_with(prefix) {
+                cur.clone()
+            } else {
+                prefix.to_vec()
+            };
+            for (k, _) in db
+                .iterator(IteratorMode::From(&from, Direction::Forward))
+                .filter_map(|r| r.ok())
+                .take_while(|(k, _)| k.starts_with(prefix))
+                .take(EVICT_SCAN_LIMIT)
+            {
+                let Some(addr) = std::str::from_utf8(&k)
+                    .ok()
+                    .map(|s| s[PFX_PEER.len()..].to_string())
+                else {
+                    continue;
+                };
+                // Resume after this key next time, whether or not it is taken.
+                let mut next = k.to_vec();
+                next.push(0);
+                *cur = next;
+                if crate::service::network::dos_guard::is_whitelisted(Self::extract_ip(&addr)) {
+                    continue;
+                }
+                return Some(addr);
+            }
+            if pass == 0 {
+                // Walked off the end of the prefix: restart from the front.
+                *cur = prefix.to_vec();
+            }
+        }
+        None
     }
 
     pub fn remove_peer(&self, addr: &str) -> Result<(), NetworkError> {
@@ -456,10 +603,7 @@ impl PeerManager {
 
     pub fn get_peers(&self) -> Vec<String> {
         let db = self.lock_db();
-        let prefix = PFX_PEER.as_bytes();
-        db.iterator(IteratorMode::Start)
-            .filter_map(|r| r.ok())
-            .filter(|(k, _)| k.starts_with(prefix))
+        Self::prefix_iter(&db, PFX_PEER.as_bytes())
             .filter_map(|(k, _)| {
                 let s = std::str::from_utf8(&k).ok()?;
                 Some(s[PFX_PEER.len()..].to_string())
@@ -469,10 +613,7 @@ impl PeerManager {
 
     pub fn get_peer_records(&self) -> Vec<PeerRecord> {
         let db = self.lock_db();
-        let prefix = PFX_PEER.as_bytes();
-        db.iterator(IteratorMode::Start)
-            .filter_map(|r| r.ok())
-            .filter(|(k, _)| k.starts_with(prefix))
+        Self::prefix_iter(&db, PFX_PEER.as_bytes())
             .filter_map(|(_, v)| bincode::deserialize::<PeerRecord>(&v).ok())
             .collect()
     }
@@ -490,8 +631,13 @@ impl PeerManager {
         peers
     }
 
+    /// Number of persisted peer records.
+    ///
+    /// Reads the `meta:peer_count` key rather than walking and allocating a
+    /// String for every record to then throw them away: the two agree by
+    /// construction, which `peer_count_meta_tracks_add_and_remove` pins.
     pub fn count(&self) -> usize {
-        self.get_peers().len()
+        self.stored_peer_count() as usize
     }
 
     /// Live persisted-peer count from the `meta:peer_count` key (O(1) after lazy
@@ -660,10 +806,7 @@ impl PeerManager {
     pub fn decay_penalties(&self) {
         let db = self.lock_db();
         let prefix = PFX_PENALTY.as_bytes();
-        let entries: Vec<(Vec<u8>, u64, String)> = db
-            .iterator(IteratorMode::Start)
-            .filter_map(|r| r.ok())
-            .filter(|(k, _)| k.starts_with(prefix))
+        let entries: Vec<(Vec<u8>, u64, String)> = Self::prefix_iter(&db, prefix)
             .filter_map(|(k, v)| {
                 let score = v
                     .get(..8)
@@ -731,18 +874,27 @@ impl PeerManager {
         self.get_addr_list_limited(MAX_GETADDR_RESPONSE)
     }
 
+    /// Addresses to advertise in an Addr reply.
+    ///
+    /// Served from `peer:`, the table the live path actually fills. It used to
+    /// read `addr:`, which only `bootstrap_for_network` writes (the configured
+    /// seeds) because the Addr ingest calls `add_peer` and that writes `peer:`,
+    /// `seen:` and `conn:` and never `addr:`. So address gossip was ONE-WAY: we
+    /// took addresses in and advertised nothing but our own seeds, which meant
+    /// no peer could learn about any other peer through us and the topology
+    /// could not heal when a seed went down.
+    ///
+    /// Banned addresses are not advertised: handing peers an address we have
+    /// ourselves banned wastes their dial budget on something we know is bad.
     pub fn get_addr_list_limited(&self, max: usize) -> Vec<String> {
         let db = self.lock_db();
-        let prefix = PFX_ADDR.as_bytes();
-        let cap = max.min(MAX_ADDR_CACHE_SIZE);
-        let mut addrs: Vec<String> = db
-            .iterator(IteratorMode::Start)
-            .filter_map(|r| r.ok())
-            .filter(|(k, _)| k.starts_with(prefix))
+        let cap = max.min(MAX_GETADDR_RESPONSE);
+        let mut addrs: Vec<String> = Self::prefix_iter(&db, PFX_PEER.as_bytes())
             .filter_map(|(k, _)| {
                 let s = std::str::from_utf8(&k).ok()?;
-                Some(s[PFX_ADDR.len()..].to_string())
+                Some(s[PFX_PEER.len()..].to_string())
             })
+            .filter(|addr| !Self::is_banned_inner(&db, addr))
             .take(cap)
             .collect();
         addrs.sort();
@@ -818,10 +970,7 @@ impl PeerManager {
 
     pub fn best_peer_height(&self) -> u64 {
         let db = self.lock_db();
-        let prefix = PFX_HEIGHT.as_bytes();
-        db.iterator(IteratorMode::Start)
-            .filter_map(|r| r.ok())
-            .filter(|(k, _)| k.starts_with(prefix))
+        Self::prefix_iter(&db, PFX_HEIGHT.as_bytes())
             .filter_map(|(_, v)| {
                 v.get(..8)
                     .and_then(|s| s.try_into().ok())
@@ -999,6 +1148,181 @@ mod tests {
         let pm = PeerManager::open(&path).unwrap();
         pm.ban_peer("x:9333", 3600, "test");
         assert!(pm.get_ban_expiry("x:9333") > 0);
+    }
+
+    /// Present a full store without writing 16,384 records: the cap is read
+    /// from `meta:peer_count`, so seeding that key is what `add_peer_record`
+    /// actually consults.
+    fn declare_store_full(pm: &PeerManager) {
+        let db = pm.lock_db();
+        db.put(PEER_COUNT_KEY, MAX_STORED_PEERS.to_le_bytes()).unwrap();
+    }
+
+    #[test]
+    fn a_full_store_evicts_instead_of_freezing_forever() {
+        // The defect: the cap was a refusal, and nothing in the process ever
+        // removes a `peer:` record, so the first peer to claim every slot froze
+        // the store for the life of the data directory — every later address
+        // refused, the configured seeds included.
+        let path = tmp("evict_not_freeze");
+        let _ = fs::remove_dir_all(&path);
+        let pm = PeerManager::open(&path).unwrap();
+        for i in 1..=4 {
+            assert!(pm.add_peer(&format!("9.0.0.{}:9333", i)).is_ok());
+        }
+        declare_store_full(&pm);
+
+        // A new address is still admitted, and the store does not grow.
+        assert!(
+            pm.add_peer("9.9.9.9:9333").is_ok(),
+            "a full store must evict, not refuse for ever"
+        );
+        assert!(pm.peer_exists("9.9.9.9:9333"));
+        assert_eq!(
+            pm.stored_peer_count(),
+            MAX_STORED_PEERS,
+            "one in, one out: the count must not grow past the cap"
+        );
+        // Exactly one of the originals is gone.
+        let gone: Vec<u32> = (1..=4)
+            .filter(|i| !pm.peer_exists(&format!("9.0.0.{}:9333", i)))
+            .collect();
+        assert_eq!(gone.len(), 1, "exactly one record should have been evicted");
+
+        // And its satellite keys went with it. A per-IP count left behind
+        // ratchets upward on every evict-and-readd cycle until the per-IP cap
+        // refuses that address for good — the same shape as the inbound-slot
+        // lockout.
+        let db = pm.lock_db();
+        assert_eq!(
+            PeerManager::conn_count_for_ip_inner(&db, &format!("9.0.0.{}", gone[0])),
+            0,
+            "the evicted record's per-IP connection count must come back down"
+        );
+    }
+
+    #[test]
+    fn a_whitelisted_address_is_never_refused_and_never_evicted() {
+        // The seeds are the whole point: the old refusal locked them out of our
+        // own store, so eviction must never choose one and the cap must never
+        // refuse one.
+        let path = tmp("evict_whitelist");
+        let _ = fs::remove_dir_all(&path);
+        let pm = PeerManager::open(&path).unwrap();
+        crate::service::network::dos_guard::whitelist_peer("9.1.0.7");
+        assert!(pm.add_peer("9.1.0.7:9333").is_ok());
+        for i in 20..26 {
+            assert!(pm.add_peer(&format!("9.1.1.{}:9333", i)).is_ok());
+        }
+        declare_store_full(&pm);
+
+        // A stranger is admitted by evicting an ORDINARY record, repeatedly...
+        for i in 30..40 {
+            assert!(
+                pm.add_peer(&format!("9.2.0.{}:9333", i)).is_ok(),
+                "a full store must evict an ordinary record rather than refuse"
+            );
+        }
+        // ...and the whitelisted record is never the one that goes, however
+        // many times the rotating walk passes over it.
+        assert!(
+            pm.peer_exists("9.1.0.7:9333"),
+            "a whitelisted address must never be the eviction victim"
+        );
+
+        // And a whitelisted address is admitted over the cap even with nothing
+        // at all to evict: counted, never refused. A stranger in that same
+        // store IS refused — which is the honest fallback, and still strictly
+        // better than the old unconditional refusal.
+        let only = tmp("evict_whitelist_only");
+        let _ = fs::remove_dir_all(&only);
+        let pm2 = PeerManager::open(&only).unwrap();
+        crate::service::network::dos_guard::whitelist_peer("9.1.0.9");
+        declare_store_full(&pm2);
+        assert!(
+            pm2.add_peer("9.1.0.9:9333").is_ok(),
+            "a whitelisted address must be admitted over the cap"
+        );
+        assert!(
+            pm2.add_peer("9.1.0.250:9333").is_err(),
+            "with nothing evictable a stranger is refused — but only then"
+        );
+    }
+
+    #[test]
+    fn the_eviction_walk_rotates_over_the_whole_store() {
+        // A fixed start would evict the same lexicographically-first records
+        // for ever while the rest sat untouched — and whoever gossips
+        // low-sorting addresses would choose which ones those are.
+        let path = tmp("evict_rotates");
+        let _ = fs::remove_dir_all(&path);
+        let pm = PeerManager::open(&path).unwrap();
+        for i in 1..=5 {
+            assert!(pm.add_peer(&format!("9.3.0.{}:9333", i)).is_ok());
+        }
+        let db = pm.lock_db();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..5 {
+            let victim = PeerManager::evict_candidate_inner(&db, &pm.evict_cursor)
+                .expect("a store with records must offer a victim");
+            seen.insert(victim);
+        }
+        assert_eq!(seen.len(), 5, "five calls must name all five records once");
+        // And it wraps rather than returning None at the end.
+        assert!(PeerManager::evict_candidate_inner(&db, &pm.evict_cursor).is_some());
+    }
+
+    #[test]
+    fn the_addr_reply_advertises_the_peers_we_know() {
+        // Address gossip was ONE-WAY: the reply was served from `addr:`, which
+        // only bootstrap writes, while the ingest wrote `peer:`. So we took
+        // addresses in and advertised nothing but our own seeds, and no peer
+        // could learn about any other peer through us.
+        let path = tmp("addr_reply");
+        let _ = fs::remove_dir_all(&path);
+        let pm = PeerManager::open(&path).unwrap();
+        assert!(
+            pm.get_addr_list_limited(10).is_empty(),
+            "a fresh store has nothing to advertise"
+        );
+        assert!(pm.add_peer("9.4.0.1:9333").is_ok());
+        assert!(pm.add_peer("9.4.0.2:9333").is_ok());
+        let advertised = pm.get_addr_list_limited(10);
+        assert_eq!(
+            advertised,
+            vec!["9.4.0.1:9333".to_string(), "9.4.0.2:9333".to_string()],
+            "an ingested address must be advertisable"
+        );
+
+        // A banned address is not handed to peers: it would waste their dial
+        // budget on something we have already judged.
+        pm.ban_peer("9.4.0.1:9333", 3_600, "test");
+        assert_eq!(
+            pm.get_addr_list_limited(10),
+            vec!["9.4.0.2:9333".to_string()],
+            "a banned address must not be advertised"
+        );
+        // And the cap binds.
+        assert!(pm.get_addr_list_limited(1).len() <= 1);
+    }
+
+    #[test]
+    fn the_o1_count_agrees_with_walking_the_records() {
+        // `count()` now reads `meta:peer_count` instead of walking every record
+        // and allocating a String per key to then discard them. The two must
+        // not be able to drift apart silently.
+        let path = tmp("count_agrees");
+        let _ = fs::remove_dir_all(&path);
+        let pm = PeerManager::open(&path).unwrap();
+        assert_eq!(pm.count(), pm.get_peers().len());
+        for i in 1..=6 {
+            assert!(pm.add_peer(&format!("9.5.0.{}:9333", i)).is_ok());
+        }
+        assert_eq!(pm.count(), 6);
+        assert_eq!(pm.count(), pm.get_peers().len());
+        pm.remove_peer("9.5.0.3:9333").unwrap();
+        assert_eq!(pm.count(), 5);
+        assert_eq!(pm.count(), pm.get_peers().len());
     }
 
     #[test]
