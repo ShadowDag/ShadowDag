@@ -334,11 +334,228 @@ const PONG_TIMEOUT_SECS: u64 = 120;
 static OUTBOUND_MSGS: Lazy<Arc<PlMutex<(u64, Vec<(u64, P2PMessage)>)>>> =
     Lazy::new(|| Arc::new(PlMutex::new((0, Vec::with_capacity(256)))));
 
-/// Targeted outbound messages: (target_peer_id, message).
-/// Used by Dandelion++ stem phase to send to exactly one peer.
-#[allow(clippy::type_complexity)]
-static TARGETED_MSGS: Lazy<Arc<PlMutex<Vec<(String, P2PMessage)>>>> =
-    Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(64))));
+/// Estimated payload bytes of a message: the heap data, not the stack enum.
+///
+/// `size_of_val` measures only the discriminant and inline fields, missing the
+/// `Vec<u8>`/`String` contents that dominate a real message. Extracted so the
+/// DoS guard's accounting and the targeted queue's byte budget share ONE
+/// estimate — two implementations of the same notion drift, and a byte budget
+/// that disagrees with the rate limiter about what a message costs is worse
+/// than no budget.
+fn payload_size_estimate(msg: &P2PMessage) -> usize {
+    match msg {
+        P2PMessage::Block { data } => data.len(),
+        P2PMessage::Tx { data } => data.len(),
+        P2PMessage::ShadowTx { data } => data.len(),
+        P2PMessage::OnionTx { data } => data.len(),
+        P2PMessage::Addr { peers } => peers.iter().map(|s| s.len()).sum(),
+        P2PMessage::Headers { hashes } => hashes.iter().map(|s| s.len()).sum(),
+        P2PMessage::Inv { items } => items.iter().map(|i| i.kind.len() + i.hash.len()).sum(),
+        P2PMessage::GetData { items } => items.iter().map(|i| i.kind.len() + i.hash.len()).sum(),
+        P2PMessage::PuzzleSolution {
+            challenge, hash, ..
+        } => challenge.len() + hash.len() + 8,
+        P2PMessage::PuzzleChallenge { challenge } => challenge.len(),
+        P2PMessage::Version { user_agent, .. } => user_agent.len() + 32,
+        P2PMessage::Reject { reason } => reason.len(),
+        P2PMessage::GetHeaders { from_hash, .. } => from_hash.len() + 4,
+        P2PMessage::GetBlock { hash } => hash.len(),
+        // Small fixed-size messages (Ping, Pong, GetAddr, VerAck, GetMempool).
+        other => std::mem::size_of_val(other),
+    }
+}
+
+/// Entries one peer may hold in the targeted queue.
+///
+/// Sized by the burst it answers: a peer catching up can have up to
+/// `MAX_BLOCK_REQUESTS_PER_IP` block replies owed to it.
+const MAX_TARGETED_PER_PEER: usize = MAX_BLOCK_REQUESTS_PER_IP;
+/// Bytes one peer may hold. This is the send-side bound the process had NOWHERE:
+/// `check_bandwidth` counts inbound only, and `record_bytes_sent` feeds a
+/// counter whose only reader is a debug line at connection close. Four
+/// serve passes' worth at `MAX_BLOCK_SERVE_BYTES_PER_TICK`.
+const MAX_TARGETED_BYTES_PER_PEER: usize = 8 * 1024 * 1024;
+/// Entries and bytes across all peers.
+const MAX_TARGETED_ENTRIES: usize = 10_000;
+const MAX_TARGETED_BYTES: usize = 64 * 1024 * 1024;
+/// How long an undelivered targeted message is kept.
+///
+/// A peer flushes on every pass of its connection loop, so a message still
+/// queued after this has missed hundreds of them: its peer is gone, or wedged.
+/// The queue's two removers are a peer's own flush and its cleanup, and the
+/// daemon can enqueue for a peer AFTER its cleanup ran — so without an age
+/// bound such an entry is immortal, and enough of them refuse every future
+/// targeted message for the life of the process.
+const TARGETED_TTL_SECS: u64 = 60;
+
+const _: () = assert!(
+    MAX_TARGETED_BYTES_PER_PEER >= crate::service::network::dos_guard::MAX_BLOCK_BYTES,
+    "one maximum block must fit in a peer's send budget"
+);
+const _: () = assert!(
+    MAX_TARGETED_BYTES >= MAX_TARGETED_BYTES_PER_PEER,
+    "the global send budget must admit at least one peer's"
+);
+
+/// One peer's undelivered targeted messages, oldest first.
+struct PeerTargeted {
+    msgs: std::collections::VecDeque<(Instant, usize, P2PMessage)>,
+    bytes: usize,
+}
+
+/// Targeted outbound messages, keyed by target peer.
+///
+/// Used by the block and header serve paths and by the Dandelion++ stem phase
+/// to send to exactly one peer.
+///
+/// Keyed by peer rather than a flat list, which is what makes the rest cheap: a
+/// drain is one `remove` that MOVES that peer's messages out, where the flat
+/// version walked all 10,000 entries and deep-CLONED every match under the
+/// global lock — up to 2 MiB per block — although the entry was removed in the
+/// same pass. A per-peer cap also becomes O(1), so an overflow can evict the
+/// backlog of the peer that caused it instead of dropping the arriving message,
+/// which belonged to whichever peer was behaving.
+struct TargetedQueue {
+    by_peer: HashMap<String, PeerTargeted>,
+    entries: usize,
+    bytes: usize,
+}
+
+impl TargetedQueue {
+    fn new() -> Self {
+        Self {
+            by_peer: HashMap::new(),
+            entries: 0,
+            bytes: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries
+    }
+
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Drop one peer's oldest message. Returns false when it had none.
+    fn drop_oldest_for(&mut self, peer: &str) -> bool {
+        let Some(pt) = self.by_peer.get_mut(peer) else {
+            return false;
+        };
+        match pt.msgs.pop_front() {
+            Some((_, size, _)) => {
+                pt.bytes = pt.bytes.saturating_sub(size);
+                self.entries = self.entries.saturating_sub(1);
+                self.bytes = self.bytes.saturating_sub(size);
+                if pt.msgs.is_empty() {
+                    self.by_peer.remove(peer);
+                }
+                true
+            }
+            None => {
+                self.by_peer.remove(peer);
+                false
+            }
+        }
+    }
+
+    /// The peer holding the most bytes — the one to charge a global overflow to.
+    fn heaviest_peer(&self) -> Option<String> {
+        self.by_peer
+            .iter()
+            .max_by_key(|(_, pt)| pt.bytes)
+            .map(|(p, _)| p.clone())
+    }
+
+    /// Queue a message for `peer`, making room by evicting the backlog of
+    /// whoever is responsible for the overflow rather than refusing the arrival.
+    fn push(&mut self, peer: &str, msg: P2PMessage, front: bool) {
+        let size = payload_size_estimate(&msg);
+        // That peer's own quota first.
+        loop {
+            let pt = self.by_peer.get(peer);
+            let (n, b) = pt.map_or((0, 0), |pt| (pt.msgs.len(), pt.bytes));
+            if n == 0 || (n < MAX_TARGETED_PER_PEER && b + size <= MAX_TARGETED_BYTES_PER_PEER) {
+                break;
+            }
+            if !self.drop_oldest_for(peer) {
+                break;
+            }
+        }
+        // Then the global budget, charged to whoever holds the most.
+        while self.entries >= MAX_TARGETED_ENTRIES || self.bytes + size > MAX_TARGETED_BYTES {
+            let Some(victim) = self.heaviest_peer() else {
+                break;
+            };
+            if !self.drop_oldest_for(&victim) {
+                break;
+            }
+        }
+        let pt = self.by_peer.entry(peer.to_string()).or_insert(PeerTargeted {
+            msgs: std::collections::VecDeque::new(),
+            bytes: 0,
+        });
+        if front {
+            pt.msgs.push_front((Instant::now(), size, msg));
+        } else {
+            pt.msgs.push_back((Instant::now(), size, msg));
+        }
+        pt.bytes = pt.bytes.saturating_add(size);
+        self.entries = self.entries.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(size);
+    }
+
+    /// Take everything queued for one peer, oldest first. Moves; clones nothing.
+    fn take_for(&mut self, peer: &str) -> Vec<P2PMessage> {
+        match self.by_peer.remove(peer) {
+            Some(pt) => {
+                self.entries = self.entries.saturating_sub(pt.msgs.len());
+                self.bytes = self.bytes.saturating_sub(pt.bytes);
+                pt.msgs.into_iter().map(|(_, _, m)| m).collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    fn remove_peer(&mut self, peer: &str) {
+        let _ = self.take_for(peer);
+    }
+
+    /// Drop messages older than `ttl`. Returns how many went.
+    ///
+    /// The age bound is a parameter so a test can observe expiry without
+    /// waiting out `TARGETED_TTL_SECS`: a zero TTL expires everything, which is
+    /// the only way to see that the sweep really walks each peer's queue and
+    /// keeps the totals in step.
+    fn sweep_expired(&mut self, ttl: Duration) -> usize {
+        let mut dropped = 0usize;
+        let mut empty: Vec<String> = Vec::new();
+        for (peer, pt) in self.by_peer.iter_mut() {
+            while let Some((queued_at, size, _)) = pt.msgs.front() {
+                if queued_at.elapsed() < ttl {
+                    break;
+                }
+                let size = *size;
+                pt.msgs.pop_front();
+                pt.bytes = pt.bytes.saturating_sub(size);
+                self.entries = self.entries.saturating_sub(1);
+                self.bytes = self.bytes.saturating_sub(size);
+                dropped += 1;
+            }
+            if pt.msgs.is_empty() {
+                empty.push(peer.clone());
+            }
+        }
+        for peer in empty {
+            self.by_peer.remove(&peer);
+        }
+        dropped
+    }
+}
+
+static TARGETED_MSGS: Lazy<Arc<PlMutex<TargetedQueue>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(TargetedQueue::new())));
 
 /// Block-serve requests from peers: (requesting_peer_id, block_hash). Filled by
 /// the GetBlock/GetData handlers (which lack block_store access) and drained by
@@ -1018,8 +1235,7 @@ pub fn cleanup_peer_state(peer_id: &str) {
         }
     }
     {
-        let mut q = TARGETED_MSGS.lock();
-        q.retain(|(target, _)| target != peer_id);
+        TARGETED_MSGS.lock().remove_peer(peer_id);
     }
     {
         let mut q = PENDING_BLOCK_REQUESTS.lock();
@@ -1525,31 +1741,55 @@ fn current_outbound_seq() -> u64 {
     OUTBOUND_MSGS.lock().0
 }
 
-/// Push a message targeted at a specific peer (Dandelion++ stem phase).
-/// Thread-safe: can be called from any thread.
+/// Push a message targeted at a specific peer (block/header serve, and the
+/// Dandelion++ stem phase). Thread-safe: can be called from any thread.
+///
+/// Never refuses: an overflow evicts the oldest backlog of the peer
+/// responsible, because dropping the arriving message punished whichever peer
+/// was behaving.
 pub fn push_outbound_to_peer(peer_id: &str, msg: P2PMessage) {
-    let mut q = TARGETED_MSGS.lock();
-    if q.len() < 10_000 {
-        q.push((peer_id.to_string(), msg));
-    } else {
-        slog_warn!("p2p", "targeted_queue_full");
-    }
+    TARGETED_MSGS.lock().push(peer_id, msg, false);
+}
+
+/// Put an undelivered targeted message back at the FRONT of its peer's queue,
+/// so a retry keeps its place in order.
+///
+/// Goes through the same bounds as any other push: the old requeue wrote
+/// straight into the queue with no cap check at all, so the global cap was not
+/// a hard cap.
+fn requeue_targeted_front(peer_id: &str, msg: P2PMessage) {
+    TARGETED_MSGS.lock().push(peer_id, msg, true);
 }
 
 /// Drain targeted messages for a specific peer_id.
 /// Each peer connection thread calls this with its own ID.
 fn drain_targeted_for(peer_id: &str) -> Vec<P2PMessage> {
-    let mut q = TARGETED_MSGS.lock();
-    let mut mine = Vec::new();
-    q.retain(|(target, msg)| {
-        if target == peer_id {
-            mine.push(msg.clone());
-            false // remove from queue
-        } else {
-            true // keep for other peers
-        }
-    });
-    mine
+    TARGETED_MSGS.lock().take_for(peer_id)
+}
+
+/// Drop targeted messages nobody came to collect.
+///
+/// Called from the maintenance loop. The queue's only other removers are a
+/// peer's own flush and its `cleanup_peer_state`, and the daemon can enqueue
+/// for a peer AFTER its cleanup has run — the drain and the cleanup are
+/// separate critical sections — so without this an entry for a departed peer
+/// is immortal and enough of them refuse every future targeted message for the
+/// life of the process.
+pub fn sweep_targeted_expired() {
+    let (dropped, left, bytes) = {
+        let mut q = TARGETED_MSGS.lock();
+        (
+            q.sweep_expired(Duration::from_secs(TARGETED_TTL_SECS)),
+            q.len(),
+            q.bytes(),
+        )
+    };
+    if dropped > 0 {
+        slog_warn!("p2p", "targeted_expired_dropped",
+            dropped => dropped,
+            entries_left => left,
+            bytes_left => bytes);
+    }
 }
 
 /// The lowest outbound cursor any live connection holds, or None when none do.
@@ -2747,10 +2987,7 @@ impl P2P {
                     slog_error!("p2p", "write_error_targeted", addr => peer_str, error => &we.to_string());
                     // Re-queue the undelivered targeted message so it is not
                     // permanently lost. The next flush cycle will retry delivery.
-                    {
-                        let mut q = TARGETED_MSGS.lock();
-                        q.push((peer_str.to_string(), t_msg));
-                    }
+                    requeue_targeted_front(peer_str, t_msg);
                     return false;
                 }
             }
@@ -2953,30 +3190,7 @@ impl P2P {
             return Ok(());
         }
         let dos_type = Self::cmd_to_dos_type(cmd);
-        // Estimate actual payload size (heap data) rather than stack enum size.
-        // size_of_val only measures the enum discriminant + inline fields, missing
-        // heap-allocated Vec<u8>/String contents which dominate real message size.
-        let msg_size = match &msg {
-            P2PMessage::Block { data } => data.len(),
-            P2PMessage::Tx { data } => data.len(),
-            P2PMessage::ShadowTx { data } => data.len(),
-            P2PMessage::OnionTx { data } => data.len(),
-            P2PMessage::Addr { peers } => peers.iter().map(|s| s.len()).sum(),
-            P2PMessage::Headers { hashes } => hashes.iter().map(|s| s.len()).sum(),
-            P2PMessage::Inv { items } => items.iter().map(|i| i.kind.len() + i.hash.len()).sum(),
-            P2PMessage::GetData { items } => {
-                items.iter().map(|i| i.kind.len() + i.hash.len()).sum()
-            }
-            P2PMessage::PuzzleSolution {
-                challenge, hash, ..
-            } => challenge.len() + hash.len() + 8,
-            P2PMessage::PuzzleChallenge { challenge } => challenge.len(),
-            P2PMessage::Version { user_agent, .. } => user_agent.len() + 32,
-            P2PMessage::Reject { reason } => reason.len(),
-            P2PMessage::GetHeaders { from_hash, .. } => from_hash.len() + 4,
-            P2PMessage::GetBlock { hash } => hash.len(),
-            _ => std::mem::size_of_val(&msg), // small fixed-size messages (Ping, Pong, etc.)
-        };
+        let msg_size = payload_size_estimate(&msg);
         match DOS_GUARD.check(peer, &dos_type, msg_size) {
             DosVerdict::Allow => {}
             DosVerdict::BanActive => {
@@ -3793,6 +4007,7 @@ impl P2P {
             maintain_dos_guard(&DOS_GUARD);
             peers.decay_penalties();
             peers.evict_addr_cache_if_full();
+            sweep_targeted_expired();
         });
     }
 
@@ -4310,6 +4525,180 @@ mod tests {
         assert_eq!(dial_window(10, 3, 0, |_| true), (Vec::new(), 3));
         let (picked, _) = dial_window(4, 99, 2, |_| true);
         assert_eq!(picked, vec![3, 0], "a cursor past the end wraps, not panics");
+    }
+
+    // ── the targeted queue: bounded per peer, and nothing outlives its peer ──
+
+    fn targeted_block(bytes: usize) -> P2PMessage {
+        P2PMessage::Block {
+            data: vec![0u8; bytes],
+        }
+    }
+
+    fn targeted_ping(nonce: u64) -> P2PMessage {
+        P2PMessage::Ping { nonce }
+    }
+
+    #[test]
+    fn a_targeted_drain_moves_one_peers_messages_and_leaves_the_rest_alone() {
+        // The drain used to walk the whole 10,000-entry queue and deep-CLONE
+        // every match under the global lock — up to 2 MiB per block — although
+        // the entry was removed in the same pass. Keyed by peer it is one
+        // remove that moves.
+        let mut q = TargetedQueue::new();
+        q.push("a:1", targeted_ping(1), false);
+        q.push("b:1", targeted_ping(2), false);
+        q.push("a:1", targeted_ping(3), false);
+        assert_eq!(q.len(), 3);
+
+        let mine = q.take_for("a:1");
+        assert_eq!(mine.len(), 2, "both of a's messages, oldest first");
+        assert!(matches!(mine[0], P2PMessage::Ping { nonce: 1 }));
+        assert!(matches!(mine[1], P2PMessage::Ping { nonce: 3 }));
+        assert_eq!(q.len(), 1, "b's message is untouched");
+        assert_eq!(q.take_for("b:1").len(), 1);
+        assert_eq!(q.len(), 0);
+        assert_eq!(q.bytes(), 0, "the totals must come back to zero");
+    }
+
+    #[test]
+    fn one_peer_cannot_fill_the_targeted_queue_for_everyone() {
+        // No per-peer cap existed, and an overflow dropped the ARRIVING
+        // message — which belongs to whichever peer is behaving, not to the one
+        // that filled the queue.
+        let mut q = TargetedQueue::new();
+        for i in 0..(MAX_TARGETED_PER_PEER + 10) {
+            q.push("flooder:1", targeted_ping(i as u64), false);
+        }
+        assert_eq!(
+            q.len(),
+            MAX_TARGETED_PER_PEER,
+            "one peer is held to its own share"
+        );
+
+        // A quiet peer still gets in, and keeps its message.
+        q.push("quiet:1", targeted_ping(999), false);
+        let mine = q.take_for("quiet:1");
+        assert_eq!(mine.len(), 1, "the arriving message must not be the victim");
+        assert!(matches!(mine[0], P2PMessage::Ping { nonce: 999 }));
+
+        // And what the flooder lost was its OLDEST, not its newest.
+        let flood = q.take_for("flooder:1");
+        assert!(matches!(flood[0], P2PMessage::Ping { nonce: 10 }));
+    }
+
+    #[test]
+    fn a_peers_targeted_bytes_are_bounded_and_one_block_always_fits() {
+        // The queue had NO byte term at all, while its entries hold blocks of
+        // up to MAX_BLOCK_BYTES — and nothing else in the process bounds what
+        // we send: check_bandwidth counts inbound only.
+        let mut q = TargetedQueue::new();
+        let one_mib = 1024 * 1024;
+        for _ in 0..32 {
+            q.push("heavy:1", targeted_block(one_mib), false);
+        }
+        assert!(
+            q.bytes() <= MAX_TARGETED_BYTES_PER_PEER,
+            "a peer's queued bytes must stay inside its share, got {}",
+            q.bytes()
+        );
+
+        // A single maximum-size block is never refused, however full we are.
+        let mut q = TargetedQueue::new();
+        q.push(
+            "heavy:1",
+            targeted_block(crate::service::network::dos_guard::MAX_BLOCK_BYTES),
+            false,
+        );
+        assert_eq!(q.take_for("heavy:1").len(), 1);
+    }
+
+    #[test]
+    fn a_global_overflow_is_charged_to_the_peer_holding_the_most() {
+        let mut q = TargetedQueue::new();
+        let one_mib = 1024 * 1024;
+        // Fill the global byte budget with heavy peers.
+        let mut peer = 0;
+        while q.bytes() + one_mib <= MAX_TARGETED_BYTES {
+            q.push(&format!("heavy{peer}:1"), targeted_block(one_mib), false);
+            peer = (peer + 1) % 8;
+        }
+        let before = q.bytes();
+        // A light peer arriving must get in, and the bytes must not grow past
+        // the budget.
+        q.push("light:1", targeted_block(one_mib), false);
+        assert!(
+            q.bytes() <= MAX_TARGETED_BYTES,
+            "the global byte budget must hold, was {before} now {}",
+            q.bytes()
+        );
+        assert_eq!(
+            q.take_for("light:1").len(),
+            1,
+            "the arriving message is never the victim"
+        );
+    }
+
+    #[test]
+    fn an_undelivered_targeted_message_does_not_outlive_its_peer() {
+        // THE TERMINAL DEFECT: the only removers are a peer's own flush and its
+        // cleanup, and the daemon can enqueue for a peer AFTER its cleanup ran,
+        // because the drain and the cleanup are separate critical sections. So
+        // such an entry was immortal, and enough of them refuse every future
+        // targeted message for the life of the process — block serving, header
+        // serving and stem relay all dead.
+        let mut q = TargetedQueue::new();
+        q.push("ghost:51234", targeted_block(1024), false);
+        q.push("ghost:51235", targeted_ping(1), false);
+        assert_eq!(q.len(), 2);
+
+        assert_eq!(
+            q.sweep_expired(Duration::from_secs(3_600)),
+            0,
+            "a message queued moments ago is not expired"
+        );
+        assert_eq!(q.len(), 2);
+
+        assert_eq!(q.sweep_expired(Duration::ZERO), 2, "both must be reaped");
+        assert_eq!(q.len(), 0);
+        assert_eq!(q.bytes(), 0, "and the totals with them");
+        assert!(
+            q.take_for("ghost:51234").is_empty(),
+            "the peer's entry itself must be gone, not left empty"
+        );
+    }
+
+    #[test]
+    fn a_requeued_targeted_message_keeps_its_place_at_the_front() {
+        // A write failure puts the message back; it must be retried BEFORE
+        // whatever was queued behind it, or ordering is lost. The old requeue
+        // also bypassed every cap, so the global limit was not a hard limit.
+        let mut q = TargetedQueue::new();
+        q.push("a:1", targeted_ping(1), false);
+        q.push("a:1", targeted_ping(2), false);
+        q.push("a:1", targeted_ping(9), true);
+        let mine = q.take_for("a:1");
+        assert!(matches!(mine[0], P2PMessage::Ping { nonce: 9 }));
+        assert!(matches!(mine[1], P2PMessage::Ping { nonce: 1 }));
+        assert!(matches!(mine[2], P2PMessage::Ping { nonce: 2 }));
+    }
+
+    #[test]
+    fn the_payload_estimate_is_the_one_the_rate_limiter_uses() {
+        // Two implementations of "how big is this message" drift, and a byte
+        // budget that disagrees with the rate limiter about what a message
+        // costs is worse than no budget.
+        assert_eq!(payload_size_estimate(&targeted_block(4096)), 4096);
+        assert_eq!(
+            payload_size_estimate(&P2PMessage::Headers {
+                hashes: vec!["ab".repeat(32), "cd".repeat(32)]
+            }),
+            128
+        );
+        assert!(
+            payload_size_estimate(&targeted_ping(1)) > 0,
+            "a fixed-size message still costs something"
+        );
     }
 
     // ── #5: the pending-block queue is tested, not walked ─────────────────
