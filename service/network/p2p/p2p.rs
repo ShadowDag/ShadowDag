@@ -853,11 +853,203 @@ const _: () = assert!(
 );
 
 /// Orphan blocks: received blocks whose parent is not yet known, buffered for
-/// reprocessing once the missing ancestor arrives. (peer_id, block). Bounded.
-#[allow(clippy::type_complexity)]
-static ORPHAN_BLOCKS: Lazy<Arc<PlMutex<Vec<(String, Block)>>>> =
-    Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(256))));
+/// reprocessing once the missing ancestor arrives.
+static ORPHAN_BLOCKS: Lazy<Arc<PlMutex<OrphanPool>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(OrphanPool::new())));
+
+/// Orphan entries across all peers.
 const MAX_ORPHAN_BLOCKS: usize = 5_000;
+/// Orphans ONE peer may hold.
+///
+/// A backward fork walk buffers one orphan per level until the ancestor
+/// arrives, and `orphan_worth_resolving` admits orphans within `FINALITY_DEPTH`
+/// of the tip — so a per-peer cap below that would make the pool refuse exactly
+/// the heal it exists to serve. Deeper gaps are header-sync's job, by that
+/// function's own reasoning, not this pool's.
+const MAX_ORPHANS_PER_PEER: usize =
+    crate::engine::consensus::reorg::FINALITY_DEPTH as usize;
+/// Bytes ONE peer may hold — the same share the targeted queue gives a peer.
+const MAX_ORPHAN_BYTES_PER_PEER: usize = 8 * 1024 * 1024;
+/// Bytes across all peers.
+///
+/// The pool had NO byte term at all, only the entry count above, while
+/// `payload_size_bounds(CommandId::Block)` admits a payload up to
+/// `MAX_MESSAGE_SIZE` — so 5,000 entries was tens of gigabytes of memory whose
+/// size the sender chooses, held until each parent arrives or the sender leaves.
+const MAX_ORPHAN_BYTES: usize = 64 * 1024 * 1024;
+const _: () = assert!(
+    MAX_ORPHANS_PER_PEER <= MAX_ORPHAN_BLOCKS
+        && MAX_ORPHAN_BYTES_PER_PEER <= MAX_ORPHAN_BYTES,
+    "a peer's own orphan quota must fit inside the global one"
+);
+const _: () = assert!(
+    MAX_ORPHAN_BYTES / MAX_ORPHAN_BYTES_PER_PEER >= 8,
+    "several peers must be able to hold a full share at once, or one heal starves the rest"
+);
+
+struct PeerOrphans {
+    /// (block hash, measured bytes, block) in arrival order.
+    blocks: std::collections::VecDeque<(String, usize, Block)>,
+    bytes: usize,
+}
+
+/// Orphans held per SENDER, bounded per peer and in total, by entries AND bytes.
+///
+/// This was a flat `Vec<(String, Block)>`: a linear dedup scan over up to 5,000
+/// entries per push, `remove(0)` eviction, a deep `clone` of every match when a
+/// parent arrived, an O(n) retain to drop a departed peer — and no byte term.
+/// The shape here, including charging a global overflow to the peer holding the
+/// most bytes, is `TargetedQueue`'s, which already solved the same problem for
+/// the send side in this file.
+struct OrphanPool {
+    by_peer: HashMap<String, PeerOrphans>,
+    entries: usize,
+    bytes: usize,
+}
+
+impl OrphanPool {
+    fn new() -> Self {
+        Self {
+            by_peer: HashMap::new(),
+            entries: 0,
+            bytes: 0,
+        }
+    }
+
+    /// Both accessors exist for the accounting invariant the tests drive; the
+    /// pool's own logic reads the fields directly, so production carries neither.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries
+    }
+
+    #[cfg(test)]
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Drop one peer's oldest orphan. Returns false when it had none.
+    fn drop_oldest_for(&mut self, peer: &str) -> bool {
+        let Some(po) = self.by_peer.get_mut(peer) else {
+            return false;
+        };
+        match po.blocks.pop_front() {
+            Some((_, size, _)) => {
+                po.bytes = po.bytes.saturating_sub(size);
+                self.entries = self.entries.saturating_sub(1);
+                self.bytes = self.bytes.saturating_sub(size);
+                if po.blocks.is_empty() {
+                    self.by_peer.remove(peer);
+                }
+                true
+            }
+            None => {
+                self.by_peer.remove(peer);
+                false
+            }
+        }
+    }
+
+    /// The peer holding the most bytes — the one to charge a global overflow to,
+    /// so a flooder cannot evict the orphans another peer is healing a fork with.
+    fn heaviest_peer(&self) -> Option<String> {
+        self.by_peer
+            .iter()
+            .max_by_key(|(_, po)| po.bytes)
+            .map(|(p, _)| p.clone())
+    }
+
+    /// Buffer `block` from `peer`, making room by evicting the backlog of
+    /// whoever is responsible for the overflow.
+    ///
+    /// Deduplicated per SENDER, not by hash alone: `remove_peer` deletes this
+    /// pool by peer, so a hash-wide key made the first sender's disconnect
+    /// destroy the only copy of a block several peers had handed us, and the
+    /// ancestor we had already broadcast GetBlock for arrived to find nothing
+    /// waiting on it. `PendingBlocks::retain_other_peers` states the same lesson
+    /// for the queue these blocks are drained from.
+    fn push(&mut self, peer: &str, block: Block) {
+        let hash = block.header.hash.clone();
+        if self
+            .by_peer
+            .get(peer)
+            .is_some_and(|po| po.blocks.iter().any(|(h, _, _)| *h == hash))
+        {
+            return;
+        }
+        let size = bincode::serialized_size(&block).unwrap_or(0) as usize;
+        // That peer's own quota first.
+        loop {
+            let (n, b) = self
+                .by_peer
+                .get(peer)
+                .map_or((0, 0), |po| (po.blocks.len(), po.bytes));
+            if n == 0 || (n < MAX_ORPHANS_PER_PEER && b + size <= MAX_ORPHAN_BYTES_PER_PEER) {
+                break;
+            }
+            if !self.drop_oldest_for(peer) {
+                break;
+            }
+        }
+        // Then the global budget, charged to whoever holds the most.
+        while self.entries >= MAX_ORPHAN_BLOCKS || self.bytes + size > MAX_ORPHAN_BYTES {
+            let Some(victim) = self.heaviest_peer() else {
+                break;
+            };
+            if !self.drop_oldest_for(&victim) {
+                break;
+            }
+        }
+        let po = self.by_peer.entry(peer.to_string()).or_insert(PeerOrphans {
+            blocks: std::collections::VecDeque::new(),
+            bytes: 0,
+        });
+        po.blocks.push_back((hash, size, block));
+        po.bytes = po.bytes.saturating_add(size);
+        self.entries = self.entries.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(size);
+    }
+
+    /// Remove and return every buffered orphan listing `parent_hash` among its
+    /// parents. The block is MOVED out, not cloned: the flat-Vec retain this
+    /// replaces deep-copied each match while holding the pool's lock.
+    fn take_for_parent(&mut self, parent_hash: &str) -> Vec<(String, Block)> {
+        let mut ready: Vec<(String, Block)> = Vec::new();
+        let (mut freed_entries, mut freed_bytes) = (0usize, 0usize);
+        for (peer, po) in self.by_peer.iter_mut() {
+            let mut keep = std::collections::VecDeque::with_capacity(po.blocks.len());
+            while let Some((hash, size, block)) = po.blocks.pop_front() {
+                if block.header.parents.iter().any(|p| p == parent_hash) {
+                    po.bytes = po.bytes.saturating_sub(size);
+                    freed_entries = freed_entries.saturating_add(1);
+                    freed_bytes = freed_bytes.saturating_add(size);
+                    ready.push((peer.clone(), block));
+                } else {
+                    keep.push_back((hash, size, block));
+                }
+            }
+            po.blocks = keep;
+        }
+        self.entries = self.entries.saturating_sub(freed_entries);
+        self.bytes = self.bytes.saturating_sub(freed_bytes);
+        self.by_peer.retain(|_, po| !po.blocks.is_empty());
+        ready
+    }
+
+    /// Drop everything a departed peer sent. O(1) in the pool's size; the Vec
+    /// this replaces scanned every entry.
+    fn remove_peer(&mut self, peer: &str) -> usize {
+        match self.by_peer.remove(peer) {
+            Some(po) => {
+                let n = po.blocks.len();
+                self.entries = self.entries.saturating_sub(n);
+                self.bytes = self.bytes.saturating_sub(po.bytes);
+                n
+            }
+            None => 0,
+        }
+    }
+}
 
 /// Header-serve requests: (peer_id, from_hash, count). The GetHeaders handler
 /// queues these; the daemon walks the chain FORWARD from from_hash and returns
@@ -1494,8 +1686,10 @@ pub fn cleanup_peer_state(peer_id: &str) {
         q.retain(|(target, _)| target != peer_id);
     }
     {
-        let mut q = ORPHAN_BLOCKS.lock();
-        q.retain(|(source, _)| source != peer_id);
+        let dropped = ORPHAN_BLOCKS.lock().remove_peer(peer_id);
+        if dropped > 0 {
+            slog_warn!("p2p", "cleanup_dropped_orphans", peer => peer_id, dropped => dropped);
+        }
     }
     {
         let mut q = PENDING_HEADER_REQUESTS.lock();
@@ -1686,34 +1880,14 @@ pub fn drain_block_requests() -> Vec<(String, String)> {
 /// waiting on it. `PendingBlocks::retain_other_peers` states the same lesson for
 /// the queue these blocks were drained from; this pool had not learned it.
 pub fn buffer_orphan(peer_id: &str, block: Block) {
-    let mut q = ORPHAN_BLOCKS.lock();
-    if q
-        .iter()
-        .any(|(p, b)| p == peer_id && b.header.hash == block.header.hash)
-    {
-        return;
-    }
-    if q.len() >= MAX_ORPHAN_BLOCKS {
-        q.remove(0);
-    }
-    q.push((peer_id.to_string(), block));
+    ORPHAN_BLOCKS.lock().push(peer_id, block);
 }
 
 /// Remove and return buffered orphans that list `parent_hash` among their
 /// parents. Called after a block is accepted: those orphans may now be
 /// processable (re-queue them; still-missing parents re-buffer + re-request).
 pub fn take_orphans_for_parent(parent_hash: &str) -> Vec<(String, Block)> {
-    let mut q = ORPHAN_BLOCKS.lock();
-    let mut ready = Vec::new();
-    q.retain(|(peer, b)| {
-        if b.header.parents.iter().any(|p| p == parent_hash) {
-            ready.push((peer.clone(), b.clone()));
-            false
-        } else {
-            true
-        }
-    });
-    ready
+    ORPHAN_BLOCKS.lock().take_for_parent(parent_hash)
 }
 
 /// Whether the header-request queue must refuse this request.
@@ -5437,6 +5611,163 @@ mod tests {
             1,
             "one sender, one copy"
         );
+    }
+
+    fn sized_orphan(hash: &str, parent: &str, pad: usize) -> Block {
+        use crate::domain::block::block_body::BlockBody;
+        use crate::domain::block::block_header::BlockHeader;
+        Block {
+            header: BlockHeader::new_with_defaults(
+                1,
+                hash.to_string(),
+                vec![parent.to_string()],
+                "p".repeat(pad),
+                0,
+                0,
+                1,
+                0,
+            ),
+            body: BlockBody {
+                transactions: Vec::new(),
+            },
+        }
+    }
+
+    fn assert_orphan_accounting(pool: &OrphanPool) {
+        let entries: usize = pool.by_peer.values().map(|po| po.blocks.len()).sum();
+        assert_eq!(entries, pool.len(), "the entry count drifted from the pool");
+        let bytes: usize = pool.by_peer.values().map(|po| po.bytes).sum();
+        assert_eq!(bytes, pool.bytes(), "the byte count drifted from the pool");
+        for (peer, po) in &pool.by_peer {
+            assert!(!po.blocks.is_empty(), "an empty peer row was left behind: {peer}");
+            let own: usize = po.blocks.iter().map(|(_, size, _)| *size).sum();
+            assert_eq!(own, po.bytes, "{peer}'s own byte total drifted");
+        }
+    }
+
+    #[test]
+    fn the_orphan_pool_accounting_survives_every_mutation() {
+        // Two running totals and a per-peer total, all mutated on four paths. A
+        // drifted count would either refuse orphans the pool has room for or
+        // never evict at all, and neither shows up as a wrong block.
+        let mut pool = OrphanPool::new();
+        assert_orphan_accounting(&pool);
+
+        pool.push("a", sized_orphan("h1", "p1", 16));
+        pool.push("a", sized_orphan("h2", "p2", 32));
+        pool.push("b", sized_orphan("h3", "p1", 64));
+        assert_eq!(pool.len(), 3);
+        assert_orphan_accounting(&pool);
+
+        // A repeat from the same sender is refused and changes nothing.
+        pool.push("a", sized_orphan("h1", "p1", 16));
+        assert_eq!(pool.len(), 3, "a sender's repeat is not stored twice");
+        assert_orphan_accounting(&pool);
+
+        // Taking by parent frees both totals.
+        let ready = pool.take_for_parent("p1");
+        assert_eq!(ready.len(), 2, "a's h1 and b's h3 both list p1");
+        assert_eq!(pool.len(), 1);
+        assert_orphan_accounting(&pool);
+
+        // Dropping a departed peer frees what it held, and only that.
+        pool.push("b", sized_orphan("h4", "p9", 128));
+        assert_eq!(pool.remove_peer("a"), 1);
+        assert_eq!(pool.remove_peer("a"), 0, "removing twice is not a double free");
+        assert_orphan_accounting(&pool);
+        assert_eq!(pool.len(), 1, "b's own orphan is untouched");
+
+        pool.drop_oldest_for("b");
+        assert_eq!(pool.len(), 0);
+        assert!(pool.by_peer.is_empty(), "the last entry takes its row with it");
+        assert_orphan_accounting(&pool);
+    }
+
+    #[test]
+    fn a_peer_may_buffer_a_whole_fork_heal_walk_of_orphans() {
+        // The bound that must NOT bite. A backward walk buffers one orphan per
+        // level until the ancestor arrives, and orphan_worth_resolving admits
+        // orphans within FINALITY_DEPTH of the tip — so a per-peer cap below
+        // that would make this pool refuse precisely the heal it exists for.
+        let depth = crate::engine::consensus::reorg::FINALITY_DEPTH as usize;
+        let mut pool = OrphanPool::new();
+        for i in 0..depth {
+            pool.push("healer", sized_orphan(&format!("h{i}"), &format!("p{i}"), 8));
+        }
+        assert_eq!(pool.len(), depth, "every level of the walk is still buffered");
+        assert_orphan_accounting(&pool);
+        // And the level that would exceed it costs the OLDEST, not the newest:
+        // dropping the arrival would stall the walk at its deepest point.
+        pool.push("healer", sized_orphan("h_last", "p_last", 8));
+        assert_eq!(pool.len(), depth);
+        assert!(
+            !pool.take_for_parent("p_last").is_empty(),
+            "the newest arrival is kept"
+        );
+        assert!(
+            pool.take_for_parent("p0").is_empty(),
+            "and the oldest is what made room"
+        );
+    }
+
+    #[test]
+    fn a_peer_cannot_spend_more_orphan_bytes_than_its_own_quota() {
+        // Entry count alone bounded nothing: a Block payload is admitted up to
+        // MAX_MESSAGE_SIZE, so the old 5,000-entry cap was tens of gigabytes.
+        let mut pool = OrphanPool::new();
+        let chunk = 1024 * 1024;
+        for i in 0..(MAX_ORPHAN_BYTES_PER_PEER / chunk + 2) {
+            pool.push("fat", sized_orphan(&format!("f{i}"), &format!("fp{i}"), chunk));
+        }
+        assert!(
+            pool.bytes() <= MAX_ORPHAN_BYTES_PER_PEER,
+            "one peer held {} bytes, over its {} quota",
+            pool.bytes(),
+            MAX_ORPHAN_BYTES_PER_PEER
+        );
+        assert!(pool.len() > 0, "but it is not emptied either");
+        assert_orphan_accounting(&pool);
+    }
+
+    #[test]
+    fn a_global_orphan_overflow_is_charged_to_the_peer_holding_the_most() {
+        // The property that keeps this from becoming a weapon: a flooder that
+        // fills the pool must lose its OWN backlog, never the orphans another
+        // peer is healing a fork with.
+        let mut pool = OrphanPool::new();
+        // One honest peer with a small, real heal in progress.
+        pool.push("honest", sized_orphan("honest_1", "honest_parent", 8));
+        // Fill to EXACTLY the global entry budget from peers that each stay
+        // inside their own quota, the first padded so it is the heaviest. Going
+        // one over here instead would make the fill itself charge that peer —
+        // which is the mechanism working, but it destroys the precondition.
+        let per = MAX_ORPHANS_PER_PEER;
+        let mut placed = pool.len();
+        let mut p = 0;
+        while placed < MAX_ORPHAN_BLOCKS {
+            let pad = if p == 0 { 4096 } else { 8 };
+            let take = per.min(MAX_ORPHAN_BLOCKS - placed);
+            for i in 0..take {
+                pool.push(&format!("flood{p}"), sized_orphan(&format!("g{p}_{i}"), &format!("gp{p}_{i}"), pad));
+            }
+            placed += take;
+            p += 1;
+        }
+        assert_eq!(pool.len(), MAX_ORPHAN_BLOCKS, "filled to the cap, not past it");
+        assert_eq!(pool.heaviest_peer().as_deref(), Some("flood0"), "the padded peer holds the most");
+        let before = pool.by_peer["flood0"].blocks.len();
+        pool.push("newcomer", sized_orphan("new_1", "new_parent", 8));
+        assert!(
+            pool.by_peer["flood0"].blocks.len() < before,
+            "the overflow was charged to the heaviest holder"
+        );
+        assert!(
+            !pool.take_for_parent("honest_parent").is_empty(),
+            "and the honest peer's orphan was never touched"
+        );
+        assert!(pool.len() <= MAX_ORPHAN_BLOCKS, "the global entry cap holds");
+        assert!(pool.bytes() <= MAX_ORPHAN_BYTES, "the global byte cap holds");
+        assert_orphan_accounting(&pool);
     }
 
     #[test]
