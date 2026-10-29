@@ -1581,17 +1581,68 @@ impl VM {
 mod tests {
     use super::*;
 
-    fn make_vm() -> VM {
-        // Use `std::env::temp_dir()` instead of a hard-coded `/tmp/…`
-        // path. Windows has no `/tmp`, so the previous test helper
-        // failed the whole vm.rs test module on Windows before any
-        // assertion could run. Nanosecond suffix keeps runs unique.
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("shadowdag_test_vm_{}", ts));
-        VM::new(dir.to_str().expect("tempdir path is not valid UTF-8")).expect("VM::new failed")
+    /// A VM whose database directory is its own, and is removed with it.
+    ///
+    /// The path was `shadowdag_test_vm_{nanos}` from `SystemTime::now()` with no
+    /// cleanup, so each of this module's 28 tests abandoned a RocksDB directory
+    /// on every run — 10,644 of them had collected in the temp directory on this
+    /// machine, and enumerating that directory is work every later open pays.
+    /// The name also rested on the system clock, which on Windows ticks far
+    /// coarser than a nanosecond and is not monotonic, so two of the 28 running
+    /// in parallel could read one value and open one database. A process-wide
+    /// counter cannot collide and consults no clock.
+    struct TestVm {
+        vm: Option<VM>,
+        path: std::path::PathBuf,
+    }
+
+    impl std::ops::Deref for TestVm {
+        type Target = VM;
+        fn deref(&self) -> &VM {
+            self.vm.as_ref().expect("taken only in drop")
+        }
+    }
+
+    impl Drop for TestVm {
+        fn drop(&mut self) {
+            // RocksDB holds the directory under an exclusive lock, so the VM
+            // has to go first or the removal fails on Windows.
+            drop(self.vm.take());
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn make_vm() -> TestVm {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // `std::env::temp_dir()` rather than a hard-coded `/tmp/…`: Windows has
+        // no `/tmp`, and the helper that assumed one failed this whole module
+        // before any assertion could run.
+        let path = std::env::temp_dir().join(format!(
+            "shadowdag_test_vm_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let vm = VM::new(path.to_str().expect("tempdir path is not valid UTF-8"))
+            .expect("VM::new failed");
+        TestVm { vm: Some(vm), path }
+    }
+
+    #[test]
+    fn each_fixture_gets_its_own_database_and_leaves_none_behind() {
+        // Two fixtures in one process must not share a directory, and the
+        // directory must not outlive the fixture. Both were false: the name came
+        // from a clock the 28 parallel tests here can read identically, and
+        // nothing ever removed it.
+        let first;
+        {
+            let a = make_vm();
+            let b = make_vm();
+            assert_ne!(a.path, b.path, "two fixtures must not share a database");
+            assert!(a.path.exists(), "the database is created");
+            first = a.path.clone();
+        }
+        assert!(!first.exists(), "and removed when the fixture is dropped");
     }
 
     fn exec(vm: &VM, bytecode: &[u8], gas: u64) -> ExecutionResult {
