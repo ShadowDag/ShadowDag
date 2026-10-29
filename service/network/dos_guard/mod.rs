@@ -72,7 +72,11 @@ pub const COST_MSG_DEFAULT: f64 = 1.0;
 pub const COST_TX: f64 = 3.0;
 pub const COST_BLOCK: f64 = 8.0;
 pub const COST_GETDATA: f64 = 2.0;
-pub const COST_INV: f64 = 1.0;
+/// An Inv is what makes us emit a GetData, so it cannot be the cheaper of the
+/// two. It sat at the floor beside Ping while being the most expensive message
+/// to process per byte: every announced hash is tested against the pending
+/// block queue, and the ones we want are written straight back out as a request.
+pub const COST_INV: f64 = COST_GETDATA;
 pub const COST_ADDR: f64 = 1.0;
 pub const COST_HEADERS: f64 = 3.0;
 pub const COST_GETBLOCKS: f64 = 5.0;
@@ -1075,6 +1079,20 @@ mod tests {
         g.evict_inactive();
         let stats = g.stats();
         assert_eq!(stats.tracked_peers, 0);
+    }
+
+    #[test]
+    fn inv_costs_at_least_as_much_as_the_getdata_it_provokes() {
+        let inv = MsgType::Inv.token_cost();
+        assert!(
+            inv >= MsgType::GetData.token_cost(),
+            "an Inv makes us send a GetData, so it must not be cheaper than one"
+        );
+        assert!(
+            inv > COST_MSG_DEFAULT,
+            "an Inv is not a floor-cost message: every announced hash is tested \
+             against the pending queue, and answered with a request of its own size"
+        );
     }
 
     #[test]
