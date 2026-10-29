@@ -2011,12 +2011,14 @@ impl P2P {
                     // Query fresh peer list on each connection (fix stale snapshot)
                     let peers_snapshot = peer_manager.get_addr_list_limited(100);
 
+                    let pm = Arc::clone(peer_manager);
                     thread::spawn(move || {
                         // `slot` is moved in, so the pending slot and both
                         // anti-eclipse registrations are released when this
                         // closure unwinds as well as when it returns.
                         let _slot = slot;
-                        let result = Self::handle_peer_connection(s, false, magic, peers_snapshot);
+                        let result =
+                            Self::handle_peer_connection(s, false, magic, peers_snapshot, pm);
                         if let Err(e) = result {
                             slog_error!("p2p", "peer_connection_error", addr => &peer_addr, error => &e.to_string());
                         }
@@ -2033,6 +2035,7 @@ impl P2P {
         outbound: bool,
         magic: [u8; 4],
         known_peers: Vec<String>,
+        peers: Arc<PeerManager>,
     ) -> Result<(), NetworkError> {
         // 100ms (was 2s): this timeout is also the idle FLUSH interval — served
         // block bodies sit in the targeted queue until the connection loop wakes
@@ -2070,6 +2073,8 @@ impl P2P {
 
         // Session state: ProtocolSession + connection-level fields
         let mut session = ConnectionSession::new(peer_addr, outbound);
+        // Set when the handshake completes, so the store is told exactly once.
+        let mut marked_tried = false;
 
         // ── Connection puzzle (anti-Sybil) ─────────────────────────────────
         if !outbound {
@@ -2406,6 +2411,14 @@ impl P2P {
                     // established peer's slow bulk transfer.
                     if session.is_established() {
                         reader.get_mut().disarm();
+                        // Once per connection: the store has no other way to
+                        // learn that an address is real, and until it did, its
+                        // capacity eviction had to choose blindly and every
+                        // peer looked permanently inactive.
+                        if !marked_tried {
+                            marked_tried = true;
+                            peers.mark_tried(&peer_str);
+                        }
                     }
 
                     // Flush broadcast + targeted outbound messages
@@ -3520,7 +3533,7 @@ impl P2P {
         for addr in peer_list.into_iter().take(count) {
             // The outbound cap lives inside spawn_outbound, so this startup
             // pass needs no budget of its own.
-            let _ = Self::spawn_outbound(addr, magic, known_peers.clone());
+            let _ = Self::spawn_outbound(addr, magic, known_peers.clone(), Arc::clone(&self.peers));
         }
     }
 
@@ -3532,7 +3545,12 @@ impl P2P {
     /// Reports whether a dial was actually started, so a caller can budget
     /// DIALS rather than candidates. This is also the one choke point for the
     /// outbound slot cap: enforcing it here covers every caller.
-    fn spawn_outbound(addr: String, magic: [u8; 4], peers_snapshot: Vec<String>) -> bool {
+    fn spawn_outbound(
+        addr: String,
+        magic: [u8; 4],
+        peers_snapshot: Vec<String>,
+        peers: Arc<PeerManager>,
+    ) -> bool {
         // Never dial our own IP (identified via the identity-nonce self-check).
         // The seed list contains this node's own address; without this the node
         // wastes every dial re-connecting to itself instead of to real peers.
@@ -3572,7 +3590,7 @@ impl P2P {
                 Ok(stream) => {
                     slog_info!("p2p", "outbound_connected", addr => &addr);
                     if let Err(e) =
-                        Self::handle_peer_connection(stream, true, magic, peers_snapshot)
+                        Self::handle_peer_connection(stream, true, magic, peers_snapshot, peers)
                     {
                         slog_info!("p2p", "peer_connection_ended", addr => &addr, reason => &e.to_string());
                     }
@@ -3617,7 +3635,12 @@ impl P2P {
                 .filter(|a| crate::service::network::dos_guard::is_whitelisted(a))
             {
                 if reconnect_due(&peers, addr) {
-                    let _ = Self::spawn_outbound(addr.clone(), magic, known_snapshot.clone());
+                    let _ = Self::spawn_outbound(
+                        addr.clone(),
+                        magic,
+                        known_snapshot.clone(),
+                        Arc::clone(&peers),
+                    );
                 }
             }
 
@@ -3630,7 +3653,12 @@ impl P2P {
             });
             cursor = next;
             for i in picked {
-                let _ = Self::spawn_outbound(known[i].clone(), magic, known_snapshot.clone());
+                let _ = Self::spawn_outbound(
+                    known[i].clone(),
+                    magic,
+                    known_snapshot.clone(),
+                    Arc::clone(&peers),
+                );
             }
         });
     }

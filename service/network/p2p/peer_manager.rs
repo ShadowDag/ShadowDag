@@ -42,7 +42,20 @@ const PEER_COUNT_KEY: &[u8] = b"meta:peer_count";
 /// Not one, though: the budget has to absorb a run of whitelisted records at
 /// the cursor without failing an insert that thousands of evictable records
 /// could have satisfied.
-const EVICT_SCAN_LIMIT: usize = 8;
+const EVICT_SCAN_LIMIT: usize = 16;
+
+/// How recent a handshake must be before a tried record is protected outright.
+/// Bitcoin Core's ADDRMAN_REPLACEMENT (src/addrman.h): "How recent a successful
+/// connection should be before we allow an address to be evicted from tried".
+///
+/// This is also why there is no separate one-minute guard like the one
+/// IsTerrible opens with. Bitcoin needs that override because IsTerrible has
+/// several independent clauses that could each fire on a freshly tried record;
+/// here there is exactly ONE path to evicting a tried record and it is gated on
+/// this window, so a record handshaked moments ago is already protected. A
+/// grace constant beside this one would be a branch that cannot change an
+/// outcome — a negative control caught it as such.
+const TRIED_REPLACEMENT_SECS: u64 = 4 * 3_600;
 
 const PFX_BAN: &str = "ban:";
 const PFX_PENALTY: &str = "penalty:";
@@ -60,6 +73,14 @@ const PFX_LATENCY: &str = "latency:";
 const PFX_HEIGHT: &str = "height:";
 const PFX_BAN_COUNT: &str = "bancnt:";
 const PFX_BAN_CAT: &str = "bancat:";
+/// When we last completed a handshake with this address.
+///
+/// Its own prefix rather than a `PeerRecord` field: the record is bincode, which
+/// is not self-describing, so adding a field makes every record already on disk
+/// fail to deserialize — and the readers here swallow that with `.ok()`, so a
+/// live peer DB would go silently half-blind. `seen:`, `height:` and `latency:`
+/// are kept beside the record for the same reason.
+const PFX_TRIED: &str = "tried:";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerRecord {
@@ -422,15 +443,19 @@ impl PeerManager {
         })
     }
 
-    /// Stage the deletion of one peer record and its satellite keys.
+    /// Stage the deletion of one peer record and all of its satellite keys.
     ///
-    /// Shares the key list with `remove_peer` so an eviction cannot leave a
-    /// `seen:`/`height:`/`latency:` key orphaned behind a deleted `peer:`.
+    /// The single place that knows which keys make up a peer, so an eviction
+    /// and a `remove_peer` cannot drift apart and leave a `seen:`/`height:`/
+    /// `latency:`/`tried:` key orphaned behind a deleted `peer:`. (0460ef4
+    /// claimed the two shared this list when they were in fact two parallel
+    /// copies; `remove_peer` now really does call it.)
     fn stage_peer_delete(db: &DB, batch: &mut WriteBatch, addr: &str) {
         batch.delete(format!("{}{}", PFX_PEER, addr).as_bytes());
         batch.delete(format!("{}{}", PFX_LAST_SEEN, addr).as_bytes());
         batch.delete(format!("{}{}", PFX_HEIGHT, addr).as_bytes());
         batch.delete(format!("{}{}", PFX_LATENCY, addr).as_bytes());
+        batch.delete(format!("{}{}", PFX_TRIED, addr).as_bytes());
         let vip = Self::extract_ip(addr);
         let vcount = Self::conn_count_for_ip_inner(db, vip);
         if vcount > 0 {
@@ -444,11 +469,20 @@ impl PeerManager {
     /// The next evictable `peer:` record, walking the prefix from a rotating
     /// cursor so coverage is eventual and no key can be starved or targeted.
     ///
-    /// Whitelisted addresses are skipped: the one thing an eviction must never
-    /// do is remove a configured seed, which is the lockout this whole change
-    /// exists to undo.
+    /// Ranked rather than blind, which is what `tried:` bought:
+    /// - a whitelisted address is never evicted — removing a configured seed is
+    ///   the lockout this whole line of work exists to undo;
+    /// - an UNTRIED record is taken first, so an attacker's gossip can only ever
+    ///   displace other unverified gossip, never a peer we have talked to;
+    /// - a tried record is a last resort, and only once its handshake is older
+    ///   than `TRIED_REPLACEMENT_SECS`, so a peer we are handshaking right now
+    ///   cannot be deleted by a burst of gossiped addresses arriving on this
+    ///   same path, and the store still cannot freeze if it ever fills
+    ///   entirely with tried peers.
     fn evict_candidate_inner(db: &DB, cursor: &Arc<Mutex<Vec<u8>>>) -> Option<String> {
         let prefix = PFX_PEER.as_bytes();
+        let now = unix_now();
+        let mut stale_tried: Option<String> = None;
         let mut cur = cursor.lock().unwrap_or_else(|e| e.into_inner());
         // Two passes at most: from the cursor to the end of the prefix, then
         // from the start of the prefix back round to it.
@@ -477,18 +511,28 @@ impl PeerManager {
                 if crate::service::network::dos_guard::is_whitelisted(Self::extract_ip(&addr)) {
                     continue;
                 }
-                return Some(addr);
+                match Self::tried_at_inner(db, &addr) {
+                    None => return Some(addr),
+                    Some(at) => {
+                        if now.saturating_sub(at) > TRIED_REPLACEMENT_SECS
+                            && stale_tried.is_none()
+                        {
+                            stale_tried = Some(addr);
+                        }
+                    }
+                }
             }
             if pass == 0 {
                 // Walked off the end of the prefix: restart from the front.
                 *cur = prefix.to_vec();
             }
         }
-        None
+        // No unverified record came up in the budget: fall back to the oldest
+        // handshake we saw, if it is past the replacement window.
+        stale_tried
     }
 
     pub fn remove_peer(&self, addr: &str) -> Result<(), NetworkError> {
-        let ip = Self::extract_ip(addr);
         let db = self.lock_db();
         // Existence check + per-IP count read + the writes all happen under ONE lock
         // hold, so two concurrent removes of the same addr can no longer both pass
@@ -500,18 +544,8 @@ impl PeerManager {
         if !exists {
             return Ok(()); // Nothing to remove
         }
-        let count = Self::conn_count_for_ip_inner(&db, ip);
         let mut batch = WriteBatch::default();
-        batch.delete(format!("{}{}", PFX_PEER, addr).as_bytes());
-        batch.delete(format!("{}{}", PFX_LAST_SEEN, addr).as_bytes());
-        batch.delete(format!("{}{}", PFX_HEIGHT, addr).as_bytes());
-        batch.delete(format!("{}{}", PFX_LATENCY, addr).as_bytes());
-        if count > 0 {
-            batch.put(
-                format!("{}{}", PFX_CONN_COUNT, ip).as_bytes(),
-                (count - 1).to_le_bytes(),
-            );
-        }
+        Self::stage_peer_delete(&db, &mut batch, addr);
         // Keep the global peer count in step (peer_exists was true above, so a
         // record is actually being removed).
         let stored = Self::stored_peer_count_inner(&db);
@@ -578,6 +612,52 @@ impl PeerManager {
         if let Err(e) = db.write(batch) {
             slog_error!("p2p", "peer_manager_write_failed", op => "update_peer_latency", error => &e.to_string());
         }
+    }
+
+    /// Record that a handshake with this address completed.
+    ///
+    /// Called once per connection, the first time the session reports itself
+    /// established. This is the ONLY writer of `tried:`, and the only thing in
+    /// the process that refreshes `seen:` after insertion — which is what makes
+    /// `PeerRecord::is_active()` mean anything at all.
+    pub fn mark_tried(&self, addr: &str) {
+        let now = unix_now();
+        let db = self.lock_db();
+        let mut batch = WriteBatch::default();
+        batch.put(
+            format!("{}{}", PFX_TRIED, addr).as_bytes(),
+            now.to_le_bytes(),
+        );
+        batch.put(
+            format!("{}{}", PFX_LAST_SEEN, addr).as_bytes(),
+            now.to_le_bytes(),
+        );
+        if let Ok(Some(data)) = db.get(format!("{}{}", PFX_PEER, addr).as_bytes()) {
+            if let Ok(mut rec) = bincode::deserialize::<PeerRecord>(&data) {
+                rec.last_seen = now;
+                if let Ok(new_data) = bincode::serialize(&rec) {
+                    batch.put(format!("{}{}", PFX_PEER, addr).as_bytes(), &new_data);
+                }
+            }
+        }
+        if let Err(e) = db.write(batch) {
+            slog_error!("p2p", "peer_manager_write_failed", op => "mark_tried", error => &e.to_string());
+        }
+    }
+
+    /// When we last completed a handshake with `addr`, if ever.
+    fn tried_at_inner(db: &DB, addr: &str) -> Option<u64> {
+        db.get(format!("{}{}", PFX_TRIED, addr).as_bytes())
+            .ok()
+            .flatten()
+            .and_then(|d| d.get(..8).and_then(|s| s.try_into().ok()))
+            .map(u64::from_le_bytes)
+    }
+
+    /// Whether we have ever completed a handshake with `addr`.
+    pub fn is_tried(&self, addr: &str) -> bool {
+        let db = self.lock_db();
+        Self::tried_at_inner(&db, addr).is_some()
     }
 
     pub fn touch_peer(&self, addr: &str) {
@@ -1246,6 +1326,146 @@ mod tests {
         assert!(
             pm2.add_peer("9.1.0.250:9333").is_err(),
             "with nothing evictable a stranger is refused — but only then"
+        );
+    }
+
+    /// Backdate a handshake: `mark_tried` always stamps now, and the windows
+    /// under test are hours wide.
+    fn set_tried_age(pm: &PeerManager, addr: &str, secs_ago: u64) {
+        let db = pm.lock_db();
+        let t = unix_now().saturating_sub(secs_ago);
+        db.put(
+            format!("{}{}", PFX_TRIED, addr).as_bytes(),
+            t.to_le_bytes(),
+        )
+        .unwrap();
+    }
+
+    /// Age a record's `last_seen`. Needed because `add_peer` stamps now, and
+    /// the window under test is `PEER_HEALTH_TIMEOUT_SECS` wide.
+    fn backdate_last_seen(pm: &PeerManager, addr: &str, secs_ago: u64) {
+        let db = pm.lock_db();
+        let key = format!("{}{}", PFX_PEER, addr);
+        let data = db.get(key.as_bytes()).unwrap().expect("record must exist");
+        let mut rec: PeerRecord = bincode::deserialize(&data).unwrap();
+        rec.last_seen = unix_now().saturating_sub(secs_ago);
+        db.put(key.as_bytes(), bincode::serialize(&rec).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn mark_tried_records_the_handshake_and_revives_is_active() {
+        // `seen:` was written once at insert and never refreshed — the three
+        // writers that would have refreshed it have no production caller — so
+        // every peer read as inactive 300 s after it was stored.
+        let path = tmp("mark_tried");
+        let _ = fs::remove_dir_all(&path);
+        let pm = PeerManager::open(&path).unwrap();
+        assert!(pm.add_peer("9.6.0.1:9333").is_ok());
+        assert!(!pm.is_tried("9.6.0.1:9333"), "not tried until we shake hands");
+
+        // Age it past the health timeout: a record inserted moments ago is
+        // active either way, so without this the assertion below cannot tell
+        // whether the handshake refreshed anything.
+        backdate_last_seen(&pm, "9.6.0.1:9333", PEER_HEALTH_TIMEOUT_SECS + 60);
+        assert!(
+            !pm.get_peer("9.6.0.1:9333").unwrap().is_active(),
+            "a record last seen past the timeout must read as inactive"
+        );
+
+        pm.mark_tried("9.6.0.1:9333");
+        assert!(pm.is_tried("9.6.0.1:9333"));
+        assert!(
+            pm.get_peer("9.6.0.1:9333").unwrap().is_active(),
+            "a handshake must refresh last_seen, or is_active means nothing"
+        );
+    }
+
+    #[test]
+    fn eviction_takes_unverified_gossip_before_a_peer_we_have_talked_to() {
+        // The property that makes the cap anti-eclipse rather than merely
+        // unblocked: an attacker's gossip can only ever displace other
+        // unverified gossip, never a peer we have actually reached.
+        let path = tmp("evict_prefers_untried");
+        let _ = fs::remove_dir_all(&path);
+        let pm = PeerManager::open(&path).unwrap();
+        assert!(pm.add_peer("9.7.0.1:9333").is_ok());
+        pm.mark_tried("9.7.0.1:9333");
+        set_tried_age(&pm, "9.7.0.1:9333", 10 * 3_600); // old enough to be a last resort
+        for i in 2..=5 {
+            assert!(pm.add_peer(&format!("9.7.0.{}:9333", i)).is_ok());
+        }
+
+        let db = pm.lock_db();
+        let mut victims = Vec::new();
+        for _ in 0..4 {
+            victims.push(
+                PeerManager::evict_candidate_inner(&db, &pm.evict_cursor)
+                    .expect("four unverified records are available"),
+            );
+        }
+        assert!(
+            !victims.contains(&"9.7.0.1:9333".to_string()),
+            "the peer we handshaked must not go while unverified records remain: {victims:?}"
+        );
+        assert_eq!(
+            victims.iter().collect::<std::collections::HashSet<_>>().len(),
+            4,
+            "and the four unverified ones each come up once"
+        );
+    }
+
+    #[test]
+    fn a_handshake_from_moments_ago_is_never_the_victim() {
+        // Eviction runs on the Addr ingest path, so a burst of gossiped
+        // addresses must not be able to delete the peer we are shaking hands
+        // with right now. Bitcoin Core's IsTerrible opens with the same guard.
+        let path = tmp("evict_grace");
+        let _ = fs::remove_dir_all(&path);
+        let pm = PeerManager::open(&path).unwrap();
+        assert!(pm.add_peer("9.8.0.1:9333").is_ok());
+        pm.mark_tried("9.8.0.1:9333");
+
+        let db = pm.lock_db();
+        assert!(
+            PeerManager::evict_candidate_inner(&db, &pm.evict_cursor).is_none(),
+            "the only record was handshaked moments ago, so nothing is evictable"
+        );
+    }
+
+    #[test]
+    fn a_store_full_of_tried_peers_still_does_not_freeze() {
+        // The other half of protecting tried records: if they were untouchable
+        // for ever, a store that filled with them would be the original freeze
+        // again. Past the replacement window they are a last resort.
+        let path = tmp("evict_all_tried");
+        let _ = fs::remove_dir_all(&path);
+        let pm = PeerManager::open(&path).unwrap();
+        for i in 1..=3 {
+            let addr = format!("9.9.0.{}:9333", i);
+            assert!(pm.add_peer(&addr).is_ok());
+            pm.mark_tried(&addr);
+            set_tried_age(&pm, &addr, TRIED_REPLACEMENT_SECS + 3_600);
+        }
+        {
+            let db = pm.lock_db();
+            assert!(
+                PeerManager::evict_candidate_inner(&db, &pm.evict_cursor).is_some(),
+                "a stale handshake must be evictable rather than freezing the store"
+            );
+        }
+
+        // And the tried key goes with the record, so a re-added address does
+        // not inherit a handshake it never had.
+        declare_store_full(&pm);
+        assert!(pm.add_peer("9.9.9.1:9333").is_ok());
+        let gone: Vec<u32> = (1..=3)
+            .filter(|i| !pm.peer_exists(&format!("9.9.0.{}:9333", i)))
+            .collect();
+        assert_eq!(gone.len(), 1);
+        assert!(
+            !pm.is_tried(&format!("9.9.0.{}:9333", gone[0])),
+            "the evicted record's tried marker must be gone too"
         );
     }
 
