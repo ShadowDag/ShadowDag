@@ -328,11 +328,187 @@ const KEEPALIVE_INTERVAL_SECS: u64 = 60;
 /// Max time without pong before disconnecting (seconds).
 const PONG_TIMEOUT_SECS: u64 = 120;
 
-/// Broadcast outbound queue: (sequence_number, message).
-/// Each peer tracks `last_outbound_seq` so every peer gets every message.
-#[allow(clippy::type_complexity)]
-static OUTBOUND_MSGS: Lazy<Arc<PlMutex<(u64, Vec<(u64, P2PMessage)>)>>> =
-    Lazy::new(|| Arc::new(PlMutex::new((0, Vec::with_capacity(256)))));
+/// Entries the broadcast queue may hold. Was an unnamed literal beside the
+/// eviction that enforced it.
+const MAX_OUTBOUND_ENTRIES: usize = 10_000;
+
+/// Bytes the broadcast queue may hold.
+///
+/// It had no byte term at all, while an entry holds a relayed block or
+/// transaction. The hard retain below keeps OUTBOUND_HARD_RETAIN entries
+/// whatever peers have acknowledged, so with max-size blocks the FLOOR of the
+/// queue was already in the gigabytes, and the ceiling of 10,000 entries put it
+/// near twenty.
+const MAX_OUTBOUND_BYTES: usize = 64 * 1024 * 1024;
+
+/// Messages kept regardless of what every peer has acknowledged. The backstop
+/// for a pinned or stale cursor: a queue that stops pruning slows every flush
+/// and finally wedges sync when it fills.
+///
+/// This floor is in ENTRIES and MAX_OUTBOUND_BYTES is in bytes, so the byte
+/// budget can and does bind below it: at MAX_BLOCK_BYTES per entry the budget
+/// holds 32, not 4,096. That is the point of a byte bound and it cannot stall
+/// pruning — it only ever prunes MORE — but it does mean a laggard's window is
+/// measured in bytes rather than messages, and it recovers through header-sync
+/// as the newest-wins policy already assumes. Two independent reviewers read
+/// the 128x gap as a defect, so it is stated here.
+const OUTBOUND_HARD_RETAIN: u64 = 4_096;
+
+/// How often the queue may report that it is evicting.
+///
+/// One line per eviction was one BLOCKING stderr write per broadcast, taken
+/// while holding the lock every peer's flush waits on: `emit` ends in
+/// `eprintln!` and Rust's stderr is unbuffered. Once the byte ceiling binds —
+/// which with max-size blocks is at 32 entries — that fires on every push, so
+/// the log volume becomes a throughput tax exactly when the node is busiest.
+/// The accept loop throttles its own refusal log the same way and for the same
+/// reason.
+const OUTBOUND_WARN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A block is the largest thing any push site produces — a Tx is capped at
+/// MAX_TX_BYTES and an Inv at MAX_INV_PER_MSG small items — so this is what
+/// guarantees no single message can exceed the whole budget. If one could, the
+/// eviction loop would drain the queue for every peer to make room for it. The
+/// invariant is checked here instead of guarded at runtime, because a branch
+/// that cannot be reached is worse than none: it reads as load-bearing.
+const _: () = assert!(
+    MAX_OUTBOUND_BYTES > crate::service::network::dos_guard::MAX_BLOCK_BYTES * 2,
+    "a maximum-size block must always fit, with room for what follows it"
+);
+const _: () = assert!(
+    OUTBOUND_HARD_RETAIN < MAX_OUTBOUND_ENTRIES as u64,
+    "the hard retain must bind below the entry cap, or ack-based pruning never contributes"
+);
+
+/// The broadcast queue. Each peer tracks its own `last_outbound_seq`, so every
+/// peer receives every message that is still here when it flushes.
+///
+/// Entries hold an `Arc` because the SAME message goes to every peer. The queue
+/// used to hold the message itself and every flush CLONED up to
+/// OUTBOUND_FLUSH_BATCH of them while the global lock was held — one 2 MiB
+/// block in flight to 128 peers was 128 deep copies, made one after another
+/// behind the lock that every push and every other flush waits on. The Arc
+/// makes a flush cost eight bytes per message, and makes the byte bound mean
+/// what it says: one copy of the payload, counted once.
+struct OutboundQueue {
+    /// Newest sequence handed out. Keeps counting when entries are evicted,
+    /// because peers' cursors are compared against it.
+    seq: u64,
+    /// Sorted ascending by sequence: pushes go to the back and both eviction
+    /// and pruning take from the front, which is what lets `since` binary-search.
+    msgs: std::collections::VecDeque<(u64, usize, Arc<P2PMessage>)>,
+    bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+    /// Evictions not yet reported, and when the last report went out. Carried
+    /// rather than dropped, so a throttled line reports a count and not just
+    /// the one eviction that happened to be due.
+    dropped_since_warn: usize,
+    last_warn: Option<Instant>,
+}
+
+impl OutboundQueue {
+    fn new() -> Self {
+        Self::with_limits(MAX_OUTBOUND_ENTRIES, MAX_OUTBOUND_BYTES)
+    }
+
+    /// The limits are fields, not constants read inline, so a test can drive
+    /// the eviction logic without allocating the real budget. Six tests filling
+    /// 64 MiB put a few hundred megabytes of churn through the allocator while
+    /// the rest of the suite runs in parallel, and that is enough to deschedule
+    /// another test's thread past a 50 ms deadline. One test pins `new()` to the
+    /// real constants so the cheap ones cannot drift away from them.
+    fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            seq: 0,
+            msgs: std::collections::VecDeque::with_capacity(256),
+            bytes: 0,
+            max_entries,
+            max_bytes,
+            dropped_since_warn: 0,
+            last_warn: None,
+        }
+    }
+
+    fn pop_front(&mut self) {
+        if let Some((_, size, _)) = self.msgs.pop_front() {
+            self.bytes = self.bytes.saturating_sub(size);
+        }
+    }
+
+    /// Queue one broadcast. Returns `Some((dropped, queued_bytes))` when a
+    /// report is due, for the CALLER to log once it has released this queue's
+    /// lock — see OUTBOUND_WARN_INTERVAL for why that matters.
+    ///
+    /// Newest-wins: an overflow drops the OLDEST entry, never the arriving one.
+    /// Stale gossip is worthless to live peers, which backfill through
+    /// header-sync, while the arriving message may be the GetHeaders that
+    /// drives a sync — dropping those wedged IBD entirely.
+    fn push(&mut self, msg: P2PMessage) -> Option<(usize, usize)> {
+        let size = payload_size_estimate(&msg);
+        let mut dropped = 0usize;
+        while !self.msgs.is_empty()
+            && (self.msgs.len() >= self.max_entries || self.bytes + size > self.max_bytes)
+        {
+            self.pop_front();
+            dropped += 1;
+        }
+        self.seq += 1;
+        self.bytes += size;
+        self.msgs.push_back((self.seq, size, Arc::new(msg)));
+
+        if dropped == 0 {
+            return None;
+        }
+        self.dropped_since_warn = self.dropped_since_warn.saturating_add(dropped);
+        if self
+            .last_warn
+            .is_some_and(|t| t.elapsed() < OUTBOUND_WARN_INTERVAL)
+        {
+            return None;
+        }
+        self.last_warn = Some(Instant::now());
+        Some((std::mem::take(&mut self.dropped_since_warn), self.bytes))
+    }
+
+    /// At most `batch` entries after `since`, as Arc clones.
+    ///
+    /// The deque is sorted by sequence, so the starting point is a binary
+    /// search rather than a walk: the old filter scanned from the front on
+    /// every flush of every peer, which for a peer at the tip meant reading the
+    /// whole queue to find nothing.
+    fn since(&self, since: u64, batch: usize) -> Vec<(u64, Arc<P2PMessage>)> {
+        let start = self.msgs.partition_point(|(seq, _, _)| *seq <= since);
+        self.msgs
+            .range(start..)
+            .take(batch)
+            .map(|(seq, _, msg)| (*seq, Arc::clone(msg)))
+            .collect()
+    }
+
+    /// Drop everything at or below `cutoff`, returning how many went.
+    fn prune(&mut self, cutoff: u64) -> usize {
+        let mut dropped = 0usize;
+        while self.msgs.front().is_some_and(|(seq, _, _)| *seq <= cutoff) {
+            self.pop_front();
+            dropped += 1;
+        }
+        dropped
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.msgs.len()
+    }
+
+    #[cfg(test)]
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+static OUTBOUND_MSGS: Lazy<Arc<PlMutex<OutboundQueue>>> =
+    Lazy::new(|| Arc::new(PlMutex::new(OutboundQueue::new())));
 
 /// Estimated payload bytes of a message: the heap data, not the stack enum.
 ///
@@ -342,6 +518,14 @@ static OUTBOUND_MSGS: Lazy<Arc<PlMutex<(u64, Vec<(u64, P2PMessage)>)>>> =
 /// estimate — two implementations of the same notion drift, and a byte budget
 /// that disagrees with the rate limiter about what a message costs is worse
 /// than no budget.
+///
+/// It is EXACT for the variants that carry the bytes — Block, Tx, ShadowTx,
+/// OnionTx are their payload's length — and an undercount for the container
+/// variants, where it counts the string contents but not the per-`String`
+/// header or the `Vec` itself: an Inv of 5,000 items is short by about 240 KiB
+/// of allocator overhead. Those variants are small and bounded by their own
+/// item caps, and the bound exists for the megabyte payloads, so the estimate
+/// is tight exactly where it has to be.
 fn payload_size_estimate(msg: &P2PMessage) -> usize {
     match msg {
         P2PMessage::Block { data } => data.len(),
@@ -1697,18 +1881,14 @@ pub fn report_bad_peer_cat(peer_id: &str, score: u64, reason: &str, category: Ba
 /// Push a message to be broadcast to all connected peers.
 /// Thread-safe: can be called from any thread (e.g. TxRelay, mempool).
 pub fn push_outbound(msg: P2PMessage) {
-    let mut q = OUTBOUND_MSGS.lock();
-    if q.1.len() >= 10_000 {
-        // Newest-wins: drop the OLDEST queued message, never the new one.
-        // Stale gossip is worthless to live peers (laggards backfill via
-        // header-sync/IBD), while the new message may be a critical sync
-        // request (GetHeaders) — dropping those wedged IBD entirely.
-        q.1.remove(0);
-        slog_warn!("p2p", "outbound_queue_full");
+    // The lock is released before the log line, because the line is a blocking
+    // write to a stderr the whole process shares.
+    let report = OUTBOUND_MSGS.lock().push(msg);
+    if let Some((dropped, queued_bytes)) = report {
+        slog_warn!("p2p", "outbound_queue_full",
+            dropped => dropped,
+            queued_bytes => queued_bytes);
     }
-    let seq = q.0 + 1;
-    q.0 = seq;
-    q.1.push((seq, msg));
 }
 
 /// The current global broadcast sequence number. A freshly-connected peer must
@@ -1719,7 +1899,7 @@ pub fn push_outbound(msg: P2PMessage) {
 /// lag" and the peer is wrongly disconnected as slow the instant it connects,
 /// which prevents a lagging node from ever catching up (chain never converges).
 fn current_outbound_seq() -> u64 {
-    OUTBOUND_MSGS.lock().0
+    OUTBOUND_MSGS.lock().seq
 }
 
 /// Push a message targeted at a specific peer (block/header serve, and the
@@ -1809,7 +1989,6 @@ fn min_outbound_ack() -> Option<u64> {
 /// the newest `OUTBOUND_HARD_RETAIN` are stale gossip by definition; a peer that
 /// far behind backfills through header-sync/IBD instead.
 fn prune_cutoff(min_ack: Option<u64>, max_seq: u64) -> u64 {
-    const OUTBOUND_HARD_RETAIN: u64 = 4_096;
     let hard = max_seq.saturating_sub(OUTBOUND_HARD_RETAIN);
     min_ack.unwrap_or(0).max(hard)
 }
@@ -1818,26 +1997,19 @@ fn prune_cutoff(min_ack: Option<u64>, max_seq: u64) -> u64 {
 /// Each peer tracks its own `last_outbound_seq` to ensure ALL peers
 /// receive ALL broadcast messages (not just the first to drain).
 /// Also prunes old messages that all peers have had time to read.
-fn drain_outbound_since(since: u64) -> (Vec<(u64, P2PMessage)>, u64) {
+fn drain_outbound_since(since: u64) -> (Vec<(u64, Arc<P2PMessage>)>, u64) {
     // Oldest messages a flush hands one peer in one call. Bounds the per-flush
-    // clone cost (the cursor advances incrementally; the next flush continues),
-    // so one slow peer's flush can no longer scan-and-clone a huge backlog.
+    // cost (the cursor advances incrementally; the next flush continues), so
+    // one slow peer's flush can no longer walk a huge backlog.
     const OUTBOUND_FLUSH_BATCH: usize = 512;
     // Before the queue is locked, so this function holds one lock at a time.
     let min_ack = min_outbound_ack();
     let mut q = OUTBOUND_MSGS.lock();
-    let new_msgs: Vec<(u64, P2PMessage)> =
-        q.1.iter()
-            .filter(|(seq, _)| *seq > since)
-            .take(OUTBOUND_FLUSH_BATCH)
-            .map(|(seq, msg)| (*seq, msg.clone()))
-            .collect();
-    let max_seq = q.0;
+    let new_msgs = q.since(since, OUTBOUND_FLUSH_BATCH);
+    let max_seq = q.seq;
     let cutoff = prune_cutoff(min_ack, max_seq);
     if cutoff > 0 {
-        let before = q.1.len();
-        q.1.retain(|(seq, _)| *seq > cutoff);
-        let dropped = before.saturating_sub(q.1.len());
+        let dropped = q.prune(cutoff);
         if dropped > 0 {
             slog_debug!("p2p", "outbound_queue_pruned",
                 dropped => dropped,
@@ -4458,6 +4630,212 @@ mod tests {
         assert_eq!(picked, vec![3, 0], "a cursor past the end wraps, not panics");
     }
 
+    // ── the broadcast queue: one copy, bounded in bytes ───────────────────
+
+    fn broadcast_block(bytes: usize) -> P2PMessage {
+        P2PMessage::Block {
+            data: vec![0u8; bytes],
+        }
+    }
+
+    #[test]
+    fn the_broadcast_queue_uses_the_real_limits() {
+        // The behaviour tests below run on small limits so they allocate
+        // nothing; this is what keeps them honest about the real ones.
+        let q = OutboundQueue::new();
+        assert_eq!(q.max_entries, MAX_OUTBOUND_ENTRIES);
+        assert_eq!(q.max_bytes, MAX_OUTBOUND_BYTES);
+    }
+
+    #[test]
+    fn the_broadcast_queue_is_bounded_in_bytes_not_just_entries() {
+        // It had no byte term at all, while entries hold relayed blocks and
+        // transactions — and prune_cutoff keeps OUTBOUND_HARD_RETAIN entries
+        // whatever peers have acknowledged, so the FLOOR was in the gigabytes.
+        // Entry cap high, byte cap low: only the byte term can be doing this.
+        let mut q = OutboundQueue::with_limits(1_000, 8 * 1024);
+        for _ in 0..40 {
+            q.push(broadcast_block(1024));
+        }
+        assert!(
+            q.bytes() <= 8 * 1024,
+            "queued bytes must stay inside the budget, got {}",
+            q.bytes()
+        );
+        assert!(
+            q.len() < 40,
+            "the byte budget must have evicted, not just the entry cap"
+        );
+
+        // A single maximum-size block is never refused by the REAL budget,
+        // however full we are — the invariant the const assert pins.
+        let mut q = OutboundQueue::new();
+        q.push(broadcast_block(
+            crate::service::network::dos_guard::MAX_BLOCK_BYTES,
+        ));
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn a_broadcast_overflow_drops_the_oldest_not_the_arriving_message() {
+        // Newest-wins: stale gossip is worthless to live peers, which backfill
+        // through header-sync, while the arriving message may be the GetHeaders
+        // that drives a sync — dropping those wedged IBD entirely.
+        // Byte cap high, entry cap low: only the entry term can be doing this.
+        let entries = 8usize;
+        let mut q = OutboundQueue::with_limits(entries, 1 << 20);
+        for i in 0..(entries + 5) {
+            q.push(P2PMessage::Ping { nonce: i as u64 });
+        }
+        assert_eq!(q.len(), entries, "the entry cap must hold");
+
+        let all = q.since(0, entries);
+        assert!(
+            matches!(*all[0].1, P2PMessage::Ping { nonce: 5 }),
+            "the five oldest went, not the five newest"
+        );
+        assert!(matches!(
+            *all[all.len() - 1].1,
+            P2PMessage::Ping { nonce } if nonce == (entries + 4) as u64
+        ));
+    }
+
+    #[test]
+    fn a_flush_hands_out_a_handle_not_a_copy_of_the_payload() {
+        // THE REAL EXPOSURE: the drain cloned up to OUTBOUND_FLUSH_BATCH
+        // messages while the GLOBAL lock was held, per peer per flush. The same
+        // message goes to every peer, so one 2 MiB block in flight to 128 peers
+        // was 128 deep copies made one after another behind the lock that every
+        // push and every other flush waits on.
+        let mut q = OutboundQueue::new();
+        q.push(broadcast_block(1024));
+        let first = q.since(0, 512);
+        let second = q.since(0, 512);
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert!(
+            Arc::ptr_eq(&first[0].1, &second[0].1),
+            "two flushes of one message must share it, not copy it"
+        );
+    }
+
+    #[test]
+    fn the_overflow_report_is_due_at_most_once_per_interval() {
+        // The warning used to be emitted inside this queue's lock, once per
+        // eviction. `emit` ends in `eprintln!` and Rust's stderr is unbuffered,
+        // so that is a blocking syscall per broadcast, taken while holding the
+        // lock every peer's flush waits on — and with max-size blocks the byte
+        // ceiling binds at 32 entries, so it would fire on every push.
+        let mut q = OutboundQueue::with_limits(2, 1 << 20);
+        assert!(q.push(P2PMessage::Ping { nonce: 1 }).is_none());
+        assert!(q.push(P2PMessage::Ping { nonce: 2 }).is_none());
+
+        // The first eviction after a quiet period reports.
+        let first = q.push(P2PMessage::Ping { nonce: 3 });
+        assert_eq!(first, Some((1, q.bytes())), "one eviction, reported");
+
+        // Everything inside the interval is silent, and the count is CARRIED
+        // rather than lost, so the throttled line is a rate and not one event.
+        for i in 4..20u64 {
+            assert!(q.push(P2PMessage::Ping { nonce: i }).is_none(), "i={i}");
+        }
+        assert_eq!(
+            q.dropped_since_warn, 16,
+            "the unreported evictions must accumulate"
+        );
+
+        // And they must come OUT in the next line, which is the whole point of
+        // carrying them: a throttled report is a rate, not the one eviction
+        // that happened to be due. A control that reported only the current
+        // push's count passed everything above, because nothing here took a
+        // SECOND report — the interval is a whole second and this test runs in
+        // microseconds. Clearing `last_warn` is how it gets one without a
+        // sleep, the same reason the TTL and the two limits are parameters.
+        q.last_warn = None;
+        let second = q.push(P2PMessage::Ping { nonce: 20 });
+        assert_eq!(
+            second,
+            Some((17, q.bytes())),
+            "the sixteen carried, plus this push's own eviction"
+        );
+        assert_eq!(
+            q.dropped_since_warn, 0,
+            "and reporting them clears the carry"
+        );
+    }
+
+    #[test]
+    fn a_cursor_finds_its_place_without_walking_the_queue() {
+        // `since` binary-searches, which is only valid because the deque stays
+        // sorted by sequence: pushes go to the back, and both eviction and
+        // pruning take from the front.
+        let mut q = OutboundQueue::new();
+        for i in 0..50u64 {
+            q.push(P2PMessage::Ping { nonce: i });
+        }
+        assert_eq!(q.since(50, 512).len(), 0, "a peer at the tip gets nothing");
+        let tail = q.since(49, 512);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].0, 50, "sequences are 1-based");
+
+        let batch = q.since(10, 512);
+        assert_eq!(batch.len(), 40);
+        assert_eq!(batch[0].0, 11, "the first entry AFTER the cursor");
+        assert!(
+            batch.windows(2).all(|w| w[0].0 < w[1].0),
+            "and in sequence order"
+        );
+
+        // Bounded per flush, so one slow peer cannot walk a huge backlog.
+        assert_eq!(q.since(0, 7).len(), 7);
+    }
+
+    #[test]
+    fn pruning_keeps_the_byte_total_honest() {
+        let mut q = OutboundQueue::new();
+        for _ in 0..10 {
+            q.push(broadcast_block(1000));
+        }
+        let ten = q.bytes();
+        assert_eq!(q.prune(4), 4, "everything at or below the cutoff goes");
+        assert_eq!(q.len(), 6);
+        assert_eq!(
+            q.bytes(),
+            ten / 10 * 6,
+            "the byte total must come down with the entries"
+        );
+        assert_eq!(q.prune(0), 0, "a cutoff below the front drops nothing");
+        q.prune(u64::MAX);
+        assert_eq!(q.len(), 0);
+        assert_eq!(q.bytes(), 0, "and back to zero when it empties");
+
+        // Pruning must not roll the counter back either: a cursor ahead of it
+        // reads as thousands of seqs of lag and gets the peer disconnected.
+        // Eviction is covered by its own test; prune runs on EVERY flush.
+        assert_eq!(q.seq, 10, "an emptied queue has still issued ten sequences");
+        q.push(broadcast_block(1000));
+        assert_eq!(q.seq, 11, "and the next push continues from there");
+        assert_eq!(q.since(10, 512).len(), 1);
+    }
+
+    #[test]
+    fn the_sequence_keeps_counting_when_entries_are_evicted() {
+        // Peers' cursors are compared against the newest sequence, so it must
+        // not be rolled back by an eviction: a cursor ahead of the counter
+        // reads as thousands of seqs of lag and gets the peer disconnected.
+        let mut q = OutboundQueue::with_limits(4, 1 << 20);
+        for _ in 0..100 {
+            q.push(broadcast_block(64));
+        }
+        assert_eq!(q.seq, 100, "a hundred pushes is a hundred sequences");
+        assert!(q.len() < 100, "most of them were evicted");
+        assert_eq!(
+            q.since(q.seq, 512).len(),
+            0,
+            "and nothing sits past the newest sequence"
+        );
+    }
+
     // ── the ban key is the host, so one offence must score once ───────────
 
     #[test]
@@ -5370,6 +5748,50 @@ mod tests {
     }
 
     #[test]
+    fn the_deadline_fires_only_once_it_has_passed() {
+        // The two halves the drip test cannot assert without a clock: an armed
+        // reader whose deadline is already behind it refuses the FIRST read, and
+        // an armed reader whose deadline is ahead of it does not interfere at
+        // all. Together they rule out a guard that fires early — which would
+        // otherwise look exactly like the deadline working.
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut past = DeadlineReader::new(
+            DripReader {
+                reads: Arc::clone(&reads),
+            },
+            Instant::now(),
+        );
+        let mut one = [0u8; 1];
+        let err = past
+            .read(&mut one)
+            .expect_err("a deadline already behind us must refuse the read");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(err.to_string(), DEADLINE_ERROR_TEXT);
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "and must refuse it without reaching the socket"
+        );
+
+        // A deadline far enough ahead that no scheduler can reach it: the read
+        // must complete untouched. `repeat` never sleeps, so this is instant.
+        let mut future = DeadlineReader::new(
+            std::io::repeat(0x42),
+            Instant::now() + Duration::from_secs(3_600),
+        );
+        let mut buf = [0u8; 4096];
+        future
+            .read_exact(&mut buf)
+            .expect("an armed deadline must not interfere before it passes");
+        assert!(buf.iter().all(|b| *b == 0x42));
+
+        // And a disarmed reader is out of the way for good, which is what the
+        // established connection relies on.
+        future.disarm();
+        future.read_exact(&mut buf).expect("disarmed must not fire");
+    }
+
+    #[test]
     fn a_drip_cannot_outlive_the_pre_handshake_deadline() {
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let started = Instant::now();
@@ -5389,15 +5811,13 @@ mod tests {
             .expect_err("the deadline must end the read");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(err.to_string(), DEADLINE_ERROR_TEXT);
-        // Evidence that the DEADLINE ended this, and not something else.
-        // Deliberately not a count of recvs per unit time: the drip sleeps 1 ms
-        // but Windows' timer granularity is ~15.6 ms, and under the full suite's
-        // parallelism a 50 ms budget fits as few as 8 recvs.
+        // Evidence that the DEADLINE ended this, and not something else. NOT a
+        // lower bound on the recv count: that needed two recvs inside the 50 ms
+        // budget while the drip's 1 ms sleep is ~15.6 ms on Windows, a margin of
+        // three quanta, so one deschedule under the full suite's parallelism
+        // turned it red. `the_deadline_fires_only_once_it_has_passed` below
+        // proves the same thing without a clock.
         let recvs = reads.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(
-            recvs >= 2,
-            "the loop must have iterated, not failed on its first recv"
-        );
         assert!(
             recvs < buf.len(),
             "{} recvs for {} bytes — the read COMPLETED, so no deadline was needed",
