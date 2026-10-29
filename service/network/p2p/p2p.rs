@@ -997,10 +997,11 @@ pub fn cleanup_peer_state(peer_id: &str) {
         let mut p = PEER_PENDING.lock();
         p.remove(peer_id);
     }
-    {
-        let mut acks = PEER_LAST_OUTBOUND.lock();
-        acks.remove(peer_id);
-    }
+    // The outbound cursor is NOT removed here: `OutboundCursor` owns it for the
+    // life of the connection and drops it on every exit path, panics included.
+    // Removing it in both places would mean two owners for one entry, and the
+    // loser would delete a cursor the next connection from the same ip:port had
+    // just seeded — which silently drops that peer out of the pruning minimum.
 }
 
 /// Drain all received peer addresses from Addr messages (call from node main loop).
@@ -1436,6 +1437,47 @@ fn drain_targeted_for(peer_id: &str) -> Vec<P2PMessage> {
     mine
 }
 
+/// The lowest outbound cursor any live connection holds, or None when none do.
+///
+/// Read BEFORE the broadcast queue is locked, NEVER from inside it. Taking the
+/// cursor map while holding the queue was one half of a lock-order inversion:
+/// seeding a cursor read the queue's sequence from inside the cursor lock, so
+/// one thread held cursors and wanted the queue while another held the queue and
+/// wanted cursors. Both are `parking_lot` mutexes with no timeout, so the pair
+/// wedges the accept path, every peer's flush, and — through `push_outbound` —
+/// the daemon event loop, with nothing to break it but a restart.
+///
+/// The minimum this returns CAN be overtaken: a connection that has already
+/// read the sequence it will seed with, and is then descheduled, inserts that
+/// older value after this call, so the early read is not conservative by
+/// itself. What makes pruning safe is the order at the seeding site: a
+/// connection's DELIVERY cursor is read AFTER its entry is seeded
+/// (`OutboundCursor::seed`, then `ConnectionSession::new`), so the delivery
+/// cursor is never below the seeded value, and the global sequence only rises.
+/// Whichever order this read and that seed happen in, the minimum returned is
+/// at or below that connection's delivery cursor — before the seed, it is at
+/// most the global sequence of an earlier instant; after it, at most the seeded
+/// value itself. So no live peer loses a broadcast it still wants. Seeding from
+/// a cached sequence, or reading the delivery cursor earlier, would break that.
+fn min_outbound_ack() -> Option<u64> {
+    PEER_LAST_OUTBOUND.lock().values().copied().min()
+}
+
+/// How far the broadcast queue may be pruned: everything at or below the
+/// returned sequence is dropped.
+///
+/// `min_ack` is what every live peer has already consumed. The hard retain is
+/// the backstop for when that cursor is pinned or stale — a leaked entry, or a
+/// retained whitelisted laggard — because a queue that stops pruning first
+/// slows every flush and finally wedges sync when it fills. Messages older than
+/// the newest `OUTBOUND_HARD_RETAIN` are stale gossip by definition; a peer that
+/// far behind backfills through header-sync/IBD instead.
+fn prune_cutoff(min_ack: Option<u64>, max_seq: u64) -> u64 {
+    const OUTBOUND_HARD_RETAIN: u64 = 4_096;
+    let hard = max_seq.saturating_sub(OUTBOUND_HARD_RETAIN);
+    min_ack.unwrap_or(0).max(hard)
+}
+
 /// Get outbound messages that this peer hasn't sent yet.
 /// Each peer tracks its own `last_outbound_seq` to ensure ALL peers
 /// receive ALL broadcast messages (not just the first to drain).
@@ -1445,6 +1487,8 @@ fn drain_outbound_since(since: u64) -> (Vec<(u64, P2PMessage)>, u64) {
     // clone cost (the cursor advances incrementally; the next flush continues),
     // so one slow peer's flush can no longer scan-and-clone a huge backlog.
     const OUTBOUND_FLUSH_BATCH: usize = 512;
+    // Before the queue is locked, so this function holds one lock at a time.
+    let min_ack = min_outbound_ack();
     let mut q = OUTBOUND_MSGS.lock();
     let new_msgs: Vec<(u64, P2PMessage)> =
         q.1.iter()
@@ -1453,35 +1497,69 @@ fn drain_outbound_since(since: u64) -> (Vec<(u64, P2PMessage)>, u64) {
             .map(|(seq, msg)| (*seq, msg.clone()))
             .collect();
     let max_seq = q.0;
-    // Ack-based pruning: remove messages every connected peer has consumed.
-    let min_ack = {
-        let acks = PEER_LAST_OUTBOUND.lock();
-        acks.values().copied().min()
-    };
-    if let Some(min_seq) = min_ack {
-        if min_seq > 0 {
-            let before = q.1.len();
-            q.1.retain(|(seq, _)| *seq > min_seq);
-            let dropped = before.saturating_sub(q.1.len());
-            if dropped > 0 {
-                slog_debug!("p2p", "outbound_queue_pruned",
-                    dropped => dropped,
-                    min_ack_seq => min_seq);
-            }
+    let cutoff = prune_cutoff(min_ack, max_seq);
+    if cutoff > 0 {
+        let before = q.1.len();
+        q.1.retain(|(seq, _)| *seq > cutoff);
+        let dropped = before.saturating_sub(q.1.len());
+        if dropped > 0 {
+            slog_debug!("p2p", "outbound_queue_pruned",
+                dropped => dropped,
+                cutoff_seq => cutoff,
+                min_ack_seq => min_ack.unwrap_or(0));
         }
     }
-    // Hard-cap retention INDEPENDENT of acks: a pinned or stale ack cursor
-    // (a leaked entry after a peer-thread panic, or a retained whitelisted
-    // laggard) must never freeze pruning — the growing queue first slows
-    // every flush and finally wedges sync when it fills. Broadcast messages
-    // older than the newest HARD_RETAIN are stale gossip by definition;
-    // a peer that far behind backfills via header-sync/IBD instead.
-    const OUTBOUND_HARD_RETAIN: u64 = 4_096;
-    let cutoff = max_seq.saturating_sub(OUTBOUND_HARD_RETAIN);
-    if cutoff > 0 {
-        q.1.retain(|(seq, _)| *seq > cutoff);
-    }
     (new_msgs, max_seq)
+}
+
+/// Owns one peer's outbound-broadcast cursor for the life of its connection.
+///
+/// The cursor was seeded at the top of `handle_peer_connection` and removed only
+/// by `cleanup_peer_state` after the main loop — with sixteen early exits in
+/// between and no `catch_unwind` anywhere in this file, so every failed
+/// handshake orphaned an entry keyed on the peer's own ephemeral port. The
+/// cheapest trigger is a bare TCP connect that sends nothing, bounded only by
+/// the inbound arrival budgets, and the entries are never swept.
+///
+/// Growth is the smaller half of it. `min_outbound_ack` takes the MINIMUM over
+/// the whole map on every flush of every peer, so the first leaked entry pins
+/// the broadcast queue's pruning cursor at the sequence it was abandoned on,
+/// for the life of the process: ack-based pruning stops contributing, the queue
+/// sits at its hard-retain ceiling, and every flush then walks and clones more
+/// of it — which also widens the window of the inversion this entry's own
+/// seeding used to open.
+struct OutboundCursor {
+    peer: String,
+}
+
+impl OutboundCursor {
+    /// Seed `peer`'s cursor at `seq`, leaving an existing cursor alone.
+    ///
+    /// A new peer must start at the CURRENT broadcast sequence, not 0: a cursor
+    /// of 0 pins the minimum at 0 and freezes pruning until a restart. The
+    /// historical backlog reaches a new peer through its own header-sync, never
+    /// the broadcast queue, so starting at the current sequence costs it
+    /// nothing.
+    ///
+    /// `seq` is a parameter precisely so this cannot read it from inside the
+    /// cursor lock — that is the order inversion described on
+    /// [`min_outbound_ack`], and making the sequence an argument is what makes
+    /// reintroducing it a compile error rather than a rare wedge.
+    fn seed(peer: &str, seq: u64) -> Self {
+        PEER_LAST_OUTBOUND
+            .lock()
+            .entry(peer.to_string())
+            .or_insert(seq);
+        Self {
+            peer: peer.to_string(),
+        }
+    }
+}
+
+impl Drop for OutboundCursor {
+    fn drop(&mut self) {
+        PEER_LAST_OUTBOUND.lock().remove(&self.peer);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1976,15 +2054,11 @@ impl P2P {
         let peer_str = peer_addr.to_string();
         // IP-only key for ban scoring — ephemeral port changes on reconnect
         let peer_ip = peer_addr.ip().to_string();
-        {
-            // Seed a new peer's outbound cursor at the CURRENT broadcast seq, not
-            // 0 — a fresh peer starting at 0 would pin min_ack at 0 and freeze the
-            // outbound-queue pruning (drain_outbound_since) until a restart. The
-            // historical backlog reaches a new peer via its own header-sync, never
-            // the broadcast queue, so skipping it here is correct.
-            let mut acks = PEER_LAST_OUTBOUND.lock();
-            acks.entry(peer_str.clone()).or_insert_with(current_outbound_seq);
-        }
+        // Held for the whole connection, so every exit path takes the cursor
+        // with it — the sixteen early returns between here and the main loop
+        // included, and a panic too. The sequence is read before the guard
+        // takes the cursor lock, not inside it.
+        let _cursor = OutboundCursor::seed(&peer_str, current_outbound_seq());
 
         // The read timeout above bounds one recv; this bounds the whole
         // handshake. Disarmed in the main loop the moment it completes.
@@ -4368,6 +4442,135 @@ mod tests {
             blocks_to_request(&hashes, 0, |_| false).is_empty(),
             "a zero limit requests nothing rather than spinning"
         );
+    }
+
+    // ── #4: the outbound cursor is owned, and holds one lock at a time ─────
+
+    #[test]
+    fn an_outbound_cursor_is_seeded_once_and_released_on_drop() {
+        // The map is a process global and the suite runs in parallel, so every
+        // assertion here is about this one key.
+        let peer = "203.0.113.41:11001";
+        {
+            let _cursor = OutboundCursor::seed(peer, 77);
+            assert_eq!(
+                PEER_LAST_OUTBOUND.lock().get(peer).copied(),
+                Some(77),
+                "the cursor must start at the sequence it was handed"
+            );
+            // Seeding again must leave a live cursor alone: overwriting it
+            // either rewinds a connected peer and re-sends what it already has,
+            // or jumps it forward and drops what it has not.
+            let _again = OutboundCursor::seed(peer, 5);
+            assert_eq!(PEER_LAST_OUTBOUND.lock().get(peer).copied(), Some(77));
+        }
+        assert!(
+            !PEER_LAST_OUTBOUND.lock().contains_key(peer),
+            "the cursor must not outlive the connection that seeded it"
+        );
+    }
+
+    #[test]
+    fn an_outbound_cursor_is_released_even_when_the_peer_thread_panics() {
+        // The leak: the only remover ran after the main loop, so an unwinding
+        // panic — or any of the sixteen early returns before the loop — left
+        // the entry behind for the life of the process, pinning the broadcast
+        // queue's pruning cursor with it.
+        let peer = "203.0.113.42:11002".to_string();
+        let moved = peer.clone();
+        let joined = thread::spawn(move || {
+            let _cursor = OutboundCursor::seed(&moved, 9);
+            assert!(PEER_LAST_OUTBOUND.lock().contains_key(&moved));
+            panic!("handshake blew up");
+        })
+        .join();
+        assert!(joined.is_err(), "the thread must have panicked");
+        assert!(
+            !PEER_LAST_OUTBOUND.lock().contains_key(&peer),
+            "a panicking peer thread must still hand the cursor back"
+        );
+    }
+
+    #[test]
+    fn neither_side_of_the_cursor_inversion_holds_one_lock_to_wait_on_the_other() {
+        // The inversion: seeding a cursor read the broadcast queue's sequence
+        // from INSIDE the cursor lock (cursors -> queue), while the drain held
+        // the queue and then took the cursor map (queue -> cursors). Two
+        // parking_lot mutexes with no timeout: when the two met, the accept
+        // path, every peer's flush and the daemon's own push_outbound wedged
+        // together until a restart.
+        //
+        // Both halves are checked HERE, in sequence, and deliberately not as
+        // two tests: each half holds exactly what the other waits for, so run
+        // in parallel they would starve each other and whichever polled would
+        // lose.
+
+        // Half one: with the queue held by someone else, seeding must still
+        // finish — it is handed the sequence instead of reading it.
+        {
+            let queue = OUTBOUND_MSGS.lock();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let handle = thread::spawn(move || {
+                let cursor = OutboundCursor::seed("203.0.113.43:11003", 3);
+                let _ = tx.send(());
+                drop(cursor);
+            });
+            let seeded = rx.recv_timeout(Duration::from_secs(5));
+            // Released before the join, so a regression fails this test rather
+            // than hanging the suite.
+            drop(queue);
+            handle.join().expect("the seeding thread must not panic");
+            assert!(
+                seeded.is_ok(),
+                "seeding a cursor blocked while the broadcast queue was held"
+            );
+        }
+
+        // Half two: with the cursor map held, a drain must be waiting on the
+        // CURSORS and not sitting on the queue — so the queue is observably
+        // free. The ready signal only narrows the start-up window, so a
+        // regression could still slip through as a pass on a loaded machine;
+        // that is the safe direction, and it never goes red spuriously.
+        let cursors = PEER_LAST_OUTBOUND.lock();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || {
+            let _ = ready_tx.send(());
+            drain_outbound_since(0)
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the drain thread must start");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut queue_was_free = false;
+        while Instant::now() < deadline {
+            if OUTBOUND_MSGS.try_lock().is_some() {
+                queue_was_free = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(cursors);
+        let _ = handle.join();
+        assert!(
+            queue_was_free,
+            "the broadcast queue stayed locked while the drain waited on cursors"
+        );
+    }
+
+    #[test]
+    fn the_prune_cutoff_takes_the_later_of_the_acks_and_the_hard_retain() {
+        // Nothing connected: nothing has been consumed, and a young queue is
+        // inside the hard window, so nothing is pruned.
+        assert_eq!(prune_cutoff(None, 10), 0);
+        // Every peer has consumed up to 5 and the queue is young: prune to 5.
+        assert_eq!(prune_cutoff(Some(5), 10), 5);
+        // A cursor pinned low — by a leaked entry, or a retained laggard — must
+        // not freeze pruning: the hard retain takes over. This is the backstop
+        // that kept the leak from being an unbounded QUEUE as well as an
+        // unbounded map.
+        assert_eq!(prune_cutoff(Some(5), 10_000), 10_000 - 4_096);
+        // A fleet that is ahead of the hard window prunes by the acks.
+        assert_eq!(prune_cutoff(Some(9_000), 10_000), 9_000);
     }
 
     #[test]
