@@ -4487,15 +4487,27 @@ impl RpcServer {
         )
     }
 
+    /// What this node actually relays, sourced from the constants the live path
+    /// enforces.
+    ///
+    /// Three of the four fields were untrue. "standard + compact" and the
+    /// compact_block object described a protocol with NO wire command: CommandId
+    /// has nineteen variants and none is a compact block, and the only
+    /// CompactBlock reference outside its own module is in `network::gossip`,
+    /// which is constructed nowhere in production. "max 50K items" came from
+    /// `network::protocol::messages::MAX_INV_ITEMS`, in a module nothing outside
+    /// its own directory calls; the cap the live path enforces is
+    /// `p2p::protocol::MAX_INV_PER_MSG`, ten times smaller. Only the
+    /// Dandelion++ claim held up: `DandelionRelay::new()` in mempool_manager,
+    /// driven per transaction by `on_new_tx_with_peers`.
     fn cmd_getrelayinfo(id: Value) -> RpcResponse {
-        use crate::service::network::relay::compact_block::{MAX_PREFILLED, SHORT_ID_BYTES};
+        use crate::service::network::p2p::protocol::MAX_INV_PER_MSG;
         RpcResponse::ok(
             id,
             json!({
-                "block_relay": "standard + compact",
-                "compact_block": {"short_id_bytes": SHORT_ID_BYTES, "max_prefilled": MAX_PREFILLED, "savings_pct": 95},
+                "block_relay": "standard",
                 "tx_relay": "standard + Dandelion++",
-                "inv_relay": "batched (max 50K items)",
+                "inv_relay": {"max_items_per_msg": MAX_INV_PER_MSG},
             }),
         )
     }
@@ -5382,6 +5394,30 @@ mod tests {
     use std::path::PathBuf;
     use std::str::FromStr;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn getrelayinfo_reports_only_what_this_node_relays() {
+        // Three of its four fields were untrue. "standard + compact" and a
+        // compact_block object described a protocol with no CommandId at all,
+        // reachable only through `network::gossip`, which production never
+        // constructs. "max 50K items" came from a constant in a module nothing
+        // outside its own directory calls, while the live path enforces one ten
+        // times smaller. The advertised cap is read from that live constant
+        // here, so the number cannot drift away from the enforcement again.
+        let resp = RpcServer::cmd_getrelayinfo(json!(1));
+        let r = resp.result.expect("getrelayinfo returns a result");
+        assert_eq!(r["block_relay"], "standard");
+        assert!(
+            r.get("compact_block").is_none(),
+            "a protocol this node has no wire command for is not advertised"
+        );
+        assert_eq!(r["tx_relay"], "standard + Dandelion++");
+        assert_eq!(
+            r["inv_relay"]["max_items_per_msg"].as_u64(),
+            Some(crate::service::network::p2p::protocol::MAX_INV_PER_MSG as u64),
+            "the advertised cap must be the one the live path enforces"
+        );
+    }
 
     fn temp_db_dir() -> PathBuf {
         let uniq = SystemTime::now()

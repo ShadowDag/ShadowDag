@@ -622,7 +622,14 @@ pub fn payload_size_bounds(cmd: CommandId) -> (usize, usize) {
         CommandId::Addr => (BINCODE_TAG, BINCODE_TAG + 256 * 1024),
         CommandId::Inv => (BINCODE_TAG + 1, BINCODE_TAG + 512 * 1024),
         CommandId::GetData => (BINCODE_TAG + 1, BINCODE_TAG + 512 * 1024),
-        // Block: up to 2 MiB (MAX_BLOCK_SIZE is 2 MB per consensus)
+        // Block: up to MAX_MESSAGE_SIZE, which is TWICE the 2 MB
+        // ConsensusParams::MAX_BLOCK_SIZE a block may actually be. The comment
+        // here used to claim the 2 MB figure the bound does not apply. Left as
+        // it is deliberately: narrowing what the wire accepts is a change to
+        // what we refuse from peers, which the audit freeze covers. Until then
+        // every consumer of a Block payload must bound its own memory rather
+        // than trust this to have done it — the orphan pool did not, and held
+        // 5,000 of them.
         CommandId::Block => (BINCODE_TAG + 60, MAX_MESSAGE_SIZE),
         // Tx: max 256 KiB (prevents single giant TXs with millions of inputs)
         CommandId::Tx => (BINCODE_TAG + 12, 256 * 1024),
