@@ -1074,7 +1074,14 @@ fn reconnect_due(peers: &PeerManager, addr: &str) -> bool {
     }
     // Never dial a banned peer (a stale ban or a real one): dialing it just
     // gets rejected and re-bans via connection spam.
-    if peers.is_banned(addr) {
+    //
+    // Both systems are asked. peer_manager's is PERSISTENT and has no
+    // production writer, so on its own this gate always answered false and the
+    // loop kept dialling hosts the live guard had banned — every message from
+    // which we then drop, for a dial budget that is deliberately scarce. The
+    // live check is a host-keyed pure read, so it is affordable per candidate;
+    // whitelisted seeds answer false, so our own seeds are never refused.
+    if peers.is_banned(addr) || DOS_GUARD.is_banned(addr) {
         return false;
     }
     // Rate-limit re-dials of the same peer so a fast-failing target (banned,
@@ -1849,6 +1856,25 @@ pub fn push_pending_tx(peer_id: &str, tx: Transaction) -> bool {
 /// each handled a bare IPv6 literal differently.
 pub fn extract_ban_ip(addr: &str) -> String {
     crate::service::network::dos_guard::host_key(addr).to_string()
+}
+
+/// Whether the live DoS guard has this host banned.
+///
+/// Public because the operator's RPC peer view reported `banned` out of
+/// `peer_manager`'s persistent store, which nothing in production writes, so it
+/// answered false for every host this guard had banned.
+pub fn is_peer_banned(addr: &str) -> bool {
+    DOS_GUARD.is_banned(addr)
+}
+
+/// The live ban record for a host, for the operator's peer view.
+pub fn peer_ban_info(addr: &str) -> Option<crate::service::network::dos_guard::BanInfo> {
+    DOS_GUARD.get_ban_info(addr)
+}
+
+/// Every host the live guard has banned right now. Bounded by MAX_BAN_RECORDS.
+pub fn banned_peers() -> Vec<(String, crate::service::network::dos_guard::BanInfo)> {
+    DOS_GUARD.banned_peers()
 }
 
 /// One round of DoS-guard maintenance: decay every peer's ban score toward 0,
@@ -4834,6 +4860,44 @@ mod tests {
             0,
             "and nothing sits past the newest sequence"
         );
+    }
+
+    // ── the dial loop must ask the system that actually bans ──────────────
+
+    #[test]
+    fn the_dial_loop_will_not_dial_a_host_the_guard_has_banned() {
+        // "Never dial a banned peer" asked peer_manager's PERSISTENT ban store,
+        // which has no production writer — add_penalty and ban_peer are called
+        // only from tests — so the gate always answered false and the loop kept
+        // dialling hosts the live guard had banned, spending a dial budget that
+        // 39f9d09 made deliberately scarce on connections whose every message
+        // we then drop. Asking the live guard is affordable only because that
+        // check is now a host-keyed pure READ.
+        let path = "/tmp/p2p_reconnect_ban";
+        let _ = std::fs::remove_dir_all(path);
+        let pm = PeerManager::open(path).expect("peer store");
+
+        let addr = "192.0.2.70:9333";
+        assert!(reconnect_due(&pm, addr), "an unknown host is dialable");
+
+        report_bad_peer_cat(
+            addr,
+            crate::service::network::dos_guard::BAN_SCORE_AUTOBAN,
+            "invalid PoW",
+            BanCategory::Malicious,
+        );
+        assert!(
+            !reconnect_due(&pm, addr),
+            "a host the live guard has banned must not be dialled"
+        );
+        assert!(
+            !reconnect_due(&pm, "192.0.2.70:41122"),
+            "nor on another of its ports — the ban belongs to the host"
+        );
+        // And the operator can see it, which is the other half of the same
+        // defect: the RPC view read the same empty store.
+        assert!(is_peer_banned("192.0.2.70:1"));
+        assert!(banned_peers().iter().any(|(h, _)| h == "192.0.2.70"));
     }
 
     // ── the ban key is the host, so one offence must score once ───────────

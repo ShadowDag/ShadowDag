@@ -423,6 +423,19 @@ impl BanRecord {
     fn ban_active(&self) -> bool {
         self.banned && unix_now() < self.ban_until
     }
+
+    /// One mapping from record to report. `get_ban_info` and `banned_peers`
+    /// both need it, and two copies of it would drift.
+    fn info(&self) -> BanInfo {
+        BanInfo {
+            score: self.score,
+            banned: self.banned,
+            ban_until: self.ban_until,
+            ban_count: self.ban_count,
+            worst_category: self.worst_category,
+            reason: self.reason.clone(),
+        }
+    }
 }
 
 /// Free one slot in the reputation table, examining at most EVICT_SCAN_LIMIT
@@ -718,14 +731,23 @@ impl DosGuard {
     /// Get detailed ban info for diagnostics / RPC.
     pub fn get_ban_info(&self, peer: &str) -> Option<BanInfo> {
         let bans = self.bans.read().unwrap_or_else(|e| e.into_inner());
-        bans.get(host_key(peer)).map(|r| BanInfo {
-            score: r.score,
-            banned: r.banned,
-            ban_until: r.ban_until,
-            ban_count: r.ban_count,
-            worst_category: r.worst_category,
-            reason: r.reason.clone(),
-        })
+        bans.get(host_key(peer)).map(BanRecord::info)
+    }
+
+    /// Every host whose ban is active right now, with its record.
+    ///
+    /// For the operator's view. The RPC that reports bans reads
+    /// `peer_manager`'s PERSISTENT store, which has no production writer, so it
+    /// has always answered "none" however many hosts this guard had banned.
+    /// Bounded by MAX_BAN_RECORDS; it clones a reason string per banned host
+    /// under the read lock, so it belongs to the RPC path and not the message
+    /// path.
+    pub fn banned_peers(&self) -> Vec<(String, BanInfo)> {
+        let bans = self.bans.read().unwrap_or_else(|e| e.into_inner());
+        bans.iter()
+            .filter(|(_, r)| r.ban_active())
+            .map(|(k, r)| (k.clone(), r.info()))
+            .collect()
     }
 
     /// Owe a record `secs` more seconds of decay than it has had, so a test can
@@ -1468,6 +1490,39 @@ mod tests {
         assert!(
             buckets.contains_key("192.0.2.41:1"),
             "a drained bucket must survive the sweep, or the rate limit resets"
+        );
+    }
+
+    #[test]
+    fn the_banned_list_names_every_actively_banned_host_and_nobody_else() {
+        // The operator's banned-peers RPC reads peer_manager's PERSISTENT
+        // store, which has no production writer, so it reported "none" however
+        // many hosts this guard had banned. This is what it should be asking.
+        let g = DosGuard::new();
+        g.add_ban_score_cat(
+            "192.0.2.60:51234",
+            BAN_SCORE_AUTOBAN,
+            "invalid PoW",
+            BanCategory::Malicious,
+        );
+        g.add_ban_score_cat("192.0.2.61:1", 10, "minor", BanCategory::Resource);
+
+        let listed = g.banned_peers();
+        assert_eq!(listed.len(), 1, "only the host that is actually banned");
+        assert_eq!(listed[0].0, "192.0.2.60", "named by host, not by socket");
+        assert!(listed[0].1.banned);
+        assert_eq!(listed[0].1.score, BAN_SCORE_AUTOBAN);
+        assert!(listed[0].1.reason.contains("invalid PoW"));
+
+        // An expired ban is not an active one, and the list must say so even
+        // before tick_decay has run.
+        {
+            let mut bans = g.bans.write().unwrap();
+            bans.get_mut("192.0.2.60").unwrap().ban_until = unix_now().saturating_sub(1);
+        }
+        assert!(
+            g.banned_peers().is_empty(),
+            "a ban that has run out must not be listed"
         );
     }
 
