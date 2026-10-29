@@ -26,8 +26,8 @@ use crate::service::network::p2p::protocol::{
     build_version_payload, validate_addr_list, validate_hash_hex, validate_header,
     validate_headers_list, validate_inv_count, validate_inv_item, validate_payload_checksum,
     validate_payload_size, validate_reject, CommandId, ProtocolSession, VersionPayload, WireHeader,
-    DEFAULT_BPS, HANDSHAKE_TIMEOUT_SECS, MAX_INV_PER_MSG, MAX_MESSAGE_SIZE, PUZZLE_TIMEOUT_SECS,
-    WIRE_HEADER_SIZE,
+    DEFAULT_BPS, HANDSHAKE_TIMEOUT_SECS, MAX_ADDR_PER_MSG, MAX_INV_PER_MSG, MAX_MESSAGE_SIZE,
+    PUZZLE_TIMEOUT_SECS, WIRE_HEADER_SIZE,
 };
 use crate::{slog_debug, slog_error, slog_info, slog_warn};
 
@@ -323,6 +323,34 @@ const MAX_OUTBOUND_LAG_SEQS: u64 = 5_000;
 const MAX_BYTES_PER_PEER_PER_MIN: u64 = 100 * 1024 * 1024;
 /// Interval for bandwidth check (seconds)
 const BANDWIDTH_CHECK_INTERVAL_SECS: u64 = 60;
+/// Addresses one connection may have us PROCESS before it has to wait, and the
+/// rate at which the allowance comes back.
+///
+/// Bitcoin Core's numbers: MAX_ADDR_PROCESSING_TOKEN_BUCKET = 1000 and
+/// MAX_ADDR_RATE_PER_SECOND = 0.1 — a thousand addresses at once, then one
+/// every ten seconds. There was no bound on PROCESSING here at all: COST_ADDR
+/// is ONE token for a message carrying MAX_ADDR_PER_MSG = 1,000 addresses, so
+/// at BUCKET_REFILL_RATE a peer could offer eight hundred thousand addresses a
+/// second — each one a routability parse, and past the queue a RocksDB write
+/// under the peer store's global mutex. Cheap in and expensive out is the shape
+/// that produced the GetHeaders amplifier and the puzzle amplifier.
+///
+/// The allowance is per CONNECTION, as it is upstream, not per host: a
+/// reconnect resets the burst, and what bounds THAT is the arrival throttle and
+/// MAX_PEERS_PER_IP, not this. Keeping it in the session also means it cannot
+/// leak — it dies with the connection, where a global map would need a cap and
+/// a sweep of its own.
+const ADDR_TOKEN_BURST: usize = 1_000;
+const ADDR_TOKENS_PER_SEC: f64 = 0.1;
+const _: () = assert!(
+    ADDR_TOKEN_BURST >= MAX_ADDR_PER_MSG,
+    "one full Addr message must fit the burst, or an honest peer's first reply is clipped"
+);
+
+/// Addresses waiting for the daemon to feed them to the peer store. Was an
+/// unnamed literal beside the push that enforced it.
+const MAX_RECEIVED_ADDRS: usize = 4_096;
+
 /// Keepalive ping interval (seconds) — detect dead connections.
 const KEEPALIVE_INTERVAL_SECS: u64 = 60;
 /// Max time without pong before disconnecting (seconds).
@@ -2221,6 +2249,10 @@ struct ConnectionSession {
     /// legitimately asks us to solve at most one, so anything beyond the first
     /// is unpaid work for a stranger.
     puzzles_solved: u32,
+    /// Address-processing allowance left for this connection, and when it was
+    /// last refilled. See ADDR_TOKEN_BURST.
+    addr_tokens: f64,
+    addr_tokens_at: Instant,
 }
 
 // dos_type_name removed — CommandId::name() used directly now
@@ -2249,7 +2281,43 @@ impl ConnectionSession {
             // convergence for any node behind the broadcast counter.
             last_outbound_seq: current_outbound_seq(),
             puzzles_solved: 0,
+            addr_tokens: ADDR_TOKEN_BURST as f64,
+            addr_tokens_at: Instant::now(),
         }
+    }
+
+    /// Take up to `wanted` address-processing tokens and return how many were
+    /// granted. A trusted seed is exempt, exactly as upstream exempts a peer
+    /// holding the Addr permission: the fleet's own seeds must be able to hand
+    /// a lagging node a full address book.
+    fn take_addr_tokens(&mut self, wanted: usize, whitelisted: bool) -> usize {
+        if whitelisted {
+            return wanted;
+        }
+        let elapsed = self.addr_tokens_at.elapsed().as_secs_f64();
+        self.addr_tokens =
+            (self.addr_tokens + elapsed * ADDR_TOKENS_PER_SEC).min(ADDR_TOKEN_BURST as f64);
+        self.addr_tokens_at = Instant::now();
+        let granted = (self.addr_tokens.floor() as usize).min(wanted);
+        self.addr_tokens -= granted as f64;
+        granted
+    }
+
+    /// The prefix of `peers` this connection's allowance admits, and how many
+    /// it refuses.
+    ///
+    /// Spending and admitting are ONE call deliberately. The handler first took
+    /// a budget and decremented it per address, and a negative control that
+    /// deleted that decrement went unnoticed — the handler lives inside
+    /// `dispatch_message`, which no unit test can drive without a live socket.
+    /// Here there is no separate counter to forget.
+    fn admit_addresses<'a>(
+        &mut self,
+        peers: &'a [String],
+        whitelisted: bool,
+    ) -> (&'a [String], usize) {
+        let granted = self.take_addr_tokens(peers.len(), whitelisted);
+        (&peers[..granted], peers.len() - granted)
     }
 
     fn touch(&mut self) {
@@ -3550,18 +3618,29 @@ impl P2P {
                 // per-IP cap never trips), letting a handshaked peer grow the peer
                 // DB without bound (disk exhaustion) and poison peer selection.
                 {
+                    // An address costs an allowance token whether or not it
+                    // turns out to be routable: the work is the examination, and
+                    // garbage is already scored below. Over-rate addresses are
+                    // DROPPED and not punished, as upstream does — an honest
+                    // peer with a big address book is not an attacker.
+                    let whitelisted = crate::service::network::dos_guard::is_whitelisted(peer);
+                    let (admitted, rate_limited) = session.admit_addresses(peers, whitelisted);
                     let mut q = RECEIVED_ADDRS.lock();
                     let mut rejected = 0u32;
-                    for addr in peers {
+                    for addr in admitted {
                         if !is_routable_peer_addr(addr) {
                             rejected = rejected.saturating_add(1);
                             continue;
                         }
-                        if q.len() < 4096 {
+                        if q.len() < MAX_RECEIVED_ADDRS {
                             q.push(addr.clone());
                         }
                     }
                     drop(q);
+                    if rate_limited > 0 {
+                        slog_debug!("p2p", "addr_rate_limited",
+                            addr => peer, dropped => rate_limited);
+                    }
                     if rejected > 0 {
                         // Penalize peers that send invalid/garbage addresses.
                         DOS_GUARD.add_ban_score_cat(
@@ -4860,6 +4939,76 @@ mod tests {
             0,
             "and nothing sits past the newest sequence"
         );
+    }
+
+    // ── address processing has a rate, not just a per-message cap ─────────
+
+    #[test]
+    fn address_processing_is_rate_limited_after_the_first_burst() {
+        // There was no bound on PROCESSING: COST_ADDR is ONE token for a
+        // message carrying MAX_ADDR_PER_MSG = 1,000 addresses, so at
+        // BUCKET_REFILL_RATE a peer could offer eight hundred thousand
+        // addresses a second — each a routability parse and, past the queue, a
+        // RocksDB write under the peer store's global mutex.
+        let mut s = ConnectionSession::new("192.0.2.80:9333".parse().unwrap(), false);
+
+        // The whole burst is there at once, which is what lets an honest peer
+        // answer a GetAddr in one message.
+        assert_eq!(
+            s.take_addr_tokens(MAX_ADDR_PER_MSG, false),
+            MAX_ADDR_PER_MSG
+        );
+        // And then nothing: at 0.1 a second the next token is ten seconds away.
+        assert_eq!(s.take_addr_tokens(MAX_ADDR_PER_MSG, false), 0);
+
+        // A short allowance grants what it has rather than refusing outright,
+        // so a peer just over the line still gets most of its message through.
+        s.addr_tokens = 4.0;
+        assert_eq!(s.take_addr_tokens(10, false), 4);
+        assert_eq!(s.take_addr_tokens(1, false), 0);
+
+        // The rate itself: a hundred seconds owed buys ten tokens, not a full
+        // burst. Backdated rather than slept, for the same reason the TTL and
+        // the queue limits are parameters.
+        s.addr_tokens = 0.0;
+        s.addr_tokens_at = Instant::now()
+            .checked_sub(Duration::from_secs(100))
+            .expect("the process has been up longer than that");
+        assert_eq!(s.take_addr_tokens(50, false), 10);
+
+        // A trusted seed is exempt and spends nothing: the fleet's own seeds
+        // must be able to hand a lagging node a full address book.
+        s.addr_tokens = 0.0;
+        assert_eq!(s.take_addr_tokens(5_000, true), 5_000);
+        assert_eq!(s.addr_tokens, 0.0, "and it cost them nothing");
+    }
+
+    #[test]
+    fn an_addr_message_is_admitted_only_as_far_as_the_allowance_reaches() {
+        // The allowance is SPENT by admitting, in one call, because the handler
+        // that used to spend it per address cannot be unit-tested — it is
+        // inside dispatch_message — and a control that deleted the spend went
+        // unnoticed.
+        let mut s = ConnectionSession::new("192.0.2.81:9333".parse().unwrap(), false);
+        let list: Vec<String> = (0..10).map(|i| format!("203.0.113.{i}:9333")).collect();
+
+        s.addr_tokens = 4.0;
+        let (admitted, refused) = s.admit_addresses(&list, false);
+        assert_eq!(admitted.len(), 4, "only as far as the allowance reaches");
+        assert_eq!(refused, 6, "and the rest are refused, not silently kept");
+        assert_eq!(admitted[0], list[0], "the prefix, in order");
+        assert_eq!(admitted[3], list[3]);
+
+        // The allowance is gone, so the next message of the same size is all
+        // refused — which is what proves admitting SPENT it.
+        let (admitted, refused) = s.admit_addresses(&list, false);
+        assert!(admitted.is_empty());
+        assert_eq!(refused, list.len());
+
+        // A trusted seed is admitted whole.
+        let (admitted, refused) = s.admit_addresses(&list, true);
+        assert_eq!(admitted.len(), list.len());
+        assert_eq!(refused, 0);
     }
 
     // ── the dial loop must ask the system that actually bans ──────────────
