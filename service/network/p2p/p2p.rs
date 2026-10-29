@@ -42,7 +42,16 @@ static DOS_GUARD: Lazy<DosGuard> = Lazy::new(DosGuard::new);
 /// other inbound connection for the rest of that second, the node's own seeds
 /// included.
 const MAX_INBOUND_PER_SEC: u32 = 10;
-/// Max pending (not-yet-handshaked) connections.
+/// Max concurrent inbound connections — pre-handshake AND established.
+///
+/// Named for the pre-handshake pool it was long believed to bound, which it is
+/// not: the `InboundSlot` holding one of these is moved into the connection's
+/// own thread and dropped only when `handle_peer_connection` returns, so the
+/// count falls when the CONNECTION ends, not when its handshake completes.
+/// Nothing else bounds established inbound connections — there is no inbound
+/// analogue of `MAX_PEERS`, which caps the outbound dial set — so this single
+/// constant is the entire inbound capacity, and the 76-day lockout was that
+/// capacity leaking, not a pending pool's.
 const MAX_PENDING_CONNECTIONS: usize = 64;
 /// Max inbound arrivals per second from one /16 subnet. The per-IP budget alone
 /// is bypassed by an attacker who owns a whole /16 — every address passes its
@@ -52,9 +61,23 @@ const MAX_PENDING_CONNECTIONS: usize = 64;
 const MAX_INBOUND_PER_SEC_PER_SUBNET: u32 = MAX_INBOUND_PER_SUBNET * 3;
 /// Backstop on TOTAL inbound arrivals per second, so a flood spread across many
 /// subnets still cannot spin the accept thread without bound. Tied to
-/// `MAX_PENDING_CONNECTIONS`: the node may be asked to build at most one pending
-/// pool's worth of pre-handshake state per second.
+/// `MAX_PENDING_CONNECTIONS`: the whole inbound population may be asked to turn
+/// over at most once per second.
 const MAX_INBOUND_GLOBAL_PER_SEC: u32 = MAX_PENDING_CONNECTIONS as u32;
+
+/// The three arrival budgets must widen strictly outwards, or the narrower one
+/// is decorative and a single host (or /16) can starve every other peer.
+///
+/// This bound was asserted inside a `#[test]` body, so it held for `cargo test`
+/// and bound nothing in a release build of the daemon: re-deriving either end —
+/// `MAX_INBOUND_GLOBAL_PER_SEC` takes its value from a constant whose name says
+/// "pending", and `MAX_INBOUND_PER_SEC_PER_SUBNET` from one that says "subnet" —
+/// could invert the order and still ship.
+const _: () = assert!(
+    MAX_INBOUND_PER_SEC < MAX_INBOUND_PER_SEC_PER_SUBNET
+        && MAX_INBOUND_PER_SEC_PER_SUBNET < MAX_INBOUND_GLOBAL_PER_SEC,
+    "per-IP < per-/16 < global, or a single source can exhaust the budget above it"
+);
 /// Distinct keys (source IPs, and separately /16s) tracked within one throttle
 /// window, bounding each per-window map against a flood that rolls addresses.
 const MAX_THROTTLE_TRACKED_IPS: usize = 4_096;
@@ -4405,15 +4428,8 @@ mod tests {
 
     #[test]
     fn one_source_cannot_spend_the_whole_inbound_budget() {
-        // The budgets must widen strictly outwards, or the narrower one is
-        // decorative and a single host (or /16) can starve every other peer.
-        const {
-            assert!(
-                MAX_INBOUND_PER_SEC < MAX_INBOUND_PER_SEC_PER_SUBNET
-                    && MAX_INBOUND_PER_SEC_PER_SUBNET < MAX_INBOUND_GLOBAL_PER_SEC,
-                "per-IP < per-/16 < global, or a single source can exhaust the budget above it"
-            )
-        };
+        // The widen-strictly-outwards bound is asserted at the constants
+        // themselves, so it fails a release build and not merely this test.
         // Walk one flooder's arrivals: it is cut off at its own budget, and
         // nothing else in the window is.
         for n in 1..=MAX_INBOUND_GLOBAL_PER_SEC {
