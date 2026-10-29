@@ -23,22 +23,42 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 /// operator-configured, so these peers bypass the DoS layer entirely.
 static WHITELIST: Lazy<RwLock<HashSet<String>>> = Lazy::new(|| RwLock::new(HashSet::new()));
 
-/// Extract the bare IP from a `ip:port` / `[ipv6]:port` / bare-ip peer key.
-fn peer_ip(peer: &str) -> &str {
+/// The host a peer key belongs to: `ip:port`, `[ipv6]:port` and a bare address
+/// all collapse onto the bare address.
+///
+/// Reputation, whitelisting and per-host connection counting all mean "which
+/// host is this", and all three key on this one function. There were three
+/// implementations of it before (here, `p2p::extract_ban_ip`,
+/// `peer_manager::extract_ip`) and they disagreed, which only became
+/// load-bearing once ban records were keyed by host: a key the attacker can
+/// choose is a key the attacker can use to start over.
+///
+/// A bare IPv6 literal is the case the old splitters got wrong. All three cut
+/// on the LAST colon, so `2001:db8::1` became `2001:db8:` — shared by every
+/// address in that prefix, so one offender would have banned all of them — and
+/// `::1` became `:`, so whitelisting an IPv6 seed by its bare address never
+/// matched the bracketed form a socket reports.
+///
+/// Splitting on the FIRST colon is what makes the unbracketed case safe, and
+/// the only reason it works: with two or more colons the suffix contains one,
+/// so it can never pass the all-digits port test, and the address is returned
+/// whole. An explicit multi-colon guard here was unreachable — a negative
+/// control confirmed no test could tell whether it was present.
+pub fn host_key(peer: &str) -> &str {
     if let Some(rest) = peer.strip_prefix('[') {
         if let Some(end) = rest.find(']') {
             return &rest[..end]; // IPv6 literal inside brackets
         }
     }
-    match peer.rsplit_once(':') {
-        Some((ip, _port)) => ip,
-        None => peer,
+    match peer.split_once(':') {
+        Some((ip, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => ip,
+        _ => peer,
     }
 }
 
 /// Add a trusted peer IP to the whitelist. Accepts `ip` or `ip:port`.
 pub fn whitelist_peer(addr: &str) {
-    let ip = peer_ip(addr);
+    let ip = host_key(addr);
     if !ip.is_empty() {
         WHITELIST
             .write()
@@ -49,7 +69,7 @@ pub fn whitelist_peer(addr: &str) {
 
 /// True if the peer's IP is whitelisted (a trusted seed / `--connect` node).
 pub fn is_whitelisted(peer: &str) -> bool {
-    let ip = peer_ip(peer);
+    let ip = host_key(peer);
     WHITELIST
         .read()
         .unwrap_or_else(|e| e.into_inner())
@@ -105,6 +125,24 @@ pub const BAN_DECAY_PER_MINUTE: u64 = 1;
 /// and the string is cloned into `BanInfo` and logged. The newest evidence is
 /// the useful part, so the cap keeps the tail.
 pub const MAX_BAN_REASON_LEN: usize = 512;
+
+/// Ceiling on hosts tracked for reputation.
+///
+/// Records are keyed by host, so this counts hosts that have offended since the
+/// last eviction pass rather than sockets — but a botnet is a real set of
+/// hosts, and each record carries a reason string of up to MAX_BAN_REASON_LEN,
+/// so the table still needs a bound of its own.
+pub const MAX_BAN_RECORDS: usize = 16_384;
+
+/// Ceiling on live rate-limiter buckets. These are keyed per CONNECTION, and
+/// the sweep only drops a bucket once it has refilled, so a connect-and-drop
+/// loop can hold one per attempt until it does.
+pub const MAX_BUCKET_RECORDS: usize = 8_192;
+
+/// How many records an insert at a ceiling may examine to find a victim. An
+/// unbounded scan would make every message at the ceiling cost O(table), which
+/// is the amplifier shape this layer has already been bitten by once.
+const EVICT_SCAN_LIMIT: usize = 32;
 
 // ── Offense categories ─────────────────────────────────────────────────
 /// Categorise offenses so decay, ban duration, and repeat-offender
@@ -241,6 +279,14 @@ impl TokenBucket {
         self.last_refill = Instant::now();
     }
 
+    /// A bucket refilled to capacity carries no state worth keeping: a peer
+    /// returning to a fresh bucket and a peer returning to this one are
+    /// indistinguishable. This is the test that actually means "inactive".
+    fn is_full(&mut self) -> bool {
+        self.refill();
+        self.tokens >= BUCKET_CAPACITY
+    }
+
     fn consume(&mut self, cost: f64) -> bool {
         self.refill();
         if self.tokens >= cost {
@@ -368,9 +414,39 @@ impl BanRecord {
         }
     }
 
-    fn is_banned(&mut self) -> bool {
-        self.decay();
+    /// Whether the ban is active right now, without touching the record.
+    ///
+    /// `decay()` is what CLEARS an expired ban; it is not needed to answer the
+    /// question. Asking used to need the WRITE lock and created a record for
+    /// whatever key it was handed, so every inbound connection both serialised
+    /// on a writer and grew the table by asking about itself.
+    fn ban_active(&self) -> bool {
         self.banned && unix_now() < self.ban_until
+    }
+}
+
+/// Free one slot in the reputation table, examining at most EVICT_SCAN_LIMIT
+/// records. Prefers a record whose ban is not active (lowest score first), and
+/// falls back to the active ban that expires soonest.
+///
+/// It evicts rather than refusing on purpose: refusing at the ceiling would
+/// mean a full table can no longer ban anyone new, which hands whoever filled
+/// it an immunity for everybody.
+fn evict_one_ban(bans: &mut HashMap<String, BanRecord>) -> bool {
+    let victim = bans
+        .iter()
+        .take(EVICT_SCAN_LIMIT)
+        .min_by_key(|(_, r)| {
+            let active = r.ban_active();
+            (u8::from(active), if active { r.ban_until } else { r.score })
+        })
+        .map(|(k, _)| k.clone());
+    match victim {
+        Some(k) => {
+            bans.remove(&k);
+            true
+        }
+        None => false,
     }
 }
 
@@ -501,6 +577,23 @@ impl DosGuard {
         let cost = msg_type.token_cost();
         let allowed = {
             let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+            if !buckets.contains_key(peer) && buckets.len() >= MAX_BUCKET_RECORDS {
+                // Drop the most-refilled bucket we can find in a bounded scan.
+                // Refusing instead would rate-limit every NEW peer the moment
+                // the table filled — the lockout shape, not a rate limit.
+                let victim = buckets
+                    .iter()
+                    .take(EVICT_SCAN_LIMIT)
+                    .max_by(|(_, a), (_, b)| {
+                        a.tokens
+                            .partial_cmp(&b.tokens)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(k, _)| k.clone());
+                if let Some(k) = victim {
+                    buckets.remove(&k);
+                }
+            }
             let bucket = buckets
                 .entry(peer.to_string())
                 .or_insert_with(TokenBucket::new);
@@ -544,8 +637,21 @@ impl DosGuard {
         if is_whitelisted(peer) {
             return false;
         }
+        let key = host_key(peer);
         let mut bans = self.bans.write().unwrap_or_else(|e| e.into_inner());
-        let rec = bans.entry(peer.to_string()).or_insert_with(BanRecord::new);
+        if !bans.contains_key(key) && bans.len() >= MAX_BAN_RECORDS && !evict_one_ban(&mut bans) {
+            return false;
+        }
+        let rec = bans.entry(key.to_string()).or_insert_with(BanRecord::new);
+        // Scoring must see a current record. `decay()` is what clears an
+        // EXPIRED ban's leftover score, and it used to run here only by
+        // accident: `check()` asked `is_banned` first, and that asked the
+        // record, which decayed it. Now that asking is a pure read, a peer
+        // whose ban had just run out would otherwise be re-banned by its first
+        // minor offence, on a score it had already served out. The paths that
+        // never went through `check()` — report_bad_peer and the lifecycle
+        // arms — never got the decay at all.
+        rec.decay();
         let banned = rec.add_score(points, reason, category);
 
         // Metrics
@@ -565,8 +671,18 @@ impl DosGuard {
     }
 
     pub fn ban_peer(&self, peer: &str, duration_secs: u64, reason: &str) {
+        // add_ban_score_cat exempts trusted seeds; the direct path must too, or
+        // the one guard meant to cover every ban path covers all but the
+        // bluntest.
+        if is_whitelisted(peer) {
+            return;
+        }
+        let key = host_key(peer);
         let mut bans = self.bans.write().unwrap_or_else(|e| e.into_inner());
-        let rec = bans.entry(peer.to_string()).or_insert_with(BanRecord::new);
+        if !bans.contains_key(key) && bans.len() >= MAX_BAN_RECORDS && !evict_one_ban(&mut bans) {
+            return;
+        }
+        let rec = bans.entry(key.to_string()).or_insert_with(BanRecord::new);
         rec.banned = true;
         rec.ban_until = unix_now() + duration_secs;
         rec.reason = log_prefix(reason, MAX_BAN_REASON_LEN).to_string();
@@ -574,7 +690,7 @@ impl DosGuard {
 
     pub fn unban_peer(&self, peer: &str) {
         let mut bans = self.bans.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(rec) = bans.get_mut(peer) {
+        if let Some(rec) = bans.get_mut(host_key(peer)) {
             rec.banned = false;
             rec.score = 0;
             rec.ban_until = 0;
@@ -590,21 +706,19 @@ impl DosGuard {
         if is_whitelisted(peer) {
             return false;
         }
-        let mut bans = self.bans.write().unwrap_or_else(|e| e.into_inner());
-        bans.entry(peer.to_string())
-            .or_insert_with(BanRecord::new)
-            .is_banned()
+        let bans = self.bans.read().unwrap_or_else(|e| e.into_inner());
+        bans.get(host_key(peer)).is_some_and(|r| r.ban_active())
     }
 
     pub fn get_ban_score(&self, peer: &str) -> u64 {
         let bans = self.bans.read().unwrap_or_else(|e| e.into_inner());
-        bans.get(peer).map(|r| r.score).unwrap_or(0)
+        bans.get(host_key(peer)).map(|r| r.score).unwrap_or(0)
     }
 
     /// Get detailed ban info for diagnostics / RPC.
     pub fn get_ban_info(&self, peer: &str) -> Option<BanInfo> {
         let bans = self.bans.read().unwrap_or_else(|e| e.into_inner());
-        bans.get(peer).map(|r| BanInfo {
+        bans.get(host_key(peer)).map(|r| BanInfo {
             score: r.score,
             banned: r.banned,
             ban_until: r.ban_until,
@@ -612,6 +726,24 @@ impl DosGuard {
             worst_category: r.worst_category,
             reason: r.reason.clone(),
         })
+    }
+
+    /// Owe a record `secs` more seconds of decay than it has had, so a test can
+    /// observe decay without waiting out real minutes.
+    ///
+    /// Test-only seam: the decay rate is per-MINUTE, so there is no other way to
+    /// exercise the composed decay-then-evict pass, and the pass existing in
+    /// that order is the whole point of `maintain_dos_guard`.
+    #[cfg(test)]
+    pub(crate) fn backdate_decay(&self, peer: &str, secs: u64) -> bool {
+        let mut bans = self.bans.write().unwrap_or_else(|e| e.into_inner());
+        match bans.get_mut(host_key(peer)) {
+            Some(rec) => {
+                rec.last_decay = rec.last_decay.saturating_sub(secs);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn tick_decay(&self) {
@@ -622,11 +754,15 @@ impl DosGuard {
     }
 
     pub fn evict_inactive(&self) {
-        let mut bans = self.bans.write().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut bans = self.bans.write().unwrap_or_else(|e| e.into_inner());
+            bans.retain(|_, r| r.banned || r.score > 0);
+        }
+        // Buckets are keyed per connection and reputation per host, so the old
+        // `bans.contains_key` test would drop nearly every bucket now. It was
+        // also the only place in this file that held both locks at once.
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-        bans.retain(|_, r| r.banned || r.score > 0);
-
-        buckets.retain(|k, _| bans.contains_key(k.as_str()));
+        buckets.retain(|_, b| !b.is_full());
     }
 
     pub fn stats(&self) -> DosStats {
@@ -1072,13 +1208,25 @@ mod tests {
     #[test]
     fn evict_inactive_cleans_up() {
         let g = DosGuard::new();
-        // Create some entries
-        g.check("active_peer", &MsgType::Ping, 10);
-        g.check("another_peer", &MsgType::Ping, 10);
-        // Evict: all are score=0, not banned → should be cleaned
+        // A ban CHECK no longer creates a record, so this pass has to be given
+        // something to evict or it proves nothing: it used to assert 0 tracked
+        // peers, which is now true before the pass even runs.
+        g.check("198.51.100.11:1", &MsgType::Ping, 10);
+        assert_eq!(
+            g.stats().tracked_peers,
+            0,
+            "asking about a peer must not track it"
+        );
+
+        g.add_ban_score("198.51.100.12", 10, "minor");
+        g.add_ban_score("198.51.100.13", BAN_SCORE_AUTOBAN, "severe");
+        g.unban_peer("198.51.100.13"); // cleared: score 0 and not banned
+        assert_eq!(g.stats().tracked_peers, 2);
+
         g.evict_inactive();
-        let stats = g.stats();
-        assert_eq!(stats.tracked_peers, 0);
+        assert_eq!(g.stats().tracked_peers, 1, "only the cleared record goes");
+        assert!(g.get_ban_info("198.51.100.12").is_some());
+        assert!(g.get_ban_info("198.51.100.13").is_none());
     }
 
     #[test]
@@ -1125,5 +1273,215 @@ mod tests {
         let stats = g.stats();
         assert_eq!(stats.currently_banned, 2);
         assert!(stats.tracked_peers >= 2);
+    }
+
+    // ── the ban key: the host, not the socket ─────────────────────────────
+
+    #[test]
+    fn a_ban_follows_the_host_not_the_socket() {
+        // THE DEFECT: the accept gate checked the IP-only key while ~26 scoring
+        // sites inside dispatch_message scored the attacker-chosen `ip:port`,
+        // so the whole post-handshake ban mechanism cost one new source port to
+        // bypass — and each evaded cycle left a 24h record keyed on the port it
+        // had already abandoned.
+        let g = DosGuard::new();
+        g.add_ban_score_cat(
+            "192.0.2.10:51234",
+            BAN_SCORE_AUTOBAN,
+            "invalid PoW",
+            BanCategory::Malicious,
+        );
+        assert!(g.is_banned("192.0.2.10:51234"));
+        assert!(
+            g.is_banned("192.0.2.10:7777"),
+            "a fresh source port must not be a fresh reputation"
+        );
+        assert!(g.is_banned("192.0.2.10"), "and neither must the bare address");
+        assert!(
+            !g.is_banned("192.0.2.11:51234"),
+            "but a different host is a different host"
+        );
+        assert_eq!(
+            g.stats().tracked_peers,
+            1,
+            "one host, one record — not one per port it tried"
+        );
+    }
+
+    #[test]
+    fn a_bare_ipv6_literal_is_its_own_host() {
+        // All three old splitters cut on the LAST colon, so `2001:db8::1`
+        // became `2001:db8:` — one key shared by every address in the prefix,
+        // which would have let one offender ban all of them — and `::1` became
+        // `:`, so whitelisting an IPv6 seed by its bare address never matched
+        // the bracketed form a socket reports.
+        assert_eq!(host_key("2001:db8::1"), "2001:db8::1");
+        assert_eq!(host_key("[2001:db8::1]:9333"), "2001:db8::1");
+        assert_eq!(host_key("::1"), "::1");
+        assert_eq!(host_key("[::1]:9333"), "::1");
+        assert_eq!(host_key("1.2.3.4:9333"), "1.2.3.4");
+        assert_eq!(host_key("1.2.3.4"), "1.2.3.4");
+        // A non-numeric suffix is not a port, so it is part of the name.
+        assert_eq!(host_key("some-seed:name"), "some-seed:name");
+
+        let g = DosGuard::new();
+        g.add_ban_score_cat(
+            "[2001:db8::1]:9333",
+            BAN_SCORE_AUTOBAN,
+            "invalid PoW",
+            BanCategory::Malicious,
+        );
+        assert!(g.is_banned("2001:db8::1"));
+        assert!(
+            !g.is_banned("2001:db8::2"),
+            "a neighbour in the same prefix must not be banned with it"
+        );
+    }
+
+    #[test]
+    fn asking_whether_a_peer_is_banned_does_not_create_a_record() {
+        // `is_banned` took the WRITE lock and did
+        // `bans.entry(peer).or_insert_with(BanRecord::new)`, so every inbound
+        // connection both serialised on a writer and grew the table by asking
+        // about itself.
+        let g = DosGuard::new();
+        for port in 0..200u16 {
+            assert!(!g.is_banned(&format!("192.0.2.20:{}", port)));
+        }
+        assert_eq!(
+            g.stats().tracked_peers,
+            0,
+            "a query must not be a write"
+        );
+        assert!(g.get_ban_info("192.0.2.20:1").is_none());
+    }
+
+    #[test]
+    fn a_served_out_ban_does_not_make_the_next_offence_instant() {
+        // `decay()` is what clears an expired ban's leftover score, and it used
+        // to run on the scoring path only by accident: `check()` asked
+        // `is_banned` first, and that asked the record, which decayed it. With
+        // asking made a pure read, the decay has to be explicit or a peer whose
+        // ban had just run out would be re-banned by its first minor offence,
+        // on a score it had already served.
+        let g = DosGuard::new();
+        let peer = "192.0.2.30:1";
+        assert!(g.add_ban_score_cat(peer, BAN_SCORE_AUTOBAN, "severe", BanCategory::Malformed));
+        {
+            // Run the ban out without waiting for it.
+            let mut bans = g.bans.write().unwrap();
+            let rec = bans.get_mut(host_key(peer)).unwrap();
+            rec.ban_until = unix_now().saturating_sub(1);
+        }
+        assert!(!g.is_banned(peer), "the ban has expired");
+
+        let banned_again = g.add_ban_score_cat(peer, 10, "minor", BanCategory::Resource);
+        assert!(
+            !banned_again,
+            "a 10-point offence must not re-ban a peer that served its time"
+        );
+        // ban_count is 1, so the repeat multiplier doubles the 10 to 20 — and
+        // nothing of the old 100 is left.
+        assert_eq!(g.get_ban_score(peer), 20);
+    }
+
+    // ── both tables have a ceiling, and neither can lock anyone out ───────
+
+    #[test]
+    fn the_reputation_table_has_a_ceiling_it_cannot_be_pushed_past() {
+        let g = DosGuard::new();
+        for i in 0..(MAX_BAN_RECORDS + 500) {
+            g.add_ban_score_cat(
+                &format!("198.18.{}.{}", i / 256, i % 256),
+                10,
+                "minor",
+                BanCategory::Resource,
+            );
+        }
+        assert_eq!(
+            g.stats().tracked_peers,
+            MAX_BAN_RECORDS,
+            "the table must stop growing at the ceiling"
+        );
+        // And a full table must still be able to ban someone new: refusing
+        // instead of evicting would hand whoever filled it an immunity for
+        // everybody.
+        g.add_ban_score_cat(
+            "203.0.113.77:1",
+            BAN_SCORE_AUTOBAN,
+            "invalid PoW",
+            BanCategory::Malicious,
+        );
+        assert!(
+            g.is_banned("203.0.113.77:9999"),
+            "a full table must not stop us banning a new offender"
+        );
+        assert_eq!(g.stats().tracked_peers, MAX_BAN_RECORDS);
+    }
+
+    #[test]
+    fn the_bucket_table_has_a_ceiling_and_still_admits_a_new_peer() {
+        let g = DosGuard::new();
+        for i in 0..(MAX_BUCKET_RECORDS + 200) {
+            // Inv has no global per-second limit, so every call reaches the
+            // bucket stage and creates a bucket.
+            g.check(&format!("198.18.{}.{}:9333", i / 256, i % 256), &MsgType::Inv, 100);
+        }
+        let live = g.buckets.lock().unwrap().len();
+        assert!(
+            live <= MAX_BUCKET_RECORDS,
+            "buckets must stop growing at the ceiling, got {}",
+            live
+        );
+        assert!(
+            matches!(
+                g.check("203.0.113.88:9333", &MsgType::Inv, 100),
+                DosVerdict::Allow
+            ),
+            "a full bucket table must not rate-limit every new peer"
+        );
+    }
+
+    #[test]
+    fn the_bucket_sweep_keeps_a_drained_bucket_and_drops_a_refilled_one() {
+        // The sweep used to be `buckets.retain(|k, _| bans.contains_key(k))`.
+        // Buckets are keyed per connection and reputation is now keyed per
+        // host, so that test would drop nearly every bucket. A bucket that has
+        // refilled to capacity is the one that carries no state worth keeping.
+        let g = DosGuard::new();
+        g.check("192.0.2.40:1", &MsgType::Inv, 100); // 2 of 4000 tokens spent
+        for _ in 0..1_500 {
+            g.check("192.0.2.41:1", &MsgType::Inv, 100); // 3000 tokens spent
+        }
+        assert_eq!(g.buckets.lock().unwrap().len(), 2);
+
+        // Long enough for the first to refill its 2 tokens (800/s) and nowhere
+        // near enough for the second to refill 3000.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        g.evict_inactive();
+
+        let buckets = g.buckets.lock().unwrap();
+        assert!(
+            !buckets.contains_key("192.0.2.40:1"),
+            "a refilled bucket holds nothing worth keeping"
+        );
+        assert!(
+            buckets.contains_key("192.0.2.41:1"),
+            "a drained bucket must survive the sweep, or the rate limit resets"
+        );
+    }
+
+    #[test]
+    fn banning_a_whitelisted_peer_directly_is_a_no_op() {
+        // `add_ban_score_cat` is documented as the single choke point that
+        // exempts trusted seeds, and `ban_peer` walked straight past it.
+        whitelist_peer("203.0.113.210");
+        let g = DosGuard::new();
+        g.ban_peer("203.0.113.210:9333", 86_400, "manual");
+        assert!(
+            !g.is_banned("203.0.113.210:9333"),
+            "a trusted seed must not be bannable by the direct path either"
+        );
+        assert_eq!(g.stats().tracked_peers, 0, "and must leave no record");
     }
 }
