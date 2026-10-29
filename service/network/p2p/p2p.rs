@@ -24,9 +24,10 @@ use crate::service::network::p2p::peer_diversity::PeerIdentity;
 use crate::service::network::p2p::peer_manager::PeerManager;
 use crate::service::network::p2p::protocol::{
     build_version_payload, validate_addr_list, validate_hash_hex, validate_header,
-    validate_headers_list, validate_inv_items, validate_payload_checksum, validate_payload_size,
-    validate_reject, CommandId, ProtocolSession, VersionPayload, WireHeader, DEFAULT_BPS,
-    HANDSHAKE_TIMEOUT_SECS, MAX_MESSAGE_SIZE, PUZZLE_TIMEOUT_SECS, WIRE_HEADER_SIZE,
+    validate_headers_list, validate_inv_count, validate_inv_item, validate_payload_checksum,
+    validate_payload_size, validate_reject, CommandId, ProtocolSession, VersionPayload, WireHeader,
+    DEFAULT_BPS, HANDSHAKE_TIMEOUT_SECS, MAX_INV_PER_MSG, MAX_MESSAGE_SIZE, PUZZLE_TIMEOUT_SECS,
+    WIRE_HEADER_SIZE,
 };
 use crate::{slog_debug, slog_error, slog_info, slog_warn};
 
@@ -93,16 +94,135 @@ pub const PROTOCOL_VERSION: u32 = 1;
 // Each item is tagged with the peer_id that sent it, so the event loop
 // can ban_score on rejection (closing the feedback gap).
 use once_cell::sync::Lazy;
-use parking_lot::Mutex as PlMutex;
+use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 
 /// (peer_id, transaction) — peer attribution for ban feedback on rejection.
 #[allow(clippy::type_complexity)]
 static PENDING_TXS: Lazy<Arc<PlMutex<Vec<(String, Transaction)>>>> =
     Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(1024))));
-/// (peer_id, block) — peer attribution for ban feedback on rejection.
-#[allow(clippy::type_complexity)]
-static PENDING_BLOCKS: Lazy<Arc<PlMutex<Vec<(String, Block)>>>> =
-    Lazy::new(|| Arc::new(PlMutex::new(Vec::with_capacity(128))));
+/// The pending-block queue, (peer_id, block) for ban attribution on rejection,
+/// paired with an index of the hashes it holds.
+///
+/// The index exists because membership in this queue is tested on the hot
+/// inbound path: the Inv and Headers handlers check every announced hash
+/// against it. That test used to be a walk of the queue, with the queue's own
+/// lock held, which made one Inv up to 5,000 x `MAX_PENDING_BLOCK_QUEUE` string
+/// comparisons on the single lock the consensus loop needs to drain its work —
+/// and it got more expensive as the backlog grew, so the further behind the node
+/// fell, the more each announcement cost it.
+///
+/// Both live under one lock so they cannot drift apart, and the queue is kept
+/// hash-unique so the index needs no reference counts.
+struct PendingBlocks {
+    queue: Vec<(String, Block)>,
+    hashes: HashSet<String>,
+}
+
+impl PendingBlocks {
+    fn new() -> Self {
+        Self {
+            queue: Vec::with_capacity(128),
+            hashes: HashSet::with_capacity(128),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// One hash lookup, whatever the queue's depth.
+    fn contains(&self, hash: &str) -> bool {
+        self.hashes.contains(hash)
+    }
+
+    /// Append a block. Returns false when that hash is already queued, in which
+    /// case nothing was stored and the caller must charge no quota for it.
+    fn push(&mut self, peer_id: &str, block: Block) -> bool {
+        if !self.hashes.insert(block.header.hash.clone()) {
+            return false;
+        }
+        self.queue.push((peer_id.to_string(), block));
+        true
+    }
+
+    /// Of `items`, those that can really go back into the queue: not already
+    /// queued, not a repeat within the batch, and within `available` slots.
+    /// Returns them in order with the count it refused.
+    ///
+    /// Separated from the quota accounting so the caller charges a peer for
+    /// exactly what gets stored. A count charged for a block that was never
+    /// stored never comes back down, and a peer whose count is stuck at the
+    /// per-peer limit has every block it sends dropped from then on.
+    fn admissible_for_requeue(
+        &self,
+        items: Vec<(String, Block)>,
+        available: usize,
+    ) -> (Vec<(String, Block)>, usize) {
+        let mut admitted: Vec<(String, Block)> = Vec::with_capacity(items.len().min(available));
+        let mut batch: HashSet<String> = HashSet::with_capacity(items.len().min(available));
+        let mut refused = 0usize;
+        // The batch is MOVED through, not copied: a requeue can carry hundreds
+        // of blocks of up to 2 MiB each, every tick.
+        for (peer_id, block) in items {
+            if admitted.len() >= available
+                || self.contains(&block.header.hash)
+                || !batch.insert(block.header.hash.clone())
+            {
+                refused = refused.saturating_add(1);
+                continue;
+            }
+            admitted.push((peer_id, block));
+        }
+        (admitted, refused)
+    }
+
+    /// Put already-admitted items back at the front, index in step.
+    ///
+    /// Callers filter with [`PendingBlocks::admissible_for_requeue`] first, so a
+    /// hash arriving here twice is a bug rather than a case to handle; the index
+    /// is written unconditionally so a release build cannot desync even if one
+    /// slips through.
+    fn prepend(&mut self, items: Vec<(String, Block)>) {
+        if items.is_empty() {
+            return;
+        }
+        for (_, block) in &items {
+            let fresh = self.hashes.insert(block.header.hash.clone());
+            debug_assert!(fresh, "prepended a block the queue already held");
+        }
+        let mut combined = items;
+        combined.append(&mut self.queue);
+        self.queue = combined;
+    }
+
+    /// Take the whole queue; the index empties with it.
+    fn take(&mut self) -> Vec<(String, Block)> {
+        self.hashes.clear();
+        std::mem::take(&mut self.queue)
+    }
+
+    /// Drop everything attributed to one peer, returning how many went.
+    ///
+    /// The index is rebuilt from what survives instead of having the dropped
+    /// hashes removed from it: a rebuild cannot leave a phantom entry behind,
+    /// and a phantom would make us refuse to request that block ever again.
+    fn retain_other_peers(&mut self, peer_id: &str) -> usize {
+        let before = self.queue.len();
+        self.queue.retain(|(peer, _)| peer != peer_id);
+        let dropped = before.saturating_sub(self.queue.len());
+        if dropped > 0 {
+            self.hashes = self
+                .queue
+                .iter()
+                .map(|(_, b)| b.header.hash.clone())
+                .collect();
+        }
+        dropped
+    }
+}
+
+static PENDING_BLOCKS: Lazy<Arc<PlRwLock<PendingBlocks>>> =
+    Lazy::new(|| Arc::new(PlRwLock::new(PendingBlocks::new())));
 
 /// Per-peer pending counts: prevents one peer from monopolizing the queue.
 /// Key: peer_id, Value: (pending_tx_count, pending_block_count)
@@ -120,6 +240,31 @@ const MAX_PENDING_BLOCKS_PER_PEER: u32 = 512;
 /// Global hard caps for pending inbound queues (all peers combined).
 const MAX_PENDING_TX_QUEUE: usize = 10_000;
 const MAX_PENDING_BLOCK_QUEUE: usize = 4_096;
+/// Ceiling on blocks queued from the NETWORK path, deliberately below
+/// `MAX_PENDING_BLOCK_QUEUE` (which also bounds requeue and local submission)
+/// because every entry is a deserialized block of up to 2 MiB. Named here
+/// rather than left as a bare literal in the Block arm, where it read as a
+/// contradiction of the global cap declared beside it.
+const MAX_NETWORK_PENDING_BLOCKS: usize = 1_000;
+/// Items one Inv announcement can make us request.
+///
+/// Never ask a peer for more than we could accept from it: the surplus is
+/// dropped by the per-peer quota the moment it arrives and then re-requested,
+/// so it buys nothing and costs a round of inbound bandwidth. Blocks and
+/// transactions share the announcement, so the bound is the tighter quota.
+const MAX_INV_ITEMS_REQUESTED: usize = if MAX_PENDING_BLOCKS_PER_PEER < MAX_PENDING_TXS_PER_PEER {
+    MAX_PENDING_BLOCKS_PER_PEER as usize
+} else {
+    MAX_PENDING_TXS_PER_PEER as usize
+};
+const _: () = assert!(
+    MAX_NETWORK_PENDING_BLOCKS <= MAX_PENDING_BLOCK_QUEUE,
+    "the network path must not be allowed to fill more than the whole queue"
+);
+const _: () = assert!(
+    MAX_INV_ITEMS_REQUESTED > 0 && MAX_INV_ITEMS_REQUESTED < MAX_INV_PER_MSG,
+    "the per-announcement request cap must bind below the wire limit"
+);
 const MAX_OUTBOUND_LAG_SEQS: u64 = 5_000;
 /// Bytes per peer per minute — disconnect abusive peers (100MB/min).
 const MAX_BYTES_PER_PEER_PER_MIN: u64 = 100 * 1024 * 1024;
@@ -746,7 +891,7 @@ pub fn drain_pending_txs() -> Vec<(String, Transaction)> {
 /// Returns (peer_id, block) tuples for ban attribution.
 /// Thread-safe: works from ANY thread, not just the one that pushed.
 pub fn drain_pending_blocks() -> Vec<(String, Block)> {
-    let items = std::mem::take(&mut *PENDING_BLOCKS.lock());
+    let items = PENDING_BLOCKS.write().take();
     // Decrement per-peer pending counts
     if !items.is_empty() {
         let mut counts = PEER_PENDING.lock();
@@ -774,10 +919,7 @@ pub fn cleanup_peer_state(peer_id: &str) {
         }
     }
     {
-        let mut q = PENDING_BLOCKS.lock();
-        let before = q.len();
-        q.retain(|(peer, _)| peer != peer_id);
-        let dropped = before.saturating_sub(q.len());
+        let dropped = PENDING_BLOCKS.write().retain_other_peers(peer_id);
         if dropped > 0 {
             slog_warn!("p2p", "cleanup_dropped_pending_blocks", peer => peer_id, dropped => dropped);
         }
@@ -821,6 +963,74 @@ pub fn push_block_request(peer_id: &str, hash: &str) {
     if q.len() < MAX_BLOCK_REQUEST_QUEUE {
         q.push((peer_id.to_string(), hash.to_string()));
     }
+}
+
+/// Queue a batch of block-serve requests under ONE lock.
+///
+/// A GetData carries up to `MAX_INV_PER_MSG` hashes, and pushing them one at a
+/// time took the request queue's lock once per hash.
+pub fn push_block_requests(peer_id: &str, hashes: Vec<String>) {
+    if hashes.is_empty() {
+        return;
+    }
+    let mut q = PENDING_BLOCK_REQUESTS.lock();
+    for hash in hashes {
+        if q.len() >= MAX_BLOCK_REQUEST_QUEUE {
+            break;
+        }
+        q.push((peer_id.to_string(), hash));
+    }
+}
+
+/// Which items of an Inv announcement to actually request: the announcement's
+/// own order, each hash once, nothing the pending-block queue already holds,
+/// and at most `MAX_INV_ITEMS_REQUESTED` of them.
+///
+/// `is_queued` is consulted once per DISTINCT item, after the repeat filter, so
+/// a thousand copies of one hash cost one lookup on the shared queue instead of
+/// a thousand.
+fn inv_items_to_request(items: &[InvItem], is_queued: impl Fn(&str) -> bool) -> Vec<InvItem> {
+    let mut out: Vec<InvItem> = Vec::new();
+    let mut seen: HashSet<(&str, &str)> =
+        HashSet::with_capacity(items.len().min(MAX_INV_ITEMS_REQUESTED));
+    for item in items {
+        if out.len() >= MAX_INV_ITEMS_REQUESTED {
+            break;
+        }
+        if !seen.insert((item.kind.as_str(), item.hash.as_str())) {
+            continue;
+        }
+        if is_queued(&item.hash) {
+            continue;
+        }
+        out.push(item.clone());
+    }
+    out
+}
+
+/// Which hashes of a Headers reply to request as blocks: in order, each once,
+/// skipping empties and anything already queued, at most `limit` of them.
+///
+/// Returned as a list so the caller can write the requests with no lock held;
+/// the queue's lock used to be taken per hash, inside the write loop.
+fn blocks_to_request<'a>(
+    hashes: &'a [String],
+    limit: usize,
+    is_queued: impl Fn(&str) -> bool,
+) -> Vec<&'a str> {
+    let mut out: Vec<&'a str> = Vec::new();
+    let mut seen: HashSet<&'a str> = HashSet::with_capacity(hashes.len().min(limit));
+    for hash in hashes {
+        if out.len() >= limit {
+            break;
+        }
+        let hash = hash.as_str();
+        if hash.is_empty() || !seen.insert(hash) || is_queued(hash) {
+            continue;
+        }
+        out.push(hash);
+    }
+    out
 }
 
 /// Drain queued block-serve requests (call from the node main loop).
@@ -933,20 +1143,19 @@ pub fn requeue_pending_blocks(items: Vec<(String, Block)>) {
     if items.is_empty() {
         return;
     }
-    let mut q = PENDING_BLOCKS.lock();
-    let mut counts = PEER_PENDING.lock();
+    let mut q = PENDING_BLOCKS.write();
 
     // Keep queue bounded even during requeue. Under load, new incoming items
     // can arrive between drain and requeue; without this cap, requeue could
-    // temporarily exceed the global queue limit.
+    // temporarily exceed the global queue limit. A copy of a requeued block can
+    // also have arrived in that window, and the orphan pool can hand back one
+    // the queue already holds, so ask the queue what it can really take.
     let available = MAX_PENDING_BLOCK_QUEUE.saturating_sub(q.len());
-    let mut dropped = 0usize;
-    let mut requeued: Vec<(String, Block)> = Vec::with_capacity(items.len().min(available));
-    for (peer_id, block) in items {
-        if requeued.len() >= available {
-            dropped = dropped.saturating_add(1);
-            continue;
-        }
+    let (candidates, mut dropped) = q.admissible_for_requeue(items, available);
+
+    let mut counts = PEER_PENDING.lock();
+    let mut requeued: Vec<(String, Block)> = Vec::with_capacity(candidates.len());
+    for (peer_id, block) in candidates {
         let entry = counts.entry(peer_id.clone()).or_insert((0, 0));
         if entry.1 >= MAX_PENDING_BLOCKS_PER_PEER {
             dropped = dropped.saturating_add(1);
@@ -955,13 +1164,12 @@ pub fn requeue_pending_blocks(items: Vec<(String, Block)>) {
         entry.1 = entry.1.saturating_add(1);
         requeued.push((peer_id, block));
     }
+    drop(counts);
     if dropped > 0 {
         slog_warn!("p2p", "pending_block_requeue_dropped", dropped => dropped);
     }
 
-    let mut combined = requeued;
-    combined.extend(q.drain(..));
-    *q = combined;
+    q.prepend(requeued);
 }
 
 /// Requeue excess transactions that couldn't be processed in this tick.
@@ -1011,13 +1219,14 @@ pub fn requeue_pending_txs(items: Vec<(String, Transaction)>) {
 pub fn push_pending_block(peer_id: &str, block: Block) -> bool {
     // Lock queue FIRST to match lock order in dispatch_message
     // (queue → PEER_PENDING), preventing deadlocks.
-    let mut q = PENDING_BLOCKS.lock();
+    let mut q = PENDING_BLOCKS.write();
     if q.len() >= MAX_PENDING_BLOCK_QUEUE {
         slog_warn!("p2p", "pending_block_queue_full");
         return false;
     }
-    // Drop duplicate block hashes already waiting in queue.
-    if q.iter().any(|(_, b)| b.header.hash == block.header.hash) {
+    // Drop duplicate block hashes already waiting in queue — one hash lookup,
+    // not a walk of the queue.
+    if q.contains(&block.header.hash) {
         return true;
     }
 
@@ -1027,8 +1236,10 @@ pub fn push_pending_block(peer_id: &str, block: Block) -> bool {
         slog_warn!("p2p", "per_peer_block_limit_reached", peer => peer_id);
         return false;
     }
-    entry.1 += 1;
-    q.push((peer_id.to_string(), block));
+    // Charge the quota only for a block that was really stored.
+    if q.push(peer_id, block) {
+        entry.1 += 1;
+    }
     true
 }
 
@@ -2818,7 +3029,7 @@ impl P2P {
                                 // to prevent TOCTOU race where multiple threads pass the check.
                                 let pushed = {
                                     let mut q = PENDING_TXS.lock();
-                                    if q.len() >= 10_000 {
+                                    if q.len() >= MAX_PENDING_TX_QUEUE {
                                         false
                                     } else {
                                         // Check per-peer quota inside the same critical section
@@ -2875,17 +3086,28 @@ impl P2P {
                             Ok(()) => {
                                 // Atomicize quota check + queue push (same pattern as Tx)
                                 let pushed = {
-                                    let mut q = PENDING_BLOCKS.lock();
-                                    if q.len() >= 1_000 {
+                                    let mut q = PENDING_BLOCKS.write();
+                                    if q.len() >= MAX_NETWORK_PENDING_BLOCKS {
                                         false
+                                    } else if q.contains(&block.header.hash) {
+                                        // Already waiting, from this peer or
+                                        // another: nothing to store, so nothing
+                                        // to charge. This path had no duplicate
+                                        // check at all, so the queue could fill
+                                        // with copies of one block — and every
+                                        // copy made the announcement filters
+                                        // that walked it slower.
+                                        true
                                     } else {
                                         let mut m = PEER_PENDING.lock();
                                         let entry = m.entry(peer.to_string()).or_insert((0, 0));
                                         if entry.1 >= MAX_PENDING_BLOCKS_PER_PEER {
                                             false
                                         } else {
-                                            entry.1 += 1;
-                                            q.push((peer.to_string(), block));
+                                            // Charge for what was really stored.
+                                            if q.push(peer, block) {
+                                                entry.1 += 1;
+                                            }
                                             true
                                         }
                                     }
@@ -2926,11 +3148,7 @@ impl P2P {
 
             // ── Inv: validate item list via protocol validators ─────────
             P2PMessage::Inv { ref items } => {
-                let pairs: Vec<(String, String)> = items
-                    .iter()
-                    .map(|i| (i.kind.clone(), i.hash.clone()))
-                    .collect();
-                if let Err(pe) = validate_inv_items(&pairs) {
+                if let Err(pe) = validate_inv_count(items.len()) {
                     DOS_GUARD.add_ban_score_cat(
                         peer,
                         pe.ban_score as u64,
@@ -2939,16 +3157,25 @@ impl P2P {
                     );
                     return Ok(());
                 }
-                // Filter out items we already have to avoid redundant GetData
-                // requests. Without this, a peer can send repeated Inv messages
-                // to force us to re-download everything we already have.
-                let needed: Vec<_> = {
-                    let pending = PENDING_BLOCKS.lock();
-                    items
-                        .iter()
-                        .filter(|i| !pending.iter().any(|(_, b)| b.header.hash == i.hash))
-                        .cloned()
-                        .collect()
+                for item in items {
+                    if let Err(pe) = validate_inv_item(&item.kind, &item.hash) {
+                        DOS_GUARD.add_ban_score_cat(
+                            peer,
+                            pe.ban_score as u64,
+                            &pe.message,
+                            BanCategory::Malformed,
+                        );
+                        return Ok(());
+                    }
+                }
+                // Request only what we are not already holding, once each, and
+                // never more than one peer could queue for us. Without the
+                // filter a peer can re-announce what we already hold and make us
+                // download it again; with a filter that walked the queue per
+                // item, the announcement itself was the attack.
+                let needed = {
+                    let pending = PENDING_BLOCKS.read();
+                    inv_items_to_request(items, |hash| pending.contains(hash))
                 };
                 if !needed.is_empty() {
                     let get_data = P2PMessage::GetData { items: needed };
@@ -2959,11 +3186,7 @@ impl P2P {
 
             // ── GetData: validate item list and serve requested data ────
             P2PMessage::GetData { ref items } => {
-                let pairs: Vec<(String, String)> = items
-                    .iter()
-                    .map(|i| (i.kind.clone(), i.hash.clone()))
-                    .collect();
-                if let Err(pe) = validate_inv_items(&pairs) {
+                if let Err(pe) = validate_inv_count(items.len()) {
                     DOS_GUARD.add_ban_score_cat(
                         peer,
                         pe.ban_score as u64,
@@ -2972,27 +3195,43 @@ impl P2P {
                     );
                     return Ok(());
                 }
-                // Serve requested data by forwarding to per-peer targeted queue.
-                // The peer's connection thread drains targeted messages and writes
-                // them to the socket, so we never touch the TcpStream directly.
                 for item in items {
-                    match item.kind.as_str() {
-                        "block" => {
-                            // Block serving needs block_store access (not
-                            // available here). Queue the request for the daemon
-                            // event loop, which serves it to this peer.
-                            push_block_request(peer, &item.hash);
-                        }
-                        "tx" => {
-                            // TX serving requires mempool access which this layer
-                            // doesn't have. Log the request for the upper layer.
-                            slog_debug!("p2p", "getdata_tx_requested", hash => &item.hash, peer => peer);
-                        }
-                        _ => {
-                            slog_debug!("p2p", "getdata_unknown_kind", kind => &item.kind, peer => peer);
-                        }
+                    if let Err(pe) = validate_inv_item(&item.kind, &item.hash) {
+                        DOS_GUARD.add_ban_score_cat(
+                            peer,
+                            pe.ban_score as u64,
+                            &pe.message,
+                            BanCategory::Malformed,
+                        );
+                        return Ok(());
                     }
                 }
+                // Serve requested data by forwarding to per-peer targeted queue.
+                // The peer's connection thread drains targeted messages and
+                // writes them to the socket, so we never touch the TcpStream
+                // directly. Block serving needs block_store access, which this
+                // layer lacks, so the hashes are queued for the daemon event
+                // loop; TX serving needs the mempool, which it also lacks.
+                //
+                // Both outcomes are counted and reported once per message rather
+                // than logged per item: the log macros build their event and all
+                // its fields BEFORE the level is consulted, so a per-item debug
+                // line is thousands of discarded allocations per message even
+                // with debug logging switched off.
+                let mut wanted_blocks: Vec<String> = Vec::with_capacity(items.len());
+                let mut tx_requests = 0usize;
+                for item in items {
+                    // The validator above accepts only "block" and "tx".
+                    if item.kind == "block" {
+                        wanted_blocks.push(item.hash.clone());
+                    } else {
+                        tx_requests += 1;
+                    }
+                }
+                if tx_requests > 0 {
+                    slog_debug!("p2p", "getdata_tx_unserved", peer => peer, count => tx_requests);
+                }
+                push_block_requests(peer, wanted_blocks);
             }
 
             // ── GetHeaders: queue a forward-walk header response ─────────
@@ -3032,36 +3271,30 @@ impl P2P {
                 }
                 // Limit GetBlock requests to prevent amplification attacks.
                 // A malicious peer could send 2000 header hashes to trigger
-                // 2000 outbound GetBlock requests in one message.
-                let mut seen = std::collections::HashSet::new();
-                // Max blocks to request per Headers message. Bounded to cap the
-                // outbound amplification a hostile peer can trigger, but large
+                // 2000 outbound GetBlock requests in one message. Bounded to the
+                // per-peer pending-block quota: that is one full served Headers
+                // range, and asking for more than we could queue from this peer
+                // only guarantees the surplus is dropped and re-requested. Big
                 // enough that IBD backfill isn't throttled to a crawl — a node
-                // catching up a tall chain needs to pull the served range (up to
-                // 512 hashes) in a few round-trips, not 64 at a time (W3). The
-                // GetBlock serve side is itself bounded (512/tick), so this is
-                // safe. (was 64 — too slow to close a large gap.)
-                let max_requests = 512; // one full served Headers range per round
-                let mut request_count = 0;
-                for hash in hashes {
-                    if request_count >= max_requests {
-                        break;
-                    }
-                    if hash.is_empty() || !seen.insert(hash.clone()) {
-                        continue;
-                    }
-                    // Skip blocks already in the pending queue — avoids
-                    // redundant GetBlock requests that waste bandwidth.
-                    {
-                        let pending = PENDING_BLOCKS.lock();
-                        if pending.iter().any(|(_, b)| b.header.hash == *hash) {
-                            continue;
-                        }
-                    }
-                    let req = P2PMessage::GetBlock { hash: hash.clone() };
+                // catching up a tall chain needs the served range in a few
+                // round-trips, not 64 at a time (W3).
+                //
+                // The pending-queue filter runs ONCE, under one lock, before
+                // anything is written. It used to take that lock per hash,
+                // interleaved with the socket writes, and walk the whole queue
+                // on each of up to 2,000 hashes.
+                let requests = {
+                    let pending = PENDING_BLOCKS.read();
+                    blocks_to_request(hashes, MAX_PENDING_BLOCKS_PER_PEER as usize, |hash| {
+                        pending.contains(hash)
+                    })
+                };
+                for hash in requests {
+                    let req = P2PMessage::GetBlock {
+                        hash: hash.to_string(),
+                    };
                     let bytes = Self::write_message(writer, &req, magic)?;
                     session.record_bytes_sent(bytes);
-                    request_count += 1;
                 }
             }
 
@@ -3805,6 +4038,214 @@ mod tests {
         assert_eq!(dial_window(10, 3, 0, |_| true), (Vec::new(), 3));
         let (picked, _) = dial_window(4, 99, 2, |_| true);
         assert_eq!(picked, vec![3, 0], "a cursor past the end wraps, not panics");
+    }
+
+    // ── #5: the pending-block queue is tested, not walked ─────────────────
+
+    fn pending_test_block(hash: &str) -> Block {
+        use crate::domain::block::block_body::BlockBody;
+        use crate::domain::block::block_header::BlockHeader;
+        Block {
+            header: BlockHeader::new_with_defaults(
+                1,
+                hash.to_string(),
+                Vec::new(),
+                String::new(),
+                0,
+                0,
+                1,
+                0,
+            ),
+            body: BlockBody {
+                transactions: Vec::new(),
+            },
+        }
+    }
+
+    fn assert_index_matches_queue(q: &PendingBlocks) {
+        assert_eq!(
+            q.queue.len(),
+            q.hashes.len(),
+            "the index drifted from the queue"
+        );
+        for (_, b) in &q.queue {
+            assert!(
+                q.contains(&b.header.hash),
+                "a queued hash is missing from the index: {}",
+                b.header.hash
+            );
+        }
+    }
+
+    #[test]
+    fn the_pending_block_index_matches_the_queue_through_every_mutation() {
+        // The index is only trustworthy if it cannot drift, so drive every
+        // mutation the queue has and check the two halves after each one. A
+        // phantom entry would make us refuse to request that block ever again.
+        let mut q = PendingBlocks::new();
+
+        assert!(q.push("peer_a", pending_test_block("aa")));
+        assert!(q.push("peer_b", pending_test_block("bb")));
+        assert_eq!(q.len(), 2);
+        assert_index_matches_queue(&q);
+
+        assert!(
+            !q.push("peer_c", pending_test_block("aa")),
+            "a hash already queued must be refused so no quota is charged for it"
+        );
+        assert_eq!(q.len(), 2);
+        assert_index_matches_queue(&q);
+
+        q.prepend(vec![("peer_d".to_string(), pending_test_block("cc"))]);
+        assert_eq!(
+            q.queue[0].1.header.hash, "cc",
+            "requeued work goes to the front"
+        );
+        assert_index_matches_queue(&q);
+
+        assert_eq!(q.retain_other_peers("peer_a"), 1);
+        assert!(!q.contains("aa"), "a dropped hash must leave the index");
+        assert!(q.contains("bb") && q.contains("cc"));
+        assert_index_matches_queue(&q);
+
+        let taken = q.take();
+        assert_eq!(taken.len(), 2);
+        assert_eq!(q.len(), 0);
+        assert!(!q.contains("bb"), "the index must empty with the queue");
+        assert_index_matches_queue(&q);
+    }
+
+    #[test]
+    fn a_requeue_offers_only_blocks_the_queue_can_really_store() {
+        let mut q = PendingBlocks::new();
+        assert!(q.push("peer_a", pending_test_block("aa")));
+
+        // "aa" is back in the queue already (a copy arrived while the batch was
+        // out being processed), and "bb" appears twice in the batch itself.
+        let batch = vec![
+            ("peer_x".to_string(), pending_test_block("aa")),
+            ("peer_x".to_string(), pending_test_block("bb")),
+            ("peer_y".to_string(), pending_test_block("bb")),
+            ("peer_y".to_string(), pending_test_block("cc")),
+        ];
+        let (admitted, dropped) = q.admissible_for_requeue(batch, 8);
+        assert_eq!(
+            admitted
+                .iter()
+                .map(|(_, b)| b.header.hash.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bb", "cc"],
+            "only what will really be stored may be admitted — the caller \
+             charges a per-peer count for exactly this list"
+        );
+        assert_eq!(dropped, 2);
+
+        // Space left is honoured before anything else.
+        let (admitted, dropped) = q.admissible_for_requeue(
+            vec![
+                ("peer_x".to_string(), pending_test_block("dd")),
+                ("peer_x".to_string(), pending_test_block("ee")),
+            ],
+            1,
+        );
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(dropped, 1);
+
+        // And what was admitted really does go in, index included.
+        q.prepend(admitted);
+        assert!(q.contains("dd"));
+        assert_index_matches_queue(&q);
+    }
+
+    #[test]
+    fn an_announcement_is_requested_once_each_and_only_for_what_is_not_queued() {
+        let inv = |kind: &str, hash: &str| InvItem {
+            kind: kind.to_string(),
+            hash: hash.to_string(),
+        };
+        let items = vec![
+            inv("block", "aa"),
+            inv("block", "aa"),
+            inv("block", "queued"),
+            inv("tx", "bb"),
+            inv("block", "cc"),
+        ];
+        let got = inv_items_to_request(&items, |h| h == "queued");
+        assert_eq!(
+            got.iter()
+                .map(|i| (i.kind.as_str(), i.hash.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("block", "aa"), ("tx", "bb"), ("block", "cc")],
+            "order kept, each hash asked for once, queued hashes skipped"
+        );
+    }
+
+    #[test]
+    fn a_repeated_hash_is_tested_against_the_shared_queue_once() {
+        // The membership test is the one thing that touches the shared queue
+        // under its lock, so the repeat filter has to run FIRST: an
+        // announcement of 500 copies of one hash must cost one lookup there.
+        let items: Vec<InvItem> = (0..500)
+            .map(|_| InvItem {
+                kind: "block".to_string(),
+                hash: "ab".repeat(32),
+            })
+            .collect();
+        let lookups = std::cell::Cell::new(0usize);
+        let got = inv_items_to_request(&items, |_| {
+            lookups.set(lookups.get() + 1);
+            false
+        });
+        assert_eq!(got.len(), 1, "500 copies of one hash is one request");
+        assert_eq!(lookups.get(), 1, "and one test against the pending queue");
+    }
+
+    #[test]
+    fn an_announcement_cannot_ask_for_more_than_one_peer_could_queue() {
+        assert!(
+            MAX_INV_ITEMS_REQUESTED <= MAX_PENDING_BLOCKS_PER_PEER as usize
+                && MAX_INV_ITEMS_REQUESTED <= MAX_PENDING_TXS_PER_PEER as usize,
+            "the cap must not exceed either per-peer quota, or the surplus is \
+             dropped on arrival and re-requested for nothing"
+        );
+        let items: Vec<InvItem> = (0..MAX_INV_PER_MSG)
+            .map(|i| InvItem {
+                kind: "block".to_string(),
+                hash: format!("{:064x}", i),
+            })
+            .collect();
+        let got = inv_items_to_request(&items, |_| false);
+        assert_eq!(
+            got.len(),
+            MAX_INV_ITEMS_REQUESTED,
+            "a full wire-sized announcement is bounded, not answered in full"
+        );
+    }
+
+    #[test]
+    fn a_headers_reply_becomes_bounded_deduplicated_block_requests() {
+        let hashes: Vec<String> = vec![
+            "aa".into(),
+            String::new(),
+            "aa".into(),
+            "queued".into(),
+            "bb".into(),
+            "cc".into(),
+        ];
+        assert_eq!(
+            blocks_to_request(&hashes, 2, |h| h == "queued"),
+            vec!["aa", "bb"],
+            "empties, repeats and queued hashes drop out, and the limit binds"
+        );
+        assert_eq!(
+            blocks_to_request(&hashes, 64, |_| false),
+            vec!["aa", "queued", "bb", "cc"],
+            "with nothing queued, every distinct hash is requested once"
+        );
+        assert!(
+            blocks_to_request(&hashes, 0, |_| false).is_empty(),
+            "a zero limit requests nothing rather than spinning"
+        );
     }
 
     #[test]

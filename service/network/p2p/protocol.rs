@@ -1262,41 +1262,58 @@ pub fn validate_payload_checksum(payload: &[u8], expected: [u8; 4]) -> Result<()
     Ok(())
 }
 
-/// Validate an Inv/GetData message's item list.
-pub fn validate_inv_items(items: &[(String, String)]) -> Result<(), ProtocolError> {
-    if items.len() > MAX_INV_PER_MSG {
+/// Validate an Inv/GetData message's item count against the wire limit.
+pub fn validate_inv_count(count: usize) -> Result<(), ProtocolError> {
+    if count > MAX_INV_PER_MSG {
         return Err(ProtocolError::new(
             ProtocolErrorKind::FieldViolation,
-            format!("inv items {} > max {}", items.len(), MAX_INV_PER_MSG),
+            format!("inv items {} > max {}", count, MAX_INV_PER_MSG),
             50,
         ));
     }
+    Ok(())
+}
+
+/// Validate ONE Inv/GetData item, in place.
+///
+/// The same checks, messages and ban scores as [`validate_inv_items`], which is
+/// now this function in a loop. The dispatcher calls this one because the slice
+/// form takes owned pairs: checking a 5,000-item announcement through it meant
+/// copying it into 10,000 freshly allocated strings first, every message.
+pub fn validate_inv_item(kind: &str, hash: &str) -> Result<(), ProtocolError> {
+    if kind != "block" && kind != "tx" {
+        return Err(ProtocolError::new(
+            ProtocolErrorKind::FieldViolation,
+            format!("unknown inv type '{}'", kind),
+            20,
+        ));
+    }
+    if hash.len() != MAX_HASH_HEX_LEN {
+        return Err(ProtocolError::new(
+            ProtocolErrorKind::FieldViolation,
+            format!(
+                "inv hash length {} != required {}",
+                hash.len(),
+                MAX_HASH_HEX_LEN
+            ),
+            50,
+        ));
+    }
+    if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ProtocolError::new(
+            ProtocolErrorKind::FieldViolation,
+            "inv hash contains non-hex characters".to_string(),
+            50,
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an Inv/GetData message's item list.
+pub fn validate_inv_items(items: &[(String, String)]) -> Result<(), ProtocolError> {
+    validate_inv_count(items.len())?;
     for (kind, hash) in items {
-        if kind != "block" && kind != "tx" {
-            return Err(ProtocolError::new(
-                ProtocolErrorKind::FieldViolation,
-                format!("unknown inv type '{}'", kind),
-                20,
-            ));
-        }
-        if hash.len() != MAX_HASH_HEX_LEN {
-            return Err(ProtocolError::new(
-                ProtocolErrorKind::FieldViolation,
-                format!(
-                    "inv hash length {} != required {}",
-                    hash.len(),
-                    MAX_HASH_HEX_LEN
-                ),
-                50,
-            ));
-        }
-        if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(ProtocolError::new(
-                ProtocolErrorKind::FieldViolation,
-                "inv hash contains non-hex characters".to_string(),
-                50,
-            ));
-        }
+        validate_inv_item(kind, hash)?;
     }
     Ok(())
 }
@@ -1893,6 +1910,53 @@ mod tests {
             ("tx".to_string(), "bb".repeat(32)),
         ];
         assert!(validate_inv_items(&items).is_ok());
+    }
+
+    #[test]
+    fn the_item_validators_agree_with_the_slice_form() {
+        // The dispatcher validates items in place; the slice form must stay the
+        // same function in a loop, down to the message and the ban score.
+        let good = "a".repeat(MAX_HASH_HEX_LEN);
+        let bad_hex = "z".repeat(MAX_HASH_HEX_LEN);
+        let cases = [
+            ("block", good.as_str()),
+            ("tx", good.as_str()),
+            ("wat", good.as_str()),
+            ("block", "short"),
+            ("block", bad_hex.as_str()),
+        ];
+        for (kind, hash) in cases {
+            let slice = validate_inv_items(&[(kind.to_string(), hash.to_string())]);
+            let item = validate_inv_item(kind, hash);
+            match (slice, item) {
+                (Ok(()), Ok(())) => {}
+                (Err(a), Err(b)) => {
+                    assert_eq!(a.message, b.message, "message differs for {kind}/{hash}");
+                    assert_eq!(a.ban_score, b.ban_score, "score differs for {kind}/{hash}");
+                }
+                (a, b) => panic!("verdicts differ for {kind}/{hash}: {a:?} vs {b:?}"),
+            }
+        }
+        // The count check is the other half, and it is checked first: a list
+        // that is both too long AND holds a bad item must still report the
+        // length, the way it did when the items were copied up front.
+        assert!(validate_inv_count(MAX_INV_PER_MSG).is_ok());
+        let long_and_bad: Vec<(String, String)> = (0..=MAX_INV_PER_MSG)
+            .map(|_| ("wat".to_string(), "short".to_string()))
+            .collect();
+        let err = validate_inv_items(&long_and_bad).unwrap_err();
+        assert!(err.message.starts_with("inv items"), "got {}", err.message);
+
+        // And the scores the refactor promised not to move.
+        assert_eq!(
+            validate_inv_count(MAX_INV_PER_MSG + 1).unwrap_err().ban_score,
+            50
+        );
+        assert_eq!(validate_inv_item("wat", &good).unwrap_err().ban_score, 20);
+        assert_eq!(validate_inv_item("block", "short").unwrap_err().ban_score, 50);
+        let err = validate_inv_item("block", &bad_hex).unwrap_err();
+        assert_eq!(err.ban_score, 50);
+        assert_eq!(err.message, "inv hash contains non-hex characters");
     }
 
     #[test]
