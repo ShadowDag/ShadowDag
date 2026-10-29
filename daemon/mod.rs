@@ -43,6 +43,7 @@ use crate::service::network::dos_guard::{BanCategory, MAX_TX_BYTES};
 use crate::service::network::nodes::full_node::FullNode;
 use crate::service::network::p2p::p2p::{
     buffer_orphan, drain_block_requests, drain_header_requests, drain_pending_blocks,
+    requeue_block_requests,
     drain_pending_txs, extract_ban_ip, push_outbound, push_outbound_to_peer, report_bad_peer,
     report_bad_peer_cat, requeue_pending_blocks, requeue_pending_txs, take_orphans_for_parent,
     P2PMessage, P2P,
@@ -224,6 +225,36 @@ const MAX_HEADER_HASHES_PER_TICK: usize = 8_192;
 /// `last_sync_req`/`sync_interval` in this loop.
 const HEADER_SERVE_INTERVAL: std::time::Duration = POLL_INTERVAL;
 
+/// Block-serve requests processed per pass.
+///
+/// Counts requests PROCESSED, not blocks found: a request for a hash we do not
+/// have still costs a RocksDB point lookup, and the old counter only advanced
+/// on a hit, so a flood of unknown hashes was unbounded work per pass.
+///
+/// Sized ABOVE the honest per-host burst, as the header budget is: a peer
+/// catching up answers one Headers reply with up to `MAX_BLOCK_REQUESTS_PER_IP`
+/// GetBlock messages, and a budget BELOW that would mean a normal sync round
+/// could never be served in one pass. The bytes budget below is what actually
+/// bounds the heavy case; this one only stops a flood of cheap misses from
+/// monopolising a pass.
+const MAX_BLOCK_SERVES_PER_TICK: usize = 256;
+
+/// Bytes of block serialized per pass. The dimension that actually matters
+/// here: a block runs to MAX_BLOCK_BYTES, so 512 of them was up to a gigabyte
+/// of read-plus-serialize in one turn of the loop, and all of it lands in
+/// TARGETED_MSGS, which has no byte bound of its own.
+///
+/// Sized so one maximum block always gets through — the budget is checked
+/// before a request is served, so progress cannot stall on an oversized block.
+/// Whatever a pass cannot reach is requeued, not dropped, so this is a rate
+/// limit rather than a ceiling on what a sync round can ever receive.
+const MAX_BLOCK_SERVE_BYTES_PER_TICK: usize = 2 * 1024 * 1024;
+
+/// Minimum wall-clock gap between block-serve passes. Without it the per-pass
+/// numbers above are not a rate: `did_work` suppresses the loop's only sleep
+/// for as long as requests keep arriving.
+const BLOCK_SERVE_INTERVAL: std::time::Duration = POLL_INTERVAL;
+
 /// Whether a header-serve pass is due.
 ///
 /// Extracted so the pacing is checkable: it is the only thing that turns the
@@ -231,6 +262,16 @@ const HEADER_SERVE_INTERVAL: std::time::Duration = POLL_INTERVAL;
 /// cannot be unit-tested.
 fn header_pass_due(since_last_pass: std::time::Duration) -> bool {
     since_last_pass >= HEADER_SERVE_INTERVAL
+}
+
+/// Whether enough time has passed to run another block-serve pass.
+fn block_pass_due(since_last_pass: std::time::Duration) -> bool {
+    since_last_pass >= BLOCK_SERVE_INTERVAL
+}
+
+/// Whether this block-serve pass has spent its budget.
+fn block_budget_spent(served: usize, bytes: usize) -> bool {
+    served >= MAX_BLOCK_SERVES_PER_TICK || bytes >= MAX_BLOCK_SERVE_BYTES_PER_TICK
 }
 
 /// Whether this pass's header-serve budget is spent.
@@ -659,9 +700,12 @@ impl DaemonNode {
         let mut last_flush = Instant::now();
         let mut last_sync_req = Instant::now();
         let mut last_header_serve = Instant::now();
+        let mut last_block_serve = Instant::now();
         // Which host leads the next header-serve pass. Advanced by what the
         // pass served, so a flooder cannot lead every pass.
         let mut header_rr_cursor = 0usize;
+        // Rotating lead for the block-serve order, for the same reason.
+        let mut block_rr_cursor = 0usize;
         // While catching up, request the next header range every 500ms instead of
         // the idle 6s cadence so the download pipeline stays full. Extended 5s on
         // every tick that applies blocks; lapses back to 6s once caught up.
@@ -980,21 +1024,59 @@ impl DaemonNode {
             // A peer that hit an orphan asks us for the missing ancestor; reply
             // with the block from our store so it can walk the chain forward and
             // converge. Without this, GetBlock is a no-op and forks never heal.
-            let block_reqs = drain_block_requests();
+            // Paced, budgeted and round-robin for the same reasons as the
+            // header path below: the per-pass budget is only a per-second bound
+            // if the passes themselves are paced, and arrival order lets one
+            // flooder be served first with everything it queued.
+            let block_reqs = if block_pass_due(last_block_serve.elapsed()) {
+                last_block_serve = Instant::now();
+                drain_block_requests()
+            } else {
+                Vec::new()
+            };
             if !block_reqs.is_empty() {
                 did_work = true;
-                let mut served = 0usize;
-                for (req_peer, hash) in block_reqs {
-                    if served >= 512 {
-                        break; // bound serving work per tick
+                let order = round_robin_by_peer(
+                    &block_reqs
+                        .iter()
+                        .map(|(peer, _)| extract_ban_ip(peer))
+                        .collect::<Vec<_>>(),
+                    block_rr_cursor,
+                );
+                let mut bytes_total = 0usize;
+                let mut processed = 0usize;
+                // `served` is the enumerate index, so every request counts —
+                // including one for a hash we do not have, which still costs a
+                // point lookup.
+                let mut deferred: Vec<(String, String)> = Vec::new();
+                for (served, i) in order.into_iter().enumerate() {
+                    if block_budget_spent(served, bytes_total) {
+                        // Deferred, not dropped: the requester has no retry for
+                        // an unanswered GetBlock, so dropping here would make
+                        // the budget a hard ceiling on sync throughput instead
+                        // of a rate. An ordinary event while catching up, hence
+                        // debug rather than warn.
+                        slog_debug!("daemon", "block_serve_budget_spent",
+                            queued => block_reqs.len(),
+                            requests_served => served,
+                            bytes => bytes_total,
+                            deferred => block_reqs.len().saturating_sub(served));
+                        deferred.push(block_reqs[i].clone());
+                        continue;
                     }
-                    if let Some(b) = self.block_store.get_block(&hash) {
+                    let (req_peer, hash) = &block_reqs[i];
+                    if let Some(b) = self.block_store.get_block(hash) {
                         if let Ok(bytes) = bincode::serialize(&b) {
-                            push_outbound_to_peer(&req_peer, P2PMessage::Block { data: bytes });
-                            served += 1;
+                            bytes_total = bytes_total.saturating_add(bytes.len());
+                            push_outbound_to_peer(req_peer, P2PMessage::Block { data: bytes });
                         }
                     }
+                    processed = served + 1;
                 }
+                // Move the lead on by what we got through, so the hosts this
+                // pass could not reach lead the next one.
+                block_rr_cursor = block_rr_cursor.wrapping_add(processed.max(1));
+                requeue_block_requests(deferred);
             }
 
             // ── Serve header requests: walk the chain FORWARD from from_hash ──
@@ -2088,6 +2170,62 @@ mod tests {
             flooder_positions.windows(2).all(|w| w[0] < w[1]),
             "a peer's own requests must stay in arrival order"
         );
+    }
+
+    #[test]
+    fn the_block_serve_budget_counts_every_request_not_just_the_hits() {
+        // The old counter advanced only when a block was FOUND and serialized,
+        // so a flood of hashes we do not have was unbounded work per pass: each
+        // one still costs a RocksDB point lookup.
+        assert!(
+            block_budget_spent(MAX_BLOCK_SERVES_PER_TICK, 0),
+            "a pass that found nothing at all must still run out of budget"
+        );
+        assert!(!block_budget_spent(
+            MAX_BLOCK_SERVES_PER_TICK - 1,
+            MAX_BLOCK_SERVE_BYTES_PER_TICK - 1
+        ));
+        // The byte dimension binds on its own: a block runs to MAX_BLOCK_BYTES
+        // and all of it lands in TARGETED_MSGS, which has no byte bound.
+        assert!(block_budget_spent(1, MAX_BLOCK_SERVE_BYTES_PER_TICK));
+        // And one maximum-size block must always get through, since the budget
+        // is checked before a request is served.
+        assert!(!block_budget_spent(0, 0));
+        const { 
+            assert!(
+                MAX_BLOCK_SERVE_BYTES_PER_TICK
+                    >= crate::service::network::dos_guard::MAX_BLOCK_BYTES,
+                "one maximum block must fit in a pass byte budget"
+            )
+        };
+    }
+
+    #[test]
+    fn the_block_serve_budget_is_a_rate_only_because_the_passes_are_paced() {
+        // Same reasoning as the header path: without a pass interval the
+        // per-pass numbers bound nothing per second, because did_work
+        // suppresses the loop only sleep while requests keep arriving.
+        assert!(block_pass_due(BLOCK_SERVE_INTERVAL));
+        assert!(!block_pass_due(
+            BLOCK_SERVE_INTERVAL - std::time::Duration::from_millis(1)
+        ));
+        let passes_per_sec = 1_000 / BLOCK_SERVE_INTERVAL.as_millis() as usize;
+        assert_eq!(passes_per_sec * MAX_BLOCK_SERVES_PER_TICK, 5_120);
+        assert_eq!(
+            passes_per_sec * MAX_BLOCK_SERVE_BYTES_PER_TICK,
+            40 * 1024 * 1024
+        );
+        // The request budget must sit ABOVE the honest per-host burst, the way
+        // the header budget does. Below it, a normal sync round could never be
+        // served in one pass — which is what made the remainder's fate matter
+        // so much in the first place.
+        const {
+            assert!(
+                MAX_BLOCK_SERVES_PER_TICK
+                    >= crate::service::network::p2p::p2p::MAX_BLOCK_REQUESTS_PER_IP / 2,
+                "a pass must be able to clear a substantial part of one burst"
+            )
+        };
     }
 
     #[test]
