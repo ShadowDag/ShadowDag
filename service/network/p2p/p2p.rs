@@ -1676,10 +1676,21 @@ pub fn drain_block_requests() -> Vec<(String, String)> {
 }
 
 /// Buffer an orphan block (parent not yet known) for reprocessing once the
-/// missing ancestor arrives. Deduplicated by hash; bounded (drops oldest).
+/// missing ancestor arrives. Bounded (drops oldest).
+///
+/// Deduplicated per SENDER, not by hash alone. With a hash-wide key the second
+/// peer to gossip an orphan was turned away with nothing stored for it, while
+/// `cleanup_peer_state` deletes this pool BY PEER — so the first sender's
+/// disconnect took the only copy of a block several peers had handed us, and the
+/// ancestor we had already broadcast GetBlock for arrived to find nothing
+/// waiting on it. `PendingBlocks::retain_other_peers` states the same lesson for
+/// the queue these blocks were drained from; this pool had not learned it.
 pub fn buffer_orphan(peer_id: &str, block: Block) {
     let mut q = ORPHAN_BLOCKS.lock();
-    if q.iter().any(|(_, b)| b.header.hash == block.header.hash) {
+    if q
+        .iter()
+        .any(|(p, b)| p == peer_id && b.header.hash == block.header.hash)
+    {
         return;
     }
     if q.len() >= MAX_ORPHAN_BLOCKS {
@@ -5358,6 +5369,88 @@ mod tests {
             payload_size_estimate(&targeted_ping(1)) > 0,
             "a fixed-size message still costs something"
         );
+    }
+
+    // ── the orphan pool keeps a block its first sender abandoned ───────
+
+    fn orphan_test_block(hash: &str, parent: &str) -> Block {
+        use crate::domain::block::block_body::BlockBody;
+        use crate::domain::block::block_header::BlockHeader;
+        Block {
+            header: BlockHeader::new_with_defaults(
+                1,
+                hash.to_string(),
+                vec![parent.to_string()],
+                String::new(),
+                0,
+                0,
+                1,
+                0,
+            ),
+            body: BlockBody {
+                transactions: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn an_orphan_outlives_the_disconnect_of_the_peer_that_sent_it_first() {
+        // `buffer_orphan` deduplicated on the HASH alone, so the second peer to
+        // gossip an orphan was turned away with nothing stored for it, while
+        // `cleanup_peer_state` deletes by PEER — so the first sender leaving took
+        // the only copy. `PendingBlocks::retain_other_peers` states this exact
+        // lesson for the queue one pool over: a hash-wide dedup makes one peer's
+        // disconnect destroy a block several peers had handed us.
+        let parent = "orphan_parent_outlives";
+        let child = "orphan_child_outlives";
+        buffer_orphan("orphan_peer_a", orphan_test_block(child, parent));
+        buffer_orphan("orphan_peer_b", orphan_test_block(child, parent));
+
+        cleanup_peer_state("orphan_peer_a");
+
+        let ready = take_orphans_for_parent(parent);
+        assert_eq!(
+            ready.len(),
+            1,
+            "peer_b handed us this block too, so it must still be here"
+        );
+        assert_eq!(ready[0].1.header.hash, child);
+        assert_eq!(ready[0].0, "orphan_peer_b", "attributed to who still has it");
+        assert!(
+            take_orphans_for_parent(parent).is_empty(),
+            "and taking it removes it"
+        );
+    }
+
+    #[test]
+    fn one_sender_cannot_buffer_the_same_orphan_twice() {
+        // Per-sender keying must not become no keying: a peer that repeats an
+        // orphan would otherwise multiply its own footprint in a pool bounded
+        // only by entry count, and evict other peers' orphans to do it.
+        let parent = "orphan_parent_once";
+        let child = "orphan_child_once";
+        buffer_orphan("orphan_peer_c", orphan_test_block(child, parent));
+        buffer_orphan("orphan_peer_c", orphan_test_block(child, parent));
+        buffer_orphan("orphan_peer_c", orphan_test_block(child, parent));
+        assert_eq!(
+            take_orphans_for_parent(parent).len(),
+            1,
+            "one sender, one copy"
+        );
+    }
+
+    #[test]
+    fn one_sender_may_buffer_different_orphans() {
+        // The key is (sender, hash), and it needs BOTH halves. Without the hash
+        // a peer's first orphan would block every later one it sent, which is
+        // how a node stops healing the fork it is actively downloading — and no
+        // other test here notices, because each uses one orphan per sender.
+        let p1 = "orphan_parent_many_1";
+        let p2 = "orphan_parent_many_2";
+        buffer_orphan("orphan_peer_d", orphan_test_block("orphan_child_many_1", p1));
+        buffer_orphan("orphan_peer_d", orphan_test_block("orphan_child_many_2", p2));
+        assert_eq!(take_orphans_for_parent(p1).len(), 1, "the first is kept");
+        assert_eq!(take_orphans_for_parent(p2).len(), 1, "and so is the second");
     }
 
     // ── #5: the pending-block queue is tested, not walked ─────────────────
