@@ -351,6 +351,16 @@ const _: () = assert!(
 /// unnamed literal beside the push that enforced it.
 const MAX_RECEIVED_ADDRS: usize = 4_096;
 
+/// Addresses one GetAddr is answered with. Was an unnamed literal beside the
+/// `take` that enforced it. Well below MAX_ADDR_PER_MSG so the reply always
+/// passes the receiver's own validation — including a receiver running this
+/// code, whose ADDR_TOKEN_BURST must also cover it.
+const MAX_GETADDR_REPLY: usize = 100;
+const _: () = assert!(
+    MAX_GETADDR_REPLY <= MAX_ADDR_PER_MSG && MAX_GETADDR_REPLY <= ADDR_TOKEN_BURST,
+    "our own reply must fit both the receiver's per-message cap and its address allowance"
+);
+
 /// Keepalive ping interval (seconds) — detect dead connections.
 const KEEPALIVE_INTERVAL_SECS: u64 = 60;
 /// Max time without pong before disconnecting (seconds).
@@ -2253,6 +2263,14 @@ struct ConnectionSession {
     /// last refilled. See ADDR_TOKEN_BURST.
     addr_tokens: f64,
     addr_tokens_at: Instant,
+    /// Whether this connection has already been answered a GetAddr.
+    ///
+    /// GetAddr is not in `token_cost`'s match, so it costs COST_MSG_DEFAULT = 1:
+    /// a 13-byte request for a ~2.5 KiB reply, about 190x, repeatable at
+    /// BUCKET_REFILL_RATE a second. That is megabytes a second of OUR upstream
+    /// per peer, written synchronously from the peer's own thread. Bitcoin Core
+    /// answers it once per connection for exactly this reason.
+    getaddr_answered: bool,
 }
 
 // dos_type_name removed — CommandId::name() used directly now
@@ -2283,6 +2301,7 @@ impl ConnectionSession {
             puzzles_solved: 0,
             addr_tokens: ADDR_TOKEN_BURST as f64,
             addr_tokens_at: Instant::now(),
+            getaddr_answered: false,
         }
     }
 
@@ -2318,6 +2337,26 @@ impl ConnectionSession {
     ) -> (&'a [String], usize) {
         let granted = self.take_addr_tokens(peers.len(), whitelisted);
         (&peers[..granted], peers.len() - granted)
+    }
+
+    /// Whether to answer a GetAddr on this connection, consuming the single
+    /// allowance if so.
+    ///
+    /// Deciding and spending are ONE call, for the reason `admit_addresses`
+    /// gives: the caller is inside `dispatch_message` and no unit test can
+    /// reach it, so a separate flag to set would be a flag to forget.
+    ///
+    /// Two rules, both Bitcoin Core's. Once per connection, because the reply
+    /// is ~190x the request and costs the asker one token. And never on a
+    /// connection WE dialled: we chose that peer, so it has no business asking
+    /// for our address book, and upstream ignores GETADDR from outbound peers
+    /// for the same reason.
+    fn admit_getaddr(&mut self) -> bool {
+        if self.protocol.is_outbound || self.getaddr_answered {
+            return false;
+        }
+        self.getaddr_answered = true;
+        true
     }
 
     fn touch(&mut self) {
@@ -3593,10 +3632,18 @@ impl P2P {
 
             // ── GetAddr: validated address list ─���──────────────────────
             P2PMessage::GetAddr => {
-                let addrs: Vec<String> = known_peers.iter().take(100).cloned().collect();
-                let response = P2PMessage::Addr { peers: addrs };
-                let bytes = Self::write_message(writer, &response, magic)?;
-                session.record_bytes_sent(bytes);
+                // Ignored rather than refused, and not scored: asking twice is
+                // wasteful, not malicious, and upstream treats it the same way.
+                if session.admit_getaddr() {
+                    let addrs: Vec<String> =
+                        known_peers.iter().take(MAX_GETADDR_REPLY).cloned().collect();
+                    let response = P2PMessage::Addr { peers: addrs };
+                    let bytes = Self::write_message(writer, &response, magic)?;
+                    session.record_bytes_sent(bytes);
+                } else {
+                    slog_debug!("p2p", "getaddr_ignored",
+                        addr => peer, outbound => session.protocol.is_outbound);
+                }
             }
 
             // ── Addr: validate list size ──���────────────────────────────
@@ -4938,6 +4985,52 @@ mod tests {
             q.since(q.seq, 512).len(),
             0,
             "and nothing sits past the newest sequence"
+        );
+    }
+
+    // ── GetAddr is answered once per connection, and never when we dialled ─
+
+    #[test]
+    fn getaddr_is_answered_once_per_inbound_connection_and_never_outbound() {
+        // GetAddr is absent from `token_cost`'s match, so it falls to
+        // COST_MSG_DEFAULT = 1: a 13-byte request for a MAX_GETADDR_REPLY
+        // answer of ~2.5 KiB, about 190x, repeatable at BUCKET_REFILL_RATE a
+        // second. Megabytes a second of OUR upstream per peer, written
+        // synchronously from the peer's own thread.
+        let mut inbound = ConnectionSession::new("192.0.2.90:9333".parse().unwrap(), false);
+        assert!(inbound.admit_getaddr(), "a peer that dialled us is answered");
+        assert!(
+            !inbound.admit_getaddr(),
+            "and only once — this is the amplifier"
+        );
+        assert!(!inbound.admit_getaddr(), "the allowance does not come back");
+
+        // We send GetAddr at exactly one site, in the handshake-completion arm,
+        // so one answer per connection cannot cost us our own refresh.
+        let mut outbound = ConnectionSession::new("192.0.2.91:9333".parse().unwrap(), true);
+        assert!(
+            !outbound.admit_getaddr(),
+            "we chose this peer; it has no business asking for our address book"
+        );
+        assert!(
+            !outbound.getaddr_answered,
+            "and being refused for direction must not spend the allowance, \
+             or the rule would depend on which check ran first"
+        );
+    }
+
+    #[test]
+    fn our_getaddr_reply_fits_what_the_receiver_will_accept() {
+        // Including a receiver running this code: the reply must pass
+        // validate_addr_list's per-message cap AND fit the address allowance,
+        // or we would rate-limit our own honest answer. Both bounds are held
+        // by the const assert at MAX_GETADDR_REPLY, which is compile-time and
+        // needs no test; what needs one is the runtime consequence.
+        let mut s = ConnectionSession::new("192.0.2.92:9333".parse().unwrap(), false);
+        assert_eq!(
+            s.take_addr_tokens(MAX_GETADDR_REPLY, false),
+            MAX_GETADDR_REPLY,
+            "a fresh connection admits a full reply from us in one message"
         );
     }
 
