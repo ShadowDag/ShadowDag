@@ -111,18 +111,33 @@ static PENDING_TXS: Lazy<Arc<PlMutex<Vec<(String, Transaction)>>>> =
 /// and it got more expensive as the backlog grew, so the further behind the node
 /// fell, the more each announcement cost it.
 ///
-/// Both live under one lock so they cannot drift apart, and the queue is kept
-/// hash-unique so the index needs no reference counts.
+/// All three live under one lock so they cannot drift apart.
 struct PendingBlocks {
     queue: Vec<(String, Block)>,
-    hashes: HashSet<String>,
+    /// How many queued entries carry each hash. A count rather than a set
+    /// because two peers may each hold a copy of the same block.
+    hashes: HashMap<String, u32>,
+    /// Which hashes each peer already has queued.
+    ///
+    /// The dedup key is per PEER, and that matters twice over. The hash is a
+    /// peer-chosen field here: `DagShield::pre_validate_block` checks only that
+    /// it is 64 hex characters, and nothing binds it to the content until full
+    /// validation recomputes it after the drain — so a hash-wide key would let
+    /// one peer name any hash and have every honest copy of that block thrown
+    /// away on arrival. And the entry's peer is also what `retain_other_peers`
+    /// deletes by, so a hash-wide key would make the first deliverer's
+    /// disconnect destroy the only copy the node holds. Per peer still stops one
+    /// peer filling its own quota with copies of one block, which is all the
+    /// dedup is for.
+    owned: HashMap<String, HashSet<String>>,
 }
 
 impl PendingBlocks {
     fn new() -> Self {
         Self {
             queue: Vec::with_capacity(128),
-            hashes: HashSet::with_capacity(128),
+            hashes: HashMap::with_capacity(128),
+            owned: HashMap::new(),
         }
     }
 
@@ -130,19 +145,51 @@ impl PendingBlocks {
         self.queue.len()
     }
 
-    /// One hash lookup, whatever the queue's depth.
+    /// One hash lookup, whatever the queue's depth: does ANY peer have this
+    /// block queued?
     fn contains(&self, hash: &str) -> bool {
-        self.hashes.contains(hash)
+        self.hashes.contains_key(hash)
     }
 
-    /// Append a block. Returns false when that hash is already queued, in which
-    /// case nothing was stored and the caller must charge no quota for it.
+    /// Does this peer already have this block queued?
+    fn owns(&self, peer_id: &str, hash: &str) -> bool {
+        self.owned
+            .get(peer_id)
+            .is_some_and(|hashes| hashes.contains(hash))
+    }
+
+    /// Append a block. Returns false when THIS PEER already has that hash
+    /// queued, in which case nothing was stored and the caller must charge no
+    /// quota for it.
     fn push(&mut self, peer_id: &str, block: Block) -> bool {
-        if !self.hashes.insert(block.header.hash.clone()) {
+        if !self
+            .owned
+            .entry(peer_id.to_string())
+            .or_default()
+            .insert(block.header.hash.clone())
+        {
             return false;
         }
+        *self.hashes.entry(block.header.hash.clone()).or_insert(0) += 1;
         self.queue.push((peer_id.to_string(), block));
         true
+    }
+
+    /// Rebuild both indexes from the queue, which is the only source of truth.
+    ///
+    /// Used wherever entries leave in bulk: a rebuild cannot leave a phantom
+    /// behind the way a decrement-and-remove can, and a phantom would make us
+    /// refuse to request that block again.
+    fn reindex(&mut self) {
+        self.hashes.clear();
+        self.owned.clear();
+        for (peer, block) in &self.queue {
+            *self.hashes.entry(block.header.hash.clone()).or_insert(0) += 1;
+            self.owned
+                .entry(peer.clone())
+                .or_default()
+                .insert(block.header.hash.clone());
+        }
     }
 
     /// Of `items`, those that can really go back into the queue: not already
@@ -159,15 +206,14 @@ impl PendingBlocks {
         available: usize,
     ) -> (Vec<(String, Block)>, usize) {
         let mut admitted: Vec<(String, Block)> = Vec::with_capacity(items.len().min(available));
-        let mut batch: HashSet<String> = HashSet::with_capacity(items.len().min(available));
+        let mut batch: HashSet<(String, String)> =
+            HashSet::with_capacity(items.len().min(available));
         let mut refused = 0usize;
         // The batch is MOVED through, not copied: a requeue can carry hundreds
         // of blocks of up to 2 MiB each, every tick.
         for (peer_id, block) in items {
-            if admitted.len() >= available
-                || self.contains(&block.header.hash)
-                || !batch.insert(block.header.hash.clone())
-            {
+            let key = (peer_id.clone(), block.header.hash.clone());
+            if admitted.len() >= available || self.owns(&key.0, &key.1) || !batch.insert(key) {
                 refused = refused.saturating_add(1);
                 continue;
             }
@@ -186,36 +232,43 @@ impl PendingBlocks {
         if items.is_empty() {
             return;
         }
-        for (_, block) in &items {
-            let fresh = self.hashes.insert(block.header.hash.clone());
-            debug_assert!(fresh, "prepended a block the queue already held");
+        for (peer, block) in &items {
+            let fresh = self
+                .owned
+                .entry(peer.clone())
+                .or_default()
+                .insert(block.header.hash.clone());
+            debug_assert!(fresh, "requeued a block this peer already had queued");
+            *self.hashes.entry(block.header.hash.clone()).or_insert(0) += 1;
         }
         let mut combined = items;
         combined.append(&mut self.queue);
         self.queue = combined;
     }
 
-    /// Take the whole queue; the index empties with it.
+    /// Take the whole queue; the indexes empty with it.
     fn take(&mut self) -> Vec<(String, Block)> {
         self.hashes.clear();
+        self.owned.clear();
         std::mem::take(&mut self.queue)
     }
 
     /// Drop everything attributed to one peer, returning how many went.
     ///
-    /// The index is rebuilt from what survives instead of having the dropped
-    /// hashes removed from it: a rebuild cannot leave a phantom entry behind,
-    /// and a phantom would make us refuse to request that block ever again.
+    /// The indexes are rebuilt from what survives rather than having the
+    /// dropped entries removed from them: a rebuild cannot leave a phantom
+    /// behind, and a phantom would make us refuse to request that block again.
+    ///
+    /// Note what this does NOT do: another peer's copy of the same block is a
+    /// separate entry and stays. That is the whole reason the dedup key carries
+    /// the peer — this delete is by peer, so a hash-wide dedup would make one
+    /// peer's disconnect destroy a block several peers had handed us.
     fn retain_other_peers(&mut self, peer_id: &str) -> usize {
         let before = self.queue.len();
         self.queue.retain(|(peer, _)| peer != peer_id);
         let dropped = before.saturating_sub(self.queue.len());
         if dropped > 0 {
-            self.hashes = self
-                .queue
-                .iter()
-                .map(|(_, b)| b.header.hash.clone())
-                .collect();
+            self.reindex();
         }
         dropped
     }
@@ -3089,22 +3142,21 @@ impl P2P {
                                     let mut q = PENDING_BLOCKS.write();
                                     if q.len() >= MAX_NETWORK_PENDING_BLOCKS {
                                         false
-                                    } else if q.contains(&block.header.hash) {
-                                        // Already waiting, from this peer or
-                                        // another: nothing to store, so nothing
-                                        // to charge. This path had no duplicate
-                                        // check at all, so the queue could fill
-                                        // with copies of one block — and every
-                                        // copy made the announcement filters
-                                        // that walked it slower.
-                                        true
                                     } else {
                                         let mut m = PEER_PENDING.lock();
                                         let entry = m.entry(peer.to_string()).or_insert((0, 0));
                                         if entry.1 >= MAX_PENDING_BLOCKS_PER_PEER {
                                             false
                                         } else {
-                                            // Charge for what was really stored.
+                                            // `push` refuses a block THIS peer
+                                            // already has queued — the path had
+                                            // no duplicate check at all, so one
+                                            // peer could fill its whole quota
+                                            // with copies of one block. A copy
+                                            // from another peer is a separate
+                                            // entry and is kept: it is the only
+                                            // copy left once this peer goes.
+                                            // Charge only for what was stored.
                                             if q.push(peer, block) {
                                                 entry.1 += 1;
                                             }
@@ -4063,16 +4115,27 @@ mod tests {
     }
 
     fn assert_index_matches_queue(q: &PendingBlocks) {
+        let counted: u32 = q.hashes.values().sum();
         assert_eq!(
-            q.queue.len(),
-            q.hashes.len(),
-            "the index drifted from the queue"
+            q.queue.len() as u32,
+            counted,
+            "the hash counts drifted from the queue"
         );
-        for (_, b) in &q.queue {
+        let owned_pairs: usize = q.owned.values().map(|h| h.len()).sum();
+        assert_eq!(
+            owned_pairs,
+            q.queue.len(),
+            "the per-peer ownership drifted from the queue"
+        );
+        for (peer, b) in &q.queue {
             assert!(
                 q.contains(&b.header.hash),
-                "a queued hash is missing from the index: {}",
+                "a queued hash is missing from the counts: {}",
                 b.header.hash
+            );
+            assert!(
+                q.owns(peer, &b.header.hash),
+                "a queued entry is missing from its peer's ownership: {peer}"
             );
         }
     }
@@ -4090,10 +4153,18 @@ mod tests {
         assert_index_matches_queue(&q);
 
         assert!(
-            !q.push("peer_c", pending_test_block("aa")),
-            "a hash already queued must be refused so no quota is charged for it"
+            !q.push("peer_a", pending_test_block("aa")),
+            "the SAME peer sending it twice is refused, so no quota is charged"
         );
         assert_eq!(q.len(), 2);
+        assert_index_matches_queue(&q);
+
+        assert!(
+            q.push("peer_c", pending_test_block("aa")),
+            "ANOTHER peer's copy is its own entry: it is the only copy left \
+             once peer_a disconnects"
+        );
+        assert_eq!(q.len(), 3);
         assert_index_matches_queue(&q);
 
         q.prepend(vec![("peer_d".to_string(), pending_test_block("cc"))]);
@@ -4104,14 +4175,63 @@ mod tests {
         assert_index_matches_queue(&q);
 
         assert_eq!(q.retain_other_peers("peer_a"), 1);
-        assert!(!q.contains("aa"), "a dropped hash must leave the index");
+        assert!(
+            q.contains("aa"),
+            "peer_c's copy must survive peer_a leaving"
+        );
         assert!(q.contains("bb") && q.contains("cc"));
+        assert_index_matches_queue(&q);
+
+        assert_eq!(q.retain_other_peers("peer_c"), 1);
+        assert!(
+            !q.contains("aa"),
+            "and with the last copy gone the hash leaves the index"
+        );
         assert_index_matches_queue(&q);
 
         let taken = q.take();
         assert_eq!(taken.len(), 2);
         assert_eq!(q.len(), 0);
-        assert!(!q.contains("bb"), "the index must empty with the queue");
+        assert!(!q.contains("bb"), "the indexes must empty with the queue");
+        assert_index_matches_queue(&q);
+    }
+
+    #[test]
+    fn a_block_survives_the_disconnect_of_the_peer_that_delivered_it_first() {
+        // The regression that keys the dedup per peer. The entry's peer is also
+        // what `retain_other_peers` deletes by, so deduplicating on the hash
+        // alone made the FIRST deliverer's disconnect destroy the only copy of a
+        // block that several peers had handed us — and closing a socket costs a
+        // peer nothing and accrues no ban score.
+        let mut q = PendingBlocks::new();
+        assert!(q.push("first:1", pending_test_block("ab")));
+        assert!(q.push("second:2", pending_test_block("ab")));
+        assert!(q.push("third:3", pending_test_block("ab")));
+        assert_eq!(q.len(), 3, "one entry per peer that delivered it");
+
+        assert_eq!(q.retain_other_peers("first:1"), 1);
+        assert!(q.contains("ab"), "two copies still remain");
+        assert_eq!(q.retain_other_peers("second:2"), 1);
+        assert!(q.contains("ab"), "one copy still remains");
+        assert_eq!(q.retain_other_peers("third:3"), 1);
+        assert!(!q.contains("ab"), "and only now is the block gone");
+        assert_index_matches_queue(&q);
+    }
+
+    #[test]
+    fn one_peer_cannot_fill_its_quota_with_copies_of_one_block() {
+        // What the dedup is actually for: the network path had no duplicate
+        // check at all, so one peer could spend its whole 512-slot quota on
+        // copies of a single block.
+        let mut q = PendingBlocks::new();
+        assert!(q.push("flooder:9", pending_test_block("cd")));
+        for _ in 0..16 {
+            assert!(
+                !q.push("flooder:9", pending_test_block("cd")),
+                "a repeat from the same peer is refused, and charges no quota"
+            );
+        }
+        assert_eq!(q.len(), 1);
         assert_index_matches_queue(&q);
     }
 
@@ -4120,21 +4240,23 @@ mod tests {
         let mut q = PendingBlocks::new();
         assert!(q.push("peer_a", pending_test_block("aa")));
 
-        // "aa" is back in the queue already (a copy arrived while the batch was
-        // out being processed), and "bb" appears twice in the batch itself.
+        // peer_a's own copy of "aa" is in the queue already, and peer_x offers
+        // "bb" twice inside one batch. peer_x's copy of "aa" is NOT a
+        // duplicate: it is a separate entry, and the only one left if peer_a
+        // disconnects before the drain.
         let batch = vec![
+            ("peer_a".to_string(), pending_test_block("aa")),
             ("peer_x".to_string(), pending_test_block("aa")),
             ("peer_x".to_string(), pending_test_block("bb")),
-            ("peer_y".to_string(), pending_test_block("bb")),
-            ("peer_y".to_string(), pending_test_block("cc")),
+            ("peer_x".to_string(), pending_test_block("bb")),
         ];
         let (admitted, dropped) = q.admissible_for_requeue(batch, 8);
         assert_eq!(
             admitted
                 .iter()
-                .map(|(_, b)| b.header.hash.as_str())
+                .map(|(p, b)| (p.as_str(), b.header.hash.as_str()))
                 .collect::<Vec<_>>(),
-            vec!["bb", "cc"],
+            vec![("peer_x", "aa"), ("peer_x", "bb")],
             "only what will really be stored may be admitted — the caller \
              charges a per-peer count for exactly this list"
         );
