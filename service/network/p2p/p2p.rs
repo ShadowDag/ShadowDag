@@ -1845,8 +1845,8 @@ pub fn cleanup_peer_state(peer_id: &str) {
         let mut p = PEER_PENDING.lock();
         p.remove(peer_id);
     }
-    // The outbound cursor is NOT removed here: `OutboundCursor` owns it for the
-    // life of the connection and drops it on every exit path, panics included.
+    // The outbound cursor is NOT removed here: `OutboundCursor` owns it from the
+    // start of relay until the session drops, on every exit path, panics included.
     // Removing it in both places would mean two owners for one entry, and the
     // loser would delete a cursor the next connection from the same ip:port had
     // just seeded — which silently drops that peer out of the pruning minimum.
@@ -2385,8 +2385,8 @@ pub fn sweep_targeted_expired() {
 /// read the sequence it will seed with, and is then descheduled, inserts that
 /// older value after this call, so the early read is not conservative by
 /// itself. What makes pruning safe is the order at the seeding site: a
-/// connection's DELIVERY cursor is read AFTER its entry is seeded
-/// (`OutboundCursor::seed`, then `ConnectionSession::new`), so the delivery
+/// connection's DELIVERY cursor is read AFTER its entry is seeded (both at the
+/// start of relay, in `flush_outbound`), so the delivery
 /// cursor is never below the seeded value, and the global sequence only rises.
 /// Whichever order this read and that seed happen in, the minimum returned is
 /// at or below that connection's delivery cursor — before the seed, it is at
@@ -2438,7 +2438,9 @@ fn drain_outbound_since(since: u64) -> (Vec<(u64, Arc<P2PMessage>)>, u64) {
     (new_msgs, max_seq)
 }
 
-/// Owns one peer's outbound-broadcast cursor for the life of its connection.
+/// Owns one peer's outbound-broadcast cursor for as long as it is relayed to.
+/// Held by the connection's session, created when relay starts after the
+/// handshake.
 ///
 /// The cursor was seeded at the top of `handle_peer_connection` and removed only
 /// by `cleanup_peer_state` after the main loop — with sixteen early exits in
@@ -2617,6 +2619,13 @@ struct ConnectionSession {
     /// last refilled. See ADDR_TOKEN_BURST.
     addr_tokens: f64,
     addr_tokens_at: Instant,
+    /// This peer's broadcast cursor, created by the first flush after the
+    /// handshake and dropped with the session on every exit path, panics
+    /// included. A connection still in its handshake therefore has no entry in
+    /// `PEER_LAST_OUTBOUND` and cannot hold back the queue's pruning: the
+    /// cursor used to be seeded at connect, and once relay waits for the
+    /// handshake, a seeded cursor that cannot advance would pin the minimum.
+    relay_cursor: Option<OutboundCursor>,
     /// Whether this connection has already been answered a GetAddr.
     ///
     /// GetAddr is not in `token_cost`'s match, so it costs COST_MSG_DEFAULT = 1:
@@ -2646,15 +2655,18 @@ impl ConnectionSession {
             lifecycle_violations: 0,
             legacy_peer: false,
             unsupported_msg_violations: 0,
-            // Start at the CURRENT global seq, not 0: a new peer only needs
-            // future broadcasts (backlog comes via sync). Starting at 0 makes
-            // the outbound-lag check see the whole global counter as "lag" and
-            // disconnect the peer as slow on its first flush — which stalled
-            // convergence for any node behind the broadcast counter.
+            // Overwritten when relay starts in flush_outbound, and nothing
+            // reads it before then. It still starts at the CURRENT global seq,
+            // not 0: a new peer only needs future broadcasts (backlog comes via
+            // sync), and starting at 0 made the outbound-lag check see the whole
+            // global counter as "lag" and disconnect the peer as slow on its
+            // first flush — which stalled convergence for any node behind the
+            // broadcast counter.
             last_outbound_seq: current_outbound_seq(),
             puzzles_solved: 0,
             addr_tokens: ADDR_TOKEN_BURST as f64,
             addr_tokens_at: Instant::now(),
+            relay_cursor: None,
             getaddr_answered: false,
         }
     }
@@ -3050,11 +3062,6 @@ impl P2P {
             .peer_addr()
             .map_err(|e| NetworkError::ConnectionFailed(format!("No peer addr: {}", e)))?;
         let peer_str = peer_addr.to_string();
-        // Held for the whole connection, so every exit path takes the cursor
-        // with it — the sixteen early returns between here and the main loop
-        // included, and a panic too. The sequence is read before the guard
-        // takes the cursor lock, not inside it.
-        let _cursor = OutboundCursor::seed(&peer_str, current_outbound_seq());
 
         // The read timeout above bounds one recv; this bounds the whole
         // handshake. Disarmed in the main loop the moment it completes.
@@ -3508,6 +3515,28 @@ impl P2P {
         session: &mut ConnectionSession,
         magic: [u8; 4],
     ) -> bool {
+        // Nothing is relayed before the handshake completes. A peer that has
+        // our Version but not yet our VerAck scores anything outside the
+        // handshake commands 50 and closes, and this flush runs after every
+        // dispatched message and on every idle tick of the main loop, which a
+        // connection enters as soon as our Version is sent. Bitcoin Core's
+        // SendMessages sends nothing past the version message until the
+        // handshake is complete, and Kaspa launches its flows only after the
+        // ready exchange.
+        if !session.is_established() {
+            return true;
+        }
+        // Relay starts here, once. The order is the one min_outbound_ack's
+        // safety argument rests on: the sequence is read BEFORE the cursor lock
+        // is taken, the entry is seeded, and the delivery cursor is read only
+        // AFTER the entry exists, so it is never below the seeded value and no
+        // prune reaches past it before this peer reads it, short of the hard
+        // retain.
+        if session.relay_cursor.is_none() {
+            let seeded_at = current_outbound_seq();
+            session.relay_cursor = Some(OutboundCursor::seed(peer_str, seeded_at));
+            session.last_outbound_seq = current_outbound_seq();
+        }
         let (outbound, global_seq) = drain_outbound_since(session.last_outbound_seq);
         if !outbound.is_empty() {
             // Lag is measured against the GLOBAL newest seq, not the (batched)
@@ -3949,9 +3978,7 @@ impl P2P {
 
                 // Log peer identity. Use char-safe truncation: `id` derives from
                 // the attacker-controlled Version user_agent, so byte-slicing
-                // `&id[..16]` could land mid-UTF-8 and panic the peer thread
-                // (and leak its PEER_LAST_OUTBOUND entry since cleanup runs after
-                // the loop).
+                // `&id[..16]` could land mid-UTF-8 and panic the peer thread.
                 if let Some(id) = session.protocol.peer_identity() {
                     let short: String = id.chars().take(16).collect();
                     slog_debug!("p2p", "peer_identity", addr => peer, identity => &short);
@@ -6459,6 +6486,266 @@ mod tests {
         };
         writer.join().ok();
         result
+    }
+
+    // ── no relay before the handshake ────────────────────────────────────
+
+    fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let ours = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (theirs, _) = listener.accept().expect("accept");
+        (ours, theirs)
+    }
+
+    /// The frames that arrive on `stream`, decoded under `proto`'s gate, until
+    /// `done` holds or `window` has passed: each frame's command, and the nonce
+    /// when it is a Ping. Polls at least once, so a stalled test thread cannot
+    /// return before reading what is already buffered. A frame the gate refuses
+    /// ends the read as an Err naming its command.
+    fn read_frames(
+        stream: &TcpStream,
+        proto: &ProtocolSession,
+        window: Duration,
+        mut done: impl FnMut(&[(CommandId, Option<u64>)]) -> bool,
+    ) -> Result<Vec<(CommandId, Option<u64>)>, String> {
+        stream.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let mut reader = BufReader::new(DeadlineReader::new(stream, Instant::now() + Duration::from_secs(60)));
+        let mut dec = FrameDecoder::new();
+        let end = Instant::now() + window;
+        let mut out = Vec::new();
+        loop {
+            match P2P::poll_frame(&mut reader, &mut dec, NetworkParams::REGTEST_MAGIC, proto) {
+                Ok(Some((P2PMessage::Ping { nonce }, cmd, _))) => out.push((cmd, Some(nonce))),
+                Ok(Some((_, cmd, _))) => out.push((cmd, None)),
+                Ok(None) => {}
+                Err(ReadStop::Premature { cmd, .. }) => return Err(format!("the gate refused {cmd}")),
+                Err(ReadStop::Failed(_)) => break,
+            }
+            if done(&out) || Instant::now() >= end {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    fn pings(frames: &[(CommandId, Option<u64>)]) -> Vec<u64> {
+        frames.iter().filter_map(|(_, n)| *n).collect()
+    }
+
+    fn has_ping(frames: &[(CommandId, Option<u64>)], nonce: u64) -> bool {
+        frames.iter().any(|(_, n)| *n == Some(nonce))
+    }
+
+    fn established_connection_session(peer: &str) -> ConnectionSession {
+        let mut session = ConnectionSession::new(peer.parse().unwrap(), false);
+        session.protocol.state = crate::service::network::p2p::protocol::HandshakeState::Established;
+        session
+    }
+
+    #[test]
+    fn a_session_still_in_its_handshake_is_relayed_nothing_and_holds_no_cursor() {
+        // The two states the main loop flushes in before VerAck: our Version
+        // sent, and the peer's Version answered. A peer in either scores
+        // anything outside the handshake commands 50 Malicious and closes. The
+        // broadcast is pushed after the session's creation, so a gate around the
+        // cursor alone would still deliver it, and the targeted message is
+        // written by any flush that runs at all.
+        use crate::service::network::p2p::protocol::HandshakeState;
+        use std::io::Write;
+        for (i, state) in [HandshakeState::AwaitVersion, HandshakeState::AwaitPeerVerAck]
+            .into_iter()
+            .enumerate()
+        {
+            let (ours, theirs) = socket_pair();
+            let peer = format!("203.0.113.51:{}", 12001 + i);
+            let mut session = ConnectionSession::new(peer.parse().unwrap(), false);
+            session.protocol.state = state;
+            push_outbound(P2PMessage::Ping { nonce: 0x51_0000_0001 + i as u64 });
+            push_outbound_to_peer(&peer, P2PMessage::Ping { nonce: 0x51_0000_0011 + i as u64 });
+            let mut writer = BufWriter::new(&ours);
+            assert!(P2P::flush_outbound(&mut writer, &peer, &mut session, NetworkParams::REGTEST_MAGIC));
+            writer.flush().unwrap();
+            assert!(session.relay_cursor.is_none(), "no cursor in {state:?}");
+            assert!(
+                !PEER_LAST_OUTBOUND.lock().contains_key(&peer),
+                "a peer still in its handshake must not be in the pruning minimum"
+            );
+            let got = read_frames(&theirs, &established_session(), Duration::from_millis(300), |_| false)
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert!(got.is_empty(), "nothing at all may be written in {state:?}: {got:?}");
+            assert_eq!(
+                drain_targeted_for(&peer).len(),
+                1,
+                "a message targeted at a peer in its handshake must wait for it, not be dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_starts_after_the_handshake_with_only_what_comes_next() {
+        // Only future broadcasts, the same rule the cursor has always started
+        // under: the backlog reaches a new peer through its own sync.
+        use std::io::Write;
+        let (ours, theirs) = socket_pair();
+        let peer = "203.0.113.52:12002";
+        {
+            let mut session = established_connection_session(peer);
+            let mut writer = BufWriter::new(&ours);
+            push_outbound(P2PMessage::Ping { nonce: 0x52_0000_000A });
+            assert!(P2P::flush_outbound(&mut writer, peer, &mut session, NetworkParams::REGTEST_MAGIC));
+            assert!(PEER_LAST_OUTBOUND.lock().contains_key(peer), "relay starts on the first established flush");
+            push_outbound(P2PMessage::Ping { nonce: 0x52_0000_000B });
+            assert!(P2P::flush_outbound(&mut writer, peer, &mut session, NetworkParams::REGTEST_MAGIC));
+            writer.flush().unwrap();
+            // One writer in sequence order, so a replayed A would arrive before B.
+            let got = read_frames(&theirs, &established_session(), Duration::from_secs(5), |f| {
+                has_ping(f, 0x52_0000_000B)
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+            assert!(!has_ping(&got, 0x52_0000_000A), "a broadcast from before relay started was replayed");
+            assert!(has_ping(&got, 0x52_0000_000B), "a broadcast pushed after relay started was lost");
+        }
+        assert!(
+            !PEER_LAST_OUTBOUND.lock().contains_key(peer),
+            "the cursor goes with the session"
+        );
+    }
+
+    #[test]
+    fn every_broadcast_between_flushes_of_an_established_peer_is_delivered() {
+        // Relay must start ONCE. Restarting it on every flush would move the
+        // cursor past whatever was pushed since the previous flush, so a peer
+        // that keeps sending would silently miss blocks, transactions and the
+        // GetHeaders that drives its own sync.
+        use std::io::Write;
+        let (ours, theirs) = socket_pair();
+        let peer = "203.0.113.53:12003";
+        let mut session = established_connection_session(peer);
+        let mut writer = BufWriter::new(&ours);
+        assert!(P2P::flush_outbound(&mut writer, peer, &mut session, NetworkParams::REGTEST_MAGIC));
+        push_outbound(P2PMessage::Ping { nonce: 0x53_0000_000C });
+        assert!(P2P::flush_outbound(&mut writer, peer, &mut session, NetworkParams::REGTEST_MAGIC));
+        push_outbound(P2PMessage::Ping { nonce: 0x53_0000_000D });
+        assert!(P2P::flush_outbound(&mut writer, peer, &mut session, NetworkParams::REGTEST_MAGIC));
+        writer.flush().unwrap();
+        let got = read_frames(&theirs, &established_session(), Duration::from_secs(5), |f| {
+            has_ping(f, 0x53_0000_000C) && has_ping(f, 0x53_0000_000D)
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            has_ping(&got, 0x53_0000_000C) && has_ping(&got, 0x53_0000_000D),
+            "got {:?}",
+            pings(&got)
+        );
+    }
+
+    #[test]
+    fn a_relayed_peer_rejoins_the_pruning_minimum_when_another_connection_drops_its_entry() {
+        // Two live connections can share one peer string, and the first to
+        // close removes the shared entry. The survivor's next flush must put it
+        // back, or the survivor stays outside the pruning minimum until
+        // something else seeds that key, and other peers' drains prune
+        // broadcasts it has not been sent.
+        let (ours, _theirs) = socket_pair();
+        let peer = "203.0.113.54:12004";
+        let mut session = established_connection_session(peer);
+        let other = OutboundCursor::seed(peer, current_outbound_seq());
+        let mut writer = BufWriter::new(&ours);
+        assert!(P2P::flush_outbound(&mut writer, peer, &mut session, NetworkParams::REGTEST_MAGIC));
+        drop(other);
+        assert!(!PEER_LAST_OUTBOUND.lock().contains_key(peer));
+        assert!(P2P::flush_outbound(&mut writer, peer, &mut session, NetworkParams::REGTEST_MAGIC));
+        assert!(
+            PEER_LAST_OUTBOUND.lock().contains_key(peer),
+            "the surviving connection was left out of the pruning minimum"
+        );
+    }
+
+    #[test]
+    fn a_connection_still_in_its_handshake_does_not_hold_back_pruning() {
+        // The pruning minimum is taken over every entry in PEER_LAST_OUTBOUND. A
+        // cursor seeded at connect, for a peer that cannot be relayed to until
+        // its handshake completes, cannot advance either: every connection kept
+        // in its handshake would hold back the broadcast queue's pruning until
+        // its deadline, the profile of the leak 964f55b closed. This covers the
+        // acceptor up to its puzzle read; the dialer test covers the main loop.
+        let dir = std::env::temp_dir().join(format!("shadowdag_test_relaygate_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pm = Arc::new(PeerManager::new(dir.to_str().unwrap()).expect("peer store"));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let key = client.local_addr().expect("client addr").to_string();
+        let (stream, _) = listener.accept().expect("accept");
+        let worker = thread::spawn(move || {
+            let _ = P2P::handle_peer_connection(stream, false, NetworkParams::REGTEST_MAGIC, Vec::new(), pm);
+        });
+        let end = Instant::now() + Duration::from_millis(300);
+        let mut seen = false;
+        while Instant::now() < end && !worker.is_finished() {
+            if PEER_LAST_OUTBOUND.lock().contains_key(&key) {
+                seen = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(client);
+        worker.join().ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!seen, "a connection in its handshake took a place in the pruning minimum");
+    }
+
+    #[test]
+    fn a_dialled_peer_kept_in_its_handshake_is_relayed_nothing() {
+        // The window the gate exists for, through the production path: our
+        // dialer has solved the puzzle and sent its Version, the main loop is
+        // running its idle flushes, and the peer never answers. The peer reads
+        // under the gate a peer in that state applies, so anything relayed is
+        // refused and named rather than silently read.
+        use crate::service::network::p2p::protocol::HandshakeState;
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("shadowdag_test_relaygate_dial_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pm = Arc::new(PeerManager::new(dir.to_str().unwrap()).expect("peer store"));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let key = listener.local_addr().expect("addr").to_string();
+        let dial = TcpStream::connect(&key).expect("connect");
+        let worker = thread::spawn(move || {
+            let _ = P2P::handle_peer_connection(dial, true, NetworkParams::REGTEST_MAGIC, Vec::new(), pm);
+        });
+        let (theirs, _) = listener.accept().expect("accept");
+        let challenge = ConnectionPuzzle::generate_challenge();
+        (&theirs)
+            .write_all(&wire_frame(
+                NetworkParams::REGTEST_MAGIC,
+                &P2PMessage::PuzzleChallenge { challenge: challenge.challenge.clone() },
+            ))
+            .unwrap();
+        let mut held_since: Option<Instant> = None;
+        let mut cursor_seen = false;
+        let got = read_frames(&theirs, &session_in(HandshakeState::Init), Duration::from_secs(20), |f| {
+            if PEER_LAST_OUTBOUND.lock().contains_key(&key) {
+                cursor_seen = true;
+            }
+            let since = held_since;
+            match since {
+                Some(t) => t.elapsed() >= Duration::from_millis(400),
+                None if f.iter().any(|(c, _)| *c == CommandId::Version) => {
+                    held_since = Some(Instant::now());
+                    push_outbound(P2PMessage::Ping { nonce: 0x55_0000_000E });
+                    push_outbound_to_peer(&key, P2PMessage::Ping { nonce: 0x55_0000_000F });
+                    false
+                }
+                None => false,
+            }
+        });
+        let held = drain_targeted_for(&key);
+        drop(theirs);
+        worker.join().ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        let got = got.unwrap_or_else(|e| panic!("relayed to a peer in its handshake: {e}"));
+        assert!(held_since.is_some(), "the dialer never sent its Version: {got:?}");
+        assert!(!cursor_seen, "a connection in its handshake took a place in the pruning minimum");
+        assert_eq!(held.len(), 1, "a message targeted at a peer in its handshake must wait for it");
     }
 
     // ── the frame decoder ─────────────────────────────────────────────────
