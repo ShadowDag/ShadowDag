@@ -27,7 +27,7 @@ use crate::service::network::p2p::protocol::{
     validate_headers_list, validate_inv_count, validate_inv_item, validate_payload_checksum,
     validate_payload_size, validate_reject, CommandId, ProtocolSession, VersionPayload, WireHeader,
     DEFAULT_BPS, HANDSHAKE_TIMEOUT_SECS, MAX_ADDR_PER_MSG, MAX_INV_PER_MSG, MAX_MESSAGE_SIZE,
-    PUZZLE_TIMEOUT_SECS, WIRE_HEADER_SIZE,
+    WIRE_HEADER_SIZE,
 };
 use crate::{slog_debug, slog_error, slog_info, slog_warn};
 
@@ -81,27 +81,20 @@ const _: () = assert!(
 /// Distinct keys (source IPs, and separately /16s) tracked within one throttle
 /// window, bounding each per-window map against a flood that rolls addresses.
 const MAX_THROTTLE_TRACKED_IPS: usize = 4_096;
-/// TOTAL wall-clock budget, from the moment the connection is handled, for a
-/// peer to finish its handshake.
-///
-/// Every pre-handshake read was already bounded by the 100 ms `SO_RCVTIMEO`,
-/// but a per-recv timeout is not a deadline: `read_exact` fails only when ONE
-/// recv returns nothing, so a byte every 99 ms kept a stranger looping inside a
-/// single read indefinitely — holding an inbound slot, a `MAX_PEERS_PER_IP`
-/// registration, a `MAX_INBOUND_PER_SUBNET` registration and a blocked OS
-/// thread for about 10 B/s.
-///
-/// One second past the longest handshake the protocol itself permits: it
-/// measures `PUZZLE_TIMEOUT_SECS` and `HANDSHAKE_TIMEOUT_SECS` from
-/// `connected_at` in whole seconds and fires on `elapsed >`, so this deadline
-/// can never cut a handshake the state machine would still have allowed. The
-/// assert keeps that true if either protocol constant moves.
-const PRE_HANDSHAKE_DEADLINE_SECS: u64 = PUZZLE_TIMEOUT_SECS + 1;
+const ACCEPTOR_PUZZLE_STEP: Duration = Duration::from_secs(4);
+const DIALER_PUZZLE_STEP: Duration = Duration::from_secs(8);
+const VERSION_EXCHANGE_DEADLINE: Duration = Duration::from_secs(HANDSHAKE_TIMEOUT_SECS + 1);
 const _: () = assert!(
-    PRE_HANDSHAKE_DEADLINE_SECS > PUZZLE_TIMEOUT_SECS
-        && PRE_HANDSHAKE_DEADLINE_SECS > HANDSHAKE_TIMEOUT_SECS,
-    "the read deadline must outlast every handshake the protocol permits"
+    ACCEPTOR_PUZZLE_STEP.as_secs() < HANDSHAKE_TIMEOUT_SECS
+        && DIALER_PUZZLE_STEP.as_secs() < HANDSHAKE_TIMEOUT_SECS,
+    "the puzzle step must leave time for the Version exchange"
 );
+
+#[derive(Clone, Copy)]
+struct HandshakeBudget {
+    puzzle_step: Duration,
+    version_exchange: Duration,
+}
 
 pub const MAX_PEERS: usize = NetworkParams::MAX_PEERS;
 pub const MIN_PEERS: usize = NetworkParams::MIN_PEERS;
@@ -1347,16 +1340,6 @@ fn reconnect_due(peers: &PeerManager, addr: &str) -> bool {
     true
 }
 
-/// Whether we owe this peer a connection-puzzle solution.
-///
-/// Solving is work WE pay for, so it is allowed only where the protocol
-/// actually asks for it: a connection we dialled (on an inbound connection we
-/// are the challenger, never the solver), at most one puzzle per connection,
-/// and only for a challenge of the exact shape `generate_challenge` emits.
-fn should_solve_puzzle(is_outbound: bool, puzzles_solved: u32, challenge: &str) -> bool {
-    is_outbound && puzzles_solved == 0 && ConnectionPuzzle::is_well_formed(challenge)
-}
-
 /// Error text the deadline reader reports once the budget is spent.
 ///
 /// Deliberately NOT one of the substrings `is_transient_read_timeout` matches:
@@ -1369,12 +1352,13 @@ const DEADLINE_ERROR_TEXT: &str = "pre-handshake read deadline exceeded";
 /// A `Read` that refuses to make progress once a wall-clock deadline passes.
 ///
 /// Returning an error from `read` (rather than, say, shutting the socket down
-/// from a reaper) unwinds `read_exact` -> `read_message` ->
+/// from a reaper) unwinds `fill_buf` -> `poll_frame` ->
 /// `handle_peer_connection` through the ordinary error path, so
 /// `InboundSlot::drop` releases the pending slot and both anti-eclipse
 /// registrations on the way out.
 ///
-/// `disarm` drops the deadline once the handshake completes: an established
+/// `set_deadline` moves it from one handshake step to the next, and `disarm`
+/// drops it once the handshake completes: an established
 /// peer has solved the puzzle and holds a live slot that `MAX_PEERS_PER_IP` and
 /// `MAX_INBOUND_PER_SUBNET` already bound, and a total deadline there would cut
 /// an honest follower's slow bulk transfer during IBD.
@@ -1389,6 +1373,10 @@ impl<R> DeadlineReader<R> {
             inner,
             deadline: Some(deadline),
         }
+    }
+
+    fn set_deadline(&mut self, deadline: Instant) {
+        self.deadline = Some(deadline);
     }
 
     fn disarm(&mut self) {
@@ -1415,9 +1403,7 @@ impl<R: Read> Read for DeadlineReader<R> {
 ///
 /// One classifier for both read sites. They carried two hand-written copies of
 /// this list and the pre-handshake one was missing Windows' `WSAETIMEDOUT`
-/// (10060) — which that platform returns for an `SO_RCVTIMEO` expiry, as the
-/// main loop's own copy documents — so on Windows a peer that had not sent its
-/// puzzle challenge within 100 ms was dropped instead of treated as legacy.
+/// (10060), which that platform returns for an `SO_RCVTIMEO` expiry.
 fn is_transient_read_timeout(msg_lowercase: &str) -> bool {
     msg_lowercase.contains("timed out")
         || msg_lowercase.contains("would block")
@@ -2602,19 +2588,12 @@ struct ConnectionSession {
     /// Count of lifecycle violations (restricted peer sending forbidden commands).
     /// Escalates ban score and disconnects after threshold.
     lifecycle_violations: u32,
-    /// Whether this peer connected without solving the connection puzzle.
-    /// Legacy peers are monitored more aggressively.
-    legacy_peer: bool,
     /// Count of unsupported-message violations (unimplemented protocol commands).
     /// Repeated abuse is treated as malformed/malicious behavior and disconnects.
     unsupported_msg_violations: u32,
     /// Last outbound broadcast sequence number sent to this peer.
     /// Used to ensure every peer gets every broadcast message.
     last_outbound_seq: u64,
-    /// How many connection puzzles we have solved for this peer. A connection
-    /// legitimately asks us to solve at most one, so anything beyond the first
-    /// is unpaid work for a stranger.
-    puzzles_solved: u32,
     /// Address-processing allowance left for this connection, and when it was
     /// last refilled. See ADDR_TOKEN_BURST.
     addr_tokens: f64,
@@ -2653,7 +2632,6 @@ impl ConnectionSession {
             bandwidth_window_start: Instant::now(),
             last_message_at: now,
             lifecycle_violations: 0,
-            legacy_peer: false,
             unsupported_msg_violations: 0,
             // Overwritten when relay starts in flush_outbound, and nothing
             // reads it before then. It still starts at the CURRENT global seq,
@@ -2663,7 +2641,6 @@ impl ConnectionSession {
             // first flush — which stalled convergence for any node behind the
             // broadcast counter.
             last_outbound_seq: current_outbound_seq(),
-            puzzles_solved: 0,
             addr_tokens: ADDR_TOKEN_BURST as f64,
             addr_tokens_at: Instant::now(),
             relay_cursor: None,
@@ -3044,6 +3021,25 @@ impl P2P {
         known_peers: Vec<String>,
         peers: Arc<PeerManager>,
     ) -> Result<(), NetworkError> {
+        let budget = HandshakeBudget {
+            puzzle_step: if outbound {
+                DIALER_PUZZLE_STEP
+            } else {
+                ACCEPTOR_PUZZLE_STEP
+            },
+            version_exchange: VERSION_EXCHANGE_DEADLINE,
+        };
+        Self::handle_peer_connection_within(stream, outbound, magic, known_peers, peers, budget)
+    }
+
+    fn handle_peer_connection_within(
+        stream: TcpStream,
+        outbound: bool,
+        magic: [u8; 4],
+        known_peers: Vec<String>,
+        peers: Arc<PeerManager>,
+        budget: HandshakeBudget,
+    ) -> Result<(), NetworkError> {
         // 100ms (was 2s): this timeout is also the idle FLUSH interval — served
         // block bodies sit in the targeted queue until the connection loop wakes
         // (on inbound, or this timeout) and flush_outbound writes them. At 2s an
@@ -3063,14 +3059,12 @@ impl P2P {
             .map_err(|e| NetworkError::ConnectionFailed(format!("No peer addr: {}", e)))?;
         let peer_str = peer_addr.to_string();
 
-        // The read timeout above bounds one recv; this bounds the whole
-        // handshake. Disarmed in the main loop the moment it completes.
+        // The read timeout above bounds one recv; this bounds each handshake
+        // step. Disarmed in the main loop the moment the handshake completes.
+        let connected_at = Instant::now();
         let mut reader = BufReader::with_capacity(
             READ_BUFFER_BYTES,
-            DeadlineReader::new(
-                &stream,
-                Instant::now() + Duration::from_secs(PRE_HANDSHAKE_DEADLINE_SECS),
-            ),
+            DeadlineReader::new(&stream, connected_at + budget.puzzle_step),
         );
         // One decoder for the whole connection, so a frame that arrives in the
         // same read as the one before it survives the hand-over from the puzzle
@@ -3104,7 +3098,7 @@ impl P2P {
 
             // Bound to a local first: the arms below mutate the session, so
             // the state borrow must end here.
-            let first = Self::read_message(&mut reader, &mut decoder, magic, &session.protocol);
+            let first = Self::read_step(&mut reader, &mut decoder, magic, &session.protocol);
             match first {
                 Ok((
                     P2PMessage::PuzzleSolution {
@@ -3139,12 +3133,6 @@ impl P2P {
                     slog_info!("p2p", "puzzle_verified", addr => &peer_str);
                 }
                 Ok((_, cmd, _)) => {
-                    DOS_GUARD.add_ban_score_cat(
-                        &peer_str,
-                        50,
-                        "expected puzzle solution",
-                        BanCategory::Malicious,
-                    );
                     return Err(NetworkError::ConnectionFailed(format!(
                         "Expected PuzzleSolution from {}, got {}",
                         peer_str, cmd
@@ -3179,7 +3167,7 @@ impl P2P {
             }
         } else {
             // Outbound: wait for puzzle challenge, solve it, send solution
-            let first = Self::read_message(&mut reader, &mut decoder, magic, &session.protocol);
+            let first = Self::read_step(&mut reader, &mut decoder, magic, &session.protocol);
             match first {
                 Ok((P2PMessage::PuzzleChallenge { challenge }, _, sz)) => {
                     session.record_bytes_received(sz as u64);
@@ -3215,7 +3203,6 @@ impl P2P {
                             )));
                         }
                     };
-                    session.puzzles_solved = session.puzzles_solved.saturating_add(1);
                     let sol_msg = P2PMessage::PuzzleSolution {
                         challenge: sol.challenge,
                         nonce: sol.nonce,
@@ -3227,43 +3214,11 @@ impl P2P {
                         NetworkError::ConnectionFailed(format!("State error: {}", e))
                     })?;
                 }
-                Ok((msg, cmd, sz)) => {
-                    // Legacy peer sent a non-puzzle message first.
-                    // Accept it but mark this peer as legacy (no puzzle support).
-                    // Only allow Version as the first non-puzzle message — anything
-                    // else is suspicious and gets a ban score.
-                    session.record_bytes_received(sz as u64);
-                    session.touch();
-                    session.protocol.puzzle_verified().ok();
-                    session.legacy_peer = true;
-                    if cmd != CommandId::Version {
-                        DOS_GUARD.add_ban_score_cat(
-                            &peer_str,
-                            20,
-                            &format!(
-                                "non-Version first message ({}), expected puzzle or Version",
-                                cmd
-                            ),
-                            BanCategory::Malformed,
-                        );
-                    }
-                    if cmd == CommandId::Version {
-                        // Version is part of handshake — dispatch it
-                        if let Err(e) = Self::dispatch_message(
-                            &mut writer,
-                            msg,
-                            &peer_str,
-                            magic,
-                            &mut session,
-                            &known_peers,
-                            cmd,
-                        ) {
-                            slog_debug!("p2p", "dispatch_error", addr => &peer_str, error => &e.to_string());
-                        }
-                    }
-                    // Non-Version messages are dropped (ban score already added above).
-                    // Dispatching before the handshake (Version/VerAck) completes
-                    // violates the protocol state machine.
+                Ok((_, cmd, _)) => {
+                    return Err(NetworkError::ConnectionFailed(format!(
+                        "Expected PuzzleChallenge from {}, got {}",
+                        peer_str, cmd
+                    )));
                 }
                 Err(ReadStop::Premature {
                     cmd,
@@ -3282,17 +3237,16 @@ impl P2P {
                     )));
                 }
                 Err(ReadStop::Failed(e)) => {
-                    if !is_transient_read_timeout(&e.to_string().to_lowercase()) {
-                        return Err(e);
-                    }
-                    // Timeout waiting for puzzle challenge — peer might be slow or legacy.
-                    // Allow connection but flag as legacy. The handshake timeout in the
-                    // main loop will catch peers that never complete Version/VerAck.
-                    session.protocol.puzzle_verified().ok();
-                    session.legacy_peer = true;
+                    return Err(NetworkError::ConnectionFailed(format!(
+                        "Puzzle exchange failed with {}: {}",
+                        peer_str, e
+                    )));
                 }
             }
         }
+        reader
+            .get_mut()
+            .set_deadline(connected_at + budget.version_exchange);
 
         // ── Send our Version (after puzzle phase) ──────────────────────────
         let bytes = Self::send_version(&mut writer, 0, magic)?;
@@ -3698,6 +3652,22 @@ impl P2P {
         }
     }
 
+    /// Wait out idle polls until a frame arrives or the reader's deadline ends
+    /// the step.
+    fn read_step(
+        reader: &mut BufReader<DeadlineReader<&TcpStream>>,
+        decoder: &mut FrameDecoder,
+        magic: [u8; 4],
+        protocol: &ProtocolSession,
+    ) -> Result<Frame, ReadStop> {
+        debug_assert!(reader.get_ref().deadline.is_some());
+        loop {
+            if let Some(frame) = Self::poll_frame(reader, decoder, magic, protocol)? {
+                return Ok(frame);
+            }
+        }
+    }
+
     /// Feed whatever bytes are buffered or arrive into `decoder` until a frame
     /// completes. `Ok(None)` means exactly what an idle tick has always meant: no
     /// byte arrived within one poll interval. A partial frame is kept for the next
@@ -3827,51 +3797,15 @@ impl P2P {
         match msg {
             // ── Puzzle messages (edge case: received in main loop) ──────
             //
-            // PuzzleChallenge is allowed before the handshake completes, so
-            // this arm runs for a stranger. Solving unconditionally inverted
-            // the puzzle's whole purpose — the peer that wants the connection
-            // is supposed to pay — and because `solve` hashes the challenge
-            // once per iteration it turned one 4 MiB message into ~16 GiB of
-            // SHA-256 at 800 messages/s per peer.
-            //
-            // We owe a solution in exactly one case: we dialled out, the
-            // challenge arrived too late for the handshake window (slow peer),
-            // and we have not already answered one on this connection.
-            P2PMessage::PuzzleChallenge { challenge } => {
-                if !should_solve_puzzle(
-                    session.protocol.is_outbound,
-                    session.puzzles_solved,
-                    &challenge,
-                ) {
-                    DOS_GUARD.add_ban_score_cat(
-                        peer,
-                        10,
-                        "unexpected puzzle challenge",
-                        BanCategory::Malformed,
-                    );
-                    return Ok(());
-                }
-                let sol = match ConnectionPuzzle::solve(&challenge) {
-                    Some(s) => s,
-                    None => {
-                        DOS_GUARD.add_ban_score_cat(
-                            peer,
-                            10,
-                            "puzzle challenge exceeded the solver bound",
-                            BanCategory::Malformed,
-                        );
-                        return Ok(());
-                    }
-                };
-                session.puzzles_solved = session.puzzles_solved.saturating_add(1);
-                let sol_msg = P2PMessage::PuzzleSolution {
-                    challenge: sol.challenge,
-                    nonce: sol.nonce,
-                    hash: sol.hash,
-                };
-                let bytes = Self::write_message(writer, &sol_msg, magic)?;
-                session.record_bytes_sent(bytes);
-                session.protocol.puzzle_verified().ok();
+            // A connection's one puzzle is exchanged before the main loop, so a
+            // challenge here is never solved.
+            P2PMessage::PuzzleChallenge { .. } => {
+                DOS_GUARD.add_ban_score_cat(
+                    peer,
+                    10,
+                    "unexpected puzzle challenge",
+                    BanCategory::Malformed,
+                );
             }
 
             P2PMessage::PuzzleSolution { .. } => {
@@ -4847,32 +4781,6 @@ mod tests {
         let untracked = count_arrival(&mut arrivals, "192.0.2.254");
         assert_eq!(untracked, 0);
         assert!(!inbound_throttle_rejects(false, untracked, 1, 1));
-    }
-
-    #[test]
-    fn puzzle_is_solved_only_where_the_protocol_asks_for_it() {
-        let good = ConnectionPuzzle::generate_challenge().challenge;
-
-        // The one legitimate case: we dialled out and have not answered yet.
-        assert!(should_solve_puzzle(true, 0, &good));
-
-        // Inbound: we are the challenger. A challenge from the peer that
-        // connected TO us inverts the puzzle — it would have us pay for a
-        // stranger's connection attempt.
-        assert!(!should_solve_puzzle(false, 0, &good));
-
-        // One puzzle per connection; repeats are free work for the peer.
-        assert!(!should_solve_puzzle(true, 1, &good));
-        assert!(!should_solve_puzzle(true, u32::MAX, &good));
-
-        // The amplifier: `solve` hashes the whole challenge once per
-        // iteration (~4096 iterations), so an oversized challenge turns one
-        // message into gigabytes of SHA-256. Shape is checked before solving.
-        assert!(!should_solve_puzzle(true, 0, &"a".repeat(4 * 1024 * 1024)));
-        assert!(!should_solve_puzzle(true, 0, ""));
-        assert!(!should_solve_puzzle(true, 0, &"0".repeat(63)));
-        assert!(!should_solve_puzzle(true, 0, &"0".repeat(65)));
-        assert!(!should_solve_puzzle(true, 0, &"z".repeat(64)));
     }
 
     use super::*;
@@ -6430,6 +6338,601 @@ mod tests {
             connect_within(&target, Duration::ZERO).is_err(),
             "the timeout must be passed through to connect_timeout"
         );
+    }
+
+    // ── the handshake must survive a real round-trip time ─────────────────
+
+    use std::net::Ipv4Addr;
+
+    /// Forwards one direction of a TCP stream, holding every chunk for `delay`.
+    fn pump_with_delay(mut from: TcpStream, mut to: TcpStream, delay: Duration) {
+        use std::io::{Read, Write};
+        thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            loop {
+                match from.read(&mut buf) {
+                    Ok(0) | Err(_) => {
+                        let _ = to.shutdown(std::net::Shutdown::Write);
+                        break;
+                    }
+                    Ok(n) => {
+                        thread::sleep(delay);
+                        if to.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn connect_from(source: Ipv4Addr, to: SocketAddr) -> TcpStream {
+        let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+            .expect("socket");
+        sock.bind(&SocketAddr::from((source, 0)).into())
+            .expect("bind a loopback source");
+        sock.connect(&to.into()).expect("connect");
+        sock.into()
+    }
+
+    fn test_store(tag: &str) -> (Arc<PeerManager>, std::path::PathBuf) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "shadowdag_test_hs_{}_{}_{}",
+            tag,
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pm = Arc::new(PeerManager::new(dir.to_str().unwrap()).expect("peer store"));
+        (pm, dir)
+    }
+
+    fn score_of(host: Ipv4Addr) -> u64 {
+        let host = host.to_string();
+        assert!(!crate::service::network::dos_guard::is_whitelisted(&host));
+        DOS_GUARD.get_ban_score(&host)
+    }
+
+    fn foreign_version() -> P2PMessage {
+        let vp = build_version_payload("ShadowDAG/test", 0, DEFAULT_BPS);
+        P2PMessage::Version {
+            version: vp.version,
+            height: vp.height,
+            timestamp: vp.timestamp,
+            user_agent: vp.user_agent,
+            bps: vp.bps,
+            chain_id: vp.chain_id,
+            services: vp.services,
+            nonce: vp.nonce ^ 1,
+        }
+    }
+
+    fn ended_on_the_deadline(outcome: &Result<(), NetworkError>) -> bool {
+        matches!(outcome, Err(e) if e.to_string().contains(DEADLINE_ERROR_TEXT))
+    }
+
+    /// Run `f` on its own thread, so a connection that never ends fails the
+    /// test at `recv_timeout` instead of hanging the suite.
+    fn spawn_bounded<T: Send + 'static>(
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> std::sync::mpsc::Receiver<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx
+    }
+
+    const SHORT_STEP: Duration = Duration::from_millis(600);
+
+    fn short_puzzle_step() -> HandshakeBudget {
+        HandshakeBudget {
+            puzzle_step: SHORT_STEP,
+            version_exchange: VERSION_EXCHANGE_DEADLINE,
+        }
+    }
+
+    fn read_challenge(client: &TcpStream) -> String {
+        use crate::service::network::p2p::protocol::HandshakeState;
+        client.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let mut reader = BufReader::new(DeadlineReader::new(client, Instant::now() + Duration::from_secs(10)));
+        let mut dec = FrameDecoder::new();
+        let gate = session_in(HandshakeState::Init);
+        loop {
+            match P2P::poll_frame(&mut reader, &mut dec, NetworkParams::REGTEST_MAGIC, &gate) {
+                Ok(Some((P2PMessage::PuzzleChallenge { challenge }, _, _))) => return challenge,
+                Ok(Some((_, cmd, _))) => panic!("expected a challenge, got {cmd}"),
+                Ok(None) => {}
+                Err(_) => panic!("no challenge arrived"),
+            }
+        }
+    }
+
+    fn solution_to(challenge: &str) -> Vec<u8> {
+        let sol = ConnectionPuzzle::solve(challenge).expect("solvable");
+        wire_frame(
+            NetworkParams::REGTEST_MAGIC,
+            &P2PMessage::PuzzleSolution {
+                challenge: sol.challenge,
+                nonce: sol.nonce,
+                hash: sol.hash,
+            },
+        )
+    }
+
+    /// One connection at production budgets through a proxy that adds
+    /// `one_way` in each direction, connects to the acceptor only after
+    /// `one_way` so the dialer waits a full round trip for its challenge, and
+    /// reaches the acceptor from `dialer_host`. Returns how each side ended and
+    /// the score the acceptor gave that host.
+    ///
+    /// Both ends share this process's identity nonce, so the first Version
+    /// either reads ends the connection as a self-connection inside the main
+    /// loop, which returns Ok(()). Only a failure before the main loop returns
+    /// an error, so Ok(()) on both sides means both completed the puzzle phase
+    /// and sent their Version.
+    fn puzzle_phase_across(one_way: Duration, dialer_host: Ipv4Addr) -> (String, String, u64) {
+        let (acc_pm, acc_dir) = test_store("acc");
+        let (dial_pm, dial_dir) = test_store("dial");
+        let magic = NetworkParams::REGTEST_MAGIC;
+
+        let acceptor = TcpListener::bind("127.0.0.1:0").expect("bind acceptor");
+        let acceptor_addr = acceptor.local_addr().expect("acceptor addr");
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+
+        thread::spawn(move || {
+            if let Ok((client, _)) = proxy.accept() {
+                thread::sleep(one_way);
+                let server = connect_from(dialer_host, acceptor_addr);
+                let (c2, s2) = (client.try_clone().unwrap(), server.try_clone().unwrap());
+                pump_with_delay(client, server, one_way);
+                pump_with_delay(s2, c2, one_way);
+            }
+        });
+
+        let as_text = |r: Result<(), NetworkError>| match r {
+            Ok(()) => "ok".to_string(),
+            Err(e) => e.to_string(),
+        };
+        let acc = spawn_bounded(move || {
+            let (stream, _) = acceptor.accept().expect("accept");
+            as_text(P2P::handle_peer_connection(stream, false, magic, Vec::new(), acc_pm))
+        });
+        let dial = spawn_bounded(move || match TcpStream::connect(proxy_addr) {
+            Ok(stream) => as_text(P2P::handle_peer_connection(stream, true, magic, Vec::new(), dial_pm)),
+            Err(e) => format!("connect: {e}"),
+        });
+
+        let acceptor_outcome = acc
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|_| "still connected after 20 s".to_string());
+        let dialer_outcome = dial
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|_| "still connected after 20 s".to_string());
+        let score = score_of(dialer_host);
+        SELF_ADDRS.lock().remove("127.0.0.1");
+        SELF_ADDRS.lock().remove(&dialer_host.to_string());
+        let _ = std::fs::remove_dir_all(&acc_dir);
+        let _ = std::fs::remove_dir_all(&dial_dir);
+        (acceptor_outcome, dialer_outcome, score)
+    }
+
+    fn assert_puzzle_phase_completes(one_way: Duration, dialer_host: Ipv4Addr) {
+        let (acceptor, dialer, score) = puzzle_phase_across(one_way, dialer_host);
+        assert_eq!(acceptor, "ok", "{one_way:?} each way: the acceptor ended: {acceptor}");
+        assert_eq!(dialer, "ok", "{one_way:?} each way: the dialer ended: {dialer}");
+        assert_eq!(score, 0, "{one_way:?} each way: the acceptor scored the dialer");
+    }
+
+    #[test]
+    fn the_puzzle_phase_completes_across_a_local_link() {
+        assert_puzzle_phase_completes(Duration::ZERO, Ipv4Addr::new(127, 0, 0, 61));
+    }
+
+    #[test]
+    fn the_puzzle_phase_completes_across_an_intercontinental_round_trip() {
+        assert_puzzle_phase_completes(Duration::from_millis(75), Ipv4Addr::new(127, 0, 0, 62));
+    }
+
+    #[test]
+    fn the_puzzle_phase_completes_across_a_300_ms_round_trip() {
+        assert_puzzle_phase_completes(Duration::from_millis(150), Ipv4Addr::new(127, 0, 0, 63));
+    }
+
+    #[test]
+    fn an_acceptor_waits_out_its_step_for_a_silent_dialer_and_closes_unscored() {
+        use crate::service::network::p2p::protocol::HandshakeState;
+        let host = Ipv4Addr::new(127, 0, 0, 64);
+        let (pm, dir) = test_store("silent_dialer");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client = connect_from(host, listener.local_addr().expect("addr"));
+        let (stream, _) = listener.accept().expect("accept");
+        let done = spawn_bounded(move || {
+            let started = Instant::now();
+            let r = P2P::handle_peer_connection_within(
+                stream,
+                false,
+                NetworkParams::REGTEST_MAGIC,
+                Vec::new(),
+                pm,
+                short_puzzle_step(),
+            );
+            (r, started.elapsed())
+        });
+        let got = read_frames(&client, &session_in(HandshakeState::Init), Duration::from_secs(10), |_| false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (outcome, elapsed) = done.recv_timeout(Duration::from_secs(10)).expect("the step never ended");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ended_on_the_deadline(&outcome), "{outcome:?}");
+        assert!(elapsed >= SHORT_STEP, "closed after {elapsed:?}, before its step ran out");
+        let cmds: Vec<CommandId> = got.iter().map(|(c, _)| *c).collect();
+        assert_eq!(cmds, vec![CommandId::PuzzleChallenge], "only the challenge may be written");
+        assert_eq!(score_of(host), 0);
+    }
+
+    #[test]
+    fn a_trickling_dialer_is_cut_at_the_step_not_carried_by_its_bytes() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let host = Ipv4Addr::new(127, 0, 0, 65);
+        let magic = NetworkParams::REGTEST_MAGIC;
+        let (pm, dir) = test_store("trickle");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client = connect_from(host, listener.local_addr().expect("addr"));
+        let (stream, _) = listener.accept().expect("accept");
+        let frame = wire_frame(
+            magic,
+            &P2PMessage::PuzzleSolution {
+                challenge: "0".repeat(64),
+                nonce: 0,
+                hash: "0".repeat(64),
+            },
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_writer = Arc::clone(&stop);
+        let trickle = thread::spawn(move || {
+            for b in frame {
+                if stop_writer.load(Ordering::Relaxed) || (&client).write_all(&[b]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let done = spawn_bounded(move || {
+            let started = Instant::now();
+            let r = P2P::handle_peer_connection_within(stream, false, magic, Vec::new(), pm, short_puzzle_step());
+            (r, started.elapsed())
+        });
+        let result = done.recv_timeout(Duration::from_secs(20));
+        stop.store(true, Ordering::Relaxed);
+        trickle.join().ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        let (outcome, elapsed) = result.expect("the step never ended");
+        assert!(ended_on_the_deadline(&outcome), "{outcome:?}");
+        assert!(elapsed < Duration::from_secs(3), "a byte every 50 ms held the step for {elapsed:?}");
+        assert_eq!(score_of(host), 0);
+    }
+
+    #[test]
+    fn a_dialer_whose_acceptor_stays_silent_closes_unscored_having_sent_nothing() {
+        use std::io::Read;
+        let host = Ipv4Addr::new(127, 0, 0, 66);
+        let (pm, dir) = test_store("silent_acceptor");
+        let listener = TcpListener::bind((host, 0)).expect("bind");
+        let dial = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (theirs, _) = listener.accept().expect("accept");
+        let done = spawn_bounded(move || {
+            let started = Instant::now();
+            let r = P2P::handle_peer_connection_within(
+                dial,
+                true,
+                NetworkParams::REGTEST_MAGIC,
+                Vec::new(),
+                pm,
+                short_puzzle_step(),
+            );
+            (r, started.elapsed())
+        });
+        theirs.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut sent = Vec::new();
+        let _ = (&theirs).read_to_end(&mut sent);
+        let (outcome, elapsed) = done.recv_timeout(Duration::from_secs(10)).expect("the step never ended");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ended_on_the_deadline(&outcome), "{outcome:?}");
+        assert!(elapsed >= SHORT_STEP, "gave up after {elapsed:?}, before its step ran out");
+        assert!(sent.is_empty(), "wrote {} bytes to a peer that never challenged it", sent.len());
+        assert_eq!(score_of(host), 0);
+    }
+
+    #[test]
+    fn a_dialer_sent_another_handshake_command_first_closes_unscored_without_answering() {
+        use std::io::{Read, Write};
+        let magic = NetworkParams::REGTEST_MAGIC;
+        let cases = [
+            (Ipv4Addr::new(127, 0, 0, 71), foreign_version()),
+            (Ipv4Addr::new(127, 0, 0, 74), P2PMessage::VerAck),
+            (
+                Ipv4Addr::new(127, 0, 0, 75),
+                P2PMessage::PuzzleSolution {
+                    challenge: "0".repeat(64),
+                    nonce: 0,
+                    hash: "0".repeat(64),
+                },
+            ),
+            (Ipv4Addr::new(127, 0, 0, 76), P2PMessage::Reject { reason: "busy".to_string() }),
+        ];
+        for (host, first) in cases {
+            let cmd = P2P::msg_to_command_id(&first);
+            let (pm, dir) = test_store("no_challenge");
+            let listener = TcpListener::bind((host, 0)).expect("bind");
+            let dial = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+            let (theirs, _) = listener.accept().expect("accept");
+            (&theirs).write_all(&wire_frame(magic, &first)).unwrap();
+            let done = spawn_bounded(move || P2P::handle_peer_connection(dial, true, magic, Vec::new(), pm));
+            theirs.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut sent = Vec::new();
+            let _ = (&theirs).read_to_end(&mut sent);
+            let outcome = done.recv_timeout(Duration::from_secs(10)).expect("the dialer never ended");
+            let _ = std::fs::remove_dir_all(&dir);
+            let text = format!("{outcome:?}");
+            assert!(text.contains("Expected PuzzleChallenge"), "{cmd}: {text}");
+            assert!(sent.is_empty(), "{cmd}: answered a peer that skipped the puzzle with {} bytes", sent.len());
+            assert_eq!(score_of(host), 0, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn an_acceptor_sent_another_handshake_command_instead_of_a_solution_closes_unscored() {
+        use std::io::Write;
+        let magic = NetworkParams::REGTEST_MAGIC;
+        let cases = [
+            (Ipv4Addr::new(127, 0, 0, 67), foreign_version()),
+            (Ipv4Addr::new(127, 0, 0, 77), P2PMessage::VerAck),
+            (
+                Ipv4Addr::new(127, 0, 0, 78),
+                P2PMessage::PuzzleChallenge {
+                    challenge: ConnectionPuzzle::generate_challenge().challenge,
+                },
+            ),
+            (Ipv4Addr::new(127, 0, 0, 79), P2PMessage::Reject { reason: "busy".to_string() }),
+        ];
+        for (host, sent_instead) in cases {
+            let cmd = P2P::msg_to_command_id(&sent_instead);
+            let (pm, dir) = test_store("no_solution");
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let client = connect_from(host, listener.local_addr().expect("addr"));
+            let (stream, _) = listener.accept().expect("accept");
+            let done = spawn_bounded(move || P2P::handle_peer_connection(stream, false, magic, Vec::new(), pm));
+            thread::sleep(Duration::from_millis(100));
+            (&client).write_all(&wire_frame(magic, &sent_instead)).unwrap();
+            let outcome = done.recv_timeout(Duration::from_secs(10)).expect("the acceptor never ended");
+            drop(client);
+            let _ = std::fs::remove_dir_all(&dir);
+            let text = format!("{outcome:?}");
+            assert!(text.contains("Expected PuzzleSolution"), "{cmd}: {text}");
+            assert_eq!(score_of(host), 0, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_solution_still_scores_100() {
+        use std::io::Write;
+        let host = Ipv4Addr::new(127, 0, 0, 80);
+        let magic = NetworkParams::REGTEST_MAGIC;
+        let (pm, dir) = test_store("invalid_solution");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client = connect_from(host, listener.local_addr().expect("addr"));
+        let (stream, _) = listener.accept().expect("accept");
+        let done = spawn_bounded(move || P2P::handle_peer_connection(stream, false, magic, Vec::new(), pm));
+        let challenge = read_challenge(&client);
+        let sol = ConnectionPuzzle::solve(&challenge).expect("solvable");
+        let forged = P2PMessage::PuzzleSolution {
+            challenge: sol.challenge,
+            nonce: sol.nonce.wrapping_add(1),
+            hash: sol.hash,
+        };
+        (&client).write_all(&wire_frame(magic, &forged)).unwrap();
+        let outcome = done.recv_timeout(Duration::from_secs(10)).expect("the acceptor never ended");
+        drop(client);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(format!("{outcome:?}").contains("Invalid puzzle solution"), "{outcome:?}");
+        assert_eq!(score_of(host), 100);
+    }
+
+    #[test]
+    fn a_solution_and_a_version_in_one_write_are_both_answered() {
+        use crate::service::network::p2p::protocol::HandshakeState;
+        use std::io::Write;
+        let host = Ipv4Addr::new(127, 0, 0, 68);
+        let magic = NetworkParams::REGTEST_MAGIC;
+        let (pm, dir) = test_store("coalesced");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client = connect_from(host, listener.local_addr().expect("addr"));
+        let (stream, _) = listener.accept().expect("accept");
+        let done = spawn_bounded(move || P2P::handle_peer_connection(stream, false, magic, Vec::new(), pm));
+        let mut both = solution_to(&read_challenge(&client));
+        both.extend(wire_frame(magic, &foreign_version()));
+        (&client).write_all(&both).unwrap();
+        let got = read_frames(&client, &session_in(HandshakeState::AwaitVersion), Duration::from_secs(5), |f| {
+            f.iter().any(|(c, _)| *c == CommandId::VerAck)
+        });
+        drop(client);
+        let _ = done.recv_timeout(Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+        let got = got.unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            got.iter().any(|(c, _)| *c == CommandId::VerAck),
+            "the coalesced Version went unanswered: {got:?}"
+        );
+        assert_eq!(score_of(host), 0);
+    }
+
+    #[test]
+    fn an_acceptor_past_its_puzzle_step_still_completes_the_version_exchange() {
+        use crate::service::network::p2p::protocol::HandshakeState;
+        use std::io::Write;
+        let host = Ipv4Addr::new(127, 0, 0, 72);
+        let magic = NetworkParams::REGTEST_MAGIC;
+        let (pm, dir) = test_store("acceptor_past_step");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client = connect_from(host, listener.local_addr().expect("addr"));
+        let (stream, _) = listener.accept().expect("accept");
+        let started = Instant::now();
+        let done = spawn_bounded(move || {
+            P2P::handle_peer_connection_within(stream, false, magic, Vec::new(), pm, short_puzzle_step())
+        });
+        (&client).write_all(&solution_to(&read_challenge(&client))).unwrap();
+        let mut version_sent = false;
+        let got = read_frames(&client, &session_in(HandshakeState::AwaitVersion), Duration::from_secs(20), |f| {
+            if !version_sent && started.elapsed() >= SHORT_STEP * 3 {
+                (&client).write_all(&wire_frame(magic, &foreign_version())).unwrap();
+                version_sent = true;
+            }
+            f.iter().any(|(c, _)| *c == CommandId::VerAck)
+        });
+        drop(client);
+        let _ = done.recv_timeout(Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+        let got = got.unwrap_or_else(|e| panic!("{e}"));
+        assert!(version_sent, "the acceptor closed before the Version was due: {got:?}");
+        assert!(
+            got.iter().any(|(c, _)| *c == CommandId::VerAck),
+            "the acceptor did not answer a Version that came after its puzzle step: {got:?}"
+        );
+        assert_eq!(score_of(host), 0);
+    }
+
+    #[test]
+    fn a_peer_trickling_its_version_is_cut_at_the_version_exchange_deadline() {
+        use crate::service::network::p2p::protocol::HandshakeState;
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let host = Ipv4Addr::new(127, 0, 0, 73);
+        let magic = NetworkParams::REGTEST_MAGIC;
+        let budget = HandshakeBudget {
+            puzzle_step: SHORT_STEP,
+            version_exchange: Duration::from_millis(1500),
+        };
+        let (pm, dir) = test_store("version_trickle");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client = connect_from(host, listener.local_addr().expect("addr"));
+        let (stream, _) = listener.accept().expect("accept");
+        let started = Instant::now();
+        let done = spawn_bounded(move || P2P::handle_peer_connection_within(stream, false, magic, Vec::new(), pm, budget));
+        (&client).write_all(&solution_to(&read_challenge(&client))).unwrap();
+        let version = wire_frame(magic, &foreign_version());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_writer = Arc::clone(&stop);
+        let writer = client.try_clone().expect("clone");
+        let trickle = thread::spawn(move || {
+            for b in version {
+                if stop_writer.load(Ordering::Relaxed) || (&writer).write_all(&[b]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(60));
+            }
+        });
+        let got = read_frames(&client, &session_in(HandshakeState::AwaitVersion), Duration::from_secs(15), |_| false);
+        let ended_after = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        trickle.join().ok();
+        drop(client);
+        let _ = done.recv_timeout(Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+        let got = got.unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            !got.iter().any(|(c, _)| *c == CommandId::VerAck),
+            "a Version trickled past the deadline was answered: {got:?}"
+        );
+        assert!(
+            ended_after < Duration::from_millis(3500),
+            "a byte every 60 ms held the Version exchange for {ended_after:?}"
+        );
+        assert_eq!(score_of(host), 0);
+    }
+
+    #[test]
+    fn a_challenge_that_arrives_after_the_puzzle_phase_is_never_solved() {
+        use crate::service::network::p2p::protocol::HandshakeState;
+        use std::io::Write;
+        let host = Ipv4Addr::new(127, 0, 0, 69);
+        let magic = NetworkParams::REGTEST_MAGIC;
+        let (pm, dir) = test_store("late_challenge");
+        let listener = TcpListener::bind((host, 0)).expect("bind");
+        let dial = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let done = spawn_bounded(move || P2P::handle_peer_connection(dial, true, magic, Vec::new(), pm));
+        let (theirs, _) = listener.accept().expect("accept");
+        let challenge = || P2PMessage::PuzzleChallenge {
+            challenge: ConnectionPuzzle::generate_challenge().challenge,
+        };
+        (&theirs).write_all(&wire_frame(magic, &challenge())).unwrap();
+        let mut second_sent: Option<Instant> = None;
+        let got = read_frames(&theirs, &session_in(HandshakeState::AwaitVersion), Duration::from_secs(20), |f| {
+            match second_sent {
+                Some(t) => t.elapsed() >= Duration::from_millis(500),
+                None if f.iter().any(|(c, _)| *c == CommandId::Version) => {
+                    (&theirs).write_all(&wire_frame(magic, &challenge())).unwrap();
+                    second_sent = Some(Instant::now());
+                    false
+                }
+                None => false,
+            }
+        });
+        drop(theirs);
+        let _ = done.recv_timeout(Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+        let got = got.unwrap_or_else(|e| panic!("{e}"));
+        assert!(second_sent.is_some(), "the dialer never sent its Version: {got:?}");
+        let solutions = got.iter().filter(|(c, _)| *c == CommandId::PuzzleSolution).count();
+        assert_eq!(solutions, 1, "a challenge after the puzzle phase was solved: {got:?}");
+        assert_eq!(score_of(host), 10);
+    }
+
+    #[test]
+    fn a_dialer_past_its_puzzle_step_still_completes_the_version_exchange() {
+        use crate::service::network::p2p::protocol::HandshakeState;
+        use std::io::Write;
+        let host = Ipv4Addr::new(127, 0, 0, 70);
+        let magic = NetworkParams::REGTEST_MAGIC;
+        let (pm, dir) = test_store("past_step");
+        let listener = TcpListener::bind((host, 0)).expect("bind");
+        let dial = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let started = Instant::now();
+        let done = spawn_bounded(move || {
+            P2P::handle_peer_connection_within(dial, true, magic, Vec::new(), pm, short_puzzle_step())
+        });
+        let (theirs, _) = listener.accept().expect("accept");
+        (&theirs)
+            .write_all(&wire_frame(
+                magic,
+                &P2PMessage::PuzzleChallenge {
+                    challenge: ConnectionPuzzle::generate_challenge().challenge,
+                },
+            ))
+            .unwrap();
+        let mut version_sent = false;
+        let got = read_frames(&theirs, &session_in(HandshakeState::AwaitVersion), Duration::from_secs(20), |f| {
+            if !version_sent
+                && started.elapsed() >= SHORT_STEP * 3
+                && f.iter().any(|(c, _)| *c == CommandId::Version)
+            {
+                (&theirs).write_all(&wire_frame(magic, &foreign_version())).unwrap();
+                version_sent = true;
+            }
+            f.iter().any(|(c, _)| *c == CommandId::VerAck)
+        });
+        drop(theirs);
+        let _ = done.recv_timeout(Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+        let got = got.unwrap_or_else(|e| panic!("{e}"));
+        assert!(version_sent, "the dialer never sent its Version: {got:?}");
+        assert!(
+            got.iter().any(|(c, _)| *c == CommandId::VerAck),
+            "the dialer did not answer a Version that came after its puzzle step: {got:?}"
+        );
+        assert_eq!(score_of(host), 0);
     }
 
     /// Write one frame split at `split`, with `pause` between the halves, and
