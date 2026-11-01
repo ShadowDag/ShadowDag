@@ -21,5 +21,15 @@ pub trait TxPool: Send + Sync {
 
     /// Get transactions for block building, validated against the UTXO set.
     /// Returns up to `max_count` transactions ordered by fee priority.
-    fn get_transactions_for_block(&self, utxo_set: &UtxoSet, max_count: usize) -> Vec<Transaction>;
+    ///
+    /// `block_height` is the height the template block will occupy (tip + 1).
+    /// It is required, not optional: coinbase maturity is height-relative, and
+    /// selecting a tx that apply will skip as immature makes the coinbase
+    /// over-claim fees and the block unacceptable to every validator.
+    fn get_transactions_for_block(
+        &self,
+        utxo_set: &UtxoSet,
+        max_count: usize,
+        block_height: u64,
+    ) -> Vec<Transaction>;
 }

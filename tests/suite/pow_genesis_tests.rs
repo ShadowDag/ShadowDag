@@ -20,28 +20,28 @@ mod pow_tests {
 
     #[test]
     fn hash_is_64_chars() {
-        let h = shadow_hash_raw_full(1, 0, 1735689600, 0, 0, 4, "merkle", &[]);
+        let h = shadow_hash_raw_full(1, 0, 1735689600, 0, 0, 4, "merkle", &[], None);
         assert_eq!(h.len(), 64, "SHA-256/SHA3-256 hash must be 64 hex chars");
     }
 
     #[test]
     fn hash_is_deterministic() {
-        let h1 = shadow_hash_raw_full(1, 1, 1735689600, 42, 0, 4, "some_merkle", &[]);
-        let h2 = shadow_hash_raw_full(1, 1, 1735689600, 42, 0, 4, "some_merkle", &[]);
+        let h1 = shadow_hash_raw_full(1, 1, 1735689600, 42, 0, 4, "some_merkle", &[], None);
+        let h2 = shadow_hash_raw_full(1, 1, 1735689600, 42, 0, 4, "some_merkle", &[], None);
         assert_eq!(h1, h2, "Same inputs must produce same PoW hash");
     }
 
     #[test]
     fn different_nonce_different_hash() {
-        let h1 = shadow_hash_raw_full(1, 1, 1735689600, 1, 0, 4, "merkle", &[]);
-        let h2 = shadow_hash_raw_full(1, 1, 1735689600, 2, 0, 4, "merkle", &[]);
+        let h1 = shadow_hash_raw_full(1, 1, 1735689600, 1, 0, 4, "merkle", &[], None);
+        let h2 = shadow_hash_raw_full(1, 1, 1735689600, 2, 0, 4, "merkle", &[], None);
         assert_ne!(h1, h2, "Different nonce must yield different hash");
     }
 
     #[test]
     fn different_height_different_hash() {
-        let h1 = shadow_hash_raw_full(1, 1, 1735689600, 0, 0, 4, "merkle", &[]);
-        let h2 = shadow_hash_raw_full(1, 2, 1735689600, 0, 0, 4, "merkle", &[]);
+        let h1 = shadow_hash_raw_full(1, 1, 1735689600, 0, 0, 4, "merkle", &[], None);
+        let h2 = shadow_hash_raw_full(1, 2, 1735689600, 0, 0, 4, "merkle", &[], None);
         assert_ne!(h1, h2);
     }
 

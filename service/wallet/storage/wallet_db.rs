@@ -57,3 +57,45 @@ impl WalletDB {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::wallet::core::wallet::ConfidentialUtxo;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_path(label: &str) -> String {
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let id = CTR.fetch_add(1, Ordering::Relaxed);
+        format!(
+            "{}/shadowdag_walletdb_test_{}_{}",
+            std::env::temp_dir().display(),
+            label,
+            id
+        )
+    }
+
+    #[test]
+    fn confidential_utxos_persist_with_wallet_blob() {
+        let db = WalletDB::new(&temp_path("cutxo")).unwrap();
+        let mut w = Wallet::new("mainnet");
+        // create() establishes account 0 + primary address (the save key).
+        let (_words, _enc) = w.create("password123").unwrap();
+        w.add_confidential_utxo(ConfidentialUtxo {
+            txid: "deadbeef".into(),
+            index: 2,
+            amount: 777,
+            blinding_hex: "01".repeat(32),
+            one_time_pubkey: "ab".repeat(32),
+            ephemeral_pubkey: "cd".repeat(32),
+            spent: false,
+        });
+        let addr = w.address();
+        db.save_wallet(&w).unwrap();
+
+        let loaded = db.get_wallet(&addr).unwrap().unwrap();
+        assert_eq!(loaded.confidential_utxos().len(), 1);
+        assert_eq!(loaded.confidential_utxos()[0].amount, 777);
+        assert_eq!(loaded.confidential_balance(), 777);
+    }
+}

@@ -1,0 +1,43 @@
+# ShadowDAG monitoring stack: Prometheus + Grafana scraping the node's /metrics.
+#
+#   docker compose -f docker-compose.yml -f monitoring/docker-compose.monitoring.yml up -d
+#
+# This extends the main compose (which defines the `node` service). Prometheus
+# reaches the node at node:9332 over the shared compose network, so the RPC port
+# need not be published to the host.
+#
+#   Grafana:    http://localhost:3001  (admin / admin on first login)
+#   Prometheus: http://localhost:9090
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: shadowdag-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - node
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: shadowdag-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus-data:
+  grafana-data:

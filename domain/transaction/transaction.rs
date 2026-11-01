@@ -26,6 +26,11 @@ pub enum TxType {
     SwapTx,
     /// DEX order placement/cancellation transaction
     DexOrder,
+    /// Shield transaction — TRANSPARENT inputs -> CONFIDENTIAL outputs. The entry
+    /// point into the RingCT pool: public input amounts (read from the UTXO set)
+    /// are converted into hidden-amount confidential outputs. CONSENSUS-CRITICAL,
+    /// inflation-risk — see docs/superpowers/specs/2026-07-04-shield-tx-design.md.
+    Shield,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -43,6 +48,27 @@ pub struct TxInput {
     /// None for transparent TXs.
     #[serde(default)]
     pub ring_members: Option<Vec<String>>,
+    /// Serialized CLSAG signature (hex) for confidential inputs. None for
+    /// transparent inputs (which use `signature` = Ed25519 hex). For RingCT
+    /// confidential inputs this holds a dual-key CLSAG (embeds key images I, D).
+    #[serde(default)]
+    pub ring_signature: Option<String>,
+    /// RingCT: commitment C_i for each ring member, parallel to `ring_members`
+    /// (same length). ring_members[i] = P_i, ring_commitments[i] = C_i. Hex
+    /// compressed Ristretto. None for transparent inputs.
+    #[serde(default)]
+    pub ring_commitments: Option<Vec<String>>,
+    /// RingCT: per-input pseudo-output commitment C' (hex compressed Ristretto).
+    /// None for transparent inputs.
+    #[serde(default)]
+    pub pseudo_commitment: Option<String>,
+    /// SHIELD only: the Pedersen blinding scalar r_i (hex) for a transparent
+    /// input consumed by a Shield tx. The verifier forms the input commitment
+    /// C_in = A_i·H + r_i·G where A_i is the input UTXO's amount read from the
+    /// UTXO SET (never from the tx) — so r_i cannot move value, only balance the
+    /// output blindings. None for transparent/confidential inputs.
+    #[serde(default)]
+    pub shield_blinding: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -61,6 +87,17 @@ pub struct TxOutput {
     /// Present on stealth outputs so the recipient can perform ECDH to detect ownership.
     #[serde(default)]
     pub ephemeral_pubkey: Option<String>,
+    /// RingCT: full one-time output public key P (hex compressed Ristretto).
+    /// The `address` is a truncated hash and cannot be a ring member; this
+    /// carries the full point so the output can be a decoy and be recorded in
+    /// the on-chain output-key index. None for transparent outputs.
+    #[serde(default)]
+    pub one_time_pubkey: Option<String>,
+    /// RingCT: amount masked with a one-time pad derived from the ECDH shared
+    /// secret (hex, 8 bytes). Lets the recipient recover the amount. None for
+    /// transparent outputs.
+    #[serde(default)]
+    pub encrypted_amount: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -151,6 +188,40 @@ impl Transaction {
         self.tx_type == TxType::Confidential
     }
 
+    /// Returns true if this is a SHIELD transaction (transparent inputs ->
+    /// confidential outputs). It lives in BOTH worlds, so every routing site
+    /// that special-cases `is_confidential()` must also handle `is_shield()`.
+    pub fn is_shield(&self) -> bool {
+        self.tx_type == TxType::Shield
+    }
+
+    /// Whether this tx runs through ShadowVM during block execution
+    /// (ContractCreate / ContractCall). Only these consume gas.
+    pub fn is_contract_tx(&self) -> bool {
+        matches!(self.tx_type, TxType::ContractCreate | TxType::ContractCall)
+    }
+
+    /// The gas this tx is allowed to consume during block execution — the
+    /// SINGLE SOURCE OF TRUTH shared by the block-gas validator and the
+    /// executor so they can never disagree.
+    ///
+    /// CONSENSUS-CRITICAL: a contract tx with no explicit `gas_limit` still
+    /// executes up to `DEFAULT_CONTRACT_GAS_LIMIT`, so it MUST count that much
+    /// against MAX_BLOCK_GAS. Counting it as 0 (the old validator behavior)
+    /// let a hostile miner pack thousands of unbounded-gas contract txs that
+    /// passed the cap yet forced every node to execute far beyond it. Non-VM
+    /// txs (Transfer/Confidential/etc.) never run code, so they contribute 0
+    /// regardless of any stray `gas_limit` value.
+    pub fn effective_gas_limit(&self) -> u64 {
+        if self.is_contract_tx() {
+            self.gas_limit.unwrap_or(
+                crate::config::consensus::consensus_params::ConsensusParams::DEFAULT_CONTRACT_GAS_LIMIT,
+            )
+        } else {
+            0
+        }
+    }
+
     /// Sum of all output amounts. Returns None on overflow (attack detection).
     pub fn total_output_checked(&self) -> Option<u64> {
         let mut total: u64 = 0;
@@ -196,6 +267,7 @@ impl Transaction {
             TxType::TokenTransfer => 0x06,
             TxType::SwapTx => 0x07,
             TxType::DexOrder => 0x08,
+            TxType::Shield => 0x09,
         };
         buf.push(tx_type_byte);
 
@@ -260,6 +332,49 @@ impl Transaction {
             } else {
                 buf.push(0x00);
             }
+
+            // ring_signature: bind the CLSAG signature into the txid so it
+            // cannot be swapped without changing the transaction identity.
+            if let Some(ref rs) = inp.ring_signature {
+                buf.push(0x01);
+                let rs_bytes = rs.as_bytes();
+                buf.extend_from_slice(&(rs_bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(rs_bytes);
+            } else {
+                buf.push(0x00);
+            }
+
+            // RingCT: ring_commitments (parallel C_i) bound to the txid.
+            if let Some(ref cs) = inp.ring_commitments {
+                buf.push(0x01);
+                buf.extend_from_slice(&(cs.len() as u32).to_le_bytes());
+                for c in cs {
+                    let cb = c.as_bytes();
+                    buf.extend_from_slice(&(cb.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(cb);
+                }
+            } else {
+                buf.push(0x00);
+            }
+            // RingCT: pseudo-output commitment C'.
+            if let Some(ref pc) = inp.pseudo_commitment {
+                buf.push(0x01);
+                let pb = pc.as_bytes();
+                buf.extend_from_slice(&(pb.len() as u32).to_le_bytes());
+                buf.extend_from_slice(pb);
+            } else {
+                buf.push(0x00);
+            }
+            // SHIELD: per-input blinding r_i, bound into the txid so it cannot be
+            // altered without changing the transaction identity.
+            if let Some(ref sb) = inp.shield_blinding {
+                buf.push(0x01);
+                let sbb = sb.as_bytes();
+                buf.extend_from_slice(&(sbb.len() as u32).to_le_bytes());
+                buf.extend_from_slice(sbb);
+            } else {
+                buf.push(0x00);
+            }
         }
 
         // 4. outputs — in original order (order matters for output indices)
@@ -291,6 +406,22 @@ impl Transaction {
                 buf.push(0x01);
                 buf.extend_from_slice(&(epk.len() as u32).to_le_bytes());
                 buf.extend_from_slice(epk.as_bytes());
+            } else {
+                buf.push(0x00);
+            }
+            // RingCT: full one-time output pubkey P.
+            if let Some(ref otk) = out.one_time_pubkey {
+                buf.push(0x01);
+                buf.extend_from_slice(&(otk.len() as u32).to_le_bytes());
+                buf.extend_from_slice(otk.as_bytes());
+            } else {
+                buf.push(0x00);
+            }
+            // RingCT: encrypted amount (masked).
+            if let Some(ref ea) = out.encrypted_amount {
+                buf.push(0x01);
+                buf.extend_from_slice(&(ea.len() as u32).to_le_bytes());
+                buf.extend_from_slice(ea.as_bytes());
             } else {
                 buf.push(0x00);
             }
@@ -389,6 +520,10 @@ impl TxInput {
             pub_key,
             key_image: None,
             ring_members: None,
+            ring_signature: None,
+            ring_commitments: None,
+            pseudo_commitment: None,
+            shield_blinding: None,
         }
     }
 
@@ -410,6 +545,10 @@ impl TxInput {
             pub_key,
             key_image: Some(key_image),
             ring_members: Some(ring_members),
+            ring_signature: None,
+            ring_commitments: None,
+            pseudo_commitment: None,
+            shield_blinding: None,
         }
     }
 }
@@ -423,6 +562,8 @@ impl TxOutput {
             commitment: None,
             range_proof: None,
             ephemeral_pubkey: None,
+            one_time_pubkey: None,
+            encrypted_amount: None,
         }
     }
 
@@ -434,11 +575,149 @@ impl TxOutput {
             commitment: Some(commitment),
             range_proof: Some(range_proof),
             ephemeral_pubkey: None,
+            one_time_pubkey: None,
+            encrypted_amount: None,
         }
     }
 
     /// Returns true if this output uses a Pedersen commitment
     pub fn is_confidential(&self) -> bool {
         self.commitment.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::consensus::consensus_params::ConsensusParams;
+
+    #[test]
+    fn effective_gas_limit_matches_executor_default() {
+        // Contract tx, no explicit gas → the implicit executor budget.
+        let mut t = Transaction::new(String::new(), vec![], vec![], 0, 0);
+        t.tx_type = TxType::ContractCall;
+        t.gas_limit = None;
+        assert_eq!(
+            t.effective_gas_limit(),
+            ConsensusParams::DEFAULT_CONTRACT_GAS_LIMIT
+        );
+        // Explicit gas is honored.
+        t.gas_limit = Some(42);
+        assert_eq!(t.effective_gas_limit(), 42);
+        // Non-contract txs never run the VM → 0 regardless of gas_limit.
+        t.tx_type = TxType::Transfer;
+        t.gas_limit = Some(999_999);
+        assert_eq!(t.effective_gas_limit(), 0);
+        assert!(!t.is_contract_tx());
+    }
+
+    #[test]
+    fn ring_signature_changes_canonical_bytes() {
+        let mut tx = Transaction::new(
+            String::new(),
+            vec![TxInput {
+                txid: "b".repeat(64),
+                index: 0,
+                owner: "SD1o".into(),
+                signature: String::new(),
+                pub_key: String::new(),
+                key_image: Some("11".repeat(32)),
+                ring_members: Some(vec!["22".repeat(32)]),
+                ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
+                shield_blinding: None,
+            }],
+            vec![TxOutput::new("SD1x".into(), 10)],
+            1,
+            0,
+        );
+        let before = tx.canonical_bytes();
+        tx.inputs[0].ring_signature = Some("abcd".into());
+        let after = tx.canonical_bytes();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn ringct_input_fields_change_canonical_bytes() {
+        let mut tx = Transaction::new(
+            String::new(),
+            vec![TxInput {
+                txid: "b".repeat(64),
+                index: 0,
+                owner: "SD1o".into(),
+                signature: String::new(),
+                pub_key: String::new(),
+                key_image: Some("11".repeat(32)),
+                ring_members: Some(vec!["22".repeat(32)]),
+                ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
+                shield_blinding: None,
+            }],
+            vec![TxOutput::new("SD1x".into(), 10)],
+            1,
+            0,
+        );
+        let base = tx.canonical_bytes();
+        tx.inputs[0].ring_commitments = Some(vec!["33".repeat(32)]);
+        let after_rc = tx.canonical_bytes();
+        assert_ne!(base, after_rc);
+        tx.inputs[0].pseudo_commitment = Some("44".repeat(32));
+        assert_ne!(after_rc, tx.canonical_bytes());
+    }
+
+    #[test]
+    fn ringct_output_one_time_pubkey_changes_canonical_bytes() {
+        let mut tx = Transaction::new(String::new(), vec![], vec![TxOutput::new("SD1x".into(), 10)], 1, 0);
+        let base = tx.canonical_bytes();
+        tx.outputs[0].one_time_pubkey = Some("55".repeat(32));
+        assert_ne!(base, tx.canonical_bytes());
+    }
+
+    #[test]
+    fn encrypted_amount_changes_canonical_bytes() {
+        let mut tx = Transaction::new(String::new(), vec![], vec![TxOutput::new("SD1x".into(), 10)], 1, 0);
+        let base = tx.canonical_bytes();
+        tx.outputs[0].encrypted_amount = Some("0011223344556677".into());
+        assert_ne!(base, tx.canonical_bytes());
+    }
+
+    #[test]
+    fn confidential_tx_serde_round_trips() {
+        let mut tx = Transaction::new(
+            String::new(),
+            vec![TxInput {
+                txid: "b".repeat(64),
+                index: 0,
+                owner: "o".into(),
+                signature: String::new(),
+                pub_key: String::new(),
+                key_image: Some("11".repeat(32)),
+                ring_members: Some(vec!["22".repeat(32), "33".repeat(32)]),
+                ring_signature: Some("aa".repeat(40)),
+                ring_commitments: Some(vec!["44".repeat(32), "55".repeat(32)]),
+                pseudo_commitment: Some("66".repeat(32)),
+                shield_blinding: None,
+            }],
+            vec![TxOutput {
+                address: "SD1s".into(),
+                amount: 0,
+                commitment: Some("77".repeat(32)),
+                range_proof: Some("88".repeat(10)),
+                ephemeral_pubkey: Some("99".repeat(32)),
+                one_time_pubkey: Some("aa".repeat(32)),
+                encrypted_amount: Some("0011223344556677".into()),
+            }],
+            5,
+            1_700_000_000,
+        );
+        tx.tx_type = TxType::Confidential;
+        let bytes = bincode::serialize(&tx).unwrap();
+        let back: Transaction = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.inputs[0].ring_commitments, tx.inputs[0].ring_commitments);
+        assert_eq!(back.inputs[0].pseudo_commitment, tx.inputs[0].pseudo_commitment);
+        assert_eq!(back.outputs[0].one_time_pubkey, tx.outputs[0].one_time_pubkey);
+        assert_eq!(back.canonical_bytes(), tx.canonical_bytes());
     }
 }

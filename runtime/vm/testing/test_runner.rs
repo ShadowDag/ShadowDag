@@ -93,7 +93,18 @@ impl TestRunner {
     ///
     /// Use [`Self::for_network`] if you need a different network tag.
     pub fn new() -> Self {
-        Self::for_network("regtest").expect("regtest is a known network")
+        Self {
+            env: ExecutionEnvironment::new(BlockContext {
+                timestamp: 1_000_000,
+                block_hash: "00".repeat(32),
+                network: "regtest".to_string(),
+            }),
+            contract_addr: String::new(),
+            results: Vec::new(),
+            network: "regtest".to_string(),
+            network_prefix: "SR1",
+            deploy_counter: 0,
+        }
     }
 
     /// Create a new test runner pinned to a specific network.

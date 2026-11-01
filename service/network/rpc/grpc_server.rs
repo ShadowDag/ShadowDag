@@ -41,6 +41,9 @@ pub const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 
 /// Maximum concurrent connections
 pub const MAX_CONNECTIONS: usize = 256;
+/// Per-connection request cap to prevent a single client from monopolizing
+/// a worker thread indefinitely.
+pub const MAX_REQUESTS_PER_CONNECTION: usize = 10_000;
 
 /// gRPC method IDs
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -347,8 +350,18 @@ impl GrpcServer {
             slog_error!("rpc", "grpc_set_read_timeout_failed", error => e);
             return;
         }
+        if let Err(e) = stream.set_write_timeout(Some(std::time::Duration::from_secs(30))) {
+            slog_error!("rpc", "grpc_set_write_timeout_failed", error => e);
+            return;
+        }
 
+        let mut served_requests: usize = 0;
         loop {
+            if served_requests >= MAX_REQUESTS_PER_CONNECTION {
+                slog_info!("rpc", "grpc_connection_request_cap_reached",
+                    cap => MAX_REQUESTS_PER_CONNECTION);
+                break;
+            }
             // Read 4-byte length prefix
             let mut len_buf = [0u8; 4];
             if stream.read_exact(&mut len_buf).is_err() {
@@ -404,6 +417,9 @@ impl GrpcServer {
             if stream.write_all(&resp_bytes).is_err() {
                 break;
             }
+            if stream.flush().is_err() {
+                break;
+            }
             stats
                 .bytes_sent
                 .fetch_add(resp_bytes.len() as u64, Ordering::Relaxed);
@@ -411,6 +427,7 @@ impl GrpcServer {
             stats
                 .bytes_received
                 .fetch_add((4 + msg_len) as u64, Ordering::Relaxed);
+            served_requests += 1;
         }
     }
 
@@ -526,7 +543,7 @@ pub fn parse_request(data: &[u8]) -> Option<GrpcRequest> {
     if !(9..=MAX_MESSAGE_SIZE).contains(&msg_len) {
         return None;
     }
-    if data.len() < 4 + msg_len {
+    if data.len() != 4 + msg_len {
         return None;
     }
 
@@ -620,6 +637,19 @@ mod tests {
     #[test]
     fn parse_too_short() {
         assert!(parse_request(&[0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_trailing_bytes() {
+        let mut data = Vec::new();
+        let payload = b"test";
+        let msg_len = (1 + 8 + payload.len()) as u32;
+        data.extend_from_slice(&msg_len.to_be_bytes());
+        data.push(0x01);
+        data.extend_from_slice(&42u64.to_be_bytes());
+        data.extend_from_slice(payload);
+        data.extend_from_slice(&[0xAA, 0xBB]); // trailing garbage
+        assert!(parse_request(&data).is_none());
     }
 
     #[test]

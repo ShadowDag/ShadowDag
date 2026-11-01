@@ -1,6 +1,5 @@
 target/
 
-
 # RPC admin password file.
 #
 # `service/network/rpc/rpc_server.rs::load_or_create_admin_password`
@@ -10,7 +9,12 @@ target/
 # publishes the live admin credential for any node that ever ran
 # from this checkout.
 rpc_password
-target/ 
- 
 full_test2.log
 full_test_final.log
+
+# Scratch logs (audit/clippy/test output captured during local runs).
+.tmp/
+
+# Python bytecode cache
+__pycache__/
+*.pyc

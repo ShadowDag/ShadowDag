@@ -29,9 +29,15 @@ use crate::infrastructure::storage::rocksdb::blocks::block_store::BlockStore;
 
 // ─────────────────────────────────────────
 
-/// Canonical maximum future timestamp drift for the entire codebase (120 seconds).
-/// All other modules should reference this value.
-pub const MAX_FUTURE_SECS: u64 = 120;
+/// Canonical maximum future timestamp drift for the entire codebase, in
+/// MILLISECONDS (120 s of real-time clock-skew tolerance). Timestamps are unix
+/// epoch milliseconds. Shares ConsensusParams::MAX_FUTURE_MS so every block-ts
+/// future gate uses one value.
+pub const MAX_FUTURE_MS: u64 = ConsensusParams::MAX_FUTURE_MS;
+/// MTP window length in BLOCKS (unit-agnostic count). REVIEW ITEM (spec open
+/// Q#2): at 100 ms spacing an 11-block window spans ~1.1 s of real time; a
+/// larger span (~99) would restore ~10 s of coverage. Kept at 11 pending the
+/// external reviewer's security/latency call — a count change, not a unit bug.
 pub const MEDIAN_TIME_SPAN: usize = 11;
 pub const MAX_BLOCK_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_TX_BYTES_IN_BLOCK: usize = 100 * 1024;
@@ -40,24 +46,24 @@ pub const MAX_TX_BYTES_IN_BLOCK: usize = 100 * 1024;
 /// Prevents worst-case CPU consumption from blocks with excessive TXs.
 pub const MAX_TXS_PER_BLOCK_VALIDATION: usize = 10_000;
 
-/// Maximum how far in the past a block timestamp can be relative to wall clock.
-/// Prevents miners from backdating blocks to manipulate difficulty windows.
-/// 10 minutes is generous enough for clock skew but tight enough to prevent
-/// systematic timewarp attacks.
-pub const MAX_PAST_BLOCK_SECS: u64 = 600;
+/// Maximum how far in the past a block timestamp can be relative to wall clock,
+/// in MILLISECONDS. NOTE: not enforced on the live validation path (referenced
+/// only by tests/docs); converted to ms to keep test semantics meaningful.
+pub const MAX_PAST_BLOCK_MS: u64 = 600_000;
 
-/// Maximum forward timestamp jump from the best parent.
+/// Maximum forward timestamp jump from the best parent, in MILLISECONDS.
 /// Must be large enough to handle legitimate mining delays (difficulty
 /// overshoot, network partitions, miner restarts) without rejecting valid
-/// blocks. At 10 BPS with 100ms target, 30s = 300 blocks max jump —
-/// tight enough to prevent timewarp manipulation while allowing recovery.
-pub const MAX_TIMESTAMP_JUMP_SECS: u64 = 30;
+/// blocks. 30_000 ms keeps the historical 30 s window (at 10 BPS / 100 ms that
+/// is ~300 blocks of allowed jump) — tight enough to bound timewarp while
+/// allowing recovery. REVIEW ITEM (spec open Q#4): reviewer may tighten.
+pub const MAX_TIMESTAMP_JUMP_MS: u64 = 30_000;
 
-/// Stricter timestamp drift for DAG-dense heights. When multiple parallel
-/// blocks exist at the same height, a tighter cap prevents timewarp attacks
-/// that exploit DAG parallelism. Used as a secondary check when the block
-/// has ≥3 parents (indicating high DAG density at that height).
-pub const MAX_DAG_DENSE_TIMESTAMP_JUMP_SECS: u64 = 10;
+/// Stricter timestamp drift for DAG-dense heights, in MILLISECONDS. When
+/// multiple parallel blocks exist at the same height, a tighter cap prevents
+/// timewarp attacks that exploit DAG parallelism. Used as a secondary check
+/// when the block has ≥3 parents (indicating high DAG density at that height).
+pub const MAX_DAG_DENSE_TIMESTAMP_JUMP_MS: u64 = 10_000;
 
 // ─────────────────────────────────────────
 
@@ -193,6 +199,16 @@ impl BlockValidator {
     /// **L1 Network** — cheapest checks first. Reject malformed data
     /// before spending CPU on crypto or DB lookups.
     pub fn validate_network_layer(block: &Block) -> Result<(), ConsensusError> {
+        Self::validate_network_layer_for_network(block, &NetworkMode::Mainnet)
+    }
+
+    /// Network-aware L1 layer. The live consensus path passes the node's
+    /// `NetworkMode` so the DagShield selfish-mining (min-parents) rule is
+    /// relaxed on test networks (see `SelfishMiningGuard::min_dag_parents_for`).
+    pub fn validate_network_layer_for_network(
+        block: &Block,
+        network: &NetworkMode,
+    ) -> Result<(), ConsensusError> {
         // ── Early cost guards (O(1), before ANY iteration) ──────────
         // Reject obviously oversized blocks before spending CPU on
         // serialization, signature checks, or merkle computation.
@@ -203,6 +219,38 @@ impl BlockValidator {
                 MAX_TXS_PER_BLOCK_VALIDATION
             )));
         }
+        // Block gas budget: sum of tx EFFECTIVE gas must not exceed
+        // MAX_BLOCK_GAS. Enforced HERE (not just in block_builder) so a peer
+        // cannot pack a block with unbounded contract execution and force every
+        // node to burn CPU far beyond the intended per-block bound (DoS).
+        // effective_gas_limit charges a contract tx its implicit default when
+        // gas_limit is None — the SAME amount the executor spends — so a
+        // None-gas contract tx can no longer count as 0 here yet run at 10M.
+        // checked_add: a gas_limit near u64::MAX must not wrap past the cap.
+        {
+            let mut block_gas: u64 = 0;
+            for tx in &block.body.transactions {
+                let g = tx.effective_gas_limit();
+                if g == 0 {
+                    continue;
+                }
+                block_gas = match block_gas.checked_add(g) {
+                    Some(v) => v,
+                    None => {
+                        return Err(ConsensusError::BlockValidation(
+                            "block gas_limit sum overflow".into(),
+                        ))
+                    }
+                };
+                if block_gas > ConsensusParams::MAX_BLOCK_GAS {
+                    return Err(ConsensusError::BlockValidation(format!(
+                        "block gas {} exceeds MAX_BLOCK_GAS {}",
+                        block_gas,
+                        ConsensusParams::MAX_BLOCK_GAS
+                    )));
+                }
+            }
+        }
         if block.header.version == 0 {
             return Err(ConsensusError::BlockValidation("version=0".into()));
         }
@@ -212,7 +260,7 @@ impl BlockValidator {
         Self::validate_block_size(block)?;
 
         // DagShield = unified fast filter (DoS + Spam + Flood + Selfish mining)
-        if let Err(rej) = DagShield::validate_block(block) {
+        if let Err(rej) = DagShield::validate_block_for_network(block, network.clone()) {
             return Err(ConsensusError::BlockValidation(format!(
                 "DagShield: {}",
                 rej.reason
@@ -246,7 +294,7 @@ impl BlockValidator {
             if !seen.insert(&tx.hash) {
                 return Err(ConsensusError::BlockValidation(format!(
                     "duplicate tx {}",
-                    &tx.hash[..16.min(tx.hash.len())]
+                    crate::domain::types::hash::log_prefix(&tx.hash, 16)
                 )));
             }
         }
@@ -262,7 +310,29 @@ impl BlockValidator {
         network: &NetworkMode,
     ) -> Result<(), ConsensusError> {
         Self::validate_parents(block)?;
-        Self::validate_timestamp(block, ancestor_timestamps)?;
+        Self::validate_timestamp_for_network(block, ancestor_timestamps, network)?;
+
+        // Per-tx timestamp sanity, HEADER-RELATIVE (IBD-safe). The mempool
+        // rejects future-dated txs at entry; enforce the equivalent on the block
+        // path so a miner cannot include a tx timestamped meaningfully after the
+        // block that carries it. We bound against the BLOCK header timestamp (not
+        // wall clock) so legitimately-old historical txs are NOT rejected during
+        // IBD/replay. Coinbase is exempt (its timestamp is the block's own).
+        // MILLISECONDS: tx and block timestamps are both unix epoch ms and are
+        // compared directly here, so both must migrate together (mixed units
+        // would fork). Matches the mempool future bound (tx_validator).
+        const MAX_TX_FUTURE_MS: u64 = 15_000; // 15 s of tx-vs-block drift
+        for tx in &block.body.transactions {
+            if tx.is_coinbase() {
+                continue;
+            }
+            if tx.timestamp > block.header.timestamp.saturating_add(MAX_TX_FUTURE_MS) {
+                return Err(ConsensusError::BlockValidation(format!(
+                    "tx {} timestamp {} is after block timestamp {} (+{}ms)",
+                    tx.hash, tx.timestamp, block.header.timestamp, MAX_TX_FUTURE_MS
+                )));
+            }
+        }
 
         // Merkle root — header must commit to actual TX body
         let computed_merkle = MerkleTree::build(
@@ -356,7 +426,7 @@ impl BlockValidator {
             }
             // Validate swap/dex transaction payloads
             if tx.tx_type == TxType::SwapTx {
-                Self::validate_swap_tx(tx)?;
+                Self::validate_swap_tx(tx, network)?;
             }
             if tx.tx_type == TxType::DexOrder {
                 Self::validate_dex_order_tx(tx)?;
@@ -380,42 +450,14 @@ impl BlockValidator {
         }
 
         if let Some(expected) = expected_difficulty {
-            // Allow a small tolerance around the expected difficulty to account
-            // for the window between getblocktemplate and submitblock. During
-            // that window the retarget engine may have adjusted difficulty by
-            // one or more EMA steps. A ±10% tolerance on non-mainnet covers
-            // normal retarget drift on fast testnet DAG growth without opening
-            // the door to large difficulty gaming.
-            //
-            // Why not strict equality: in a DAG with 10 BPS, the EMA retarget
-            // can move substantially between getblocktemplate and submitblock.
-            // Each node sees blocks arrive in different order, so their EMA
-            // states diverge. We keep non-mainnet tolerance modest (10%)
-            // and keep mainnet strict (0%) for consensus safety.
-            //
-            // On mainnet with stable hashrate this can be tightened, but for
-            // testnet bootstrap and early chain growth, wide tolerance is needed.
-            let tolerance_pct: u64 = if matches!(network, NetworkMode::Mainnet) {
-                0
-            } else {
-                10
-            };
-            let delta = if tolerance_pct == 0 {
-                0
-            } else {
-                expected.saturating_mul(tolerance_pct).saturating_div(100).max(1)
-            };
-            let min_allowed = expected.saturating_sub(delta).max(1);
-            let max_allowed = expected.saturating_add(delta);
-            if block.header.difficulty < min_allowed || block.header.difficulty > max_allowed {
+            // Consensus safety: difficulty must match exactly on all networks.
+            // Any tolerance can admit invalid work and cause fork divergence.
+            if block.header.difficulty != expected {
                 return Err(ConsensusError::BlockValidation(format!(
-                    "difficulty {} outside allowed range [{}, {}] (expected {} on {:?}, tolerance={}%)",
+                    "difficulty mismatch: claimed {} expected {} on {:?}",
                     block.header.difficulty,
-                    min_allowed,
-                    max_allowed,
                     expected,
                     network,
-                    tolerance_pct
                 )));
             }
         }
@@ -441,7 +483,7 @@ impl BlockValidator {
     ) -> BlockValidationResult {
         // L1: Network layer — always runs, even for genesis.
         // Format, size, and DoS checks apply to ALL blocks regardless of height.
-        if let Err(reason) = Self::validate_network_layer(block) {
+        if let Err(reason) = Self::validate_network_layer_for_network(block, network) {
             return BlockValidationResult::fail(&reason.to_string());
         }
 
@@ -457,7 +499,7 @@ impl BlockValidator {
         // A single ShadowHash + target comparison is ~100μs, while verifying
         // N transaction signatures can take milliseconds. Rejecting invalid PoW
         // here prevents attackers from wasting CPU on fake-block signature checks.
-        if let Err(reason) = Self::validate_pow(block) {
+        if let Err(reason) = Self::validate_pow(block, network) {
             return BlockValidationResult::fail(&reason.to_string());
         }
 
@@ -488,56 +530,67 @@ impl BlockValidator {
 
     /// Hardened timestamp validation — anti-timewarp for DAG.
     ///
-    /// Five rules enforced:
-    ///   R1  ts ≤ now + MAX_FUTURE_SECS              (no far-future)
-    ///   R2  ts ≥ now − MAX_PAST_BLOCK_SECS          (no far-past vs wall clock)
+    /// Rules enforced:
+    ///   R1  ts ≤ now + MAX_FUTURE_MS                (no far-future vs wall clock)
     ///   R3  ts > MTP(ancestors)                      (monotonic progress)
-    ///   R4  ts ≥ max(parent_timestamps)              (DAG causality)
-    ///   R5  ts ≤ max(parent_ts) + MAX_TIMESTAMP_JUMP (no large jumps)
+    ///   R4  ts > max(parent_timestamps)              (strict DAG causality)
+    ///   R5  ts ≤ max(parent_ts) + MAX_TIMESTAMP_JUMP (no large forward jumps)
     ///
-    /// R2 is the critical anti-timewarp addition: it prevents miners from
-    /// setting timestamps to MTP+1 (far behind real time) to systematically
-    /// shrink the difficulty window, which would lower difficulty over time.
+    /// There is intentionally NO wall-clock "too far in the past" rule: blocks
+    /// are historical by nature and a past bound makes sync/IBD impossible (a
+    /// lagging node could never accept the backlog). Anti-timewarp is enforced
+    /// against ANCESTRY instead — R3+R4+R5 clamp the timestamp into a tight band
+    /// relative to parents, coupling it to the DAG structure. In a DAG, multiple
+    /// parents are independent timestamp witnesses, so an attacker would need to
+    /// control ALL tips to shift the band; and the band traces back to genesis.
+    /// This mirrors Bitcoin (future bound + MTP, no wall-clock past bound).
     ///
-    /// R4+R5 together clamp the timestamp into a tight band relative to
-    /// parents, which couples timestamps to the DAG structure. In a DAG,
-    /// multiple parents provide independent timestamp witnesses — an
-    /// attacker would need to control ALL tips to manipulate the band.
-    /// NOTE ON WALL-CLOCK DEPENDENCY (R1, R2):
-    /// SystemTime::now() is intentionally used as an anchor to prevent
-    /// timestamp manipulation. This is standard blockchain practice
-    /// (Bitcoin uses ±2 hours). Nodes with severely drifted clocks will
-    /// reject valid blocks, but this is the node operator's responsibility
-    /// (NTP is assumed). The DAG-based rules (R3–R6) provide secondary
-    /// protection independent of wall-clock accuracy.
+    /// NOTE ON WALL-CLOCK DEPENDENCY (R1 only): SystemTime::now() anchors just
+    /// the future bound. A node with a badly drifted clock may reject genuinely
+    /// future-dated blocks (NTP is assumed); R3–R5 are wall-clock-independent.
+    #[cfg(test)]
     fn validate_timestamp(block: &Block, ancestors: &[u64]) -> Result<(), ConsensusError> {
+        Self::validate_timestamp_for_network(block, ancestors, &NetworkMode::Mainnet)
+    }
+
+    /// Network-aware timestamp validation. On test networks the R5 "max forward
+    /// jump from parent" anti-timewarp cap is skipped so a chain that has been
+    /// IDLE longer than the cap can RESUME: a block mined now has ts≈now, which
+    /// is legitimately far ahead of an old parent but still within R1's
+    /// future bound and R4's monotonic rule. Mainnet keeps R5 unchanged.
+    fn validate_timestamp_for_network(
+        block: &Block,
+        ancestors: &[u64],
+        network: &NetworkMode,
+    ) -> Result<(), ConsensusError> {
+        // MILLISECONDS: block timestamps are unix epoch ms, so the wall-clock
+        // anchor for R1 must also be ms. Reading as_secs() here while ts is ms
+        // would make every block look ~1000x in the future = universal rejection.
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
 
         let ts = block.header.timestamp;
 
         // R1: Not too far in the future
-        if ts > now + MAX_FUTURE_SECS {
+        if ts > now + MAX_FUTURE_MS {
             return Err(ConsensusError::Timestamp(format!(
-                "timestamp {}s in future (max {}s)",
+                "timestamp {}ms in future (max {}ms)",
                 ts.saturating_sub(now),
-                MAX_FUTURE_SECS
+                MAX_FUTURE_MS
             )));
         }
 
-        // R2: Not too far in the past (wall clock anchor — anti-timewarp)
-        // Without this, miners can set ts = MTP+1 which drifts behind real
-        // time, shrinking the difficulty window and lowering difficulty.
-        if ts < now.saturating_sub(MAX_PAST_BLOCK_SECS) {
-            return Err(ConsensusError::Timestamp(format!(
-                "timestamp {}s behind wall clock (max {}s)",
-                now.saturating_sub(ts),
-                MAX_PAST_BLOCK_SECS
-            )));
-        }
-
+        // NO wall-clock "too far in the past" bound. Blocks are historical by
+        // nature: during sync/IBD a lagging node receives blocks minutes/hours/
+        // days old, and a wall-clock past bound made catch-up IMPOSSIBLE (a node
+        // more than MAX_PAST_BLOCK_MS behind rejected every backlog block —
+        // and the reject banned the peer serving it, so the chain never healed).
+        // Anti-timewarp is enforced against the block's ANCESTRY — the correct,
+        // wall-clock-independent anchor — by R3 (MTP), R4 (strict causality:
+        // ts > max parent) and R5 (forward-jump cap). This matches Bitcoin,
+        // which has a future bound + MTP but no wall-clock past bound.
         if ancestors.len() >= 2 {
             // R3: Must be after Median Time Past (monotonic progress)
             let mtp = Self::median_time_past(ancestors);
@@ -567,11 +620,15 @@ impl BlockValidator {
             // block took 120s when it really took 1s. The jump limit
             // is generous (30x target) to allow normal variance but
             // tight enough to prevent systematic manipulation.
-            if ts > max_parent_ts + MAX_TIMESTAMP_JUMP_SECS {
+            // Skipped on test networks so an idle chain can resume (R1 still
+            // bounds future-dated timestamps on all networks).
+            if matches!(network, NetworkMode::Mainnet)
+                && ts > max_parent_ts + MAX_TIMESTAMP_JUMP_MS
+            {
                 return Err(ConsensusError::Timestamp(format!(
-                    "timestamp jump {}s from parent (max {}s)",
+                    "timestamp jump {}ms from parent (max {}ms)",
                     ts.saturating_sub(max_parent_ts),
-                    MAX_TIMESTAMP_JUMP_SECS
+                    MAX_TIMESTAMP_JUMP_MS
                 )));
             }
 
@@ -581,12 +638,12 @@ impl BlockValidator {
             // allowed timestamp jump to prevent timewarp exploits that abuse
             // DAG parallelism to inflate the difficulty window.
             if block.header.parents.len() >= 3
-                && ts > max_parent_ts + MAX_DAG_DENSE_TIMESTAMP_JUMP_SECS
+                && ts > max_parent_ts + MAX_DAG_DENSE_TIMESTAMP_JUMP_MS
             {
                 return Err(ConsensusError::Timestamp(format!(
-                    "DAG-dense timestamp jump {}s from parent (max {}s with {} parents)",
+                    "DAG-dense timestamp jump {}ms from parent (max {}ms with {} parents)",
                     ts.saturating_sub(max_parent_ts),
-                    MAX_DAG_DENSE_TIMESTAMP_JUMP_SECS,
+                    MAX_DAG_DENSE_TIMESTAMP_JUMP_MS,
                     block.header.parents.len()
                 )));
             }
@@ -779,8 +836,8 @@ impl BlockValidator {
     /// Validate PoW using the CANONICAL PowValidator (256-bit target comparison).
     /// There is ONE PoW validation rule in the entire codebase — PowValidator.
     /// BlockValidator delegates to it to prevent consensus rule divergence.
-    fn validate_pow(block: &Block) -> Result<(), ConsensusError> {
-        let result = PowValidator::validate(block);
+    fn validate_pow(block: &Block, network: &NetworkMode) -> Result<(), ConsensusError> {
+        let result = PowValidator::validate_for_network(block, network);
         if result.valid {
             Ok(())
         } else {
@@ -790,6 +847,30 @@ impl BlockValidator {
                     .unwrap_or_else(|| "PoW validation failed".to_string()),
             ))
         }
+    }
+
+    /// SELF-CONSISTENT validation only — the checks that need ONLY the block
+    /// itself, not its (possibly un-synced) ancestry: the L1 network layer
+    /// (format/size/DoS) and PoW (ShadowHash meets the block's own claimed
+    /// difficulty). Deliberately EXCLUDES ancestry-dependent rules — L2
+    /// timestamps (MTP/parent causality) and L3 difficulty (claimed vs the
+    /// value implied by the parent window).
+    ///
+    /// Used to junk-filter an ORPHAN before buffering it: a far-behind node
+    /// must be able to accept an ahead-of-tip block without validating its
+    /// difficulty against our own un-synced tip (which would spuriously
+    /// mismatch). PoW here bounds the cost so an attacker cannot flood the
+    /// orphan pool with work-free blocks. The FULL ancestry-dependent
+    /// validation runs when the orphan reconnects — before it is ever applied.
+    pub fn validate_self_consistent(
+        block: &Block,
+        network: &NetworkMode,
+    ) -> Result<(), ConsensusError> {
+        Self::validate_network_layer_for_network(block, network)?;
+        if block.header.height != 0 {
+            Self::validate_pow(block, network)?;
+        }
+        Ok(())
     }
 
     // ─────────────────────────────────────────
@@ -817,6 +898,22 @@ impl BlockValidator {
             }
         }
 
+        // CONSENSUS RULE (external audit C2): parents MUST be in canonical
+        // ascending order. The PoW pre-image SORTS parents before hashing, so
+        // [A,B] and [B,A] share ONE block hash — but GHOSTDAG
+        // (select_parent / compute_merge_set / classify_merge_set) and the MTP
+        // timestamp walk consume the RAW header.parents order. Two nodes that
+        // received different orderings of the same hash could then classify
+        // blue/red differently → a consensus split under one block identity.
+        // Requiring the stored order to equal the hashed (sorted) order makes the
+        // parent order part of the block's identity. Strictly-ascending also
+        // re-affirms uniqueness.
+        if !parents.windows(2).all(|w| w[0] < w[1]) {
+            return Err(ConsensusError::BlockValidation(
+                "parents not in canonical ascending order".into(),
+            ));
+        }
+
         // Validate selected_parent is a member of parents (if set).
         // The reorg path walks selected_parent to find fork points,
         // so an invalid selected_parent would cause incorrect chain
@@ -825,7 +922,7 @@ impl BlockValidator {
             if !block.header.parents.contains(sp) {
                 return Err(ConsensusError::BlockValidation(format!(
                     "selected_parent {} is not in parents list",
-                    &sp[..sp.len().min(16)]
+                    crate::domain::types::hash::log_prefix(sp, 16)
                 )));
             }
         }
@@ -1011,7 +1108,10 @@ impl BlockValidator {
         // emission must be split correctly.
         {
             use crate::config::genesis::genesis::{DEV_REWARD_PCT, MINER_REWARD_PCT};
-            let expected_miner_base = (expected_reward * MINER_REWARD_PCT) / 100;
+            // u128 intermediate: avoid overflow on the multiply (consensus check
+            // on attacker-influenced height), matching rewards/reward.rs.
+            let expected_miner_base =
+                ((expected_reward as u128 * MINER_REWARD_PCT as u128) / 100) as u64;
             let expected_dev_base = expected_reward - expected_miner_base;
             // Dev share must be at least the expected amount
             if cb.outputs[1].amount < expected_dev_base {
@@ -1102,7 +1202,7 @@ impl BlockValidator {
                         i
                     ));
                 }
-                if !TxValidator::verify_signatures(tx) {
+                if !TxValidator::verify_signatures_for_network(tx, network) {
                     return BlockValidationResult::fail(&format!(
                         "genesis tx {} signature verification failed",
                         i
@@ -1140,36 +1240,24 @@ impl BlockValidator {
     /// secret hash format is checked, not whether the output actually locks
     /// funds to the correct HTLC address derived from the secret hash and
     /// participants' public keys.
-    fn validate_swap_tx(tx: &Transaction) -> Result<(), ConsensusError> {
-        TxValidator::validate_swap_payload(tx)?;
-        // 1. Must have payload_hash (HTLC secret hash)
-        let _secret_hash = tx.payload_hash.as_ref().ok_or_else(|| {
-            ConsensusError::BlockValidation("SwapTx missing payload_hash (HTLC secret hash)".into())
-        })?;
-        // 3. Must have at least one output (the HTLC lock)
-        if tx.outputs.is_empty() {
-            return Err(ConsensusError::BlockValidation(
-                "SwapTx must have at least one output".into(),
-            ));
-        }
-        // 3b. First output must lock funds to an HTLC address (P2SH prefix "SD1h")
-        if let Some(first_output) = tx.outputs.first() {
-            if !first_output
-                .address
-                .starts_with(crate::domain::address::address::P2SH_PREFIX)
-            {
-                return Err(ConsensusError::BlockValidation(
-                    "SwapTx first output must lock funds to HTLC address (SD1h prefix)".into(),
-                ));
-            }
-        }
-        // 4. Must not be coinbase
-        if tx.is_coinbase {
-            return Err(ConsensusError::BlockValidation(
-                "SwapTx cannot be coinbase".into(),
-            ));
-        }
-        Ok(())
+    fn validate_swap_tx(_tx: &Transaction, _network: &NetworkMode) -> Result<(), ConsensusError> {
+        // DISABLED AT CONSENSUS (security): an atomic-swap (SwapTx) locks its
+        // first output to a P2SH/HTLC address (SD1h/ST1h/SR1h), but the spend-time
+        // ownership check (verify_input_ownership_by_address) only matches standard
+        // Ed25519 addresses — a 44-char SD1h address can never equal a derived
+        // 43-char SD1 address — so HTLC outputs are PERMANENTLY UNSPENDABLE.
+        // Moreover the HTLC engine (engine/swap/atomic_swap.rs) is in-memory only
+        // and never consulted by consensus (no secret-reveal / timeout enforcement).
+        // Accepting a SwapTx would therefore BURN the locked funds with a false
+        // "trustless swap" guarantee. Reject it until a real HTLC redeem/refund
+        // spend path exists, enforced in BOTH apply_block_dag_ordered AND
+        // validate_block_utxos (preimage+recipient-sig before timeout, or
+        // sender-sig after).
+        Err(ConsensusError::BlockValidation(
+            "atomic-swap (SwapTx) is disabled: HTLC outputs are unspendable; \
+             rejected to prevent fund loss until an HTLC spend path is implemented"
+                .into(),
+        ))
     }
 
     /// Validate a DEX order transaction's payload.
@@ -1214,7 +1302,7 @@ mod tests {
     use crate::config::genesis::genesis::TESTNET_DEV_ADDRESS;
     use crate::domain::block::block_body::BlockBody;
     use crate::domain::block::block_header::BlockHeader;
-    use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput};
+    use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
     use crate::domain::transaction::tx_hash::TxHash;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1222,11 +1310,11 @@ mod tests {
     //  Helpers
     // ─────────────────────────────────────────
 
-    fn now_secs() -> u64 {
+    fn now_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs()
+            .as_millis() as u64
     }
 
     /// Build a coinbase transaction with correct 2-output structure
@@ -1243,7 +1331,7 @@ mod tests {
                 TxOutput::new(ConsensusParams::OWNER_REWARD_ADDRESS.into(), dev_reward),
             ],
             0,
-            now_secs(),
+            now_ms(),
         );
         tx.hash = TxHash::hash_for_network(&tx, &NetworkMode::Mainnet);
         tx
@@ -1253,7 +1341,7 @@ mod tests {
     /// Input txid must be 64 hex chars (DagShield requirement).
     /// The TX hash is computed from canonical bytes for structural validity.
     fn make_regular_tx(seed: &str) -> Transaction {
-        let ts = now_secs();
+        let ts = now_ms();
         let mut tx = Transaction::new(
             String::new(), // placeholder
             vec![TxInput::new(
@@ -1291,7 +1379,7 @@ mod tests {
     /// Parents are valid 64-char hex strings and we provide at least 2
     /// (required by SelfishMiningGuard for height > 1).
     fn make_block(height: u64, txs: Vec<Transaction>) -> Block {
-        let ts = now_secs();
+        let ts = now_ms();
         // DagShield requires parents to be exactly 64 hex chars, unique,
         // and at least MIN_DAG_PARENTS (2) for height > 1.
         let parents = if height <= 1 {
@@ -1318,6 +1406,8 @@ mod tests {
                 extra_nonce: 0,
                 receipt_root: None,
                 state_root: None,
+                mix_hash: String::new(),
+                prev_state_commitment: None,
             },
             body: BlockBody { transactions: txs },
         }
@@ -1330,6 +1420,14 @@ mod tests {
         make_block(height, vec![cb, tx])
     }
 
+    fn make_swap_tx_with_prefix(prefix: &str) -> Transaction {
+        let mut tx = make_regular_tx("swap_seed");
+        tx.tx_type = TxType::SwapTx;
+        tx.payload_hash = Some("ab".repeat(32));
+        tx.outputs[0].address = format!("{}{}", prefix, "11".repeat(20));
+        tx
+    }
+
     // ─────────────────────────────────────────
     //  L1 Network Layer
     // ─────────────────────────────────────────
@@ -1338,6 +1436,104 @@ mod tests {
     fn network_layer_valid_block_passes() {
         let block = make_valid_block(5);
         assert!(BlockValidator::validate_network_layer(&block).is_ok());
+    }
+
+    #[test]
+    fn network_layer_rejects_block_over_gas_limit() {
+        // Regression: a peer block whose CONTRACT tx gas_limits sum beyond
+        // MAX_BLOCK_GAS must be rejected (otherwise unbounded contract
+        // execution = CPU DoS). Gas only counts for VM txs (ContractCall).
+        let cb = make_coinbase(5);
+        let mut t1 = make_regular_tx("gas_tx_1");
+        t1.tx_type = TxType::ContractCall;
+        t1.gas_limit = Some(ConsensusParams::MAX_BLOCK_GAS);
+        t1.hash = TxHash::hash_for_network(&t1, &NetworkMode::Mainnet);
+        let mut t2 = make_regular_tx("gas_tx_2");
+        t2.tx_type = TxType::ContractCall;
+        t2.gas_limit = Some(1);
+        t2.hash = TxHash::hash_for_network(&t2, &NetworkMode::Mainnet);
+        let block = make_block(5, vec![cb, t1, t2]);
+        let r = BlockValidator::validate_network_layer(&block);
+        assert!(r.is_err(), "block exceeding MAX_BLOCK_GAS must be rejected");
+        assert!(
+            format!("{:?}", r).to_lowercase().contains("gas"),
+            "rejection reason should mention gas: {:?}",
+            r
+        );
+    }
+
+    #[test]
+    fn network_layer_accepts_block_within_gas_limit() {
+        let cb = make_coinbase(5);
+        let mut t1 = make_regular_tx("gas_ok_1");
+        t1.gas_limit = Some(ConsensusParams::MAX_BLOCK_GAS / 2);
+        t1.hash = TxHash::hash_for_network(&t1, &NetworkMode::Mainnet);
+        let block = make_block(5, vec![cb, t1]);
+        assert!(BlockValidator::validate_network_layer(&block).is_ok());
+    }
+
+    #[test]
+    fn validate_self_consistent_runs_pow_not_ancestry_difficulty() {
+        // W4: the orphan junk-filter runs L1 + PoW but NEVER the ancestry-
+        // dependent difficulty check (it takes no expected_difficulty — it
+        // structurally cannot compute one). A placeholder-hash block fails on
+        // PoW (proving PoW runs), and the failure is never a difficulty-anchor
+        // / difficulty-mismatch error (proving L3 difficulty is NOT run here).
+        let block = make_block(5, vec![make_coinbase(5)]);
+        let r = BlockValidator::validate_self_consistent(&block, &NetworkMode::Mainnet);
+        assert!(r.is_err(), "a non-PoW block must fail self-consistent validation");
+        let msg = format!("{:?}", r).to_lowercase();
+        assert!(
+            !msg.contains("difficulty anchor") && !msg.contains("difficulty mismatch"),
+            "self-consistent validation must not perform the ancestry-difficulty check: {:?}",
+            r
+        );
+    }
+
+    #[test]
+    fn network_layer_charges_none_gas_contract_tx_its_default() {
+        // DoS regression: a hostile miner packs contract txs that declare NO
+        // gas_limit. The executor runs each at DEFAULT_CONTRACT_GAS_LIMIT, so
+        // the block-gas validator MUST charge the same — otherwise None counted
+        // as 0, the block passed the cap, yet execution burned 10M per tx.
+        let per_tx = ConsensusParams::DEFAULT_CONTRACT_GAS_LIMIT;
+        // Enough None-gas contract txs to blow past MAX_BLOCK_GAS at 10M each.
+        let n = (ConsensusParams::MAX_BLOCK_GAS / per_tx) as usize + 2;
+        let mut txs = vec![make_coinbase(5)];
+        for i in 0..n {
+            let mut t = make_regular_tx(&format!("none_gas_{:04x}", i));
+            t.tx_type = TxType::ContractCall;
+            t.gas_limit = None; // <-- the attack: implicit budget
+            t.hash = TxHash::hash_for_network(&t, &NetworkMode::Mainnet);
+            txs.push(t);
+        }
+        let block = make_block(5, txs);
+        let r = BlockValidator::validate_network_layer(&block);
+        assert!(
+            r.is_err(),
+            "None-gas contract txs summing past MAX_BLOCK_GAS must be rejected"
+        );
+        assert!(
+            format!("{:?}", r).to_lowercase().contains("gas"),
+            "rejection reason should mention gas: {:?}",
+            r
+        );
+    }
+
+    #[test]
+    fn network_layer_ignores_gas_on_non_contract_tx() {
+        // A Transfer never runs the VM, so a stray gas_limit must NOT count
+        // against the block gas budget (effective_gas_limit returns 0 for it).
+        let cb = make_coinbase(5);
+        let mut t1 = make_regular_tx("transfer_gas");
+        t1.tx_type = TxType::Transfer;
+        t1.gas_limit = Some(ConsensusParams::MAX_BLOCK_GAS * 4); // absurd, but non-VM
+        t1.hash = TxHash::hash_for_network(&t1, &NetworkMode::Mainnet);
+        let block = make_block(5, vec![cb, t1]);
+        assert!(
+            BlockValidator::validate_network_layer(&block).is_ok(),
+            "gas on a non-contract tx must not count toward MAX_BLOCK_GAS"
+        );
     }
 
     #[test]
@@ -1404,6 +1600,16 @@ mod tests {
         assert!(result.is_err(), "single non-coinbase tx block must fail");
     }
 
+    #[test]
+    fn swap_tx_rejected_to_prevent_burn() {
+        // HTLC atomic swaps have no on-chain spend path; SD1h/ST1h outputs are
+        // unspendable, so SwapTx is rejected at consensus to prevent fund loss.
+        let tx = make_swap_tx_with_prefix("ST1h");
+        assert!(BlockValidator::validate_swap_tx(&tx, &NetworkMode::Testnet).is_err());
+        let tx2 = make_swap_tx_with_prefix("SD1h");
+        assert!(BlockValidator::validate_swap_tx(&tx2, &NetworkMode::Mainnet).is_err());
+    }
+
     // ─────────────────────────────────────────
     //  Parent Validation
     // ─────────────────────────────────────────
@@ -1463,14 +1669,14 @@ mod tests {
     #[test]
     fn timestamp_valid_passes() {
         let block = make_valid_block(5);
-        // Empty ancestors — only R1 and R2 are checked
+        // Empty ancestors — only R1 (future bound) is checked
         assert!(BlockValidator::validate_timestamp(&block, &[]).is_ok());
     }
 
     #[test]
     fn timestamp_too_far_in_future_fails() {
         let mut block = make_valid_block(5);
-        block.header.timestamp = now_secs() + MAX_FUTURE_SECS + 60;
+        block.header.timestamp = now_ms() + MAX_FUTURE_MS + 60_000;
 
         let result = BlockValidator::validate_timestamp(&block, &[]);
         assert!(result.is_err());
@@ -1478,21 +1684,22 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_too_far_in_past_fails() {
+    fn timestamp_old_wall_clock_allowed_for_sync() {
+        // Historical blocks (old wall-clock ts, no ancestry context) MUST pass —
+        // otherwise a lagging node can never sync the backlog. There is no
+        // wall-clock past bound; anti-timewarp is enforced via MTP/causality
+        // against ancestry (see timestamp_before_mtp_fails).
         let mut block = make_valid_block(5);
-        block.header.timestamp = now_secs().saturating_sub(MAX_PAST_BLOCK_SECS + 60);
-
-        let result = BlockValidator::validate_timestamp(&block, &[]);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("behind wall clock"));
+        block.header.timestamp = now_ms().saturating_sub(MAX_PAST_BLOCK_MS + 3_600_000);
+        assert!(
+            BlockValidator::validate_timestamp(&block, &[]).is_ok(),
+            "an old historical block must validate during sync"
+        );
     }
 
     #[test]
     fn timestamp_before_mtp_fails() {
-        let now = now_secs();
+        let now = now_ms();
         let mut block = make_valid_block(5);
         // Set ancestors all at current time — MTP will be ~now
         let ancestors: Vec<u64> = vec![now; 5];
@@ -1500,24 +1707,65 @@ mod tests {
         block.header.timestamp = now - 1;
 
         let result = BlockValidator::validate_timestamp(&block, &ancestors);
-        // Will fail either on R2 (past wall clock) or R3 (MTP) or R4 (causality)
+        // Anti-timewarp still holds via ancestry: R3 (MTP) / R4 (causality).
         assert!(result.is_err());
     }
 
     #[test]
     fn timestamp_large_jump_from_parent_fails() {
-        let now = now_secs();
+        let now = now_ms();
         let mut block = make_valid_block(5);
         // Parent timestamps from ~10 minutes ago — within R2 wall clock limit
-        let parent_ts = now - MAX_TIMESTAMP_JUMP_SECS - 100;
+        let parent_ts = now - MAX_TIMESTAMP_JUMP_MS - 100;
         let ancestors = vec![parent_ts; 3];
-        // Block timestamp = now, which is MAX_TIMESTAMP_JUMP_SECS + 100 after parent
+        // Block timestamp = now, which is MAX_TIMESTAMP_JUMP_MS + 100 ms after parent
         // This exceeds the R5 jump limit
         block.header.timestamp = now;
 
         let result = BlockValidator::validate_timestamp(&block, &ancestors);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("jump"));
+    }
+
+    #[test]
+    fn ms_future_boundary_r1() {
+        // R1 in MILLISECONDS: a block at the edge (now + MAX_FUTURE_MS) is
+        // accepted; one clearly beyond the window is rejected. Guards against a
+        // half-migrated gate that reads wall-clock seconds while ts is ms (which
+        // would make every ms block look ~1000x in the future).
+        let mut ok = make_valid_block(5);
+        ok.header.timestamp = now_ms() + MAX_FUTURE_MS;
+        assert!(
+            BlockValidator::validate_timestamp(&ok, &[]).is_ok(),
+            "a block at the future edge must be accepted"
+        );
+        let mut bad = make_valid_block(5);
+        bad.header.timestamp = now_ms() + MAX_FUTURE_MS + 5_000; // 5 s beyond
+        assert!(
+            BlockValidator::validate_timestamp(&bad, &[]).is_err(),
+            "a block past the future window must be rejected"
+        );
+    }
+
+    #[test]
+    fn ms_monotonic_r4_one_ms_progress() {
+        // R4 stays strict `>` — in ms that is >= 1 ms progress, so the selected
+        // chain can advance up to ~1000 blocks/sec (well above 10 BPS). A child
+        // one ms after its parents is valid; equal timestamps are rejected.
+        let parent_ts = 1_700_000_000_000u64; // ms, in the recent past
+        let ancestors = vec![parent_ts; 3];
+        let mut ok = make_valid_block(5);
+        ok.header.timestamp = parent_ts + 1; // +1 ms
+        assert!(
+            BlockValidator::validate_timestamp(&ok, &ancestors).is_ok(),
+            "a block 1 ms after its parents must be accepted"
+        );
+        let mut bad = make_valid_block(5);
+        bad.header.timestamp = parent_ts; // no progress
+        assert!(
+            BlockValidator::validate_timestamp(&bad, &ancestors).is_err(),
+            "a block at the parent timestamp must be rejected (R4)"
+        );
     }
 
     // ─────────────────────────────────────────
@@ -1543,9 +1791,29 @@ mod tests {
         // so we can test merkle root + parent + timestamp validation cleanly.
         let cb = make_coinbase(5);
         let block = make_block(5, vec![cb]);
-        // With empty ancestors, timestamp validation only checks R1+R2
+        // With empty ancestors, timestamp validation only checks R1 (future).
         assert!(
             BlockValidator::validate_structural_layer(&block, &[], &NetworkMode::Mainnet,).is_ok()
+        );
+    }
+
+    #[test]
+    fn structural_layer_rejects_tx_timestamped_after_block() {
+        // Header-relative per-tx timestamp rule: a non-coinbase tx timestamped
+        // far after the block header must be rejected on the block path (mirrors
+        // the mempool future-timestamp rule, IBD-safe).
+        let cb = make_coinbase(5);
+        let mut tx = make_regular_tx("future_ts");
+        // Build a block first so we know the header timestamp, then push tx 1 day ahead.
+        let mut block = make_block(5, vec![cb.clone(), tx.clone()]);
+        tx.timestamp = block.header.timestamp + 86_400_000; // 1 day (ms) after the block
+        tx.hash = TxHash::hash_for_network(&tx, &NetworkMode::Mainnet);
+        block.body.transactions = vec![cb, tx];
+        block.header.merkle_root =
+            MerkleTree::build(&block.body.transactions, block.header.height, &block.header.parents);
+        assert!(
+            BlockValidator::validate_structural_layer(&block, &[], &NetworkMode::Mainnet).is_err(),
+            "a tx timestamped after the block header must be rejected"
         );
     }
 
@@ -1610,7 +1878,7 @@ mod tests {
             "cb_one_output".into(),
             vec![TxOutput::new("miner".into(), reward)],
             0,
-            now_secs(),
+            now_ms(),
         );
         let tx = make_regular_tx("tx_1");
         let block = make_block(5, vec![cb, tx]);
@@ -1633,7 +1901,7 @@ mod tests {
                 TxOutput::new(ConsensusParams::OWNER_REWARD_ADDRESS.into(), 1),
             ],
             0,
-            now_secs(),
+            now_ms(),
         );
         let tx = make_regular_tx("tx_1");
         let block = make_block(5, vec![cb, tx]);
@@ -1656,7 +1924,7 @@ mod tests {
                 TxOutput::new("wrong_dev_address".into(), dev_reward),
             ],
             0,
-            now_secs(),
+            now_ms(),
         );
         let tx = make_regular_tx("tx_1");
         let block = make_block(5, vec![cb, tx]);
@@ -1682,7 +1950,7 @@ mod tests {
                 TxOutput::new(ConsensusParams::OWNER_REWARD_ADDRESS.into(), dev_reward),
             ],
             10, // nonzero fee
-            now_secs(),
+            now_ms(),
         );
         let tx = make_regular_tx("tx_1");
         let block = make_block(5, vec![cb, tx]);
@@ -1742,7 +2010,7 @@ mod tests {
             )],
             vec![TxOutput::new("a".into(), 50)],
             1,
-            now_secs(),
+            now_ms(),
         );
         let tx2 = Transaction::new(
             "tx_ds_2".into(),
@@ -1755,7 +2023,7 @@ mod tests {
             )],
             vec![TxOutput::new("b".into(), 50)],
             1,
-            now_secs(),
+            now_ms(),
         );
         let block = make_block(5, vec![cb, tx1, tx2]);
 
@@ -1775,18 +2043,13 @@ mod tests {
     }
 
     #[test]
-    fn consensus_difficulty_testnet_allows_small_drift_only() {
+    fn consensus_difficulty_testnet_requires_exact() {
         let mut near = make_valid_block(1);
         // make_coinbase() uses mainnet owner address by default.
         near.body.transactions[0].outputs[1].address = TESTNET_DEV_ADDRESS.to_string();
-        near.header.difficulty = 1_099; // within +10%
+        near.header.difficulty = 1_099;
         let ok = BlockValidator::validate_consensus_layer(&near, Some(1_000), &NetworkMode::Testnet);
-        assert!(ok.is_ok(), "testnet should allow <=10% drift");
-
-        let mut far = near.clone();
-        far.header.difficulty = 1_111; // beyond +10%
-        let bad = BlockValidator::validate_consensus_layer(&far, Some(1_000), &NetworkMode::Testnet);
-        assert!(bad.is_err(), "testnet must reject >10% drift");
+        assert!(ok.is_err(), "testnet must reject non-exact difficulty");
     }
 
     #[test]
@@ -1815,7 +2078,7 @@ mod tests {
                 hash: "11".repeat(32), // wrong genesis hash
                 parents,
                 merkle_root: merkle,
-                timestamp: now_secs(),
+                timestamp: now_ms(),
                 nonce: 0,
                 difficulty: 1,
                 height: 0,
@@ -1825,6 +2088,8 @@ mod tests {
                 extra_nonce: 0,
                 receipt_root: None,
                 state_root: None,
+                mix_hash: String::new(),
+                prev_state_commitment: None,
             },
             body: BlockBody {
                 transactions: vec![cb],

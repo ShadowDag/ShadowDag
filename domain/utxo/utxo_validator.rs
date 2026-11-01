@@ -4,17 +4,51 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::domain::block::block::Block;
+use crate::config::node::node_config::NetworkMode;
 use crate::domain::transaction::transaction::Transaction;
 use crate::domain::transaction::tx_hash::TxHash;
 use crate::domain::transaction::tx_validator::TxValidator;
 use crate::domain::utxo::utxo_key::UtxoKey;
-use crate::domain::utxo::utxo_set::{utxo_key, UtxoSet, COINBASE_MATURITY};
+use crate::domain::utxo::utxo_set::{utxo_key, UtxoSet};
 use crate::errors::StorageError;
 use std::collections::{HashMap, HashSet};
+
+/// Best-effort network inference from a block's output address prefixes
+/// (ST1*=Testnet, SR1*=Regtest, else Mainnet). Used only to pick the chain_id
+/// for the confidential signing message. Proper threading of the node's network
+/// is audit follow-up H-net.
+fn infer_block_network(block: &Block) -> NetworkMode {
+    for tx in &block.body.transactions {
+        for o in &tx.outputs {
+            if o.address.starts_with("ST1") {
+                return NetworkMode::Testnet;
+            }
+            if o.address.starts_with("SR1") {
+                return NetworkMode::Regtest;
+            }
+            if o.address.starts_with("SD1") {
+                return NetworkMode::Mainnet;
+            }
+        }
+    }
+    NetworkMode::Mainnet
+}
 
 pub struct UtxoValidator;
 
 impl UtxoValidator {
+    #[inline]
+    fn network_from_owner_address(owner_address: &str) -> NetworkMode {
+        if owner_address.starts_with("ST1") {
+            NetworkMode::Testnet
+        } else if owner_address.starts_with("SR1") {
+            NetworkMode::Regtest
+        } else {
+            // Keep backward compatibility for legacy/plain owners used in tests.
+            NetworkMode::Mainnet
+        }
+    }
+
     pub fn validate(tx: &Transaction, utxo_set: &UtxoSet) -> bool {
         // Non-coinbase tx MUST have inputs. Empty inputs = reject.
         // Coinbase tx are validated separately (they have no inputs by design).
@@ -111,6 +145,11 @@ impl UtxoValidator {
         let mut staged_outputs: HashMap<UtxoKey, (String, u64, bool)> =
             HashMap::with_capacity(transactions.len() * 2);
 
+        // RingCT: network for the confidential signing message + block-wide
+        // key-image set for intra-block double-spend detection.
+        let conf_network = infer_block_network(block);
+        let mut seen_key_images: HashSet<String> = HashSet::new();
+
         for tx in transactions {
             // Empty outputs check (applies to all tx including coinbase)
             if tx.outputs.is_empty() {
@@ -145,6 +184,45 @@ impl UtxoValidator {
                 continue;
             }
 
+            // RingCT confidential tx: verified entirely by the confidential gate
+            // (CLSAG + ring authenticity + key images + range + homomorphic
+            // balance). Confidential inputs do NOT spend transparent UTXOs and
+            // confidential outputs are NOT staged into the transparent map.
+            if tx.is_confidential() {
+                crate::engine::privacy::ringct::confidential_consensus::verify_confidential_tx(
+                    tx,
+                    utxo_set,
+                    &conf_network,
+                    &mut seen_key_images,
+                )?;
+                continue;
+            }
+            // Shield (transparent -> confidential): verified by the shield gate.
+            // Its transparent inputs ARE spent (in apply), but the crypto/balance
+            // is checked here via the shared gate, same as mempool + reorg.
+            if tx.is_shield() {
+                crate::engine::privacy::ringct::confidential_consensus::verify_shield_tx(
+                    tx,
+                    utxo_set,
+                    &conf_network,
+                )?;
+                // A shield tx SPENDS its transparent inputs (in apply). Reserve
+                // them in the block-wide will_spend set so the same transparent
+                // outpoint cannot be consumed by another tx in the same block —
+                // matching the transparent loop and the authoritative apply-path
+                // staged_spent skip (keeps validate and apply in agreement).
+                for input in &tx.inputs {
+                    let key = utxo_key(&input.txid, input.index)?;
+                    if !will_spend.insert(key) {
+                        return Err(StorageError::Other(format!(
+                            "validate_block_utxos: double-spend within block: {} (shield tx {})",
+                            key, tx.hash
+                        )));
+                    }
+                }
+                continue;
+            }
+
             // Non-coinbase must have inputs
             if tx.inputs.is_empty() {
                 return Err(StorageError::Other(format!(
@@ -156,6 +234,8 @@ impl UtxoValidator {
             // Duplicate inputs within same tx + UTXO checks
             let mut seen_in_tx: HashSet<UtxoKey> = HashSet::with_capacity(tx.inputs.len());
             let mut input_sum: u64 = 0;
+            let mut tx_network: Option<NetworkMode> = None;
+            let mut signing_msg: Option<Vec<u8>> = None;
 
             for input in &tx.inputs {
                 let key = utxo_key(&input.txid, input.index)?;
@@ -192,10 +272,11 @@ impl UtxoValidator {
                     // Coinbase maturity check (base UTXO set only)
                     if let Some(created_height) = utxo_set.coinbase_created_height(&key) {
                         let confirmations = block_height.saturating_sub(created_height);
-                        if confirmations < COINBASE_MATURITY {
+                        let maturity = utxo_set.coinbase_maturity();
+                        if confirmations < maturity {
                             return Err(StorageError::Other(format!(
                                     "validate_block_utxos: coinbase utxo {} immature: {} confirmations < required {} (tx {})",
-                                    key, confirmations, COINBASE_MATURITY, tx.hash
+                                    key, confirmations, maturity, tx.hash
                                 )));
                         }
                     }
@@ -219,9 +300,28 @@ impl UtxoValidator {
                         )));
                 };
 
-                // Verify signature matches UTXO owner
-                let signing_msg = TxHash::signing_message(tx);
-                if !TxValidator::verify_input_ownership_by_address(input, &owner, &signing_msg) {
+                // Determine tx network from input owners and enforce consistency
+                // across all inputs in the same transaction.
+                let input_network = Self::network_from_owner_address(&owner);
+                match tx_network {
+                    None => {
+                        tx_network = Some(input_network.clone());
+                        signing_msg = Some(TxHash::signing_message_for_network(tx, &input_network));
+                    }
+                    Some(ref net) if *net != input_network => {
+                        return Err(StorageError::Other(format!(
+                            "validate_block_utxos: mixed input networks in tx {}",
+                            tx.hash
+                        )));
+                    }
+                    _ => {}
+                }
+
+                // Verify signature matches UTXO owner.
+                let msg = signing_msg
+                    .as_ref()
+                    .ok_or_else(|| StorageError::Other("missing signing message".into()))?;
+                if !TxValidator::verify_input_ownership_by_address(input, &owner, msg) {
                     return Err(StorageError::Other(format!(
                         "validate_block_utxos: input {} signature does not match UTXO owner (tx {})",
                         key, tx.hash

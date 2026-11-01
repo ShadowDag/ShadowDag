@@ -27,6 +27,9 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+const MAX_RPC_RESPONSE_BYTES: usize = 8 * 1024 * 1024; // 8 MiB hard cap
+const MAX_RPC_HEADER_LINES: usize = 100;
+
 fn main() {
     shadowdag::telemetry::logging::structured::init();
     let args: Vec<String> = std::env::args().collect();
@@ -211,48 +214,63 @@ fn rpc_submit_tx(
     // Read HTTP response: skip headers until empty line, then read body by Content-Length
     let mut reader = BufReader::new(&stream);
     let mut content_length: usize = 0;
+    let mut content_length_seen = false;
+    let mut unsupported_transfer_encoding = false;
 
+    let mut header_lines = 0usize;
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
             Ok(0) => break,
             Ok(_) => {
+                header_lines += 1;
+                if header_lines > MAX_RPC_HEADER_LINES {
+                    return Err(NetworkError::Other(format!(
+                        "too many response headers (>{})",
+                        MAX_RPC_HEADER_LINES
+                    )));
+                }
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     break;
                 }
-                if trimmed.len() > 15 && trimmed[..15].eq_ignore_ascii_case("content-length:") {
-                    let cl_str = trimmed[15..].trim();
-                    content_length = match cl_str.parse() {
-                        Ok(n) => n,
-                        Err(_) => {
-                            eprintln!("[loadtest] Warning: invalid Content-Length '{}', reading up to 65536", cl_str);
-                            65536
+                if let Some((name, value)) = trimmed.split_once(':') {
+                    if name.trim().eq_ignore_ascii_case("content-length") {
+                        if content_length_seen {
+                            return Err(NetworkError::Other(
+                                "duplicate Content-Length in response".into(),
+                            ));
                         }
-                    };
+                        content_length_seen = true;
+                        let cl_str = value.trim();
+                        content_length = cl_str.parse().map_err(|_| {
+                            NetworkError::Other("malformed Content-Length in response".into())
+                        })?;
+                    } else if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+                        unsupported_transfer_encoding = true;
+                    }
                 }
             }
             Err(e) => return Err(NetworkError::Other(format!("read header: {}", e))),
         }
     }
+    if unsupported_transfer_encoding || !content_length_seen {
+        return Err(NetworkError::Other(
+            "unsupported response framing (need Content-Length, no Transfer-Encoding)".into(),
+        ));
+    }
 
-    let response = if content_length > 0 {
-        let mut buf = vec![0u8; content_length];
-        std::io::Read::read_exact(&mut reader, &mut buf)
-            .map_err(|e| NetworkError::Other(format!("read body: {}", e)))?;
-        String::from_utf8(buf).map_err(|e| NetworkError::Other(format!("utf8: {}", e)))?
-    } else {
-        let mut buf = vec![0u8; 65536];
-        let n = match std::io::Read::read(&mut reader, &mut buf) {
-            Ok(n) => n,
-            Err(e) => {
-                slog_warn!("loadtest", "response_read_failed", error => e);
-                return Err(NetworkError::Other(format!("read failed: {}", e)));
-            }
-        };
-        String::from_utf8(buf[..n].to_vec())
-            .map_err(|e| NetworkError::Other(format!("utf8: {}", e)))?
-    };
+    if content_length > MAX_RPC_RESPONSE_BYTES {
+        return Err(NetworkError::Other(format!(
+            "response too large: {} > {}",
+            content_length, MAX_RPC_RESPONSE_BYTES
+        )));
+    }
+    let mut buf = vec![0u8; content_length];
+    std::io::Read::read_exact(&mut reader, &mut buf)
+        .map_err(|e| NetworkError::Other(format!("read body: {}", e)))?;
+    let response =
+        String::from_utf8(buf).map_err(|e| NetworkError::Other(format!("utf8: {}", e)))?;
 
     if response.contains("\"error\"") && !response.contains("\"error\":null") {
         return Err(NetworkError::Other(format!(
@@ -294,6 +312,10 @@ fn generate_test_tx_invalid(from: &str, to: &str, seq: u64) -> Transaction {
             pub_key: "loadtest_pk".to_string(),
             key_image: None,
             ring_members: None,
+            ring_signature: None,
+            ring_commitments: None,
+            pseudo_commitment: None,
+            shield_blinding: None,
         }],
         outputs: vec![TxOutput {
             address: to.to_string(),
@@ -301,6 +323,8 @@ fn generate_test_tx_invalid(from: &str, to: &str, seq: u64) -> Transaction {
             commitment: None,
             range_proof: None,
             ephemeral_pubkey: None,
+            one_time_pubkey: None,
+            encrypted_amount: None,
         }],
         fee: 1,
         timestamp: ts,
@@ -339,6 +363,10 @@ fn generate_valid_transfer_tx(n: u64, from_addr: &str, to_addr: &str) -> Transac
             pub_key: hex::encode(vec![0u8; 32]),   // placeholder 32-byte pubkey
             key_image: None,
             ring_members: None,
+            ring_signature: None,
+            ring_commitments: None,
+            pseudo_commitment: None,
+            shield_blinding: None,
         }],
         outputs: vec![TxOutput {
             address: to_addr.to_string(),
@@ -346,6 +374,8 @@ fn generate_valid_transfer_tx(n: u64, from_addr: &str, to_addr: &str) -> Transac
             commitment: None,
             range_proof: None,
             ephemeral_pubkey: None,
+            one_time_pubkey: None,
+            encrypted_amount: None,
         }],
         fee: 100,
         timestamp: ts,

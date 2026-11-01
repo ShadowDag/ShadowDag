@@ -216,6 +216,8 @@ fn install_ctrlc_handler() {
                     ) -> i32;
                 }
 
+                // SAFETY: `handler` uses the required ABI/signature for
+                // `SetConsoleCtrlHandler`; `add=1` only registers it.
                 unsafe {
                     let ok = SetConsoleCtrlHandler(handler, 1);
                     if ok == 0 {

@@ -79,7 +79,7 @@ impl TxRelay {
 
         log::debug!(
             "[TxRelay] Queued tx {} for broadcast",
-            &tx.hash[..tx.hash.len().min(8)]
+            crate::domain::types::hash::log_prefix(&tx.hash, 8)
         );
     }
 

@@ -151,9 +151,15 @@ impl GhostDag {
         // For persistence, we store the diff. For computation, we use it directly.
         let blue_set = blue_set_diff.clone();
 
-        let blue_score = self.get_blue_score(&selected_parent) + merge_blues.len() as u64 + 1;
+        // saturating_add: a corrupt/forged stored score near u64::MAX must not
+        // wrap to a small value (which would break the monotonic-blue-score
+        // invariant that fork choice / reorg rely on) nor panic in debug.
+        let blue_score = self
+            .get_blue_score(&selected_parent)
+            .saturating_add(merge_blues.len() as u64)
+            .saturating_add(1);
 
-        let chain_height = self.get_chain_height(&selected_parent) + 1;
+        let chain_height = self.get_chain_height(&selected_parent).saturating_add(1);
 
         let order_index = self.next_order_index();
 
@@ -188,6 +194,95 @@ impl GhostDag {
             merge_set_blues: merge_blues,
             merge_set_reds: merge_reds,
         })
+    }
+
+    /// Remove a CHILDLESS, non-genesis block from GHOSTDAG, exactly reversing the
+    /// structural effects of `add_block` for that block: deletes the block's own
+    /// per-block keys, removes it from each parent's children list, and restores
+    /// the tips set (drop this block; re-add each parent that becomes a leaf
+    /// again). All writes land in ONE atomic WriteBatch.
+    ///
+    /// It deliberately does NOT touch the global PFX_BLUE/PFX_RED byte-markers of
+    /// OTHER blocks (this block's merge set): the consensus blue-set
+    /// reconstruction (`reconstruct_full_blue_set`) unions per-block PFX_BLUE_SET
+    /// DIFFS along the selected-parent chain and never reads those markers, so
+    /// leaving them is safe — clearing them could wrongly flip a surviving block's
+    /// color. A childless block is on no surviving block's selected-parent chain,
+    /// so its own diff is never read either.
+    ///
+    /// REFUSES (returns Err, writes nothing) if the block is genesis/parentless or
+    /// still has children: removing a block with descendants would leave dangling
+    /// parent references and corrupt their already-persisted blue_set/mergeset.
+    /// The atomic-acceptance callers (full_node) only remove a just-added tip
+    /// whose UTXO recompute failed — childless by construction.
+    pub fn remove_block(&self, hash: &str) -> Result<(), DagError> {
+        let parents = self.get_parents(hash);
+        if parents.is_empty() {
+            return Err(DagError::InvalidParent(format!(
+                "refusing to remove genesis/parentless block {}",
+                hash
+            )));
+        }
+        let own_children = self.get_children_inner(hash);
+        if !own_children.is_empty() {
+            return Err(DagError::Other(format!(
+                "refusing to remove block {} with {} child(ren) — not a leaf",
+                hash,
+                own_children.len()
+            )));
+        }
+
+        let mut batch = WriteBatch::default();
+
+        // 1. Delete the removed block's own per-block keys.
+        for pfx in [
+            PFX_BLOCK,
+            PFX_PARENTS,
+            PFX_CHILDREN,
+            PFX_BLUE_SCORE,
+            PFX_BLUE_SET,
+            PFX_CHAIN_HEIGHT,
+            PFX_SEL_PARENT,
+            PFX_ORDER,
+            PFX_BLUE,
+            PFX_RED,
+        ] {
+            batch.delete(format!("{}{}", pfx, hash));
+        }
+
+        // 2. Remove `hash` from each parent's children list; a parent left with no
+        //    children becomes a tip again.
+        let mut tips = self.get_tips_inner();
+        tips.remove(hash);
+        for p in &parents {
+            let remaining: Vec<String> = self
+                .get_children_inner(p)
+                .into_iter()
+                .filter(|c| c != hash)
+                .collect();
+            if remaining.is_empty() {
+                batch.delete(format!("{}{}", PFX_CHILDREN, p));
+                tips.insert(p.clone());
+            } else {
+                let data = bincode::serialize(&remaining)
+                    .map_err(|e| DagError::Storage(StorageError::Serialization(e.to_string())))?;
+                batch.put(format!("{}{}", PFX_CHILDREN, p), &data);
+            }
+        }
+
+        // 3. Persist the updated tips set in the same atomic batch.
+        let tips_vec: Vec<String> = tips.into_iter().collect();
+        let tips_data = bincode::serialize(&tips_vec)
+            .map_err(|e| DagError::Storage(StorageError::Serialization(e.to_string())))?;
+        batch.put(PFX_TIPS, &tips_data);
+
+        self.db
+            .write(batch)
+            .map_err(|e| DagError::Storage(StorageError::WriteFailed(e.to_string())))?;
+
+        // Anticone results computed in the removed block's context are now stale.
+        self.anticone_cache.clear();
+        Ok(())
     }
 
     pub fn select_parent(&self, parents: &[String]) -> String {
@@ -444,7 +539,9 @@ impl GhostDag {
         match self.db.get(format!("{}{}", PFX_BLUE_SCORE, hash)) {
             Ok(Some(d)) => {
                 if d.len() >= 8 {
-                    u64::from_le_bytes(d[..8].try_into().unwrap())
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&d[..8]);
+                    u64::from_le_bytes(bytes)
                 } else {
                     slog_error!("ghostdag", "blue_score_corrupt_length",
                         hash => hash, len => d.len());
@@ -464,7 +561,9 @@ impl GhostDag {
         match self.db.get(format!("{}{}", PFX_CHAIN_HEIGHT, hash)) {
             Ok(Some(d)) => {
                 if d.len() >= 8 {
-                    u64::from_le_bytes(d[..8].try_into().unwrap())
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&d[..8]);
+                    u64::from_le_bytes(bytes)
                 } else {
                     slog_error!("ghostdag", "chain_height_corrupt_length",
                         hash => hash, len => d.len());
@@ -827,6 +926,85 @@ mod tests {
         let dag = make_ghostdag("bs_unknown");
         assert_eq!(dag.get_blue_score("does_not_exist"), 0);
         assert_eq!(dag.get_blue_score(""), 0);
+    }
+
+    #[test]
+    fn select_parent_picks_max_blue_not_first_parent() {
+        // The canonical GHOSTDAG selected parent is argmax(blue_score), NOT
+        // parents[0]. save_block_normalized (full_node) relies on this to store
+        // the header's selected parent so every fork-choice/reorg/recovery walk
+        // follows the true blue chain on a multi-parent block.
+        let dag = make_ghostdag("select_parent_blue");
+        dag.store_blue_score("p_low", 5);
+        dag.store_blue_score("p_high", 9);
+        // parents[0] = p_low (lower score) — the WRONG choice for a naive
+        // parents[0] rule; select_parent must return the higher-scored p_high.
+        let parents = vec!["p_low".to_string(), "p_high".to_string()];
+        assert_eq!(dag.select_parent(&parents), "p_high");
+        // Order-independent: same result if the high-score parent is first.
+        let parents_rev = vec!["p_high".to_string(), "p_low".to_string()];
+        assert_eq!(dag.select_parent(&parents_rev), "p_high");
+    }
+
+    #[test]
+    fn remove_block_restores_tips_and_refuses_unsafe() {
+        // M3: remove_block must exactly reverse add_block for a CHILDLESS,
+        // non-genesis leaf (restore parent as tip, clear the block's own keys) and
+        // REFUSE genesis or a block that still has children (which would corrupt
+        // descendants).
+        let dag = make_ghostdag("remove_block");
+        dag.add_block(genesis_block()).unwrap();
+        dag.add_block(DagBlock {
+            hash: "b1".into(),
+            parents: vec!["genesis".into()],
+            height: 1,
+            timestamp: 1,
+        })
+        .unwrap();
+        dag.add_block(DagBlock {
+            hash: "b2".into(),
+            parents: vec!["b1".into()],
+            height: 2,
+            timestamp: 2,
+        })
+        .unwrap();
+
+        // b2 is the sole tip; b1 has child b2; b2 carries real ghostdag data.
+        assert_eq!(dag.get_tips(), vec!["b2".to_string()]);
+        assert!(dag.get_blue_score("b2") > 0);
+
+        // REFUSALS (no writes): genesis (parentless) and b1 (has child b2).
+        assert!(dag.remove_block("genesis").is_err(), "must refuse genesis/parentless");
+        assert!(dag.remove_block("b1").is_err(), "must refuse a non-leaf");
+        assert_eq!(dag.get_tips(), vec!["b2".to_string()], "refusals wrote nothing");
+
+        // Remove the childless tip b2.
+        dag.remove_block("b2").expect("remove childless tip");
+        assert_eq!(dag.get_tips(), vec!["b1".to_string()], "b1 becomes the tip again");
+        assert!(dag.get_parents("b2").is_empty(), "b2 parents key cleared");
+        assert_eq!(dag.get_blue_score("b2"), 0, "b2 blue_score cleared");
+        assert!(dag.get_selected_parent("b2").is_none(), "b2 selected_parent cleared");
+        assert!(dag.get_children_inner("b1").is_empty(), "b1 no longer lists b2");
+        // b1 (a surviving block) is intact.
+        assert!(dag.get_blue_score("b1") > 0, "b1 blue_score intact");
+        assert_eq!(dag.get_parents("b1"), vec!["genesis".to_string()], "b1 parents intact");
+
+        // b1 is now a childless leaf -> removable; genesis returns as the tip.
+        dag.remove_block("b1").expect("remove b1 now that it is a leaf");
+        assert_eq!(dag.get_tips(), vec!["genesis".to_string()], "genesis becomes the tip");
+        assert!(dag.get_children_inner("genesis").is_empty());
+    }
+
+    #[test]
+    fn select_parent_tie_breaks_deterministically_by_hash() {
+        // Equal blue score + height → deterministic tie-break (max hash), so
+        // every node computes the SAME selected parent (no split).
+        let dag = make_ghostdag("select_parent_tie");
+        dag.store_blue_score("aaaa", 7);
+        dag.store_blue_score("bbbb", 7);
+        let a = dag.select_parent(&["aaaa".to_string(), "bbbb".to_string()]);
+        let b = dag.select_parent(&["bbbb".to_string(), "aaaa".to_string()]);
+        assert_eq!(a, b, "tie-break must be order-independent");
     }
 
     // ── Multiple blocks can have scores stored and retrieved ──────────

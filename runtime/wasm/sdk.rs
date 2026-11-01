@@ -21,7 +21,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::errors::VmError;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
@@ -170,7 +170,8 @@ pub fn verify_signature(public_key_hex: &str, message: &[u8], signature_hex: &st
         Err(_) => return false,
     };
     let sig = Signature::from_bytes(&sig_arr);
-    vk.verify(message, &sig).is_ok()
+    // verify_strict rejects malleable/non-canonical signatures (B5-M02).
+    vk.verify_strict(message, &sig).is_ok()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

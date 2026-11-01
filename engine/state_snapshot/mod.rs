@@ -4,7 +4,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::errors::StorageError;
-use rocksdb::{IteratorMode, Options, WriteBatch, DB};
+use rocksdb::{IteratorMode, Options, WriteBatch, WriteOptions, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -350,32 +350,34 @@ impl SnapshotManager {
             )));
         }
 
-        // Clear existing UTXO state before applying snapshot.
-        // This prevents stale UTXOs from persisting after snapshot restore.
-        {
-            let mut clear_batch = WriteBatch::default();
-            let iter = db.iterator(IteratorMode::Start);
-            for (k, _) in iter.flatten() {
-                // UTXO entries use 36-byte binary keys (UtxoKey format)
-                if k.len() == 36 {
-                    clear_batch.delete(&k);
-                }
+        // Clear existing UTXO state AND apply the snapshot in a SINGLE atomic,
+        // synced WriteBatch. Doing the clear and the restore as two separate
+        // db.write() calls (the previous behavior) left a window where a crash
+        // between them produced a zero-UTXO set — and snapshot restore is exactly
+        // when there is no other source of truth to rebuild from.
+        let mut batch = WriteBatch::default();
+
+        // 1. Delete existing UTXO entries (36-byte binary UtxoKey format).
+        let iter = db.iterator(IteratorMode::Start);
+        for (k, _) in iter.flatten() {
+            if k.len() == 36 {
+                batch.delete(&k);
             }
-            db.write(clear_batch)
-                .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         }
 
-        let mut batch = WriteBatch::default();
+        // 2. Restore snapshot entries with the canonical binary UtxoKey (36 bytes)
+        //    — matches apply_block_dag_ordered and all other UTXO operations.
         for entry in &all_entries {
-            // Use canonical binary UtxoKey (36 bytes) — matches the format used by
-            // apply_block_dag_ordered and all other UTXO operations. Previously used
-            // "utxo:txid:index" string which would be invisible to the UTXO layer.
             let key = crate::domain::utxo::utxo_set::utxo_key(&entry.txid, entry.index)?;
             let data = bincode::serialize(entry)
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
             batch.put(key.as_ref(), &data);
         }
-        db.write(batch)
+
+        // Durable: fsync so a crash right after restore cannot lose the set.
+        let mut wopts = WriteOptions::default();
+        wopts.set_sync(true);
+        db.write_opt(batch, &wopts)
             .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
 
         Ok(meta)

@@ -30,6 +30,7 @@ fn bench_shadowhash(c: &mut Criterion) {
                 black_box(4),
                 black_box("merkle_root_hash"),
                 black_box(&[]),
+            black_box(None),
             )
         })
     });

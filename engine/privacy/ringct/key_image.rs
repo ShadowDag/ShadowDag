@@ -42,6 +42,17 @@ impl KeyImageStore {
     /// Maximum key images in memory cache (rest are in RocksDB)
     const MAX_CACHE: usize = 500_000;
 
+    #[inline]
+    fn decode_key_image_key(bytes: &[u8]) -> Option<String> {
+        let s = std::str::from_utf8(bytes).ok()?;
+        let ki = s.strip_prefix("ki:")?;
+        // Key images are fixed 32-byte hashes encoded as 64 hex chars.
+        if ki.len() != 64 || !ki.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(ki.to_ascii_lowercase())
+    }
+
     /// Create with RocksDB persistence
     pub fn with_db(path: &str) -> Self {
         let mut opts = rocksdb::Options::default();
@@ -56,11 +67,17 @@ impl KeyImageStore {
                     break;
                 } // Cap cache loading
                 if let Ok((k, _)) = item {
-                    let k_str = String::from_utf8_lossy(&k);
-                    if !k_str.starts_with("ki:") {
+                    let Some(decoded) = Self::decode_key_image_key(k.as_ref()) else {
+                        // Prefix iterator may still yield malformed/corrupt keys; skip safely.
+                        if !k.starts_with(b"ki:") {
+                            break;
+                        }
+                        continue;
+                    };
+                    if !k.starts_with(b"ki:") {
                         break;
                     }
-                    cache.insert(k_str[3..].to_string());
+                    cache.insert(decoded);
                 }
             }
         }

@@ -56,7 +56,7 @@ pub struct MempoolConfig {
 
     /// Maximum age of a mempool transaction before it is evicted (seconds).
     /// 72 hours = 259_200 seconds.
-    pub max_mempool_tx_age_secs: u64,
+    pub max_mempool_tx_age_ms: u64,
 
     // ── RBF (Replace-By-Fee) Parameters ───────────────────────────────────
     /// Minimum additional fee (in satoshis) a replacement tx must pay
@@ -76,7 +76,7 @@ pub struct MempoolConfig {
     pub max_orphan_pool_size: usize,
 
     /// Maximum age of an orphan transaction before it is discarded (seconds).
-    pub max_orphan_age_secs: u64,
+    pub max_orphan_age_ms: u64,
 
     // ── Base Fee / EIP-1559 Style ─────────────────────────────────────────
     /// Target utilization percentage of the mempool / block space.
@@ -119,7 +119,7 @@ impl MempoolConfig {
 
     // ── Eviction Parameters ───────────────────────────────────────────────
     pub const EVICTION_BATCH_SIZE: usize = 256;
-    pub const MAX_MEMPOOL_TX_AGE_SECS: u64 = 72 * 60 * 60; // 259_200 seconds
+    pub const MAX_MEMPOOL_TX_AGE_MS: u64 = 72 * 60 * 60 * 1_000; // 259_200_000 ms (72h)
 
     // ── RBF Parameters ────────────────────────────────────────────────────
     pub const MIN_FEE_BUMP: u64 = 1_000;
@@ -128,7 +128,7 @@ impl MempoolConfig {
 
     // ── Orphan Pool ───────────────────────────────────────────────────────
     pub const MAX_ORPHAN_POOL_SIZE: usize = 1_000;
-    pub const MAX_ORPHAN_AGE_SECS: u64 = 3_600; // 1 hour
+    pub const MAX_ORPHAN_AGE_MS: u64 = 3_600 * 1_000; // 1 hour in ms
 
     // ── Base Fee / EIP-1559 ───────────────────────────────────────────────
     pub const TARGET_UTILIZATION_PCT: u64 = 50;
@@ -160,7 +160,7 @@ impl MempoolConfig {
 
             // Eviction
             eviction_batch_size: Self::EVICTION_BATCH_SIZE,
-            max_mempool_tx_age_secs: Self::MAX_MEMPOOL_TX_AGE_SECS,
+            max_mempool_tx_age_ms: Self::MAX_MEMPOOL_TX_AGE_MS,
 
             // RBF
             min_fee_bump: Self::MIN_FEE_BUMP,
@@ -169,7 +169,7 @@ impl MempoolConfig {
 
             // Orphan Pool
             max_orphan_pool_size: Self::MAX_ORPHAN_POOL_SIZE,
-            max_orphan_age_secs: Self::MAX_ORPHAN_AGE_SECS,
+            max_orphan_age_ms: Self::MAX_ORPHAN_AGE_MS,
 
             // Base Fee / EIP-1559
             target_utilization_pct: Self::TARGET_UTILIZATION_PCT,

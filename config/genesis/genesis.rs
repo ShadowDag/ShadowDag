@@ -19,7 +19,9 @@ use crate::domain::block::block::Block;
 use crate::domain::block::block_body::BlockBody;
 use crate::domain::block::block_header::BlockHeader;
 use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
-use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
+use crate::engine::mining::algorithms::shadowhash::{
+    genesis_prev_state_commitment, shadow_hash_raw_full,
+};
 use crate::engine::mining::pow::pow_validator::PowValidator;
 use crate::errors::ConsensusError;
 use crate::{slog_error, slog_warn};
@@ -38,9 +40,12 @@ pub const GENESIS_MESSAGE: &str = "ShadowDAG/Genesis/2026-01-01/Privacy-is-a-rig
 //                      MAINNET GENESIS CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub const GENESIS_VERSION: u32 = 1;
+// Version 2 = millisecond-timestamp era (v1 was unix-seconds). The version is
+// part of the PoW preimage, so bumping it (like the ms timestamp) requires a
+// genesis re-mine; it lets tooling distinguish s-era from ms-era blocks.
+pub const GENESIS_VERSION: u32 = 2;
 pub const GENESIS_HEIGHT: u64 = 0;
-pub const GENESIS_TIMESTAMP: u64 = 1_735_689_600; // 2025-01-01 00:00:00 UTC
+pub const GENESIS_TIMESTAMP: u64 = 1_735_689_600_000; // 2025-01-01 00:00:00 UTC (ms)
 pub const GENESIS_DIFFICULTY: u64 = 8192;
 
 /// Developer wallet address — receives 5% of every block reward
@@ -59,21 +64,24 @@ pub const DEV_REWARD_PCT: u64 = 5;
 // ── HARDCODED PoW RESULTS (mined with ShadowHash algorithm) ──────────────
 // These were mined by running `mine-genesis` binary.
 // Every node verifies these on startup. If they don't match, the node panics.
-pub const MAINNET_GENESIS_NONCE: u64 = 8888;
+// Re-mined 2026-07-04 for the ms-timestamp / version-2 era (GENESIS_TIMESTAMP in
+// ms + GENESIS_VERSION=2 change the PoW preimage). Produced by the
+// mine_new_genesis_constants test.
+pub const MAINNET_GENESIS_NONCE: u64 = 31519;
 pub const MAINNET_GENESIS_HASH: &str =
-    "0003402066a8335bd50d10054a36a5b82c2a6e5690cf80449a02fa8867e82851";
+    "0001aceb6c2b22373512f3640da4c2dc308c82347722b2fcc8ce1296b4dab018";
 pub const MAINNET_MERKLE_ROOT: &str =
-    "647b7531e64ef4511202ca43c87729d1bdb1594933325c8f79b3cf172febba7e";
+    "7a56948a71e9460192d1c74d28ec559d7d9a6dd206f8a41155d23453aaabdca7";
 pub const MAINNET_COINBASE_HASH: &str =
-    "647b7531e64ef4511202ca43c87729d1bdb1594933325c8f79b3cf172febba7e";
+    "7a56948a71e9460192d1c74d28ec559d7d9a6dd206f8a41155d23453aaabdca7";
 
-pub const TESTNET_GENESIS_NONCE: u64 = 11242;
+pub const TESTNET_GENESIS_NONCE: u64 = 345;
 pub const TESTNET_GENESIS_HASH: &str =
-    "000e9dbf3c0ad3fe540ccec65cd72d09dfa0a32aff8d4f3a3b2e67d98ea73068";
+    "00021fd83c77b4555326ea2c2bc2c8bf130cb4e0dcde5e675a454fe25cf38b6a";
 
 pub const REGTEST_GENESIS_NONCE: u64 = 0;
 pub const REGTEST_GENESIS_HASH: &str =
-    "ec4447ead9c537678a2293f09f652affb8194e713a0f117b548f47015a1d0a4f";
+    "3fc3e995e74deea38ff06b8ae8b55b0dd2d8b99806337f5917b3c1235b694579";
 
 // ═══════════════════════════════════════════════════════════════════════════
 //                      TESTNET GENESIS CONSTANTS
@@ -91,7 +99,7 @@ pub const REGTEST_GENESIS_HASH: &str =
 // Re-mine with `mine-genesis --network testnet` after changing any constant.
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub const TESTNET_TIMESTAMP: u64 = 1_735_776_000; // 2025-01-02 00:00:00 UTC
+pub const TESTNET_TIMESTAMP: u64 = 1_735_776_000_000; // 2025-01-02 00:00:00 UTC (ms)
 pub const TESTNET_DIFFICULTY: u64 = 4096;
 pub const TESTNET_REWARD: u64 = 1_000_000_000;
 pub const TESTNET_MESSAGE: &str = "ShadowDAG/Testnet/2026-01-02/Testing-the-shadows";
@@ -194,6 +202,8 @@ fn build_coinbase(p: &GenesisParams) -> Transaction {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             },
             // Output 1: Developer reward (5%)
             TxOutput {
@@ -202,6 +212,8 @@ fn build_coinbase(p: &GenesisParams) -> Transaction {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             },
         ],
         fee: 0,
@@ -233,7 +245,7 @@ pub fn compute_merkle_root(tx_hashes: &[String]) -> String {
             match crate::domain::types::hash::parse_hash256(h) {
                 Ok(bytes) => bytes.to_vec(),
                 Err(e) => {
-                    slog_error!("genesis", "malformed_merkle_hash", hash_prefix => &h[..h.len().min(16)], error => &e.to_string());
+                    slog_error!("genesis", "malformed_merkle_hash", hash_prefix => crate::domain::types::hash::log_prefix(h, 16), error => &e.to_string());
                     vec![0xFF; 32]
                 }
             }
@@ -280,6 +292,7 @@ fn mine_genesis(p: &GenesisParams, merkle_root: &str) -> (u64, String) {
             p.difficulty,
             merkle_root,
             &[], // Genesis has no parents
+            Some(&genesis_prev_state_commitment()),
         );
 
         if PowValidator::hash_meets_target(&hash, p.difficulty) {
@@ -288,12 +301,10 @@ fn mine_genesis(p: &GenesisParams, merkle_root: &str) -> (u64, String) {
 
         nonce += 1;
 
-        // Safety: prevent infinite loop in case of misconfiguration
-        if nonce > 100_000_000 {
-            panic!(
-                "FATAL: Genesis mining failed after 100,000,000 attempts. \
-                 This indicates a misconfigured difficulty target."
-            );
+        // Keep searching; if parameters are unusual this may take a long
+        // time, so emit periodic progress instead of aborting.
+        if nonce.is_multiple_of(10_000_000) {
+            slog_warn!("genesis", "mining_still_in_progress", nonce => nonce, difficulty => p.difficulty);
         }
     }
 }
@@ -303,7 +314,13 @@ fn mine_genesis(p: &GenesisParams, merkle_root: &str) -> (u64, String) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Build a complete genesis block.
-/// Uses hardcoded PoW results for fast startup. Falls back to mining if needed.
+/// Uses hardcoded PoW results for fast startup.
+///
+/// Mainnet safety rule:
+/// - If hardcoded mainnet genesis constants do not reproduce the expected hash,
+///   abort startup immediately.
+/// - Never "re-mine" mainnet genesis at runtime, because that can create a
+///   different network root across nodes.
 fn build_block(p: GenesisParams) -> Block {
     let coinbase = build_coinbase(&p);
     let merkle_root = compute_merkle_root(std::slice::from_ref(&coinbase.hash));
@@ -322,12 +339,22 @@ fn build_block(p: GenesisParams) -> Block {
                 p.difficulty,
                 &merkle_root,
                 &[],
+                Some(&genesis_prev_state_commitment()),
             );
             if hash == MAINNET_GENESIS_HASH {
                 (MAINNET_GENESIS_NONCE, hash)
             } else {
-                slog_warn!("genesis", "mainnet_hash_mismatch_remining");
-                mine_genesis(&p, &merkle_root)
+                // Consensus-critical invariant:
+                // mainnet genesis must be deterministic and fixed.
+                // Runtime re-mining on mainnet can split the network.
+                slog_error!("genesis", "mainnet_hash_mismatch_abort",
+                    expected => MAINNET_GENESIS_HASH,
+                    got => &hash);
+                panic!(
+                    "FATAL: mainnet genesis constants mismatch (expected {}, got {}). \
+                     Refusing to re-mine mainnet genesis at runtime.",
+                    MAINNET_GENESIS_HASH, hash
+                );
             }
         }
         0xDA0C_0002 => {
@@ -340,6 +367,7 @@ fn build_block(p: GenesisParams) -> Block {
                 p.difficulty,
                 &merkle_root,
                 &[],
+                Some(&genesis_prev_state_commitment()),
             );
             if hash == TESTNET_GENESIS_HASH {
                 (TESTNET_GENESIS_NONCE, hash)
@@ -358,6 +386,7 @@ fn build_block(p: GenesisParams) -> Block {
                 p.difficulty,
                 &merkle_root,
                 &[],
+                Some(&genesis_prev_state_commitment()),
             );
             if hash == REGTEST_GENESIS_HASH {
                 (REGTEST_GENESIS_NONCE, hash)
@@ -385,6 +414,10 @@ fn build_block(p: GenesisParams) -> Block {
             extra_nonce: 0,
             receipt_root: None,
             state_root: None,
+            mix_hash: String::new(),
+            // M5: genesis binds the empty-initial-state commitment (no parent);
+            // must match the value the mine sites hashed into the genesis PoW.
+            prev_state_commitment: Some(genesis_prev_state_commitment()),
         },
         body: BlockBody {
             transactions: vec![coinbase],
@@ -580,6 +613,7 @@ pub fn verify_genesis_detailed(block: &Block, network: &NetworkMode) -> Result<(
         block.header.difficulty,
         &block.header.merkle_root,
         &block.header.parents,
+        block.header.prev_state_commitment.as_deref(),
     );
     if recomputed_hash != block.header.hash {
         return Err(ConsensusError::InvalidPow(format!(
@@ -733,6 +767,7 @@ mod tests {
             g.header.difficulty,
             &g.header.merkle_root,
             &g.header.parents,
+            g.header.prev_state_commitment.as_deref(),
         );
         assert_eq!(
             g.header.hash, recomputed,
@@ -839,9 +874,11 @@ mod tests {
     }
 
     #[test]
-    fn genesis_version_is_one() {
+    fn genesis_version_is_current() {
+        // Version 2 = millisecond-timestamp era (v1 was unix seconds).
         let g = create_genesis_block();
-        assert_eq!(g.header.version, 1);
+        assert_eq!(g.header.version, GENESIS_VERSION);
+        assert_eq!(GENESIS_VERSION, 2);
     }
 
     #[test]

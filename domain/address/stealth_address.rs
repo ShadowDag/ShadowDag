@@ -182,6 +182,41 @@ impl StealthAddress {
         })
     }
 
+    /// Like `generate_full_for_network` but also returns the ECDH shared secret
+    /// `ss = r·V`, so the caller can derive the output blinding + amount mask
+    /// (RingCT). The recipient recomputes the same `ss` via
+    /// `recipient_shared_secret`.
+    pub fn generate_full_for_network_with_secret(
+        recipient_view_pub: &RistrettoPoint,
+        recipient_spend_pub: &RistrettoPoint,
+        network: &str,
+    ) -> Result<(StealthAddressResult, RistrettoPoint), CryptoError> {
+        let r = Scalar::random(&mut OsRng);
+        let big_r = r * g();
+        let shared_secret = r * recipient_view_pub;
+        let hs = derive_hash_scalar(&shared_secret)?;
+        let one_time_pub = hs * g() + recipient_spend_pub;
+        let compressed = one_time_pub.compress();
+        let prefix = stealth_prefix(network);
+        let addr = format!("{}{}", prefix, hex::encode(&compressed.as_bytes()[..20]));
+        Ok((
+            StealthAddressResult {
+                one_time_address: addr,
+                ephemeral_pubkey: hex::encode(big_r.compress().as_bytes()),
+                one_time_pubkey: hex::encode(compressed.as_bytes()),
+            },
+            shared_secret,
+        ))
+    }
+
+    /// Recipient side: recompute the ECDH shared secret `ss = view_priv · R`.
+    pub fn recipient_shared_secret(
+        ephemeral_r: &RistrettoPoint,
+        view_priv: &Scalar,
+    ) -> RistrettoPoint {
+        view_priv * ephemeral_r
+    }
+
     /// Generate a stealth address with domain separation context.
     /// Defaults to mainnet prefix. Use the `network` parameter variant for other networks.
     ///
@@ -347,6 +382,26 @@ impl StealthAddress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sender_and_recipient_derive_same_shared_secret() {
+        use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+        let g = RISTRETTO_BASEPOINT_POINT;
+        let view_priv = Scalar::random(&mut OsRng);
+        let spend_priv = Scalar::random(&mut OsRng);
+        let (res, ss_sender) = StealthAddress::generate_full_for_network_with_secret(
+            &(view_priv * g),
+            &(spend_priv * g),
+            "mainnet",
+        )
+        .unwrap();
+        let r_point = crate::engine::privacy::ringct::serialization::point_from_hex(
+            &res.ephemeral_pubkey,
+        )
+        .unwrap();
+        let ss_recipient = StealthAddress::recipient_shared_secret(&r_point, &view_priv);
+        assert_eq!(ss_sender, ss_recipient);
+    }
 
     #[test]
     fn generate_produces_valid_stealth_address() {

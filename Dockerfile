@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # ═══════════════════════════════════════════════════════════════════════════
 #  ShadowDAG — Multi-stage Docker build
 #
@@ -16,16 +17,32 @@
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────
-FROM rust:1.78-slim-bookworm AS builder
+FROM rust:1-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
+    build-essential \
+    clang \
+    cmake \
     libclang-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 COPY . .
-RUN cargo build --release
+# BuildKit cache mounts persist the cargo registry and the target/ dir across
+# builds, so a source-only change recompiles just the changed crates instead of
+# the whole tree (cold build ~12 min; incremental ~1-2 min). target/ lives in
+# the cache mount (not in the image layer), so copy the release binaries into
+# /out within the same RUN — the runtime stage copies from there.
+RUN --mount=type=cache,target=/build/target \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo build --release && \
+    mkdir -p /build/out && \
+    cp target/release/shadowdag-node \
+       target/release/shadowdag-miner \
+       target/release/shadowdag-wallet \
+       target/release/shadowasm /build/out/
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -38,11 +55,11 @@ RUN apt-get update && apt-get install -y \
 # Create non-root user
 RUN useradd -m -s /bin/bash shadowdag
 
-# Copy binaries
-COPY --from=builder /build/target/release/shadowdag-node   /usr/local/bin/
-COPY --from=builder /build/target/release/shadowdag-miner  /usr/local/bin/
-COPY --from=builder /build/target/release/shadowdag-wallet /usr/local/bin/
-COPY --from=builder /build/target/release/shadowasm        /usr/local/bin/
+# Copy binaries (from /out — see the builder stage's cache-mount note)
+COPY --from=builder /build/out/shadowdag-node   /usr/local/bin/
+COPY --from=builder /build/out/shadowdag-miner  /usr/local/bin/
+COPY --from=builder /build/out/shadowdag-wallet /usr/local/bin/
+COPY --from=builder /build/out/shadowasm        /usr/local/bin/
 
 # Copy examples
 COPY examples/ /opt/shadowdag/examples/
@@ -56,6 +73,7 @@ ENV SHADOWDAG_DATA_DIR=/data
 ENV NETWORK=mainnet
 ENV MINER_ADDRESS=""
 ENV MINER_THREADS=1
+ENV MINER_POW=""
 
 # Ports
 # 9332: RPC  |  9333: P2P  |  7779: Stratum  |  8080: Explorer  |  3000: IDE
@@ -84,14 +102,29 @@ echo "  P2P:      0.0.0.0:9333"
 echo "  Stratum:  0.0.0.0:7779"
 echo "═══════════════════════════════════════════"
 
-# Start miner in background if address is set
+# Start a resilient background miner if an address is configured. Wait for the
+# node to publish its RPC password, then mine in a restart loop. No --rpc flag:
+# the miner derives the correct port from --network (testnet=19332, mainnet=9332)
+# — hardcoding 9332 broke testnet mining. Output goes to the container log.
 if [ -n "$MINER_ADDRESS" ]; then
     echo "  Mining to: ${MINER_ADDRESS}"
     echo "  Threads:   ${MINER_THREADS}"
-    shadowdag-miner --network="${NETWORK}" \
-        --address="${MINER_ADDRESS}" \
-        --threads="${MINER_THREADS}" \
-        --rpc=127.0.0.1:9332 &
+    (
+        # The node writes rpc_password into the data dir shortly after start.
+        while [ ! -s "${SHADOWDAG_DATA_DIR}/rpc_password" ]; do sleep 1; done
+        MINER_PW="$(cat "${SHADOWDAG_DATA_DIR}/rpc_password")"
+        POW_ARG=""
+        [ -n "${MINER_POW}" ] && POW_ARG="--pow=${MINER_POW}"
+        while true; do
+            shadowdag-miner --network="${NETWORK}" \
+                --address="${MINER_ADDRESS}" \
+                --threads="${MINER_THREADS}" \
+                ${POW_ARG} \
+                --rpc-password="${MINER_PW}"
+            echo "[entrypoint] miner exited; restarting in 2s" >&2
+            sleep 2
+        done
+    ) &
 fi
 
 exec shadowdag-node $ARGS "$@"

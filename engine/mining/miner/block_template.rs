@@ -5,6 +5,7 @@
 
 use crate::config::consensus::consensus_params::ConsensusParams;
 use crate::config::consensus::emission_schedule::EmissionSchedule;
+use crate::config::node::node_config::NetworkMode;
 use crate::domain::block::block::Block;
 use crate::domain::block::block_body::BlockBody;
 use crate::domain::block::block_header::BlockHeader;
@@ -15,6 +16,7 @@ use crate::domain::transaction::tx_validator::TxValidator;
 use crate::domain::utxo::utxo_key::UtxoKey;
 use crate::domain::utxo::utxo_set::{utxo_key, UtxoSet};
 use crate::engine::dag::core::dag_manager::DagManager;
+use crate::engine::mining::miner::fair_ordering::FairOrdering;
 use crate::engine::dag::security::dos_protection::{MAX_BLOCK_TX_COUNT, MAX_DAG_PARENTS};
 use crate::engine::dag::tips::tip_manager::TipManager;
 use crate::errors::ConsensusError;
@@ -52,7 +54,7 @@ impl BlockTemplateBuilder {
         let mut validated_parents: Vec<String> = Vec::with_capacity(candidates.len());
         for parent_hash in &candidates {
             if !dag_manager.block_exists(parent_hash) {
-                slog_warn!("mining", "tip_not_found_in_dag", hash_prefix => &parent_hash[..parent_hash.len().min(16)]);
+                slog_warn!("mining", "tip_not_found_in_dag", hash_prefix => crate::domain::types::hash::log_prefix(parent_hash, 16));
                 continue;
             }
             validated_parents.push(parent_hash.clone());
@@ -81,12 +83,36 @@ impl BlockTemplateBuilder {
         timestamp: u64,
         difficulty: u64,
     ) -> Result<Block, ConsensusError> {
-        let parents = Self::select_dag_parents(tip_manager, dag_manager)?;
+        // Read tips ONCE: select the parents AND capture the snapshot their
+        // height/blue_score are read from in a SINGLE lock. Previously the
+        // parents came from select_dag_parents' own tip read and the height map
+        // from a SECOND get_tips read — a tip evicted between the two dropped a
+        // parent from the map, collapsing the block height (max(parent_heights)+1
+        // fell short) and wasting the miner's PoW on a rejected template (B2-L01).
+        let max_parents = ConsensusParams::MAX_PARENTS.min(MAX_DAG_PARENTS);
+        let (candidates, tips) = tip_manager.select_parents_with_snapshot(max_parents);
+        if candidates.is_empty() {
+            return Err(ConsensusError::Other(
+                "No DAG tips available for parent selection".to_string(),
+            ));
+        }
+        // Validate all parent blocks exist in the DAG (as select_dag_parents did).
+        let mut parents: Vec<String> = Vec::with_capacity(candidates.len());
+        for parent_hash in &candidates {
+            if !dag_manager.block_exists(parent_hash) {
+                slog_warn!("mining", "tip_not_found_in_dag", hash_prefix => crate::domain::types::hash::log_prefix(parent_hash, 16));
+                continue;
+            }
+            parents.push(parent_hash.clone());
+        }
+        if parents.is_empty() {
+            return Err(ConsensusError::Other(
+                "No valid parent blocks found in DAG".to_string(),
+            ));
+        }
+        // Deterministic parent ordering — consensus requires all nodes agree.
+        parents.sort();
 
-        // Read tips ONCE to avoid TOCTOU between height, selected_parent,
-        // and blue_score computations. If tips change between reads, the
-        // template could have an inconsistent combination.
-        let tips = tip_manager.get_tips();
         let tip_map_height: std::collections::HashMap<&str, u64> =
             tips.iter().map(|t| (t.hash.as_str(), t.height)).collect();
         let tip_map_score: std::collections::HashMap<&str, u64> = tips
@@ -112,9 +138,11 @@ impl BlockTemplateBuilder {
         let candidates = mempool.get_transactions_for_block(
             utxo_set,
             MAX_BLOCK_TX_COUNT - 1, // reserve slot for coinbase
+            height,                 // maturity is judged at THIS block's height
         );
 
-        let template = Self::select_valid_transactions(candidates, utxo_set);
+        let network = Self::network_from_miner_address(miner_address);
+        let template = Self::select_valid_transactions(candidates, utxo_set, &network);
 
         // Coinbase reward = emission + transaction fees (must match validator expectation)
         let emission = EmissionSchedule::block_reward(height);
@@ -154,7 +182,7 @@ impl BlockTemplateBuilder {
             if let Some(ref best_hash) = best {
                 if tip_map_score.get(best_hash.as_str()).copied().unwrap_or(0) == 0 {
                     slog_warn!("mining", "selected_parent_not_in_tips",
-                        parent => &best_hash[..best_hash.len().min(16)],
+                        parent => crate::domain::types::hash::log_prefix(best_hash, 16),
                         note => "parent not found in tip_manager — using fallback ordering");
                 }
             }
@@ -182,7 +210,7 @@ impl BlockTemplateBuilder {
         };
 
         let header = BlockHeader {
-            version: 1,
+            version: 2, // ms-timestamp era (matches GENESIS_VERSION)
             hash: String::new(),
             parents,
             merkle_root,
@@ -196,6 +224,8 @@ impl BlockTemplateBuilder {
             extra_nonce: 0,
             receipt_root: None,
             state_root: None,
+            mix_hash: String::new(),
+            prev_state_commitment: None,
         };
 
         let mut all_txs = vec![coinbase];
@@ -226,9 +256,10 @@ impl BlockTemplateBuilder {
         _prev_hash: &str,
     ) -> Block {
         // Select transactions BEFORE building coinbase so we know total fees
-        let candidates = mempool.get_transactions_for_block(utxo_set, MAX_BLOCK_TX_COUNT - 1);
+        let candidates = mempool.get_transactions_for_block(utxo_set, MAX_BLOCK_TX_COUNT - 1, height);
 
-        let template = Self::select_valid_transactions(candidates, utxo_set);
+        let network = Self::network_from_miner_address(miner_address);
+        let template = Self::select_valid_transactions(candidates, utxo_set, &network);
 
         // Coinbase reward = emission + transaction fees.
         // Legacy method returns Block (not Result), so avoid panics here.
@@ -258,7 +289,7 @@ impl BlockTemplateBuilder {
         let selected_parent = parents.first().cloned();
 
         let header = BlockHeader {
-            version: 1,
+            version: 2, // ms-timestamp era (matches GENESIS_VERSION)
             hash: String::new(),
             parents,
             merkle_root,
@@ -272,6 +303,8 @@ impl BlockTemplateBuilder {
             extra_nonce: 0,
             receipt_root: None,
             state_root: None,
+            mix_hash: String::new(),
+            prev_state_commitment: None,
         };
 
         let mut all_txs = vec![coinbase];
@@ -286,9 +319,25 @@ impl BlockTemplateBuilder {
     }
 
     fn select_valid_transactions(
-        candidates: Vec<Transaction>,
+        mut candidates: Vec<Transaction>,
         utxo_set: &UtxoSet,
+        network: &NetworkMode,
     ) -> BlockTemplate {
+        // MEV-resistant fair ordering: deterministic effective-fee (fee + mempool
+        // age bonus) descending with a hash tiebreaker, applied before the
+        // topological (dependency) sort so independent txs follow the fair order.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let ranking = FairOrdering::order_for_block(&candidates, now);
+        let rank: HashMap<&str, usize> = ranking
+            .iter()
+            .enumerate()
+            .map(|(i, o)| (o.tx_hash.as_str(), i))
+            .collect();
+        candidates.sort_by_key(|tx| rank.get(tx.hash.as_str()).copied().unwrap_or(usize::MAX));
+
         let mut staged_utxos: HashMap<UtxoKey, (String, u64)> = HashMap::new();
 
         let mut spent_in_block: HashSet<UtxoKey> = HashSet::new();
@@ -340,7 +389,7 @@ impl BlockTemplateBuilder {
                 continue;
             }
 
-            if !tx.is_coinbase() && !TxValidator::validate_tx(&tx, utxo_set) {
+            if !tx.is_coinbase() && !TxValidator::validate_tx_for_network(&tx, utxo_set, network) {
                 // TX failed full validation — reject it regardless of staged UTXO status.
                 // Previously, TXs whose inputs were all in staged_utxos were accepted
                 // even when signature/fee/ring checks failed. This bypassed consensus.
@@ -402,6 +451,18 @@ impl BlockTemplateBuilder {
             tx_count: accepted.len(),
             total_fees,
             transactions: accepted,
+        }
+    }
+
+    #[inline]
+    fn network_from_miner_address(miner_address: &str) -> NetworkMode {
+        if miner_address.starts_with("ST1") {
+            NetworkMode::Testnet
+        } else if miner_address.starts_with("SR1") {
+            NetworkMode::Regtest
+        } else {
+            // Default to mainnet for unknown/legacy prefixes.
+            NetworkMode::Mainnet
         }
     }
 

@@ -3,8 +3,6 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub mod pruning_engine;
-
 use std::collections::{HashMap, HashSet};
 
 pub const DEFAULT_PRUNE_DEPTH: u64 = 1_000;

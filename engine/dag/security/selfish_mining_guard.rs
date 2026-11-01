@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 
+use crate::config::node::node_config::NetworkMode;
 use crate::domain::block::block::Block;
 
 /// Minimum parents per block for selfish mining protection.
@@ -24,29 +25,61 @@ pub const MAX_DAG_PARENTS: usize =
 pub struct SelfishMiningGuard;
 
 impl SelfishMiningGuard {
+    /// Minimum DAG parents required at a given height.
+    ///
+    /// SECURITY: this is a CONSENSUS rule and is a pure function of `height`
+    /// plus the fixed `MIN_DAG_PARENTS` constant. It MUST NOT depend on process
+    /// environment — a previous version read `SHADOWDAG_MIN_DAG_PARENTS` /
+    /// `NETWORK` env vars here, which let two honest nodes disagree on block
+    /// validity (one accepting a 1-parent block at height ≥ 2, the other
+    /// rejecting it) and permanently fork the chain. Any per-network relaxation
+    /// for single-miner dev networks must be threaded explicitly via
+    /// `NetworkMode`, never via the environment.
     #[inline]
-    fn configured_min_dag_parents() -> usize {
-        // Optional override for small/dev networks where only one DAG tip may exist.
-        // Mainnet keeps the secure default (2) unless explicitly overridden.
-        std::env::var("SHADOWDAG_MIN_DAG_PARENTS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(MIN_DAG_PARENTS)
-            .clamp(1, MAX_DAG_PARENTS)
+    pub fn configured_min_dag_parents_for_height(height: u64) -> usize {
+        Self::min_dag_parents_for(height, NetworkMode::Mainnet)
+    }
+
+    /// Network-aware minimum DAG parents at `height`.
+    ///
+    /// Mainnet enforces the 2-parent anti-selfish-mining rule at height >= 2.
+    /// Test networks (testnet/regtest) allow LINEAR (single-parent) chains so a
+    /// small number of miners can bootstrap from a single genesis: the 2-parent
+    /// rule deadlocks a fresh chain (one tip can never produce a 2-parent child).
+    /// This IS a consensus rule, but keyed purely on the fixed `NetworkMode`, so
+    /// every node on a given network agrees — no fork (unlike an env-var switch,
+    /// which two honest nodes could read differently).
+    #[inline]
+    pub fn min_dag_parents_for(height: u64, network: NetworkMode) -> usize {
+        match network {
+            NetworkMode::Mainnet => match height {
+                0 => 0,
+                1 => 1,
+                _ => MIN_DAG_PARENTS,
+            },
+            NetworkMode::Testnet | NetworkMode::Regtest => {
+                if height == 0 {
+                    0
+                } else {
+                    1
+                }
+            }
+        }
     }
 
     #[inline(always)]
     pub fn validate(block: &Block) -> bool {
+        Self::validate_for_network(block, NetworkMode::Mainnet)
+    }
+
+    /// Network-aware variant of [`validate`]; the consensus path passes the
+    /// node's `NetworkMode` so test networks accept linear chains.
+    #[inline(always)]
+    pub fn validate_for_network(block: &Block, network: NetworkMode) -> bool {
         let parents = &block.header.parents;
         let len = parents.len();
 
-        // Genesis has no parents. Height 1 can only point to genesis.
-        // For height >= 2, enforce the configured minimum parent count.
-        let min_parents = match block.header.height {
-            0 => 0,
-            1 => 1,
-            _ => Self::configured_min_dag_parents(),
-        };
+        let min_parents = Self::min_dag_parents_for(block.header.height, network);
 
         // 1️⃣ Range
         if len < min_parents || len > MAX_DAG_PARENTS {
@@ -115,6 +148,8 @@ mod tests {
                 extra_nonce: 0,
                 receipt_root: None,
                 state_root: None,
+                mix_hash: String::new(),
+                prev_state_commitment: None,
             },
             body: BlockBody {
                 transactions: vec![],
@@ -192,5 +227,39 @@ mod tests {
     fn whitespace_only_parent_rejected() {
         let b = make_block("ws", vec!["   ", "valid"], 2);
         assert!(!SelfishMiningGuard::validate(&b));
+    }
+
+    #[test]
+    fn min_parents_is_environment_independent() {
+        // Consensus rule must NOT be influenced by env vars (fork-prevention).
+        std::env::set_var("NETWORK", "regtest");
+        std::env::set_var("SHADOWDAG_MIN_DAG_PARENTS", "1");
+        let min = SelfishMiningGuard::configured_min_dag_parents_for_height(2);
+        std::env::remove_var("SHADOWDAG_MIN_DAG_PARENTS");
+        std::env::remove_var("NETWORK");
+        assert_eq!(min, MIN_DAG_PARENTS, "env must not weaken the min-parent rule");
+        // Height schedule is fixed.
+        assert_eq!(SelfishMiningGuard::configured_min_dag_parents_for_height(0), 0);
+        assert_eq!(SelfishMiningGuard::configured_min_dag_parents_for_height(1), 1);
+    }
+
+    #[test]
+    fn testnet_allows_linear_chain_mainnet_does_not() {
+        use crate::config::node::node_config::NetworkMode;
+        // A 1-parent block at height >= 2: mainnet rejects (anti-selfish-mining),
+        // test networks accept so a fresh chain can bootstrap from one genesis.
+        let b = make_block("b2", vec!["b1"], 2);
+        assert!(!SelfishMiningGuard::validate(&b)); // mainnet default
+        assert!(SelfishMiningGuard::validate_for_network(&b, NetworkMode::Testnet));
+        assert!(SelfishMiningGuard::validate_for_network(&b, NetworkMode::Regtest));
+        // Parent-count schedule by network.
+        assert_eq!(SelfishMiningGuard::min_dag_parents_for(2, NetworkMode::Mainnet), 2);
+        assert_eq!(SelfishMiningGuard::min_dag_parents_for(2, NetworkMode::Testnet), 1);
+        assert_eq!(SelfishMiningGuard::min_dag_parents_for(0, NetworkMode::Testnet), 0);
+        // Genesis still needs 0 parents everywhere; height-1 still 1.
+        assert!(SelfishMiningGuard::validate_for_network(
+            &make_block("g", vec![], 0),
+            NetworkMode::Testnet
+        ));
     }
 }

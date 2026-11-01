@@ -87,10 +87,13 @@ impl Address {
         h.update(public_key);
         let hash = h.finalize();
 
+        // Fail-safe default: treat unknown labels as mainnet instead of
+        // silently mis-tagging as regtest.
         let prefix = match network {
             "mainnet" => MAINNET_PREFIX,
             "testnet" => TESTNET_PREFIX,
-            _ => REGTEST_PREFIX,
+            "regtest" => REGTEST_PREFIX,
+            _ => MAINNET_PREFIX,
         };
 
         let value = format!("{}{}", prefix, hex::encode(&hash[..20]));
@@ -192,8 +195,10 @@ impl Address {
             "mainnet"
         } else if self.value.starts_with("ST") {
             "testnet"
-        } else {
+        } else if self.value.starts_with("SR") {
             "regtest"
+        } else {
+            "unknown"
         }
     }
 
@@ -260,6 +265,18 @@ mod tests {
         assert_eq!(Address::new("SD1abc".to_string()).network(), "mainnet");
         assert_eq!(Address::new("ST1abc".to_string()).network(), "testnet");
         assert_eq!(Address::new("SR1abc".to_string()).network(), "regtest");
+    }
+
+    #[test]
+    fn network_detection_unknown_prefix_is_unknown() {
+        assert_eq!(Address::new("XX1abc".to_string()).network(), "unknown");
+    }
+
+    #[test]
+    fn from_public_key_unknown_network_defaults_mainnet() {
+        let pk = [0x42u8; 32];
+        let addr = Address::from_public_key(&pk, "customnet");
+        assert!(addr.value.starts_with("SD1"));
     }
 
     #[test]

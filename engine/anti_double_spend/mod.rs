@@ -17,6 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const LOCK_TTL_SECS: u64 = 10_800;
 pub const MAX_LOCKS_PER_TX: usize = 50;
 pub const EVICT_BATCH_SIZE: usize = 1_000;
+pub const MAX_LOCK_OWNER_ID_BYTES: usize = 128;
 
 const PFX_LOCK: &[u8] = b"l:";
 const PFX_SPENT: &[u8] = b"s:";
@@ -82,6 +83,41 @@ pub struct DoubleSpendProtector {
 }
 
 impl DoubleSpendProtector {
+    #[inline]
+    fn normalize_lock_owner_id(txid: &str) -> Option<Vec<u8>> {
+        if txid.is_empty() || txid.len() > MAX_LOCK_OWNER_ID_BYTES {
+            return None;
+        }
+        if !txid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return None;
+        }
+        Some(txid.as_bytes().to_vec())
+    }
+
+    #[inline]
+    fn decode_lock_owner_id(bytes: &[u8]) -> String {
+        let decoded = match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return "INVALID_OWNER".to_string(),
+        };
+        let mut out = String::with_capacity(decoded.len().min(MAX_LOCK_OWNER_ID_BYTES));
+        for c in decoded.chars().take(MAX_LOCK_OWNER_ID_BYTES) {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                out.push(c);
+            } else {
+                out.push('?');
+            }
+        }
+        if out.is_empty() {
+            "UNKNOWN_OWNER".to_string()
+        } else {
+            out
+        }
+    }
+
     pub fn new(path: &str) -> Result<Self, StorageError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -143,7 +179,8 @@ impl DoubleSpendProtector {
             return Err(StorageError::Other("too many inputs".to_string()));
         }
 
-        let txid_bytes = txid.as_bytes();
+        let txid_bytes = Self::normalize_lock_owner_id(txid)
+            .ok_or_else(|| StorageError::Other("invalid txid/owner id".to_string()))?;
         let now = unix_now();
 
         let mut key = Vec::with_capacity(38);
@@ -197,7 +234,7 @@ impl DoubleSpendProtector {
             }
 
             let rec = LockRecord {
-                locked_by: txid_bytes.to_vec(),
+                locked_by: txid_bytes.clone(),
                 locked_at: now,
                 fee,
             };
@@ -293,7 +330,7 @@ impl DoubleSpendProtector {
                 if let Ok(rec) = bincode::deserialize::<LockRecord>(&data) {
                     if !rec.is_expired(now) {
                         return SpendStatus::LockedInMempool(
-                            String::from_utf8_lossy(&rec.locked_by).to_string(),
+                            Self::decode_lock_owner_id(&rec.locked_by),
                         );
                     }
                 }

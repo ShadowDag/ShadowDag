@@ -30,6 +30,15 @@ const MAX_IDE_CONNECTIONS: usize = 200;
 const MAX_REQUEST_LINE_BYTES: usize = 4096;
 const MAX_HEADER_LINES: usize = 64;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
+const MAX_HOST_HEADER_BYTES: usize = 256;
+const MAX_PATH_BYTES: usize = 512;
+const MAX_RPC_RESPONSE_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
+const MAX_CONTRACT_ID_BYTES: usize = 128;
+const MAX_STORAGE_SLOT_BYTES: usize = 128;
+const MAX_RECEIPT_HASH_BYTES: usize = 128;
+const MAX_EXAMPLE_NAME_BYTES: usize = 64;
+const MAX_BYTECODE_BYTES: usize = 512 * 1024;
+const MAX_CALLDATA_BYTES: usize = 64 * 1024;
 
 pub struct ContractIdeServer {
     port: u16,
@@ -38,6 +47,70 @@ pub struct ContractIdeServer {
 }
 
 impl ContractIdeServer {
+    fn host_name_only(host: &str) -> String {
+        let h = host.trim().to_ascii_lowercase();
+        if h.starts_with('[') {
+            if let Some(end) = h.find(']') {
+                return h[..=end].to_string();
+            }
+            return h;
+        }
+        h.split(':').next().unwrap_or("").trim().to_string()
+    }
+
+    fn origin_host_only(origin: &str) -> Option<String> {
+        let o = origin.trim().to_ascii_lowercase();
+        let rest = if let Some(s) = o.strip_prefix("http://") {
+            s
+        } else if let Some(s) = o.strip_prefix("https://") {
+            s
+        } else {
+            return None;
+        };
+        let authority = rest.split('/').next().unwrap_or("");
+        if authority.is_empty() {
+            return None;
+        }
+        Some(Self::host_name_only(authority))
+    }
+
+    fn is_safe_local_request(host: Option<&str>, origin: Option<&str>) -> bool {
+        let Some(h) = host else {
+            // Require Host explicitly to reduce ambiguity and proxy quirks.
+            return false;
+        };
+        let host_only = Self::host_name_only(h);
+        if host_only != "127.0.0.1" && host_only != "localhost" && host_only != "[::1]" {
+            return false;
+        }
+        if let Some(o) = origin {
+            let Some(origin_host) = Self::origin_host_only(o) else {
+                return false;
+            };
+            if origin_host != "127.0.0.1" && origin_host != "localhost" && origin_host != "[::1]"
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn looks_like_identifier(s: &str, max_len: usize) -> bool {
+        !s.is_empty()
+            && s.len() <= max_len
+            && s.chars().all(|c| {
+                c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ':' || c == '.'
+            })
+    }
+
+    fn looks_like_hex_payload(s: &str, max_len: usize) -> bool {
+        if s.is_empty() || s.len() > max_len {
+            return false;
+        }
+        let stripped = s.strip_prefix("0x").unwrap_or(s);
+        !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
     pub fn new(port: u16, rpc_port: u16) -> Self {
         Self {
             port,
@@ -52,6 +125,16 @@ impl ContractIdeServer {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "127.0.0.1".to_string());
+        // Security hardening: IDE is a high-privilege local tool and must not be
+        // exposed on public interfaces. Reject non-loopback binds.
+        let bind_lower = bind_host.to_ascii_lowercase();
+        let is_loopback = matches!(bind_lower.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]");
+        if !is_loopback {
+            return Err(format!(
+                "Refusing to bind Contract IDE to non-loopback host '{}'. Use 127.0.0.1/localhost only.",
+                bind_host
+            ));
+        }
         let addr = format!("{}:{}", bind_host, self.port);
         let listener = TcpListener::bind(&addr)
             .map_err(|e| format!("IDE bind failed on {}: {}", addr, e))?;
@@ -61,20 +144,18 @@ impl ContractIdeServer {
         let rpc_port = self.rpc_port;
         let active_connections = Arc::new(AtomicUsize::new(0));
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                if let Ok(stream) = stream {
-                    let prev = active_connections.fetch_add(1, Ordering::AcqRel);
-                    if prev >= MAX_IDE_CONNECTIONS {
-                        active_connections.fetch_sub(1, Ordering::Relaxed);
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
-                        continue;
-                    }
-                    let active_connections = Arc::clone(&active_connections);
-                    std::thread::spawn(move || {
-                        Self::handle_connection(stream, rpc_port);
-                        active_connections.fetch_sub(1, Ordering::Relaxed);
-                    });
+            for stream in listener.incoming().flatten() {
+                let prev = active_connections.fetch_add(1, Ordering::AcqRel);
+                if prev >= MAX_IDE_CONNECTIONS {
+                    active_connections.fetch_sub(1, Ordering::Relaxed);
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    continue;
                 }
+                let active_connections = Arc::clone(&active_connections);
+                std::thread::spawn(move || {
+                    Self::handle_connection(stream, rpc_port);
+                    active_connections.fetch_sub(1, Ordering::Relaxed);
+                });
             }
         });
 
@@ -110,22 +191,68 @@ impl ContractIdeServer {
             Err(e) => return json!({"error": format!("RPC unreachable: {}", e)}),
         };
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
         if stream.write_all(request.as_bytes()).is_err() {
             return json!({"error": "failed to send RPC request"});
         }
         let _ = stream.flush();
 
-        // Read response
-        let mut response = String::new();
-        let _ = stream.read_to_string(&mut response);
-
-        // Parse HTTP response — find the JSON body after \r\n\r\n
-        if let Some(pos) = response.find("\r\n\r\n") {
-            let json_body = &response[pos + 4..];
-            serde_json::from_str(json_body).unwrap_or(json!({"error": "invalid RPC response"}))
-        } else {
-            serde_json::from_str(&response).unwrap_or(json!({"error": "malformed RPC response"}))
+        let mut reader = BufReader::new(&stream);
+        let mut content_length: usize = 0;
+        let mut content_length_seen = false;
+        let mut unsupported_transfer_encoding = false;
+        let mut header_lines = 0usize;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    header_lines += 1;
+                    if header_lines > MAX_HEADER_LINES {
+                        return json!({"error": "RPC headers too large"});
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = trimmed.split_once(':') {
+                        if name.trim().eq_ignore_ascii_case("content-length") {
+                            if content_length_seen {
+                                return json!({"error": "invalid RPC response"});
+                            }
+                            content_length_seen = true;
+                            content_length = match value.trim().parse::<usize>() {
+                                Ok(n) => n,
+                                Err(_) => return json!({"error": "invalid RPC response"}),
+                            };
+                        } else if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+                            unsupported_transfer_encoding = true;
+                        }
+                    }
+                }
+                Err(_) => return json!({"error": "failed to read RPC response headers"}),
+            }
         }
+        if unsupported_transfer_encoding || !content_length_seen {
+            return json!({"error": "invalid RPC response"});
+        }
+        let response_body = if content_length > 0 {
+            if content_length > MAX_RPC_RESPONSE_BYTES {
+                return json!({"error": "RPC response too large"});
+            }
+            let mut body = vec![0u8; content_length];
+            if reader.read_exact(&mut body).is_err() {
+                return json!({"error": "failed to read RPC response body"});
+            }
+            match String::from_utf8(body) {
+                Ok(s) => s,
+                Err(_) => return json!({"error": "invalid RPC response"}),
+            }
+        } else {
+            String::new()
+        };
+
+        serde_json::from_str(&response_body).unwrap_or(json!({"error": "invalid RPC response"}))
     }
 
     fn handle_connection(mut stream: TcpStream, rpc_port: u16) {
@@ -153,6 +280,8 @@ impl ContractIdeServer {
         // Parse headers
         let mut content_length: usize = 0;
         let mut malformed_content_length = false;
+        let mut host_header: Option<String> = None;
+        let mut origin_header: Option<String> = None;
         let mut header_line = String::new();
         let mut header_lines = 0usize;
         let mut header_bytes = 0usize;
@@ -178,6 +307,20 @@ impl ContractIdeServer {
                                 Err(_) => malformed_content_length = true,
                             }
                         }
+                    } else if lower.starts_with("host:") {
+                        if let Some((_, val)) = header_line.trim().split_once(':') {
+                            let h = val.trim();
+                            if h.len() <= MAX_HOST_HEADER_BYTES {
+                                host_header = Some(h.to_string());
+                            }
+                        }
+                    } else if lower.starts_with("origin:") {
+                        if let Some((_, val)) = header_line.trim().split_once(':') {
+                            let o = val.trim();
+                            if o.len() <= MAX_HOST_HEADER_BYTES {
+                                origin_header = Some(o.to_string());
+                            }
+                        }
                     }
                 }
             }
@@ -188,12 +331,22 @@ impl ContractIdeServer {
             return;
         }
 
-        let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
+        let parts: Vec<&str> = request_line.split_whitespace().collect();
         if parts.len() < 2 {
             return;
         }
         let method = parts[0];
         let path = parts[1];
+        if path.len() > MAX_PATH_BYTES {
+            Self::send_response(&mut stream, 414, "text/plain", b"URI Too Long");
+            return;
+        }
+
+        // DNS rebinding / CSRF guard: IDE must be accessed from loopback origins only.
+        if !Self::is_safe_local_request(host_header.as_deref(), origin_header.as_deref()) {
+            Self::send_response(&mut stream, 403, "text/plain", b"Forbidden");
+            return;
+        }
 
         // Handle CORS preflight
         if method == "OPTIONS" {
@@ -212,7 +365,13 @@ impl ContractIdeServer {
             if reader.read_exact(&mut buf).is_err() {
                 return;
             }
-            String::from_utf8_lossy(&buf).to_string()
+            match String::from_utf8(buf) {
+                Ok(s) => s,
+                Err(_) => {
+                    Self::send_response(&mut stream, 400, "text/plain", b"Invalid UTF-8 body");
+                    return;
+                }
+            }
         } else {
             String::new()
         };
@@ -232,9 +391,17 @@ impl ContractIdeServer {
 
             ("POST", "/api/deploy") => {
                 let p: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+                let bytecode = p.get("bytecode").and_then(|v| v.as_str()).unwrap_or("");
+                let deployer = p.get("deployer").and_then(|v| v.as_str()).unwrap_or("");
+                if !Self::looks_like_hex_payload(bytecode, MAX_BYTECODE_BYTES)
+                    || !Self::looks_like_identifier(deployer, MAX_CONTRACT_ID_BYTES)
+                {
+                    Self::send_json(&mut stream, &json!({"error": "invalid deploy payload"}));
+                    return;
+                }
                 let params = json!([
-                    p.get("bytecode").and_then(|v| v.as_str()).unwrap_or(""),
-                    p.get("deployer").and_then(|v| v.as_str()).unwrap_or(""),
+                    bytecode,
+                    deployer,
                     p.get("value").and_then(|v| v.as_u64()).unwrap_or(0),
                     p.get("gas").and_then(|v| v.as_u64()).unwrap_or(10_000_000),
                 ]);
@@ -243,10 +410,20 @@ impl ContractIdeServer {
 
             ("POST", "/api/call") => {
                 let p: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+                let contract = p.get("contract").and_then(|v| v.as_str()).unwrap_or("");
+                let calldata = p.get("calldata").and_then(|v| v.as_str()).unwrap_or("");
+                let caller = p.get("caller").and_then(|v| v.as_str()).unwrap_or("");
+                if !Self::looks_like_identifier(contract, MAX_CONTRACT_ID_BYTES)
+                    || !Self::looks_like_hex_payload(calldata, MAX_CALLDATA_BYTES)
+                    || !Self::looks_like_identifier(caller, MAX_CONTRACT_ID_BYTES)
+                {
+                    Self::send_json(&mut stream, &json!({"error": "invalid call payload"}));
+                    return;
+                }
                 let params = json!([
-                    p.get("contract").and_then(|v| v.as_str()).unwrap_or(""),
-                    p.get("calldata").and_then(|v| v.as_str()).unwrap_or(""),
-                    p.get("caller").and_then(|v| v.as_str()).unwrap_or(""),
+                    contract,
+                    calldata,
+                    caller,
                     p.get("value").and_then(|v| v.as_u64()).unwrap_or(0),
                     p.get("gas").and_then(|v| v.as_u64()).unwrap_or(1_000_000),
                 ]);
@@ -255,10 +432,20 @@ impl ContractIdeServer {
 
             ("POST", "/api/estimate") => {
                 let p: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+                let contract = p.get("contract").and_then(|v| v.as_str()).unwrap_or("");
+                let calldata = p.get("calldata").and_then(|v| v.as_str()).unwrap_or("");
+                let caller = p.get("caller").and_then(|v| v.as_str()).unwrap_or("");
+                if !Self::looks_like_identifier(contract, MAX_CONTRACT_ID_BYTES)
+                    || !Self::looks_like_hex_payload(calldata, MAX_CALLDATA_BYTES)
+                    || !Self::looks_like_identifier(caller, MAX_CONTRACT_ID_BYTES)
+                {
+                    Self::send_json(&mut stream, &json!({"error": "invalid estimate payload"}));
+                    return;
+                }
                 let params = json!([
-                    p.get("contract").and_then(|v| v.as_str()).unwrap_or(""),
-                    p.get("calldata").and_then(|v| v.as_str()).unwrap_or(""),
-                    p.get("caller").and_then(|v| v.as_str()).unwrap_or(""),
+                    contract,
+                    calldata,
+                    caller,
                     p.get("value").and_then(|v| v.as_u64()).unwrap_or(0),
                 ]);
                 Self::send_json(&mut stream, &Self::rpc_call(rpc_port, "estimategas", &params));
@@ -266,6 +453,10 @@ impl ContractIdeServer {
 
             ("GET", p) if p.starts_with("/api/code/") => {
                 let addr = &p["/api/code/".len()..];
+                if !Self::looks_like_identifier(addr, MAX_CONTRACT_ID_BYTES) {
+                    Self::send_json(&mut stream, &json!({"error": "invalid contract id"}));
+                    return;
+                }
                 Self::send_json(&mut stream, &Self::rpc_call(rpc_port, "get_contract_code", &json!([addr])));
             }
 
@@ -273,6 +464,12 @@ impl ContractIdeServer {
                 let rest = &p["/api/storage/".len()..];
                 let parts: Vec<&str> = rest.splitn(2, '/').collect();
                 if parts.len() == 2 {
+                    if !Self::looks_like_identifier(parts[0], MAX_CONTRACT_ID_BYTES)
+                        || !Self::looks_like_identifier(parts[1], MAX_STORAGE_SLOT_BYTES)
+                    {
+                        Self::send_json(&mut stream, &json!({"error": "invalid storage path"}));
+                        return;
+                    }
                     Self::send_json(&mut stream, &Self::rpc_call(rpc_port, "get_storage_at", &json!([parts[0], parts[1]])));
                 } else {
                     Self::send_json(&mut stream, &json!({"error": "usage: /api/storage/{addr}/{slot}"}));
@@ -281,6 +478,10 @@ impl ContractIdeServer {
 
             ("GET", p) if p.starts_with("/api/receipt/") => {
                 let hash = &p["/api/receipt/".len()..];
+                if !Self::looks_like_hex_payload(hash, MAX_RECEIPT_HASH_BYTES) {
+                    Self::send_json(&mut stream, &json!({"error": "invalid receipt hash"}));
+                    return;
+                }
                 Self::send_json(&mut stream, &Self::rpc_call(rpc_port, "get_transaction_receipt", &json!([hash])));
             }
 
@@ -288,6 +489,10 @@ impl ContractIdeServer {
 
             ("GET", p) if p.starts_with("/api/example/") => {
                 let name = &p["/api/example/".len()..];
+                if !Self::looks_like_identifier(name, MAX_EXAMPLE_NAME_BYTES) {
+                    Self::send_json(&mut stream, &json!({"error": "invalid example name"}));
+                    return;
+                }
                 Self::api_example_source(&mut stream, name);
             }
 

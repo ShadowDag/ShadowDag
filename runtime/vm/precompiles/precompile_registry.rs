@@ -65,12 +65,11 @@ impl PrecompileRegistry {
     pub fn new() -> Self {
         let mut contracts = BTreeMap::new();
 
-        // 0x01: Ed25519 signature verification with address derivation.
-        // WARNING: NOT standard secp256k1 ecrecover -- requires pubkey as input.
+        // 0x01: ecrecover — standard Ethereum secp256k1 ECDSA key recovery.
         contracts.insert(
             0x01,
             PrecompileEntry {
-                name: "ed25519_verify_and_derive (not ecrecover)",
+                name: "ecrecover",
                 address: 0x01,
                 base_gas: 3000,
                 per_word_gas: 0,
@@ -90,12 +89,11 @@ impl PrecompileRegistry {
             },
         );
 
-        // 0x03: SHA-256-truncated-to-20-bytes (NOT real RIPEMD-160).
-        // WARNING: Produces different output than actual RIPEMD-160.
+        // 0x03: RIPEMD-160 (real).
         contracts.insert(
             0x03,
             PrecompileEntry {
-                name: "ripemd160 (SHA-256 truncation, not real RIPEMD-160)",
+                name: "ripemd160",
                 address: 0x03,
                 base_gas: 600,
                 per_word_gas: 120,

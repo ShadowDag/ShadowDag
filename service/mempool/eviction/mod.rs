@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_MEMPOOL_SIZE: usize = MempoolConfig::MAX_MEMPOOL_SIZE;
 pub const MAX_MEMPOOL_BYTES: usize = MempoolConfig::MAX_MEMPOOL_BYTES;
-pub const TX_MAX_AGE_SECS: u64 = MempoolConfig::MAX_MEMPOOL_TX_AGE_SECS;
+pub const TX_MAX_AGE_MS: u64 = MempoolConfig::MAX_MEMPOOL_TX_AGE_MS;
 pub const EVICTION_BATCH_SIZE: usize = MempoolConfig::EVICTION_BATCH_SIZE;
 pub const MIN_FEE_RATE: f64 = MempoolConfig::MIN_FEE_RATE;
 
@@ -35,12 +35,12 @@ impl EvictableEntry {
         }
     }
 
-    pub fn age_secs(&self) -> u64 {
-        now_secs().saturating_sub(self.added_at)
+    pub fn age_ms(&self) -> u64 {
+        now_ms().saturating_sub(self.added_at)
     }
 
     pub fn is_expired(&self) -> bool {
-        self.age_secs() > TX_MAX_AGE_SECS
+        self.age_ms() > TX_MAX_AGE_MS
     }
 
     pub fn is_low_fee(&self) -> bool {
@@ -144,11 +144,11 @@ impl MempoolEviction {
     }
 }
 
-fn now_secs() -> u64 {
+fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs()
+        .as_millis() as u64
 }
 
 #[cfg(test)]
@@ -157,7 +157,7 @@ mod tests {
 
     fn entry(hash: &str, fee_rate: f64, age_secs: u64) -> EvictableEntry {
         let fee = (fee_rate * 200.0) as u64;
-        EvictableEntry::new(hash, fee, 200, now_secs().saturating_sub(age_secs))
+        EvictableEntry::new(hash, fee, 200, now_ms().saturating_sub(age_secs))
     }
 
     #[test]
@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn mixed_removes_expired() {
         let entries = vec![
-            entry("expired", 1.0, TX_MAX_AGE_SECS + 100),
+            entry("expired", 1.0, TX_MAX_AGE_MS + 100),
             entry("fresh", 1.0, 100),
         ];
         let res = MempoolEviction::select_evictable(&entries, &EvictionPolicy::Mixed, usize::MAX);
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn is_expired_after_timeout() {
-        let e = entry("tx", 1.0, TX_MAX_AGE_SECS + 10);
+        let e = entry("tx", 1.0, TX_MAX_AGE_MS + 10);
         assert!(e.is_expired());
     }
 

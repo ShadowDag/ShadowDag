@@ -91,7 +91,9 @@ impl KeyDerivation {
 
     /// Derive multiple child keys at sequential indices
     pub fn derive_children(parent_key: &[u8; 32], start: u32, count: u32) -> Vec<[u8; 32]> {
-        (start..start + count)
+        // saturating_add: avoid overflow panic when start + count exceeds u32::MAX
+        // (indices that high are out of range; we simply stop at the ceiling).
+        (start..start.saturating_add(count))
             .map(|i| Self::derive_child(parent_key, i))
             .collect()
     }

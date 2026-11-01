@@ -17,11 +17,22 @@
 
 use crate::domain::block::block_header::BlockHeader;
 
-/// Minimum cumulative difficulty to accept a chain as valid
-pub const MIN_CUMULATIVE_WORK: u64 = 1_000;
+/// Minimum cumulative difficulty to accept a chain as valid.
+/// Keep this in the same unit as `block_work` (difficulty units).
+pub const MIN_CUMULATIVE_WORK: u128 = 1_000;
 
-/// Maximum allowed timestamp gap between consecutive headers (1 hour)
-pub const MAX_HEADER_TIME_GAP_SECS: u64 = 3_600;
+/// Maximum allowed timestamp gap between consecutive headers.
+/// Keep aligned with consensus future-drift policy to reduce timewarp surface.
+pub const MAX_HEADER_TIME_GAP_SECS: u64 = 120;
+
+/// Char-safe truncation for log/error strings built from peer-supplied hashes.
+///
+/// `&s[..n]` byte-slices and PANICS if it lands inside a multibyte UTF-8
+/// codepoint. Peer headers carry an arbitrary `hash: String`, so a malicious
+/// header can crash the sync thread. Truncate by characters instead.
+fn short_hash(s: &str) -> String {
+    s.chars().take(16).collect()
+}
 
 /// Verification result
 #[derive(Debug, Clone)]
@@ -50,8 +61,8 @@ pub enum ChainVerifyResult {
         got: String,
     },
     InsufficientWork {
-        cumulative: u64,
-        required: u64,
+        cumulative: u128,
+        required: u128,
     },
     EmptyChain,
 }
@@ -65,13 +76,23 @@ pub struct Checkpoint {
 pub struct ChainVerifier {
     genesis_hash: String,
     checkpoints: Vec<Checkpoint>,
+    /// Network whose UmbraHash activation schedule this verifier enforces.
+    /// REQUIRED at construction: with the network-blind rule, a sync verifier
+    /// would accept a downgraded legacy header past the mainnet fork that the
+    /// authoritative validator rejects. Making it a constructor argument means a
+    /// future wiring cannot silently omit it.
+    network: crate::config::node::node_config::NetworkMode,
 }
 
 impl ChainVerifier {
-    pub fn new(genesis_hash: &str) -> Self {
+    pub fn new(
+        genesis_hash: &str,
+        network: crate::config::node::node_config::NetworkMode,
+    ) -> Self {
         Self {
             genesis_hash: genesis_hash.to_string(),
             checkpoints: Vec::new(),
+            network,
         }
     }
 
@@ -122,54 +143,20 @@ impl ChainVerifier {
             }
         }
 
-        let mut cumulative_work: u64 = 0;
+        let mut cumulative_work: u128 = 0;
         let mut prev_timestamp: u64 = 0;
         let mut prev_hash: Option<&str> = None;
         let mut prev_height: u64 = headers[0].height.saturating_sub(1);
 
         for header in headers {
-            // 2. PoW check — use PowValidator (numeric target comparison)
-            //    so sync verification matches consensus validation exactly.
-            //    The previous leading-zeros check silently skipped PoW for
-            //    difficulty > 64, and used a weaker difficulty metric than
-            //    the actual consensus rule.
-            // Recompute hash from header fields to prevent forgery.
-            // shadow_hash_raw_full computes from (version, height, timestamp,
-            // nonce, extra_nonce, difficulty, merkle_root, parents) — all
-            // available in the header without the block body.
-            {
-                use crate::engine::mining::algorithms::shadowhash::shadow_hash_raw_full;
-                let recomputed = shadow_hash_raw_full(
-                    header.version,
-                    header.height,
-                    header.timestamp,
-                    header.nonce,
-                    header.extra_nonce,
-                    header.difficulty,
-                    &header.merkle_root,
-                    &header.parents,
-                );
-                if recomputed != header.hash {
-                    return ChainVerifyResult::InvalidPoW {
-                        height: header.height,
-                        hash: format!(
-                            "hash mismatch: claimed {} != computed {}",
-                            &header.hash[..header.hash.len().min(16)],
-                            &recomputed[..recomputed.len().min(16)]
-                        ),
-                    };
-                }
-            }
-
-            if header.difficulty > 0 {
-                use crate::engine::mining::pow::pow_validator::PowValidator;
-                if !PowValidator::hash_meets_target(&header.hash, header.difficulty) {
-                    return ChainVerifyResult::InvalidPoW {
-                        height: header.height,
-                        hash: header.hash.clone(),
-                    };
-                }
-            } else if header.height > 0 {
+            // ORDERING IS SECURITY (external audit H3): the identity recompute
+            // below builds a 16 MiB UmbraHash epoch cache for the header's claimed
+            // height. It therefore runs AFTER the free checks — difficulty!=0,
+            // wall-clock, parent continuity and height continuity — so an
+            // attacker-chosen far height is rejected by a comparison instead of by
+            // hundreds of thousands of hashes. It is also tip-bounded against the
+            // previous header's height.
+            if header.difficulty == 0 && header.height > 0 {
                 // Non-genesis header with difficulty 0 is invalid — it would
                 // bypass PoW entirely.
                 return ChainVerifyResult::InvalidPoW {
@@ -182,11 +169,14 @@ impl ChainVerifier {
             // too far in the future. Without this, an attacker could
             // serve a chain with all timestamps set years ahead and
             // it would pass the relative monotonicity/gap checks.
+            // Header timestamps are epoch MILLISECONDS; compare against a ms bound
+            // (MAX_HEADER_TIME_GAP_SECS * 1000), else every real header is wrongly
+            // rejected as "future" (B4-L07).
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_secs();
-            if header.timestamp > now + MAX_HEADER_TIME_GAP_SECS {
+                .as_millis() as u64;
+            if header.timestamp > now + MAX_HEADER_TIME_GAP_SECS * 1000 {
                 return ChainVerifyResult::TimestampGap {
                     height: header.height,
                     gap_secs: header.timestamp - now,
@@ -203,7 +193,7 @@ impl ChainVerifier {
                         height: header.height,
                         hash: format!(
                             "parent continuity: expected parent {}",
-                            &ph[..ph.len().min(16)]
+                            short_hash(ph)
                         ),
                     };
                 }
@@ -226,17 +216,52 @@ impl ChainVerifier {
                 }
             }
 
-            // 3. Timestamp check — must be strictly increasing and within max gap
+            // 2d. PoW — the EXPENSIVE step, deliberately last (see the ordering
+            // note at the top of the loop). Recompute the identity hash from the
+            // header fields to prevent forgery: an attacker can otherwise send a
+            // fake hash that meets the target but does not correspond to the
+            // header content. Version-gated (UmbraHash for v>=UMBRA_POW_VERSION,
+            // else shadow_hash) and tip-bounded against the previous header.
+            {
+                use crate::engine::mining::pow::pow_validator::PowValidator;
+                let recomputed = PowValidator::recompute_identity_hash_checked(
+                    header,
+                    prev_height,
+                    Some(&self.network),
+                );
+                if recomputed != header.hash {
+                    return ChainVerifyResult::InvalidPoW {
+                        height: header.height,
+                        hash: format!(
+                            "hash mismatch: claimed {} != computed {}",
+                            short_hash(&header.hash),
+                            short_hash(&recomputed)
+                        ),
+                    };
+                }
+                if header.difficulty > 0
+                    && !PowValidator::hash_meets_target(&header.hash, header.difficulty)
+                {
+                    return ChainVerifyResult::InvalidPoW {
+                        height: header.height,
+                        hash: header.hash.clone(),
+                    };
+                }
+            }
+
+            // 3. Timestamp check — must be monotonic (non-decreasing) and within max gap.
+            // Equal timestamps are valid in 1-second resolution networks.
             if prev_timestamp > 0 {
-                if header.timestamp <= prev_timestamp {
+                if header.timestamp < prev_timestamp {
                     return ChainVerifyResult::TimestampBackward {
                         height: header.height,
                         timestamp: header.timestamp,
                         prev_timestamp,
                     };
                 }
+                // gap is a MILLISECOND delta; compare against the bound in ms (B4-L08).
                 let gap = header.timestamp - prev_timestamp;
-                if gap > MAX_HEADER_TIME_GAP_SECS {
+                if gap > MAX_HEADER_TIME_GAP_SECS * 1000 {
                     return ChainVerifyResult::TimestampGap {
                         height: header.height,
                         gap_secs: gap,
@@ -256,18 +281,10 @@ impl ChainVerifier {
                 }
             }
 
-            // 5. Accumulate work: use exponential metric (2^difficulty) not
-            // linear difficulty. A chain at difficulty 20 has ~1M times
-            // more work than difficulty 0, not 20 times more.
-            let block_work = if header.difficulty <= 63 {
-                1u64 << header.difficulty
-            } else {
-                // Cap at 2^63 (not u64::MAX) to preserve meaningful
-                // comparison between high-difficulty chains. u64::MAX
-                // saturates all chains above difficulty 63 to the same
-                // value, making cumulative work comparison useless.
-                1u64 << 63
-            };
+            // 5. Accumulate work in the same unit used by consensus retarget/PoW checks:
+            // difficulty units (target = MAX_TARGET / difficulty).
+            // This avoids unrealistic bit-shift work that collapses at high difficulties.
+            let block_work = u128::from(header.difficulty.max(1));
             cumulative_work = cumulative_work.saturating_add(block_work);
 
             prev_hash = Some(&header.hash);
@@ -294,6 +311,28 @@ impl ChainVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::node::node_config::NetworkMode;
+
+    #[test]
+    fn short_hash_is_char_safe_on_multibyte() {
+        // Byte-slicing &s[..16] would panic mid-codepoint; short_hash must not.
+        let s = "区".repeat(20); // each char is 3 bytes
+        let out = short_hash(&s);
+        assert_eq!(out.chars().count(), 16);
+        // A peer hash mixing ascii + multibyte around the 16-byte boundary.
+        let mixed = format!("ab{}", "好".repeat(10));
+        let _ = short_hash(&mixed); // must not panic
+    }
+
+    #[test]
+    fn verify_header_chain_does_not_panic_on_multibyte_hash() {
+        // A header whose hash is non-ASCII will mismatch the recomputed PoW
+        // hash and hit the short_hash formatting path — must return, not panic.
+        let cv = ChainVerifier::new("genesis", NetworkMode::Testnet);
+        let mut h = make_header(1, 1, 1_000, vec!["好".repeat(30)]);
+        h.hash = "好".repeat(30);
+        let _ = cv.verify_header_chain(&[h]); // no panic = pass
+    }
 
     /// Build a header with a real shadow_hash_raw_full so the hash
     /// recomputation check passes during verify_header_chain.
@@ -314,6 +353,7 @@ mod tests {
             difficulty,
             &merkle_root,
             &parents,
+            None,
         );
         BlockHeader {
             version: 1,
@@ -330,6 +370,8 @@ mod tests {
             extra_nonce: 0,
             receipt_root: None,
             state_root: None,
+            mix_hash: String::new(),
+            prev_state_commitment: None,
         }
     }
 
@@ -355,17 +397,19 @@ mod tests {
             extra_nonce: 0,
             receipt_root: None,
             state_root: None,
+            mix_hash: String::new(),
+            prev_state_commitment: None,
         }
     }
 
     #[test]
     fn valid_chain() {
         let genesis = make_header(0, 1, 1000, vec![]);
-        let cv = ChainVerifier::new(&genesis.hash);
-        // MIN_CUMULATIVE_WORK = 1000; difficulty 1 => work = 2 per block.
-        // Need ~500 blocks minimum.
+        let cv = ChainVerifier::new(&genesis.hash, NetworkMode::Testnet);
+        // MIN_CUMULATIVE_WORK = 1000; difficulty 1 => work = 1 per block.
+        // Need ~1000 blocks minimum.
         let mut headers = vec![genesis];
-        for i in 1..550u64 {
+        for i in 1..1100u64 {
             let prev_hash = headers.last().unwrap().hash.clone();
             headers.push(make_header(i, 1, 1000 + i * 100, vec![prev_hash]));
         }
@@ -377,7 +421,7 @@ mod tests {
 
     #[test]
     fn invalid_genesis() {
-        let cv = ChainVerifier::new("0000real_genesis");
+        let cv = ChainVerifier::new("0000real_genesis", NetworkMode::Testnet);
         // Use a real-hash header (hash won't match "0000real_genesis")
         let headers = vec![make_header(0, 1, 1000, vec![])];
         assert!(matches!(
@@ -390,7 +434,7 @@ mod tests {
     fn invalid_pow() {
         // Header with a bad hash will fail the hash recomputation check
         let genesis = make_header(0, 1, 1000, vec![]);
-        let cv = ChainVerifier::new(&genesis.hash);
+        let cv = ChainVerifier::new(&genesis.hash, NetworkMode::Testnet);
         let headers = vec![
             genesis.clone(),
             make_header_bad_hash(1, "abcd_no_zeros", 1, 2000),
@@ -404,9 +448,9 @@ mod tests {
     #[test]
     fn checkpoint_mismatch() {
         let genesis = make_header(0, 1, 1000, vec![]);
-        let mut cv = ChainVerifier::new(&genesis.hash);
+        let mut cv = ChainVerifier::new(&genesis.hash, NetworkMode::Testnet);
         // Set a checkpoint that the real hash won't match
-        let block1 = make_header(1, 1, 2000, vec![genesis.hash.clone()]);
+        let block1 = make_header(1, 1, 1100, vec![genesis.hash.clone()]);
         cv.add_checkpoint(1, "0000wrong_checkpoint_hash");
         let headers = vec![genesis, block1];
         assert!(matches!(
@@ -417,7 +461,7 @@ mod tests {
 
     #[test]
     fn empty_chain() {
-        let cv = ChainVerifier::new("0000genesis");
+        let cv = ChainVerifier::new("0000genesis", NetworkMode::Testnet);
         assert!(matches!(
             cv.verify_header_chain(&[]),
             ChainVerifyResult::EmptyChain
@@ -427,7 +471,7 @@ mod tests {
     #[test]
     fn backward_timestamp_rejected() {
         let genesis = make_header(0, 1, 5000, vec![]);
-        let cv = ChainVerifier::new(&genesis.hash);
+        let cv = ChainVerifier::new(&genesis.hash, NetworkMode::Testnet);
         // Block 1 has earlier timestamp — will fail recomputation then timestamp check
         // But since we need a real hash for block1, create it with earlier timestamp
         let block1 = make_header(1, 1, 4000, vec![genesis.hash.clone()]);
@@ -441,19 +485,21 @@ mod tests {
     #[test]
     fn equal_timestamp_rejected() {
         let genesis = make_header(0, 1, 5000, vec![]);
-        let cv = ChainVerifier::new(&genesis.hash);
+        let cv = ChainVerifier::new(&genesis.hash, NetworkMode::Testnet);
         let block1 = make_header(1, 1, 5000, vec![genesis.hash.clone()]);
         let headers = vec![genesis, block1];
-        assert!(matches!(
-            cv.verify_header_chain(&headers),
-            ChainVerifyResult::TimestampBackward { height: 1, .. }
-        ));
+        let res = cv.verify_header_chain(&headers);
+        assert!(
+            !matches!(res, ChainVerifyResult::TimestampBackward { height: 1, .. }),
+            "equal timestamps should be accepted as monotonic; got {:?}",
+            res
+        );
     }
 
     #[test]
     fn height_gap_rejected() {
         let genesis = make_header(0, 1, 5000, vec![]);
-        let cv = ChainVerifier::new(&genesis.hash);
+        let cv = ChainVerifier::new(&genesis.hash, NetworkMode::Testnet);
         // Skip from height 0 to height 5
         let block5 = make_header(5, 1, 6000, vec![genesis.hash.clone()]);
         let headers = vec![genesis, block5];
@@ -466,7 +512,7 @@ mod tests {
     #[test]
     fn no_checkpoints_mid_chain_rejected() {
         // Chain starting at height > 0 with no checkpoints configured
-        let cv = ChainVerifier::new("0000genesis");
+        let cv = ChainVerifier::new("0000genesis", NetworkMode::Testnet);
         let headers = vec![make_header(10, 4, 1000, vec![])];
         assert!(matches!(
             cv.verify_header_chain(&headers),
@@ -476,7 +522,7 @@ mod tests {
 
     #[test]
     fn genesis_verification() {
-        let cv = ChainVerifier::new("0000abc");
+        let cv = ChainVerifier::new("0000abc", NetworkMode::Testnet);
         assert!(cv.verify_genesis("0000abc"));
         assert!(!cv.verify_genesis("0000xyz"));
     }

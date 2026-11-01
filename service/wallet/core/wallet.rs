@@ -3,8 +3,22 @@
 //                     © ShadowDAG Project — All Rights Reserved
 // ═══════════════════════════════════════════════════════════════════════════
 
+use crate::config::node::node_config::NetworkMode;
+use crate::domain::address::address::Address;
+use crate::domain::address::invisible_wallet::InvisibleWallet;
+use crate::domain::block::block::Block;
 use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
+use crate::domain::transaction::tx_hash::TxHash;
+use crate::domain::utxo::utxo_set::UtxoSet;
+use crate::engine::privacy::ringct::builder::{
+    build_confidential_transaction, build_shield_transaction, ConfRecipient, OwnedInput, ShieldInput,
+};
+use crate::engine::privacy::ringct::decoy::select_decoys;
+use crate::engine::privacy::ringct::dual_clsag::RingMember;
+use crate::engine::privacy::ringct::scan::scan_confidential_output;
+use crate::engine::privacy::ringct::serialization::point_from_hex;
 use crate::errors::WalletError;
+use curve25519_dalek::scalar::Scalar;
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hex;
@@ -20,8 +34,19 @@ use zeroize::Zeroize;
 const PBKDF2_ITER: u32 = 600_000;
 const SALT_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
-const CHECKSUM_BYTES: usize = 4;
 const DUST_LIMIT: u64 = 546;
+/// Ring size for confidential sends: 1 real + (CONF_RING_SIZE-1) decoys.
+///
+/// Sourced from the crypto layer's DEFAULT_RING_SIZE (11) so the wallet and
+/// the ring primitives can never drift. A larger ring is a direct privacy win
+/// (each input hides among 11 outputs, not 5) and a UNIFORM size across wallets
+/// avoids the ring-size fingerprint that a small/odd ring would leak on-chain.
+/// Must stay within the consensus bounds [MIN_RING_SIZE=4, MAX_RING_SIZE=64]
+/// enforced by verify_confidential_tx. On a young chain with fewer than
+/// CONF_RING_SIZE-1 confidential outputs, build_confidential_send returns a
+/// clean "not enough decoys on-chain yet" error until the anonymity set grows.
+const CONF_RING_SIZE: usize =
+    crate::engine::privacy::ringct::ring_signature::DEFAULT_RING_SIZE;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct WalletAddress {
@@ -99,6 +124,23 @@ pub struct WalletState {
     pub accounts: Vec<WalletAccount>,
 }
 
+/// A confidential (RingCT) output owned by this wallet, recovered by scanning.
+/// The raw one-time spend secret is NOT stored — it is recovered on demand at
+/// spend time from `ephemeral_pubkey` + the wallet's view/spend scalars.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConfidentialUtxo {
+    pub txid: String,
+    pub index: u32,
+    pub amount: u64,
+    /// hex(Scalar.to_bytes()) — the Pedersen blinding (needed to spend).
+    pub blinding_hex: String,
+    /// hex(compressed point) — the real ring member (this output's one-time key).
+    pub one_time_pubkey: String,
+    /// hex(R) — ephemeral pubkey, used to recover the spend secret at spend time.
+    pub ephemeral_pubkey: String,
+    pub spent: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Wallet {
     state: WalletState,
@@ -108,6 +150,8 @@ pub struct Wallet {
     session_key: Option<Vec<u8>>,
     locked: bool,
     network: String,
+    #[serde(default)]
+    confidential_utxos: Vec<ConfidentialUtxo>,
 }
 
 impl Wallet {
@@ -124,6 +168,7 @@ impl Wallet {
             session_key: None,
             locked: true,
             network: network.to_string(),
+            confidential_utxos: Vec::new(),
         }
     }
 
@@ -138,6 +183,57 @@ impl Wallet {
 
         self.add_account(0, "Default Account")?;
         Ok((mnemonic, enc))
+    }
+
+    /// Restore a wallet from an existing recovery phrase, re-encrypting the
+    /// derived seed under `password`. Uses the SAME derivation as `create` (and
+    /// the Python/WASM SDKs), so the recovered addresses match byte-for-byte —
+    /// a phrase written down on one ShadowDAG tool restores everywhere. Returns
+    /// the encrypted seed to persist. Rejects an empty/blank phrase.
+    pub fn restore_from_mnemonic(
+        &mut self,
+        mnemonic: &[String],
+        password: &str,
+    ) -> Result<EncryptedSeed, WalletError> {
+        if mnemonic.is_empty() || mnemonic.iter().any(|w| w.trim().is_empty()) {
+            return Err(WalletError::Other("empty recovery phrase".into()));
+        }
+        // Reject non-standard word counts so a missing/extra-word typo fails loudly
+        // instead of silently deriving a different (empty) wallet. A full per-word
+        // checksum would change the derivation and break existing wallets (B6-L01).
+        if !matches!(mnemonic.len(), 12 | 15 | 18 | 21 | 24) {
+            return Err(WalletError::Other(format!(
+                "recovery phrase must be 12/15/18/21/24 words (got {})",
+                mnemonic.len()
+            )));
+        }
+        // Reject any word that this wallet's generator could never have produced.
+        // The scheme carries NO checksum (see the note on entropy_to_mnemonic_simple),
+        // so without this a mistyped word silently derives a DIFFERENT wallet and the
+        // user sees an empty balance instead of an error. Membership is checked
+        // as-typed: the wordlist is all-lowercase, and normalising case here would
+        // still derive from the normalised sentence, so a case-mangled phrase is
+        // reported rather than silently mapped. This only rejects; every phrase this
+        // wallet ever emitted still restores to the identical seed.
+        let wordlist: std::collections::HashSet<String> =
+            generate_bip39_wordlist().into_iter().collect();
+        for (i, w) in mnemonic.iter().enumerate() {
+            if !wordlist.contains(w.as_str()) {
+                return Err(WalletError::Other(format!(
+                    "word {} of the recovery phrase is not in this wallet's wordlist \
+                     (words are lowercase and 3-7 letters); check that word and retry",
+                    i + 1
+                )));
+            }
+        }
+        let seed = mnemonic_to_seed_simple(mnemonic, "");
+        let enc = encrypt_bytes(&seed, password)?;
+        self.session_key = Some(seed);
+        self.locked = false;
+        if self.state.accounts.is_empty() {
+            self.add_account(0, "Default Account")?;
+        }
+        Ok(enc)
     }
 
     pub fn restore_from_seed(&mut self, seed: Vec<u8>) -> Result<(), WalletError> {
@@ -167,6 +263,333 @@ impl Wallet {
             k.zeroize();
         }
         self.locked = true;
+    }
+
+    /// Stable 32-byte confidential master key derived from the unlocked seed.
+    /// The domain-separation tag is FIXED forever — changing it would make
+    /// previously-received confidential funds unrecoverable.
+    fn confidential_master_key(&self) -> Option<[u8; 32]> {
+        let seed = self.session_key.as_ref()?;
+        let mut h = Sha256::new();
+        h.update(b"ShadowDAG_conf_master_v1");
+        h.update(seed);
+        let out = h.finalize();
+        let mut mk = [0u8; 32];
+        mk.copy_from_slice(&out);
+        Some(mk)
+    }
+
+    /// Build the confidential (view/spend) key wallet from the seed. None if locked.
+    pub fn confidential_keys(&self) -> Option<InvisibleWallet> {
+        let mk = self.confidential_master_key()?;
+        InvisibleWallet::from_master_key(mk, &self.network).ok()
+    }
+
+    /// Reusable confidential receive address (`SD1p…`). None if locked.
+    pub fn confidential_receive_address(&self) -> Option<String> {
+        Some(self.confidential_keys()?.confidential_address())
+    }
+
+    /// Record a confidential UTXO (deduplicated by one-time pubkey).
+    pub fn add_confidential_utxo(&mut self, u: ConfidentialUtxo) {
+        if !self
+            .confidential_utxos
+            .iter()
+            .any(|e| e.one_time_pubkey == u.one_time_pubkey)
+        {
+            self.confidential_utxos.push(u);
+        }
+    }
+
+    /// Total spendable (unspent) confidential balance.
+    pub fn confidential_balance(&self) -> u64 {
+        self.confidential_utxos
+            .iter()
+            .filter(|u| !u.spent)
+            .map(|u| u.amount)
+            .sum()
+    }
+
+    /// All tracked confidential UTXOs (spent + unspent).
+    pub fn confidential_utxos(&self) -> &[ConfidentialUtxo] {
+        &self.confidential_utxos
+    }
+
+    /// Scan a transaction for confidential outputs owned by this wallet, record
+    /// any new ones, and return them. Uses `scan_confidential_output` (the same
+    /// context-free derivation the builder used) — NOT the tx-context stealth
+    /// scanner — so detection + amount recovery match what was produced.
+    pub fn scan_confidential(&mut self, tx: &Transaction) -> Vec<ConfidentialUtxo> {
+        let ck = match self.confidential_keys() {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        let (vs, sp) = (ck.view_scalar(), ck.spend_public());
+        let mut found = Vec::new();
+        for (idx, out) in tx.outputs.iter().enumerate() {
+            if let Some(rec) = scan_confidential_output(out, idx as u32, &vs, &sp) {
+                let u = ConfidentialUtxo {
+                    txid: tx.hash.clone(),
+                    index: idx as u32,
+                    amount: rec.amount,
+                    blinding_hex: hex::encode(rec.blinding.to_bytes()),
+                    one_time_pubkey: hex::encode(rec.one_time_pubkey.compress().as_bytes()),
+                    ephemeral_pubkey: out.ephemeral_pubkey.clone().unwrap_or_default(),
+                    spent: false,
+                };
+                let before = self.confidential_utxos.len();
+                self.add_confidential_utxo(u.clone());
+                if self.confidential_utxos.len() > before {
+                    found.push(u);
+                }
+            }
+        }
+
+        // Mark any of our confidential UTXOs spent if their key image appears in
+        // this tx's inputs (handles our own sends + sends from another device
+        // sharing the seed). The key image is deterministic from (spend_secret,
+        // one_time_pubkey), matching what the builder/consensus uses.
+        let input_kis: std::collections::HashSet<&str> = tx
+            .inputs
+            .iter()
+            .filter_map(|i| i.key_image.as_deref())
+            .collect();
+        if !input_kis.is_empty() {
+            for u in self.confidential_utxos.iter_mut().filter(|u| !u.spent) {
+                if let Some(ki) = confidential_key_image_hex(&ck, u) {
+                    if input_kis.contains(ki.as_str()) {
+                        u.spent = true;
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// Scan many blocks (e.g. from the node DB) and accumulate owned outputs.
+    /// Returns the count of newly-recorded confidential outputs.
+    pub fn scan_blocks(&mut self, blocks: &[Block]) -> usize {
+        let mut n = 0;
+        for b in blocks {
+            for tx in &b.body.transactions {
+                n += self.scan_confidential(tx).len();
+            }
+        }
+        n
+    }
+
+    /// Network as a `NetworkMode` (defaults to Mainnet if the string is unknown).
+    fn network_mode(&self) -> NetworkMode {
+        self.network.parse().unwrap_or(NetworkMode::Mainnet)
+    }
+
+    /// Build a confidential (RingCT) transaction sending `amount` to a confidential
+    /// payment address (`…1p`), with any change returned to this wallet. The
+    /// returned tx is unsigned-broadcast-ready (CLSAG-signed) — the caller submits
+    /// it via RPC `sendrawtransaction`. `utxo_set` is the node's confidential output
+    /// index (read-only), used for decoy selection + real-commitment lookup.
+    pub fn build_confidential_send(
+        &self,
+        recipient_addr: &str,
+        amount: u64,
+        fee: u64,
+        utxo_set: &UtxoSet,
+    ) -> Result<Transaction, WalletError> {
+        let ck = self.confidential_keys().ok_or(WalletError::Locked)?;
+        let net = self.network_mode();
+        let (view_pub, spend_pub) =
+            InvisibleWallet::parse_confidential_address(recipient_addr, &self.network)
+                .map_err(|e| WalletError::Other(format!("bad recipient address: {}", e)))?;
+
+        let need = amount
+            .checked_add(fee)
+            .ok_or_else(|| WalletError::Other("amount+fee overflow".into()))?;
+
+        // Select unspent confidential UTXOs, largest-first, until they cover need.
+        let mut chosen: Vec<&ConfidentialUtxo> =
+            self.confidential_utxos.iter().filter(|u| !u.spent).collect();
+        chosen.sort_by(|a, b| b.amount.cmp(&a.amount));
+        let mut inputs_total = 0u64;
+        let mut picked: Vec<&ConfidentialUtxo> = Vec::new();
+        for u in chosen {
+            if inputs_total >= need {
+                break;
+            }
+            inputs_total += u.amount;
+            picked.push(u);
+        }
+        if inputs_total < need {
+            return Err(WalletError::Other("insufficient confidential funds".into()));
+        }
+
+        // Build one OwnedInput per picked UTXO (ring + recovered spend secret).
+        let mut owned = Vec::with_capacity(picked.len());
+        for u in &picked {
+            let real_pk = point_from_hex(&u.one_time_pubkey)
+                .ok_or_else(|| WalletError::Other("bad one-time pubkey".into()))?;
+            let real_c = utxo_set
+                .output_key_commitment(&u.one_time_pubkey)
+                .and_then(|c| point_from_hex(&c))
+                .ok_or_else(|| WalletError::Other("real output not on-chain yet".into()))?;
+            let mut ring =
+                select_decoys(utxo_set, CONF_RING_SIZE - 1, std::slice::from_ref(&u.one_time_pubkey))
+                    .ok_or_else(|| WalletError::Other("not enough decoys on-chain yet".into()))?;
+            // PRIVACY: insert the real member at a UNIFORMLY RANDOM position.
+            // Appending it last would make the real spend positionally
+            // identifiable on-chain (the last ring member would always be the
+            // real one) — a full deanonymization of every confidential input.
+            let real_index = {
+                use rand::Rng;
+                rand::rngs::OsRng.gen_range(0..=ring.len())
+            };
+            ring.insert(
+                real_index,
+                RingMember {
+                    public_key: real_pk,
+                    commitment: real_c,
+                },
+            );
+            // Recover the one-time spend secret from the stored ephemeral pubkey.
+            let eph = point_from_hex(&u.ephemeral_pubkey)
+                .ok_or_else(|| WalletError::Other("bad ephemeral pubkey".into()))?;
+            let spend_secret = ck
+                .derive_spend_key_for(&eph)
+                .map_err(|e| WalletError::Other(format!("spend-secret recovery failed: {}", e)))?;
+            let blinding = scalar_from_hex(&u.blinding_hex)
+                .ok_or_else(|| WalletError::Other("bad blinding".into()))?;
+            owned.push(OwnedInput {
+                spend_secret,
+                amount: u.amount,
+                blinding,
+                ring,
+                real_index,
+            });
+        }
+
+        // Recipients: the target + change back to self (rescannable + spendable).
+        let mut recipients = vec![ConfRecipient {
+            view_pub,
+            spend_pub,
+            amount,
+        }];
+        let change = inputs_total - need;
+        if change > 0 {
+            recipients.push(ConfRecipient {
+                view_pub: ck.view_public(),
+                spend_pub: ck.spend_public(),
+                amount: change,
+            });
+        }
+
+        build_confidential_transaction(owned, recipients, fee, &net)
+            .map_err(|e| WalletError::Other(format!("build confidential tx failed: {}", e)))
+    }
+
+    /// Build a SHIELD transaction: move `amount` of this wallet's TRANSPARENT
+    /// balance into the confidential pool. The `amount` goes to a confidential
+    /// payment address (`…1p`); any change returns to THIS wallet's own
+    /// confidential address (change is confidential too — it never leaks back to
+    /// a transparent output). The returned tx is Ed25519-signed and
+    /// broadcast-ready; the caller submits it via RPC `sendrawtransaction`.
+    ///
+    /// This is the bootstrap into the confidential pool: with no confidential
+    /// UTXOs yet, `build_confidential_send` has nothing to spend — a shield
+    /// creates the first confidential outputs from transparent funds.
+    pub fn build_shield(
+        &self,
+        from_account: u32,
+        recipient_addr: &str,
+        amount: u64,
+        fee: u64,
+    ) -> Result<Transaction, WalletError> {
+        if self.locked {
+            return Err(WalletError::Locked);
+        }
+        let ck = self.confidential_keys().ok_or(WalletError::Locked)?;
+        let net = self.network_mode();
+        let (view_pub, spend_pub) =
+            InvisibleWallet::parse_confidential_address(recipient_addr, &self.network)
+                .map_err(|e| WalletError::Other(format!("bad recipient address: {}", e)))?;
+
+        let seed = self
+            .session_key
+            .as_ref()
+            .ok_or(WalletError::Locked)?
+            .clone();
+        let acc = self
+            .account(from_account)
+            .ok_or(WalletError::Other("Account not found".into()))?
+            .clone();
+
+        let need = amount
+            .checked_add(fee)
+            .ok_or_else(|| WalletError::Other("amount+fee overflow".into()))?;
+
+        // Gather this account's transparent UTXOs, largest-first, until covered.
+        let mut utxos: Vec<Walletutxo> = acc
+            .addresses
+            .iter()
+            .flat_map(|a| self.utxos_for(&a.address))
+            .cloned()
+            .collect();
+        utxos.sort_by(|a, b| b.amount.cmp(&a.amount));
+        let mut total_in = 0u64;
+        let mut selected: Vec<Walletutxo> = Vec::new();
+        for u in utxos {
+            if total_in >= need {
+                break;
+            }
+            total_in = total_in
+                .checked_add(u.amount)
+                .ok_or(WalletError::BalanceOverflow)?;
+            selected.push(u);
+        }
+        if total_in < need {
+            return Err(WalletError::InsufficientFunds {
+                need,
+                have: total_in,
+            });
+        }
+
+        // One ShieldInput per selected UTXO, each carrying the address's derived
+        // Ed25519 signing key (the builder signs the transparent message).
+        let mut inputs = Vec::with_capacity(selected.len());
+        for utxo in &selected {
+            let wa = acc
+                .addresses
+                .iter()
+                .find(|a| a.address == utxo.address)
+                .ok_or(WalletError::AddressNotFound(utxo.address.clone()))?;
+            let sk = derive_key(&seed, wa.account, wa.index, wa.is_change)?;
+            inputs.push(ShieldInput {
+                txid: utxo.txid.clone(),
+                index: utxo.index,
+                owner: utxo.address.clone(),
+                amount: utxo.amount,
+                pub_key_hex: wa.public_key.clone(),
+                signing_key: sk,
+            });
+        }
+
+        // Recipients: the target + confidential change back to self. Amount
+        // balance is exact (Σ inputs == Σ recipients + fee), so the change
+        // absorbs the remainder — no dust is silently burned into the fee.
+        let mut recipients = vec![ConfRecipient {
+            view_pub,
+            spend_pub,
+            amount,
+        }];
+        let change = total_in - need;
+        if change > 0 {
+            recipients.push(ConfRecipient {
+                view_pub: ck.view_public(),
+                spend_pub: ck.spend_public(),
+                amount: change,
+            });
+        }
+
+        build_shield_transaction(inputs, recipients, fee, &net)
+            .map_err(|e| WalletError::Other(format!("build shield tx failed: {}", e)))
     }
 
     pub fn is_locked(&self) -> bool {
@@ -387,7 +810,7 @@ impl Wallet {
             .ok_or(WalletError::BalanceOverflow)?;
         if avail_bal < amount.saturating_add(fee) {
             return Err(WalletError::InsufficientFunds {
-                need: amount + fee,
+                need: amount.saturating_add(fee),
                 have: avail_bal,
             });
         }
@@ -409,46 +832,13 @@ impl Wallet {
             .as_ref()
             .ok_or(WalletError::Other("No session key".to_string()))?
             .clone();
+        let net: NetworkMode = self.network.parse().unwrap_or(NetworkMode::Mainnet);
+        let ts = unix_now();
 
-        let mut signed_inputs = Vec::new();
-        for utxo in &selected {
-            // Find which address owns this UTXO and derive the correct key
-            let wa = acc
-                .addresses
-                .iter()
-                .find(|a| a.address == utxo.address)
-                .ok_or(WalletError::AddressNotFound(utxo.address.clone()))?;
-            let sk = derive_key(&seed, wa.account, wa.index, wa.is_change)?;
-            // FIXED: Use the SAME signing message format as TxValidator (TxHash::signing_message)
-            // Format: SHA-256(CHAIN_ID || txid || index || to_address || amount || fee)
-            let chain_id = match self.network.as_str() {
-                "mainnet" => 0xDA0C_0001u32,
-                "testnet" => 0xDA0C_0002u32,
-                "regtest" => 0xDA0C_0003u32,
-                _ => 0xDA0C_0001u32, // fallback to mainnet
-            };
-            let mut h = sha2::Sha256::new();
-            sha2::Digest::update(&mut h, chain_id.to_le_bytes()); // Chain ID
-            sha2::Digest::update(&mut h, utxo.txid.as_bytes());
-            sha2::Digest::update(&mut h, utxo.index.to_le_bytes());
-            sha2::Digest::update(&mut h, to_address.as_bytes());
-            sha2::Digest::update(&mut h, amount.to_le_bytes());
-            sha2::Digest::update(&mut h, fee.to_le_bytes());
-            let msg = sha2::Digest::finalize(h);
-            let sig: Signature = sk.sign(&msg);
-            signed_inputs.push(SignedInput {
-                txid: utxo.txid.clone(),
-                index: utxo.index,
-                signature: hex::encode(sig.to_bytes()),
-                pub_key: wa.public_key.clone(),
-                address: utxo.address.clone(),
-            });
-        }
-
-        let mut outputs = vec![TxOut {
-            address: to_address.to_string(),
-            amount,
-        }];
+        // Outputs: recipient first, then change-to-self on a fresh canonical
+        // change address when it clears the dust threshold. Both must be known
+        // before hashing because the txid commits to the outputs.
+        let mut outputs = vec![TxOutput::new(to_address.to_string(), amount)];
         if change > DUST_LIMIT {
             let next_idx = acc
                 .addresses
@@ -458,62 +848,124 @@ impl Wallet {
                 .max()
                 .map(|x| x + 1)
                 .unwrap_or(1);
-            let change_addr = match self.derive_change_address(from_account, next_idx) {
-                Ok(wa) => wa.address,
-                Err(_) => {
-                    return Err(WalletError::Other("cannot derive change address".into()));
-                }
-            };
-            outputs.push(TxOut {
-                address: change_addr,
-                amount: change,
+            let change_addr = self
+                .derive_change_address(from_account, next_idx)
+                .map_err(|_| WalletError::Other("cannot derive change address".into()))?
+                .address;
+            outputs.push(TxOutput::new(change_addr, change));
+        }
+
+        // Build the REAL consensus transaction. owner + pub_key are set now
+        // (the txid commits to them); signatures are filled after hashing since
+        // canonical_bytes excludes signatures (Bitcoin-style, no circular hash).
+        let mut tx_inputs: Vec<TxInput> = Vec::with_capacity(selected.len());
+        for utxo in &selected {
+            let wa = acc
+                .addresses
+                .iter()
+                .find(|a| a.address == utxo.address)
+                .ok_or(WalletError::AddressNotFound(utxo.address.clone()))?;
+            tx_inputs.push(TxInput {
+                txid: utxo.txid.clone(),
+                index: utxo.index,
+                owner: utxo.address.clone(),
+                signature: String::new(),
+                pub_key: wa.public_key.clone(),
+                key_image: None,
+                ring_members: None,
+                ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
+                shield_blinding: None,
             });
         }
 
-        let txid = compute_txid(&signed_inputs, &outputs, fee);
+        let mut tx = Transaction::new(String::new(), tx_inputs, outputs, fee, ts);
+        // Canonical txid, then the signing message over that txid — the EXACT
+        // scheme the node validates (TxHash::{hash,signing_message}_for_network)
+        // and the WASM/Python SDKs replicate byte-for-byte.
+        tx.hash = TxHash::hash_for_network(&tx, &net);
+        let signing_msg = TxHash::signing_message_for_network(&tx, &net);
+
+        // Sign each input with the key that owns its UTXO. Every input signs the
+        // same tx-wide message but with its own key (multi-address spend safe).
+        for (i, utxo) in selected.iter().enumerate() {
+            let wa = acc
+                .addresses
+                .iter()
+                .find(|a| a.address == utxo.address)
+                .ok_or(WalletError::AddressNotFound(utxo.address.clone()))?;
+            let sk = derive_key(&seed, wa.account, wa.index, wa.is_change)?;
+            let sig: Signature = sk.sign(&signing_msg);
+            tx.inputs[i].signature = hex::encode(sig.to_bytes());
+        }
+
+        // Wallet-local views for CLI display, plus the broadcast-ready JSON.
+        // `raw_hex` now carries the serialized consensus Transaction that
+        // `sendrawtransaction` accepts (params[0] = this JSON string), NOT a
+        // placeholder.
+        let signed_inputs: Vec<SignedInput> = tx
+            .inputs
+            .iter()
+            .map(|inp| SignedInput {
+                txid: inp.txid.clone(),
+                index: inp.index,
+                signature: inp.signature.clone(),
+                pub_key: inp.pub_key.clone(),
+                address: inp.owner.clone(),
+            })
+            .collect();
+        let outputs: Vec<TxOut> = tx
+            .outputs
+            .iter()
+            .map(|o| TxOut {
+                address: o.address.clone(),
+                amount: o.amount,
+            })
+            .collect();
+        let raw_json = serde_json::to_string(&tx)
+            .map_err(|e| WalletError::Other(format!("serialize tx: {}", e)))?;
 
         Ok(BuiltTx {
-            txid: txid.clone(),
+            txid: tx.hash.clone(),
             inputs: signed_inputs,
             outputs,
             fee,
             memo: memo.to_string(),
-            timestamp: unix_now(),
-            raw_hex: format!("raw:{}", txid),
+            timestamp: ts,
+            raw_hex: raw_json,
         })
     }
 
-    /// Validate a ShadowDAG address.
+    /// Validate a ShadowDAG address on this wallet's network.
     ///
-    /// Address format produced by `make_address`:
-    ///   prefix (2 chars: "SD"/"ST"/"SR") + hex(version(1) + hash(32) + checksum(4))
-    ///   = prefix(2) + 74 hex chars = 76 total chars for standard addresses.
-    ///
-    /// Stealth addresses use a 4-char prefix ("SD1s"/"ST1s"/"SR1s") + 40 hex = 44 total.
+    /// Canonical forms (all `SD1`/`ST1`/`SR1`-prefixed):
+    ///   Standard:     `SD1` + 40 hex (20-byte SHA-256 pubkey hash)
+    ///   Typed s/k/h:  `SD1s`/`SD1k`/`SD1h` + 40 hex (stealth / Schnorr / P2SH)
+    ///   Confidential: `SD1p` + 136 hex (view_pub‖spend_pub + checksum)
+    /// `s`/`k`/`h`/`p` are not hex digits, so the subtype is unambiguous.
     pub fn is_valid_address(&self, addr: &str) -> bool {
-        let prefix = match self.network.as_str() {
-            "testnet" => "ST",
-            "regtest" => "SR",
-            _ => "SD",
+        let net_prefix = match self.network.as_str() {
+            "testnet" => "ST1",
+            "regtest" => "SR1",
+            _ => "SD1",
         };
-        if !addr.starts_with(prefix) {
-            return false;
-        }
-        let after_net = &addr[prefix.len()..];
+        let after = match addr.strip_prefix(net_prefix) {
+            Some(a) => a,
+            None => return false,
+        };
 
-        // Stealth addresses: prefix + "1s" + 40 hex = 4-char prefix total
-        if after_net.starts_with("1s") || after_net.starts_with("1c") || after_net.starts_with("1m")
-        {
-            let hex_part = &after_net[2..];
-            return hex_part.len() == 40 && hex_part.chars().all(|c| c.is_ascii_hexdigit());
+        // Confidential payment address: "p" + 136 hex.
+        if let Some(rest) = after.strip_prefix('p') {
+            return rest.len() == 136 && rest.bytes().all(|b| b.is_ascii_hexdigit());
         }
-
-        // Standard addresses: prefix(2) + 74 hex chars (version + hash + checksum)
-        // 74 hex chars = 37 bytes: 1 version + 32 hash + 4 checksum
-        if after_net.len() != 74 {
-            return false;
+        // Typed addresses: subtype char (s/k/h) + 40 hex.
+        if matches!(after.as_bytes().first(), Some(b's' | b'k' | b'h')) {
+            let body = &after[1..];
+            return body.len() == 40 && body.bytes().all(|b| b.is_ascii_hexdigit());
         }
-        after_net.chars().all(|c| c.is_ascii_hexdigit())
+        // Standard address: exactly 40 hex chars.
+        after.len() == 40 && after.bytes().all(|b| b.is_ascii_hexdigit())
     }
 
     /// Select UTXOs from an account to cover the requested amount.
@@ -577,18 +1029,34 @@ impl Wallet {
         let total_needed = value.saturating_add(fee);
         let (selected, total_in) = self.select_utxos(&acc, total_needed)?;
 
-        let inputs: Vec<TxInput> = selected
-            .iter()
-            .map(|u| TxInput {
+        let seed = self
+            .session_key
+            .as_ref()
+            .ok_or(WalletError::Other("No session key".to_string()))?
+            .clone();
+        let net: NetworkMode = self.network.parse().unwrap_or(NetworkMode::Mainnet);
+
+        let mut inputs: Vec<TxInput> = Vec::with_capacity(selected.len());
+        for u in &selected {
+            let wa = acc
+                .addresses
+                .iter()
+                .find(|a| a.address == u.address)
+                .ok_or(WalletError::AddressNotFound(u.address.clone()))?;
+            inputs.push(TxInput {
                 txid: u.txid.clone(),
                 index: u.index,
-                owner: addr.clone(),
+                owner: u.address.clone(),
                 signature: String::new(),
-                pub_key: String::new(),
+                pub_key: wa.public_key.clone(),
                 key_image: None,
                 ring_members: None,
-            })
-            .collect();
+                ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
+                shield_blinding: None,
+            });
+        }
 
         let mut outputs = vec![TxOutput {
             address: "contract_deploy".into(), // placeholder — actual address computed by VM
@@ -596,6 +1064,8 @@ impl Wallet {
             commitment: None,
             range_proof: None,
             ephemeral_pubkey: None,
+            one_time_pubkey: None,
+            encrypted_amount: None,
         }];
 
         // Change output if needed
@@ -607,18 +1077,17 @@ impl Wallet {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             });
         }
 
-        let tx = Transaction {
-            hash: String::new(), // computed after signing
+        let mut tx = Transaction {
+            hash: String::new(),
             inputs,
             outputs,
             fee,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            timestamp: unix_now(),
             is_coinbase: false,
             tx_type: TxType::ContractCreate,
             payload_hash: None,
@@ -629,8 +1098,18 @@ impl Wallet {
             vm_version: Some(1),
         };
 
-        // Sign (use existing signing logic from build_tx)
-        // For now, return unsigned — signing requires private key access
+        tx.hash = TxHash::hash_for_network(&tx, &net);
+        let signing_msg = TxHash::signing_message_for_network(&tx, &net);
+        for (i, u) in selected.iter().enumerate() {
+            let wa = acc
+                .addresses
+                .iter()
+                .find(|a| a.address == u.address)
+                .ok_or(WalletError::AddressNotFound(u.address.clone()))?;
+            let sk = derive_key(&seed, wa.account, wa.index, wa.is_change)?;
+            let sig: Signature = sk.sign(&signing_msg);
+            tx.inputs[i].signature = hex::encode(sig.to_bytes());
+        }
         Ok(tx)
     }
 
@@ -660,18 +1139,34 @@ impl Wallet {
         let total_needed = value.saturating_add(fee);
         let (selected, total_in) = self.select_utxos(&acc, total_needed)?;
 
-        let inputs: Vec<TxInput> = selected
-            .iter()
-            .map(|u| TxInput {
+        let seed = self
+            .session_key
+            .as_ref()
+            .ok_or(WalletError::Other("No session key".to_string()))?
+            .clone();
+        let net: NetworkMode = self.network.parse().unwrap_or(NetworkMode::Mainnet);
+
+        let mut inputs: Vec<TxInput> = Vec::with_capacity(selected.len());
+        for u in &selected {
+            let wa = acc
+                .addresses
+                .iter()
+                .find(|a| a.address == u.address)
+                .ok_or(WalletError::AddressNotFound(u.address.clone()))?;
+            inputs.push(TxInput {
                 txid: u.txid.clone(),
                 index: u.index,
-                owner: addr.clone(),
+                owner: u.address.clone(),
                 signature: String::new(),
-                pub_key: String::new(),
+                pub_key: wa.public_key.clone(),
                 key_image: None,
                 ring_members: None,
-            })
-            .collect();
+                ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
+                shield_blinding: None,
+            });
+        }
 
         let mut outputs = vec![TxOutput {
             address: contract_addr.to_string(),
@@ -679,6 +1174,8 @@ impl Wallet {
             commitment: None,
             range_proof: None,
             ephemeral_pubkey: None,
+            one_time_pubkey: None,
+            encrypted_amount: None,
         }];
 
         let change = total_in.saturating_sub(total_needed);
@@ -689,18 +1186,17 @@ impl Wallet {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             });
         }
 
-        Ok(Transaction {
+        let mut tx = Transaction {
             hash: String::new(),
             inputs,
             outputs,
             fee,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            timestamp: unix_now(),
             is_coinbase: false,
             tx_type: TxType::ContractCall,
             payload_hash: None,
@@ -709,7 +1205,21 @@ impl Wallet {
             calldata: Some(calldata),
             contract_address: Some(contract_addr.to_string()),
             vm_version: Some(1),
-        })
+        };
+
+        tx.hash = TxHash::hash_for_network(&tx, &net);
+        let signing_msg = TxHash::signing_message_for_network(&tx, &net);
+        for (i, u) in selected.iter().enumerate() {
+            let wa = acc
+                .addresses
+                .iter()
+                .find(|a| a.address == u.address)
+                .ok_or(WalletError::AddressNotFound(u.address.clone()))?;
+            let sk = derive_key(&seed, wa.account, wa.index, wa.is_change)?;
+            let sig: Signature = sk.sign(&signing_msg);
+            tx.inputs[i].signature = hex::encode(sig.to_bytes());
+        }
+        Ok(tx)
     }
 }
 
@@ -765,12 +1275,25 @@ fn derive_key(
         .map_err(|e| WalletError::KeyDerivation(e.to_string()))?;
     mac.update(path.as_bytes());
     let res = mac.finalize().into_bytes();
-    let key: [u8; 32] = res[..32]
-        .try_into()
-        .map_err(|_| WalletError::KeyDerivation("Key slice error".to_string()))?;
+    let key: [u8; 32] = res
+        .get(..32)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| WalletError::KeyDerivation("Key slice error".to_string()))?;
     Ok(SigningKey::from_bytes(&key))
 }
 
+/// Canonical ShadowDAG address from an Ed25519 public key (hex).
+///
+/// Produces the ONLY form consensus recognizes:
+/// `prefix + hex(SHA256("ShadowDAG_Addr_v1" || pubkey)[..20])` (SD1/ST1/SR1 +
+/// 40 hex), identical to `domain::address::Address::from_public_key` and to the
+/// WASM/Python SDKs byte-for-byte. `tx_validator::verify_input_ownership`
+/// re-derives this exact string from the input pub_key and requires it to equal
+/// the UTXO owner, so coinbase/transfers to this address are spendable.
+///
+/// (Historically this emitted an SD+74hex Sha3 form that no pubkey could ever
+/// derive to, making every wallet-generated address unspendable — the ST0..
+/// bug. Do NOT reintroduce a non-canonical address here.)
 fn make_address(pub_hex: &str, network: &str) -> Result<String, WalletError> {
     let pub_bytes = hex::decode(pub_hex)
         .map_err(|e| WalletError::Other(format!("invalid public key hex: {}", e)))?;
@@ -780,37 +1303,7 @@ fn make_address(pub_hex: &str, network: &str) -> Result<String, WalletError> {
             pub_bytes.len()
         )));
     }
-    let hash = Sha3_256::digest(&pub_bytes);
-    let version = match network {
-        "testnet" => 0x01u8,
-        "regtest" => 0x02,
-        _ => 0x00,
-    };
-    let mut payload = vec![version];
-    payload.extend_from_slice(&hash);
-    let cs = &Sha3_256::digest(Sha3_256::digest(&payload))[..CHECKSUM_BYTES];
-    payload.extend_from_slice(cs);
-    let prefix = match network {
-        "testnet" => "ST",
-        "regtest" => "SR",
-        _ => "SD",
-    };
-    Ok(format!("{}{}", prefix, hex::encode(&payload)))
-}
-
-fn compute_txid(inputs: &[SignedInput], outputs: &[TxOut], fee: u64) -> String {
-    let mut h = Sha3_256::new();
-    for inp in inputs {
-        h.update(inp.txid.as_bytes());
-        h.update(inp.index.to_le_bytes());
-        h.update(inp.signature.as_bytes());
-    }
-    for out in outputs {
-        h.update(out.address.as_bytes());
-        h.update(out.amount.to_le_bytes());
-    }
-    h.update(fee.to_le_bytes());
-    hex::encode(h.finalize())
+    Ok(Address::from_public_key(&pub_bytes, network).value)
 }
 
 fn entropy_to_mnemonic_simple(entropy: &[u8]) -> Vec<String> {
@@ -937,16 +1430,488 @@ fn decrypt_bytes(
 }
 
 fn unix_now() -> u64 {
+    // Unix epoch MILLISECONDS (wallet tx timestamps are ms).
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs()
+        .as_millis() as u64
+}
+
+/// Decode a hex-encoded canonical Ristretto scalar (32 bytes).
+fn scalar_from_hex(s: &str) -> Option<Scalar> {
+    let b = hex::decode(s).ok()?;
+    let arr: [u8; 32] = b.try_into().ok()?;
+    Option::from(Scalar::from_canonical_bytes(arr))
+}
+
+/// Compute the on-chain key image (hex) for one of our confidential UTXOs, using
+/// the SAME derivation the builder/consensus use:
+/// `key_image(spend_secret, one_time_pubkey)`. The spend secret is recovered
+/// from the stored ephemeral pubkey. Returns None if any decode/recovery fails.
+fn confidential_key_image_hex(ck: &InvisibleWallet, u: &ConfidentialUtxo) -> Option<String> {
+    let otk = point_from_hex(&u.one_time_pubkey)?;
+    let eph = point_from_hex(&u.ephemeral_pubkey)?;
+    let spend_secret = ck.derive_spend_key_for(&eph).ok()?;
+    let ki = crate::engine::privacy::ringct::dual_clsag::key_image(&spend_secret, &otk);
+    Some(hex::encode(ki.compress().as_bytes()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Reference vectors pinning the wallet's address-derivation chain. The
+    // standalone wasm-sdk crate replicates this exact chain; these assertions
+    // pin the format so any change here flags that wasm-sdk must be updated.
+    #[test]
+    fn wasm_sdk_reference_vectors() {
+        use crate::domain::address::address::Address;
+
+        // V1: public key of 32 0x01 bytes -> mainnet address.
+        let a1 = Address::from_public_key(&[1u8; 32], "mainnet");
+        assert!(a1.value.starts_with("SD1") && a1.value.len() == 43);
+
+        // V2: seed of 64 0x02 bytes -> derive_key(acct=0, idx=0, change=false).
+        let sk = derive_key(&[2u8; 64], 0, 0, false).unwrap();
+        let pk = sk.verifying_key().to_bytes();
+        let a2 = Address::from_public_key(&pk, "mainnet");
+
+        // V3: full mnemonic path (entropy 32x0x03 -> words -> seed -> address).
+        let words = entropy_to_mnemonic_simple(&[3u8; 32]);
+        let seed = mnemonic_to_seed_simple(&words, "");
+        let sk3 = derive_key(&seed, 0, 0, false).unwrap();
+        let pk3 = sk3.verifying_key().to_bytes();
+        let a3 = Address::from_public_key(&pk3, "mainnet");
+
+        println!("WASM_VEC V1_pubkey_ones_addr = {}", a1.value);
+        println!("WASM_VEC V2_seed_twos_pubkey = {}", hex::encode(pk));
+        println!("WASM_VEC V2_seed_twos_addr   = {}", a2.value);
+        println!("WASM_VEC V3_mnemonic         = {}", words.join(" "));
+        println!("WASM_VEC V3_seed_hex         = {}", hex::encode(&seed));
+        println!("WASM_VEC V3_addr             = {}", a3.value);
+    }
+
+    #[test]
+    fn scanning_own_spend_marks_utxo_spent() {
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::utxo::utxo_set::UtxoSet;
+        use crate::engine::privacy::ringct::builder::{
+            build_confidential_transaction, ConfRecipient, OwnedInput,
+        };
+        use crate::engine::privacy::ringct::dual_clsag::RingMember;
+        use curve25519_dalek::ristretto::RistrettoPoint;
+        use curve25519_dalek::{constants::RISTRETTO_BASEPOINT_POINT as G, scalar::Scalar};
+        use rand::rngs::OsRng;
+
+        let net = NetworkMode::Mainnet;
+        let h = crate::engine::privacy::confidential::pedersen::generator_h();
+        let set = UtxoSet::new_empty();
+        let rec = |set: &UtxoSet, pk: RistrettoPoint, c: RistrettoPoint| {
+            set.record_confidential_output_indexed(
+                &hex::encode(pk.compress().as_bytes()),
+                &hex::encode(c.compress().as_bytes()),
+            )
+            .unwrap();
+        };
+        // Seed enough confidential outputs for a full CONF_RING_SIZE ring
+        // (needs CONF_RING_SIZE-1 = 10 decoys per input), with margin.
+        for _ in 0..24 {
+            rec(&set, Scalar::random(&mut OsRng) * G, Scalar::from(9u64) * h + Scalar::random(&mut OsRng) * G);
+        }
+
+        let mut a = Wallet::new("mainnet");
+        a.restore_from_seed(vec![44u8; 32]).unwrap();
+        let ack = a.confidential_keys().unwrap();
+        let mut b = Wallet::new("mainnet");
+        b.restore_from_seed(vec![55u8; 32]).unwrap();
+
+        // Seed A's 100-output and scan it in.
+        let spend = Scalar::random(&mut OsRng);
+        let bl = Scalar::random(&mut OsRng);
+        let real_pk = spend * G;
+        let real_c = Scalar::from(100u64) * h + bl * G;
+        rec(&set, real_pk, real_c);
+        let mut ring = crate::engine::privacy::ringct::decoy::select_decoys(
+            &set,
+            4,
+            &[hex::encode(real_pk.compress().as_bytes())],
+        )
+        .unwrap();
+        ring.push(RingMember { public_key: real_pk, commitment: real_c });
+        let ri = ring.len() - 1;
+        let seed_tx = build_confidential_transaction(
+            vec![OwnedInput { spend_secret: spend, amount: 100, blinding: bl, ring, real_index: ri }],
+            vec![ConfRecipient { view_pub: ack.view_public(), spend_pub: ack.spend_public(), amount: 100 }],
+            0,
+            &net,
+        )
+        .unwrap();
+        for out in &seed_tx.outputs {
+            rec(
+                &set,
+                point_from_hex(out.one_time_pubkey.as_ref().unwrap()).unwrap(),
+                point_from_hex(out.commitment.as_ref().unwrap()).unwrap(),
+            );
+        }
+        assert_eq!(a.scan_confidential(&seed_tx).len(), 1);
+        assert_eq!(a.confidential_balance(), 100);
+
+        // A spends 100 to B (no change). Scanning that tx must mark A's UTXO spent.
+        let tx = a
+            .build_confidential_send(&b.confidential_receive_address().unwrap(), 100, 0, &set)
+            .unwrap();
+        a.scan_confidential(&tx);
+        assert_eq!(a.confidential_balance(), 0, "spent UTXO must drop from balance");
+        assert!(a.confidential_utxos().iter().all(|u| u.spent));
+    }
+
+    #[test]
+    fn build_shield_from_transparent_passes_consensus_with_change() {
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::transaction::transaction::{Transaction as Tx, TxOutput, TxType};
+        use crate::domain::utxo::utxo_set::UtxoSet;
+        use crate::engine::privacy::ringct::confidential_consensus::verify_shield_tx;
+
+        let net = NetworkMode::Mainnet;
+        let set = UtxoSet::new_empty();
+
+        // Spending wallet A (transparent funds) + receiving wallet B (…1p addr).
+        let mut a = Wallet::new("mainnet");
+        a.restore_from_seed(vec![77u8; 32]).unwrap();
+        let mut b = Wallet::new("mainnet");
+        b.restore_from_seed(vec![88u8; 32]).unwrap();
+        let addr = a.address();
+
+        // Seed a transparent coinbase of 1000 to A on the node UTXO set, and
+        // mirror it into A's wallet-local UTXO view (as `send`/`shield` would
+        // after fetching from RPC).
+        let cb_hash = "b".repeat(64);
+        let mut cb = Tx::new_coinbase(cb_hash.clone(), vec![TxOutput::new(addr.clone(), 1000)], 0, 1);
+        cb.hash = cb_hash.clone();
+        set.apply_block_dag_ordered(std::slice::from_ref(&cb), 0, "cbblk").unwrap();
+        a.update_utxos(
+            &addr,
+            vec![Walletutxo {
+                txid: cb_hash,
+                index: 0,
+                amount: 1000,
+                address: addr.clone(),
+                height: 0,
+                confirmations: 100,
+                is_coinbase: true,
+                is_locked: false,
+            }],
+        );
+
+        // Shield 600 to B; 390 confidential change returns to A (fee 10).
+        let recipient = b.confidential_receive_address().unwrap();
+        let tx = a.build_shield(0, &recipient, 600, 10).unwrap();
+
+        assert_eq!(tx.tx_type, TxType::Shield);
+        assert_eq!(tx.outputs.len(), 2, "recipient + confidential change");
+        assert!(
+            verify_shield_tx(&tx, &set, &net).is_ok(),
+            "wallet-built shield tx must pass the consensus gate"
+        );
+        // B detects the shielded 600; A rescans and detects its own 390 change.
+        assert_eq!(b.scan_confidential(&tx).iter().map(|u| u.amount).sum::<u64>(), 600);
+        assert_eq!(a.scan_confidential(&tx).iter().map(|u| u.amount).sum::<u64>(), 390);
+    }
+
+    #[test]
+    fn shield_bootstraps_pool_then_confidential_send_finds_decoys() {
+        // END-TO-END BOOTSTRAP (spec tests 11-12, minus the network layer): on a
+        // transparent-only chain there are no confidential outputs, so a
+        // confidential send has no decoys. Shielding several coinbases fills the
+        // pool; once it holds >= CONF_RING_SIZE outputs, A's confidential->
+        // confidential send to B finds its 10 decoys, verifies, and B receives.
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::transaction::transaction::{Transaction as Tx, TxOutput};
+        use crate::domain::utxo::utxo_set::UtxoSet;
+        use crate::engine::privacy::ringct::confidential_consensus::{
+            verify_confidential_tx, verify_shield_tx,
+        };
+        use std::collections::HashSet;
+
+        let net = NetworkMode::Mainnet;
+        let set = UtxoSet::new_empty();
+        let mut a = Wallet::new("mainnet");
+        a.restore_from_seed(vec![91u8; 32]).unwrap();
+        let mut b = Wallet::new("mainnet");
+        b.restore_from_seed(vec![92u8; 32]).unwrap();
+        let addr = a.address();
+        let a_conf = a.confidential_receive_address().unwrap();
+
+        // Shield 6 mature coinbases, each -> 2 confidential outputs to A (500 +
+        // 490 change), for 12 pool outputs total (> CONF_RING_SIZE = 11).
+        for i in 0..6u64 {
+            let cb_hash = format!("{:0>64}", format!("c0{}", i));
+            let mut cb = Tx::new_coinbase(cb_hash.clone(), vec![TxOutput::new(addr.clone(), 1000)], 0, 1);
+            cb.hash = cb_hash.clone();
+            // Coinbase at height 0; shield later at a mature height.
+            set.apply_block_dag_ordered(std::slice::from_ref(&cb), 0, &format!("cbblk{}", i)).unwrap();
+            // Wallet sees ONLY this coinbase now (avoids re-selecting a spent one).
+            a.update_utxos(
+                &addr,
+                vec![Walletutxo {
+                    txid: cb_hash,
+                    index: 0,
+                    amount: 1000,
+                    address: addr.clone(),
+                    height: 0,
+                    confirmations: 5000,
+                    is_coinbase: true,
+                    is_locked: false,
+                }],
+            );
+            let sh = a.build_shield(0, &a_conf, 500, 10).unwrap();
+            assert!(verify_shield_tx(&sh, &set, &net).is_ok(), "shield {} must verify", i);
+            set.apply_block_dag_ordered(std::slice::from_ref(&sh), 2000 + i, &format!("shblk{}", i)).unwrap();
+            a.scan_confidential(&sh); // record A's two new confidential UTXOs
+        }
+
+        // The pool is now bootstrapped: A holds spendable confidential funds and
+        // the chain has enough outputs to source a full ring.
+        assert!(a.confidential_balance() >= 500, "A must hold shielded confidential funds");
+        assert!(
+            set.confidential_output_count() >= 11,
+            "pool must hold >= CONF_RING_SIZE outputs, got {}",
+            set.confidential_output_count()
+        );
+
+        // A -> B confidential send: this is what FAILED before shielding existed
+        // ("insufficient confidential funds" / "not enough decoys"). It must now
+        // build (finding 10 decoys), verify, and be received by B.
+        let send = a
+            .build_confidential_send(&b.confidential_receive_address().unwrap(), 100, 0, &set)
+            .expect("confidential send must succeed once the pool is bootstrapped");
+        let mut seen = HashSet::new();
+        assert!(
+            verify_confidential_tx(&send, &set, &net, &mut seen).is_ok(),
+            "the bootstrapped confidential send must pass consensus"
+        );
+        assert_eq!(
+            b.scan_confidential(&send).iter().map(|u| u.amount).sum::<u64>(),
+            100,
+            "B must receive the confidential 100"
+        );
+    }
+
+    #[test]
+    fn full_confidential_roundtrip_a_to_b_then_b_spends() {
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::utxo::utxo_set::UtxoSet;
+        use crate::engine::privacy::ringct::builder::{
+            build_confidential_transaction, ConfRecipient, OwnedInput,
+        };
+        use crate::engine::privacy::ringct::confidential_consensus::verify_confidential_tx;
+        use crate::engine::privacy::ringct::dual_clsag::RingMember;
+        use curve25519_dalek::ristretto::RistrettoPoint;
+        use curve25519_dalek::{constants::RISTRETTO_BASEPOINT_POINT as G, scalar::Scalar};
+        use rand::rngs::OsRng;
+        use std::collections::HashSet;
+
+        let net = NetworkMode::Mainnet;
+        let h = crate::engine::privacy::confidential::pedersen::generator_h();
+        let set = UtxoSet::new_empty();
+        let rec = |set: &UtxoSet, pk: RistrettoPoint, c: RistrettoPoint| {
+            set.record_confidential_output_indexed(
+                &hex::encode(pk.compress().as_bytes()),
+                &hex::encode(c.compress().as_bytes()),
+            )
+            .unwrap();
+        };
+        // Seed decoys.
+        // Seed enough confidential outputs for a full CONF_RING_SIZE ring
+        // (needs CONF_RING_SIZE-1 = 10 decoys per input), with margin.
+        for _ in 0..24 {
+            rec(&set, Scalar::random(&mut OsRng) * G, Scalar::from(9u64) * h + Scalar::random(&mut OsRng) * G);
+        }
+
+        let mut a = Wallet::new("mainnet");
+        a.restore_from_seed(vec![10u8; 32]).unwrap();
+        let ack = a.confidential_keys().unwrap();
+        let mut b = Wallet::new("mainnet");
+        b.restore_from_seed(vec![20u8; 32]).unwrap();
+
+        // Seed A's own 100-output by building a tx to A and scanning it.
+        let spend = Scalar::random(&mut OsRng);
+        let bl = Scalar::random(&mut OsRng);
+        let real_pk = spend * G;
+        let real_c = Scalar::from(100u64) * h + bl * G;
+        rec(&set, real_pk, real_c);
+        let mut ring = crate::engine::privacy::ringct::decoy::select_decoys(
+            &set,
+            4,
+            &[hex::encode(real_pk.compress().as_bytes())],
+        )
+        .unwrap();
+        ring.push(RingMember { public_key: real_pk, commitment: real_c });
+        let ri = ring.len() - 1;
+        let seed_tx = build_confidential_transaction(
+            vec![OwnedInput { spend_secret: spend, amount: 100, blinding: bl, ring, real_index: ri }],
+            vec![ConfRecipient {
+                view_pub: ack.view_public(),
+                spend_pub: ack.spend_public(),
+                amount: 100,
+            }],
+            0,
+            &net,
+        )
+        .unwrap();
+        for out in &seed_tx.outputs {
+            rec(
+                &set,
+                point_from_hex(out.one_time_pubkey.as_ref().unwrap()).unwrap(),
+                point_from_hex(out.commitment.as_ref().unwrap()).unwrap(),
+            );
+        }
+        assert_eq!(a.scan_confidential(&seed_tx).len(), 1);
+
+        // A sends 60 to B, 40 change back to A (fee 0).
+        let tx = a
+            .build_confidential_send(&b.confidential_receive_address().unwrap(), 60, 0, &set)
+            .unwrap();
+        // PRIVACY (A7): every input hides in a full CONF_RING_SIZE ring.
+        for inp in &tx.inputs {
+            assert_eq!(
+                inp.ring_members.as_ref().map(|r| r.len()),
+                Some(CONF_RING_SIZE),
+                "wallet must build a {}-member ring per input",
+                CONF_RING_SIZE
+            );
+        }
+        let mut seen = HashSet::new();
+        assert!(
+            verify_confidential_tx(&tx, &set, &net, &mut seen).is_ok(),
+            "A->B confidential tx must be consensus-valid"
+        );
+
+        // B scans and finds 60.
+        assert_eq!(
+            b.scan_confidential(&tx).iter().map(|u| u.amount).sum::<u64>(),
+            60
+        );
+
+        // Record tx outputs on-chain; B spends its 60 back to A.
+        for out in &tx.outputs {
+            rec(
+                &set,
+                point_from_hex(out.one_time_pubkey.as_ref().unwrap()).unwrap(),
+                point_from_hex(out.commitment.as_ref().unwrap()).unwrap(),
+            );
+        }
+        let tx2 = b
+            .build_confidential_send(&a.confidential_receive_address().unwrap(), 60, 0, &set)
+            .unwrap();
+        let mut seen2 = HashSet::new();
+        assert!(
+            verify_confidential_tx(&tx2, &set, &net, &mut seen2).is_ok(),
+            "B respend must be consensus-valid"
+        );
+    }
+
+    #[test]
+    fn scan_confidential_recovers_self_output() {
+        use crate::config::node::node_config::NetworkMode;
+        use crate::domain::utxo::utxo_set::UtxoSet;
+        use crate::engine::privacy::ringct::builder::{
+            build_confidential_transaction, ConfRecipient, OwnedInput,
+        };
+        use crate::engine::privacy::ringct::dual_clsag::RingMember;
+        use curve25519_dalek::{constants::RISTRETTO_BASEPOINT_POINT as G, scalar::Scalar};
+        use rand::rngs::OsRng;
+
+        let mut w = Wallet::new("mainnet");
+        w.restore_from_seed(vec![3u8; 32]).unwrap();
+        let ck = w.confidential_keys().unwrap();
+
+        let set = UtxoSet::new_empty();
+        let h = crate::engine::privacy::confidential::pedersen::generator_h();
+        let rec = |set: &UtxoSet, pk: curve25519_dalek::ristretto::RistrettoPoint, c: curve25519_dalek::ristretto::RistrettoPoint| {
+            set.record_confidential_output_indexed(
+                &hex::encode(pk.compress().as_bytes()),
+                &hex::encode(c.compress().as_bytes()),
+            )
+            .unwrap();
+        };
+        for _ in 0..4 {
+            rec(&set, Scalar::random(&mut OsRng) * G, Scalar::from(7u64) * h + Scalar::random(&mut OsRng) * G);
+        }
+        let spend = Scalar::random(&mut OsRng);
+        let bl = Scalar::random(&mut OsRng);
+        let real_pk = spend * G;
+        let real_c = Scalar::from(100u64) * h + bl * G;
+        rec(&set, real_pk, real_c);
+        let mut ring = crate::engine::privacy::ringct::decoy::select_decoys(
+            &set,
+            4,
+            &[hex::encode(real_pk.compress().as_bytes())],
+        )
+        .unwrap();
+        ring.push(RingMember { public_key: real_pk, commitment: real_c });
+        let real_index = ring.len() - 1;
+
+        let tx = build_confidential_transaction(
+            vec![OwnedInput { spend_secret: spend, amount: 100, blinding: bl, ring, real_index }],
+            vec![ConfRecipient {
+                view_pub: ck.view_public(),
+                spend_pub: ck.spend_public(),
+                amount: 100,
+            }],
+            0,
+            &NetworkMode::Mainnet,
+        )
+        .unwrap();
+
+        let found = w.scan_confidential(&tx);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].amount, 100);
+        assert_eq!(w.confidential_balance(), 100);
+    }
+
+    #[test]
+    fn confidential_balance_sums_unspent() {
+        let mut w = Wallet::new("mainnet");
+        w.restore_from_seed(vec![5u8; 32]).unwrap();
+        assert_eq!(w.confidential_balance(), 0);
+        w.add_confidential_utxo(ConfidentialUtxo {
+            txid: "a".into(),
+            index: 0,
+            amount: 100,
+            blinding_hex: "00".repeat(32),
+            one_time_pubkey: "11".repeat(32),
+            ephemeral_pubkey: "22".repeat(32),
+            spent: false,
+        });
+        w.add_confidential_utxo(ConfidentialUtxo {
+            txid: "b".into(),
+            index: 0,
+            amount: 50,
+            blinding_hex: "00".repeat(32),
+            one_time_pubkey: "33".repeat(32),
+            ephemeral_pubkey: "44".repeat(32),
+            spent: true,
+        });
+        assert_eq!(w.confidential_balance(), 100); // spent excluded
+    }
+
+    #[test]
+    fn confidential_address_is_deterministic_from_seed() {
+        let mut w1 = Wallet::new("mainnet");
+        w1.restore_from_seed(vec![9u8; 32]).unwrap();
+        let mut w2 = Wallet::new("mainnet");
+        w2.restore_from_seed(vec![9u8; 32]).unwrap();
+        let a1 = w1.confidential_receive_address().unwrap();
+        let a2 = w2.confidential_receive_address().unwrap();
+        assert_eq!(a1, a2, "same seed must yield same confidential address");
+        assert!(a1.starts_with("SD1p"));
+
+        let mut w3 = Wallet::new("mainnet");
+        w3.restore_from_seed(vec![1u8; 32]).unwrap();
+        assert_ne!(a1, w3.confidential_receive_address().unwrap());
+    }
 
     #[test]
     fn create_and_unlock() {
@@ -986,11 +1951,213 @@ mod tests {
         assert!(!acc0.addresses.is_empty());
     }
 
+    /// A recovery phrase from `create` must restore the SAME address (even under
+    /// a new password), and the re-encrypted seed must unlock under that new
+    /// password. Guards the reinstall/recovery path from silently diverging.
+    #[test]
+    fn restore_from_mnemonic_recovers_same_address() {
+        let mut a = Wallet::new("mainnet");
+        let (mnemonic, _enc) = a.create("pw-strong-123").unwrap();
+        let addr_a = a.address();
+
+        let mut b = Wallet::new("mainnet");
+        let enc_b = b
+            .restore_from_mnemonic(&mnemonic, "different-pw-456")
+            .unwrap();
+        assert_eq!(b.address(), addr_a, "restore must recover the same address");
+
+        // The re-encrypted seed unlocks under the NEW password → same address.
+        let mut c = Wallet::new("mainnet");
+        c.unlock(&enc_b, "different-pw-456").unwrap();
+        c.add_account(0, "Default Account").unwrap();
+        assert_eq!(c.address(), addr_a);
+
+        // Empty / blank phrases are rejected.
+        assert!(Wallet::new("mainnet")
+            .restore_from_mnemonic(&[], "pw")
+            .is_err());
+        assert!(Wallet::new("mainnet")
+            .restore_from_mnemonic(&["".to_string()], "pw")
+            .is_err());
+
+        // B6-L01: a non-standard word count (a missing/extra-word typo) is rejected
+        // instead of silently deriving a different, empty wallet.
+        let three_words: Vec<String> = vec!["abandon".into(), "ability".into(), "able".into()];
+        assert!(Wallet::new("mainnet")
+            .restore_from_mnemonic(&three_words, "pw-strong-123")
+            .is_err());
+    }
+
+    #[test]
+    fn restore_rejects_a_word_outside_the_wordlist() {
+        // The scheme carries no checksum, so before this guard a single mistyped
+        // word derived a DIFFERENT wallet and the user just saw an empty balance.
+        let mut a = Wallet::new("mainnet");
+        let (mnemonic, _enc) = a.create("pw-strong-123").unwrap();
+        assert_eq!(mnemonic.len(), 12);
+
+        // Baseline: the untouched phrase still restores to the same address, so
+        // the guard rejects nothing this wallet can legitimately produce.
+        let mut ok = Wallet::new("mainnet");
+        ok.restore_from_mnemonic(&mnemonic, "pw2").unwrap();
+        assert_eq!(ok.address(), a.address());
+
+        // A word that is not in the generated list — the common typo shape.
+        let mut typo = mnemonic.clone();
+        typo[6] = "zzzzzz".to_string();
+        let err = Wallet::new("mainnet")
+            .restore_from_mnemonic(&typo, "pw2")
+            .expect_err("an out-of-wordlist word must be rejected, not silently derived");
+        assert!(
+            format!("{}", err).contains("word 7"),
+            "the error must name the offending position, got: {}",
+            err
+        );
+
+        // Case mangling is reported too, rather than deriving a wrong seed.
+        let mut upper = mnemonic.clone();
+        upper[0] = upper[0].to_uppercase();
+        assert!(Wallet::new("mainnet")
+            .restore_from_mnemonic(&upper, "pw2")
+            .is_err());
+    }
+
     #[test]
     fn testnet_address_prefix() {
         let mut w = Wallet::new("testnet");
         let _ = w.create("pw");
         let addr = w.accounts()[0].primary_address().unwrap().to_string();
-        assert!(addr.starts_with("ST"));
+        assert!(addr.starts_with("ST1"));
+    }
+
+    /// Regression: the wallet MUST produce the canonical, consensus-spendable
+    /// address — byte-identical to `Address::from_public_key` and to the
+    /// Python/WASM SDKs (which the live network uses). Pins the SDK reference
+    /// vector so any future change reintroducing the old unspendable SD+74hex
+    /// Sha3 form (the ST0.. bug) fails loudly.
+    #[test]
+    fn address_matches_canonical_sdk_vector() {
+        // Python SDK self-test vector: derive_key([2;64],0,0,false) -> pubkey
+        // 384d0633..., address_from_public_key(pubkey,"mainnet") == SD1f28fa3d...
+        let mut w = Wallet::new("mainnet");
+        w.restore_from_seed(vec![2u8; 64]).unwrap();
+        let wa = w.accounts()[0].addresses[0].clone();
+        assert_eq!(
+            wa.public_key,
+            "384d0633d25725798cb3fa2b349dff39d1ff2d623e8a5d79fcd632e91740c2c1",
+            "derived pubkey must match the cross-tool reference vector"
+        );
+        assert_eq!(
+            wa.address, "SD1f28fa3d42b184f0ce7e84809e89efde6637bd597",
+            "wallet address must equal the SDK / live-network canonical address"
+        );
+        // Cross-check against the in-crate canonical deriver + spendable shape.
+        let pk = hex::decode(&wa.public_key).unwrap();
+        assert_eq!(
+            wa.address,
+            crate::domain::address::address::Address::from_public_key(&pk, "mainnet").value
+        );
+        assert!(w.is_valid_address(&wa.address));
+        assert_eq!(wa.address.len(), 3 + 40);
+    }
+
+    /// Acceptance oracle: build_tx must produce a REAL consensus transaction the
+    /// node accepts — canonical txid + a signature that passes the exact
+    /// ownership/signature check in TxValidator. Proves the shipped wallet can
+    /// now actually move a coin (the old build_tx returned a placeholder
+    /// "raw:{txid}" string that could never be broadcast).
+    #[test]
+    fn build_deploy_and_call_txs_are_signed() {
+        use crate::domain::transaction::tx_validator::TxValidator;
+        let mut w = Wallet::new("testnet");
+        w.restore_from_seed(vec![9u8; 64]).unwrap();
+        let from = w.address();
+        w.update_utxos(
+            &from,
+            vec![Walletutxo {
+                txid: "bb".repeat(32),
+                index: 0,
+                amount: 1_000_000,
+                address: from.clone(),
+                height: 1,
+                confirmations: 100,
+                is_coinbase: true,
+                is_locked: false,
+            }],
+        );
+        let net = NetworkMode::Testnet;
+
+        let dep = w.build_deploy_tx(0, vec![0x60, 0x00], 0, 100_000, 500).unwrap();
+        assert!(!dep.hash.is_empty(), "deploy tx must be hashed");
+        assert!(TxHash::verify_for_network(&dep, &net));
+        let msg = TxHash::signing_message_for_network(&dep, &net);
+        assert!(!dep.inputs.is_empty());
+        assert!(
+            TxValidator::verify_input_ownership_by_address(&dep.inputs[0], &from, &msg),
+            "deploy tx input must be validly signed by its owner"
+        );
+
+        let dest = format!("ST1{}", "22".repeat(20));
+        let call = w.build_call_tx(0, &dest, vec![0xde, 0xad], 0, 100_000, 500).unwrap();
+        assert!(!call.hash.is_empty(), "call tx must be hashed");
+        assert!(TxHash::verify_for_network(&call, &net));
+        let msg2 = TxHash::signing_message_for_network(&call, &net);
+        assert!(
+            TxValidator::verify_input_ownership_by_address(&call.inputs[0], &from, &msg2),
+            "call tx input must be validly signed by its owner"
+        );
+    }
+
+    #[test]
+    fn build_tx_produces_consensus_valid_transaction() {
+        use crate::domain::transaction::transaction::Transaction;
+        use crate::domain::transaction::tx_validator::TxValidator;
+
+        let mut w = Wallet::new("testnet");
+        w.restore_from_seed(vec![2u8; 64]).unwrap();
+        let from = w.address();
+
+        // Fund the wallet with one mature UTXO owned by its address.
+        w.update_utxos(
+            &from,
+            vec![Walletutxo {
+                txid: "aa".repeat(32),
+                index: 0,
+                amount: 1_000_000,
+                address: from.clone(),
+                height: 1,
+                confirmations: 100,
+                is_coinbase: true,
+                is_locked: false,
+            }],
+        );
+
+        let dest = format!("ST1{}", "11".repeat(20));
+        let built = w.build_tx(0, &dest, 400_000, 500, "").unwrap();
+
+        // raw_hex is now a serialized consensus Transaction, not a placeholder.
+        assert!(!built.raw_hex.starts_with("raw:"));
+        let tx: Transaction = serde_json::from_str(&built.raw_hex).expect("valid tx JSON");
+        assert_eq!(tx.hash, built.txid);
+
+        let net = NetworkMode::Testnet;
+        // Hash commits to content.
+        assert!(TxHash::verify_for_network(&tx, &net));
+        // Signature verifies under the canonical signing message AND the input
+        // pub_key derives to the owner address — exactly the consensus gate.
+        let msg = TxHash::signing_message_for_network(&tx, &net);
+        assert_eq!(tx.inputs.len(), 1);
+        assert!(TxValidator::verify_input_ownership_by_address(
+            &tx.inputs[0],
+            &from,
+            &msg
+        ));
+
+        // Recipient output + change-to-self output.
+        assert!(tx
+            .outputs
+            .iter()
+            .any(|o| o.address == dest && o.amount == 400_000));
+        assert!(tx.outputs.iter().any(|o| o.address != dest));
     }
 }

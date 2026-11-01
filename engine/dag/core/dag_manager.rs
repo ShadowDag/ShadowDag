@@ -21,9 +21,21 @@ use crate::{slog_error, slog_warn};
 //   - tip:{hash}      — current tip status
 //   - meta:block_count — running block counter
 
-pub const MAX_ANCESTOR_WALK: usize = 50_000;
-
 const META_BLOCK_COUNT: &[u8] = b"meta:block_count";
+
+#[inline]
+fn decode_hash_key_suffix(bytes: &[u8]) -> Option<String> {
+    // Accept canonical 64-hex hashes, but remain backward-compatible with
+    // older/test keys that used arbitrary ASCII IDs.
+    if bytes.is_empty() || bytes.len() > 256 {
+        return None;
+    }
+    let s = std::str::from_utf8(bytes).ok()?;
+    if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(s.to_ascii_lowercase());
+    }
+    Some(s.to_string())
+}
 
 // KEY BUILDERS (NO format!)
 #[inline]
@@ -88,9 +100,10 @@ impl DagManager {
         })
     }
 
-    /// Maximum allowed future timestamp drift (consensus: 120 seconds).
-    /// Canonical value defined in block_validator::MAX_FUTURE_SECS.
-    const MAX_FUTURE_TIMESTAMP: u64 = 120;
+    /// Maximum allowed future timestamp drift, in MILLISECONDS (120 s of real
+    /// time). Timestamps are unix epoch ms. Shares ConsensusParams::MAX_FUTURE_MS.
+    const MAX_FUTURE_TIMESTAMP: u64 =
+        crate::config::consensus::consensus_params::ConsensusParams::MAX_FUTURE_MS;
 
     /// Maximum children any single block can have in the DAG.
     /// Prevents any block from becoming a "hotspot" that slows traversal.
@@ -144,14 +157,14 @@ impl DagManager {
                 )));
             }
 
-            // 2. Timestamp must not be too far in the future
+            // 2. Timestamp must not be too far in the future (ms vs ms)
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_secs();
+                .as_millis() as u64;
             if block.header.timestamp > now + Self::MAX_FUTURE_TIMESTAMP {
                 return Self::reject(DagError::Other(format!(
-                    "block timestamp {} is too far in the future (now={}, max_drift={}s)",
+                    "block timestamp {} is too far in the future (now={}, max_drift={}ms)",
                     block.header.timestamp,
                     now,
                     Self::MAX_FUTURE_TIMESTAMP
@@ -208,10 +221,9 @@ impl DagManager {
                 return Self::reject(DagError::OrphanBlock(hash.to_string(), p.to_string()));
             }
 
-            // Conservative: if walk limit exceeded, treat as cycle (reject block)
-            if self.would_create_cycle(hash, p).unwrap_or(true) {
-                return Self::reject(DagError::Other(format!("cycle detected via {}", p)));
-            }
+            // A new block (rejected above if it already exists) referencing only
+            // pre-existing parents is reachable from no block in the DAG, so it
+            // cannot close a cycle. No ancestor walk is needed or performed here.
 
             // Fanout limit: reject if parent already has too many children.
             // This prevents any block from becoming a traversal bottleneck.
@@ -376,47 +388,6 @@ impl DagManager {
         tips.iter().min().cloned()
     }
 
-    // BFS cycle detection — returns Err when walk limit is exceeded
-    // (conservative: callers should treat Err as "assume cycle")
-    fn would_create_cycle(&self, target: &str, start: &str) -> Result<bool, DagError> {
-        let mut visited: HashSet<String> = HashSet::with_capacity(64);
-        let mut queue: VecDeque<String> = VecDeque::with_capacity(64);
-        let mut cache: HashMap<String, Vec<String>> = HashMap::new();
-
-        queue.push_back(start.to_string());
-
-        let mut walked = 0;
-
-        while let Some(current) = queue.pop_front() {
-            if walked >= MAX_ANCESTOR_WALK {
-                return Err(DagError::Other(format!(
-                    "cycle detection walk limit {} exceeded",
-                    MAX_ANCESTOR_WALK
-                )));
-            }
-            walked += 1;
-
-            if current == target {
-                return Ok(true);
-            }
-
-            if !cache.contains_key(&current) {
-                let parents = self.get_parents(&current);
-                cache.insert(current.clone(), parents);
-            }
-
-            let parents = &cache[&current];
-
-            for parent in parents {
-                if visited.insert(parent.clone()) {
-                    queue.push_back(parent.clone());
-                }
-            }
-        }
-
-        Ok(false)
-    }
-
     // DAG SIZE
     pub fn dag_size(&self) -> usize {
         let count = self.read_block_count();
@@ -476,8 +447,11 @@ impl DagManager {
 
         for (k, _) in self.db.iterator(IteratorMode::Start).flatten() {
             if k.starts_with(b"exists:") {
-                let hash = String::from_utf8_lossy(&k[7..]).into_owned();
-                map.insert(hash.clone(), self.get_parents(&hash));
+                if let Some(hash) = decode_hash_key_suffix(&k[7..]) {
+                    map.insert(hash.clone(), self.get_parents(&hash));
+                } else {
+                    slog_warn!("dag", "dag_map_skip_invalid_exists_key");
+                }
             }
         }
 
@@ -522,8 +496,11 @@ impl DagManager {
             if !k.starts_with(prefix_bytes) {
                 break;
             }
-
-            result.push(String::from_utf8_lossy(&k[prefix_bytes.len()..]).into_owned());
+            if let Some(hash) = decode_hash_key_suffix(&k[prefix_bytes.len()..]) {
+                result.push(hash);
+            } else {
+                slog_warn!("dag", "dag_scan_skip_invalid_hash_key");
+            }
         }
 
         result

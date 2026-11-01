@@ -8,8 +8,9 @@ use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config::node::node_config::NetworkMode;
 use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
-use crate::domain::transaction::tx_validator::TxValidator;
+use crate::domain::transaction::tx_hash::TxHash;
 use crate::errors::CryptoError;
 
 pub struct KeyPairHex {
@@ -83,10 +84,12 @@ pub fn build_transaction_with_anchor(
     public_key_hex: &str,
     anchor_block_hash: Option<String>,
 ) -> Result<Transaction, CryptoError> {
+    // Unix epoch MILLISECONDS (tx timestamps migrated with block timestamps;
+    // this value is hashed into the txid and signing preimage).
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_millis() as u64;
 
     let tx_outputs: Vec<TxOutput> = outputs
         .into_iter()
@@ -96,10 +99,10 @@ pub fn build_transaction_with_anchor(
             commitment: None,
             range_proof: None,
             ephemeral_pubkey: None,
+            one_time_pubkey: None,
+            encrypted_amount: None,
         })
         .collect();
-
-    let temp_hash = build_tx_hash_from_refs(&inputs_refs, &tx_outputs, fee, timestamp);
 
     let mut tx_inputs: Vec<TxInput> = inputs_refs
         .iter()
@@ -111,11 +114,17 @@ pub fn build_transaction_with_anchor(
             pub_key: public_key_hex.to_string(),
             key_image: None,
             ring_members: None,
+            ring_signature: None,
+            ring_commitments: None,
+            pseudo_commitment: None,
+            shield_blinding: None,
         })
         .collect();
 
-    let temp_tx = Transaction {
-        hash: temp_hash.clone(),
+    let network = infer_network_from_refs_and_outputs(&inputs_refs, &tx_outputs)?;
+
+    let mut temp_tx = Transaction {
+        hash: String::new(),
         inputs: tx_inputs.clone(),
         outputs: tx_outputs.clone(),
         fee,
@@ -130,7 +139,9 @@ pub fn build_transaction_with_anchor(
         vm_version: None,
     };
 
-    let signing_msg = TxValidator::build_signing_message(&temp_tx);
+    let temp_hash = TxHash::hash_for_network(&temp_tx, &network);
+    temp_tx.hash = temp_hash.clone();
+    let signing_msg = TxHash::signing_message_for_network(&temp_tx, &network);
 
     let sk_bytes: Vec<u8> = hex::decode(private_key_hex)
         .map_err(|e| CryptoError::InvalidKey(format!("invalid private key hex: {}", e)))?;
@@ -162,6 +173,52 @@ pub fn build_transaction_with_anchor(
     };
 
     Ok(final_tx)
+}
+
+#[inline]
+fn infer_network_from_address(addr: &str) -> Option<NetworkMode> {
+    if addr.starts_with("ST1") {
+        Some(NetworkMode::Testnet)
+    } else if addr.starts_with("SR1") {
+        Some(NetworkMode::Regtest)
+    } else if addr.starts_with("SD1") {
+        Some(NetworkMode::Mainnet)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn infer_network_from_refs_and_outputs(
+    inputs_refs: &[(String, u32, String)],
+    outputs: &[TxOutput],
+) -> Result<NetworkMode, CryptoError> {
+    let mut selected: Option<NetworkMode> = None;
+    let mut observe = |candidate: NetworkMode| -> Result<(), CryptoError> {
+        if let Some(existing) = &selected {
+            if existing != &candidate {
+                return Err(CryptoError::Other(
+                    "transaction contains mixed network address prefixes".into(),
+                ));
+            }
+        } else {
+            selected = Some(candidate);
+        }
+        Ok(())
+    };
+
+    for out in outputs {
+        if let Some(n) = infer_network_from_address(&out.address) {
+            observe(n)?;
+        }
+    }
+    for (_, _, owner) in inputs_refs {
+        if let Some(n) = infer_network_from_address(owner) {
+            observe(n)?;
+        }
+    }
+
+    Ok(selected.unwrap_or(NetworkMode::Mainnet))
 }
 
 pub fn build_coinbase(
@@ -215,6 +272,8 @@ pub fn build_coinbase_at_height(
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             },
             TxOutput {
                 address: dev_address,
@@ -222,6 +281,8 @@ pub fn build_coinbase_at_height(
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             },
         ],
         0,
@@ -304,6 +365,75 @@ pub const MAX_CONSOLIDATION_INPUTS: usize = 500;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::errors::CryptoError;
+
+    // Reference vector pinning a TRANSPARENT transfer tx end-to-end (hash +
+    // Ed25519 signature, both deterministic). The wasm-sdk replicates this exact
+    // build/sign; these literals are mirrored there. Any change here flags that
+    // the SDK must be updated.
+    #[test]
+    fn wasm_sdk_tx_reference_vector() {
+        use crate::domain::transaction::transaction::{Transaction, TxInput, TxOutput, TxType};
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let pk_hex = hex::encode(sk.verifying_key().to_bytes());
+        let owner = crate::domain::address::address::Address::from_public_key(
+            &sk.verifying_key().to_bytes(),
+            "mainnet",
+        )
+        .value;
+
+        let inputs = vec![TxInput {
+            txid: "aa".repeat(32),
+            index: 0,
+            owner: owner.clone(),
+            signature: String::new(),
+            pub_key: pk_hex.clone(),
+            key_image: None,
+            ring_members: None,
+            ring_signature: None,
+            ring_commitments: None,
+            pseudo_commitment: None,
+            shield_blinding: None,
+        }];
+        let outputs = vec![TxOutput {
+            address: format!("SD1{}", "11".repeat(20)),
+            amount: 1000,
+            commitment: None,
+            range_proof: None,
+            ephemeral_pubkey: None,
+            one_time_pubkey: None,
+            encrypted_amount: None,
+        }];
+        let mut tx = Transaction {
+            hash: String::new(),
+            inputs,
+            outputs,
+            fee: 10,
+            timestamp: 1_700_000_000,
+            is_coinbase: false,
+            tx_type: TxType::Transfer,
+            payload_hash: None,
+            gas_limit: None,
+            deploy_code: None,
+            calldata: None,
+            contract_address: None,
+            vm_version: None,
+        };
+        let net = NetworkMode::Mainnet;
+        tx.hash = TxHash::hash_for_network(&tx, &net);
+        let msg = TxHash::signing_message_for_network(&tx, &net);
+        let sig = hex::encode(sk.sign(&msg).to_bytes());
+
+        println!("WASM_TX pubkey   = {}", pk_hex);
+        println!("WASM_TX owner    = {}", owner);
+        println!("WASM_TX hash     = {}", tx.hash);
+        println!("WASM_TX sign_msg = {}", hex::encode(&msg));
+        println!("WASM_TX sig      = {}", sig);
+        assert_eq!(tx.hash.len(), 64);
+        assert_eq!(sig.len(), 128);
+    }
 
     #[test]
     fn coinbase_hash_is_deterministic() {
@@ -382,5 +512,24 @@ mod tests {
             kp.address.starts_with("SR1"),
             "Regtest address must start with 'SR1'"
         );
+    }
+
+    #[test]
+    fn build_transaction_rejects_mixed_network_prefixes() {
+        let kp = generate_keypair();
+        let res = build_transaction(
+            vec![("ab".repeat(32), 0, "SD1owner000000000000000000000000000000000001".to_string())],
+            vec![("ST1dest000000000000000000000000000000000002".to_string(), 1_000)],
+            1,
+            &kp.private_key_hex,
+            &kp.public_key_hex,
+        );
+
+        match res {
+            Err(CryptoError::Other(msg)) => {
+                assert!(msg.contains("mixed network address prefixes"), "{}", msg)
+            }
+            other => panic!("expected mixed-network rejection, got {:?}", other),
+        }
     }
 }

@@ -5,6 +5,10 @@
 
 #[cfg(test)]
 mod tests {
+    /// Height the template block would occupy. Chosen well past every network's
+    /// coinbase maturity so these tests exercise ordering/limits, not maturity.
+    const TEMPLATE_HEIGHT: u64 = 10_000;
+
     use crate::domain::transaction::transaction::{Transaction, TxOutput, TxType};
     use crate::service::mempool::core::mempool::{Mempool, MAX_MEMPOOL_SIZE, MAX_TX_BYTE_SIZE};
 
@@ -26,6 +30,10 @@ mod tests {
                 pub_key: "pk".to_string(),
                 key_image: None,
                 ring_members: None,
+                ring_signature: None,
+                ring_commitments: None,
+                pseudo_commitment: None,
+                shield_blinding: None,
             }],
             outputs: vec![TxOutput {
                 address: "addr1".into(),
@@ -33,6 +41,8 @@ mod tests {
                 commitment: None,
                 range_proof: None,
                 ephemeral_pubkey: None,
+                one_time_pubkey: None,
+                encrypted_amount: None,
             }],
             fee,
             timestamp: std::time::SystemTime::now()
@@ -62,10 +72,50 @@ mod tests {
         );
     }
 
+    /// A database path of this test's own, emptied before use.
+    ///
+    /// These were `format!("/tmp/test_mempool_{label}_{pid}")` with no cleanup,
+    /// so a process whose id had been used before inherited that run's RocksDB.
+    /// `add_transaction_test` checks `tx:` for a duplicate BEFORE `has_conflict`,
+    /// and `has_conflict` rejects on an `inp:` key whether or not its `tx:` key
+    /// still exists — so an interrupted run that left inputs indexed without
+    /// their transaction made the next add fail with no duplicate detected, and
+    /// `duplicate_tx_rejected` then saw zero transactions where it expected one.
+    /// It took eleven full-suite runs to reproduce, and 936 of those
+    /// directories had accumulated on this machine. The three other suites that
+    /// name a database by process id already clear it first.
+    fn fresh_db(label: &str) -> String {
+        let path = format!("/tmp/test_mempool_{}_{}", label, std::process::id());
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    #[test]
+    fn a_test_database_is_emptied_before_use() {
+        // The helper is the fix for a flake that took eleven full-suite runs to
+        // reproduce, so it needs a test of its own. Same label, same process,
+        // twice: the second open must see nothing, or a previous run's `inp:`
+        // keys outlive their `tx:` key and the next add is rejected as a
+        // conflict with a transaction that is no longer there.
+        let first = fresh_db("hermetic");
+        {
+            let mp = Mempool::try_new(first.clone()).expect("mp");
+            mp.add_transaction_test(&make_tx("hermetic_001", 5));
+            assert_eq!(mp.get_all_transactions().len(), 1, "written");
+        } // dropped, so RocksDB releases the directory
+
+        let again = fresh_db("hermetic");
+        assert_eq!(again, first, "the same label must be the same path");
+        let mp = Mempool::try_new(again).expect("mp");
+        assert!(
+            mp.get_all_transactions().is_empty(),
+            "a test database must come back empty"
+        );
+    }
+
     #[test]
     fn duplicate_tx_rejected() {
-        let mempool =
-            Mempool::try_new(format!("/tmp/test_mempool_dup_{}", std::process::id())).expect("mp");
+        let mempool = Mempool::try_new(fresh_db("dup")).expect("mp");
         let tx = make_tx("dup_hash_001", 5);
         mempool.add_transaction_test(&tx.clone());
 
@@ -77,15 +127,14 @@ mod tests {
 
     #[test]
     fn fee_ordering_in_get_for_block() {
-        let mempool =
-            Mempool::try_new(format!("/tmp/test_mempool_fee_{}", std::process::id())).expect("mp");
+        let mempool = Mempool::try_new(fresh_db("fee")).expect("mp");
         mempool.add_transaction_test(&make_tx("tx_fee_1", 1));
         mempool.add_transaction_test(&make_tx("tx_fee_5", 5));
         mempool.add_transaction_test(&make_tx("tx_fee_3", 3));
 
         // Create a dummy utxo_set for the method call
         let utxo_set = crate::domain::utxo::utxo_set::UtxoSet::new_empty();
-        let selected = mempool.select_transactions_for_block(&utxo_set, 3);
+        let selected = mempool.select_transactions_for_block(&utxo_set, 3, TEMPLATE_HEIGHT);
         assert!(selected.len() <= 3);
 
         for w in selected.windows(2) {

@@ -349,11 +349,22 @@ impl StateManager {
         Digest::update(&mut h, &code);
         account.code_hash = hex::encode(Digest::finalize(h));
         account.code = code;
-        if account.nonce == 0 {
+        let nonce_bumped = account.nonce == 0;
+        if nonce_bumped {
             account.nonce = 1; // Contracts start at nonce 1
         }
 
-        // Journal entry for rollback
+        // Journal entries for rollback. The nonce bump MUST be journaled too,
+        // otherwise rolling back set_code on a pre-existing nonce-0 account
+        // restores the code but leaves nonce stuck at 1 (a (nonce, code) pair
+        // that diverges from the pre-frame state).
+        if nonce_bumped {
+            self.journal.push(StateChange::NonceChange {
+                address: address.to_string(),
+                old_nonce: 0,
+                new_nonce: 1,
+            });
+        }
         self.journal.push(StateChange::CodeChanged {
             address: address.to_string(),
             old_code_hash,
@@ -913,6 +924,33 @@ mod tests {
             sm.get_nonce("alice"),
             0,
             "set_nonce must be rollbackable to the pre-snapshot value"
+        );
+    }
+
+    /// set_code bumps nonce 0->1; that bump must be journaled so a rollback
+    /// restores BOTH code and nonce (otherwise nonce is left stuck at 1).
+    #[test]
+    fn set_code_on_existing_nonce0_account_rolls_back_nonce() {
+        let mut sm = StateManager::new();
+        // Account already exists at nonce 0 BEFORE the snapshot boundary
+        // (e.g. an address that received value first, then has code installed).
+        sm.get_or_create_account("acct");
+        assert_eq!(sm.get_nonce("acct"), 0);
+
+        let snap = sm.snapshot();
+        sm.set_code("acct", vec![0x60, 0x00]).expect("set_code must succeed");
+        assert_eq!(sm.get_nonce("acct"), 1, "set_code bumps nonce 0 -> 1");
+        assert!(!sm.get_code("acct").is_empty());
+
+        sm.rollback(snap).expect("rollback must succeed");
+        assert_eq!(
+            sm.get_nonce("acct"),
+            0,
+            "rollback must restore nonce to 0, not leave it stuck at 1"
+        );
+        assert!(
+            sm.get_code("acct").is_empty(),
+            "rollback must restore empty code"
         );
     }
 }
