@@ -4,7 +4,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::thread;
@@ -1454,6 +1454,152 @@ enum ReadStop {
         reason: String,
         ban_score: u64,
     },
+}
+
+/// How far a payload buffer may grow ahead of the bytes that have actually
+/// arrived. Bitcoin Core's V1 transport uses the same bound, added after its
+/// 2024 receive-buffer disclosure: a peer that declares a large payload and then
+/// sends nothing must not be able to make us allocate the declared size.
+const PAYLOAD_LOOKAHEAD: usize = 256 * 1024;
+
+/// Read buffer per connection. One recv can then hold several small frames,
+/// and a large payload arrives in large steps.
+const READ_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Error text for a poll interval that delivered no byte. It must classify as
+/// transient, exactly like the socket timeout it stands for.
+const IDLE_POLL_TEXT: &str = "read timed out: no byte arrived within one poll interval";
+
+/// A frame decoded off the wire: the message, its command, and the bytes it took.
+type Frame = (P2PMessage, CommandId, usize);
+
+enum DecodeStage {
+    Header {
+        buf: [u8; WIRE_HEADER_SIZE],
+        filled: usize,
+    },
+    Payload {
+        cmd: CommandId,
+        checksum: [u8; 4],
+        declared: usize,
+        buf: Vec<u8>,
+    },
+}
+
+/// Turns the byte stream into frames, keeping a partial frame across reads.
+///
+/// `read_message` used to call `read_exact` for the header and the payload under
+/// the 100 ms poll timeout, and std's `read_exact` returns on the first error
+/// with the bytes it had already taken gone. So a frame whose bytes stopped for
+/// more than 100 ms mid-way — one lost packet does that over a real link, where
+/// the minimum TCP retransmission timeout is 200 ms — was cut, and the next
+/// read took a "header" from the middle of it. The shape here is Bitcoin Core's
+/// V1 transport: a state machine fed whatever bytes arrived.
+///
+/// `feed` never consumes a byte past the one that completes a message. The next
+/// header is therefore always gated in a later call, under the handshake state
+/// the caller has moved to by then — exactly as each header was gated in its own
+/// `read_message` call before.
+struct FrameDecoder {
+    stage: DecodeStage,
+}
+
+impl FrameDecoder {
+    fn new() -> Self {
+        Self {
+            stage: DecodeStage::Header {
+                buf: [0; WIRE_HEADER_SIZE],
+                filled: 0,
+            },
+        }
+    }
+
+    /// Consume as much of `input` as belongs to the current frame and report how
+    /// much, plus the frame if this call completed one. The gates run in the
+    /// order `read_message` ran them, and that order is the scoring rule: only
+    /// `check_command_allowed` scores, so a header that fails `validate_header`
+    /// first is never scored, and a forbidden command is scored before its size
+    /// is looked at.
+    fn feed(
+        &mut self,
+        input: &[u8],
+        magic: [u8; 4],
+        protocol: &ProtocolSession,
+    ) -> Result<(usize, Option<Frame>), ReadStop> {
+        let mut used = 0;
+        if let DecodeStage::Header { buf, filled } = &mut self.stage {
+            let take = (WIRE_HEADER_SIZE - *filled).min(input.len());
+            buf[*filled..*filled + take].copy_from_slice(&input[..take]);
+            *filled += take;
+            used += take;
+            if *filled < WIRE_HEADER_SIZE {
+                return Ok((used, None));
+            }
+            let header = WireHeader::decode(buf);
+            let cmd = validate_header(&header, magic).map_err(|pe| {
+                ReadStop::Failed(NetworkError::Serialization(format!("[Protocol] {}", pe)))
+            })?;
+            if let Err(pe) = protocol.check_command_allowed(cmd) {
+                return Err(ReadStop::Premature {
+                    cmd,
+                    reason: pe.message,
+                    ban_score: pe.ban_score as u64,
+                });
+            }
+            let declared = header.payload_len as usize;
+            validate_payload_size(cmd, declared).map_err(|pe| {
+                ReadStop::Failed(NetworkError::Serialization(format!("[Protocol] {}", pe)))
+            })?;
+            self.stage = DecodeStage::Payload {
+                cmd,
+                checksum: header.checksum,
+                declared,
+                buf: Vec::new(),
+            };
+        }
+
+        let DecodeStage::Payload {
+            cmd,
+            checksum,
+            declared,
+            buf,
+        } = &mut self.stage
+        else {
+            unreachable!("the header stage either returned or moved to the payload stage");
+        };
+        let rest = &input[used..];
+        let take = (*declared - buf.len()).min(rest.len());
+        if take > 0 {
+            let want = buf.len() + take;
+            if buf.capacity() < want {
+                let target = want.saturating_add(PAYLOAD_LOOKAHEAD).min(*declared);
+                buf.reserve_exact(target - buf.len());
+            }
+            buf.extend_from_slice(&rest[..take]);
+            used += take;
+        }
+        if buf.len() < *declared {
+            return Ok((used, None));
+        }
+
+        let cmd = *cmd;
+        let checksum = *checksum;
+        let payload = std::mem::take(buf);
+        self.stage = DecodeStage::Header {
+            buf: [0; WIRE_HEADER_SIZE],
+            filled: 0,
+        };
+        validate_payload_checksum(&payload, checksum).map_err(|pe| {
+            ReadStop::Failed(NetworkError::Serialization(format!("[Protocol] {}", pe)))
+        })?;
+        let msg: P2PMessage = bounded_deserialize(&payload).map_err(|e| {
+            ReadStop::Failed(NetworkError::Serialization(format!(
+                "[Protocol] {} deserialize failed: {}",
+                cmd, e
+            )))
+        })?;
+        Ok((used, Some((msg, cmd, WIRE_HEADER_SIZE + payload.len()))))
+    }
 }
 
 /// Releases an accepted inbound connection's accounting on EVERY exit path,
@@ -2912,10 +3058,17 @@ impl P2P {
 
         // The read timeout above bounds one recv; this bounds the whole
         // handshake. Disarmed in the main loop the moment it completes.
-        let mut reader = BufReader::new(DeadlineReader::new(
-            &stream,
-            Instant::now() + Duration::from_secs(PRE_HANDSHAKE_DEADLINE_SECS),
-        ));
+        let mut reader = BufReader::with_capacity(
+            READ_BUFFER_BYTES,
+            DeadlineReader::new(
+                &stream,
+                Instant::now() + Duration::from_secs(PRE_HANDSHAKE_DEADLINE_SECS),
+            ),
+        );
+        // One decoder for the whole connection, so a frame that arrives in the
+        // same read as the one before it survives the hand-over from the puzzle
+        // phase to the main loop.
+        let mut decoder = FrameDecoder::new();
         let mut writer = BufWriter::new(&stream);
 
         // Session state: ProtocolSession + connection-level fields
@@ -2944,7 +3097,7 @@ impl P2P {
 
             // Bound to a local first: the arms below mutate the session, so
             // the state borrow must end here.
-            let first = Self::read_message(&mut reader, magic, &session.protocol);
+            let first = Self::read_message(&mut reader, &mut decoder, magic, &session.protocol);
             match first {
                 Ok((
                     P2PMessage::PuzzleSolution {
@@ -3019,7 +3172,7 @@ impl P2P {
             }
         } else {
             // Outbound: wait for puzzle challenge, solve it, send solution
-            let first = Self::read_message(&mut reader, magic, &session.protocol);
+            let first = Self::read_message(&mut reader, &mut decoder, magic, &session.protocol);
             match first {
                 Ok((P2PMessage::PuzzleChallenge { challenge }, _, sz)) => {
                     session.record_bytes_received(sz as u64);
@@ -3144,7 +3297,7 @@ impl P2P {
 
         // ── Main message loop ──────────────────────────────────────────────
         loop {
-            let next = Self::read_message(&mut reader, magic, &session.protocol);
+            let next = Self::read_message(&mut reader, &mut decoder, magic, &session.protocol);
             match next {
                 Ok((msg, cmd, bytes_read)) => {
                     session.record_bytes_received(bytes_read as u64);
@@ -3504,68 +3657,64 @@ impl P2P {
     ///   9. Deserialize payload (only after all structural checks pass)
     fn read_message(
         reader: &mut BufReader<DeadlineReader<&TcpStream>>,
+        decoder: &mut FrameDecoder,
         magic: [u8; 4],
         protocol: &ProtocolSession,
-    ) -> Result<(P2PMessage, CommandId, usize), ReadStop> {
-        // 1. Read wire header (13 bytes)
-        let mut hdr_buf = [0u8; WIRE_HEADER_SIZE];
-        reader
-            .read_exact(&mut hdr_buf)
-            .map_err(|e| ReadStop::Failed(NetworkError::ConnectionFailed(e.to_string())))?;
-        let header = WireHeader::decode(&hdr_buf);
-
-        // 2-4. Validate header: magic, command_id, payload_len
-        let cmd = validate_header(&header, magic).map_err(|pe| {
-            ReadStop::Failed(NetworkError::Serialization(format!("[Protocol] {}", pe)))
-        })?;
-
-        // 5. Gate the DECLARED command against the handshake state, BEFORE the
-        // payload is sized, allocated or read. This check used to run after
-        // the payload had been read, so a peer that had not solved the puzzle
-        // could declare Block and have us allocate and read MAX_MESSAGE_SIZE
-        // for free; the size bound below is per-command, so it bounded the
-        // claim, not what the state permits. Only Version, VerAck, Reject and
-        // the two puzzle commands pass here before the handshake, which caps a
-        // stranger's allocation at Version's 1 KiB.
-        if let Err(pe) = protocol.check_command_allowed(cmd) {
-            let ban_score = pe.ban_score as u64;
-            return Err(ReadStop::Premature {
-                cmd,
-                reason: pe.message,
-                ban_score,
-            });
+    ) -> Result<Frame, ReadStop> {
+        match Self::poll_frame(reader, decoder, magic, protocol)? {
+            Some(frame) => Ok(frame),
+            None => Err(ReadStop::Failed(NetworkError::ConnectionFailed(
+                IDLE_POLL_TEXT.to_string(),
+            ))),
         }
+    }
 
-        // 6. Validate per-command payload size bounds BEFORE allocation/read.
-        // This prevents adversaries from forcing large allocations for commands
-        // that should have tiny payloads (e.g. Ping/Pong).
-        let payload_len = header.payload_len as usize;
-        validate_payload_size(cmd, payload_len).map_err(|pe| {
-            ReadStop::Failed(NetworkError::Serialization(format!("[Protocol] {}", pe)))
-        })?;
-
-        // 7. Read payload
-        let mut payload = vec![0u8; payload_len];
-        if payload_len > 0 {
-            reader
-                .read_exact(&mut payload)
-                .map_err(|e| ReadStop::Failed(NetworkError::ConnectionFailed(e.to_string())))?;
+    /// Feed whatever bytes are buffered or arrive into `decoder` until a frame
+    /// completes. `Ok(None)` means exactly what an idle tick has always meant: no
+    /// byte arrived within one poll interval. A partial frame is kept for the next
+    /// call rather than discarded.
+    ///
+    /// The timeout is recognised by `is_transient_read_timeout`, never by
+    /// `ErrorKind`: the pre-handshake deadline error is also `TimedOut`, and it
+    /// must stay fatal.
+    fn poll_frame(
+        reader: &mut BufReader<DeadlineReader<&TcpStream>>,
+        decoder: &mut FrameDecoder,
+        magic: [u8; 4],
+        protocol: &ProtocolSession,
+    ) -> Result<Option<Frame>, ReadStop> {
+        loop {
+            let available = match reader.fill_buf() {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    let text = e.to_string();
+                    if is_transient_read_timeout(&text.to_lowercase()) {
+                        return Ok(None);
+                    }
+                    return Err(ReadStop::Failed(NetworkError::ConnectionFailed(text)));
+                }
+            };
+            if available.is_empty() {
+                return Err(ReadStop::Failed(NetworkError::ConnectionFailed(
+                    "connection closed by peer".to_string(),
+                )));
+            }
+            let (used, frame) = decoder.feed(available, magic, protocol)?;
+            // A decoder that takes nothing from a non-empty buffer and yields no
+            // frame would spin here for ever: fill_buf hands back the same bytes
+            // without a syscall, so neither the poll timeout nor the deadline
+            // could ever fire.
+            if used == 0 && frame.is_none() {
+                return Err(ReadStop::Failed(NetworkError::ConnectionFailed(
+                    "frame decoder made no progress".to_string(),
+                )));
+            }
+            reader.consume(used);
+            if let Some(frame) = frame {
+                return Ok(Some(frame));
+            }
         }
-
-        // 8. Validate checksum (BEFORE deserialization — blocks tampered data)
-        validate_payload_checksum(&payload, header.checksum).map_err(|pe| {
-            ReadStop::Failed(NetworkError::Serialization(format!("[Protocol] {}", pe)))
-        })?;
-
-        // 9. Deserialize payload (bincode, allocation-bounded)
-        let msg: P2PMessage = bounded_deserialize(&payload).map_err(|e| {
-            ReadStop::Failed(NetworkError::Serialization(format!(
-                "[Protocol] {} deserialize failed: {}",
-                cmd, e
-            )))
-        })?;
-
-        Ok((msg, cmd, WIRE_HEADER_SIZE + payload_len))
     }
 
     /// Map CommandId to DoS guard MsgType for rate limiting.
@@ -6254,6 +6403,401 @@ mod tests {
             connect_within(&target, Duration::ZERO).is_err(),
             "the timeout must be passed through to connect_timeout"
         );
+    }
+
+    /// Write one frame split at `split`, with `pause` between the halves, and
+    /// read it the way the main loop does: `read_message` under the 100 ms
+    /// SO_RCVTIMEO, retried on a transient timeout. Returns the nonce read back,
+    /// or what went wrong.
+    fn read_split_frame(split: usize, pause: Duration) -> Result<u64, String> {
+        use std::io::Write;
+        let magic = NetworkParams::REGTEST_MAGIC;
+        let nonce = 0x5AD0_C0DE_u64;
+        let payload = bincode::serialize(&P2PMessage::Ping { nonce }).unwrap();
+        let mut frame = WireHeader::for_payload(magic, CommandId::Ping as u8, &payload).encode().to_vec();
+        frame.extend_from_slice(&payload);
+        assert!(split > 0 && split < frame.len(), "the split must fall inside the frame");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let writer = thread::spawn(move || {
+            let mut out = TcpStream::connect(addr).expect("connect");
+            out.set_nodelay(true).ok();
+            out.write_all(&frame[..split]).unwrap();
+            out.flush().unwrap();
+            thread::sleep(pause);
+            out.write_all(&frame[split..]).unwrap();
+            out.flush().unwrap();
+            thread::sleep(Duration::from_secs(1));
+        });
+
+        let (stream, _) = listener.accept().expect("accept");
+        stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let mut reader = BufReader::new(DeadlineReader::new(
+            &stream,
+            Instant::now() + Duration::from_secs(10),
+        ));
+        let mut proto = ProtocolSession::new(false, 10);
+        proto.state = crate::service::network::p2p::protocol::HandshakeState::Established;
+
+        // One decoder for the whole read, as the connection has: the point is
+        // that a frame interrupted by a pause is resumed, not restarted.
+        let mut decoder = FrameDecoder::new();
+        let started = Instant::now();
+        let result = loop {
+            match P2P::read_message(&mut reader, &mut decoder, magic, &proto) {
+                Ok((P2PMessage::Ping { nonce: n }, _, _)) => break Ok(n),
+                Ok((_, cmd, _)) => break Err(format!("read the wrong message: {cmd}")),
+                Err(ReadStop::Failed(e)) if is_transient_read_timeout(&e.to_string().to_lowercase()) => {
+                    if started.elapsed() > Duration::from_secs(3) {
+                        break Err("no message within 3 s".to_string());
+                    }
+                }
+                Err(ReadStop::Failed(e)) => break Err(format!("stream desynchronised: {e}")),
+                Err(ReadStop::Premature { reason, .. }) => break Err(format!("premature: {reason}")),
+            }
+        };
+        writer.join().ok();
+        result
+    }
+
+    // ── the frame decoder ─────────────────────────────────────────────────
+
+    fn wire_frame(magic: [u8; 4], msg: &P2PMessage) -> Vec<u8> {
+        let payload = bincode::serialize(msg).unwrap();
+        let cmd = P2P::msg_to_command_id(msg) as u8;
+        let mut frame = WireHeader::for_payload(magic, cmd, &payload).encode().to_vec();
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    fn session_in(state: crate::service::network::p2p::protocol::HandshakeState) -> ProtocolSession {
+        let mut p = ProtocolSession::new(false, 10);
+        p.state = state;
+        p
+    }
+
+    fn established_session() -> ProtocolSession {
+        session_in(crate::service::network::p2p::protocol::HandshakeState::Established)
+    }
+
+    /// Feed `input` in the given chunk sizes and collect every frame, checking
+    /// after each call that the decoder made progress and that the payload
+    /// buffer never ran further ahead of the data than the look-ahead allows.
+    fn feed_in_chunks(
+        input: &[u8],
+        chunks: &mut dyn Iterator<Item = usize>,
+        proto: &ProtocolSession,
+    ) -> Result<Vec<Frame>, ReadStop> {
+        let magic = NetworkParams::REGTEST_MAGIC;
+        let mut dec = FrameDecoder::new();
+        let mut frames = Vec::new();
+        let mut at = 0;
+        let mut turns = 0usize;
+        while at < input.len() {
+            turns += 1;
+            assert!(turns <= input.len() + 16, "the decoder stopped making progress");
+            let n = chunks.next().unwrap_or(1).max(1).min(input.len() - at);
+            let mut slice = &input[at..at + n];
+            while !slice.is_empty() {
+                let (used, frame) = dec.feed(slice, magic, proto)?;
+                assert!(
+                    used > 0 || frame.is_some(),
+                    "feed took nothing from {} bytes and returned no frame",
+                    slice.len()
+                );
+                if let DecodeStage::Payload { declared, buf, .. } = &dec.stage {
+                    assert!(
+                        buf.capacity() <= (buf.len() + PAYLOAD_LOOKAHEAD).min(*declared),
+                        "payload buffer at {} of {} bytes ran {} ahead",
+                        buf.len(),
+                        declared,
+                        buf.capacity() - buf.len()
+                    );
+                }
+                slice = &slice[used..];
+                at += used;
+                if let Some(f) = frame {
+                    frames.push(f);
+                }
+            }
+        }
+        Ok(frames)
+    }
+
+    fn frame_identity(f: &Frame) -> (CommandId, usize, Vec<u8>) {
+        (f.1, f.2, bincode::serialize(&f.0).unwrap())
+    }
+
+    #[test]
+    fn the_decoder_reads_a_stream_byte_by_byte_exactly_as_it_reads_it_whole() {
+        let magic = NetworkParams::REGTEST_MAGIC;
+        let msgs = vec![
+            P2PMessage::Ping { nonce: 7 },
+            P2PMessage::Pong { nonce: 8 },
+            P2PMessage::Addr { peers: vec!["198.51.100.7:19333".to_string(); 40] },
+            P2PMessage::GetBlock { hash: "ab".repeat(32) },
+            P2PMessage::Block { data: (0..5000u32).map(|i| (i * 31) as u8).collect() },
+        ];
+        let mut stream = Vec::new();
+        for m in &msgs {
+            stream.extend(wire_frame(magic, m));
+        }
+        let proto = established_session();
+        let whole = feed_in_chunks(&stream, &mut std::iter::repeat(stream.len()), &proto)
+            .unwrap_or_else(|_| panic!("whole stream failed"));
+        let single = feed_in_chunks(&stream, &mut std::iter::repeat(1), &proto)
+            .unwrap_or_else(|_| panic!("byte-by-byte stream failed"));
+        assert_eq!(whole.len(), msgs.len());
+        assert_eq!(
+            whole.iter().map(frame_identity).collect::<Vec<_>>(),
+            single.iter().map(frame_identity).collect::<Vec<_>>(),
+            "how the bytes are split must not change what is read"
+        );
+    }
+
+    #[test]
+    fn a_large_block_in_random_chunks_is_read_intact_without_overallocating() {
+        // 1.5 MiB: six look-ahead steps. Chunk sizes from a small LCG, 1 B to
+        // 64 KiB, so every boundary lands somewhere different.
+        let magic = NetworkParams::REGTEST_MAGIC;
+        let data: Vec<u8> = (0..1_572_864u32).map(|i| (i ^ (i >> 7)) as u8).collect();
+        let stream = wire_frame(magic, &P2PMessage::Block { data: data.clone() });
+        let mut state = 0x2545_F491_u64;
+        let mut chunks = std::iter::from_fn(move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            Some(1 + (state >> 33) as usize % 65_536)
+        });
+        let frames = feed_in_chunks(&stream, &mut chunks, &established_session())
+            .unwrap_or_else(|_| panic!("the large block failed to decode"));
+        assert_eq!(frames.len(), 1);
+        match &frames[0].0 {
+            P2PMessage::Block { data: got } => assert!(got == &data, "the block came back altered"),
+            _ => panic!("decoded the wrong message"),
+        }
+    }
+
+    #[test]
+    fn a_declared_payload_is_not_allocated_before_it_arrives() {
+        // Bitcoin Core's 2024 receive-buffer disclosure: a peer that declares
+        // 4 MiB and sends one byte must not cost us 4 MiB.
+        let magic = NetworkParams::REGTEST_MAGIC;
+        let header = WireHeader {
+            magic,
+            command_id: CommandId::Block as u8,
+            payload_len: MAX_MESSAGE_SIZE as u32,
+            checksum: [0; 4],
+        }
+        .encode();
+        let mut dec = FrameDecoder::new();
+        let mut input = header.to_vec();
+        input.push(0);
+        let (used, frame) = dec
+            .feed(&input, magic, &established_session())
+            .unwrap_or_else(|_| panic!("a valid header was refused"));
+        assert_eq!(used, input.len());
+        assert!(frame.is_none());
+        match &dec.stage {
+            DecodeStage::Payload { buf, .. } => assert!(
+                buf.capacity() <= 1 + PAYLOAD_LOOKAHEAD,
+                "allocated {} bytes for 1 byte of payload",
+                buf.capacity()
+            ),
+            _ => panic!("the decoder should be inside the payload"),
+        }
+    }
+
+    #[test]
+    fn feed_never_consumes_past_the_message_it_completes() {
+        // The next header must be gated under the state the caller moves to
+        // after dispatching this message. VerAck is what completes the
+        // handshake, and GetAddr is refused before it: consuming GetAddr's
+        // header in the same call would gate it under the old state and score
+        // an honest peer 50.
+        use crate::service::network::p2p::protocol::HandshakeState;
+        let magic = NetworkParams::REGTEST_MAGIC;
+        let verack = wire_frame(magic, &P2PMessage::VerAck);
+        let getaddr = wire_frame(magic, &P2PMessage::GetAddr);
+        let mut input = verack.clone();
+        input.extend_from_slice(&getaddr);
+
+        let mut dec = FrameDecoder::new();
+        let before = session_in(HandshakeState::AwaitPeerVerAck);
+        let (used, frame) = dec
+            .feed(&input, magic, &before)
+            .unwrap_or_else(|_| panic!("VerAck was refused"));
+        assert_eq!(used, verack.len(), "consumed past the end of the VerAck frame");
+        assert!(matches!(frame, Some((P2PMessage::VerAck, _, _))));
+
+        let after = established_session();
+        let (used, frame) = dec
+            .feed(&input[verack.len()..], magic, &after)
+            .unwrap_or_else(|_| panic!("GetAddr was refused once established"));
+        assert_eq!(used, getaddr.len());
+        assert!(matches!(frame, Some((P2PMessage::GetAddr, _, _))));
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Outcome {
+        Read(CommandId),
+        Failed,
+        Premature(u64),
+    }
+
+    /// The gate sequence `read_message` ran before the decoder existed, on a
+    /// complete frame: validate_header, check_command_allowed,
+    /// validate_payload_size, checksum, deserialize.
+    fn reference_outcome(frame: &[u8], magic: [u8; 4], proto: &ProtocolSession) -> Outcome {
+        let mut hdr = [0u8; WIRE_HEADER_SIZE];
+        hdr.copy_from_slice(&frame[..WIRE_HEADER_SIZE]);
+        let header = WireHeader::decode(&hdr);
+        let Ok(cmd) = validate_header(&header, magic) else { return Outcome::Failed };
+        if let Err(pe) = proto.check_command_allowed(cmd) {
+            return Outcome::Premature(pe.ban_score as u64);
+        }
+        if validate_payload_size(cmd, header.payload_len as usize).is_err() {
+            return Outcome::Failed;
+        }
+        let payload = &frame[WIRE_HEADER_SIZE..];
+        if payload.len() < header.payload_len as usize {
+            return Outcome::Failed;
+        }
+        let payload = &payload[..header.payload_len as usize];
+        if validate_payload_checksum(payload, header.checksum).is_err() {
+            return Outcome::Failed;
+        }
+        match bounded_deserialize::<P2PMessage>(payload) {
+            Ok(_) => Outcome::Read(cmd),
+            Err(_) => Outcome::Failed,
+        }
+    }
+
+    fn decoder_outcome(frame: &[u8], magic: [u8; 4], proto: &ProtocolSession) -> Outcome {
+        let mut dec = FrameDecoder::new();
+        let mut slice = frame;
+        loop {
+            match dec.feed(slice, magic, proto) {
+                Ok((_, Some((_, cmd, _)))) => return Outcome::Read(cmd),
+                Ok((used, None)) => {
+                    if used >= slice.len() {
+                        return Outcome::Failed; // ran out of input: the frame was short
+                    }
+                    slice = &slice[used..];
+                }
+                Err(ReadStop::Failed(_)) => return Outcome::Failed,
+                Err(ReadStop::Premature { ban_score, .. }) => return Outcome::Premature(ban_score),
+            }
+        }
+    }
+
+    #[test]
+    fn the_decoder_gates_and_scores_exactly_as_read_message_did() {
+        // Only check_command_allowed's score is ever applied, so the ORDER of
+        // the gates is the scoring rule. Compare against the old sequence.
+        use crate::service::network::p2p::protocol::HandshakeState;
+        let magic = NetworkParams::REGTEST_MAGIC;
+        let raw = |m: [u8; 4], cmd: u8, len: u32, payload: &[u8], good_sum: bool| {
+            let mut h = WireHeader { magic: m, command_id: cmd, payload_len: len, checksum: [0; 4] };
+            if good_sum {
+                h.checksum = WireHeader::for_payload(m, cmd, payload).checksum;
+            }
+            let mut f = h.encode().to_vec();
+            f.extend_from_slice(payload);
+            f
+        };
+        let ping = bincode::serialize(&P2PMessage::Ping { nonce: 1 }).unwrap();
+        let version = vec![0u8; 2000];
+        let init = session_in(HandshakeState::Init);
+        let est = established_session();
+        let cases: Vec<(&str, Vec<u8>, &ProtocolSession)> = vec![
+            ("pre-handshake Block over the wire maximum", raw(magic, CommandId::Block as u8, (MAX_MESSAGE_SIZE + 1) as u32, &[], false), &init),
+            ("pre-handshake Block with an empty payload", raw(magic, CommandId::Block as u8, 0, &[], false), &init),
+            ("pre-handshake Ping", raw(magic, CommandId::Ping as u8, ping.len() as u32, &ping, true), &init),
+            ("pre-handshake Ping declaring 100 bytes", raw(magic, CommandId::Ping as u8, 100, &[0; 100], true), &init),
+            ("Version after the handshake", raw(magic, CommandId::Version as u8, 2000, &version, true), &est),
+            ("wrong magic", raw([1, 2, 3, 4], CommandId::Ping as u8, ping.len() as u32, &ping, true), &est),
+            ("unknown command", raw(magic, 0xEE, ping.len() as u32, &ping, true), &est),
+            ("payload shorter than the command allows", raw(magic, CommandId::Ping as u8, 2, &[0, 0], true), &est),
+            ("bad checksum", raw(magic, CommandId::Ping as u8, ping.len() as u32, &ping, false), &est),
+            ("undeserialisable payload", raw(magic, CommandId::Ping as u8, 12, &[0xFF; 12], true), &est),
+            ("a good Ping", raw(magic, CommandId::Ping as u8, ping.len() as u32, &ping, true), &est),
+        ];
+        for (name, frame, proto) in cases {
+            assert_eq!(
+                decoder_outcome(&frame, magic, proto),
+                reference_outcome(&frame, magic, proto),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_cut_off_by_the_peer_closing_is_a_failure_not_a_wait() {
+        use std::io::Write;
+        let magic = NetworkParams::REGTEST_MAGIC;
+        let frame = wire_frame(magic, &P2PMessage::Ping { nonce: 9 });
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let writer = thread::spawn(move || {
+            let mut out = TcpStream::connect(addr).expect("connect");
+            out.write_all(&frame[..10]).unwrap();
+        });
+        let (stream, _) = listener.accept().expect("accept");
+        writer.join().ok();
+        stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let mut reader = BufReader::new(DeadlineReader::new(&stream, Instant::now() + Duration::from_secs(5)));
+        let mut dec = FrameDecoder::new();
+        let proto = established_session();
+        let started = Instant::now();
+        let result = loop {
+            match P2P::poll_frame(&mut reader, &mut dec, magic, &proto) {
+                Ok(None) if started.elapsed() < Duration::from_secs(3) => continue,
+                other => break other,
+            }
+        };
+        assert!(
+            matches!(result, Err(ReadStop::Failed(_))),
+            "a peer that hangs up mid-frame must end the read"
+        );
+    }
+
+    #[test]
+    fn a_spent_deadline_ends_the_read_through_the_decoder_too() {
+        // The deadline error is ErrorKind::TimedOut, the same kind as an idle
+        // poll. poll_frame must classify it by its text, as before, or the
+        // pre-handshake deadline would turn into an idle tick for ever.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let _client = TcpStream::connect(addr).expect("connect");
+        let (stream, _) = listener.accept().expect("accept");
+        stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let mut reader = BufReader::new(DeadlineReader::new(&stream, Instant::now()));
+        let mut dec = FrameDecoder::new();
+        let result = P2P::poll_frame(&mut reader, &mut dec, NetworkParams::REGTEST_MAGIC, &established_session());
+        assert!(
+            matches!(result, Err(ReadStop::Failed(_))),
+            "a spent deadline must be fatal, not an idle poll"
+        );
+    }
+
+    #[test]
+    fn a_frame_split_by_a_retransmission_pause_is_read_intact() {
+        // A frame whose bytes stop arriving for longer than the 100 ms poll —
+        // which one lost packet does over a real link, where the minimum TCP
+        // retransmission timeout is 200 ms — used to lose the bytes read_exact
+        // had already consumed. The main loop treats the timeout as an idle tick
+        // and starts a fresh 13-byte header in the middle of the old frame.
+        // Split inside the header, then inside the payload.
+        for split in [7, WIRE_HEADER_SIZE + 5] {
+            let got = read_split_frame(split, Duration::from_millis(250));
+            assert_eq!(got, Ok(0x5AD0_C0DE), "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn a_frame_that_arrives_whole_is_read_intact() {
+        // The control for the split test: same harness, no pause.
+        assert_eq!(read_split_frame(7, Duration::ZERO), Ok(0x5AD0_C0DE));
     }
 
     // ── Sweep-3 #2: one peer may not own the header-serve queue ──────────
